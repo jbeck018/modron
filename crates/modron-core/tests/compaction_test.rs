@@ -475,3 +475,122 @@ fn phase0_session_events_still_load_and_compaction_roundtrips() {
         }
     );
 }
+
+/// Phase 5i: the SELECTED model's window drives the compaction trigger —
+/// a 128k-window model compacts at 0.8×128k even when the global cap is
+/// 180k. This is the live finding from the 105k-token free-model run.
+#[tokio::test]
+async fn compaction_uses_the_model_window_not_the_global_cap() {
+    use modron_core::testing::{MockProvider, StaticSelector};
+    use modron_core::{CompactionPolicy, SessionEvent, SessionStore};
+
+    // A model with a small window; the global cap stays large.
+    let selector = StaticSelector::new("small-window-model", "mock");
+    // Fake its window via a ModelChoice-carrying selector: StaticSelector
+    // reports context_window None, so use a custom wrapper.
+    struct WindowedSelector(StaticSelector);
+    impl modron_core::ModelSelector for WindowedSelector {
+        fn select(&self, req: &modron_core::SelectRequest) -> modron_core::ModelChoice {
+            let mut choice = self.0.select(req);
+            choice.context_window = Some(10_000); // tiny window
+            choice
+        }
+    }
+
+    // Turn 1: large assistant text + a tool call → the transcript crosses
+    // 0.8 × 10k, so turn 2 must compact (window-driven, not global-cap).
+    // Script: turn 1 (tool call, huge text), then the SUMMARIZER response
+    // (the compaction pass consumes it), then turn 2's final answer.
+    let provider = MockProvider::new()
+        .then_response(TurnResponse {
+            text: "y".repeat(40_000),
+            tool_calls: vec![modron_core::ToolCall {
+                id: "c1".into(),
+                name: "noop".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: Usage {
+                input_tokens: 9_000,
+                output_tokens: 100,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::ToolUse,
+        })
+        .then_response(TurnResponse {
+            text: "TASK: force compaction\nDECISIONS: none\nEDITS: none\nOPEN ITEMS: none".into(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 500,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::EndTurn,
+        })
+        .then_response(TurnResponse {
+            text: "done".into(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 200,
+                output_tokens: 10,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::EndTurn,
+        });
+
+    let mut registry = modron_core::ToolRegistry::new();
+    struct Noop;
+    #[async_trait::async_trait]
+    impl modron_core::Tool for Noop {
+        fn spec(&self) -> modron_core::ToolSpec {
+            modron_core::ToolSpec {
+                name: "noop".into(),
+                description: "does nothing".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &modron_core::ToolCtx,
+        ) -> modron_core::Result<modron_core::ToolOutcome> {
+            Ok(modron_core::ToolOutcome::ok("ok"))
+        }
+    }
+    registry.register(std::sync::Arc::new(Noop));
+
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::default());
+    let engine = modron_core::Engine {
+        selector: Arc::new(WindowedSelector(selector)),
+        providers: [(
+            "mock".to_string(),
+            Arc::new(provider) as Arc<dyn modron_core::ModelProvider>,
+        )]
+        .into_iter()
+        .collect(),
+        tools: Arc::new(registry),
+        store: Arc::clone(&store),
+        config: modron_core::EngineConfig {
+            working_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+            max_input_tokens: 180_000, // global cap LARGE — window must win
+            compaction: CompactionPolicy {
+                enabled: true,
+                threshold_frac: 0.8,
+                min_interval_turns: 0,
+                tail_messages: 1, // the 40k message must NOT survive in the tail
+                summary_max_bytes: 2048,
+            },
+            ..modron_core::EngineConfig::default()
+        },
+    };
+
+    let summary = engine.run_task("force compaction").await.unwrap();
+    let events = store.load(summary.session_id).await.unwrap();
+    let compactions = events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::Compaction { .. }))
+        .count();
+    assert_eq!(
+        compactions, 1,
+        "compaction fired against the 10k model window despite the 180k global cap"
+    );
+}

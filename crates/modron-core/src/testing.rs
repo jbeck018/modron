@@ -278,6 +278,7 @@ impl ModelSelector for StaticSelector {
             provider: self.provider.clone(),
             reason: self.reason.clone(),
             confident: true,
+            context_window: None,
         }
     }
 }

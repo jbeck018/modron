@@ -120,6 +120,7 @@ impl HeuristicSelector {
             provider,
             reason,
             confident: true,
+            context_window: None,
         }
     }
 }
@@ -132,6 +133,7 @@ impl ModelSelector for HeuristicSelector {
         if let Some(remaining) = req.budget_remaining_usd {
             if remaining < BUDGET_PRESSURE_USD {
                 let (model, provider) = self.cheap.clone();
+                let window = lookup(&model).map(|i| i.context_window);
                 return ModelChoice {
                     model,
                     provider,
@@ -139,6 +141,7 @@ impl ModelSelector for HeuristicSelector {
                         "budget pressure: ${remaining:.2} remaining of the cap → cheap tier"
                     ),
                     confident: true,
+                    context_window: window,
                 };
             }
         }
@@ -153,6 +156,7 @@ impl ModelSelector for HeuristicSelector {
                 provider,
                 reason: format!("config override: action={:?} → {model}", req.action),
                 confident: true,
+                context_window: lookup(model).map(|i| i.context_window),
             };
         }
 
@@ -189,6 +193,7 @@ impl ModelSelector for HeuristicSelector {
             provider,
             reason,
             confident: true,
+            context_window: None,
         }
     }
 }

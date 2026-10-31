@@ -40,6 +40,18 @@ impl BudgetGovernor {
     /// Pre-flight check: reject a turn whose assembled-context estimate
     /// exceeds the per-turn input cap. The error names both numbers so the
     /// operator can act on it.
+    /// Check against an explicit cap (Phase 5i): the selected model's
+    /// window, not the global config cap.
+    pub fn check_input_with_cap(&self, estimated_input_tokens: u64, cap: u64) -> Result<()> {
+        if estimated_input_tokens > cap {
+            return Err(Error::Budget(format!(
+                "turn context ~{estimated_input_tokens} est. tokens exceeds cap {cap} — \
+                 compact or raise the cap"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn check_input(&self, estimated_input_tokens: u64) -> Result<()> {
         if estimated_input_tokens > self.max_input_tokens {
             return Err(Error::Budget(format!(

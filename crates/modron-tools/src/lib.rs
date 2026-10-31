@@ -34,7 +34,7 @@ mod verify;
 mod write;
 
 pub use bash::BashTool;
-pub use delegate::DelegateTool;
+pub use delegate::{DelegateStatusTool, DelegateTool};
 pub use edit::EditTool;
 pub use explore::ExploreTool;
 pub use glob::GlobTool;

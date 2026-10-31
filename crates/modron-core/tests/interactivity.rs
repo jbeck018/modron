@@ -264,6 +264,7 @@ impl modron_core::ModelSelector for TierSelector {
             provider: "anthropic".into(),
             reason: "tier test selector".into(),
             confident,
+            context_window: None,
         }
     }
 }

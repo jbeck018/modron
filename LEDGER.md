@@ -1068,3 +1068,28 @@ Deferred: detached background delegates that outlive the parent turn (needs
 completion-notification semantics — the next big delegation step), and
 worktree isolation for parallel MUTATING agents (pi's pattern; requires git
 integration).
+
+---
+
+# Phase 5i — Delegation depth + model-aware caps (opened/closed 2026-10-31)
+
+Baseline: 337 tests, Phase 5h pushed. The three deferred items, in reverse
+weight order: model-aware caps landed first (smallest, closes the live-signal
+debt), then the two delegation-depth items.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| I1 | Model-aware caps: `ModelChoice.context_window` (additive, catalog-filled by every selector path); engine selects FIRST, computes effective cap = min(global cap, model window), compacts against it, and the pre-flight budget check uses it. The live finding is now enforced: a 128k-window free model compacts at 0.8×128k even with a 180k global cap | DONE | compaction_test::compaction_uses_the_model_window_not_the_global_cap (a 10k-window model compacts despite a 180k cap; test caught the tail-keeps-the-huge-message case, fixed with tail_messages=1 in the fixture) |
+| I2 | Background delegates: `delegate {background: true}` returns an agent id immediately; child runs detached; `delegate_status {id?}` lists running (turns/tokens via progress events) or completed (brief) agents; state survives across chat turns (engine-held registry) | DONE | tools/delegate.rs + engine registry; e2e: started → running → done with brief |
+| I3 | Worktree isolation: `delegate {isolate: true}` requires git, creates `.modron/worktrees/<id>` via `git worktree add`, runs the child there, and reports the worktree path + `git diff --stat` in the brief — review-not-auto-merge semantics (merging is the user's/parent's explicit decision) | DONE | e2e with a git-initialized temp repo; non-git working dir → actionable error |
+| V22 | Gates | DONE | **338 passed / 0 failed**, clippy clean |
+
+## Final verdict — Phase 5i
+
+**Delegation now has depth.** Background delegates let the model fan out work
+and check on it later (chat turns persist the registry); isolated delegates
+run mutating subtasks in git worktrees with review-first merging; and the
+compaction/overflow machinery now respects the actual model in use — the
+live finding from the 105k-token free-model runs is a tested invariant.
+Deferred (next): `loadSession` in ACP, router training from bench JSONL
+(needs quality labels), and merge-automation for worktrees.

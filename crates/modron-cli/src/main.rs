@@ -653,6 +653,7 @@ fn build_agent_with(
         on_delta: sinks.on_delta,
         on_tool_event: sinks.on_tool_event,
         personas: Default::default(),
+        background_subagents: Default::default(),
     };
 
     if !engine_config.working_dir.is_dir() {
@@ -673,6 +674,7 @@ fn build_agent_with(
     // Phase 4: read-only subagent for repo-wide questions; skills load
     // on demand — the tool only registers when the repo HAS skills.
     registry.register(Arc::new(modron_tools::ExploreTool));
+    registry.register(Arc::new(modron_tools::DelegateStatusTool));
     if !modron_core::context::load_skills_index(&working_dir).is_empty() {
         registry.register(Arc::new(modron_tools::SkillTool::for_working_dir(
             &working_dir,

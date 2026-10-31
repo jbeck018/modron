@@ -153,31 +153,11 @@ impl Engine {
                 break;
             }
 
-            // Autocompaction (PLAN.md §4.10): before any turn after the
-            // first, under context pressure and past the min-interval,
-            // summarize the older transcript. Runs before the pre-flight
-            // budget check so a compaction can rescue an over-cap context.
+            // Route FIRST (Phase 5i): the selected model's context window
+            // (from ModelChoice) is the compaction trigger — a 128k-window
+            // free model must compact at 0.8×128k even when the global cap
+            // is 180k.
             let mut context_tokens = estimate_context_tokens(&system, &tool_specs, &transcript);
-            if self.should_compact(turns, turns_since_compaction, context_tokens) {
-                if let Some(outcome) = self.run_compaction(session_id, task).await? {
-                    governor.feed_turn(outcome.usage);
-                    spend_usd += self.turn_cost_usd(&outcome.model, &outcome.usage);
-                    total.input_tokens += outcome.usage.input_tokens;
-                    total.output_tokens += outcome.usage.output_tokens;
-                    total.cached_input_tokens += outcome.usage.cached_input_tokens;
-                    if !models_used.contains(&outcome.model) {
-                        models_used.push(outcome.model);
-                    }
-                    transcript = outcome.transcript;
-                    turns_since_compaction = 0;
-                    context_tokens = estimate_context_tokens(&system, &tool_specs, &transcript);
-                }
-            }
-
-            // Pre-flight budget check on the assembled context.
-            governor.check_input(context_tokens)?;
-
-            // Route: Chat on the first turn, then derive from the last tool call.
             let action = if turns == 0 {
                 ActionKind::Chat
             } else {
@@ -192,6 +172,49 @@ impl Engine {
                     .max_cost_usd
                     .map(|cap| (cap - spend_usd).max(0.0)),
             });
+            let effective_cap = choice
+                .context_window
+                .unwrap_or(self.config.max_input_tokens)
+                .min(self.config.max_input_tokens);
+
+            // Autocompaction (PLAN.md §4.10): before any turn after the
+            // first, under context pressure and past the min-interval,
+            // summarize the older transcript. Runs before the pre-flight
+            // budget check so a compaction can rescue an over-cap context.
+            if self.should_compact_with_cap(
+                turns,
+                turns_since_compaction,
+                context_tokens,
+                effective_cap,
+            ) {
+                if let Some(outcome) = self.run_compaction(session_id, task).await? {
+                    governor.feed_turn(outcome.usage);
+                    spend_usd += self.turn_cost_usd(&outcome.model, &outcome.usage);
+                    total.input_tokens += outcome.usage.input_tokens;
+                    total.output_tokens += outcome.usage.output_tokens;
+                    total.cached_input_tokens += outcome.usage.cached_input_tokens;
+                    if !models_used.contains(&outcome.model) {
+                        models_used.push(outcome.model);
+                    }
+                    transcript = outcome.transcript;
+                    turns_since_compaction = 0;
+                    context_tokens = estimate_context_tokens(&system, &tool_specs, &transcript);
+                    // The context changed materially: re-route once.
+                    choice = self.selector.select(&SelectRequest {
+                        task: task.to_string(),
+                        action,
+                        context_tokens,
+                        budget_remaining_usd: self
+                            .config
+                            .max_cost_usd
+                            .map(|cap| (cap - spend_usd).max(0.0)),
+                    });
+                }
+            }
+
+            // Pre-flight budget check on the assembled context, against the
+            // effective cap (the model's window when known).
+            governor.check_input_with_cap(context_tokens, effective_cap)?;
 
             // Async decision model (Phase-3b M1): consulted per JudgeMode.
             // A verdict re-queries the sync selector with the mapped action —
@@ -693,13 +716,20 @@ impl Engine {
     /// on the first turn, only when the policy is enabled, under context
     /// pressure (estimate > `threshold_frac × max_input_tokens`), and past
     /// the min-interval since the last compaction.
-    fn should_compact(&self, turns: u32, turns_since_compaction: u32, context_tokens: u64) -> bool {
+    /// Compaction trigger against an effective cap (Phase 5i): the selected
+    /// model's window, not the global config cap.
+    fn should_compact_with_cap(
+        &self,
+        turns: u32,
+        turns_since_compaction: u32,
+        context_tokens: u64,
+        effective_cap: u64,
+    ) -> bool {
         let policy = &self.config.compaction;
         policy.enabled
             && turns > 0
             && turns_since_compaction >= policy.min_interval_turns
-            && (context_tokens as f64)
-                > policy.threshold_frac * (self.config.max_input_tokens as f64)
+            && (context_tokens as f64) > policy.threshold_frac * (effective_cap as f64)
     }
 
     /// One compaction pass (X1, PLAN.md §4.10): load the session's events,

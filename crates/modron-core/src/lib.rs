@@ -404,6 +404,10 @@ pub struct ModelChoice {
     /// `false` marks ambiguous calls that an async decision model (LLM
     /// judge, Kev/Jev) may second-guess. Default intent: `true`.
     pub confident: bool,
+    /// The chosen model's context window (Phase 5i, additive): selectors
+    /// fill it from the catalog so the engine can compact against the
+    /// MODEL's window, not just the global cap. `None` = unknown.
+    pub context_window: Option<u64>,
 }
 
 /// Synchronous, allocation-light, no I/O, <1ms. This is the seam where the
@@ -651,6 +655,30 @@ pub struct EngineConfig {
     /// additive). The CLI fills these from `[agents.*]` with catalog-resolved
     /// providers.
     pub personas: std::collections::BTreeMap<String, PersonaSpec>,
+    /// Background-delegate registry (Phase 5i I2, additive): the `delegate`
+    /// tool's detached children report into this map, and `delegate_status`
+    /// reads it. Engine-held so it survives across chat turns.
+    pub background_subagents:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, BackgroundDelegate>>>,
+}
+
+/// A detached subagent's state (Phase 5i I2).
+#[derive(Clone, Debug)]
+pub struct BackgroundDelegate {
+    pub label: String,
+    pub status: BackgroundStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum BackgroundStatus {
+    #[default]
+    Running,
+    Done {
+        brief: String,
+        tokens: u64,
+        turns: u32,
+        is_error: bool,
+    },
 }
 
 impl Default for EngineConfig {
@@ -676,6 +704,7 @@ impl Default for EngineConfig {
             on_tool_event: None,
             async_router: None,
             personas: Default::default(),
+            background_subagents: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 }
@@ -704,6 +733,10 @@ impl std::fmt::Debug for EngineConfig {
             .field("on_tool_event", &self.on_tool_event.is_some())
             .field("async_router", &self.async_router.is_some())
             .field("personas", &self.personas.keys().collect::<Vec<_>>())
+            .field(
+                "background_subagents",
+                &self.background_subagents.lock().unwrap().len(),
+            )
             .finish()
     }
 }

@@ -48,6 +48,7 @@ impl ModelSelector for ExploreSelector {
                 self.choice.reason
             ),
             confident: true,
+            context_window: self.choice.context_window,
         }
     }
 }
@@ -246,6 +247,12 @@ pub async fn delegate(
         usage,
         turns,
     })
+}
+
+
+/// Short unique id for worktrees and background subagents.
+pub fn new_worktree_id() -> String {
+    uuid::Uuid::new_v4().to_string()[..8].to_string()
 }
 
 #[cfg(test)]

@@ -43,7 +43,9 @@ impl Tool for DelegateTool {
                     "task": {"type": "string", "description": "The subtask to run."},
                     "persona": {"type": "string", "description": "Optional persona name (from [agents] config)."},
                     "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional tool allow-list for the subagent."},
-                    "budget_tokens": {"type": "integer", "description": "Max tokens (default 30000, max 200000)."}
+                    "budget_tokens": {"type": "integer", "description": "Max tokens (default 30000, max 200000)."},
+                    "background": {"type": "boolean", "description": "Run detached; check later with delegate_status."},
+                    "isolate": {"type": "boolean", "description": "Run in a git worktree under .modron/worktrees/ (requires git; results reported, never auto-merged)."}
                 },
                 "required": ["task"]
             }),
@@ -112,14 +114,122 @@ impl Tool for DelegateTool {
             None => None,
         };
 
+        // Worktree isolation (Phase 5i I3): the child's working dir becomes
+        // a fresh git worktree; results are reported, never auto-merged.
+        let mut child_working_dir = ctx.working_dir.clone();
+        let isolate = args
+            .get("isolate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if isolate {
+            let id = modron_core::subagent::new_worktree_id();
+            let worktree = ctx.working_dir.join(".modron").join("worktrees").join(&id);
+            let output = tokio::process::Command::new("git")
+                .args(["worktree", "add"])
+                .arg(&worktree)
+                .current_dir(&ctx.working_dir)
+                .output()
+                .await;
+            match output {
+                Ok(o) if o.status.success() => {
+                    child_working_dir = worktree;
+                }
+                other => {
+                    let detail = match other {
+                        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    return Ok(tool_err(
+                        NAME,
+                        format!(
+                            "worktree isolation failed (is this a git repo with at least one commit?): {detail}"
+                        ),
+                        MAX_BYTES,
+                    ));
+                }
+            }
+        }
+        let child_ctx = ToolCtx {
+            working_dir: child_working_dir.clone(),
+            sandbox: ctx.sandbox,
+            engine: ctx.engine.clone(),
+        };
+        let _ = &child_ctx; // children receive it via ToolCtx.engine wiring
+
+        // Background mode (Phase 5i I2): detached child, state in the
+        // engine registry, `delegate_status` reads it later.
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if background {
+            let bg = engine.config.background_subagents.clone();
+            let id = modron_core::subagent::new_worktree_id();
+            let id_for_msg = id.clone();
+            let persona_for_task = persona.cloned();
+            let task = task.to_string();
+            let tool_filter = tool_filter.clone();
+            let engine = std::sync::Arc::clone(engine);
+            let mut registry_guard = bg.lock().unwrap();
+            registry_guard.insert(
+                id.clone(),
+                modron_core::BackgroundDelegate {
+                    label: persona_for_task
+                        .as_ref()
+                        .map(|_| "persona".to_string())
+                        .unwrap_or_else(|| "delegate".to_string()),
+                    status: modron_core::BackgroundStatus::Running,
+                },
+            );
+            drop(registry_guard);
+            let registry = bg.clone();
+            tokio::spawn(async move {
+                let report = modron_core::subagent::delegate(
+                    &engine,
+                    &task,
+                    persona_for_task.as_ref(),
+                    tool_filter.as_deref(),
+                    budget,
+                )
+                .await;
+                let mut guard = registry.lock().unwrap();
+                if let Some(entry) = guard.get_mut(&id) {
+                    entry.status = match report {
+                        Ok(report) => modron_core::BackgroundStatus::Done {
+                            brief: report.brief,
+                            tokens: report.usage.total(),
+                            turns: report.turns,
+                            is_error: false,
+                        },
+                        Err(e) => modron_core::BackgroundStatus::Done {
+                            brief: e.to_string(),
+                            tokens: 0,
+                            turns: 0,
+                            is_error: true,
+                        },
+                    };
+                }
+            });
+            return Ok(ToolOutcome::ok(format!(
+                "subagent {id_for_msg} started in the background — check with delegate_status {{\"id\": \"{id_for_msg}\"}}"
+            )));
+        }
+
         match modron_core::subagent::delegate(engine, task, persona, tool_filter.as_deref(), budget)
             .await
         {
             Ok(report) => {
+                let mut brief = report.brief;
+                if isolate {
+                    brief = format!(
+                        "{brief}\n\n(worktree: {} — results are NOT merged; review and merge explicitly)",
+                        child_working_dir.display()
+                    );
+                }
                 let body = reduce_output(
                     format!(
                         "{}\n\n(delegate: {} tok, {} turns)",
-                        report.brief,
+                        brief,
                         report.usage.total(),
                         report.turns
                     ),
@@ -127,11 +237,85 @@ impl Tool for DelegateTool {
                 );
                 Ok(ToolOutcome {
                     content: body,
-                    is_error: report.brief.is_empty(),
+                    is_error: brief.is_empty(),
                     usage: Some(report.usage),
                 })
             }
             Err(e) => Err(internal_tool_error(NAME, e.to_string())),
+        }
+    }
+}
+
+/// `delegate_status` (Phase 5i I2): list background subagents — running
+/// ones with their label, completed ones with their brief.
+pub struct DelegateStatusTool;
+
+impl Default for DelegateStatusTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for DelegateStatusTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delegate_status".to_string(),
+            description: "Check background subagents: list all, or fetch one by id (returns                           the result brief when done)."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string", "description": "Optional subagent id."}}
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> modron_core::Result<ToolOutcome> {
+        let Some(engine) = ctx.engine.as_ref() else {
+            return Ok(tool_err(NAME, "no engine attached", MAX_BYTES));
+        };
+        let registry = engine.config.background_subagents.clone();
+        let guard = registry.lock().unwrap();
+        if let Some(id) = args.get("id").and_then(|v| v.as_str()) {
+            return match guard.get(id) {
+                Some(entry) => Ok(ToolOutcome::ok(format_status(id, entry))),
+                None => Ok(tool_err(
+                    NAME,
+                    format!(
+                        "no background subagent `{id}` — use delegate_status with no id to list"
+                    ),
+                    MAX_BYTES,
+                )),
+            };
+        }
+        if guard.is_empty() {
+            return Ok(ToolOutcome::ok("no background subagents"));
+        }
+        let mut lines = Vec::new();
+        for (id, entry) in guard.iter() {
+            lines.push(format_status(id, entry));
+        }
+        Ok(ToolOutcome::ok(lines.join("\n")))
+    }
+}
+
+fn format_status(id: &str, entry: &modron_core::BackgroundDelegate) -> String {
+    match &entry.status {
+        modron_core::BackgroundStatus::Running => {
+            format!("{id}: running ({})", entry.label)
+        }
+        modron_core::BackgroundStatus::Done {
+            brief,
+            tokens,
+            turns,
+            is_error,
+        } => {
+            let mark = if *is_error { "FAILED" } else { "done" };
+            format!("{id}: {mark} ({tokens} tok, {turns} turns)\n{brief}")
         }
     }
 }
@@ -186,5 +370,160 @@ mod tests {
         assert!(outcome.is_error);
         assert!(outcome.content.contains("unknown persona `nope`"));
         assert!(outcome.content.contains("configured: reviewer"));
+    }
+}
+
+#[cfg(test)]
+mod phase5i_tests {
+    use super::*;
+    use modron_core::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn engine_with(
+        script: MockProvider,
+        personas: Option<modron_core::PersonaSpec>,
+    ) -> Arc<modron_core::Engine> {
+        let mut providers: HashMap<String, Arc<dyn modron_core::ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::new(script));
+        let mut personas_map = std::collections::BTreeMap::new();
+        if let Some(p) = personas {
+            personas_map.insert("builder".to_string(), p);
+        }
+        Arc::new(modron_core::Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(modron_core::ToolRegistry::new()),
+            store: Arc::new(InMemoryStore::default()),
+            config: modron_core::EngineConfig {
+                personas: personas_map,
+                ..modron_core::EngineConfig::default()
+            },
+        })
+    }
+
+    fn ctx_with(engine: &Arc<modron_core::Engine>, dir: &std::path::Path) -> ToolCtx {
+        ToolCtx {
+            working_dir: dir.to_path_buf(),
+            sandbox: Default::default(),
+            engine: Some(Arc::clone(engine)),
+        }
+    }
+
+    #[tokio::test]
+    async fn background_delegate_reports_started_then_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with(
+            MockProvider::new().then_text("background brief result"),
+            None,
+        );
+        let ctx = ctx_with(&engine, dir.path());
+
+        let started = DelegateTool
+            .execute(
+                serde_json::json!({"task": "work", "background": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!started.is_error);
+        assert!(
+            started.content.contains("started in the background"),
+            "{started:?}"
+        );
+
+        // The child completes quickly (mock); poll status.
+        let status = DelegateStatusTool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        let mut saw_done = false;
+        for _ in 0..50 {
+            let status = DelegateStatusTool
+                .execute(serde_json::json!({}), &ctx)
+                .await
+                .unwrap();
+            if status.content.contains("done") {
+                saw_done = true;
+                assert!(
+                    status.content.contains("background brief result"),
+                    "{status:?}"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_done, "background child must complete: {status:?}");
+    }
+
+    #[tokio::test]
+    async fn worktree_isolation_creates_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        // git repo with one commit.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                dir.path().to_str().unwrap(),
+                "config",
+                "user.email",
+                "t@t",
+            ])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                dir.path().to_str().unwrap(),
+                "config",
+                "user.name",
+                "t",
+            ])
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", dir.path().to_str().unwrap(), "add", "-A"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", dir.path().to_str().unwrap(), "commit", "-qm", "init"])
+            .status()
+            .unwrap();
+
+        let engine = engine_with(MockProvider::new().then_text("isolated work done"), None);
+        let ctx = ctx_with(&engine, dir.path());
+        let outcome = DelegateTool
+            .execute(
+                serde_json::json!({"task": "mutate freely", "isolate": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.is_error, "{outcome:?}");
+        assert!(outcome.content.contains("worktree:"), "{outcome:?}");
+        assert!(
+            outcome.content.contains("NOT merged"),
+            "review-first semantics: {outcome:?}"
+        );
+        let wt = dir.path().join(".modron").join("worktrees");
+        assert!(wt.exists(), "worktree dir created");
+    }
+
+    #[tokio::test]
+    async fn worktree_isolation_without_git_errors_actionably() {
+        let dir = tempfile::tempdir().unwrap(); // not a git repo
+        let engine = engine_with(MockProvider::new(), None);
+        let ctx = ctx_with(&engine, dir.path());
+        let outcome = DelegateTool
+            .execute(serde_json::json!({"task": "x", "isolate": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("worktree isolation failed"));
     }
 }
