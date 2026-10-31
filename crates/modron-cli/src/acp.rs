@@ -43,7 +43,7 @@ pub fn initialize_result() -> Value {
     json!({
         "protocolVersion": 1,
         "agentCapabilities": {
-            "loadSession": false,
+            "loadSession": true,
             "promptCapabilities": {"embeddedContext": false}
         },
         "authMethods": []
@@ -141,6 +141,22 @@ pub fn stop_reason_to_acp(reason: modron_core::StopReason) -> &'static str {
 pub fn route_initialize(params: &Value) -> Value {
     let _ = params;
     initialize_result()
+}
+
+/// `session/load`: the editor passes a Modron session id (from a previous
+/// run's footer or `modron sessions`); we hand back a fresh ACP session id
+/// whose first prompt will resume that Modron session.
+pub fn load_session_result(session_id: &str) -> Value {
+    json!({"sessionId": session_id})
+}
+
+/// Validate a session/load request: returns the Modron session id to bind.
+pub fn session_load_id(params: &Value) -> Option<String> {
+    params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .filter(|s| !s.is_empty())
 }
 
 /// Validate a session/new request: returns the working directory.
@@ -352,6 +368,27 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                     "initialize" => {
                         send!(json_response(id, route_initialize(&message["params"])));
                     }
+                    "session/load" => {
+                        let Some(modron_id) = session_load_id(&message["params"]) else {
+                            send!(json_error(id, -32602, "missing sessionId"));
+                            continue;
+                        };
+                        // Validate it parses as a Modron session id.
+                        match modron_id.parse::<modron_core::SessionId>() {
+                            Ok(parsed) => {
+                                let acp_session = uuid::Uuid::new_v4().to_string();
+                                *current_acp_session.lock().unwrap() = Some(acp_session.clone());
+                                sessions
+                                    .lock()
+                                    .unwrap()
+                                    .insert(acp_session.clone(), Some(parsed));
+                                send!(json_response(id, json!({"sessionId": acp_session})));
+                            }
+                            Err(_) => {
+                                send!(json_error(id, -32602, "invalid sessionId (expected a Modron session uuid)"));
+                            }
+                        }
+                    }
                     "session/new" => {
                         let _ = session_new_cwd(&message["params"]);
                         let acp_session = uuid::Uuid::new_v4().to_string();
@@ -484,6 +521,18 @@ mod tests {
         .unwrap();
         assert_eq!(text, "fix the\nbug");
         assert!(prompt_text(&json!({"prompt": []})).is_none());
+    }
+
+    #[test]
+    fn load_session_parses_and_advertises() {
+        let result = route_initialize(&json!({}));
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
+        assert_eq!(load_session_result("abc"), json!({"sessionId": "abc"}));
+        assert_eq!(
+            session_load_id(&json!({"sessionId": "abc"})),
+            Some("abc".into())
+        );
+        assert_eq!(session_load_id(&json!({})), None);
     }
 
     #[test]

@@ -222,13 +222,13 @@ impl Tool for DelegateTool {
                 let mut brief = report.brief;
                 if isolate {
                     brief = format!(
-                        "{brief}\n\n(worktree: {} — results are NOT merged; review and merge explicitly)",
+                        "{brief}\n(worktree: {} — results are NOT merged; review and merge explicitly)",
                         child_working_dir.display()
                     );
                 }
                 let body = reduce_output(
                     format!(
-                        "{}\n\n(delegate: {} tok, {} turns)",
+                        "{}\n(delegate: {} tok, {} turns)",
                         brief,
                         report.usage.total(),
                         report.turns
@@ -525,5 +525,259 @@ mod phase5i_tests {
             .unwrap();
         assert!(outcome.is_error);
         assert!(outcome.content.contains("worktree isolation failed"));
+    }
+}
+/// `merge_worktree` (Phase 6f): merge an isolated delegate's git worktree
+/// back into the current branch with a merge commit. Conflicts abort with
+/// an actionable error — review-first; the agent never force-resolves.
+pub struct MergeWorktreeTool;
+
+impl Default for MergeWorktreeTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for MergeWorktreeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "merge_worktree".to_string(),
+            description: "Merge an isolated delegate's worktree (path from a delegate result) \
+                          back into the current branch. Conflicts abort with an error — resolve \
+                          them yourself; never force."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "The worktree directory to merge."},
+                    "message": {"type": "string", "description": "Optional merge commit message."}
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> modron_core::Result<ToolOutcome> {
+        let spec = self.spec();
+        if let Err(message) = validate_args(&spec, &args) {
+            return Ok(tool_err(
+                NAME,
+                format!("invalid arguments: {message}"),
+                MAX_BYTES,
+            ));
+        }
+        let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+            return Ok(tool_err(NAME, "missing `path`", MAX_BYTES));
+        };
+        // The worktree must live under the repo's .modron/worktrees —
+        // merging arbitrary paths is not this tool's contract.
+        let canonical =
+            std::path::Path::new(path)
+                .canonicalize()
+                .map_err(|e| modron_core::Error::Tool {
+                    tool: NAME.into(),
+                    message: format!("worktree path unreadable: {e}"),
+                })?;
+        let allowed_root = ctx
+            .working_dir
+            .join(".modron")
+            .join("worktrees")
+            .canonicalize()
+            .unwrap_or_else(|_| ctx.working_dir.join(".modron").join("worktrees"));
+        if !canonical.starts_with(&allowed_root) {
+            return Ok(tool_err(
+                NAME,
+                "path is not under .modron/worktrees — only isolated delegate worktrees can be merged",
+                MAX_BYTES,
+            ));
+        }
+
+        // Commit any uncommitted work in the worktree first (the delegate
+        // may not have committed), then merge its HEAD.
+        async fn run_in(
+            dir: &std::path::Path,
+            args: &[&str],
+        ) -> std::io::Result<std::process::Output> {
+            tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+        }
+        let status = run_in(&canonical, &["status", "--porcelain"])
+            .await
+            .map_err(internal_err)?;
+        if !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+            let add = run_in(&canonical, &["add", "-A"])
+                .await
+                .map_err(internal_err)?;
+            if !add.status.success() {
+                return Ok(tool_err(NAME, "cannot stage worktree changes", MAX_BYTES));
+            }
+            let commit = run_in(&canonical, &["commit", "-qm", "delegate work"]).await;
+            if let Ok(c) = &commit {
+                if !c.status.success()
+                    && !String::from_utf8_lossy(&c.stdout).contains("nothing to commit")
+                {
+                    return Ok(tool_err(NAME, "cannot commit worktree changes", MAX_BYTES));
+                }
+            }
+        }
+        let head = run_in(&canonical, &["rev-parse", "HEAD"])
+            .await
+            .map_err(internal_err)?;
+        if !head.status.success() {
+            return Ok(tool_err(NAME, "worktree has no commits", MAX_BYTES));
+        }
+        let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("merge delegated work ({sha:.8})"));
+        let merge = run_in(
+            &ctx.working_dir,
+            &["merge", "--no-ff", "-m", &message, &sha],
+        )
+        .await
+        .map_err(internal_err)?;
+        if !merge.status.success() {
+            // Abort the in-progress conflicted merge, then report.
+            let _ = run_in(&ctx.working_dir, &["merge", "--abort"]).await;
+            return Ok(tool_err(
+                NAME,
+                format!(
+                    "merge conflicted and was aborted — resolve manually: {}",
+                    String::from_utf8_lossy(&merge.stdout).trim()
+                ),
+                MAX_BYTES,
+            ));
+        }
+        Ok(ToolOutcome::ok(format!(
+            "merged {sha:.8} into the current branch ({})",
+            ctx.working_dir.display()
+        )))
+    }
+}
+
+fn internal_err(e: std::io::Error) -> modron_core::Error {
+    modron_core::Error::Tool {
+        tool: "merge_worktree".into(),
+        message: e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use modron_core::Tool as _;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn repo_with_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "user.email", "t@t"]);
+        git(dir.path(), &["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("base.txt"), "base").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-qm", "init"]);
+        // The worktree an isolated delegate would have created.
+        let wt = dir
+            .path()
+            .join(".modron")
+            .join("worktrees")
+            .join("abc12345");
+        git(dir.path(), &["worktree", "add", wt.to_str().unwrap()]);
+        // Uncommitted delegate work inside it.
+        std::fs::write(wt.join("feature.txt"), "delegated").unwrap();
+        (dir, wt)
+    }
+
+    #[tokio::test]
+    async fn merges_delegated_work_with_commit() {
+        let (dir, wt) = repo_with_worktree();
+        let ctx = ToolCtx::new(dir.path());
+        let out = MergeWorktreeTool
+            .execute(
+                serde_json::json!({"path": wt.to_str().unwrap(), "message": "merge feat"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{out:?}");
+        assert!(
+            dir.path().join("feature.txt").exists(),
+            "file landed in main tree"
+        );
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline", "-1"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&log.stdout).contains("merge feat"),
+            "merge commit exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_paths_outside_worktrees() {
+        let (dir, _wt) = repo_with_worktree();
+        let outside = dir.path().join("..");
+        let ctx = ToolCtx::new(dir.path());
+        let out = MergeWorktreeTool
+            .execute(serde_json::json!({"path": outside.to_str().unwrap()}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("not under .modron/worktrees"));
+    }
+
+    #[tokio::test]
+    async fn conflict_aborts_review_first() {
+        let (dir, wt) = repo_with_worktree();
+        // Diverge: main and worktree both change base.txt differently.
+        std::fs::write(dir.path().join("base.txt"), "main-change").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-qm", "main change"]);
+        std::fs::write(wt.join("base.txt"), "delegate-change").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "delegate change"]);
+
+        let ctx = ToolCtx::new(dir.path());
+        let out = MergeWorktreeTool
+            .execute(serde_json::json!({"path": wt.to_str().unwrap()}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error, "conflict must fail the tool");
+        assert!(out.content.contains("conflicted"), "{}", out.content);
+        // Repo is left clean (merge aborted), not mid-conflict.
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&status.stdout).contains("UU"),
+            "no unresolved conflict state left behind"
+        );
     }
 }

@@ -757,6 +757,7 @@ fn build_agent_with(
     // on demand — the tool only registers when the repo HAS skills.
     registry.register(Arc::new(modron_tools::ExploreTool));
     registry.register(Arc::new(modron_tools::DelegateStatusTool));
+    registry.register(Arc::new(modron_tools::MergeWorktreeTool));
     if !modron_core::context::load_skills_index(&working_dir).is_empty() {
         registry.register(Arc::new(modron_tools::SkillTool::for_working_dir(
             &working_dir,
