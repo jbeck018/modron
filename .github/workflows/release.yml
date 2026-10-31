@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # install.sh expects modron-<arch>-<os>.tar.gz archives containing
+          # a single `modron` binary — keep names in sync with install.sh.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_os: unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_os: apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (modron-<arch>-<os>.tar.gz with a `modron` binary)
+        run: |
+          mkdir -p stage
+          cp "target/${{ matrix.target }}/release/modron" stage/modron
+          ARCHIVE="modron-${{ matrix.target }}.tar.gz"
+          tar -czf "$ARCHIVE" -C stage modron
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+      - name: Create release and upload archive
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE }}
+          generate_release_notes: true
