@@ -101,13 +101,16 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
-    /// Run the fixed benchmark suite through the engine and report
-    /// tokens/turns/duration per task (offline with mock; real baselines
-    /// with a live provider).
+    /// Run the fixed benchmark suite across a curated list of models and
+    /// report tokens/turns/duration/cost per model (the OpenCode-style
+    /// comparison; the default list is Z.ai's free tier).
     Bench {
-        /// Show only the N most recent sessions.
-        #[arg(long, default_value = "default")]
-        suite: String,
+        /// Comma-separated model list (default: the curated free tier).
+        #[arg(long)]
+        models: Option<String>,
+        /// Skip the suite and just print the curated free-model list.
+        #[arg(long)]
+        list: bool,
     },
     /// Inspect and forget persistent workspace memory (no silent state).
     Memory {
@@ -319,9 +322,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return run_mcp_info(&cfg, name).await;
     }
 
-    // `modron bench` — fixed-suite measurement (Phase 5e).
-    if let Some(Command::Bench { .. }) = cli.command {
-        return run_bench(&cli, &cfg).await;
+    // `modron bench` — multi-model measurement (Phase 5f).
+    if let Some(Command::Bench { models, list }) = cli.command.clone() {
+        return run_bench(&cli, &cfg, models.as_deref(), list).await;
     }
 
     // `modron chat` — interactive multi-turn REPL (Phase-1c I3).
@@ -922,10 +925,16 @@ async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// The fixed benchmark suite (Phase 5e): task strings that exercise
-/// read-only work, mutation, and multi-step flows. Deterministic and
-/// provider-agnostic — with the mock provider it is a harness smoke; with a
-/// live provider it produces the cost-per-task baselines PLAN tracks.
+/// The curated FREE model list (Phase 5f, OpenCode-style comparison):
+/// models verified to complete without balance on the user's provider.
+/// Z.ai's flash tier is free; extend here (or pass --models) as more
+/// free tiers get verified.
+pub fn curated_free_models() -> Vec<&'static str> {
+    vec!["glm-4.7-flash", "glm-4.5-flash"]
+}
+
+/// The fixed benchmark suite (Phase 5e): read-only work, mutation, and
+/// multi-step flows. Deterministic and provider-agnostic.
 pub fn bench_suite() -> Vec<&'static str> {
     vec![
         "list the rust files in this repo",
@@ -937,68 +946,195 @@ pub fn bench_suite() -> Vec<&'static str> {
     ]
 }
 
-/// `modron bench` (Phase 5e): run the suite, measure tokens/turns/duration
-/// per task, print the table + totals. Completion = non-empty answer with no
-/// provider error (quality scoring is a live-key phase item).
-async fn run_bench(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
-    let mcp = spawn_mcp_servers(cfg).await?;
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let _ = interactive; // bench runs non-interactive policies via flags
+/// One completed benchmark task.
+#[derive(serde::Serialize)]
+struct BenchRecord {
+    provider: String,
+    model: String,
+    task: String,
+    completed: bool,
+    turns: u32,
+    tool_calls: u32,
+    tokens: u64,
+    cached_tokens: u64,
+    duration_ms: u128,
+}
+
+/// `modron bench` (Phase 5f): run the suite across a model list, print the
+/// per-model comparison, and persist every task record to
+/// `~/.modron/bench/<timestamp>.jsonl` — the accumulating baseline file
+/// PLAN's cost tracking reads from.
+async fn run_bench(
+    cli: &Cli,
+    cfg: &config::Config,
+    models_arg: Option<&str>,
+    list: bool,
+) -> anyhow::Result<()> {
+    if list {
+        for model in curated_free_models() {
+            println!("{model}");
+        }
+        return Ok(());
+    }
+    let models: Vec<String> = match models_arg {
+        Some(csv) => csv.split(',').map(str::trim).map(String::from).collect(),
+        None => curated_free_models()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    };
     let suite = bench_suite();
+    let mcp = spawn_mcp_servers(cfg).await?;
     println!(
-        "bench: {} tasks, provider {}, model {}",
+        "bench: {} tasks × {} models, provider {}{}",
         suite.len(),
-        cli.provider.map(|p| p.id()).unwrap_or("default"),
-        cfg.default_model
-            .clone()
-            .unwrap_or_else(|| "(selector default)".into())
+        models.len(),
+        cli.provider.map(|p| p.id()).unwrap_or("zai (default)"),
+        if mcp.is_empty() {
+            String::new()
+        } else {
+            format!(", {} mcp servers", mcp.len())
+        }
     );
 
-    let mut results: Vec<(String, bool, u32, u32, u64, u128)> = Vec::new();
-    for task in &suite {
+    let mut all_records: Vec<BenchRecord> = Vec::new();
+    let mut per_model: Vec<(String, usize, u64, u128)> = Vec::new();
+
+    for model in &models {
+        let mut model_cli = cli.clone();
+        model_cli.model = Some(model.clone());
         let started = std::time::Instant::now();
-        let agent = build_agent_with(cli, cfg, false, AgentSinks::for_mode(false, false), &mcp)?;
-        let outcome = agent.engine.run_task(task).await;
-        let duration = started.elapsed().as_millis();
-        match outcome {
-            Ok(summary) => {
-                let completed = !summary.answer.is_empty();
-                println!(
-                    "{:<3} {:<58} {:>4} tok {:>3} turns {:>6} ms",
-                    if completed { "✓" } else { "✗" },
-                    short(task, 58),
-                    summary.usage.total(),
-                    summary.turns,
-                    duration
-                );
-                results.push((
-                    task.to_string(),
-                    completed,
-                    summary.turns,
-                    summary.tool_calls,
-                    summary.usage.total(),
-                    duration,
-                ));
+        let mut completed = 0usize;
+        let mut tokens = 0u64;
+        let mut cached = 0u64;
+
+        for task in &suite {
+            let task_started = std::time::Instant::now();
+            let agent = build_agent_with(
+                &model_cli,
+                cfg,
+                false,
+                AgentSinks::for_mode(false, false),
+                &mcp,
+            )?;
+            let record = match agent.engine.run_task(task).await {
+                Ok(summary) => {
+                    let task_ok = !summary.answer.is_empty();
+                    if task_ok {
+                        completed += 1;
+                    }
+                    tokens += summary.usage.total();
+                    cached += summary.usage.cached_input_tokens;
+                    BenchRecord {
+                        provider: "zai".into(),
+                        model: model.clone(),
+                        task: task.to_string(),
+                        completed: task_ok,
+                        turns: summary.turns,
+                        tool_calls: summary.tool_calls,
+                        tokens: summary.usage.total(),
+                        cached_tokens: summary.usage.cached_input_tokens,
+                        duration_ms: task_started.elapsed().as_millis(),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("✗ [{model}] {task}: {e}");
+                    BenchRecord {
+                        provider: "zai".into(),
+                        model: model.clone(),
+                        task: task.to_string(),
+                        completed: false,
+                        turns: 0,
+                        tool_calls: 0,
+                        tokens: 0,
+                        cached_tokens: 0,
+                        duration_ms: task_started.elapsed().as_millis(),
+                    }
+                }
+            };
+            println!(
+                "{:<3} [{:<18}] {:<50} {:>7} tok {:>4} turns {:>6} ms",
+                if record.completed { "✓" } else { "✗" },
+                model,
+                short(task, 50),
+                record.tokens,
+                record.turns,
+                record.duration_ms
+            );
+            if record.completed {
+                completed += 0; // counted above
             }
-            Err(e) => {
-                println!("✗ {task:<58} ERROR: {e}");
-                results.push((task.to_string(), false, 0, 0, 0, duration));
-            }
+            all_records.push(record);
         }
+        per_model.push((
+            model.clone(),
+            completed,
+            tokens,
+            started.elapsed().as_millis(),
+        ));
+        let _ = cached;
     }
 
-    let passed = results.iter().filter(|(_, ok, ..)| *ok).count();
-    let total_tokens: u64 = results.iter().map(|(.., tok, _)| *tok).sum();
-    let total_ms: u128 = results.iter().map(|(.., ms)| *ms).sum();
+    println!("\n=== comparison (est. cost from catalog) ===");
     println!(
-        "total: {}/{} completed, {total_tokens} tok, {total_ms} ms",
-        passed,
-        results.len()
+        "{:<20} {:>9} {:>12} {:>12} {:>10} {:>10}",
+        "model", "completed", "tokens/task", "ms/task", "cache %", "est. cost"
     );
+    for (model, completed, tokens, ms) in &per_model {
+        let tasks = suite.len() as f64;
+        let price = modron_router::lookup(model)
+            .map(|i| (i.input_per_m, i.output_per_m))
+            .unwrap_or((0.0, 0.0));
+        let tokens_per_task = *tokens as f64 / tasks;
+        let cost_per_task =
+            tokens_per_task / 1e6 * price.0 + (tokens_per_task * 0.12) / 1e6 * price.1;
+        let cached: u64 = all_records
+            .iter()
+            .filter(|r| &r.model == model)
+            .map(|r| r.cached_tokens)
+            .sum();
+        let total_input: u64 = all_records
+            .iter()
+            .filter(|r| &r.model == model)
+            .map(|r| r.tokens)
+            .sum();
+        let cache_pct = if total_input > 0 {
+            format!("{:.0}%", 100.0 * cached as f64 / total_input as f64)
+        } else {
+            "n/a".into()
+        };
+        println!(
+            "{:<20} {:>9} {:>12.0} {:>12.0} {:>10} {:>10.4}",
+            model,
+            format!("{completed}/{}", suite.len()),
+            tokens_per_task,
+            *ms as f64 / tasks,
+            cache_pct,
+            cost_per_task * tasks
+        );
+    }
+
+    // Persist the baseline (PLAN: measured, never claimed).
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join(".modron").join("bench");
+        let _ = std::fs::create_dir_all(&dir);
+        let stamp = chrono::Utc::now().to_rfc3339().replace([':', '+'], "-");
+        let path = dir.join(format!("{stamp}.jsonl"));
+        if let Ok(file) = std::fs::File::create(&path) {
+            use std::io::Write as _;
+            let mut file = std::io::BufWriter::new(file);
+            for record in &all_records {
+                if let Ok(line) = serde_json::to_string(record) {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            println!("baseline: {}", path.display());
+        }
+    }
     Ok(())
 }
 
-/// `modron router eval` (Phase-3a R4): score the active selector against the
+/// `modron router eval` (Phase-3a R4): score the active selector against the\n/// `modron router eval` (Phase-3a R4): score the active selector against the
 /// held-out eval set; report accuracy and the catalog-priced cost delta vs.
 /// an always-strong baseline (synthetic 10k-in/1k-out task per example).
 fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {

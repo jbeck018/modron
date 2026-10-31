@@ -142,6 +142,22 @@ output_per_m = 1.25
 tier = "cheap"
 
 [[models]]
+name = "glm-4.7-flash"
+provider = "zai"
+context_window = 200000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "cheap"   # free tier, verified live 2026-10-31
+
+[[models]]
+name = "glm-4.5-flash"
+provider = "zai"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "cheap"   # free tier
+
+[[models]]
 name = "llama-3.3-70b"
 provider = "ollama"
 context_window = 128_000

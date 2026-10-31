@@ -224,8 +224,10 @@ endpoint = "http://127.0.0.1:8009"
 
 # Inspect any configured MCP server without running the agent:
 #   modron mcp info <name>       # tools + schema costs, resources, prompts
-# Measure the harness on a fixed 6-task suite:
-#   modron bench --provider mock # (real baselines with a live provider)
+# Measure the harness across the curated FREE model tier (OpenCode-style):
+#   modron bench --provider zai --approve-all
+#   modron bench --provider zai --models glm-4.7-flash,glm-4.5-flash
+# Baselines persist to ~/.modron/bench/*.jsonl
 
 # Optional: MCP servers (stdio). Tools appear as mcp__<server>__<tool>;
 # each server's schema cost is counted and capped (default 20k tokens).

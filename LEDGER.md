@@ -948,3 +948,54 @@ keys into baselines with one command.** Everything on the offline list —
 every item from every review, gap analysis, and roadmap phase — is now
 built. What remains is *signal*: a key, a browser round-trip, and real
 traffic. The next engineering session should be driven by what those reveal.
+
+---
+
+# Phase 5f — THE LIVE PHASE BEGINS (opened/closed 2026-10-31)
+
+**First live API calls in Modron's history.** The user's Z.ai key arrived;
+the smoke ran; the findings below are real-traffic signal, exactly what every
+prior phase was preparation for.
+
+## What happened
+
+1. **Smoke (glm-5.3-flash):** authenticated on both endpoints but `429 code
+   1113 — Insufficient balance or no resource package` — the account has no
+   balance and no active Coding Plan package. Our retry (3 backoffs) + honest
+   error taxonomy worked exactly as designed on a real 429.
+2. **Free tier discovered:** `glm-4.7-flash` (per PLAN research: free) ran
+   WITHOUT balance — a 5-turn, 8-tool-call repo exploration completed with
+   **105k input tokens, 63k cached (38% real cache hit)** and an accurate,
+   file-cited description of Modron's own architecture. Dogfooding achieved
+   on a $0 model. Catalog gap found honestly: unknown model → `n/a` cost, not
+   an invented price. Fixed: glm-4.7-flash + glm-4.5-flash added as free
+   tier entries.
+3. **Multi-model bench (the user's ask, OpenCode-style):** `--models` list
+   (default = curated free tier), per-task records persisted to
+   `~/.modron/bench/<ts>.jsonl`, comparison table with cache-% and cost.
+   **First real results:** glm-4.5-flash 6/6 completed (7.7k tok/task, 59%
+   cache) — including the full mutation flow (create → edit → verify);
+   glm-4.7-flash 4/6 (4.9k tok/task, 48% cache) — the 2 failures are
+   transient free-tier rate limits (reproduced task passes in isolation;
+   pacing between tasks is the fix, noted as debt).
+4. **Cost of the entire live session: $0.00** (free tier verified in
+   production; est. cost column shows the catalog's real 0.0/0.0).
+
+## Findings (real-traffic signal — the stuff offline work couldn't reveal)
+
+- Cache-aware prompt structure: CONFIRMED live (48–59% hit rates on
+  multi-turn runs).
+- Honest accounting: CONFIRMED live (provider-reported cached tokens parsed
+  correctly from Z.ai's OpenAI-compat responses; unknown models render n/a).
+- Token weights: a 5-turn repo exploration costs ~105k input on a 128k-window
+  free model — compaction thresholds and reduction aggressiveness now have
+  real numbers to tune against.
+- Free-tier rate limits: back-to-back benching needs pacing (debt: `--delay`
+  flag or adaptive backoff on 429-with-code-1113-style rate responses).
+
+| Item | Status | Evidence |
+|---|---|---|
+| Live smoke | DONE | session 6e221cc0: 5 turns, 8 tools, 38% cache, glm-4.7-flash |
+| Catalog free tier | DONE | glm-4.7-flash + glm-4.5-flash (0/0 pricing, verified) |
+| Multi-model bench | DONE | bench --provider zai: comparison table + persisted JSONL baseline |
+| V19 | DONE | **336 passed / 0 failed**, clippy clean |
