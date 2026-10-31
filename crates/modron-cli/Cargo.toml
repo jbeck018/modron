@@ -9,12 +9,12 @@ name = "modron"
 path = "src/main.rs"
 
 [dependencies]
-modron-core.workspace = true
-modron-providers.workspace = true
-modron-tools.workspace = true
-modron-store.workspace = true
-modron-router.workspace = true
-modron-tui.workspace = true
+modron-core = { path = "../modron-core", version = "0.1.0" }
+modron-providers = { path = "../modron-providers", version = "0.1.0" }
+modron-tools = { path = "../modron-tools", version = "0.1.0" }
+modron-store = { path = "../modron-store", version = "0.1.0" }
+modron-router = { path = "../modron-router", version = "0.1.0" }
+modron-tui = { path = "../modron-tui", version = "0.1.0" }
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true

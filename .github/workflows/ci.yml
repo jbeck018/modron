@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test + clippy + fmt (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests (offline — the mock provider is the acceptance harness)
+        run: cargo test --workspace
+
+  deny:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny || cargo install cargo-deny
+      - name: cargo-deny check (advisories, licenses, bans, sources)
+        run: cargo deny check
+
+  release-binary:
+    name: release binary (${{ matrix.os }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Binary size (keep it honest — PLAN §"lightweight")
+        run: ls -lh target/${{ matrix.target }}/release/modron
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modron-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/modron
