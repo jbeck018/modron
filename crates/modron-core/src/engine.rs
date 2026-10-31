@@ -335,17 +335,43 @@ impl Engine {
             let ctx = ToolCtx {
                 sandbox: self.config.sandbox,
                 working_dir: self.config.working_dir.clone(),
+                engine: Some(Arc::new(self.clone())),
             };
-            for call in &response.tool_calls {
-                if self.config.approvals.mode == ApprovalMode::ApproveAll {
-                    if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
-                        self.store.append(session_id, &checkpoint).await?;
-                    }
-                }
-                let outcome = self
-                    .execute_tool_with_hooks(session_id, call, &ctx)
+            // Phase 4: when every call in the turn is read-only, they run
+            // concurrently (order-preserving — the transcript is identical to
+            // the sequential case, only faster). Mutating calls stay
+            // sequential: checkpoints and approval gating are order-sensitive.
+            let all_read_only = response
+                .tool_calls
+                .iter()
+                .all(|c| !MUTATING_TOOLS.contains(&c.name.as_str()));
+            let outcomes: Vec<ToolOutcome> = if all_read_only && response.tool_calls.len() > 1 {
+                let futures = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| self.execute_tool_with_hooks(session_id, call, &ctx));
+                futures::future::join_all(futures)
                     .await
-                    .unwrap_or_else(|err| ToolOutcome::err(err.to_string()));
+                    .into_iter()
+                    .map(|r| r.unwrap_or_else(|err| ToolOutcome::err(err.to_string())))
+                    .collect()
+            } else {
+                let mut outcomes = Vec::with_capacity(response.tool_calls.len());
+                for call in &response.tool_calls {
+                    if self.config.approvals.mode == ApprovalMode::ApproveAll {
+                        if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
+                            self.store.append(session_id, &checkpoint).await?;
+                        }
+                    }
+                    let outcome = self
+                        .execute_tool_with_hooks(session_id, call, &ctx)
+                        .await
+                        .unwrap_or_else(|err| ToolOutcome::err(err.to_string()));
+                    outcomes.push(outcome);
+                }
+                outcomes
+            };
+            for (call, outcome) in response.tool_calls.iter().zip(&outcomes) {
                 tracing::info!(
                     tool = %call.name,
                     error = outcome.is_error,
@@ -361,7 +387,7 @@ impl Engine {
                         },
                     )
                     .await?;
-                transcript.push(Message::tool_result(call.id.clone(), &outcome));
+                transcript.push(Message::tool_result(call.id.clone(), outcome));
                 tool_calls_executed += 1;
             }
 
@@ -426,6 +452,14 @@ impl Engine {
             base
         } else {
             format!("{base}{memory_block}")
+        };
+        // Skills index (Phase 4): names + descriptions only; the model loads
+        // a body via the `skill` tool when it wants the workflow.
+        let system = match context::load_skills_index(&self.config.working_dir) {
+            index if index.is_empty() => system,
+            index => format!(
+                "{system}\n\n## Skills\n{index}\nCall the `skill` tool to load full instructions before following one."
+            ),
         };
         match &self.config.memory_root {
             Some(root) => context::with_user_memory(
@@ -592,7 +626,17 @@ impl Engine {
         };
 
         // Approval gate (A1): mutating tools never execute unless approved.
+        // Deny list: any tool, any mode, always wins.
+        if self.config.approvals.deny.iter().any(|d| d == &call.name) {
+            return ToolOutcome::err(format!(
+                "tool `{}` denied by configuration (--deny)",
+                call.name
+            ));
+        }
+        // Allow list bypasses Ask mode (deny already checked).
+        let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == &call.name);
         if MUTATING_TOOLS.contains(&call.name.as_str())
+            && !explicitly_allowed
             && self.config.approvals.mode != ApprovalMode::ApproveAll
         {
             // Ask mode with an interactive approver (Phase-1c I2): offer the

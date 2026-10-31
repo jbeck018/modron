@@ -175,6 +175,13 @@ struct Cli {
     /// otherwise (with an explanation on stderr).
     #[arg(long, global = true)]
     approve_all: bool,
+    /// Allow a tool without prompting (repeatable, e.g. --allow bash).
+    /// Deny wins over allow.
+    #[arg(long, global = true)]
+    allow: Vec<String>,
+    /// Always block a tool (repeatable, any tool class).
+    #[arg(long, global = true)]
+    deny: Vec<String>,
     /// USD spend cap for this run, enforced per turn from provider-reported
     /// usage priced by the model catalog. Models missing from the catalog
     /// count as $0 (warned once).
@@ -505,6 +512,8 @@ fn build_agent_with(
                 modron_core::ApprovalMode::Ask
             },
             non_interactive: !interactive,
+            allow: cli.allow.clone(),
+            deny: cli.deny.clone(),
         },
         max_cost_usd: cli.max_cost,
         price_lookup: Some(Arc::new(|model: &str| {
@@ -554,6 +563,14 @@ fn build_agent_with(
     let mut registry = default_registry_with_memory(&memory_root);
     if let Some(verify) = &cfg.verify {
         registry.register(Arc::new(VerifyTool::new(&verify.command)));
+    }
+    // Phase 4: read-only subagent for repo-wide questions; skills load
+    // on demand — the tool only registers when the repo HAS skills.
+    registry.register(Arc::new(modron_tools::ExploreTool));
+    if !modron_core::context::load_skills_index(&working_dir).is_empty() {
+        registry.register(Arc::new(modron_tools::SkillTool::for_working_dir(
+            &working_dir,
+        )));
     }
     let engine = Engine {
         selector: build_selector(cfg)?,

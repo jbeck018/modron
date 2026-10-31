@@ -136,6 +136,8 @@ async fn approver_allows_mutating_tool_in_ask_mode() {
             approvals: ApprovalPolicy {
                 mode: ApprovalMode::Ask,
                 non_interactive: false,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             approver: Some(always_allow()),
             ..EngineConfig::default()
@@ -171,6 +173,8 @@ async fn approver_denial_blocks_with_message() {
             approvals: ApprovalPolicy {
                 mode: ApprovalMode::Ask,
                 non_interactive: false,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             approver: Some(always_deny()),
             ..EngineConfig::default()

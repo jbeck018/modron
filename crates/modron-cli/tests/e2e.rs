@@ -75,6 +75,8 @@ fn mock_engine(
             approvals: modron_core::ApprovalPolicy {
                 mode: modron_core::ApprovalMode::ApproveAll,
                 non_interactive: true,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             ..EngineConfig::default()
         },

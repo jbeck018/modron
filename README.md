@@ -5,7 +5,7 @@ how smart the agent is; the harness decides how fast, safe, and expensive that
 intelligence is to use.** Read the founding document in [PLAN.md](PLAN.md); the live
 work ledger is [LEDGER.md](LEDGER.md).
 
-Status: **Phase 3b (decision models)** — one-shot CLI + `modron chat` REPL with
+Status: **Phase 4a (recursion + skills)** — one-shot CLI + `modron chat` REPL with
 live streaming answers, interactive approvals (Ask prompts on your terminal), agent
 engine loop, Anthropic + OpenAI-compatible + **Z.ai** providers (SSE streaming
 proven at the wire level), 6 essential tools behind an approval gate + optional
@@ -176,6 +176,12 @@ threshold_frac = 0.7
 
 [verify]                             # registers the `verify` tool: the agent runs
 command = "cargo test --quiet"       #   your checks after edits and fixes failures
+
+# Skills (SKILL.md open standard): drop a folder with SKILL.md into
+# .claude/skills/<name>/ (or .modron/skills/<name>/) — the index appears in
+# the agent's system prompt and it loads bodies via the `skill` tool.
+# Repo-wide questions can also go through the `explore` subagent tool
+# (read-only, cheap tier, its own token budget).
 
 [router]                             # model routing (learned by default)
 mode = "learned"                     # or "heuristic" (rules only)

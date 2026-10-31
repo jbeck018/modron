@@ -130,6 +130,8 @@ async fn verify_tool_runs_through_the_engine() {
             approvals: ApprovalPolicy {
                 mode: ApprovalMode::ApproveAll,
                 non_interactive: true,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             ..EngineConfig::default()
         },
@@ -164,6 +166,8 @@ async fn verify_failure_is_visible_to_the_model() {
             approvals: ApprovalPolicy {
                 mode: ApprovalMode::ApproveAll,
                 non_interactive: true,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             ..EngineConfig::default()
         },

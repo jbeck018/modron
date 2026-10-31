@@ -109,6 +109,7 @@ mod tests {
 
     async fn run(pattern: &str, dir: &tempfile::TempDir) -> ToolOutcome {
         let ctx = ToolCtx {
+            engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.path().to_path_buf(),
         };

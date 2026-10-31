@@ -114,6 +114,8 @@ async fn mutating_tool_gated_per_mode() {
             ApprovalPolicy {
                 mode,
                 non_interactive: true,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             tools,
         );
@@ -167,6 +169,8 @@ async fn read_only_tool_unaffected_by_every_mode() {
             ApprovalPolicy {
                 mode,
                 non_interactive: true,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             tools,
         );
@@ -196,6 +200,8 @@ async fn model_adapts_after_block() {
         ApprovalPolicy {
             mode: ApprovalMode::Ask,
             non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
         },
         tools,
     );
@@ -234,6 +240,8 @@ async fn resume_unaffected_by_blocks() {
         ApprovalPolicy {
             mode: ApprovalMode::Deny,
             non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
         },
         Arc::clone(&tools),
     );
@@ -259,6 +267,8 @@ async fn resume_unaffected_by_blocks() {
             approvals: ApprovalPolicy {
                 mode: ApprovalMode::ApproveAll,
                 non_interactive: true,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             ..EngineConfig::default()
         },

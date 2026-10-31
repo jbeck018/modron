@@ -13,6 +13,7 @@ anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+futures.workspace = true
 # Real dependency (not dev): hooks (H1) spawn hook processes with timeouts,
 # matching the providers-crate precedent for retry backoff.
 tokio.workspace = true

@@ -130,6 +130,8 @@ async fn approve_all_executes_mutating_tools() {
         cfg.approvals = ApprovalPolicy {
             mode: ApprovalMode::ApproveAll,
             non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
         };
     });
 
@@ -174,6 +176,8 @@ async fn seatbelt_sandbox_blocks_network_allows_workspace_writes() {
         cfg.approvals = ApprovalPolicy {
             mode: ApprovalMode::ApproveAll,
             non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
         };
         cfg.sandbox = SandboxPolicy::Seatbelt;
     });
@@ -220,6 +224,8 @@ async fn pre_tool_hook_vetoes_the_tool() {
         cfg.approvals = ApprovalPolicy {
             mode: ApprovalMode::ApproveAll,
             non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
         };
         cfg.hooks = HookConfig {
             pre_tool: Some("echo no-writes-allowed >&2; exit 1".to_string()),
@@ -269,6 +275,8 @@ async fn checkpoint_then_rewind_restores_file_and_truncates_transcript() {
         cfg.approvals = ApprovalPolicy {
             mode: ApprovalMode::ApproveAll,
             non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
         };
     });
 
@@ -308,6 +316,8 @@ async fn checkpoint_then_rewind_restores_file_and_truncates_transcript() {
             approvals: ApprovalPolicy {
                 mode: ApprovalMode::ApproveAll,
                 non_interactive: true,
+                allow: Vec::new(),
+                deny: Vec::new(),
             },
             resume_from_event: Some(outcome.truncated_at_event),
             ..EngineConfig::default()
@@ -337,6 +347,8 @@ async fn rewind_deletes_files_the_agent_created() {
         cfg.approvals = ApprovalPolicy {
             mode: ApprovalMode::ApproveAll,
             non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
         };
     });
     let summary = engine.run_task("create a file").await.unwrap();

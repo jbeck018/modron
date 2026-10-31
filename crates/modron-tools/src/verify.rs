@@ -121,6 +121,7 @@ mod tests {
             .execute(
                 serde_json::json!({}),
                 &ToolCtx {
+                    engine: None,
                     working_dir: dir.to_path_buf(),
                     sandbox: Default::default(),
                 },
@@ -176,6 +177,7 @@ mod tests {
             .execute(
                 serde_json::json!({"path": "x"}),
                 &ToolCtx {
+                    engine: None,
                     working_dir: dir.path().to_path_buf(),
                     sandbox: Default::default(),
                 },

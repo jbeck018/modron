@@ -21,22 +21,26 @@
 mod bash;
 mod common;
 mod edit;
+mod explore;
 mod glob;
 mod grep;
 mod read;
 pub mod reduce;
 mod remember;
+mod skill;
 pub mod validate;
 mod verify;
 mod write;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
+pub use explore::ExploreTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use reduce::reduce_output;
 pub use remember::RememberTool;
+pub use skill::SkillTool;
 pub use validate::validate_args;
 pub use verify::VerifyTool;
 pub use write::WriteTool;
@@ -102,6 +106,7 @@ mod tests {
         let registry = default_registry();
         let dir = tempfile::tempdir().unwrap();
         let ctx = modron_core::ToolCtx {
+            engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.path().to_path_buf(),
         };

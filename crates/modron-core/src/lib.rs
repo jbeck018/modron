@@ -21,6 +21,7 @@ pub mod judge;
 pub mod memory;
 pub mod rewind;
 pub mod sandbox;
+pub mod subagent;
 pub mod testing;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -181,6 +182,9 @@ pub struct ToolCtx {
     /// Sandbox policy the tool must honor for any subprocess it spawns
     /// (bash routes its shell through it; file tools don't spawn).
     pub sandbox: SandboxPolicy,
+    /// Handle to the running engine (Phase 4): read-only subagent tools
+    /// (`explore`) use it to spawn child agents. `None` in unit tests.
+    pub engine: Option<Arc<Engine>>,
 }
 
 impl ToolCtx {
@@ -189,6 +193,7 @@ impl ToolCtx {
         Self {
             working_dir: working_dir.into(),
             sandbox: SandboxPolicy::Off,
+            engine: None,
         }
     }
 }
@@ -526,10 +531,16 @@ pub type ToolActivitySink = dyn Fn(ToolActivity) + Send + Sync;
 /// How the engine gates mutating tools ([`ApprovalMode`]) plus the
 /// non-interactivity flag (set by the CLI so hooks/logic can tell a TTY run
 /// from a scripted one; v1: informational).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalPolicy {
     pub mode: ApprovalMode,
     pub non_interactive: bool,
+    /// Tools explicitly allowed (bypass Ask mode; Phase 4). Deny wins.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Tools always blocked, whatever the mode says (any tool class).
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// Pricing hook for USD spend caps (Phase-1b A3): given a model name, return

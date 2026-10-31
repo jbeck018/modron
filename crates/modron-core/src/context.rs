@@ -407,3 +407,87 @@ mod tests {
         );
     }
 }
+
+/// SKILL.md index (Phase 4): `- name: description` per skill found under
+/// `<dir>/.modron/skills/*/SKILL.md` and `<dir>/.claude/skills/*/SKILL.md`.
+/// The system prompt carries only this index; bodies load via the `skill`
+/// tool on demand. Byte-capped at 2KB.
+pub fn load_skills_index(working_dir: &std::path::Path) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    for root in [
+        working_dir.join(".modron").join("skills"),
+        working_dir.join(".claude").join("skills"),
+    ] {
+        let Ok(read_dir) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
+                continue;
+            };
+            let (name, description) = parse_skill_frontmatter(&text);
+            entries.push(format!(
+                "- {}: {}",
+                name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
+                description.unwrap_or_else(|| "(no description)".to_string())
+            ));
+        }
+    }
+    let mut out = entries.join("\n");
+    if out.len() > 2048 {
+        let cut: String = out.chars().take(2048).collect();
+        out = format!("{cut}…");
+    }
+    out
+}
+
+/// (name, description) from SKILL.md frontmatter.
+pub fn parse_skill_frontmatter(text: &str) -> (Option<String>, Option<String>) {
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        return (None, None);
+    }
+    let mut name = None;
+    let mut description = None;
+    for line in lines {
+        if line == "---" {
+            break;
+        }
+        if let Some(v) = line.strip_prefix("name:") {
+            name = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("description:") {
+            description = Some(v.trim().to_string());
+        }
+    }
+    (name, description)
+}
+
+#[cfg(test)]
+mod skills_tests {
+    use super::*;
+
+    #[test]
+    fn skills_index_lists_and_parses_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join(".claude").join("skills").join("deploy");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: deploy\ndescription: Ship it safely.\n---\nbody",
+        )
+        .unwrap();
+        let index = load_skills_index(dir.path());
+        assert!(index.contains("- deploy: Ship it safely."), "{index}");
+        assert_eq!(
+            parse_skill_frontmatter("---\nname: a\n---\nrest"),
+            (Some("a".into()), None)
+        );
+        assert_eq!(parse_skill_frontmatter("no frontmatter"), (None, None));
+    }
+
+    #[test]
+    fn no_skills_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_skills_index(dir.path()), "");
+    }
+}

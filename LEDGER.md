@@ -785,3 +785,43 @@ fail-open to the sync selector; all decisions logged with provenance. And the
 binary shed half its size. 303 tests, clippy clean, 3.9MB release binary on
 pinned Rust 1.99.1. Remaining offline items: subscription OAuth (Phase 3
 residual), the MCP client, the ACP server. Live items still queue on a key.
+
+---
+
+# Phase 4a — Recursion + skills (opened/closed 2026-10-31)
+
+Baseline: 303 tests, repo now under git with CI + cargo-deny. Scope: the RLM
+economy from PLAN §4.7 (explore subagents), parallel read-only dispatch,
+per-tool-class approvals, and the SKILL.md open standard.
+
+| ID | Item | Acceptance criteria | Status | Evidence |
+|---|---|---|---|---|
+| P1 | Explore subagent: read-only child engine (read/glob/grep only, cheap tier pinned via parent's Search routing, own session + token budget, explore excluded from child registry, deltas suppressed) exposed as the `explore` tool via `ToolCtx.engine` | Unit: brief + usage + budget enforcement + tier pinning; tool errors honestly without an engine handle | DONE | subagent.rs + explore.rs; 62 tools tests |
+| P2 | Parallel read-only dispatch: a turn whose calls are all non-mutating runs concurrently (futures::join_all), order-preserving; mutating turns stay sequential (checkpoints/approvals are order-sensitive) | Existing transcript-order tests green; code path guarded by all_read_only | DONE | engine.rs dispatch restructure |
+| P3 | Per-tool-class approvals: `--allow <tool>` (bypasses Ask) / `--deny <tool>` (always blocks, any class, wins over allow); ApprovalPolicy.allow/deny (additive) | Gate tests: deny-any-mode, allow-bypass — engine gate honors both | DONE | phase1b-style gate tests extended; 313 tests |
+| P4 | SKILL.md skills: index (name+description) in the system prompt via `context::load_skills_index` (2KB cap); `skill` tool loads bodies on demand (frontmatter stripped, traversal-guarded); tool registered only when the repo has skills | Unit: index parse, body load, unknown-name lists available, traversal rejected; `.claude/skills` honored for ecosystem compat | DONE | context.rs + skill.rs; e2e via budget-gate registry |
+| P5 | Gates + docs | 313 passed / 0 failed; clippy clean; fmt applied | DONE | this log |
+| P6 | DEFERRED: parallel explore at the agent level (model issues several explores in one turn — P2 already executes them concurrently when present); daemonized core + RPC mode; map/reduce over file sets | Next tranche | DEFERRED | — |
+
+## Verification log — Phase 4a (principal)
+
+- **2026-10-31 — git/CI.** Repo initialized; CI (fmt/clippy/test on
+  ubuntu+macos @ 1.99.1, cargo-deny supply-chain gate, release builds with
+  size reporting) + versioned internal deps. Push to the PERSONAL account
+  (jbeck018) pending the empty repo's creation — the first `gh repo create`
+  landed on the work account by accident and was removed from the remote;
+  the work-account copy needs a one-time browser deletion (the work token
+  lacks delete_repo, deliberately not escalated).
+- **2026-10-31 — P1–P5.** Explore subagent + parallel dispatch + allow/deny
+  + skills landed; 313 passed / 0 failed, clippy -D warnings clean.
+
+## Final verdict — Phase 4a
+
+**The recursion economy is live.** Repo-wide questions now route through a
+cheap, budgeted, read-only subagent whose brief — not its raw output — enters
+the parent context; multiple read-only calls per turn run concurrently;
+approvals are per-tool configurable; and the repo can teach the agent new
+workflows by dropping SKILL.md files into `.claude/skills/` (open-standard
+compatible). Deferred: RPC/daemon, parallel-explore orchestration at the
+planner level. Remaining offline items: MCP client, ACP server, subscription
+OAuth. Live items still queue on a Z.ai key.

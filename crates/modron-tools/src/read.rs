@@ -96,6 +96,7 @@ mod tests {
 
     async fn run(args: Value, dir: &std::path::Path) -> ToolOutcome {
         let ctx = ToolCtx {
+            engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.to_path_buf(),
         };

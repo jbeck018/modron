@@ -197,7 +197,8 @@ Usage already distinguishes `cached_input_tokens`. Now we *engineer* for it:
 | 1 — Agent (residual) | Linux sandbox port (Landlock/bubblewrap), per-tool-class approval overrides, hardening from real usage | Agent can complete a multi-file edit task with approval gates and rollback on macOS + Linux |
 | 2 — Efficiency | Compaction, cache-hit tracking, LSP diagnostics tool, token dashboard, prompt-budget CI gate | Measured cost-per-task baseline vs. Claude Code on a fixed task suite |
 | 3 — Routing | Embedder router (Avengers-Pro style), DecisionModel trait + Jev adapter, subscription OAuth, routing-decision logging | Router beats static model choice on cost at equal quality on the task suite |
-| 4 — Recursion | explore subagents, parallel spawn, daemonized core, RPC mode | Repo-wide questions answered under a fixed token budget vs. flat context |
+| **4a — Recursion** (done 2026-10-31) | explore subagents (read-only, budgeted, briefs-only into parent context), parallel read-only dispatch, per-tool allow/deny, SKILL.md skills | Repo-wide questions answered under a fixed token budget vs. flat context |
+| 4 — Recursion (residual) | daemonized core + RPC mode; planner-level parallel explore | Sessions survive terminal close; multi-explore orchestration |
 | 5 — Ecosystem | MCP client (opt-in, token-accounted), SKILL.md + AGENTS.md polish, ACP server, packaging (single static binary) | Installs via one curl; works in Zed via ACP |
 
 ## 6. Risk register
