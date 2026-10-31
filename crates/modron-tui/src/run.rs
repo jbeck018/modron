@@ -105,10 +105,22 @@ pub async fn run_with(
     // Terminal setup: inline viewport, raw mode, hidden cursor.
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    // Alternate screen is deliberately NOT used for the transcript; we enter
-    // raw mode only. (Inline viewport renders at the bottom of the normal
-    // buffer — scrollback stays native.)
+    // NO alternate screen: the normal buffer keeps native scrollback and
+    // selectable text (Claude Code's inline pattern). The earlier
+    // EnterAlternateScreen here was the black-void bug — the alt screen is
+    // an empty buffer with no history.
+    //
+    // Bottom anchoring: push the cursor to the terminal's last row before
+    // creating the inline viewport, so the input box pins to the bottom
+    // (like a chat). The padding lines scroll away as content commits.
+    {
+        use std::io::Write as _;
+        let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
+        for _ in 0..rows.saturating_sub(1) {
+            let _ = writeln!(stdout);
+        }
+        let _ = stdout.flush();
+    }
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::with_options(
         backend,
@@ -323,11 +335,6 @@ pub async fn run_with(
 
     // Teardown: flush the last status as a plain line so scrollback keeps a
     // trace of the session, restore the terminal.
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
     crossterm::terminal::disable_raw_mode()?;
     if let Some(id) = app.session_id {
         println!("session: {id} — resume with --resume {id}");
