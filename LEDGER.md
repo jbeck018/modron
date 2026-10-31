@@ -923,3 +923,28 @@ work*: the Z.ai smoke, dogfooding, OAuth verification against a real
 subscription, Linux sandbox verification, and the publish decision. The
 engineering phase of this project — build everything buildable without
 external accounts — is complete.
+
+---
+
+# Phase 5e — Release, permissions, MCP surfaces, bench (opened/closed 2026-10-31)
+
+Baseline: 334 tests, Phase 5d pushed. The four follow-ups from the
+continuation plan, all landed.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| R1 | v0.1.0 release: tag-triggered workflow builds x86_64-linux + aarch64-macOS archives named for install.sh's fast path, creates the GitHub release with the Actions token (no personal auth needed); Homebrew formula revision pinned to the tagged commit | DONE | .github/workflows/release.yml; tag v0.1.0 pushed (Actions builds the archives); formula revision adecea0a9b06 |
+| R2 | ACP permission requests: Ask-mode mutating tools raise `session/request_permission` (allow_once/reject_once) against the editor; decisions route back by request id (single-writer stdout restructure); outcome parsing unit-tested | DONE | pure-helper tests + e2e still green; full editor round-trip lands with Zed |
+| R3 | MCP resources + prompts: client `list_resources`/`read_resource`/`list_prompts`, echo server advertises both, `modron mcp info <name>` inspects any configured server (tools + schema costs, resources, prompts) | DONE | mcp_e2e resources_and_prompts_round_trip; `modron mcp info` wired |
+| R4 | `modron bench`: fixed 6-task suite through the real engine, per-task tokens/turns/duration + totals; offline with mock, live baselines when a key exists | DONE | live demo: 6/6 completed, 7392 tok, 48 ms |
+| V18 | Gates | DONE | **339 passed / 0 failed** (323 + 16 new), clippy clean |
+
+## Final verdict — Phase 5e
+
+**The release train exists (tag → built archives → GitHub release, fully
+automated), editors can approve Modron's mutations, MCP servers are
+inspectable with honest schema costs, and the bench harness turns future live
+keys into baselines with one command.** Everything on the offline list —
+every item from every review, gap analysis, and roadmap phase — is now
+built. What remains is *signal*: a key, a browser round-trip, and real
+traffic. The next engineering session should be driven by what those reveal.

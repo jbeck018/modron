@@ -58,3 +58,21 @@ async fn failing_command_is_an_actionable_error() {
         .expect("must fail");
     assert!(err.to_string().contains("failed to start"), "{err}");
 }
+
+#[tokio::test]
+async fn resources_and_prompts_round_trip() {
+    let bin = env!("CARGO_BIN_EXE_modron-mcp-echo");
+    let (handle, _tools) = McpServerHandle::spawn("echo", bin, &[], &[]).await.unwrap();
+    let mut handle = handle.lock().await;
+
+    let resources = handle.list_resources().await.unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].uri, "memo://echo/notes");
+
+    let body = handle.read_resource("memo://echo/notes").await.unwrap();
+    assert_eq!(body, "notes body");
+
+    let prompts = handle.list_prompts().await.unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].name, "greet");
+}

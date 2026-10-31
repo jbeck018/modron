@@ -95,6 +95,20 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Inspect configured MCP servers (tools with schema costs, resources,
+    /// prompts) without running the agent.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+    /// Run the fixed benchmark suite through the engine and report
+    /// tokens/turns/duration per task (offline with mock; real baselines
+    /// with a live provider).
+    Bench {
+        /// Show only the N most recent sessions.
+        #[arg(long, default_value = "default")]
+        suite: String,
+    },
     /// Inspect and forget persistent workspace memory (no silent state).
     Memory {
         #[command(subcommand)]
@@ -117,6 +131,12 @@ enum Command {
         #[arg(long)]
         last: Option<usize>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum McpAction {
+    /// Inspect one configured server by name.
+    Info { name: String },
 }
 
 #[derive(Subcommand, Clone)]
@@ -289,6 +309,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // `modron auth …` — subscription token management (Phase 5d X3).
     if let Some(Command::Auth { action }) = cli.command {
         return crate::auth::run_auth(action).await;
+    }
+
+    // `modron mcp info …` — server inspection (Phase 5e).
+    if let Some(Command::Mcp {
+        action: McpAction::Info { name },
+    }) = cli.command
+    {
+        return run_mcp_info(&cfg, name).await;
+    }
+
+    // `modron bench` — fixed-suite measurement (Phase 5e).
+    if let Some(Command::Bench { .. }) = cli.command {
+        return run_bench(&cli, &cfg).await;
     }
 
     // `modron chat` — interactive multi-turn REPL (Phase-1c I3).
@@ -832,6 +865,137 @@ fn build_selector(
             "unknown router mode `{other}` — use \"learned\" or \"heuristic\"",
         )),
     }
+}
+
+/// `modron mcp info <name>` (Phase 5e): spawn one configured server and
+/// print its tools (with schema costs), resources, and prompts.
+async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> {
+    let Some(mcp) = &cfg.mcp else {
+        anyhow::bail!("no [mcp.servers] configured");
+    };
+    let Some(server) = mcp.servers.get(&name) else {
+        let available: Vec<&str> = mcp.servers.keys().map(|s| s.as_str()).collect();
+        anyhow::bail!(
+            "unknown MCP server `{name}` — configured: {}",
+            if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available.join(", ")
+            }
+        );
+    };
+    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
+    let args = server.args.clone().unwrap_or_default();
+    let (handle, tools) =
+        modron_mcp::McpServerHandle::spawn(&name, &server.command, &args, &env).await?;
+    let mut handle = handle.lock().await;
+
+    let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
+    println!(
+        "server {name} — {} tools, {total} est. schema tokens",
+        tools.len()
+    );
+    for tool in &tools {
+        println!(
+            "  ● {:<30} {:>5} tok — {}",
+            tool.name, tool.schema_tokens, tool.description
+        );
+    }
+    match handle.list_resources().await {
+        Ok(resources) if !resources.is_empty() => {
+            println!("resources:");
+            for r in &resources {
+                println!("  {} — {}", r.uri, r.description);
+            }
+        }
+        _ => println!("resources: none"),
+    }
+    match handle.list_prompts().await {
+        Ok(prompts) if !prompts.is_empty() => {
+            println!("prompts:");
+            for p in &prompts {
+                println!("  {} — {}", p.name, p.description);
+            }
+        }
+        _ => println!("prompts: none"),
+    }
+    Ok(())
+}
+
+/// The fixed benchmark suite (Phase 5e): task strings that exercise
+/// read-only work, mutation, and multi-step flows. Deterministic and
+/// provider-agnostic — with the mock provider it is a harness smoke; with a
+/// live provider it produces the cost-per-task baselines PLAN tracks.
+pub fn bench_suite() -> Vec<&'static str> {
+    vec![
+        "list the rust files in this repo",
+        "read the first 20 lines of Cargo.toml and summarize them",
+        "create a file named bench-marker.txt containing the word ok, then read it back",
+        "find where the budget governor is implemented and report the file",
+        "edit bench-marker.txt to say done instead of ok, then verify by reading it",
+        "count how many test functions exist in crates/modron-core/src/engine.rs",
+    ]
+}
+
+/// `modron bench` (Phase 5e): run the suite, measure tokens/turns/duration
+/// per task, print the table + totals. Completion = non-empty answer with no
+/// provider error (quality scoring is a live-key phase item).
+async fn run_bench(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
+    let mcp = spawn_mcp_servers(cfg).await?;
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let _ = interactive; // bench runs non-interactive policies via flags
+    let suite = bench_suite();
+    println!(
+        "bench: {} tasks, provider {}, model {}",
+        suite.len(),
+        cli.provider.map(|p| p.id()).unwrap_or("default"),
+        cfg.default_model
+            .clone()
+            .unwrap_or_else(|| "(selector default)".into())
+    );
+
+    let mut results: Vec<(String, bool, u32, u32, u64, u128)> = Vec::new();
+    for task in &suite {
+        let started = std::time::Instant::now();
+        let agent = build_agent_with(cli, cfg, false, AgentSinks::for_mode(false, false), &mcp)?;
+        let outcome = agent.engine.run_task(task).await;
+        let duration = started.elapsed().as_millis();
+        match outcome {
+            Ok(summary) => {
+                let completed = !summary.answer.is_empty();
+                println!(
+                    "{:<3} {:<58} {:>4} tok {:>3} turns {:>6} ms",
+                    if completed { "✓" } else { "✗" },
+                    short(task, 58),
+                    summary.usage.total(),
+                    summary.turns,
+                    duration
+                );
+                results.push((
+                    task.to_string(),
+                    completed,
+                    summary.turns,
+                    summary.tool_calls,
+                    summary.usage.total(),
+                    duration,
+                ));
+            }
+            Err(e) => {
+                println!("✗ {task:<58} ERROR: {e}");
+                results.push((task.to_string(), false, 0, 0, 0, duration));
+            }
+        }
+    }
+
+    let passed = results.iter().filter(|(_, ok, ..)| *ok).count();
+    let total_tokens: u64 = results.iter().map(|(.., tok, _)| *tok).sum();
+    let total_ms: u128 = results.iter().map(|(.., ms)| *ms).sum();
+    println!(
+        "total: {}/{} completed, {total_tokens} tok, {total_ms} ms",
+        passed,
+        results.len()
+    );
+    Ok(())
 }
 
 /// `modron router eval` (Phase-3a R4): score the active selector against the

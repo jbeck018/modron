@@ -20,6 +20,7 @@ use crate::{build_agent_with, config, spawn_mcp_servers, AgentSinks, Cli};
 use modron_core::{StreamDelta, ToolActivity};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 
 /// Events from the engine/UI layer that become ACP `session/update`
@@ -85,6 +86,44 @@ pub fn tool_call_notification(
             }
         }
     })
+}
+
+/// Build a `session/request_permission` agent→client request for one tool
+/// call (Phase: ACP permission requests). Options follow the ACP vocabulary;
+/// the client answers with `{outcome: {outcome: "selected", optionId}}` or
+/// `{outcome: {outcome: "cancelled"}}`.
+pub fn permission_request(
+    session_id: &str,
+    tool_call_id: &str,
+    title: &str,
+    request_id: u64,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": session_id,
+            "toolCall": {"toolCallId": tool_call_id, "title": title},
+            "options": [
+                {"kind": "allow_once", "id": "allow", "name": "Allow"},
+                {"kind": "reject_once", "id": "deny", "name": "Deny"}
+            ]
+        }
+    })
+}
+
+/// Parse the client's outcome: true = allow.
+pub fn parse_permission_response(response: &Value) -> bool {
+    let outcome = response
+        .get("outcome")
+        .or_else(|| response.pointer("/result/outcome"));
+    match outcome {
+        Some(o) if o.get("outcome").and_then(|v| v.as_str()) == Some("selected") => {
+            o.get("optionId").and_then(|v| v.as_str()) == Some("allow")
+        }
+        _ => false,
+    }
 }
 
 /// Map an engine stop reason to the ACP stopReason vocabulary.
@@ -162,19 +201,67 @@ pub fn update_to_line(
 /// same CLI config as every other front end. ACP sessions map onto Modron
 /// sessions lazily: `session/new` returns an opaque id; the first
 /// `session/prompt` creates the Modron session, later prompts resume it.
-pub(super) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
+///
+/// Approvals: mutating tools in Ask mode raise `session/request_permission`
+/// against the editor (allow/deny once) — the safety gate survives the
+/// interface change, per PLAN §3.5.
+pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     let mcp = spawn_mcp_servers(cfg).await?;
+
+    // Single-writer stdout: every emission (responses, errors, updates,
+    // permission requests) goes through this channel in order.
+    let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+        while let Some(line) = write_rx.recv().await {
+            if stdout.write_all(line.as_bytes()).await.is_err()
+                || stdout.write_all(b"\n").await.is_err()
+                || stdout.flush().await.is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Pending permission requests: id → decision channel.
+    let pending_permissions: Arc<Mutex<HashMap<u64, mpsc::Sender<bool>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let permission_ids = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let current_acp_session: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let write_for_approver = write_tx.clone();
+    let approver_map = Arc::clone(&pending_permissions);
+    let approver_ids = Arc::clone(&permission_ids);
+    let approver_session = Arc::clone(&current_acp_session);
+
     let (update_tx, update_rx) = mpsc::channel::<AcUpdate>();
     let delta_tx = update_tx.clone();
     let tool_tx = update_tx.clone();
     let agent = Arc::new(build_agent_with(
         cli,
         cfg,
-        false, // editor-side approvals land with request_permission (next)
+        true, // the editor is the approver
         AgentSinks {
-            approver: None,
+            approver: Some(Arc::new(move |call: &modron_core::ToolCall| {
+                let request_id = approver_ids.fetch_add(1, Ordering::Relaxed);
+                let session = approver_session
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let (respond, receive) = mpsc::channel();
+                approver_map.lock().unwrap().insert(request_id, respond);
+                let request = permission_request(
+                    &session,
+                    &format!("call-{request_id}"),
+                    &format!("{} {}", call.name, short_call_summary(call)),
+                    request_id,
+                );
+                let _ = write_for_approver.send(request.to_string());
+                // Park the engine task until the editor answers.
+                tokio::task::block_in_place(|| receive.recv().unwrap_or(false))
+            })),
             on_delta: Some(Arc::new(move |d: StreamDelta| {
                 let _ = delta_tx.send(AcUpdate::Delta(d));
             })),
@@ -184,7 +271,6 @@ pub(super) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
         },
         &mcp,
     )?);
-
     // ACP session id → Modron session id (None until the first prompt ran).
     let sessions: Arc<Mutex<HashMap<String, Option<modron_core::SessionId>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -194,47 +280,61 @@ pub(super) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
         modron_core::Result<modron_core::RunSummary>,
     )>();
 
-    let stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::BufWriter::new(
-        tokio::io::stdout(),
-    )));
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdin_lines = stdin.lines();
-    let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
-    // The in-flight prompt: (acp session id, JSON-RPC request id).
     let mut pending: Option<(String, Value)> = None;
     let mut tool_call_counter: u64 = 0;
     let result: anyhow::Result<()> = Ok(());
+
+    macro_rules! send {
+        ($line:expr) => {
+            let _ = write_tx.send($line);
+        };
+    }
 
     loop {
         tokio::select! {
             line = stdin_lines.next_line() => {
                 let Some(line) = line? else { break };
                 let Some(message) = parse_message(&line) else { continue };
-                let Some(method) = message.get("method").and_then(|m| m.as_str()).map(str::to_owned) else {
-                    continue; // a response to a client-side request we did not send
-                };
                 let id = message.get("id").cloned();
+                // Responses to OUR requests (permission decisions) route by id.
+                if message.get("method").is_none() {
+                    if let Some(respond) = id
+                        .as_ref()
+                        .and_then(|v| v.as_u64())
+                        .and_then(|pid| pending_permissions.lock().unwrap().remove(&pid))
+                    {
+                        let allow = parse_permission_response(&message);
+                        let _ = respond.send(allow);
+                    }
+                    continue;
+                }
+                let Some(method) = message.get("method").and_then(|m| m.as_str()).map(str::to_owned) else {
+                    continue;
+                };
                 match method.as_str() {
                     "initialize" => {
-                        write_response(&stdout, id, route_initialize(&message["params"])).await?;
+                        send!(json_response(id, route_initialize(&message["params"])));
                     }
                     "session/new" => {
                         let _ = session_new_cwd(&message["params"]);
                         let acp_session = uuid::Uuid::new_v4().to_string();
+                        *current_acp_session.lock().unwrap() = Some(acp_session.clone());
                         sessions.lock().unwrap().insert(acp_session.clone(), None);
-                        write_response(&stdout, id, json!({"sessionId": acp_session})).await?;
+                        send!(json_response(id, json!({"sessionId": acp_session})));
                     }
                     "session/prompt" => {
                         let Some(session_id) = message.pointer("/params/sessionId").and_then(|v| v.as_str()).map(str::to_owned) else {
-                            write_error(&stdout, id, -32602, "missing sessionId").await?;
+                            send!(json_error(id, -32602, "missing sessionId"));
                             continue;
                         };
                         let Some(task) = prompt_text(&message["params"]) else {
-                            write_error(&stdout, id, -32602, "empty prompt").await?;
+                            send!(json_error(id, -32602, "empty prompt"));
                             continue;
                         };
                         if pending.is_some() {
-                            write_error(&stdout, id, -32000, "a prompt is already running").await?;
+                            send!(json_error(id, -32000, "a prompt is already running"));
                             continue;
                         }
                         pending = Some((session_id.clone(), id.clone().unwrap_or(json!(null))));
@@ -242,7 +342,7 @@ pub(super) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                         let sessions = Arc::clone(&sessions);
                         let done = done_tx.clone();
                         let sid = session_id.clone();
-                        engine_task = Some(tokio::spawn(async move {
+                        tokio::spawn(async move {
                             let modron_session =
                                 sessions.lock().unwrap().get(&sid).cloned().flatten();
                             let outcome = match modron_session {
@@ -250,17 +350,16 @@ pub(super) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                                 None => agent.engine.run_task(&task).await,
                             };
                             let _ = done.send((sid, id.unwrap_or(json!(null)), outcome));
-                        }));
+                        });
                     }
                     _ => {
                         if id.is_some() {
-                            write_error(&stdout, id, -32601, "method not found").await?;
+                            send!(json_error(id, -32601, "method not found"));
                         }
                     }
                 }
             }
             Some((session_id, request_id, outcome)) = done_rx.recv() => {
-                engine_task = None;
                 if let Some(map) = sessions.lock().unwrap().get_mut(&session_id) {
                     if map.is_none() {
                         *map = outcome.as_ref().ok().map(|s| s.session_id);
@@ -270,21 +369,16 @@ pub(super) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                 // the streamed chunks and tool calls before end_turn.
                 while let Ok(update) = update_rx.try_recv() {
                     if let Some(line) = update_to_line(&update, &session_id, &mut tool_call_counter) {
-                        let mut out = stdout.lock().await;
-                        out.write_all(line.as_bytes()).await?;
-                        out.write_all(b"\n").await?;
-                        out.flush().await?;
+                        send!(line);
                     }
                 }
                 match outcome {
                     Ok(summary) => {
-                        // Per-prompt usage lands in the transcript (the
-                        // engine already persisted it); editors see stopReason.
-                        write_response(&stdout, Some(request_id), json!({"stopReason": stop_reason_to_acp(modron_core::StopReason::EndTurn)})).await?;
+                        send!(json_response(Some(request_id), json!({"stopReason": stop_reason_to_acp(modron_core::StopReason::EndTurn)})));
                         let _ = summary;
                     }
                     Err(e) => {
-                        write_error(&stdout, Some(request_id), -32000, &e.to_string()).await?;
+                        send!(json_error(Some(request_id), -32000, &e.to_string()));
                     }
                 }
                 pending = None;
@@ -295,64 +389,36 @@ pub(super) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
         while let Ok(update) = update_rx.try_recv() {
             if let Some((session_id, _)) = pending.as_ref() {
                 if let Some(line) = update_to_line(&update, session_id, &mut tool_call_counter) {
-                    let mut out = stdout.lock().await;
-                    out.write_all(line.as_bytes()).await?;
-                    out.write_all(b"\n").await?;
-                    out.flush().await?;
+                    send!(line);
                 }
             }
-        }
-        // Pending prompt whose task already finished in the drain window.
-        if let Some((session_id, request_id)) = pending.clone() {
-            let finished = engine_task
-                .as_ref()
-                .map(|t| t.is_finished())
-                .unwrap_or(true);
-            if finished && done_rx.try_recv().is_ok() {
-                if let Some(task) = engine_task.take() {
-                    let _ = task.await;
-                }
-                write_response(&stdout, Some(request_id), json!({"stopReason": "end_turn"}))
-                    .await?;
-                pending = None;
-            }
-            let _ = session_id;
         }
     }
 
+    drop(write_tx);
+    let _ = writer.await;
     result
 }
 
-async fn write_response(
-    stdout: &Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::io::Stdout>>>,
-    id: Option<Value>,
-    result: Value,
-) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let message = json!({"jsonrpc": "2.0", "id": id.unwrap_or(json!(null)), "result": result});
-    let mut out = stdout.lock().await;
-    out.write_all(message.to_string().as_bytes()).await?;
-    out.write_all(b"\n").await?;
-    out.flush().await?;
-    Ok(())
+fn short_call_summary(call: &modron_core::ToolCall) -> String {
+    let args = call.arguments.to_string();
+    if args.chars().count() > 80 {
+        format!("{}…", args.chars().take(80).collect::<String>())
+    } else {
+        args
+    }
 }
 
-async fn write_error(
-    stdout: &Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::io::Stdout>>>,
-    id: Option<Value>,
-    code: i64,
-    message: &str,
-) -> anyhow::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let message = json!({
+fn json_response(id: Option<Value>, result: Value) -> String {
+    json!({"jsonrpc": "2.0", "id": id.unwrap_or(json!(null)), "result": result}).to_string()
+}
+
+fn json_error(id: Option<Value>, code: i64, message: &str) -> String {
+    json!({
         "jsonrpc": "2.0", "id": id.unwrap_or(json!(null)),
         "error": {"code": code, "message": message}
-    });
-    let mut out = stdout.lock().await;
-    out.write_all(message.to_string().as_bytes()).await?;
-    out.write_all(b"\n").await?;
-    out.flush().await?;
-    Ok(())
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -383,6 +449,25 @@ mod tests {
         .unwrap();
         assert_eq!(text, "fix the\nbug");
         assert!(prompt_text(&json!({"prompt": []})).is_none());
+    }
+
+    #[test]
+    fn permission_requests_and_outcomes() {
+        let request = permission_request("s1", "call-1", "bash echo hi", 42);
+        assert_eq!(request["id"], 42);
+        assert_eq!(request["method"], "session/request_permission");
+        assert_eq!(request["params"]["options"][0]["kind"], "allow_once");
+
+        assert!(parse_permission_response(&json!({
+            "outcome": {"outcome": "selected", "optionId": "allow"}
+        })));
+        assert!(!parse_permission_response(&json!({
+            "outcome": {"outcome": "selected", "optionId": "deny"}
+        })));
+        assert!(!parse_permission_response(&json!({
+            "outcome": {"outcome": "cancelled"}
+        })));
+        assert!(!parse_permission_response(&json!({})));
     }
 
     #[test]

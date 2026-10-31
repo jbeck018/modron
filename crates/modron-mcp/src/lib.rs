@@ -187,6 +187,80 @@ impl McpServerHandle {
         Ok(())
     }
 
+    /// List resources the server exposes (MCP resources surface).
+    pub async fn list_resources(&mut self) -> anyhow::Result<Vec<McpResourceInfo>> {
+        let result = self.request("resources/list", json!({})).await?;
+        let mut out = Vec::new();
+        for resource in result
+            .get("resources")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            out.push(McpResourceInfo {
+                uri: resource
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: resource
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                description: resource
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read one resource by URI (text contents only).
+    pub async fn read_resource(&mut self, uri: &str) -> anyhow::Result<String> {
+        let result = self.request("resources/read", json!({"uri": uri})).await?;
+        let mut text = String::new();
+        if let Some(contents) = result.get("contents").and_then(|c| c.as_array()) {
+            for block in contents {
+                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+        }
+        Ok(text)
+    }
+
+    /// List prompt templates the server exposes.
+    pub async fn list_prompts(&mut self) -> anyhow::Result<Vec<McpPromptInfo>> {
+        let result = self.request("prompts/list", json!({})).await?;
+        let mut out = Vec::new();
+        for prompt in result
+            .get("prompts")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            out.push(McpPromptInfo {
+                name: prompt
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                description: prompt
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Call a tool on this server.
     pub async fn call_tool(
         &mut self,
@@ -223,6 +297,21 @@ impl McpServerHandle {
             is_error,
         })
     }
+}
+
+/// One resource a server exposes.
+#[derive(Clone, Debug)]
+pub struct McpResourceInfo {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// One prompt template a server exposes.
+#[derive(Clone, Debug)]
+pub struct McpPromptInfo {
+    pub name: String,
+    pub description: String,
 }
 
 /// Result of a tools/call.

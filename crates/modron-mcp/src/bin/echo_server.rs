@@ -24,9 +24,37 @@ fn main() {
                     "jsonrpc": "2.0", "id": id,
                     "result": {
                         "protocolVersion": "2024-11-05",
-                        "capabilities": {"tools": {}},
+                        "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                         "serverInfo": {"name": "modron-mcp-echo", "version": "0.1.0"}
                     }
+                })
+            }
+            "resources/list" => {
+                let id = message.get("id").cloned().unwrap_or(json!(null));
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"resources": [{
+                        "uri": "memo://echo/notes",
+                        "name": "echo-notes",
+                        "description": "The echo server's notes."
+                    }]}
+                })
+            }
+            "resources/read" => {
+                let id = message.get("id").cloned().unwrap_or(json!(null));
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"contents": [{"uri": "memo://echo/notes", "text": "notes body"}]}
+                })
+            }
+            "prompts/list" => {
+                let id = message.get("id").cloned().unwrap_or(json!(null));
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"prompts": [{
+                        "name": "greet",
+                        "description": "A greeting prompt template."
+                    }]}
                 })
             }
             "tools/list" => {
