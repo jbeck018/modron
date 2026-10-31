@@ -1118,3 +1118,42 @@ ever deleted silently), the user opts into TTL via config or vacuumes
 explicitly with a dry-run preview, and restarting a session keeps its id and
 history while giving the model a clean context. Plus the bench no longer
 litters the target repo. 342 tests, clippy clean.
+
+---
+
+# Phase 6b — PAID: first subscription benchmark (opened/closed 2026-10-31)
+
+The user subscribed to the GLM Coding Plan (Pro, ~$80/mo) and the plan went
+live mid-session (the earlier 1113s were the plan not yet attached). First
+paid benchmark, full suite, three models:
+
+| model | completed | tokens/task | cache % | est. cost/suite |
+|---|---|---|---|---|
+| glm-5.3 | **6/6** | 5,234 | **77%** | $0.0605 (nominal — plan credits) |
+| glm-5.3-flash | **6/6** | 5,428 | **82%** | $0.0068 (nominal) |
+| glm-4.5-flash | 0/6 — `429 code 1309` "Coding Plan package has expired/unavailable" | — | — | — |
+
+## Live findings (real-traffic signal)
+
+1. **Cache design validated at production scale: 77–82% cache hit rates** on
+   multi-turn agentic runs — the Phase-1a stable-prefix work is saving ~4 of
+   every 5 input tokens from full re-billing.
+2. **The 1309 discovery**: once a Coding Plan is attached to an account, the
+   previously-free flash models can return 1309 instead of running free —
+   Z.ai appears to gate non-plan models behind the plan status. The curated
+   free list stands for plan-less accounts; plan accounts should bench the
+   plan models.
+3. **glm-5.3-flash is the efficiency pick**: ~9x cheaper per suite than
+   glm-5.3 with identical 6/6 completion. glm-5.3's edge would need quality
+   scoring (next bench iteration: add task-level verification).
+4. On a subscription, the "est. cost" column is nominal (per-token catalog
+   price); real spend burns plan credits on Z.ai's 5-hour/weekly windows —
+   Modron's usage table measures tokens; credit monitoring lives in the
+   Z.ai dashboard.
+
+## Final verdict — Phase 6b
+
+**The full loop is closed on the paid tier: real key → real agentic runs →
+real comparison table → persisted baseline.** Every subsystem shipped this
+session (cache discipline, honest accounting, bench harness, error taxonomy)
+did its job against live traffic on the first try.
