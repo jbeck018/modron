@@ -28,7 +28,7 @@ fn chat_repl_runs_multi_turn_through_one_session() {
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn modron chat");
 

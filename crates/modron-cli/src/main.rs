@@ -16,6 +16,7 @@ pub mod acp;
 pub mod auth;
 pub mod config;
 pub mod evals;
+pub mod upgrade;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use modron_core::memory::MemoryStore;
@@ -100,6 +101,8 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Upgrade the binary from the latest GitHub release.
+    Upgrade,
     /// Subscription auth (EXPERIMENTAL): manage OAuth tokens for providers
     /// that support it (currently: claude).
     Auth {
@@ -366,6 +369,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return crate::evals::run_evals(&cli, &cfg, models.as_deref(), filter.as_deref()).await;
     }
 
+    // `modron upgrade` — self-update from the latest release (Phase 6e).
+    if let Some(Command::Upgrade) = cli.command {
+        return crate::upgrade::run_upgrade().await;
+    }
+
     // `modron auth …` — subscription token management (Phase 5d X3).
     if let Some(Command::Auth { action }) = cli.command {
         return crate::auth::run_auth(action).await;
@@ -417,6 +425,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(Command::Tui) = cli.command {
         let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
         let mcp = spawn_mcp_servers(&cfg).await?;
+        let notice = modron_upgrade_notice();
         return modron_tui::run_with(
             |sinks| {
                 let agent = build_agent_with(
@@ -434,6 +443,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 (agent.engine, agent.resume)
             },
             String::new(),
+            notice,
         )
         .await
         .map_err(|err| anyhow::anyhow!("{err:#}"));
@@ -1498,6 +1508,9 @@ async fn run_chat(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     let mcp = spawn_mcp_servers(cfg).await?;
     let agent = build_agent_with(cli, cfg, true, AgentSinks::for_mode(true, true), &mcp)?;
     println!("modron chat — one session, streaming answers. /exit or Ctrl-D to quit.");
+    if let Some(tag) = crate::upgrade::startup_update_notice() {
+        println!("⬆ modron {tag} is available — run `modron upgrade`");
+    }
     let mut session_id: Option<SessionId> = None;
     let mut total = Usage::default();
     let stdin = std::io::stdin();
@@ -1554,6 +1567,12 @@ fn parse_judge_mode(mode: Option<&str>) -> anyhow::Result<modron_core::JudgeMode
             "unknown judge mode `{other}` — use \"ambiguous\" or \"always\""
         )),
     }
+}
+
+/// Startup update check (Phase 6e): cached 24h, 2s live timeout, never
+/// fails the caller.
+fn modron_upgrade_notice() -> Option<String> {
+    crate::upgrade::startup_update_notice()
 }
 
 /// Char-safe truncation for one-line UI summaries.

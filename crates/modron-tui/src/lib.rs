@@ -61,6 +61,9 @@ pub struct App {
     pub quit: bool,
     /// Braille spinner frame counter (advanced per tick).
     pub spinner_tick: u64,
+    /// Upgrade notice (Phase 6e): rendered in the status line when a newer
+    /// release exists.
+    pub upgrade_notice: Option<String>,
     /// Live subagent rows (Phase 5h): id, label, turns, tokens, last_tool.
     pub subagents: Vec<(String, String, u32, u64, Option<String>)>,
 }

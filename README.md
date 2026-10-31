@@ -22,6 +22,17 @@ curl -fsSL https://raw.githubusercontent.com/jbeck018/modron/main/install.sh | b
 cargo install --locked --git https://github.com/jbeck018/modron
 ```
 
+## Upgrade
+
+```sh
+modron upgrade
+```
+
+Checks the latest GitHub release, downloads the platform archive, verifies
+it, and swaps the binary (previous version kept as `modron.bak`). The TUI
+and chat show an upgrade notice when a newer release exists (checked at most
+once per 24h, cached in `~/.modron/update-check.json`).
+
 ## Build
 
 ```sh

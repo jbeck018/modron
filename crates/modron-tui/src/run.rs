@@ -60,6 +60,7 @@ type ToolCallLike = String;
 pub async fn run_with(
     build: impl FnOnce(TuiSinks) -> (Engine, Option<SessionId>),
     _model_label: String,
+    upgrade_notice: Option<String>,
 ) -> anyhow::Result<()> {
     use std::io::IsTerminal as _;
     if !std::io::stdout().is_terminal() {
@@ -114,6 +115,8 @@ pub async fn run_with(
     )?;
 
     let mut app = App {
+        upgrade_notice,
+
         session_id: resume_session,
         ..App::default()
     };

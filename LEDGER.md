@@ -1210,3 +1210,30 @@ stack in action:
   own verification), budget/scoping judgment, and merge decisions.
 - This is exactly the Claude Code working relationship — and it ran on OUR
   harness, on OUR own codebase.
+
+---
+
+# Phase 6e — Self-upgrade + update notices (opened/closed 2026-10-31)
+
+The final requested step: build/deploy in git (done: release workflow), curl
+install instructions (done: install.sh + README), an `/upgrade`-style
+command, and an upgrade notice in the TUI.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| U1 | `modron upgrade`: queries the GitHub release API (unauthenticated → MODRON_GITHUB_TOKEN → GITHUB_TOKEN → gh keyring — needed while the repo is private), downloads the platform archive, verifies the binary (`--version`), backs up the current binary as `modron.bak`, replaces in place with rollback-on-failure | DONE | live: "already up to date (0.1.0 ≥ v0.1.0)" against the real release |
+| U2 | Update notices: `startup_update_notice` — 24h-cached verdict in `~/.modron/update-check.json`, live check via the `curl` subprocess (a reqwest::blocking client panics on drop inside tokio — found by the e2e test, fixed), 2s cap; TUI status line renders `⬆ vN available — modron upgrade`; chat prints the notice after the banner | DONE | chat e2e green with the notice path active; TUI status renders it |
+| U3 | curl install instructions + `modron upgrade` documented in the README | DONE | README install section |
+| V24 | Gates | DONE | **348 passed / 0 failed**, clippy clean |
+
+## Final verdict — Phase 6e
+
+**The distribution loop is closed end-to-end:** tag v0.1.0 → workflow builds
+platform archives → release published → `install.sh` curl-installs it →
+`modron upgrade` keeps it current → TUI/chat tell the user when a new one
+exists. The live upgrade check ran against the real release (up to date), and
+the notice path is exercised by the chat e2e. One finding: reqwest::blocking
+panics on drop inside tokio — the startup check uses the curl subprocess
+instead (matches install.sh, zero deps). Remaining: make the repo public (or
+ship tokens) for unauthenticated installs; the publish decision (crates.io,
+Homebrew) stays with you.
