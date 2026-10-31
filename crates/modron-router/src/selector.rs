@@ -51,6 +51,23 @@ impl HeuristicSelector {
         self.overrides = overrides;
         self
     }
+
+    /// Force EVERY action onto one model (agent personas, competitive
+    /// review A1): applied after per-action overrides, before tier rules.
+    pub fn with_forced_model(mut self, model: Option<String>) -> Self {
+        if let Some(model) = model {
+            for action in [
+                ActionKind::Chat,
+                ActionKind::Search,
+                ActionKind::Summarize,
+                ActionKind::Plan,
+                ActionKind::Edit,
+            ] {
+                self.overrides.insert(action, model.clone());
+            }
+        }
+        self
+    }
 }
 
 impl Default for HeuristicSelector {

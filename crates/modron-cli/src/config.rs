@@ -55,6 +55,23 @@ pub struct Config {
     /// as `mcp__<server>__<tool>`, with per-server schema token accounting.
     #[serde(default)]
     pub mcp: Option<McpConfig>,
+    /// Named agent personas (competitive review A1): tailored system prompt,
+    /// forced model, tool allow/deny. Selected with `--agent <name>`.
+    #[serde(default)]
+    pub agents: Option<std::collections::BTreeMap<String, AgentPersona>>,
+}
+
+/// `[agents.<name>]` — a Kilo-style custom mode.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct AgentPersona {
+    /// Replaces the assembled system prompt entirely when set.
+    pub system: Option<String>,
+    /// Force every routing decision onto this model.
+    pub model: Option<String>,
+    /// Extra tool allow list (merged with --allow).
+    pub allow: Option<Vec<String>>,
+    /// Extra tool deny list (merged with --deny; wins).
+    pub deny: Option<Vec<String>>,
 }
 
 /// `[mcp]` section (Phase 5a).

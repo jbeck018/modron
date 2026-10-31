@@ -175,6 +175,10 @@ struct Cli {
     /// otherwise (with an explanation on stderr).
     #[arg(long, global = true)]
     approve_all: bool,
+    /// Run as a named persona from [agents] in config (system prompt, forced
+    /// model, tool lists).
+    #[arg(long, global = true)]
+    agent: Option<String>,
     /// Allow a tool without prompting (repeatable, e.g. --allow bash).
     /// Deny wins over allow.
     #[arg(long, global = true)]
@@ -485,9 +489,31 @@ fn build_agent_with(
             None
         };
 
+    let persona = cli
+        .agent
+        .as_ref()
+        .map(|name| {
+            let agents = cfg.agents.clone().unwrap_or_default();
+            agents.get(name).cloned().ok_or_else(|| {
+                let available: Vec<&str> = agents.keys().map(|s| s.as_str()).collect();
+                anyhow::anyhow!(
+                    "unknown agent `{name}` — configured agents: {}",
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                )
+            })
+        })
+        .transpose()?;
+
     let engine_config = EngineConfig {
         working_dir: working_dir.clone(),
-        system: String::new(),
+        system: persona
+            .as_ref()
+            .and_then(|p| p.system.clone())
+            .unwrap_or_default(),
         default_provider: provider_id.clone(),
         default_model: model.clone(),
         max_turns: cli.max_turns.unwrap_or(engine_defaults.max_turns),
@@ -501,15 +527,22 @@ fn build_agent_with(
             .unwrap_or(engine_defaults.max_total_tokens),
         compaction,
         memory_root: Some(memory_root.clone()),
-        approvals: modron_core::ApprovalPolicy {
-            mode: if cli.approve_all {
-                modron_core::ApprovalMode::ApproveAll
-            } else {
-                modron_core::ApprovalMode::Ask
-            },
-            non_interactive: !interactive,
-            allow: cli.allow.clone(),
-            deny: cli.deny.clone(),
+        approvals: {
+            let mut approvals = modron_core::ApprovalPolicy {
+                mode: if cli.approve_all {
+                    modron_core::ApprovalMode::ApproveAll
+                } else {
+                    modron_core::ApprovalMode::Ask
+                },
+                non_interactive: !interactive,
+                allow: cli.allow.clone(),
+                deny: cli.deny.clone(),
+            };
+            if let Some(p) = persona.as_ref() {
+                approvals.allow.extend(p.allow.clone().unwrap_or_default());
+                approvals.deny.extend(p.deny.clone().unwrap_or_default());
+            }
+            approvals
         },
         max_cost_usd: cli.max_cost,
         price_lookup: Some(Arc::new(|model: &str| {
@@ -576,7 +609,7 @@ fn build_agent_with(
         )));
     }
     let engine = Engine {
-        selector: build_selector(cfg)?,
+        selector: build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()))?,
         providers,
         tools: Arc::new(registry),
         store: Arc::clone(&store) as Arc<dyn SessionStore>,
@@ -697,7 +730,10 @@ async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegist
 /// Default mode is `learned` (corpus centroids + heuristic fallback — the
 /// fallback preserves budget/overflow rules, so learned is a strict
 /// refinement of the rules).
-fn build_selector(cfg: &config::Config) -> anyhow::Result<Arc<dyn modron_core::ModelSelector>> {
+fn build_selector(
+    cfg: &config::Config,
+    persona_model: Option<String>,
+) -> anyhow::Result<Arc<dyn modron_core::ModelSelector>> {
     use modron_router::{learned::LearnedRouter, HeuristicSelector};
     let router_cfg = cfg.router.clone().unwrap_or_default();
     let cheap = router_cfg
@@ -734,7 +770,8 @@ fn build_selector(cfg: &config::Config) -> anyhow::Result<Arc<dyn modron_core::M
         (cheap.clone(), provider_of(&cheap)),
         (strong.clone(), provider_of(&strong)),
     )
-    .with_overrides(overrides);
+    .with_overrides(overrides)
+    .with_forced_model(persona_model);
     match router_cfg.mode.as_deref() {
         None | Some("learned") => Ok(Arc::new(LearnedRouter::new(heuristic))),
         Some("heuristic") => Ok(Arc::new(heuristic)),
@@ -749,7 +786,7 @@ fn build_selector(cfg: &config::Config) -> anyhow::Result<Arc<dyn modron_core::M
 /// an always-strong baseline (synthetic 10k-in/1k-out task per example).
 fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
     use modron_router::learned::run_eval;
-    let selector = build_selector(cfg)?;
+    let selector = build_selector(cfg, None)?;
     let cases = run_eval(selector.as_ref());
     let router_cfg = cfg.router.clone().unwrap_or_default();
     let cheap = router_cfg

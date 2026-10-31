@@ -37,6 +37,21 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        // Protected instruction sources (Phase: competitive review A3) —
+        // the agent must not edit the files that instruct it. bash remains
+        // the documented escape hatch (and is approval-gated).
+        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+            if is_protected_path(path) {
+                return Ok(tool_err(
+                    NAME,
+                    format!(
+                        "`{path}` is write-protected (instruction/memory source); \
+                             edit it yourself outside the agent"
+                    ),
+                    MAX_BYTES,
+                ));
+            }
+        }
         const NAME: &str = "edit";
         let spec = self.spec();
         if let Err(message) = validate_args(&spec, &args) {
@@ -110,6 +125,22 @@ impl Tool for EditTool {
             MAX_BYTES,
         )))
     }
+}
+
+/// Files the agent may not modify: instruction and memory sources.
+fn is_protected_path(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if name == "AGENTS.md" || name == "CLAUDE.md" {
+        return true;
+    }
+    p.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s == ".modron" || s == ".claude" || s == ".git"
+    })
 }
 
 #[cfg(test)]

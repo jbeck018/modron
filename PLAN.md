@@ -226,7 +226,44 @@ Usage already distinguishes `cached_input_tokens`. Now we *engineer* for it:
   should be driven *through Modron itself* (the harness building the harness) — an
   explicit goal, not a hard requirement. Keep the harness able to run on its own repo.
 
-## 8. Companion document
+## 8. Competitive review — Kilo (2026-10-31)
+
+[Kilo](https://kilo.ai) (Anaconda-owned; ex Kilo Code/Cline lineage) is the
+closest high-momentum comparable: IDE extensions (VS Code/JetBrains/Cursor/
+Windsurf), CLI 1.0 (Feb 2026), desktop app beta, Cloud, Slack, mobile; 500+
+models at zero markup, BYOK + local models. Feature snapshot vs Modron:
+
+**Modron ahead (defend):**
+- Token efficiency as *enforced engineering*: prompt-budget CI gate, MCP
+  schema caps (Kilo's MCP has no budget discipline), measured usage/cache-hit
+  dashboards, autocompaction with a measured ≤1.5× cheapness gate.
+- Learned routing (corpus centroids + LLM judge + Kev/Jev SystemOne, with an
+  offline eval harness) — Kilo routes by user-picked model per mode.
+- Safety: OS sandbox (Seatbelt), USD spend caps, approval allow/deny, hooks,
+  checkpoints + rewind; single 4.1MB Rust binary, ms startup.
+
+**Kilo ahead (adopt):**
+1. **Custom agent personas** ("custom modes"): user-defined agents with
+   tailored prompts + tool restrictions. → Adopt as `[agents.<name>]` config
+   (system prompt + allow/deny + router override), `--agent <name>`. Cheap:
+   composes existing EngineConfig pieces. **Backlog A1.**
+2. **General delegation** (post-orchestrator pattern): large tasks split into
+   subtasks run in isolated contexts by named agents. → Extend the explore
+   subagent into a `delegate` tool (persona + budget + tool restrictions).
+   **Backlog A2.**
+3. **Write-protected memory**: Kilo protects AGENTS.md from its own agent.
+   → Make write/edit refuse AGENTS.md/CLAUDE.md/.modron/* by default.
+   **Backlog A3.**
+4. **Surface breadth** (IDE/desktop/cloud/mobile): we will not chase this.
+   Our answer is terminal-first + the planned ACP server (Zed) — one protocol
+   instead of six GUI codebases.
+
+**Marketplace posture:** Kilo ships a curated Skills/Agents/Plugins gallery.
+Modron consumes the SKILL.md open standard already — run a compatibility pass
+against popular community skills instead of building a marketplace.
+**Backlog A4** (verification, not construction).
+
+## 9. Companion document
 
 `LEDGER.md` — the live work ledger. Single writer: the lead architect.
 Workers report; the lead verifies against acceptance criteria and records evidence.

@@ -177,6 +177,13 @@ threshold_frac = 0.7
 [verify]                             # registers the `verify` tool: the agent runs
 command = "cargo test --quiet"       #   your checks after edits and fixes failures
 
+# Agent personas (Kilo-style custom modes): tailored prompt, forced model,
+# tool permissions. Select with --agent debug.
+[agents.debug]
+system = "You are a debugging specialist. Reproduce first, then fix, then verify."
+model = "glm-5.3"
+deny = ["write", "edit"]
+
 # Skills (SKILL.md open standard): drop a folder with SKILL.md into
 # .claude/skills/<name>/ (or .modron/skills/<name>/) — the index appears in
 # the agent's system prompt and it loads bodies via the `skill` tool.

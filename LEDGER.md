@@ -850,3 +850,27 @@ connect and enforced against a per-server cap; transport/handshake failures
 are actionable build errors, not silent skips. The echo server ships as a
 working example of the transport. Remaining offline items: ACP server
 (Zed), subscription OAuth. Live: the Z.ai smoke + dogfooding.
+
+---
+
+# Phase 5b — Kilo review adoption (opened/closed 2026-10-31)
+
+Competitive review recorded in PLAN §8 (Kilo = Anaconda-owned multi-surface
+agent: IDE extensions, CLI 1.0, desktop beta, cloud; 500+ models at zero
+markup). Four adoptable gaps identified; two landed immediately.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| A1 | Agent personas: `[agents.<name>]` (system prompt / forced model / allow+deny merge) + `--agent <name>` with actionable unknown-agent errors; `HeuristicSelector::with_forced_model` pins every action | DONE | 317 tests; build path wired through persona resolution |
+| A3 | Write-protected instruction sources: write/edit refuse AGENTS.md, CLAUDE.md, .modron/**, .claude/** (Kilo-parity safety; bash remains the documented, approval-gated escape hatch) | DONE | protection tests in write.rs; edit.rs guard |
+| A2 | General `delegate` tool (persona + budget + tool restrictions on an isolated child engine; explore becomes the read-only special case) | DEFERRED | next tranche |
+| A4 | Community SKILL.md gallery compatibility pass | DEFERRED | verification, not construction |
+
+## Final verdict — Phase 5b
+
+**The two cheap Kilo adoptions are in.** Personas give Modron the
+custom-modes pattern (a debug persona, a reviewer persona — each with its own
+prompt, model, and tool permissions) composed entirely from existing
+mechanisms; and the agent can no longer edit the files that instruct it.
+Defended differentiators (token-budget enforcement, learned routing, safety
+stack, 4.1MB binary) remain the strategy. 317 tests, clippy clean, pushed.
