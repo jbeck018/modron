@@ -37,7 +37,10 @@ pub struct TuiConfig {
     pub model_label: String,
 }
 
-const VIEWPORT_HEIGHT: u16 = 8;
+/// Minimum live-region height (input box 3 + status 1 + breathing room).
+const VIEWPORT_MIN: u16 = 5;
+/// Cap for the live region — the terminal's native scrollback owns the rest.
+const VIEWPORT_MAX: u16 = 24;
 const TICK: Duration = Duration::from_millis(50);
 
 /// Shared approval slot: the engine-side approver queues a call; the render
@@ -59,7 +62,7 @@ type ToolCallLike = String;
 /// returns an actionable error otherwise.
 pub async fn run_with(
     build: impl FnOnce(TuiSinks) -> (Engine, Option<SessionId>),
-    _model_label: String,
+    model_label: String,
     upgrade_notice: Option<String>,
 ) -> anyhow::Result<()> {
     use std::io::IsTerminal as _;
@@ -110,9 +113,48 @@ pub async fn run_with(
     let mut terminal = ratatui::Terminal::with_options(
         backend,
         ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(VIEWPORT_HEIGHT),
+            viewport: ratatui::Viewport::Inline(VIEWPORT_MIN),
         },
     )?;
+
+    // Welcome banner (Phase 6g): the TUI opens onto content, not a void.
+    {
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        let welcome: Vec<Line<'static>> = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("✦ ", Style::default().fg(crate::ACCENT)),
+                Span::styled(
+                    "modron",
+                    Style::default()
+                        .fg(crate::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" v{}", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(crate::DIM),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "  a token-efficient Rust coding agent",
+                Style::default().fg(crate::DIM),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  model ", Style::default().fg(crate::DIM)),
+                Span::styled(model_label.clone(), Style::default()),
+                Span::styled(
+                    "  ·  enter send · esc interrupt · ctrl+o detail",
+                    Style::default().fg(crate::DIM),
+                ),
+            ]),
+            Line::from(""),
+        ];
+        for line in &welcome {
+            let _ = commit(&mut terminal, line);
+        }
+    }
 
     let mut app = App {
         upgrade_notice,
@@ -122,6 +164,7 @@ pub async fn run_with(
     };
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut last_viewport_height: u16 = VIEWPORT_MIN;
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
 
@@ -251,6 +294,29 @@ pub async fn run_with(
         }
 
         // 6. Render the live region; advance the spinner.
+        // Reactive viewport (Phase 6g): grows with content, shrinks idle.
+        let term_size = terminal.size()?;
+        let streaming_h = if app.streaming.is_empty() {
+            0
+        } else {
+            (term_size.height / 3).clamp(3, 12)
+        };
+        let desired = 3
+            + 1
+            + app.subagents.len() as u16
+            + streaming_h
+            + u16::from(app.pending_approval.is_some());
+        let new_height = desired.clamp(VIEWPORT_MIN, term_size.height.min(VIEWPORT_MAX));
+        if new_height != last_viewport_height {
+            let _ = terminal.resize(ratatui::layout::Rect::new(
+                0,
+                0,
+                term_size.width,
+                new_height,
+            ));
+            last_viewport_height = new_height;
+        }
+
         app.spinner_tick += 1;
         terminal.draw(|frame| app.view(frame, frame.area()))?;
     }

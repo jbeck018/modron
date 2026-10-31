@@ -218,14 +218,14 @@ fn finish_turn_flushes_tools_and_answer_and_updates_totals() {
 #[test]
 fn streaming_tail_is_bounded_and_wraps_manually() {
     let text = "x".repeat(1000);
-    let tail = modron_tui::streaming_tail(&text, 5);
+    let tail = modron_tui::streaming_tail(&text, 5, 110);
     assert_eq!(tail.len(), 5, "window bounded");
     for line in &tail {
         assert!(line.width() <= 110, "manual wrap keeps lines short");
     }
     // Multi-byte safety: emoji do not split.
     let emoji = "🦀".repeat(300);
-    let tail = modron_tui::streaming_tail(&emoji, 3);
+    let tail = modron_tui::streaming_tail(&emoji, 3, 110);
     assert_eq!(tail.len(), 3);
 }
 

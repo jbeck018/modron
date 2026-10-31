@@ -393,7 +393,11 @@ impl App {
 
         let mut idx = 0;
         if !self.streaming.is_empty() {
-            let tail = streaming_tail(&self.streaming, chunks[idx].height as usize);
+            let tail = streaming_tail(
+                &self.streaming,
+                chunks[idx].height as usize,
+                chunks[idx].width as usize,
+            );
             frame.render_widget(Paragraph::new(tail), chunks[idx]);
             idx += 1;
         }
@@ -539,15 +543,15 @@ impl App {
 /// Last `max_lines` lines of streamed text, each hard-wrapped to `width`
 /// chars (manual wrapping: ratatui's Paragraph wrap inside an inline
 /// viewport is a known misbehavior source — see LEDGER Phase 1d).
-pub fn streaming_tail(text: &str, max_lines: usize) -> Vec<Line<'static>> {
-    const WIDTH: usize = 110;
+pub fn streaming_tail(text: &str, max_lines: usize, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(20); // floor for pathological cases
     let mut wrapped: Vec<String> = Vec::new();
     for line in text.lines() {
         let chars: Vec<char> = line.chars().collect();
-        if chars.len() <= WIDTH {
+        if chars.len() <= width {
             wrapped.push(line.to_string());
         } else {
-            for chunk in chars.chunks(WIDTH) {
+            for chunk in chars.chunks(width) {
                 wrapped.push(chunk.iter().collect());
             }
         }
