@@ -197,7 +197,10 @@ deny = ["write", "edit"]
 # and permissions — with the child's token spend folded into the parent's
 # budget and usage reporting. MULTIPLE delegate calls in one turn run in
 # PARALLEL, with live per-agent rows in the TUI (persona, turn, tokens, last
-# tool) — the Claude Code fan-out pattern.
+# tool) — the Claude Code fan-out pattern. The model can also run delegates
+# in the BACKGROUND ({"background": true} — check with delegate_status) and
+# in git-worktree ISOLATION ({"isolate": true} — results reported, never
+# auto-merged).
 
 # Skills (SKILL.md open standard): drop a folder with SKILL.md into
 # .claude/skills/<name>/ (or .modron/skills/<name>/) — the index appears in
