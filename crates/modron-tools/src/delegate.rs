@@ -675,7 +675,6 @@ fn internal_err(e: std::io::Error) -> modron_core::Error {
 #[cfg(test)]
 mod merge_tests {
     use super::*;
-    use modron_core::Tool as _;
 
     fn git(dir: &std::path::Path, args: &[&str]) {
         let out = std::process::Command::new("git")
