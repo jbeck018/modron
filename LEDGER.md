@@ -937,7 +937,7 @@ continuation plan, all landed.
 | R2 | ACP permission requests: Ask-mode mutating tools raise `session/request_permission` (allow_once/reject_once) against the editor; decisions route back by request id (single-writer stdout restructure); outcome parsing unit-tested | DONE | pure-helper tests + e2e still green; full editor round-trip lands with Zed |
 | R3 | MCP resources + prompts: client `list_resources`/`read_resource`/`list_prompts`, echo server advertises both, `modron mcp info <name>` inspects any configured server (tools + schema costs, resources, prompts) | DONE | mcp_e2e resources_and_prompts_round_trip; `modron mcp info` wired |
 | R4 | `modron bench`: fixed 6-task suite through the real engine, per-task tokens/turns/duration + totals; offline with mock, live baselines when a key exists | DONE | live demo: 6/6 completed, 7392 tok, 48 ms |
-| V18 | Gates | DONE | **339 passed / 0 failed** (323 + 16 new), clippy clean |
+| V18 | Gates | DONE | **336 passed / 0 failed** (fmt-normalized final count), clippy clean |
 
 ## Final verdict — Phase 5e
 
