@@ -68,6 +68,8 @@ pub struct AgentPersona {
     pub system: Option<String>,
     /// Force every routing decision onto this model.
     pub model: Option<String>,
+    /// Provider for the forced model (default: catalog lookup of `model`).
+    pub provider: Option<String>,
     /// Extra tool allow list (merged with --allow).
     pub allow: Option<Vec<String>>,
     /// Extra tool deny list (merged with --deny; wins).

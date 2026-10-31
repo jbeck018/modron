@@ -217,3 +217,107 @@ mod tests {
         assert!(outcome.content.contains("invalid skill name"));
     }
 }
+
+/// A4 — gallery compatibility: real community skills carry extra
+/// frontmatter (license, allowed-tools, nested metadata), come from
+/// `.modron/skills` too, and occasionally have no frontmatter at all. The
+/// parser must tolerate all of it without inventing data.
+#[cfg(test)]
+mod gallery_compat_tests {
+    use super::*;
+
+    fn gallery_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // Anthropic-style: extra top-level keys.
+        let anthropic = dir.path().join(".claude").join("skills").join("pdf");
+        std::fs::create_dir_all(&anthropic).unwrap();
+        std::fs::write(
+            anthropic.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Process PDFs: extraction, merging, generation.\nlicense: MIT\nallowed-tools: Read, Bash\nmetadata:\n  author: anthropic\n  version: 1.0\n---\nUse pypdf for extraction...\n",
+        )
+        .unwrap();
+        // .modron location parity + nested YAML in frontmatter.
+        let modron = dir.path().join(".modron").join("skills").join("deploy");
+        std::fs::create_dir_all(&modron).unwrap();
+        std::fs::write(
+            modron.join("SKILL.md"),
+            "---\nname: deploy\ndescription: Ship safely.\nmetadata:\n  owner: platform\n  tier: 1\n---\nRun the checklist...\n",
+        )
+        .unwrap();
+        // No frontmatter: filename becomes the name, whole text is the body.
+        let bare = dir.path().join(".claude").join("skills").join("scratch");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("SKILL.md"), "Just do the thing.\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn extra_and_nested_frontmatter_keys_are_tolerated() {
+        let dir = gallery_dir();
+        let tool = SkillTool::for_working_dir(dir.path());
+        let index = tool.index();
+        assert!(index.contains("- pdf: Process PDFs"), "{index}");
+        assert!(index.contains("- deploy: Ship safely."), "{index}");
+        assert!(
+            index.contains("- scratch:"),
+            "no-frontmatter skill falls back to its folder name: {index}"
+        );
+        assert!(
+            !index.contains("anthropic"),
+            "metadata authors must not leak into the name: {index}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bodies_load_from_both_roots_with_frontmatter_stripped() {
+        let dir = gallery_dir();
+        let tool = SkillTool::for_working_dir(dir.path());
+        let pdf = tool
+            .execute(serde_json::json!({"name": "pdf"}), &ToolCtx::new("."))
+            .await
+            .unwrap();
+        assert!(pdf.content.contains("pypdf"));
+        assert!(
+            !pdf.content.contains("allowed-tools"),
+            "frontmatter stripped"
+        );
+
+        let deploy = tool
+            .execute(serde_json::json!({"name": "deploy"}), &ToolCtx::new("."))
+            .await
+            .unwrap();
+        assert!(
+            deploy.content.contains("checklist"),
+            ".modron/skills root works"
+        );
+    }
+
+    #[test]
+    fn long_descriptions_are_capped_in_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            let skill = dir
+                .path()
+                .join(".claude")
+                .join("skills")
+                .join(format!("skill{i}"));
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!(
+                    "---\nname: skill{i}\ndescription: {}\n---\nbody",
+                    "x".repeat(500)
+                ),
+            )
+            .unwrap();
+        }
+        let tool = SkillTool::for_working_dir(dir.path());
+        let index = tool.index();
+        assert!(index.ends_with("…"), "index capped with an elision marker");
+        assert!(
+            index.len() < 2200,
+            "index stays near the 2KB budget: {}",
+            index.len()
+        );
+    }
+}

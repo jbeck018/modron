@@ -20,6 +20,7 @@
 
 mod bash;
 mod common;
+mod delegate;
 mod edit;
 mod explore;
 mod glob;
@@ -33,6 +34,7 @@ mod verify;
 mod write;
 
 pub use bash::BashTool;
+pub use delegate::DelegateTool;
 pub use edit::EditTool;
 pub use explore::ExploreTool;
 pub use glob::GlobTool;
@@ -101,7 +103,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_dispatch_rejects_bad_args_as_error_outcome() {
-        // T3 acceptance: bad args -> ToolOutcome { is_error: true } with a
+        // T3 acceptance: bad args -> an error ToolOutcome with a
         // helpful message, through the registry.
         let registry = default_registry();
         let dir = tempfile::tempdir().unwrap();

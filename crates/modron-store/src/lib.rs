@@ -212,6 +212,7 @@ mod tests {
                 outcome: ToolOutcome {
                     content: "42".into(),
                     is_error: false,
+                    usage: None,
                 },
             },
             SessionEvent::Usage {

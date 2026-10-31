@@ -874,3 +874,25 @@ prompt, model, and tool permissions) composed entirely from existing
 mechanisms; and the agent can no longer edit the files that instruct it.
 Defended differentiators (token-budget enforcement, learned routing, safety
 stack, 4.1MB binary) remain the strategy. 317 tests, clippy clean, pushed.
+
+---
+
+# Phase 5c — Kilo findings baked (opened/closed 2026-10-31)
+
+Baseline: 317 tests. A1/A3 landed last phase; this closes A2 and A4.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| A2 | General `delegate` tool: isolated child engine (own session/budget), named personas from `[agents.*]` (system prompt, forced (model, provider) via ForcedSelector, approval lists), optional tool filter, `delegate` excluded from child registries (no recursion); unknown persona errors listing configured agents; **honest accounting: `ToolOutcome.usage` (additive) lets subagent spend flow into the parent's budget governor and usage events as `subagent (tool)`** | DONE | core subagent.rs (ForcedSelector + delegate), tools/delegate.rs, engine folds usage; e2e: child spend (1200 tok) recorded + folded into parent totals (1830 = 220+1200+410); 65 tools tests |
+| A4 | SKILL.md gallery compatibility: Anthropic-style extra frontmatter (license/allowed-tools/nested metadata) tolerated, `.modron/skills` + `.claude/skills` roots, no-frontmatter fallback to folder name, 2KB index cap with elision | DONE | gallery_compat_tests (3 tests) |
+| V17 | Gates | DONE | **323 passed / 0 failed**, clippy -D warnings clean, fmt applied |
+
+## Final verdict — Phase 5c
+
+**All four Kilo findings are now baked.** The delegation pattern is complete:
+`delegate` composes personas, budgets, tool restrictions, and isolated
+contexts — and, critically, delegated spend flows into the parent's budget
+governor and usage tables, so the orchestrator pattern cannot silently
+overspend. Skills are gallery-compatible. Deferred remains: ACP server,
+subscription OAuth, ONNX embedder, daemonized RPC — plus the live queue on a
+Z.ai key.

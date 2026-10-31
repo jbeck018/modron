@@ -89,6 +89,7 @@ impl Tool for ExploreTool {
                 Ok(ToolOutcome {
                     content: body,
                     is_error: report.brief.is_empty(),
+                    usage: Some(report.usage),
                 })
             }
             Err(e) => Err(internal_tool_error(NAME, e.to_string())),

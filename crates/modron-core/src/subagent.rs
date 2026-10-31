@@ -52,6 +52,48 @@ impl ModelSelector for ExploreSelector {
     }
 }
 
+/// A selector that pins one (model, provider) pair on top of another
+/// selector (persona-forced routing, Phase 5c A2).
+#[derive(Clone)]
+pub struct ForcedSelector {
+    inner: Arc<dyn ModelSelector>,
+    model: String,
+    provider: String,
+}
+
+impl std::fmt::Debug for ForcedSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForcedSelector")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+impl ForcedSelector {
+    pub fn new(
+        inner: Arc<dyn ModelSelector>,
+        model: impl Into<String>,
+        provider: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            model: model.into(),
+            provider: provider.into(),
+        }
+    }
+}
+
+impl ModelSelector for ForcedSelector {
+    fn select(&self, req: &SelectRequest) -> ModelChoice {
+        let mut choice = self.inner.select(req);
+        choice.model = self.model.clone();
+        choice.provider = self.provider.clone();
+        choice.reason = format!("persona: forced model {} — {}", self.model, choice.reason);
+        choice.confident = true;
+        choice
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExploreReport {
     pub brief: String,
@@ -59,36 +101,81 @@ pub struct ExploreReport {
     pub turns: u32,
 }
 
-/// Run one explore subagent.
+/// Run one explore subagent (read-only, cheap tier, no persona).
 pub async fn explore(parent: &Engine, task: &str, budget_tokens: u64) -> Result<ExploreReport> {
+    delegate(
+        parent,
+        task,
+        None,
+        Some(&EXPLORE_TOOLS.map(str::to_string)),
+        budget_tokens,
+    )
+    .await
+}
+
+/// Run a delegated subagent (Phase 5c A2): isolated context, its own budget
+/// and session, optionally shaped by a named persona (system prompt, forced
+/// model, approval lists) and a tool filter. Without a persona it inherits
+/// the parent's selector and full registry — the orchestrator pattern's
+/// "subtask in an isolated context". `delegate` itself is always excluded
+/// from the child registry: no recursive spawning.
+pub async fn delegate(
+    parent: &Engine,
+    task: &str,
+    persona: Option<&crate::PersonaSpec>,
+    tool_filter: Option<&[String]>,
+    budget_tokens: u64,
+) -> Result<ExploreReport> {
     if task.trim().is_empty() {
         return Err(Error::Config(
-            "empty explore task".into(),
-            "pass a question".into(),
+            "empty delegate task".into(),
+            "pass a task".into(),
         ));
     }
 
-    // Read-only registry: intersect the parent's tools with EXPLORE_TOOLS.
     let mut registry = ToolRegistry::new();
-    for name in EXPLORE_TOOLS {
-        if let Some(tool) = parent.tools.get(name) {
-            registry.register(Arc::clone(tool));
+    for spec in parent.tools.specs() {
+        if spec.name == "delegate" {
+            continue;
+        }
+        let allowed = match tool_filter {
+            Some(filter) => filter.iter().any(|f| f == &spec.name),
+            None => true,
+        };
+        if allowed {
+            if let Some(tool) = parent.tools.get(&spec.name) {
+                registry.register(Arc::clone(tool));
+            }
         }
     }
 
-    let selector = ExploreSelector::from_parent(parent, task);
+    let selector: Arc<dyn ModelSelector> = match persona {
+        Some(p) if p.model.is_some() => Arc::new(ForcedSelector::new(
+            Arc::clone(&parent.selector),
+            p.model.clone().unwrap_or_default(),
+            p.provider.clone().unwrap_or_default(),
+        )),
+        _ => Arc::clone(&parent.selector),
+    };
+
     let config = EngineConfig {
         working_dir: parent.config.working_dir.clone(),
-        system: crate::context::build_system_prompt(&registry.specs(), ""),
+        system: persona.and_then(|p| p.system.clone()).unwrap_or_default(),
         default_model: String::new(),
         default_provider: String::new(),
-        max_turns: 12,
+        max_turns: 24,
         max_input_tokens: parent.config.max_input_tokens,
         max_total_tokens: budget_tokens,
+        approvals: crate::ApprovalPolicy {
+            mode: parent.config.approvals.mode,
+            non_interactive: parent.config.approvals.non_interactive,
+            allow: persona.map(|p| p.allow.clone()).unwrap_or_default(),
+            deny: persona.map(|p| p.deny.clone()).unwrap_or_default(),
+        },
         ..EngineConfig::default()
     };
     let child = Engine {
-        selector: Arc::new(selector),
+        selector,
         providers: parent.providers.clone(),
         tools: Arc::new(registry),
         store: Arc::clone(&parent.store),

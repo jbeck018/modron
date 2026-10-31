@@ -378,6 +378,25 @@ impl Engine {
                     result_bytes = outcome.content.len(),
                     "tool done"
                 );
+                // Delegated spend (Phase 5c A2): usage spent behind a tool's
+                // interface joins the governor and the run totals — honest
+                // accounting to the token.
+                if let Some(usage) = outcome.usage {
+                    governor.feed_turn(usage);
+                    spend_usd += self.turn_cost_usd(&model, &usage);
+                    total.input_tokens += usage.input_tokens;
+                    total.output_tokens += usage.output_tokens;
+                    total.cached_input_tokens += usage.cached_input_tokens;
+                    self.store
+                        .append(
+                            session_id,
+                            &SessionEvent::Usage {
+                                model: format!("subagent ({})", call.name),
+                                usage,
+                            },
+                        )
+                        .await?;
+                }
                 self.store
                     .append(
                         session_id,

@@ -143,6 +143,11 @@ pub struct ToolSpec {
 pub struct ToolOutcome {
     pub content: String,
     pub is_error: bool,
+    /// Usage spent BEHIND the tool's interface (Phase 5c A2: subagent
+    /// delegates, explore). The engine folds this into the budget governor
+    /// and usage events so delegated work never escapes honest accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 impl ToolOutcome {
@@ -150,12 +155,14 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: false,
+            usage: None,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
+            usage: None,
         }
     }
 }
@@ -427,6 +434,22 @@ pub enum JudgeMode {
     Always,
 }
 
+/// A named agent persona (Phase 5c A2): reusable delegate configuration.
+/// The CLI resolves `provider` from the model catalog at parse time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
 /// Async decision-model seam (Phase-3b M0): consulted by the engine AFTER
 /// the sync selector. Implementations: an LLM judge over any
 /// OpenAI-compatible provider, and the Kev/Jev SystemOne client — both in
@@ -605,6 +628,10 @@ pub struct EngineConfig {
     /// Async decision model (Phase-3b M0, additive): consulted per the
     /// JudgeMode when set. `None` = sync routing only.
     pub async_router: Option<(Arc<dyn AsyncRouter>, JudgeMode)>,
+    /// Named personas available to the `delegate` tool (Phase 5c A2,
+    /// additive). The CLI fills these from `[agents.*]` with catalog-resolved
+    /// providers.
+    pub personas: std::collections::BTreeMap<String, PersonaSpec>,
 }
 
 impl Default for EngineConfig {
@@ -629,6 +656,7 @@ impl Default for EngineConfig {
             on_delta: None,
             on_tool_event: None,
             async_router: None,
+            personas: Default::default(),
         }
     }
 }
@@ -656,6 +684,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("on_delta", &self.on_delta.is_some())
             .field("on_tool_event", &self.on_tool_event.is_some())
             .field("async_router", &self.async_router.is_some())
+            .field("personas", &self.personas.keys().collect::<Vec<_>>())
             .finish()
     }
 }

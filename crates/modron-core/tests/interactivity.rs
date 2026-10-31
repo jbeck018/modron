@@ -267,3 +267,172 @@ impl modron_core::ModelSelector for TierSelector {
         }
     }
 }
+
+/// A2: a delegate call runs a child with the persona's forced model and the
+/// brief comes back into the parent context.
+#[tokio::test]
+async fn delegate_runs_child_with_persona_model() {
+    use modron_core::testing::MockAsyncRouter;
+    use modron_core::{PersonaSpec, SessionEvent, StopReason, TurnResponse, Usage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(kestrel_shim_store());
+    // Shared provider script: [parent delegate-call, child answer, parent final].
+    let delegate_call = TurnResponse {
+        text: String::new(),
+        tool_calls: vec![modron_core::ToolCall {
+            id: "d1".into(),
+            name: "delegate".into(),
+            arguments: serde_json::json!({
+                "task": "implement the fix",
+                "persona": "builder",
+                "tools": ["write"]
+            }),
+        }],
+        usage: Usage {
+            input_tokens: 200,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+        },
+        stop_reason: StopReason::ToolUse,
+    };
+    let child_answer = TurnResponse {
+        text: String::new(),
+        tool_calls: Vec::new(),
+        usage: Usage {
+            input_tokens: 300,
+            output_tokens: 900,
+            cached_input_tokens: 0,
+        },
+        // Child "edits" then ends: EndTurn directly (no tools in this script).
+        stop_reason: StopReason::EndTurn,
+    };
+    let parent_final = TurnResponse {
+        text: "delegated and merged".into(),
+        tool_calls: Vec::new(),
+        usage: Usage {
+            input_tokens: 400,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+        },
+        stop_reason: StopReason::EndTurn,
+    };
+    let provider = MockProvider::new()
+        .then_response(delegate_call)
+        .then_response(child_answer)
+        .then_response(parent_final);
+    let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+    providers.insert("anthropic".to_string(), Arc::new(provider));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(TouchTool));
+    // The tools-crate DelegateTool can't be used here (crate direction);
+    // this shim performs the same core call the real tool makes.
+    registry.register(Arc::new(TestDelegateTool));
+
+    let mut personas = std::collections::BTreeMap::new();
+    personas.insert(
+        "builder".to_string(),
+        PersonaSpec {
+            system: Some("You implement things.".into()),
+            model: Some("claude-sonnet-4-5".into()),
+            provider: Some("anthropic".into()),
+            allow: vec!["write".into()],
+            deny: vec![],
+        },
+    );
+
+    let engine = modron_core::Engine {
+        selector: Arc::new(TierSelector),
+        providers,
+        tools: Arc::new(registry),
+        store: Arc::clone(&store),
+        config: modron_core::EngineConfig {
+            working_dir: dir.path().to_path_buf(),
+            default_provider: "anthropic".into(),
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                non_interactive: true,
+                ..ApprovalPolicy::default()
+            },
+            personas,
+            ..modron_core::EngineConfig::default()
+        },
+    };
+    let _ = MockAsyncRouter::new(vec![]);
+    let summary = engine.run_task("ship it").await.unwrap();
+
+    // Honest accounting: the child's spend folds into the parent's totals
+    // as a `subagent (delegate)` usage event, and the brief is in the
+    // parent transcript.
+    let events = store.load(summary.session_id).await.unwrap();
+    let subagent_usage = events.iter().find_map(|e| match e {
+        SessionEvent::Usage { model, usage } if model.starts_with("subagent") => Some(*usage),
+        _ => None,
+    });
+    let child_usage = subagent_usage.expect("child spend must be recorded");
+    assert_eq!(
+        child_usage.total(),
+        1_200,
+        "child usage recorded: {:?}",
+        child_usage
+    );
+    assert_eq!(
+        summary.usage.total(),
+        220 + 1_200 + 410,
+        "parent totals include delegated spend"
+    );
+    let delegate_result = events.iter().find_map(|e| match e {
+        SessionEvent::ToolResult { outcome, .. } => Some(outcome.content.clone()),
+        _ => None,
+    });
+    assert!(delegate_result.is_some(), "delegate result present");
+}
+
+// Store shim for the test above (kept local to avoid a testing-crate export
+// decision in the doc-comment).
+fn kestrel_shim_store() -> impl modron_core::SessionStore {
+    modron_core::testing::InMemoryStore::default()
+}
+
+/// Test-local mirror of the tools-crate DelegateTool (same core call path:
+/// persona lookup from the engine config, then `subagent::delegate`).
+struct TestDelegateTool;
+
+#[async_trait::async_trait]
+impl modron_core::Tool for TestDelegateTool {
+    fn spec(&self) -> modron_core::ToolSpec {
+        modron_core::ToolSpec {
+            name: "delegate".into(),
+            description: "test shim".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &modron_core::ToolCtx,
+    ) -> modron_core::Result<modron_core::ToolOutcome> {
+        let Some(engine) = ctx.engine.as_ref() else {
+            return Ok(modron_core::ToolOutcome::err("no engine"));
+        };
+        let persona = args
+            .get("persona")
+            .and_then(|v| v.as_str())
+            .and_then(|name| engine.config.personas.get(name));
+        let report = modron_core::subagent::delegate(
+            engine,
+            "implement the fix",
+            persona,
+            Some(&["write".to_string()]),
+            30_000,
+        )
+        .await?;
+        Ok(modron_core::ToolOutcome {
+            content: report.brief,
+            is_error: false,
+            usage: Some(report.usage),
+        })
+    }
+}

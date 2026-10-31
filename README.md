@@ -5,7 +5,7 @@ how smart the agent is; the harness decides how fast, safe, and expensive that
 intelligence is to use.** Read the founding document in [PLAN.md](PLAN.md); the live
 work ledger is [LEDGER.md](LEDGER.md).
 
-Status: **Phase 5a (MCP client)** — one-shot CLI + `modron chat` REPL with
+Status: **Phase 5c (delegation + skills gallery compat)** — one-shot CLI + `modron chat` REPL with
 live streaming answers, interactive approvals (Ask prompts on your terminal), agent
 engine loop, Anthropic + OpenAI-compatible + **Z.ai** providers (SSE streaming
 proven at the wire level), 6 essential tools behind an approval gate + optional
@@ -183,6 +183,11 @@ command = "cargo test --quiet"       #   your checks after edits and fixes failu
 system = "You are a debugging specialist. Reproduce first, then fix, then verify."
 model = "glm-5.3"
 deny = ["write", "edit"]
+
+# Personas are also available to the agent itself via the `delegate` tool:
+# large tasks become isolated subtasks run under a persona's prompt, model,
+# and permissions — with the child's token spend folded into the parent's
+# budget and usage reporting.
 
 # Skills (SKILL.md open standard): drop a folder with SKILL.md into
 # .claude/skills/<name>/ (or .modron/skills/<name>/) — the index appears in

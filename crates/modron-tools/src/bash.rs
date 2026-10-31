@@ -99,6 +99,7 @@ impl Tool for BashTool {
                     Ok(ToolOutcome {
                         content,
                         is_error: output.status.code().is_none_or(|c| c != 0),
+                        usage: None,
                     })
                 }
                 Ok(Err(err)) => Err(internal_tool_error(NAME, err.to_string())),
@@ -154,6 +155,7 @@ impl Tool for BashTool {
                 Ok(ToolOutcome {
                     content,
                     is_error: status.code().is_none_or(|c| c != 0),
+                    usage: None,
                 })
             }
             Ok(Err(e)) => Err(internal_tool_error(NAME, format!("wait failed: {e}"))),

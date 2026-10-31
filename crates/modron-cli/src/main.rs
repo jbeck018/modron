@@ -508,7 +508,7 @@ fn build_agent_with(
         })
         .transpose()?;
 
-    let engine_config = EngineConfig {
+    let mut engine_config = EngineConfig {
         working_dir: working_dir.clone(),
         system: persona
             .as_ref()
@@ -576,6 +576,7 @@ fn build_agent_with(
         async_router,
         on_delta: sinks.on_delta,
         on_tool_event: sinks.on_tool_event,
+        personas: Default::default(),
     };
 
     if !engine_config.working_dir.is_dir() {
@@ -608,6 +609,27 @@ fn build_agent_with(
             reg.info.clone(),
         )));
     }
+    // Personas (Phase 5c A2): catalog-resolve providers so delegates can
+    // force (model, provider) pairs without a catalog dependency in core.
+    let mut personas = std::collections::BTreeMap::new();
+    for (name, p) in cfg.agents.clone().unwrap_or_default() {
+        let provider = match (p.provider.clone(), p.model.clone()) {
+            (Some(provider), _) => Some(provider),
+            (None, Some(model)) => modron_router::lookup(&model).map(|info| info.provider.clone()),
+            (None, None) => None,
+        };
+        personas.insert(
+            name,
+            modron_core::PersonaSpec {
+                system: p.system,
+                model: p.model,
+                provider,
+                allow: p.allow.unwrap_or_default(),
+                deny: p.deny.unwrap_or_default(),
+            },
+        );
+    }
+    engine_config.personas = personas;
     let engine = Engine {
         selector: build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()))?,
         providers,
