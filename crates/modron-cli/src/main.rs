@@ -15,6 +15,7 @@
 pub mod acp;
 pub mod auth;
 pub mod config;
+pub mod evals;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use modron_core::memory::MemoryStore;
@@ -89,6 +90,16 @@ enum Command {
     /// Agent Client Protocol server for editors (Zed first): JSON-RPC over
     /// stdio. Editors launch this binary themselves.
     Acp,
+    /// Mini-SWE evals: run the committed task suite through the real engine
+    /// in isolated workspaces and score with objective verifiers.
+    Eval {
+        /// Comma-separated model list (default: one run on the configured model).
+        #[arg(long)]
+        models: Option<String>,
+        /// Only run eval tasks whose id contains this substring.
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Subscription auth (EXPERIMENTAL): manage OAuth tokens for providers
     /// that support it (currently: claude).
     Auth {
@@ -343,6 +354,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // `modron acp` — editor integration (Phase 5d X1).
     if let Some(Command::Acp) = cli.command {
         return crate::acp::run_acp(&cli, &cfg).await;
+    }
+
+    // `modron eval` — mini-SWE scoring (Phase 6c).
+    if let Some(Command::Eval { models, filter }) = cli.command.clone() {
+        return crate::evals::run_evals(&cli, &cfg, models.as_deref(), filter.as_deref()).await;
     }
 
     // `modron auth …` — subscription token management (Phase 5d X3).

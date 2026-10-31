@@ -1,0 +1,56 @@
+# Modron mini-SWE suite (Phase 6c): five tasks the agent must SOLVE in a
+# fresh workspace — verified objectively by shell exit codes, not by asking
+# the model whether it succeeded. Setup runs before the agent; verify runs
+# after; exit 0 = resolved.
+
+[[task]]
+id = "hello-script"
+prompt = "Create a shell script named greet.sh in the current directory that prints exactly: hello modron"
+verify = "[ \"$(bash greet.sh)\" = \"hello modron\" ]"
+
+[[task]]
+id = "fix-failing-check"
+setup = """
+cat > calc.sh << 'INNER'
+#!/usr/bin/env bash
+echo $((2 + 2))
+INNER
+cat > check.sh << 'INNER'
+#!/usr/bin/env bash
+result="$(bash calc.sh)"
+if [ "$result" = "5" ]; then echo "check passed"; exit 0; else echo "check failed: got $result, want 5"; exit 1; fi
+INNER
+chmod +x calc.sh check.sh
+"""
+prompt = "check.sh is failing. Run it, fix calc.sh so the check passes (calc.sh must output 5), and re-run check.sh to confirm."
+verify = "./check.sh"
+
+[[task]]
+id = "count-nonempty-lines"
+setup = """
+printf 'alpha\\n\\nbeta\\n\\n\\ngamma\\n' > input.txt
+"""
+prompt = "Count the non-empty lines in input.txt and write just that number to count.txt."
+verify = "[ \"$(cat count.txt)\" = \"3\" ]"
+
+[[task]]
+id = "csv-to-json"
+setup = """
+cat > users.csv << 'INNER'
+name,role
+alice,admin
+bob,viewer
+INNER
+"""
+prompt = "Convert users.csv to users.json — a JSON array of objects with keys name and role, preserving the rows and order."
+verify = "grep -q 'alice' users.json && grep -q 'bob' users.json && grep -q 'viewer' users.json && grep -q 'admin' users.json"
+
+[[task]]
+id = "merge-configs"
+setup = """
+printf 'a=1\\n' > settings-a.txt
+printf 'c=3\\n' > settings-b.txt
+printf 'b=2\\n' > settings-c.txt
+"""
+prompt = "Merge settings-a.txt, settings-c.txt and settings-b.txt into settings.txt — one key=value line per setting, sorted alphabetically by key, nothing else in the file."
+verify = "printf 'a=1\\nb=2\\nc=3\\n' | cmp -s - settings.txt"
