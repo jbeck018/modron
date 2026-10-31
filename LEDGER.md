@@ -999,3 +999,44 @@ prior phase was preparation for.
 | Catalog free tier | DONE | glm-4.7-flash + glm-4.5-flash (0/0 pricing, verified) |
 | Multi-model bench | DONE | bench --provider zai: comparison table + persisted JSONL baseline |
 | V19 | DONE | **336 passed / 0 failed**, clippy clean |
+
+---
+
+# Phase 5g — Free-tier bench (opened/closed 2026-10-31)
+
+The user's directive: OpenCode-style benching across a curated list of FREE
+models. Research ([awesome-free-llm-apis](https://github.com/mnfst/awesome-free-llm-apis),
+[OpenRouter's free-API comparison](https://openrouter.ai/blog/tutorials/free-llm-apis-compared))
+identified seven OpenAI-compatible free tiers beyond Z.ai's: Google AI Studio
+(Gemini 2.5 Flash, 1M ctx, ~500 req/day), Groq (Llama, 14.4k req/day),
+Cerebras (fastest tokens/sec), Mistral free experiment tier (data-training
+caveat), GitHub Models (per-minute/day caps), NVIDIA NIM (~1k credits),
+OpenRouter :free (50 req/day basic).
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| F1 | Factory: seven free-tier provider ids (groq/google/cerebras/mistral/nvidia/openrouter/github-models) — each = base URL + env key, same client shape | DONE | factory.rs openai_compat_with_key; keys: GROQ_API_KEY, GEMINI_API_KEY, CEREBRAS_API_KEY, MISTRAL_API_KEY, NVIDIA_API_KEY, OPENROUTER_API_KEY, GITHUB_MODELS_TOKEN |
+| F2 | Catalog: 8 free-tier models across the new providers (tier-annotated, approximate windows); gemini-2.5-flash deduped (existed with real pricing — free-tier note added instead) | DONE | 30 router tests green |
+| F3 | Bench v2: multi-provider (per-model provider from catalog, union built, missing keys SKIP that model — not the bench), --models csv, --delay-ms pacing, persisted JSONL baselines | DONE | live run below |
+| V20 | Gates | DONE | **336 passed / 0 failed**, clippy clean |
+
+## Live results (Z.ai free tier, --delay-ms 3000)
+
+| model | completed | tokens/task | med. duration | est. cost |
+|---|---|---|---|---|
+| glm-4.5-flash | 6/6 | 9,857 | ~8.4s | $0.00 |
+| glm-4.7-flash | 6/6 | 6,854 | ~16.9s | $0.00 |
+| glm-5.3-flash | 0/6 (429 1113 — no balance, honest failures recorded) | — | — | — |
+
+**First multi-model comparison table with real data — total cost $0.00.**
+Signal: glm-4.5-flash completed every task including full mutation flows;
+glm-4.7-flash is faster per token but mixed; pacing fixed the earlier
+transient rate-limit failures (delay-ms 3000 between tasks).
+
+## Final verdict — Phase 5g
+
+**The bench now measures a curated free tier across providers, at zero cost,
+with baselines accumulating on disk.** The user adds keys (GROQ_API_KEY,
+GEMINI_API_KEY, …) and the same command grows rows. Deferred: compaction
+tuning against the model window (engine surgery), router training from bench
+JSONL (needs quality labels).

@@ -111,6 +111,10 @@ enum Command {
         /// Skip the suite and just print the curated free-model list.
         #[arg(long)]
         list: bool,
+        /// Milliseconds to sleep between tasks (free tiers rate-limit; 3000
+        /// is a good default for back-to-back free runs).
+        #[arg(long)]
+        delay_ms: Option<u64>,
     },
     /// Inspect and forget persistent workspace memory (no silent state).
     Memory {
@@ -323,8 +327,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // `modron bench` — multi-model measurement (Phase 5f).
-    if let Some(Command::Bench { models, list }) = cli.command.clone() {
-        return run_bench(&cli, &cfg, models.as_deref(), list).await;
+    if let Some(Command::Bench {
+        models,
+        list,
+        delay_ms,
+    }) = cli.command.clone()
+    {
+        return run_bench(&cli, &cfg, models.as_deref(), list, delay_ms).await;
     }
 
     // `modron chat` — interactive multi-turn REPL (Phase-1c I3).
@@ -773,6 +782,19 @@ fn stdout_delta_sink() -> Arc<modron_core::DeltaSink> {
     })
 }
 
+/// Construct one provider by id (mock/demo or env-backed), shared by the
+/// agent builder and the multi-provider bench.
+pub(crate) fn build_provider_shim(pid: &str) -> anyhow::Result<Arc<dyn ModelProvider>> {
+    Ok(match pid {
+        "mock" => Arc::new(demo_provider()),
+        other => Arc::new(RetryingProvider::new(provider_from_env(other).map_err(
+            |err| {
+                anyhow::anyhow!(err.to_string()).context(format!("cannot start provider `{other}`"))
+            },
+        )?)),
+    })
+}
+
 /// Prepared MCP registration: one tool on one live server.
 pub struct McpRegistration {
     pub server: String,
@@ -969,6 +991,7 @@ async fn run_bench(
     cfg: &config::Config,
     models_arg: Option<&str>,
     list: bool,
+    delay_ms: Option<u64>,
 ) -> anyhow::Result<()> {
     if list {
         for model in curated_free_models() {
@@ -985,6 +1008,51 @@ async fn run_bench(
     };
     let suite = bench_suite();
     let mcp = spawn_mcp_servers(cfg).await?;
+
+    // Multi-provider support: each model's provider comes from the catalog;
+    // the union of providers is built once. Free tiers all speak
+    // OpenAI-compatible HTTP (Phase 5g factory), so one client shape covers
+    // every row of the comparison table.
+    let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+    let default_provider = cli
+        .provider
+        .map(|p| p.id().to_string())
+        .or_else(|| cfg.default_provider.clone())
+        .unwrap_or_else(|| "anthropic".to_string());
+    providers.insert(
+        default_provider.clone(),
+        build_provider_shim(&default_provider)?,
+    );
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    for model in &models {
+        let provider = modron_router::lookup(model)
+            .map(|info| info.provider.clone())
+            .unwrap_or_else(|| default_provider.clone());
+        if !providers.contains_key(&provider) {
+            match build_provider_shim(&provider) {
+                Ok(provider) => {
+                    providers.insert(provider.clone().id().to_string(), provider);
+                }
+                Err(e) => {
+                    // A missing key skips that model, not the whole bench.
+                    tracing::warn!(model = %model, error = %e, "provider unavailable — skipping model");
+                    skipped.push((model.clone(), e.to_string()));
+                }
+            }
+        }
+    }
+    let models: Vec<String> = models
+        .into_iter()
+        .filter(|m| {
+            let provider = modron_router::lookup(m)
+                .map(|info| info.provider.clone())
+                .unwrap_or_else(|| default_provider.clone());
+            providers.contains_key(&provider)
+        })
+        .collect();
+    for (model, reason) in &skipped {
+        println!("✗ skipped {model}: {reason}");
+    }
     println!(
         "bench: {} tasks × {} models, provider {}{}",
         suite.len(),
@@ -1017,7 +1085,13 @@ async fn run_bench(
                 AgentSinks::for_mode(false, false),
                 &mcp,
             )?;
-            let record = match agent.engine.run_task(task).await {
+            // Re-wire the engine onto the multi-provider map (the builder
+            // only registers the run's default provider).
+            let mut engine = agent.engine;
+            for (pid, provider) in &providers {
+                engine.providers.insert(pid.clone(), Arc::clone(provider));
+            }
+            let record = match engine.run_task(task).await {
                 Ok(summary) => {
                     let task_ok = !summary.answer.is_empty();
                     if task_ok {
@@ -1065,6 +1139,9 @@ async fn run_bench(
                 completed += 0; // counted above
             }
             all_records.push(record);
+            if let Some(ms) = delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
         }
         per_model.push((
             model.clone(),

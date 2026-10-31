@@ -224,10 +224,19 @@ endpoint = "http://127.0.0.1:8009"
 
 # Inspect any configured MCP server without running the agent:
 #   modron mcp info <name>       # tools + schema costs, resources, prompts
-# Measure the harness across the curated FREE model tier (OpenCode-style):
-#   modron bench --provider zai --approve-all
-#   modron bench --provider zai --models glm-4.7-flash,glm-4.5-flash
+# Bench across the curated FREE model tier (OpenCode-style comparison):
+#   modron bench --provider zai --approve-all --delay-ms 3000
+#   modron bench --models glm-4.5-flash,gemini-2.5-flash --delay-ms 3000
 # Baselines persist to ~/.modron/bench/*.jsonl
+#
+# Free providers (add the key, the bench grows a row):
+#   GROQ_API_KEY (llama-3.1-8b-instant, llama-3.3-70b-versatile)
+#   GEMINI_API_KEY (gemini-2.5-flash, 1M context, ~500 req/day)
+#   CEREBRAS_API_KEY (qwen-3-32b, fastest tokens/sec)
+#   MISTRAL_API_KEY (mistral-small-latest; data-training caveat)
+#   GITHUB_MODELS_TOKEN (openai/gpt-4.1-mini; per-minute caps)
+#   NVIDIA_API_KEY (meta/llama-3.3-70b-instruct; ~1k credits)
+#   OPENROUTER_API_KEY (deepseek/deepseek-chat-v3-0324:free; 50 req/day)
 
 # Optional: MCP servers (stdio). Tools appear as mcp__<server>__<tool>;
 # each server's schema cost is counted and capped (default 20k tokens).

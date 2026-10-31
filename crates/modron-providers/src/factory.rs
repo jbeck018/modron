@@ -43,6 +43,25 @@ pub fn provider_from_env(provider_id: &str) -> Result<Arc<dyn ModelProvider>> {
 /// or the coding-plan endpoint; the key is always required). The scripted
 /// `"mock"` provider cannot be built from config — construct
 /// `modron_core::testing::MockProvider` and register it directly.
+/// Free-tier OpenAI-compatible providers (Phase 5g): key from `env_key`,
+/// hosted base URL by default, `base_env_key` overrides.
+fn openai_compat_with_key(
+    env: &impl Fn(&str) -> Option<String>,
+    env_key: &str,
+    default_base: &str,
+    key_hint: &str,
+    base_env_key: &str,
+) -> Result<Arc<dyn ModelProvider>> {
+    let api_key = env(env_key).ok_or_else(|| missing_key(env_key, key_hint))?;
+    let mut provider = OpenAiCompatProvider::new(api_key)?;
+    if let Some(base_url) = env(base_env_key) {
+        provider = provider.with_base_url(base_url);
+    } else {
+        provider = provider.with_base_url(default_base);
+    }
+    Ok(Arc::new(provider))
+}
+
 pub fn provider_from_config(
     provider_id: &str,
     env: impl Fn(&str) -> Option<String>,
@@ -84,6 +103,57 @@ pub fn provider_from_config(
             }
         }
         "zai" => Ok(Arc::new(zai_provider(&env)?)),
+        // Free-tier providers (Phase 5g): all OpenAI-compatible; each is a
+        // base URL + env key. See README "Free models" for rate limits.
+        "groq" => openai_compat_with_key(
+            &env,
+            "GROQ_API_KEY",
+            "https://api.groq.com/openai/v1",
+            "https://console.groq.com/keys",
+            "GROQ_BASE_URL",
+        ),
+        "google" => openai_compat_with_key(
+            &env,
+            "GEMINI_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://aistudio.google.com/apikey",
+            "GOOGLE_BASE_URL",
+        ),
+        "cerebras" => openai_compat_with_key(
+            &env,
+            "CEREBRAS_API_KEY",
+            "https://api.cerebras.ai/v1",
+            "https://cloud.cerebras.ai",
+            "CEREBRAS_BASE_URL",
+        ),
+        "mistral" => openai_compat_with_key(
+            &env,
+            "MISTRAL_API_KEY",
+            "https://api.mistral.ai/v1",
+            "https://console.mistral.ai",
+            "MISTRAL_BASE_URL",
+        ),
+        "nvidia" => openai_compat_with_key(
+            &env,
+            "NVIDIA_API_KEY",
+            "https://integrate.api.nvidia.com/v1",
+            "https://build.nvidia.com",
+            "NVIDIA_BASE_URL",
+        ),
+        "openrouter" => openai_compat_with_key(
+            &env,
+            "OPENROUTER_API_KEY",
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/keys",
+            "OPENROUTER_BASE_URL",
+        ),
+        "github-models" => openai_compat_with_key(
+            &env,
+            "GITHUB_MODELS_TOKEN",
+            "https://models.github.ai/inference",
+            "https://github.com/settings/personal-access-tokens",
+            "GITHUB_MODELS_BASE_URL",
+        ),
         "mock" => Err(Error::Config(
             "mock provider cannot be built from config".into(),
             "construct modron_core::testing::MockProvider with a script and register it \

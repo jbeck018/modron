@@ -86,7 +86,7 @@ provider = "google"
 context_window = 1_000_000
 input_per_m = 0.30
 output_per_m = 2.50
-tier = "cheap"
+tier = "cheap"   # AI Studio free tier: ~500 req/day at $0 (verified 2026-10)
 
 [[models]]
 name = "deepseek-chat"
@@ -156,6 +156,62 @@ context_window = 128000
 input_per_m = 0.0
 output_per_m = 0.0
 tier = "cheap"   # free tier
+
+[[models]]
+name = "llama-3.1-8b-instant"
+provider = "groq"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "cheap"   # Groq free tier
+
+[[models]]
+name = "llama-3.3-70b-versatile"
+provider = "groq"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "strong"  # Groq free tier; strongest free instruction-follower
+
+[[models]]
+name = "qwen-3-32b"
+provider = "cerebras"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "strong"  # Cerebras free tier; fastest tokens/sec
+
+[[models]]
+name = "mistral-small-latest"
+provider = "mistral"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "cheap"   # Mistral free experiment tier (data-training caveat)
+
+[[models]]
+name = "openai/gpt-4.1-mini"
+provider = "github-models"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "strong"  # GitHub Models free tier (per-minute/day caps)
+
+[[models]]
+name = "deepseek/deepseek-chat-v3-0324:free"
+provider = "openrouter"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "strong"  # OpenRouter :free (50 req/day basic)
+
+[[models]]
+name = "meta/llama-3.3-70b-instruct"
+provider = "nvidia"
+context_window = 128000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "strong"  # NVIDIA NIM free credits
 
 [[models]]
 name = "llama-3.3-70b"
@@ -253,7 +309,7 @@ impl ModelInfo {
 mod tests {
     use super::*;
 
-    const ALLOWED_PROVIDERS: [&str; 7] = [
+    const ALLOWED_PROVIDERS: [&str; 13] = [
         "anthropic",
         "openai",
         "openai-compat",
@@ -261,6 +317,12 @@ mod tests {
         "deepseek",
         "ollama",
         "zai",
+        "groq",
+        "cerebras",
+        "mistral",
+        "nvidia",
+        "openrouter",
+        "github-models",
     ];
 
     #[test]
