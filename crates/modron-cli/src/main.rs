@@ -129,8 +129,11 @@ enum Command {
         #[arg(long)]
         session: Option<SessionId>,
     },
-    /// List stored sessions, newest first.
-    Sessions,
+    /// Session management: list (default), vacuum old sessions, restart.
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
     /// Aggregate token/cost dashboard across sessions (provider-reported
     /// usage, catalog-priced costs, cache-hit rates).
     Usage {
@@ -138,6 +141,22 @@ enum Command {
         #[arg(long)]
         last: Option<usize>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum SessionsAction {
+    /// List stored sessions (newest first) with tokens + est. cost.
+    List,
+    /// Delete sessions not updated within the given number of days.
+    Vacuum {
+        #[arg(long)]
+        older_than_days: u64,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restart a session: same id, fresh context (history stays on disk but
+    /// never re-enters context; the next --resume starts clean).
+    Restart { id: SessionId },
 }
 
 #[derive(Subcommand, Clone)]
@@ -292,8 +311,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return run_rewind(session, &sessions_dir, &working_dir).await;
     }
     // `modron sessions` — the store is inspectable (no silent state).
-    if let Some(Command::Sessions) = cli.command {
-        return run_sessions_list(&sessions_dir).await;
+    if let Some(Command::Sessions { action }) = &cli.command {
+        match action {
+            Some(SessionsAction::List) | None => {
+                return run_sessions_list(&sessions_dir).await;
+            }
+            Some(SessionsAction::Vacuum {
+                older_than_days,
+                dry_run,
+            }) => {
+                return run_sessions_vacuum(&sessions_dir, *older_than_days, *dry_run).await;
+            }
+            Some(SessionsAction::Restart { id }) => {
+                return run_sessions_restart(&sessions_dir, *id).await;
+            }
+        }
     }
     // `modron usage` — the aggregate dashboard (Phase-2a D1).
     if let Some(Command::Usage { last }) = cli.command {
@@ -334,6 +366,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }) = cli.command.clone()
     {
         return run_bench(&cli, &cfg, models.as_deref(), list, delay_ms).await;
+    }
+
+    // Session TTL auto-vacuum (Phase 6a): runs before anything else when
+    // [sessions].ttl_days is configured. Unset = never delete automatically.
+    if let Some(sessions_cfg) = &cfg.sessions {
+        if let Some(days) = sessions_cfg.ttl_days {
+            if let Err(e) = run_sessions_vacuum(&sessions_dir, days, false).await {
+                tracing::warn!(error = %e, "session auto-vacuum failed (non-fatal)");
+            }
+        }
     }
 
     // `modron chat` — interactive multi-turn REPL (Phase-1c I3).
@@ -894,6 +936,72 @@ fn build_selector(
     }
 }
 
+/// `modron sessions vacuum --older-than-days N` (Phase 6a): delete sessions
+/// whose last update is older than N days. `--dry-run` lists what would go.
+/// The `.rewind` markers die with their sessions.
+async fn run_sessions_vacuum(
+    sessions_dir: &Path,
+    older_than_days: u64,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
+    let store = JsonlSessionStore::new(sessions_dir);
+    let sessions = store
+        .list()
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot list sessions: {err}"))?;
+    let expired: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| s.updated_at < cutoff)
+        .collect();
+    if expired.is_empty() {
+        println!("nothing to vacuum (no sessions older than {older_than_days} days)");
+        return Ok(());
+    }
+    for meta in &expired {
+        println!(
+            "{}  {}  (last update {})",
+            if dry_run { "would delete" } else { "deleting" },
+            meta.id,
+            meta.updated_at.format("%Y-%m-%d")
+        );
+    }
+    if dry_run {
+        println!("dry run — nothing deleted");
+        return Ok(());
+    }
+    let mut deleted = 0usize;
+    for meta in &expired {
+        if store.delete(meta.id).await.unwrap_or(false) {
+            deleted += 1;
+        }
+    }
+    println!("vacuumed {deleted} sessions");
+    Ok(())
+}
+
+/// `modron sessions restart <id>` (Phase 6a): same session id, fresh
+/// context. The history stays on disk (append-only log) but the resume
+/// marker moves to the log's end, so the next `--resume` starts clean.
+async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Result<()> {
+    let store = JsonlSessionStore::new(sessions_dir);
+    let events = store
+        .load(id)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot load session: {err}"))?;
+    if events.is_empty() {
+        anyhow::bail!("session {id} has no events — nothing to restart");
+    }
+    let marker = sessions_dir.join(format!("{id}.rewind"));
+    std::fs::write(&marker, events.len().to_string())
+        .map_err(|err| anyhow::anyhow!("cannot write restart marker: {err}"))?;
+    println!(
+        "session {id} restarted: {} events kept on disk, context starts fresh on the next --resume",
+        events.len()
+    );
+    Ok(())
+}
+
 /// `modron mcp info <name>` (Phase 5e): spawn one configured server and
 /// print its tools (with schema costs), resources, and prompts.
 async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> {
@@ -1209,6 +1317,15 @@ async fn run_bench(
             }
             println!("baseline: {}", path.display());
         }
+    }
+
+    // Bench hygiene: the suite's mutation tasks create files in the working
+    // dir (bench-marker.txt) — remove the known artifacts so benches never
+    // pollute the target repo.
+    let mut artifact = cli.working_dir.clone();
+    artifact.push("bench-marker.txt");
+    if std::fs::remove_file(&artifact).is_ok() {
+        tracing::debug!(path = %artifact.display(), "removed bench artifact");
     }
     Ok(())
 }

@@ -368,6 +368,12 @@ pub trait SessionStore: Send + Sync {
     /// Full event log for a session.
     async fn load(&self, id: SessionId) -> Result<Vec<SessionEvent>>;
     async fn list(&self) -> Result<Vec<SessionMeta>>;
+    /// Remove a session entirely (Phase 6a: vacuum/restart support).
+    /// Returns whether it existed. Default: unsupported.
+    async fn delete(&self, id: SessionId) -> Result<bool> {
+        let _ = id;
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------

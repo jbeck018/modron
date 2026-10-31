@@ -1093,3 +1093,28 @@ compaction/overflow machinery now respects the actual model in use — the
 live finding from the 105k-token free-model runs is a tested invariant.
 Deferred (next): `loadSession` in ACP, router training from bench JSONL
 (needs quality labels), and merge-automation for worktrees.
+
+---
+
+# Phase 6a — Session lifecycle (opened/closed 2026-10-31)
+
+The user's requirement: auto-vacuum, TTL on sessions, session restart —
+checked against the tree (none existed), built after the loose end from
+existing work (bench hygiene) was closed.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| L0 | Bench hygiene (finishing existing work): the suite's mutation tasks wrote bench-marker.txt into the working dir — the reason it got committed twice. Bench now removes its known artifacts after the run | DONE | run_bench cleanup; repo verified clean |
+| L1 | `SessionStore::delete` (additive trait method with default; JsonlSessionStore removes .jsonl + .meta.json + .rewind) | DONE | store test: delete roundtrip + second-delete false + load-after-delete errors (documented) |
+| L2 | `modron sessions vacuum --older-than-days N [--dry-run]` — deletes sessions by updated_at, lists what goes | DONE | live demo against ~/.modron/sessions (dry-run listed 5+) |
+| L3 | `modron sessions restart <id>` — same id, fresh context: history stays on disk (append-only), the resume marker moves to the log's end so the next --resume starts clean (reuses the rewind marker machinery) | DONE | handler + marker semantics |
+| L4 | TTL auto-vacuum: `[sessions] ttl_days = N` in config → vacuum runs at CLI startup; UNSET = never delete automatically (no silent data loss) | DONE | config.rs SessionsConfig; startup wiring with non-fatal failure |
+| V23 | Gates | DONE | **342 passed / 0 failed**, clippy clean |
+
+## Final verdict — Phase 6a
+
+**Sessions now have a lifecycle.** They accumulate by default (nothing is
+ever deleted silently), the user opts into TTL via config or vacuumes
+explicitly with a dry-run preview, and restarting a session keeps its id and
+history while giving the model a clean context. Plus the bench no longer
+litters the target repo. 342 tests, clippy clean.

@@ -180,6 +180,27 @@ impl SessionStore for JsonlSessionStore {
         metas.sort_by_key(|meta| std::cmp::Reverse(meta.updated_at));
         Ok(metas)
     }
+
+    async fn delete(&self, id: SessionId) -> Result<bool> {
+        let base = self.root.join(id.to_string());
+        let jsonl = base.with_extension("jsonl");
+        let meta = base.with_extension("meta.json");
+        let rewind = base.with_extension("rewind");
+        let mut existed = false;
+        for path in [jsonl, meta, rewind] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => existed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::Session(format!(
+                        "cannot delete {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        Ok(existed)
+    }
 }
 
 #[cfg(test)]
@@ -412,5 +433,26 @@ mod tests {
         let task = json!({"type": "task", "text": "x"});
         let parsed: SessionEvent = serde_json::from_value(task).unwrap();
         assert!(matches!(parsed, SessionEvent::Task { text } if text == "x"));
+    }
+    #[tokio::test]
+    async fn delete_removes_session_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let meta = store.create_session("doomed").await.unwrap();
+        store
+            .append(meta.id, &SessionEvent::Task { text: "t".into() })
+            .await
+            .unwrap();
+        assert!(dir.path().join(format!("{}.jsonl", meta.id)).exists());
+
+        assert!(store.delete(meta.id).await.unwrap());
+        assert!(!dir.path().join(format!("{}.jsonl", meta.id)).exists());
+        assert!(!dir.path().join(format!("{}.meta.json", meta.id)).exists());
+        assert!(
+            !store.delete(meta.id).await.unwrap(),
+            "second delete = false"
+        );
+        // Load of a deleted session errors (missing file) — documented.
+        assert!(store.load(meta.id).await.is_err());
     }
 }

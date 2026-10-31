@@ -144,7 +144,10 @@ modron tui                      # inline-viewport TUI: streaming, tool lines,
 modron chat                     # interactive multi-turn session (streaming)
 modron router eval                   # score the model router offline
 modron usage                    # aggregate token/cost/cache-hit dashboard
-modron sessions                 # list stored sessions with tokens + est. cost
+modron sessions                   # list stored sessions with tokens + est. cost
+modron sessions vacuum --older-than-days 30 [--dry-run]
+                                  # delete stale sessions (or [sessions] ttl_days in config)
+modron sessions restart <id>      # same session id, fresh context
 modron rewind                   # undo the last checkpointed file mutation +
                                  #   mark the transcript for resume-from-truncation
 modron memory list|show|forget  # inspect/forget the workspace's persistent memory

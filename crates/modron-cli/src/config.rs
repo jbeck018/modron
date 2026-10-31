@@ -59,6 +59,17 @@ pub struct Config {
     /// forced model, tool allow/deny. Selected with `--agent <name>`.
     #[serde(default)]
     pub agents: Option<std::collections::BTreeMap<String, AgentPersona>>,
+    /// Session lifecycle (Phase 6a): auto-vacuum TTL.
+    #[serde(default)]
+    pub sessions: Option<SessionsConfig>,
+}
+
+/// `[sessions]` section (Phase 6a). `ttl_days` enables auto-vacuum at
+/// startup: sessions not updated within N days are deleted. Unset = never
+/// delete automatically (explicit `modron sessions vacuum` still works).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct SessionsConfig {
+    pub ttl_days: Option<u64>,
 }
 
 /// `[agents.<name>]` — a Kilo-style custom mode.
