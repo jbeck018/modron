@@ -5,7 +5,7 @@ how smart the agent is; the harness decides how fast, safe, and expensive that
 intelligence is to use.** Read the founding document in [PLAN.md](PLAN.md); the live
 work ledger is [LEDGER.md](LEDGER.md).
 
-Status: **Phase 4a (recursion + skills)** — one-shot CLI + `modron chat` REPL with
+Status: **Phase 5a (MCP client)** — one-shot CLI + `modron chat` REPL with
 live streaming answers, interactive approvals (Ask prompts on your terminal), agent
 engine loop, Anthropic + OpenAI-compatible + **Z.ai** providers (SSE streaming
 proven at the wire level), 6 essential tools behind an approval gate + optional
@@ -201,6 +201,15 @@ model = "qwen2.5:0.5b"
 [kev]
 endpoint = "http://127.0.0.1:8009"
 # api_key = "…"
+
+# Optional: MCP servers (stdio). Tools appear as mcp__<server>__<tool>;
+# each server's schema cost is counted and capped (default 20k tokens).
+[mcp.servers.echo]
+command = "modron-mcp-echo"
+
+[mcp.servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
 ```
 
 Provider API keys are read from the environment: `ANTHROPIC_API_KEY`

@@ -825,3 +825,28 @@ workflows by dropping SKILL.md files into `.claude/skills/` (open-standard
 compatible). Deferred: RPC/daemon, parallel-explore orchestration at the
 planner level. Remaining offline items: MCP client, ACP server, subscription
 OAuth. Live items still queue on a Z.ai key.
+
+---
+
+# Phase 5a — MCP client (opened/closed 2026-10-31)
+
+Baseline: 313 tests, repo on GitHub with CI + cargo-deny. Scope: the opt-in
+MCP client — stdio transport, tool-serving subset, per-server schema token
+accounting (PLAN §4.8's "no silent prompt fattening"). The official `rmcp`
+SDK is deliberately NOT used for v1 (binary leanness + the subset we consume
+is stable); it is the documented migration path for resources/prompts/sampling.
+
+| ID | Item | Acceptance criteria | Status | Evidence |
+|---|---|---|---|---|
+| C1 | `modron-mcp` crate: JSON-RPC-over-stdio client (initialize handshake → tools/list → tools/call, timeout, notification skip, error taxonomy) + `McpTool` bridge (`mcp__<server>__<tool>` naming, Claude Code convention) + schema token cost at connect | E2E vs the shipped `modron-mcp-echo` server: round-trip, name mapping, unknown-tool error, failing-command actionable error, schema cost > 0 | DONE | 5 tests (3 e2e + fixture unit) |
+| C2 | Config + wiring: `[mcp.servers.<name>]` (command/args/env/max_schema_tokens, default 20k); servers spawn at agent build; registration in every mode (one-shot/chat/TUI); per-server accounting line | Config unit tests; build path wired for all three front ends; over-budget server refused with actionable error | DONE | main.rs spawn_mcp_servers + registration; config.rs |
+| C3 | Gates + docs | 316 passed / 0 failed; clippy clean; README documents MCP config | DONE | this log |
+
+## Final verdict — Phase 5a
+
+**MCP is opt-in, budgeted, and tested.** Any stdio MCP server joins the
+registry under `mcp__<server>__<tool>`; its schema cost is computed at
+connect and enforced against a per-server cap; transport/handshake failures
+are actionable build errors, not silent skips. The echo server ships as a
+working example of the transport. Remaining offline items: ACP server
+(Zed), subscription OAuth. Live: the Z.ai smoke + dogfooding.

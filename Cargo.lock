@@ -1306,6 +1306,7 @@ dependencies = [
  "clap",
  "dirs",
  "modron-core",
+ "modron-mcp",
  "modron-providers",
  "modron-router",
  "modron-store",
@@ -1336,6 +1337,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "modron-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "modron-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

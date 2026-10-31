@@ -51,6 +51,31 @@ pub struct Config {
     /// hosted decision model (wire-compatible APIs).
     #[serde(default)]
     pub kev: Option<KevConfig>,
+    /// MCP servers (Phase 5a): stdio servers whose tools join the registry
+    /// as `mcp__<server>__<tool>`, with per-server schema token accounting.
+    #[serde(default)]
+    pub mcp: Option<McpConfig>,
+}
+
+/// `[mcp]` section (Phase 5a).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct McpConfig {
+    /// Server name → launch config. Names appear in tool ids.
+    #[serde(default)]
+    pub servers: std::collections::BTreeMap<String, McpServerConfig>,
+}
+
+/// One MCP stdio server.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// Refuse the server if its tools' combined schema cost exceeds this
+    /// (prompt budget is a product principle; default 20_000 tokens).
+    pub max_schema_tokens: Option<u64>,
 }
 
 /// `[judge]` section (Phase-3b M3).

@@ -264,6 +264,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // inside the TUI, so the agent is built through the closure.
     if let Some(Command::Tui) = cli.command {
         let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let mcp = spawn_mcp_servers(&cfg).await?;
         return modron_tui::run_with(
             |sinks| {
                 let agent = build_agent_with(
@@ -275,6 +276,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         on_delta: Some(sinks.on_delta),
                         on_tool_event: Some(sinks.on_tool_event),
                     },
+                    &mcp,
                 )
                 .expect("build agent for tui");
                 (agent.engine, agent.resume)
@@ -290,7 +292,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let agent = build_agent(&cli, &cfg, interactive, false)?;
+    let mcp = spawn_mcp_servers(&cfg).await?;
+    let agent = build_agent_with(
+        &cli,
+        &cfg,
+        interactive,
+        AgentSinks::for_mode(interactive, false),
+        &mcp,
+    )?;
     let compaction_tail_messages = agent.engine.config.compaction.tail_messages;
 
     // Events already in the log before this invocation — used to scope the
@@ -367,25 +376,12 @@ impl AgentSinks {
 /// - `interactive`: attach the /dev/tty approver when a terminal is present,
 ///   so Ask mode prompts instead of blocking.
 /// - `stream`: attach the stdout delta sink (chat mode streams answers live).
-fn build_agent(
-    cli: &Cli,
-    cfg: &config::Config,
-    interactive: bool,
-    stream: bool,
-) -> anyhow::Result<Agent> {
-    build_agent_with(
-        cli,
-        cfg,
-        interactive,
-        AgentSinks::for_mode(interactive, stream),
-    )
-}
-
 fn build_agent_with(
     cli: &Cli,
     cfg: &config::Config,
     interactive: bool,
     sinks: AgentSinks,
+    mcp: &[McpRegistration],
 ) -> anyhow::Result<Agent> {
     let engine_defaults = EngineConfig::default();
     let sessions_dir = cli
@@ -572,6 +568,13 @@ fn build_agent_with(
             &working_dir,
         )));
     }
+    for reg in mcp {
+        registry.register(Arc::new(modron_mcp::McpTool::new(
+            Arc::clone(&reg.handle),
+            &reg.server,
+            reg.info.clone(),
+        )));
+    }
     let engine = Engine {
         selector: build_selector(cfg)?,
         providers,
@@ -646,6 +649,48 @@ fn stdout_delta_sink() -> Arc<modron_core::DeltaSink> {
         StreamDelta::Reasoning(_) => {}
         StreamDelta::Done => println!(),
     })
+}
+
+/// Prepared MCP registration: one tool on one live server.
+pub struct McpRegistration {
+    pub server: String,
+    pub handle: Arc<tokio::sync::Mutex<modron_mcp::McpServerHandle>>,
+    pub info: modron_mcp::McpToolInfo,
+}
+
+/// Spawn every configured MCP server and collect its tools (Phase 5a).
+/// Per-server schema cost is enforced here — a server whose tools would
+/// fatten the prompt past its budget is refused with an actionable error.
+async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegistration>> {
+    let Some(mcp) = &cfg.mcp else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (name, server) in &mcp.servers {
+        let env: Vec<(String, String)> =
+            server.env.clone().unwrap_or_default().into_iter().collect();
+        let args = server.args.clone().unwrap_or_default();
+        let (handle, tools) =
+            modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await?;
+        let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
+        let cap = server.max_schema_tokens.unwrap_or(20_000);
+        if total > cap {
+            return Err(anyhow::anyhow!(
+                "MCP server `{name}` tool schemas cost {total} est. tokens (cap {cap}) — \
+                 drop tools from the server or raise max_schema_tokens"
+            ));
+        }
+        tracing::info!(server = %name, tools = tools.len(), schema_tokens = total,
+            "mcp server ready");
+        for info in tools {
+            out.push(McpRegistration {
+                server: name.clone(),
+                handle: Arc::clone(&handle),
+                info,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Build the active selector from `[router]` config (Phase-3a R1).
@@ -774,7 +819,8 @@ fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
 /// lines. Errors don't kill the session.
 async fn run_chat(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     use std::io::Write as _;
-    let agent = build_agent(cli, cfg, true, true)?;
+    let mcp = spawn_mcp_servers(cfg).await?;
+    let agent = build_agent_with(cli, cfg, true, AgentSinks::for_mode(true, true), &mcp)?;
     println!("modron chat — one session, streaming answers. /exit or Ctrl-D to quit.");
     let mut session_id: Option<SessionId> = None;
     let mut total = Usage::default();
