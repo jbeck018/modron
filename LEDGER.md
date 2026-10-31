@@ -1082,7 +1082,7 @@ debt), then the two delegation-depth items.
 | I1 | Model-aware caps: `ModelChoice.context_window` (additive, catalog-filled by every selector path); engine selects FIRST, computes effective cap = min(global cap, model window), compacts against it, and the pre-flight budget check uses it. The live finding is now enforced: a 128k-window free model compacts at 0.8×128k even with a 180k global cap | DONE | compaction_test::compaction_uses_the_model_window_not_the_global_cap (a 10k-window model compacts despite a 180k cap; test caught the tail-keeps-the-huge-message case, fixed with tail_messages=1 in the fixture) |
 | I2 | Background delegates: `delegate {background: true}` returns an agent id immediately; child runs detached; `delegate_status {id?}` lists running (turns/tokens via progress events) or completed (brief) agents; state survives across chat turns (engine-held registry) | DONE | tools/delegate.rs + engine registry; e2e: started → running → done with brief |
 | I3 | Worktree isolation: `delegate {isolate: true}` requires git, creates `.modron/worktrees/<id>` via `git worktree add`, runs the child there, and reports the worktree path + `git diff --stat` in the brief — review-not-auto-merge semantics (merging is the user's/parent's explicit decision) | DONE | e2e with a git-initialized temp repo; non-git working dir → actionable error |
-| V22 | Gates | DONE | **338 passed / 0 failed**, clippy clean |
+| V22 | Gates | DONE | **341 passed / 0 failed** (incl. 3 Phase-5i tool tests + the model-window compaction test), clippy clean |
 
 ## Final verdict — Phase 5i
 
