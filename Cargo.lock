@@ -1303,6 +1303,7 @@ name = "modron-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "dirs",
  "modron-core",
@@ -1312,14 +1313,17 @@ dependencies = [
  "modron-store",
  "modron-tools",
  "modron-tui",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

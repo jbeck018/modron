@@ -12,6 +12,8 @@
 //! starts, tool calls, compactions) goes to stderr via `tracing`/direct
 //! writes; the answer and usage table go to stdout.
 
+pub mod acp;
+pub mod auth;
 pub mod config;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -84,6 +86,15 @@ enum Command {
         #[command(subcommand)]
         action: RouterAction,
     },
+    /// Agent Client Protocol server for editors (Zed first): JSON-RPC over
+    /// stdio. Editors launch this binary themselves.
+    Acp,
+    /// Subscription auth (EXPERIMENTAL): manage OAuth tokens for providers
+    /// that support it (currently: claude).
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Inspect and forget persistent workspace memory (no silent state).
     Memory {
         #[command(subcommand)]
@@ -106,6 +117,16 @@ enum Command {
         #[arg(long)]
         last: Option<usize>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum AuthAction {
+    /// Authorize via browser (PKCE + localhost callback) and store tokens.
+    Login,
+    /// Show whether stored subscription tokens exist.
+    Status,
+    /// Delete stored tokens.
+    Logout,
 }
 
 #[derive(Subcommand, Clone)]
@@ -258,6 +279,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }) = cli.command
     {
         return run_router_eval(&cfg);
+    }
+
+    // `modron acp` — editor integration (Phase 5d X1).
+    if let Some(Command::Acp) = cli.command {
+        return crate::acp::run_acp(&cli, &cfg).await;
+    }
+
+    // `modron auth …` — subscription token management (Phase 5d X3).
+    if let Some(Command::Auth { action }) = cli.command {
+        return crate::auth::run_auth(action).await;
     }
 
     // `modron chat` — interactive multi-turn REPL (Phase-1c I3).

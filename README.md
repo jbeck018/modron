@@ -5,7 +5,7 @@ how smart the agent is; the harness decides how fast, safe, and expensive that
 intelligence is to use.** Read the founding document in [PLAN.md](PLAN.md); the live
 work ledger is [LEDGER.md](LEDGER.md).
 
-Status: **Phase 5c (delegation + skills gallery compat)** — one-shot CLI + `modron chat` REPL with
+Status: **Phase 5d (ACP, auth, distribution)** — one-shot CLI + `modron chat` REPL with
 live streaming answers, interactive approvals (Ask prompts on your terminal), agent
 engine loop, Anthropic + OpenAI-compatible + **Z.ai** providers (SSE streaming
 proven at the wire level), 6 essential tools behind an approval gate + optional
@@ -13,6 +13,14 @@ macOS Seatbelt sandbox, lifecycle hooks (configurable in config.toml), file
 checkpoints with `modron rewind`, USD spend caps, persistent workspace memory,
 token-efficient autocompaction, JSONL session trees, heuristic model router, and a
 keyless mock-provider end-to-end path.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jbeck018/modron/main/install.sh | bash
+# or from source:
+cargo install --locked --git https://github.com/jbeck018/modron
+```
 
 ## Build
 

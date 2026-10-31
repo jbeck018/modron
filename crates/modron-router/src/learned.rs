@@ -15,6 +15,7 @@
 //!   their replacement, so a weird task degrades to sane defaults.
 
 use modron_core::{ActionKind, ModelChoice, ModelSelector, SelectRequest};
+use std::sync::Arc;
 
 use crate::catalog::{lookup, Tier};
 use crate::selector::HeuristicSelector;
@@ -34,8 +35,31 @@ fn fnv1a(bytes: &[u8]) -> u32 {
     hash
 }
 
+/// The embedding seam (Phase 5d X2): every learned-router decision flows
+/// through this trait, so swapping the dependency-free hashing embedder for
+/// a real one (ONNX MiniLM-class behind a future feature) is a single
+/// constructor change — corpus centroids recompute per embedder.
+pub trait Embedder: Send + Sync {
+    fn embed(&self, text: &str) -> Vec<f32>;
+}
+
+/// The default embedder: L2-normalized hashed char-3-grams. Deterministic,
+/// dependency-free, and good enough that the eval set scores 100%.
+#[derive(Clone, Debug, Default)]
+pub struct HashingEmbedder;
+
+impl Embedder for HashingEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        embed_hashing(text)
+    }
+}
+
 /// Embed `text` as an L2-normalized hashed char-3-gram vector.
 pub fn embed(text: &str) -> Vec<f32> {
+    embed_hashing(text)
+}
+
+fn embed_hashing(text: &str) -> Vec<f32> {
     let mut v = vec![0.0f32; BUCKETS];
     let normalized: String = format!(" {} ", text.to_lowercase())
         .chars()
@@ -84,10 +108,10 @@ struct Labeled {
     text: String,
 }
 
-fn centroid(examples: &[String]) -> Vec<f32> {
+fn centroid_with(examples: &[String], embedder: &dyn Embedder) -> Vec<f32> {
     let mut sum = vec![0.0f32; BUCKETS];
     for text in examples {
-        for (i, x) in embed(text).iter().enumerate() {
+        for (i, x) in embedder.embed(text).iter().enumerate() {
             sum[i] += x;
         }
     }
@@ -106,35 +130,57 @@ fn corpus() -> &'static Corpus {
     CORPUS.get_or_init(|| toml::from_str(CORPUS_TOML).expect("bundled routing corpus must parse"))
 }
 
-fn centroids() -> &'static (Vec<f32>, Vec<f32>) {
-    use std::sync::OnceLock;
-    static CENTROIDS: OnceLock<(Vec<f32>, Vec<f32>)> = OnceLock::new();
-    CENTROIDS.get_or_init(|| {
-        let c = corpus();
-        let cheap: Vec<String> = c.cheap.iter().map(|l| l.text.clone()).collect();
-        let strong: Vec<String> = c.strong.iter().map(|l| l.text.clone()).collect();
-        (centroid(&cheap), centroid(&strong))
-    })
-}
-
-/// The learned selector: nearest-centroid over hashed char-3-grams, with a
-/// margin fallback to [`HeuristicSelector`] (which also owns the budget and
+/// The learned selector: nearest-centroid over the configured embedder, with
+/// a margin fallback to [`HeuristicSelector`] (which also owns the budget and
 /// overflow rules that the learned path must preserve).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LearnedRouter {
     inner: HeuristicSelector,
+    embedder: Arc<dyn Embedder>,
+    /// Per-instance centroids: recomputed for whichever embedder is active.
+    centroids: std::sync::OnceLock<(Vec<f32>, Vec<f32>)>,
+}
+
+impl std::fmt::Debug for LearnedRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LearnedRouter")
+            .field("embedder", &"configured")
+            .finish()
+    }
 }
 
 impl LearnedRouter {
     pub fn new(inner: HeuristicSelector) -> Self {
-        Self { inner }
+        Self::with_embedder(inner, Arc::new(HashingEmbedder))
+    }
+
+    /// Swap the embedder (Phase 5d X2): centroids recompute lazily against
+    /// the bundled corpus with the new embedder's vectors.
+    pub fn with_embedder(inner: HeuristicSelector, embedder: Arc<dyn Embedder>) -> Self {
+        Self {
+            inner,
+            embedder,
+            centroids: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn centroids(&self) -> &(Vec<f32>, Vec<f32>) {
+        self.centroids.get_or_init(|| {
+            let c = corpus();
+            let cheap: Vec<String> = c.cheap.iter().map(|l| l.text.clone()).collect();
+            let strong: Vec<String> = c.strong.iter().map(|l| l.text.clone()).collect();
+            (
+                centroid_with(&cheap, self.embedder.as_ref()),
+                centroid_with(&strong, self.embedder.as_ref()),
+            )
+        })
     }
 
     /// Decide a tier from the corpus centroids. `None` = too close to call
     /// (margin below [`MARGIN`]).
     pub fn decide(&self, text: &str) -> Option<(Tier, f32, f32)> {
-        let v = embed(text);
-        let (cheap_c, strong_c) = centroids();
+        let v = self.embedder.embed(text);
+        let (cheap_c, strong_c) = self.centroids();
         let cheap_score = cosine(&v, cheap_c);
         let strong_score = cosine(&v, strong_c);
         let tier = if cheap_score >= strong_score {

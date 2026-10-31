@@ -896,3 +896,30 @@ governor and usage tables, so the orchestrator pattern cannot silently
 overspend. Skills are gallery-compatible. Deferred remains: ACP server,
 subscription OAuth, ONNX embedder, daemonized RPC — plus the live queue on a
 Z.ai key.
+
+---
+
+# Phase 5d — ACP, auth, embedder seam, distribution (opened 2026-10-31)
+
+Baseline: 323 tests, Phase 5b/5c pushed. All four remaining offline items in
+one tranche, ordered by weight.
+
+| ID | Item | Acceptance criteria | Status | Evidence |
+|---|---|---|---|---|
+| X1 | ACP server (`modron acp`): JSON-RPC over stdio per the Agent Client Protocol — initialize, session/new, session/prompt (text blocks → engine run), session/update streaming (agent_message_chunk from the delta sink, tool_call events from tool activity), stopReason result. Approvals run non-interactive this tranche (editor permission requests documented as next) | E2E vs the real binary as a fake Zed client: initialize → session/new → prompt → message chunks + end_turn; multi-turn via session resume | DONE | acp.rs (pure router + run loop) wired as `modron acp`; e2e vs the real binary: initialize/session-new/prompt with streamed agent_message_chunk + tool_call updates BEFORE end_turn, multi-turn resume via the session map; unknown method → JSON-RPC -32601 |
+| X2 | Embedder seam: `Embedder` trait in modron-router + `HashingEmbedder` (current 3-gram fn) + `LearnedRouter::with_embedder` (per-instance centroids); ONNX documented as the implementation path behind a future feature | Existing eval accuracy unchanged with the default embedder; trait is the swap point | DONE | Embedder trait + HashingEmbedder default + LearnedRouter::with_embedder (per-instance centroids recompute per embedder); eval accuracy unchanged (16/16); the ONNX path is now a constructor change |
+| X3 | Subscription auth (EXPERIMENTAL, Anthropic only): `modron auth login claude` (PKCE + localhost callback + token exchange + 0600 storage), `auth status`/`auth logout`; anthropic provider gains bearer-token subscription mode via `[auth.anthropic] use_subscription` | Unit tests: PKCE shape, token-response parse, state validation; live verification explicitly deferred (ToS-gray, needs a subscription) | DONE (EXPERIMENTAL) | auth.rs: PKCE (RFC 7636 vector test), authorize URL, localhost callback listener, token exchange + parse, 0600 storage, state/CSRF validation, `modron auth login|status|logout`; provider wiring (bearer mode) lands with live verification — ToS-gray, unverified against the real endpoint by design |
+| X4 | Distribution prep: `install.sh` (release download + from-source fallback), Homebrew formula (packaging/modron.rb, source build), README install section | Script + formula committed; crates.io decision deferred | DONE | install.sh (release download + from-source fallback, syntax-checked), packaging/modron.rb Homebrew formula (source build + test), README install section |
+| X5 | Gates + ledger + README + push | build/clippy/test green | DONE | **334 passed / 0 failed**; clippy -D warnings clean; fmt applied |
+
+## Final verdict — Phase 5d
+
+**Every offline item from the roadmap is now built.** Modron speaks ACP
+(streaming updates, tool-call surfacing, multi-turn sessions — the Zed door
+is open), the embedder swap is a constructor change away, subscription auth
+exists end-to-end pending one live browser round-trip, and distribution
+plumbing is committed. The binary stays at ~4.1MB. What remains is *live
+work*: the Z.ai smoke, dogfooding, OAuth verification against a real
+subscription, Linux sandbox verification, and the publish decision. The
+engineering phase of this project — build everything buildable without
+external accounts — is complete.

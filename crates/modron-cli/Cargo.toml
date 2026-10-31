@@ -18,6 +18,10 @@ modron-mcp = { path = "../modron-mcp", version = "0.1.0" }
 modron-tui = { path = "../modron-tui", version = "0.1.0" }
 clap.workspace = true
 tokio.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
