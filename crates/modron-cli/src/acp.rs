@@ -501,7 +501,7 @@ mod tests {
     fn initialize_reports_v1_capabilities() {
         let result = route_initialize(&json!({}));
         assert_eq!(result["protocolVersion"], 1);
-        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
     }
 
     #[test]
