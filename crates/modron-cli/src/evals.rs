@@ -6,7 +6,7 @@
 //! Completion alone is not success; the objective verifier decides. That is
 //! the difference between "the model said done" and "the work is done".
 
-use crate::{config, short, Cli};
+use crate::{config, short, AgentSinks, Cli};
 use modron_core::{Engine, RunSummary};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -278,4 +278,107 @@ mod tests {
         assert!(tasks.iter().all(|t| !t.verify.is_empty()));
         assert!(tasks.iter().all(|t| !t.prompt.is_empty()));
     }
+}
+
+/// `modron eval` (Phase 6c): run the suite (or a filter) across a model
+/// list, print the SWE-bench-style scorecard, persist to
+/// `~/.modron/evals/<ts>.jsonl`.
+pub(crate) async fn run_evals(
+    cli: &Cli,
+    cfg: &config::Config,
+    models_arg: Option<&str>,
+    filter: Option<&str>,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let tasks = load_suite(MINI_SWE_TOML)?;
+    let tasks: Vec<_> = match filter {
+        Some(f) => tasks.into_iter().filter(|t| t.id.contains(f)).collect(),
+        None => tasks,
+    };
+    if tasks.is_empty() {
+        anyhow::bail!("no eval tasks match the filter");
+    }
+    let models: Vec<String> = match models_arg {
+        Some(csv) => csv.split(',').map(str::trim).map(String::from).collect(),
+        None => vec![cfg
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "glm-5.3-flash".to_string())],
+    };
+
+    let mcp = crate::spawn_mcp_servers(cfg).await?;
+    let stamp = chrono::Utc::now().to_rfc3339().replace([':', '+'], "-");
+    let workspaces_root = std::env::temp_dir().join(format!("modron-evals-{stamp}"));
+    std::fs::create_dir_all(&workspaces_root)?;
+    let mut all: Vec<EvalResult> = Vec::new();
+
+    for model in &models {
+        println!("eval: {} tasks on {model}", tasks.len());
+        for task in &tasks {
+            // Per-model config: force the model, approve mutations, exact
+            // task limits.
+            let mut model_cli = cli.clone();
+            model_cli.model = Some(model.clone());
+            model_cli.approve_all = true;
+            let agent = crate::build_agent_with(
+                &model_cli,
+                cfg,
+                false,
+                AgentSinks::for_mode(false, false),
+                &mcp,
+            )?;
+            let mut task = task.clone();
+            if task.max_turns.is_none() {
+                task.max_turns = Some(16);
+            }
+            let mut result = run_eval_task(&agent.engine, &task, &workspaces_root).await?;
+            result.model = model.clone();
+            println!(
+                "{:<3} {:<24} {:>4} turns {:>3} tools {:>7} tok {:>6} ms",
+                if result.passed { "✓" } else { "✗" },
+                result.id,
+                result.turns,
+                result.tool_calls,
+                result.tokens,
+                result.duration_ms
+            );
+            if let Some(note) = &result.failure_note {
+                if !result.passed {
+                    println!("    └ {}", short(note, 110));
+                }
+            }
+            all.push(result);
+        }
+    }
+
+    // Scorecard per model (mini-SWE: resolved = passed the verifier).
+    println!("\n=== eval scorecard (resolved = verifier exit 0) ===");
+    for model in &models {
+        let cases: Vec<&EvalResult> = all.iter().filter(|r| &r.model == model).collect();
+        let resolved = cases.iter().filter(|r| r.passed).count();
+        let tokens: u64 = cases.iter().map(|r| r.tokens).sum();
+        println!(
+            "{model:<20} resolved {resolved}/{} ({:.0}%) · {tokens} tok total",
+            cases.len(),
+            100.0 * resolved as f64 / cases.len().max(1) as f64
+        );
+    }
+
+    // Persist (the accumulating eval record).
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join(".modron").join("evals");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{stamp}.jsonl"));
+        let mut file = tokio::io::BufWriter::new(tokio::fs::File::create(&path).await?);
+        for record in &all {
+            let line = serde_json::to_string(record)?;
+            file.write_all(line.as_bytes()).await?;
+            file.write_all(b"\n").await?;
+        }
+        file.flush().await?;
+        println!("evals: {}", path.display());
+    }
+
+    Ok(())
 }
