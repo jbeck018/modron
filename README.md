@@ -246,6 +246,9 @@ endpoint = "http://127.0.0.1:8009"
 #   NVIDIA_API_KEY (meta/llama-3.3-70b-instruct; ~1k credits)
 #   OPENROUTER_API_KEY (deepseek/deepseek-chat-v3-0324:free; 50 req/day)
 #
+# Mini-SWE evals (correctness, not just completion — verifier-scored):
+#   modron eval --provider zai --model glm-5.3-flash
+#
 # NOTE (verified live): with a GLM Coding Plan attached to your account,
 # plan-less models like glm-4.5-flash may return 429 code 1309 — bench the
 # plan models (glm-5.3, glm-5.3-flash) instead.

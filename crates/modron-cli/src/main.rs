@@ -126,6 +126,11 @@ enum Command {
         /// is a good default for back-to-back free runs).
         #[arg(long)]
         delay_ms: Option<u64>,
+        /// Write the per-model comparison rows (completed fraction, tokens
+        /// per task, ms per task, cache %) as a JSON array to this path, in
+        /// addition to the printed table.
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
     },
     /// Inspect and forget persistent workspace memory (no silent state).
     Memory {
@@ -379,9 +384,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         models,
         list,
         delay_ms,
+        json,
     }) = cli.command.clone()
     {
-        return run_bench(&cli, &cfg, models.as_deref(), list, delay_ms).await;
+        return run_bench(
+            &cli,
+            &cfg,
+            models.as_deref(),
+            list,
+            delay_ms,
+            json.as_deref(),
+        )
+        .await;
     }
 
     // Session TTL auto-vacuum (Phase 6a): runs before anything else when
@@ -1108,16 +1122,32 @@ struct BenchRecord {
     duration_ms: u128,
 }
 
+/// One row of the `modron bench` comparison table (and, with `--json`, of
+/// the machine-readable output). `completed` is the raw count; the fraction
+/// is derived against the suite size at write time.
+#[derive(serde::Serialize)]
+struct BenchComparisonRow {
+    model: String,
+    completed: usize,
+    total_tasks: usize,
+    tokens_per_task: f64,
+    ms_per_task: f64,
+    /// 0.0-100.0; `None` when the model consumed no tokens at all.
+    cache_pct: Option<f64>,
+}
+
 /// `modron bench` (Phase 5f): run the suite across a model list, print the
 /// per-model comparison, and persist every task record to
 /// `~/.modron/bench/<timestamp>.jsonl` — the accumulating baseline file
-/// PLAN's cost tracking reads from.
+/// PLAN's cost tracking reads from. `--json <path>` additionally writes the
+/// per-model comparison rows as a JSON array.
 async fn run_bench(
     cli: &Cli,
     cfg: &config::Config,
     models_arg: Option<&str>,
     list: bool,
     delay_ms: Option<u64>,
+    json_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     if list {
         for model in curated_free_models() {
@@ -1156,8 +1186,11 @@ async fn run_bench(
             .unwrap_or_else(|| default_provider.clone());
         if !providers.contains_key(&provider) {
             match build_provider_shim(&provider) {
-                Ok(provider) => {
-                    providers.insert(provider.clone().id().to_string(), provider);
+                Ok(built) => {
+                    // Key by the CATALOG provider name (what the filter and
+                    // fallback resolution use) — provider.id() reports
+                    // "openai-compat" for zai-built instances.
+                    providers.insert(provider.clone(), built);
                 }
                 Err(e) => {
                     // A missing key skips that model, not the whole bench.
@@ -1283,6 +1316,36 @@ async fn run_bench(
         "{:<20} {:>9} {:>12} {:>12} {:>10} {:>10}",
         "model", "completed", "tokens/task", "ms/task", "cache %", "est. cost"
     );
+    // One computed row serves both the printed table and `--json`, so the
+    // two outputs can never drift apart.
+    let rows: Vec<BenchComparisonRow> = per_model
+        .iter()
+        .map(|(model, completed, tokens, ms)| {
+            let tasks = suite.len() as f64;
+            let cached: u64 = all_records
+                .iter()
+                .filter(|r| &r.model == model)
+                .map(|r| r.cached_tokens)
+                .sum();
+            let total_input: u64 = all_records
+                .iter()
+                .filter(|r| &r.model == model)
+                .map(|r| r.tokens)
+                .sum();
+            BenchComparisonRow {
+                model: model.clone(),
+                completed: *completed,
+                total_tasks: suite.len(),
+                tokens_per_task: *tokens as f64 / tasks,
+                ms_per_task: *ms as f64 / tasks,
+                cache_pct: if total_input > 0 {
+                    Some(100.0 * cached as f64 / total_input as f64)
+                } else {
+                    None
+                },
+            }
+        })
+        .collect();
     for (model, completed, tokens, ms) in &per_model {
         let tasks = suite.len() as f64;
         let price = modron_router::lookup(model)
@@ -1315,6 +1378,17 @@ async fn run_bench(
             cache_pct,
             cost_per_task * tasks
         );
+    }
+
+    // Machine-readable output: the same rows the table printed, as a JSON
+    // array (Phase 5f follow-up — dashboards and diff scripts read this
+    // instead of scraping the table).
+    if let Some(path) = json_path {
+        let body = serde_json::to_string_pretty(&rows)?;
+        std::fs::write(path, body).map_err(|err| {
+            anyhow::anyhow!("cannot write --json output to {}: {err}", path.display())
+        })?;
+        println!("json: {}", path.display());
     }
 
     // Persist the baseline (PLAN: measured, never claimed).

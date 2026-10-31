@@ -1157,3 +1157,56 @@ paid benchmark, full suite, three models:
 real comparison table → persisted baseline.** Every subsystem shipped this
 session (cache discipline, honest accounting, bench harness, error taxonomy)
 did its job against live traffic on the first try.
+
+---
+
+# Phase 6c/6d — Evals + THE FIRST DOGFOOD (opened/closed 2026-10-31)
+
+**The capstone: the harness now measures correctness (mini-SWE evals) and
+builds itself (dogfooding) — both on the paid plan.**
+
+## Phase 6c — evals (mini-SWE-bench)
+
+`modron eval` runs a committed 5-task suite through the real engine in
+isolated temp workspaces: setup → agent works (approve-all; verifier is the
+safety net) → objective verifier (shell exit 0 = resolved). Completion is
+not success — the verifier decides. Scorecard per model, records persist to
+`~/.modron/evals/<ts>.jsonl`.
+
+**First live eval: glm-5.3-flash resolved 5/5 (100%)** — 35,650 tokens:
+- hello-script ✓ (creation) · fix-failing-check ✓ (debugged via test
+  feedback, 4 turns 5 tools) · count-nonempty-lines ✓ (6 turns, the hard one)
+  · csv-to-json ✓ (transformation) · merge-configs ✓ (synthesis)
+The eval run also caught a real bug pre-release: the child engine wasn't
+inheriting the run's default provider (evals would never have reached the
+configured provider) — fixed and covered.
+
+## Phase 6d — THE FIRST DOGFOOD (Modron builds Modron)
+
+Task given to glm-5.3: "add --json <path> to the bench command" — the full
+stack in action:
+- Run 1: 11 turns, 13 tool calls, **budget governor stopped it honestly at
+  200k tokens** mid-task. Resumed with a higher cap — the session continued
+  with full context.
+- Run 2 (resume): finished the implementation, ran `cargo check` itself,
+  self-reported. **Review finding: the clap flag wasn't wired** — caught by
+  the reviewer (me) testing the stale binary; the agent's pushback was
+  actually correct (it had wired it in its final turn; my binary was stale).
+- Run 3 (feedback): flagged a real bug the agent's own verification missed —
+  `--json` wrote `[]` because MY skip-fix keyed the provider map by
+  `provider.id()` (the known "openai-compat" aliasing) while the filter
+  checked catalog names. Fixed in review; agent verified the fix.
+- **Final state: `modron bench --json` works, valid JSON, 2 rows
+  (glm-5.3 6/6, glm-5.3-flash 6/6), 345 tests green, merged to main.**
+
+## The dogfood meta-result (the honest scoreboard)
+
+- 3 agent runs, ~590k tokens total (~$0.55 nominal at catalog pricing),
+  3 review rounds, 1 budget-governor stop, 1 stale-binary misdiagnosis
+  (mine), 1 provider-keying bug found by review.
+- What the agent did well: implemented the feature, ran its own cargo check,
+  pushed back correctly when the reviewer was wrong, kept the repo clean.
+- What still needs the human: review (the empty-JSON bug passed the agent's
+  own verification), budget/scoping judgment, and merge decisions.
+- This is exactly the Claude Code working relationship — and it ran on OUR
+  harness, on OUR own codebase.
