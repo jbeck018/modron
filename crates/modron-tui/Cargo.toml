@@ -1,0 +1,17 @@
+[package]
+name = "modron-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+modron-core.workspace = true
+modron-store.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

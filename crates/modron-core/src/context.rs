@@ -1,0 +1,409 @@
+//! Context assembly — LEDGER item C3.
+//!
+//! Builds the budgeted system prompt (asserted < 2048 estimated tokens in
+//! tests) and loads AGENTS.md / CLAUDE.md memory files from the working
+//! directory (size-capped). The prompt is kept terse on purpose: prompt
+//! weight is a tax on every turn (PLAN.md §3.1).
+
+use crate::memory::MemoryStore;
+use crate::ToolSpec;
+use std::path::Path;
+
+/// Memory files are capped at 8 KiB — memory is context, not a dumping ground.
+pub const MAX_MEMORY_BYTES: usize = 8 * 1024;
+
+/// Description shown per tool in the prompt is truncated to this many chars.
+const TOOL_DESC_MAX_CHARS: usize = 120;
+
+/// The stable, budgeted base prompt. No timestamps or volatile content: this
+/// prefix is cache-friendly (PLAN.md §4.6).
+const PROMPT_PREAMBLE: &str = "\
+You are Modron, a terminal coding agent working in the user's repository.
+
+Rules:
+- Prefer deterministic tools (read, glob, grep) over guessing; never invent file contents.
+- Keep tool outputs small: narrow read ranges, capped result counts, targeted queries.
+- Batch independent tool calls in one turn; sequence calls that depend on earlier results.
+- After editing, verify (re-read the diff, run the tests) before claiming success.
+- Be concise: findings first, `file:line` references, no filler, no restating the task.
+- If you cannot complete the task, say so plainly and stop.";
+
+/// Build the system prompt for a turn: base identity/rules, one line per tool,
+/// then the project-memory section when memory is non-empty.
+///
+/// Budget discipline: with a full built-in tool tier and an 8 KiB memory file
+/// this stays well under 2048 estimated tokens (asserted in tests).
+pub fn build_system_prompt(tools: &[ToolSpec], memory: &str) -> String {
+    let mut prompt = String::from(PROMPT_PREAMBLE);
+    if !tools.is_empty() {
+        prompt.push_str("\n\nTools:\n");
+        for tool in tools {
+            prompt.push_str(&format!(
+                "- {}: {}\n",
+                tool.name,
+                brief_description(&tool.description)
+            ));
+        }
+    }
+    prompt.push_str(&memory_section(memory));
+    prompt.trim_end().to_string()
+}
+
+/// Format the project-memory block appended to the system prompt.
+/// Empty input yields an empty string — no dead headers in the prompt.
+pub fn memory_section(memory: &str) -> String {
+    let trimmed = memory.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("\n\n# Project memory (AGENTS.md/CLAUDE.md)\n{trimmed}")
+}
+
+/// Load project memory from `dir`: reads `AGENTS.md`, falling back to
+/// `CLAUDE.md` (first found wins). Missing files yield an empty string;
+/// oversized files are capped at [`MAX_MEMORY_BYTES`] on a char boundary.
+pub fn load_memory(dir: &Path) -> String {
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let path = dir.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let capped = truncate_bytes(&content, MAX_MEMORY_BYTES);
+                tracing::debug!(path = %path.display(), bytes = capped.len(), "loaded memory file");
+                return capped.trim().to_string();
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "failed reading memory file; ignoring");
+                continue;
+            }
+        }
+    }
+    String::new()
+}
+
+/// First line of `description`, truncated to [`TOOL_DESC_MAX_CHARS`] chars.
+fn brief_description(description: &str) -> String {
+    let first_line = description.lines().next().unwrap_or("").trim();
+    let mut out: String = first_line.chars().take(TOOL_DESC_MAX_CHARS).collect();
+    if first_line.chars().count() > TOOL_DESC_MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// User (auto) memory — LEDGER Phase 1a M3, PLAN.md §4.9 user tier.
+// Additive layer on top of the repo-tier AGENTS.md/CLAUDE.md loading above;
+// the engine composes: with_user_memory(&base, &load_user_memory(root, dir)).
+// ---------------------------------------------------------------------------
+
+/// The whole user-memory section is capped at 4 KiB, on top of the 8 KiB
+/// project-memory cap and the <2k-token prompt budget.
+pub const MAX_USER_MEMORY_BYTES: usize = 4 * 1024;
+
+/// How many recent entry bodies the system prompt includes (index lines for
+/// the rest still appear, so the model knows what exists).
+const USER_MEMORY_ENTRY_LIMIT: usize = 5;
+
+/// Load the user-tier memory for a workspace: index + the 5 newest entry
+/// bodies from the [`MemoryStore`] under `memory_root`. Returns "" when the
+/// root/workspace has nothing yet or on any error — memory must never break a
+/// session. Byte-stable for identical store contents (cache-friendly prefix).
+pub fn load_user_memory(memory_root: &Path, working_dir: &Path) -> String {
+    if !memory_root.is_dir() {
+        return String::new();
+    }
+    let store = match MemoryStore::for_workspace(memory_root, working_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed resolving workspace memory; ignoring");
+            return String::new();
+        }
+    };
+    let content = store.read_entries(USER_MEMORY_ENTRY_LIMIT);
+    if content.trim().is_empty() {
+        return String::new();
+    }
+    let section = format!(
+        "Facts remembered from earlier sessions in this workspace (newest first):\n{content}"
+    );
+    truncate_bytes(&section, MAX_USER_MEMORY_BYTES)
+        .trim_end()
+        .to_string()
+}
+
+/// Append the labeled "## Persistent memory" section to a base system prompt.
+/// Empty `user_memory` returns `base_system` unchanged — no dead headers.
+/// Pure string composition: byte-deterministic for identical inputs.
+pub fn with_user_memory(base_system: &str, user_memory: &str) -> String {
+    let trimmed = user_memory.trim();
+    if trimmed.is_empty() {
+        return base_system.to_string();
+    }
+    format!("{base_system}\n\n## Persistent memory\n{trimmed}")
+}
+
+/// Slice `s` to at most `max` bytes without splitting a UTF-8 code point.
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::estimate_tokens;
+    use crate::memory::MemoryStore;
+    use serde_json::json;
+
+    /// A plausible built-in tool tier: ~10 tools with realistic descriptions.
+    fn plausible_tools() -> Vec<ToolSpec> {
+        [
+            (
+                "read",
+                "Read a file with line ranges. Output is capped at 2000 lines / 48KB.",
+            ),
+            ("glob", "Find files by glob pattern, capped at 200 results."),
+            (
+                "grep",
+                "Regex search across the repo with ripgrep semantics, capped at 50 hits.",
+            ),
+            (
+                "bash",
+                "Run a shell command with a 30s timeout; output capped at 10KB with exit code.",
+            ),
+            (
+                "edit",
+                "Replace an exact old string with a new string in a file; mismatch is an error.",
+            ),
+            (
+                "write",
+                "Write a full file, creating parent directories as needed.",
+            ),
+            ("list", "List a directory tree with depth and entry caps."),
+            (
+                "test",
+                "Run the project test suite and return a summarized result.",
+            ),
+            (
+                "git",
+                "Show git status/diff/log summaries for the working tree.",
+            ),
+            ("fetch", "Fetch a URL and return cleaned-up markdown text."),
+        ]
+        .into_iter()
+        .map(|(name, description)| ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn system_prompt_stays_under_2048_tokens() {
+        // ~3.5KB of memory plus the full tool tier must still fit the budget.
+        let memory = "Build notes: run `cargo test` before answering.\n".repeat(80);
+        let prompt = build_system_prompt(&plausible_tools(), &memory);
+        let tokens = estimate_tokens(&prompt);
+        assert!(
+            tokens < 2048,
+            "system prompt too expensive: {tokens} tokens, {} bytes",
+            prompt.len()
+        );
+    }
+
+    #[test]
+    fn system_prompt_lists_tools_and_includes_memory() {
+        let prompt = build_system_prompt(&plausible_tools(), "Always answer in French.");
+        assert!(prompt.contains("Modron"), "identity missing");
+        assert!(prompt.contains("- grep:"), "tool list missing");
+        assert!(
+            prompt.contains("Always answer in French."),
+            "memory content missing"
+        );
+        assert!(prompt.contains("Project memory"), "memory header missing");
+    }
+
+    #[test]
+    fn system_prompt_without_memory_has_no_memory_section() {
+        let prompt = build_system_prompt(&plausible_tools(), "");
+        assert!(!prompt.contains("Project memory"));
+        assert!(prompt.contains("- read:"));
+    }
+
+    #[test]
+    fn load_memory_prefers_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agents rules").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude rules").unwrap();
+        assert_eq!(load_memory(dir.path()), "agents rules");
+    }
+
+    #[test]
+    fn load_memory_falls_back_to_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude rules").unwrap();
+        assert_eq!(load_memory(dir.path()), "claude rules");
+    }
+
+    #[test]
+    fn load_memory_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_memory(dir.path()), "");
+    }
+
+    #[test]
+    fn load_memory_caps_at_8kb_on_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "a".repeat(20_000)).unwrap();
+        assert_eq!(load_memory(dir.path()).len(), MAX_MEMORY_BYTES);
+
+        // Multi-byte characters must not be split mid-code-point.
+        std::fs::write(dir.path().join("AGENTS.md"), "é".repeat(6000)).unwrap(); // 12_000 bytes
+        let memory = load_memory(dir.path());
+        assert!(memory.len() <= MAX_MEMORY_BYTES);
+        assert!(memory.chars().all(|c| c == 'é'));
+    }
+
+    // -- User (auto) memory — Phase 1a M3 -----------------------------------
+
+    #[test]
+    fn load_user_memory_reads_index_and_bodies_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
+        store.append("older fact", "use tabs").unwrap();
+        store.append("newer fact", "rust pinned to 1.99.1").unwrap();
+
+        let memory = load_user_memory(root.path(), work.path());
+        assert!(
+            !memory.contains("Persistent memory"),
+            "header comes from with_user_memory"
+        );
+        assert!(
+            memory.contains("Facts remembered from earlier sessions"),
+            "{memory}"
+        );
+        assert!(memory.contains("newer fact") && memory.contains("rust pinned to 1.99.1"));
+        assert!(memory.contains("older fact") && memory.contains("use tabs"));
+        assert!(
+            memory.find("newer fact").unwrap() < memory.find("older fact").unwrap(),
+            "newest first: {memory}"
+        );
+    }
+
+    #[test]
+    fn load_user_memory_includes_at_most_five_bodies() {
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
+        for i in 0..7 {
+            store
+                .append(&format!("fact {i}"), &format!("body {i}"))
+                .unwrap();
+        }
+        let memory = load_user_memory(root.path(), work.path());
+        assert_eq!(
+            memory.matches("### ").count(),
+            5,
+            "bodies limited, index shows all 7"
+        );
+        assert!(
+            memory.contains("fact 6") && memory.contains("body 6"),
+            "newest present"
+        );
+        assert!(
+            memory.contains("fact 0"),
+            "index line for the oldest still present"
+        );
+        assert!(!memory.contains("body 0"), "oldest body omitted");
+    }
+
+    #[test]
+    fn load_user_memory_empty_when_nothing_or_missing_root() {
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        // Fresh root, nothing remembered: empty, and reads create nothing.
+        assert_eq!(load_user_memory(root.path(), work.path()), "");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        // Root missing entirely: empty.
+        assert_eq!(load_user_memory(&root.path().join("nope"), work.path()), "");
+    }
+
+    #[test]
+    fn load_user_memory_caps_at_4kb_on_char_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
+        for i in 0..5 {
+            store
+                .append(&format!("fact {i}"), &"é".repeat(1500))
+                .unwrap(); // 3000 bytes each
+        }
+        let memory = load_user_memory(root.path(), work.path());
+        assert!(
+            memory.len() <= MAX_USER_MEMORY_BYTES,
+            "{} bytes",
+            memory.len()
+        );
+        assert!(
+            memory.is_char_boundary(memory.len()),
+            "no split code points"
+        );
+    }
+
+    #[test]
+    fn with_user_memory_appends_labeled_section() {
+        assert_eq!(
+            with_user_memory("BASE", "  remember this  "),
+            "BASE\n\n## Persistent memory\nremember this"
+        );
+    }
+
+    #[test]
+    fn with_user_memory_empty_is_identity_and_deterministic() {
+        assert_eq!(with_user_memory("BASE", ""), "BASE");
+        assert_eq!(with_user_memory("BASE", "   \n"), "BASE");
+        let once = with_user_memory("BASE", "m");
+        assert_eq!(once, with_user_memory("BASE", "m"), "byte-deterministic");
+    }
+
+    #[test]
+    fn system_prompt_with_user_memory_stays_under_2048_tokens() {
+        // Project memory the size the C3 test uses, plus a typical user
+        // memory produced by a real MemoryStore: index of 10 entries + the
+        // 5 newest bodies.
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
+        for i in 0..10 {
+            let body = format!("Decision {i}: {}.", "detail ".repeat(30));
+            store.append(&format!("decision {i}"), &body).unwrap();
+        }
+        let project = "Build notes: run `cargo test` before answering.\n".repeat(80);
+        let base = build_system_prompt(&plausible_tools(), &project);
+        let prompt = with_user_memory(&base, &load_user_memory(root.path(), work.path()));
+        assert!(
+            prompt.contains("## Persistent memory"),
+            "user section present"
+        );
+        assert!(prompt.contains("decision 9"), "recent entry present");
+        let tokens = estimate_tokens(&prompt);
+        assert!(
+            tokens < 2048,
+            "prompt too expensive: {tokens} tokens, {} bytes",
+            prompt.len()
+        );
+    }
+}

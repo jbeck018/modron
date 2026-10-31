@@ -1,0 +1,30 @@
+[package]
+name = "modron-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "modron"
+path = "src/main.rs"
+
+[dependencies]
+modron-core.workspace = true
+modron-providers.workspace = true
+modron-tools.workspace = true
+modron-store.workspace = true
+modron-router.workspace = true
+modron-tui.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

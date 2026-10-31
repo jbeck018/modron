@@ -1,0 +1,162 @@
+# Modron routing corpus (Phase-3a R3) — labeled task examples per tier.
+# `[cheap]`/`[strong]` seed the centroids; `[eval_cheap]`/`[eval_strong]` are
+# HELD OUT from fitting — they are what `modron router eval` scores. Edit
+# examples here to retune routing; the centroids are recomputed at startup.
+
+[[cheap]]
+text = "list the files in src"
+[[cheap]]
+text = "find where tokens are counted"
+[[cheap]]
+text = "show the config options"
+[[cheap]]
+text = "read the main file"
+[[cheap]]
+text = "grep for TODO comments"
+[[cheap]]
+text = "what does this function do"
+[[cheap]]
+text = "summarize the readme"
+[[cheap]]
+text = "which tests exist"
+[[cheap]]
+text = "where is the error handled"
+[[cheap]]
+text = "count lines of code"
+[[cheap]]
+text = "list recent sessions"
+[[cheap]]
+text = "show the git log"
+[[cheap]]
+text = "what version is this"
+[[cheap]]
+text = "print the directory tree"
+[[cheap]]
+text = "explain this error message"
+[[cheap]]
+text = "summarize the changes in the diff"
+[[cheap]]
+text = "how many crates are in the workspace"
+[[cheap]]
+text = "look up the pricing for this model"
+[[cheap]]
+text = "show the session transcript"
+[[cheap]]
+text = "search for unsafe blocks"
+[[cheap]]
+text = "what flags does the cli accept"
+[[cheap]]
+text = "read the ledger"
+[[cheap]]
+text = "describe the folder structure"
+[[cheap]]
+text = "show me the usage table"
+[[cheap]]
+text = "find duplicated code"
+[[cheap]]
+text = "when was this function added"
+[[cheap]]
+text = "where are the env vars read"
+[[cheap]]
+text = "find the config parser"
+[[cheap]]
+text = "find the main loop"
+[[cheap]]
+text = "find the test helper"
+[[cheap]]
+text = "list the crates"
+[[cheap]]
+text = "show the router config"
+[[cheap]]
+text = "list the open issues"
+
+[[strong]]
+text = "implement rate limiting for the api"
+[[strong]]
+text = "refactor the session store into a trait"
+[[strong]]
+text = "fix the flaky test in the engine"
+[[strong]]
+text = "add a retry policy to the provider"
+[[strong]]
+text = "write unit tests for the budget governor"
+[[strong]]
+text = "plan the migration to libsql"
+[[strong]]
+text = "design the mcp integration"
+[[strong]]
+text = "optimize the hot loop in the parser"
+[[strong]]
+text = "migrate the cli to clap derive"
+[[strong]]
+text = "restructure the crate layout"
+[[strong]]
+text = "add streaming support to the provider"
+[[strong]]
+text = "implement the approval gate"
+[[strong]]
+text = "fix the race condition in the tool dispatcher"
+[[strong]]
+text = "write a migration for the schema change"
+[[strong]]
+text = "review this pr and fix the issues"
+[[strong]]
+text = "harden the sandbox profile"
+[[strong]]
+text = "build a tui for the chat loop"
+[[strong]]
+text = "implement autocompaction"
+[[strong]]
+text = "add checkpoints with rewind"
+[[strong]]
+text = "profile and fix the memory leak"
+[[strong]]
+text = "design the router eval harness"
+[[strong]]
+text = "add per-action model overrides"
+[[strong]]
+text = "refactor the agent builder into a library"
+[[strong]]
+text = "implement the acp server"
+[[strong]]
+text = "write the pagination for the store"
+[[strong]]
+text = "fix the off-by-one in the pager"
+[[strong]]
+text = "add zstd compression to transcripts"
+[[strong]]
+text = "implement session branching"
+
+[[eval_cheap]]
+text = "list the tools"
+[[eval_cheap]]
+text = "where is the sandbox code"
+[[eval_cheap]]
+text = "summarize this crate"
+[[eval_cheap]]
+text = "find the config parser"
+[[eval_cheap]]
+text = "what models are in the catalog"
+[[eval_cheap]]
+text = "show the test results"
+[[eval_cheap]]
+text = "count the unit tests"
+[[eval_cheap]]
+text = "read the license file"
+
+[[eval_strong]]
+text = "add pagination to the store"
+[[eval_strong]]
+text = "fix the streaming parser bug"
+[[eval_strong]]
+text = "implement the plan mode"
+[[eval_strong]]
+text = "refactor the provider factory"
+[[eval_strong]]
+text = "write integration tests for hooks"
+[[eval_strong]]
+text = "optimize session loading"
+[[eval_strong]]
+text = "design the embedder router"
+[[eval_strong]]
+text = "migrate to the new edition"

@@ -1,0 +1,24 @@
+[package]
+name = "modron-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+modron-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# S1 streaming: `bytes_stream()` requires reqwest's `stream` feature
+# (workspace pin otherwise unchanged).
+reqwest = { workspace = true, features = ["stream"] }
+# P4 retry backoff needs an async sleep in library code (tokio was dev-dep only).
+tokio.workspace = true
+# S1 streaming: `futures::StreamExt` drives the reqwest byte stream.
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
