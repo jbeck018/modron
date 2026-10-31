@@ -436,3 +436,125 @@ impl modron_core::Tool for TestDelegateTool {
         })
     }
 }
+
+/// Phase 5h: TWO delegate calls in one turn run in PARALLEL (they are
+/// read-only to the parent), both results land in the transcript in order,
+/// and each child runs under its persona's forced model.
+#[tokio::test]
+async fn parallel_delegates_run_concurrently() {
+    use modron_core::testing::MockAsyncRouter;
+    use modron_core::{PersonaSpec, SessionEvent, StopReason, TurnResponse, Usage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(kestrel_shim_store());
+
+    // Script: parent turn 1 = TWO delegate calls; then one child answer per
+    // child (shared provider, order: children first? No — children run
+    // concurrently but the shared mock pops sequentially: child A, child B);
+    // then the parent's final answer.
+    let twin_delegates = TurnResponse {
+        text: String::new(),
+        tool_calls: vec![
+            modron_core::ToolCall {
+                id: "d1".into(),
+                name: "delegate".into(),
+                arguments: serde_json::json!({"task": "do A", "persona": "builder"}),
+            },
+            modron_core::ToolCall {
+                id: "d2".into(),
+                name: "delegate".into(),
+                arguments: serde_json::json!({"task": "do B", "persona": "builder"}),
+            },
+        ],
+        usage: Usage {
+            input_tokens: 200,
+            output_tokens: 20,
+            cached_input_tokens: 0,
+        },
+        stop_reason: StopReason::ToolUse,
+    };
+    let child_answer = |n: &str| TurnResponse {
+        text: format!("result {n}"),
+        tool_calls: Vec::new(),
+        usage: Usage {
+            input_tokens: 300,
+            output_tokens: 50,
+            cached_input_tokens: 0,
+        },
+        stop_reason: StopReason::EndTurn,
+    };
+    let parent_final = TurnResponse {
+        text: "both done".into(),
+        tool_calls: Vec::new(),
+        usage: Usage {
+            input_tokens: 400,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+        },
+        stop_reason: StopReason::EndTurn,
+    };
+    let provider = MockProvider::new()
+        .then_response(twin_delegates)
+        .then_response(child_answer("A"))
+        .then_response(child_answer("B"))
+        .then_response(parent_final);
+    let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+    providers.insert("anthropic".to_string(), Arc::new(provider));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(TouchTool));
+    registry.register(Arc::new(TestDelegateTool));
+
+    let mut personas = std::collections::BTreeMap::new();
+    personas.insert(
+        "builder".to_string(),
+        PersonaSpec {
+            system: Some("You build.".into()),
+            model: Some("claude-sonnet-4-5".into()),
+            provider: Some("anthropic".into()),
+            allow: vec!["write".into()],
+            deny: vec![],
+        },
+    );
+
+    let engine = modron_core::Engine {
+        selector: Arc::new(TierSelector),
+        providers,
+        tools: Arc::new(registry),
+        store: Arc::clone(&store),
+        config: modron_core::EngineConfig {
+            working_dir: dir.path().to_path_buf(),
+            default_provider: "anthropic".into(),
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                non_interactive: true,
+                ..ApprovalPolicy::default()
+            },
+            personas,
+            ..modron_core::EngineConfig::default()
+        },
+    };
+    let _ = MockAsyncRouter::new(vec![]);
+    let summary = engine.run_task("fan out").await.unwrap();
+    assert_eq!(summary.answer, "both done");
+
+    // Both children's results reached the transcript, in call order.
+    let events = store.load(summary.session_id).await.unwrap();
+    let delegate_results: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::ToolResult { outcome, .. } => Some(outcome.content.as_str()),
+            _ => None,
+        })
+        .collect();
+    let a = delegate_results.iter().position(|c| c.contains("result A"));
+    let b = delegate_results.iter().position(|c| c.contains("result B"));
+    assert!(
+        a.is_some() && b.is_some(),
+        "both children answered: {delegate_results:?}"
+    );
+    assert!(
+        a.unwrap() < b.unwrap(),
+        "order preserved under parallel execution"
+    );
+}

@@ -194,6 +194,41 @@ pub fn update_to_line(
             let status = if *is_error { "failed" } else { "completed" };
             Some(tool_call_notification(session_id, name, name, status).to_string())
         }
+        AcUpdate::Tool(ToolActivity::SubagentStarted { id, label }) => Some(
+            tool_call_notification(session_id, id, &format!("subagent: {label}"), "in_progress")
+                .to_string(),
+        ),
+        AcUpdate::Tool(ToolActivity::SubagentProgress {
+            id,
+            turns,
+            tokens,
+            last_tool,
+            ..
+        }) => {
+            let note = match last_tool {
+                Some(tool) => format!("turn {turns} · {tokens} tok · {tool}"),
+                None => format!("turn {turns} · {tokens} tok"),
+            };
+            Some(tool_call_notification(session_id, id, &note, "in_progress").to_string())
+        }
+        AcUpdate::Tool(ToolActivity::SubagentFinished {
+            id,
+            tokens,
+            turns,
+            is_error,
+            ..
+        }) => {
+            let status = if *is_error { "failed" } else { "completed" };
+            Some(
+                tool_call_notification(
+                    session_id,
+                    id,
+                    &format!("{turns} turns · {tokens} tok"),
+                    status,
+                )
+                .to_string(),
+            )
+        }
     }
 }
 

@@ -546,6 +546,25 @@ pub enum ToolActivity {
         is_error: bool,
         bytes: usize,
     },
+    /// A subagent began (Phase 5h): `label` is the persona or "explore".
+    SubagentStarted { id: String, label: String },
+    /// Subagent heartbeat (Phase 5h): emitted after each child turn so UIs
+    /// can render live per-agent progress rows.
+    SubagentProgress {
+        id: String,
+        label: String,
+        turns: u32,
+        tokens: u64,
+        last_tool: Option<String>,
+    },
+    /// A subagent settled.
+    SubagentFinished {
+        id: String,
+        label: String,
+        tokens: u64,
+        turns: u32,
+        is_error: bool,
+    },
 }
 
 /// Sink for [`ToolActivity`] (see `EngineConfig::on_tool_event`).

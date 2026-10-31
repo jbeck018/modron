@@ -195,7 +195,9 @@ deny = ["write", "edit"]
 # Personas are also available to the agent itself via the `delegate` tool:
 # large tasks become isolated subtasks run under a persona's prompt, model,
 # and permissions — with the child's token spend folded into the parent's
-# budget and usage reporting.
+# budget and usage reporting. MULTIPLE delegate calls in one turn run in
+# PARALLEL, with live per-agent rows in the TUI (persona, turn, tokens, last
+# tool) — the Claude Code fan-out pattern.
 
 # Skills (SKILL.md open standard): drop a folder with SKILL.md into
 # .claude/skills/<name>/ (or .modron/skills/<name>/) — the index appears in

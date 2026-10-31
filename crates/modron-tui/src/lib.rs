@@ -61,6 +61,8 @@ pub struct App {
     pub quit: bool,
     /// Braille spinner frame counter (advanced per tick).
     pub spinner_tick: u64,
+    /// Live subagent rows (Phase 5h): id, label, turns, tokens, last_tool.
+    pub subagents: Vec<(String, String, u32, u64, Option<String>)>,
 }
 
 const SPINNER: [&str; 8] = ["✶", "✻", "✽", "✶", "✳", "✻", "✼", "✽"];
@@ -181,7 +183,45 @@ impl App {
                 self.tool_lines
                     .push(format!("● {name} — {mark} ({bytes} B)"));
             }
+            ToolActivity::SubagentStarted { id, label } => {
+                self.subagents.push((id, label, 0, 0, None));
+            }
+            ToolActivity::SubagentProgress {
+                id,
+                turns,
+                tokens,
+                last_tool,
+                ..
+            } => {
+                if let Some(row) = self.subagents.iter_mut().find(|(rid, ..)| *rid == id) {
+                    row.2 = row.2.max(turns);
+                    row.3 = row.3.max(tokens);
+                    row.4 = last_tool.clone();
+                }
+            }
+            ToolActivity::SubagentFinished {
+                id,
+                tokens,
+                turns,
+                is_error,
+                ..
+            } => {
+                if let Some(row) = self.subagents.iter_mut().find(|(rid, ..)| *rid == id) {
+                    row.2 = turns;
+                    row.3 = tokens;
+                    row.4 = Some(if is_error {
+                        "failed".into()
+                    } else {
+                        "done".into()
+                    });
+                }
+            }
         }
+    }
+
+    /// Drop settled subagent rows (called when a turn finishes).
+    pub fn clear_subagents(&mut self) {
+        self.subagents.clear();
     }
 
     /// A turn ended: returns the lines to flush into scrollback (tool
@@ -285,9 +325,13 @@ impl App {
         use ratatui::widgets::Paragraph;
 
         let show_streaming = !self.streaming.is_empty();
+        let show_subagents = !self.subagents.is_empty();
         let mut rows: Vec<Constraint> = Vec::new();
         if show_streaming {
             rows.push(Constraint::Min(1)); // streaming tail
+        }
+        if show_subagents {
+            rows.push(Constraint::Length(self.subagents.len() as u16));
         }
         if self.pending_approval.is_some() {
             rows.push(Constraint::Length(2)); // prompt + decision hint
@@ -301,6 +345,27 @@ impl App {
         if show_streaming {
             let tail = streaming_tail(&self.streaming, chunks[idx].height as usize);
             frame.render_widget(Paragraph::new(tail).style(Style::default()), chunks[idx]);
+            idx += 1;
+        }
+
+        if show_subagents {
+            let rows: Vec<Line> = self
+                .subagents
+                .iter()
+                .map(|(id, label, turns, tokens, last)| {
+                    let state = match last {
+                        Some(t) if t == "done" || t == "failed" => t.clone(),
+                        _ => format!("turn {turns} · {tokens} tok"),
+                    };
+                    let display = if label.is_empty() {
+                        id.clone()
+                    } else {
+                        label.clone()
+                    };
+                    Line::from(format!("  ⏵ [{display}] {state}"))
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(rows), chunks[idx]);
             idx += 1;
         }
 

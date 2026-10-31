@@ -216,6 +216,7 @@ pub async fn run_with(
             engine_task = None;
             match outcome {
                 Outcome::Done(summary) => {
+                    app.clear_subagents();
                     let lines = app.finish_turn(
                         summary.answer.clone(),
                         summary.usage,

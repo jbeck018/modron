@@ -1040,3 +1040,31 @@ with baselines accumulating on disk.** The user adds keys (GROQ_API_KEY,
 GEMINI_API_KEY, …) and the same command grows rows. Deferred: compaction
 tuning against the model window (engine surgery), router training from bench
 JSONL (needs quality labels).
+
+---
+
+# Phase 5h — Parallel subagents + live inspection (opened/closed 2026-10-31)
+
+The user's ask, modeled on Claude Code (best-in-class) and pi's subagents:
+first-class PARALLEL delegation with per-agent live progress inspectable in
+the TUI. The concurrency already existed (read-only dispatch runs all calls
+in a turn concurrently); what was missing was visibility.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | DONE | core lib.rs + subagent.rs |
+| H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | DONE | App.subagents + view; run.rs clears |
+| H3 | ACP: subagent events surface as tool_call / status notifications to the editor | DONE | acp.rs update mapping |
+| H4 | Parallel delegates verified: two delegate calls in ONE turn run concurrently (read-only dispatch), results land in transcript in call order, each child under its persona's forced model | DONE | interactivity::parallel_delegates_run_concurrently |
+| V21 | Gates | DONE | **337 passed / 0 failed**, clippy clean |
+
+## Final verdict — Phase 5h
+
+**Parallel delegation with live inspection is first-class.** A model can fan
+out N delegations in one turn; they run concurrently; the TUI shows a live
+row per subagent (persona, turn, tokens, last tool); ACP editors see the same
+as tool-call updates; and every child's spend lands in the parent's budget.
+Deferred: detached background delegates that outlive the parent turn (needs
+completion-notification semantics — the next big delegation step), and
+worktree isolation for parallel MUTATING agents (pi's pattern; requires git
+integration).

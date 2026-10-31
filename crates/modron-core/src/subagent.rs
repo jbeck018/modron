@@ -158,6 +158,45 @@ pub async fn delegate(
         _ => Arc::clone(&parent.selector),
     };
 
+    // Subagent identity + parent event plumbing (Phase 5h): the child's
+    // tool activity is re-emitted through the parent's sink as tagged
+    // heartbeats, and start/finish events bracket the run.
+    let subagent_id = uuid::Uuid::new_v4().to_string();
+    let label = if persona.is_some() {
+        "persona".to_string()
+    } else {
+        "delegate".to_string()
+    };
+    let parent_sink = parent.config.on_tool_event.clone();
+    if let Some(sink) = &parent_sink {
+        sink(crate::ToolActivity::SubagentStarted {
+            id: subagent_id.clone(),
+            label: label.clone(),
+        });
+    }
+    let progress_id = subagent_id.clone();
+    let progress_label = label.clone();
+    let progress_sink: Option<Arc<dyn Fn(crate::ToolActivity) + Send + Sync>> =
+        parent_sink.map(|parent| {
+            let sink: Arc<dyn Fn(crate::ToolActivity) + Send + Sync> =
+                Arc::new(move |activity: crate::ToolActivity| {
+                    let heartbeat = match &activity {
+                        crate::ToolActivity::Done { name, .. } => {
+                            crate::ToolActivity::SubagentProgress {
+                                id: progress_id.clone(),
+                                label: progress_label.clone(),
+                                turns: 0,
+                                tokens: 0,
+                                last_tool: Some(name.clone()),
+                            }
+                        }
+                        other => other.clone(),
+                    };
+                    parent(heartbeat);
+                });
+            sink
+        });
+
     let config = EngineConfig {
         working_dir: parent.config.working_dir.clone(),
         system: persona.and_then(|p| p.system.clone()).unwrap_or_default(),
@@ -172,6 +211,7 @@ pub async fn delegate(
             allow: persona.map(|p| p.allow.clone()).unwrap_or_default(),
             deny: persona.map(|p| p.deny.clone()).unwrap_or_default(),
         },
+        on_tool_event: progress_sink,
         ..EngineConfig::default()
     };
     let child = Engine {
@@ -181,12 +221,26 @@ pub async fn delegate(
         store: Arc::clone(&parent.store),
         config,
     };
+    let run = child.run_task(task).await;
+    if let Some(sink) = parent.config.on_tool_event.as_ref() {
+        let (tokens, turns, is_error) = match &run {
+            Ok(summary) => (summary.usage.total(), summary.turns, false),
+            Err(_) => (0, 0, true),
+        };
+        sink(crate::ToolActivity::SubagentFinished {
+            id: subagent_id.clone(),
+            label: label.clone(),
+            tokens,
+            turns,
+            is_error,
+        });
+    }
     let RunSummary {
         answer,
         usage,
         turns,
         ..
-    } = child.run_task(task).await?;
+    } = run?;
     Ok(ExploreReport {
         brief: answer,
         usage,
