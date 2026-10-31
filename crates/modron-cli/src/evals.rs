@@ -383,3 +383,103 @@ pub(crate) async fn run_evals(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use modron_core::testing::{MockProvider, StaticSelector};
+    use modron_core::{StopReason, ToolCall, TurnResponse, Usage};
+
+    #[tokio::test]
+    async fn eval_harness_scores_a_solved_task() {
+        // The mock "solves" the task: writes the file the verifier checks.
+        let provider = MockProvider::new()
+            .then_response(TurnResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path": "answer.txt", "content": "42"}),
+                }],
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cached_input_tokens: 0,
+                },
+                stop_reason: StopReason::ToolUse,
+            })
+            .then_response(TurnResponse {
+                text: "done".into(),
+                tool_calls: Vec::new(),
+                usage: Usage {
+                    input_tokens: 50,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                },
+                stop_reason: StopReason::EndTurn,
+            });
+        let mut registry = modron_core::ToolRegistry::new();
+        registry.register(Arc::new(modron_tools::WriteTool));
+        let engine = modron_core::Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: [(
+                "mock".to_string(),
+                Arc::new(provider) as Arc<dyn modron_core::ModelProvider>,
+            )]
+            .into_iter()
+            .collect(),
+            tools: Arc::new(registry),
+            store: Arc::new(modron_core::testing::InMemoryStore::default()),
+            config: modron_core::EngineConfig::default(),
+        };
+        let task = EvalTask {
+            id: "answer".into(),
+            prompt: "write 42 to answer.txt".into(),
+            setup: None,
+            verify: "grep -q 42 answer.txt".into(),
+            max_turns: Some(4),
+            budget_tokens: Some(50_000),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_eval_task(&engine, &task, dir.path()).await.unwrap();
+        assert!(result.passed, "solved: {:?}", result.failure_note);
+    }
+
+    #[tokio::test]
+    async fn eval_harness_fails_an_unsolved_task() {
+        // Mock says done without doing the work → verifier fails.
+        let provider = MockProvider::new().then_text("I did nothing");
+        let engine = modron_core::Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: [(
+                "mock".to_string(),
+                Arc::new(provider) as Arc<dyn modron_core::ModelProvider>,
+            )]
+            .into_iter()
+            .collect(),
+            tools: Arc::new(modron_core::ToolRegistry::new()),
+            store: Arc::new(modron_core::testing::InMemoryStore::default()),
+            config: modron_core::EngineConfig::default(),
+        };
+        let task = EvalTask {
+            id: "answer".into(),
+            prompt: "write 42 to answer.txt".into(),
+            setup: None,
+            verify: "test -f answer.txt".into(),
+            max_turns: Some(2),
+            budget_tokens: Some(50_000),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_eval_task(&engine, &task, dir.path()).await.unwrap();
+        assert!(!result.passed, "uncompleted work must fail the verifier");
+        assert!(result.failure_note.is_some());
+    }
+
+    #[test]
+    fn suite_loads_from_committed_toml() {
+        let tasks = load_suite(MINI_SWE_TOML).unwrap();
+        assert!(tasks.len() >= 5, "mini-SWE suite: {}", tasks.len());
+        assert!(tasks.iter().all(|t| !t.verify.is_empty()));
+        assert!(tasks.iter().all(|t| !t.prompt.is_empty()));
+    }
+}
