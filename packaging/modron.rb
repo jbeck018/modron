@@ -4,7 +4,7 @@ class Modron < Formula
   homepage "https://github.com/jbeck018/modron"
   url "https://github.com/jbeck018/modron.git",
       tag:      "v0.1.0",
-      revision: "1ec0481d91c110a5fadb3a5297d30a27f45ab2f6"
+      revision: "adecea0a9b066c3962ea85008f1ac58150bdb796"
   version "0.1.0"
   license "MIT"
 
