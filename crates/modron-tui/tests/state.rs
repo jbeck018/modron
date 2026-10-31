@@ -7,6 +7,13 @@ use modron_tui::{Action, App, PendingApproval};
 use serde_json::json;
 use std::sync::mpsc;
 
+fn line_text(line: &ratatui::text::Line) -> String {
+    line.spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+}
+
 fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::from(code)
 }
@@ -195,10 +202,10 @@ fn finish_turn_flushes_tools_and_answer_and_updates_totals() {
         id,
     );
     assert!(
-        lines.iter().any(|l| l.contains("● bash")),
+        lines.iter().any(|l| line_text(l).contains("● bash")),
         "tool lines flush: {lines:?}"
     );
-    assert!(lines.iter().any(|l| l == "the full answer"));
+    assert!(lines.iter().any(|l| line_text(l) == "the full answer"));
     assert_eq!(app.cumulative.total(), 120);
     assert!(app.session_id == Some(id));
     assert!(!app.running);
@@ -241,11 +248,19 @@ fn render(app: &App, width: u16, height: u16) -> String {
 
 #[test]
 fn idle_view_renders_prompt_and_status() {
-    let mut app = App::default();
-    app.input.push_str("hello world");
-    let frame = render(&app, 80, 4);
-    assert!(frame.contains("❯ hello world"), "input line: {frame:?}");
-    assert!(frame.contains("idle"), "status: {frame:?}");
+    let app = App {
+        model_label: "glm-5.3".into(),
+        input: "hello world".into(),
+        ..App::default()
+    };
+    let frame = render(&app, 80, 6);
+    assert!(
+        frame.contains("❯ hello world"),
+        "input in the bordered box: {frame:?}"
+    );
+    assert!(frame.contains("glm-5.3"), "model in status: {frame:?}");
+    assert!(frame.contains("╭"), "rounded border: {frame:?}");
+    assert!(frame.contains("▎"), "cursor block: {frame:?}");
 }
 
 #[test]
@@ -254,30 +269,32 @@ fn approval_view_renders_the_prompt_and_hint() {
         pending_approval: Some(pending()),
         ..App::default()
     };
-    let frame = render(&app, 80, 4);
+    let frame = render(&app, 80, 7);
     assert!(frame.contains("allow bash"), "approval prompt: {frame:?}");
     assert!(frame.contains("y = allow once"), "decision hint: {frame:?}");
     assert!(
         frame.contains("rm -rf /"),
         "the dangerous command is visible: {frame:?}"
     );
+    assert!(frame.contains("╭"), "input box stays rendered: {frame:?}");
 }
 
 #[test]
 fn running_view_shows_spinner_and_interrupt_hint() {
     let mut app = App {
         running: true,
+        model_label: "glm-5.3".into(),
         ..App::default()
     };
     app.on_delta(StreamDelta::Text("streaming answer text".into()));
-    let frame = render(&app, 80, 6);
-    assert!(frame.contains("running"), "status: {frame:?}");
-    assert!(
-        frame.contains("esc to interrupt"),
-        "interrupt hint: {frame:?}"
-    );
+    let frame = render(&app, 80, 8);
+    assert!(frame.contains("esc interrupt"), "interrupt hint: {frame:?}");
     assert!(
         frame.contains("streaming answer text"),
         "streaming tail: {frame:?}"
+    );
+    assert!(
+        frame.contains("working"),
+        "working title on the border: {frame:?}"
     );
 }

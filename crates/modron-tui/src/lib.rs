@@ -15,7 +15,9 @@ pub mod run;
 pub use run::{run_with, TuiConfig, TuiSinks};
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders};
 use std::sync::mpsc::Sender;
 
 /// What the user's last key press asks the run loop to do.
@@ -64,9 +66,15 @@ pub struct App {
     /// Upgrade notice (Phase 6e): rendered in the status line when a newer
     /// release exists.
     pub upgrade_notice: Option<String>,
+    /// Model label for the status line (set by the run loop).
+    pub model_label: String,
     /// Live subagent rows (Phase 5h): id, label, turns, tokens, last_tool.
     pub subagents: Vec<(String, String, u32, u64, Option<String>)>,
 }
+
+/// Claude Code-inspired palette: a warm accent for activity, dim for meta.
+pub const ACCENT: Color = Color::Rgb(255, 159, 10);
+pub const DIM: Color = Color::DarkGray;
 
 const SPINNER: [&str; 8] = ["✶", "✻", "✽", "✶", "✳", "✻", "✼", "✽"];
 
@@ -236,7 +244,7 @@ impl App {
         turns: u32,
         _tool_calls: u32,
         session_id: modron_core::SessionId,
-    ) -> Vec<String> {
+    ) -> Vec<Line<'static>> {
         self.running = false;
         self.streaming.clear();
         self.current_tool = None;
@@ -246,28 +254,60 @@ impl App {
         self.cumulative.output_tokens += usage.output_tokens;
         self.cumulative.cached_input_tokens += usage.cached_input_tokens;
 
-        let mut lines = std::mem::take(&mut self.tool_lines);
+        // Styled scrollback: tool lines dim-cyan, answer default, meta dim.
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for tool in std::mem::take(&mut self.tool_lines) {
+            lines.push(Line::from(tool).style(Style::default().fg(Color::Cyan)));
+        }
         if answer.is_empty() {
-            lines.push("(no answer — turn/budget limit hit; see transcript)".to_string());
+            lines.push(
+                Line::from("(no answer — turn/budget limit hit; see transcript)")
+                    .style(Style::default().fg(Color::Yellow)),
+            );
         } else {
             for line in answer.lines() {
-                lines.push(line.to_string());
+                lines.push(Line::from(line.to_string()));
             }
         }
-        lines.push(String::new()); // blank separator before the next prompt
+        lines.push(
+            Line::from(format!(
+                "  {} tok · {} turns · {} cache",
+                usage.total(),
+                turns,
+                {
+                    let all = usage.input_tokens + usage.cached_input_tokens;
+                    if all > 0 {
+                        format!(
+                            "{:.0}%",
+                            100.0 * usage.cached_input_tokens as f64 / all as f64
+                        )
+                    } else {
+                        "—".to_string()
+                    }
+                }
+            ))
+            .style(Style::default().fg(DIM)),
+        );
+        lines.push(Line::from(""));
         lines
     }
 
     /// The turn was interrupted: flush partial tool lines + a note.
-    pub fn finish_interrupted(&mut self) -> Vec<String> {
+    pub fn finish_interrupted(&mut self) -> Vec<Line<'static>> {
         self.running = false;
         self.streaming.clear();
         self.current_tool = None;
         self.status_note =
             Some("interrupted — partial work is persisted; resume with --resume".into());
-        let mut lines = std::mem::take(&mut self.tool_lines);
-        lines.push("(interrupted — partial work is persisted)".to_string());
-        lines.push(String::new());
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for tool in std::mem::take(&mut self.tool_lines) {
+            lines.push(Line::from(tool).style(Style::default().fg(Color::Cyan)));
+        }
+        lines.push(
+            Line::from("(interrupted — partial work is persisted; resume with --resume)")
+                .style(Style::default().fg(Color::Yellow)),
+        );
+        lines.push(Line::from(""));
         lines
     }
 
@@ -276,8 +316,6 @@ impl App {
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
-        // Echo the submitted task into the scrollback (the run loop owns the
-        // flush; recorded here so the view can show what is running).
         self.tool_lines.push(format!("❯ {task}"));
     }
 
@@ -322,78 +360,179 @@ impl App {
     }
 
     /// Render the live region into `frame` (the run loop sizes the area).
+    /// Claude Code-style: streaming/status zone on top, a rounded bordered
+    /// input box at the bottom, color throughout (accent for activity, dim
+    /// for meta, cyan for tools, red for errors).
     pub fn view(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         use ratatui::layout::{Constraint, Layout};
-        use ratatui::style::{Modifier, Style};
         use ratatui::widgets::Paragraph;
 
-        let show_streaming = !self.streaming.is_empty();
-        let show_subagents = !self.subagents.is_empty();
+        // Split: everything above vs the bordered input box (3 rows).
+        let outer = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(3), // bordered input
+        ])
+        .split(area);
+        let top = outer[0];
+        let input_area = outer[1];
+
+        // Top zone rows: streaming (fills), subagents, approval/status.
         let mut rows: Vec<Constraint> = Vec::new();
-        if show_streaming {
-            rows.push(Constraint::Min(1)); // streaming tail
+        if !self.streaming.is_empty() {
+            rows.push(Constraint::Min(1));
         }
-        if show_subagents {
+        if !self.subagents.is_empty() {
             rows.push(Constraint::Length(self.subagents.len() as u16));
         }
         if self.pending_approval.is_some() {
-            rows.push(Constraint::Length(2)); // prompt + decision hint
+            rows.push(Constraint::Length(2));
         } else {
-            rows.push(Constraint::Length(1)); // status
+            rows.push(Constraint::Length(1));
         }
-        rows.push(Constraint::Length(1)); // input
-        let chunks = Layout::vertical(rows).split(area);
+        let chunks = Layout::vertical(rows).split(top);
 
         let mut idx = 0;
-        if show_streaming {
+        if !self.streaming.is_empty() {
             let tail = streaming_tail(&self.streaming, chunks[idx].height as usize);
-            frame.render_widget(Paragraph::new(tail).style(Style::default()), chunks[idx]);
+            frame.render_widget(Paragraph::new(tail), chunks[idx]);
             idx += 1;
         }
 
-        if show_subagents {
-            let rows: Vec<Line> = self
+        if !self.subagents.is_empty() {
+            let lines: Vec<Line> = self
                 .subagents
                 .iter()
                 .map(|(id, label, turns, tokens, last)| {
-                    let state = match last {
-                        Some(t) if t == "done" || t == "failed" => t.clone(),
-                        _ => format!("turn {turns} · {tokens} tok"),
+                    let (state_str, color) = match last {
+                        Some(t) if t == "done" => (t.clone(), Color::Green),
+                        Some(t) if t == "failed" => (t.clone(), Color::Red),
+                        _ => (format!("turn {turns} · {tokens} tok"), ACCENT),
                     };
                     let display = if label.is_empty() {
                         id.clone()
                     } else {
                         label.clone()
                     };
-                    Line::from(format!("  ⏵ [{display}] {state}"))
+                    Line::from(vec![
+                        Span::styled("  ⏵ ", Style::default().fg(ACCENT)),
+                        Span::styled(format!("[{display}] "), Style::default().fg(DIM)),
+                        Span::styled(state_str, Style::default().fg(color)),
+                    ])
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(rows), chunks[idx]);
+            frame.render_widget(Paragraph::new(lines), chunks[idx]);
             idx += 1;
         }
 
-        let status = self.status_line();
         if self.pending_approval.is_some() {
-            // Approval prompt replaces the status; decision hint on its own line.
             let hint = "y = allow once · a = allow for this run · n/Esc = deny";
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(status.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-                    Line::from(hint.to_string()),
+                    Line::from(self.status_line()).style(
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Yellow),
+                    ),
+                    Line::from(hint).style(Style::default().fg(DIM)),
                 ]),
                 chunks[idx],
             );
-            idx += 1;
         } else {
-            frame.render_widget(Paragraph::new(vec![Line::from(status)]), chunks[idx]);
-            idx += 1;
+            let status = self.styled_status_line();
+            frame.render_widget(Paragraph::new(status), chunks[idx]);
         }
 
-        let prompt = if self.running { "  " } else { "❯ " };
+        // ── Bordered input box ──
+        let border_color = if self.running { ACCENT } else { DIM };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .title(Span::styled(
+                if self.running {
+                    " modron — working (esc to interrupt) "
+                } else {
+                    " modron "
+                },
+                Style::default().fg(border_color),
+            ));
+        let inner = block.inner(input_area);
+        frame.render_widget(block, input_area);
+
+        // Input text; cursor rendered as a block at the text end.
+        let display_input = if self.input.is_empty() && !self.running {
+            "type a task…" // placeholder
+        } else {
+            &self.input
+        };
+        let input_style = if self.input.is_empty() && !self.running {
+            Style::default().fg(DIM)
+        } else {
+            Style::default()
+        };
         frame.render_widget(
-            Paragraph::new(vec![Line::from(format!("{prompt}{}", self.input))]),
-            chunks[idx],
+            Paragraph::new(Line::from(vec![
+                Span::styled("❯ ", Style::default().fg(ACCENT)),
+                Span::styled(display_input.to_string(), input_style),
+            ])),
+            inner,
         );
+        // Blinking-style cursor block after the text (only when not running
+        // and there's no placeholder shift).
+        if !self.running && !self.input.is_empty() {
+            let cursor_x = inner.x + 2 + self.input.chars().count() as u16;
+            let cursor_y = inner.y;
+            if cursor_x < inner.x + inner.width {
+                if let Some(cell) = frame
+                    .buffer_mut()
+                    .cell_mut(ratatui::layout::Position::new(cursor_x, cursor_y))
+                {
+                    cell.set_symbol("▎").set_style(Style::default().fg(ACCENT));
+                }
+            }
+        }
+    }
+
+    /// The status line as styled spans (spinner accent, model dim, tokens).
+    fn styled_status_line(&self) -> Line<'static> {
+        let spinner = SPINNER[(self.spinner_tick as usize) % SPINNER.len()];
+        if self.running {
+            let tool = self
+                .current_tool
+                .as_ref()
+                .map(|t| format!(" · {t}"))
+                .unwrap_or_default();
+            Line::from(vec![
+                Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
+                Span::styled(self.model_label.clone(), Style::default().fg(DIM)),
+                Span::styled(
+                    format!(
+                        " turn {} · {} tok{tool}",
+                        self.turn_count + 1,
+                        self.cumulative.total()
+                    ),
+                    Style::default().fg(DIM),
+                ),
+                Span::styled("  esc interrupt", Style::default().fg(DIM)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
+                Span::styled(self.model_label.clone(), Style::default().fg(DIM)),
+                Span::styled(
+                    format!(
+                        " · {} tok · ctrl+o {}",
+                        self.cumulative.total(),
+                        if self.transcript_mode {
+                            "full"
+                        } else {
+                            "compact"
+                        }
+                    ),
+                    Style::default().fg(DIM),
+                ),
+            ])
+        }
     }
 }
 
@@ -401,7 +540,6 @@ impl App {
 /// chars (manual wrapping: ratatui's Paragraph wrap inside an inline
 /// viewport is a known misbehavior source — see LEDGER Phase 1d).
 pub fn streaming_tail(text: &str, max_lines: usize) -> Vec<Line<'static>> {
-    use ratatui::text::Line;
     const WIDTH: usize = 110;
     let mut wrapped: Vec<String> = Vec::new();
     for line in text.lines() {

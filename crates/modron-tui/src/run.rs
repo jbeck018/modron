@@ -235,7 +235,11 @@ pub async fn run_with(
                     for line in app.finish_interrupted() {
                         commit(&mut terminal, &line)?;
                     }
-                    commit(&mut terminal, &format!("error: {e}"))?;
+                    commit(
+                        &mut terminal,
+                        &ratatui::text::Line::from(format!("error: {e}"))
+                            .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+                    )?;
                 }
                 Outcome::Aborted => {}
             }
@@ -268,12 +272,11 @@ pub async fn run_with(
 /// Commit one line into native scrollback above the live viewport.
 fn commit(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    line: &str,
+    line: &ratatui::text::Line<'static>,
 ) -> anyhow::Result<()> {
-    use ratatui::text::Line;
     use ratatui::widgets::Widget as _;
     terminal.insert_before(1, |buf| {
-        ratatui::widgets::Paragraph::new(Line::from(line.to_string())).render(buf.area, buf);
+        ratatui::widgets::Paragraph::new(line.clone()).render(buf.area, buf);
     })?;
     Ok(())
 }
