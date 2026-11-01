@@ -1042,9 +1042,6 @@ fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
     println!("\nconfig:");
     match config::config_path() {
         Some(path) if path.exists() => {
-            match crate::auth::load_tokens() {
-                _ => {}
-            }
             // Try parsing it via load_from.
             let loaded = config::load_from(&path, |_| None);
             println!("  ✓ {} (parses)", path.display());
