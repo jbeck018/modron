@@ -508,7 +508,7 @@ impl App {
         // Split: everything above vs the bordered input box (3 rows).
         // Input box height grows with multi-line content (3 base + 1/line).
         let input_lines = self.input.matches('\n').count() as u16;
-        let input_height = (3 + input_lines).min(area.height.saturating_sub(2));
+        let input_height = (3 + input_lines).min(6).min(area.height.saturating_sub(2));
         let outer =
             Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).split(area);
         let top = outer[0];

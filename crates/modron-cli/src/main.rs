@@ -240,6 +240,9 @@ enum MemoryAction {
     after_help = "Config file: ~/.config/modron/config.toml — Sessions: ~/.modron/sessions/ — Memory: ~/.modron/memory/"
 )]
 struct Cli {
+    /// `modron --upgrade` / `--update` — alias for the `upgrade` subcommand.
+    #[arg(long, alias = "update", hide = true)]
+    upgrade: bool,
     /// Task text; the agent runs it to completion and prints the answer.
     /// Omit when using a subcommand. If the task itself starts with a
     /// subcommand name, pass `--` first: `modron -- memory leaks in parser`.
@@ -321,20 +324,63 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+    init_tracing(cli.verbose, tui_session(&cli));
     if let Err(err) = run(cli).await {
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }
 }
 
-/// stderr tracing: `--verbose` (or `RUST_LOG`) shows debug detail; the
-/// default filter shows info-level turn/tool progress from the engine.
-/// ANSI colors only when stderr is a terminal.
-fn init_tracing(verbose: bool) {
+/// Will this invocation run the interactive TUI (bare `modron`, `modron
+/// tui`, or post-onboarding on a TTY)? Decided before tracing initializes
+/// so logs can be routed away from stderr before the viewport takes over.
+fn tui_session(cli: &Cli) -> bool {
+    use std::io::IsTerminal as _;
+    cli.task.is_none()
+        && matches!(cli.command, None | Some(Command::Tui))
+        && std::io::stdout().is_terminal()
+}
+
+/// Tracing sink: stderr for one-shot/subcommand runs; a log FILE for the
+/// TUI. Writing to stderr while the inline viewport owns the terminal
+/// corrupts the frame — raw mode means LF without CR and no wrap control,
+/// so interleaved "engine turn start" lines staircase over the UI and
+/// desync ratatui's scroll tracking (the ghost-box/duplicated-lines bug).
+/// TUI logs land in ~/.modron/logs/modron.log.
+fn init_tracing(verbose: bool, tui: bool) {
     use std::io::IsTerminal as _;
     let default_filter = if verbose { "debug" } else { "info" };
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| default_filter.to_string());
+    if tui {
+        let dir = default_sessions_dir()
+            .parent()
+            .map(|root| root.join("logs"))
+            .unwrap_or_else(std::env::temp_dir);
+        let file = std::fs::create_dir_all(&dir).ok().and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("modron.log"))
+                .ok()
+        });
+        if let Some(file) = file {
+            tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+                .init();
+            tracing::info!("modron TUI session — logs routed to file (stderr corrupts the viewport)");
+            return;
+        }
+        // Log file unopenable: protect the TUI — cap stderr at warn.
+        let fallback = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_string());
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(fallback))
+            .init();
+        return;
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
@@ -343,6 +389,10 @@ fn init_tracing(verbose: bool) {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    // `modron --upgrade` — flag alias for the upgrade subcommand.
+    if cli.upgrade {
+        return crate::upgrade::run_upgrade().await;
+    }
     // Source saved API keys from onboarding (Phase 12).
     crate::onboarding::source_env_file();
     let cfg = config::load();
@@ -471,18 +521,33 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         let notice = modron_upgrade_notice();
         return modron_tui::run_with(
             |sinks| {
-                let agent = build_agent_with(
-                    &cli,
-                    &cfg,
-                    interactive,
-                    AgentSinks {
-                        approver: Some(sinks.approver),
-                        on_delta: Some(sinks.on_delta),
-                        on_tool_event: Some(sinks.on_tool_event),
-                    },
-                    &mcp,
-                )
-                .expect("build agent for tui");
+                let build = |cli: &Cli| {
+                    build_agent_with(
+                        cli,
+                        &cfg,
+                        interactive,
+                        AgentSinks {
+                            approver: Some(sinks.approver.clone()),
+                            on_delta: Some(sinks.on_delta.clone()),
+                            on_tool_event: Some(sinks.on_tool_event.clone()),
+                        },
+                        &mcp,
+                    )
+                };
+                let agent = match build(&cli) {
+                    Ok(agent) => agent,
+                    Err(err) => {
+                        // No-key startup guarantee: the TUI always opens.
+                        eprintln!(
+                            "warning: {err:#}\n  opening in mock (demo) mode — \
+                             add a key via onboarding or `modron doctor`"
+                        );
+                        let mut demo = cli.clone();
+                        demo.provider = Some(ProviderChoice::Mock);
+                        demo.model = None;
+                        build(&demo).expect("the mock provider always builds")
+                    }
+                };
                 (agent.engine, agent.resume)
             },
             String::new(),
@@ -500,7 +565,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let interactive = std::io::stdin().is_terminal();
             // First-run onboarding (Phase 12): if no provider key exists,
             // show the friendly setup screen instead of erroring later.
-            if !onboarding::has_any_key() {
+            // An explicit --provider choice (especially mock) IS a
+            // configuration — never intercept it with onboarding.
+            if cli.provider.is_none() && !onboarding::has_any_key() {
                 let provider = onboarding::run_onboarding()?;
                 let mut onboarded = cli.clone();
                 onboarded.provider = None; // let config drive it
@@ -511,21 +578,36 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 let notice = modron_upgrade_notice();
                 return modron_tui::run_with(
                     |sinks| {
-                        let agent = build_agent_with(
-                            &onboarded,
-                            &cfg,
-                            true,
-                            AgentSinks {
-                                approver: Some(sinks.approver),
-                                on_delta: Some(sinks.on_delta),
-                                on_tool_event: Some(sinks.on_tool_event),
-                            },
-                            &mcp,
-                        )
-                        .expect("build agent after onboarding");
+                        let build = |cli: &Cli| {
+                            build_agent_with(
+                                cli,
+                                &cfg,
+                                true,
+                                AgentSinks {
+                                    approver: Some(sinks.approver.clone()),
+                                    on_delta: Some(sinks.on_delta.clone()),
+                                    on_tool_event: Some(sinks.on_tool_event.clone()),
+                                },
+                                &mcp,
+                            )
+                        };
+                        let agent = match build(&onboarded) {
+                            Ok(agent) => agent,
+                            Err(err) => {
+                                // No-key startup guarantee: the TUI always opens.
+                                eprintln!(
+                                    "warning: {err:#}\n  opening in mock (demo) mode — \
+                                     add a key via onboarding or `modron doctor`"
+                                );
+                                let mut demo = onboarded.clone();
+                                demo.provider = Some(ProviderChoice::Mock);
+                                demo.model = None;
+                                build(&demo).expect("the mock provider always builds")
+                            }
+                        };
                         (agent.engine, agent.resume)
                     },
-                    onboarded.model.clone().unwrap_or_default(),
+                    tui_model_label(&onboarded, &cfg),
                     notice,
                 )
                 .await
@@ -542,21 +624,36 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             };
             return modron_tui::run_with(
                 |sinks| {
-                    let agent = build_agent_with(
-                        &effective_cli,
-                        &cfg,
-                        interactive,
-                        AgentSinks {
-                            approver: Some(sinks.approver),
-                            on_delta: Some(sinks.on_delta),
-                            on_tool_event: Some(sinks.on_tool_event),
-                        },
-                        &mcp,
-                    )
-                    .expect("build agent for tui");
+                    let build = |cli: &Cli| {
+                        build_agent_with(
+                            cli,
+                            &cfg,
+                            interactive,
+                            AgentSinks {
+                                approver: Some(sinks.approver.clone()),
+                                on_delta: Some(sinks.on_delta.clone()),
+                                on_tool_event: Some(sinks.on_tool_event.clone()),
+                            },
+                            &mcp,
+                        )
+                    };
+                    let agent = match build(&effective_cli) {
+                        Ok(agent) => agent,
+                        Err(err) => {
+                            // No-key startup guarantee: the TUI always opens.
+                            eprintln!(
+                                "warning: {err:#}\n  opening in mock (demo) mode — \
+                                 add a key via onboarding or `modron doctor`"
+                            );
+                            let mut demo = effective_cli.clone();
+                            demo.provider = Some(ProviderChoice::Mock);
+                            demo.model = None;
+                            build(&demo).expect("the mock provider always builds")
+                        }
+                    };
                     (agent.engine, agent.resume)
                 },
-                cli.model.clone().unwrap_or_default(),
+                tui_model_label(&cli, &cfg),
                 notice,
             )
             .await
@@ -694,6 +791,57 @@ impl AgentSinks {
 /// - `interactive`: attach the /dev/tty approver when a terminal is present,
 ///   so Ask mode prompts instead of blocking.
 /// - `stream`: attach the stdout delta sink (chat mode streams answers live).
+/// First provider (besides `unavailable`) whose key is set — the no-key
+/// startup fallback scans common providers in rough preference order.
+pub(crate) fn detect_available_provider(unavailable: &str) -> Option<String> {
+    let candidates = [
+        ("zai", "ZAI_API_KEY"),
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openai-compat", "OPENAI_API_KEY"),
+        ("google", "GEMINI_API_KEY"),
+        ("groq", "GROQ_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+        ("mistral", "MISTRAL_API_KEY"),
+        ("cerebras", "CEREBRAS_API_KEY"),
+        ("nvidia", "NVIDIA_API_KEY"),
+    ];
+    candidates
+        .iter()
+        .find(|(pid, env)| {
+            *pid != unavailable
+                && std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false)
+        })
+        .map(|(pid, _)| pid.to_string())
+}
+
+/// The catalog's default model for a provider (first strong-tier entry,
+/// else the first entry) — used when a provider switch invalidates the
+/// default model.
+fn default_model_for_provider(pid: &str) -> Option<String> {
+    let entries = modron_router::catalog();
+    entries
+        .iter()
+        .filter(|m| m.provider == pid)
+        .find(|m| m.tier == modron_router::Tier::Strong)
+        .or_else(|| entries.iter().find(|m| m.provider == pid))
+        .map(|m| m.name.clone())
+}
+
+/// The TUI status-line model label: explicit flag > config > "mock" for
+/// demo runs, else empty (the engine's internal default).
+fn tui_model_label(cli: &Cli, cfg: &config::Config) -> String {
+    cli.model
+        .clone()
+        .or_else(|| cfg.default_model.clone())
+        .unwrap_or_else(|| {
+            if matches!(cli.provider, Some(ProviderChoice::Mock)) {
+                "mock".to_string()
+            } else {
+                String::new()
+            }
+        })
+}
+
 fn build_agent_with(
     cli: &Cli,
     cfg: &config::Config,
@@ -902,7 +1050,31 @@ fn build_agent_with(
     }
 
     let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-    providers.insert(provider_id.clone(), build_provider(&provider_id)?);
+    // No-key startup: if the chosen provider can't start (usually a missing
+    // key) but another provider has a key, switch instead of dying. The
+    // user sees a note; a provider-specific default model follows the
+    // switch unless the user pinned a model explicitly.
+    let (provider_id, main_provider) = match build_provider(&provider_id) {
+        Ok(provider) => (provider_id, provider),
+        Err(err) => match detect_available_provider(&provider_id) {
+            Some(alt) => {
+                let note =
+                    format!("provider `{provider_id}` unavailable ({err:#}) — using `{alt}`");
+                eprintln!("note: {note}");
+                tracing::warn!("{note}");
+                let provider = build_provider(&alt)?;
+                (alt, provider)
+            }
+            None => return Err(err),
+        },
+    };
+    let model_explicit = cli.model.is_some() || cfg.default_model.is_some();
+    if !model_explicit {
+        if let Some(m) = default_model_for_provider(&provider_id) {
+            engine_config.default_model = m;
+        }
+    }
+    providers.insert(provider_id.clone(), main_provider);
 
     let store = Arc::new(JsonlSessionStore::new(&sessions_dir));
     let mut registry = default_registry_with_memory(&memory_root);

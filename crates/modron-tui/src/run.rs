@@ -37,10 +37,12 @@ pub struct TuiConfig {
     pub model_label: String,
 }
 
-/// Minimum live-region height (input box 3 + status 1 + breathing room).
-const VIEWPORT_MIN: u16 = 5;
-/// Cap for the live region — the terminal's native scrollback owns the rest.
-const VIEWPORT_MAX: u16 = 24;
+/// Fixed live-region height: input box + status + streaming tail. The
+/// earlier reactive grow/shrink viewport repositioned ratatui's inline
+/// region mid-session and left stale frames frozen in scrollback (the
+/// ghost "working" input box). A fixed region with internal flex layout
+/// (streaming/subagents/approval trade space inside it) is deterministic.
+const VIEWPORT_HEIGHT: u16 = 10;
 const TICK: Duration = Duration::from_millis(50);
 
 /// Shared approval slot: the engine-side approver queues a call; the render
@@ -125,7 +127,15 @@ pub async fn run_with(
     let mut terminal = ratatui::Terminal::with_options(
         backend,
         ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(VIEWPORT_MIN),
+            viewport: ratatui::Viewport::Inline(
+                // Fit small terminals, but never resize after this.
+                crossterm::terminal::size()
+                    .map(|(_, r)| r)
+                    .unwrap_or(24)
+                    .saturating_sub(1)
+                    .min(VIEWPORT_HEIGHT)
+                    .max(3),
+            ),
         },
     )?;
 
@@ -179,7 +189,6 @@ pub async fn run_with(
     };
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut last_viewport_height: u16 = VIEWPORT_MIN;
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
 
@@ -248,9 +257,9 @@ pub async fn run_with(
                                 // Give the runtime a beat to cancel.
                                 tokio::time::sleep(Duration::from_millis(30)).await;
                             }
-                            for line in app.finish_interrupted() {
-                                commit(&mut terminal, &line)?;
-                            }
+                            blank_frame(&mut terminal)?;
+                            let lines = app.finish_interrupted();
+                            commit_block(&mut terminal, &lines)?;
                         }
                         crate::Action::Quit => {
                             if let Some(task) = engine_task.take() {
@@ -272,9 +281,16 @@ pub async fn run_with(
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 5. Engine settled?
+        // 5. Engine settled? (Re-drain the event channels first: deltas and
+        // tool activities can queue behind the Done notification.)
         while let Ok(outcome) = done_rx.try_recv() {
             engine_task = None;
+            while let Ok(msg) = delta_rx.try_recv() {
+                match msg {
+                    DeltaOrTool::Delta(d) => app.on_delta(d),
+                    DeltaOrTool::Tool(t) => app.on_tool(t),
+                }
+            }
             match outcome {
                 Outcome::Done(summary) => {
                     app.clear_subagents();
@@ -285,19 +301,17 @@ pub async fn run_with(
                         summary.tool_calls,
                         summary.session_id,
                     );
-                    for line in &lines {
-                        commit(&mut terminal, line)?;
-                    }
+                    blank_frame(&mut terminal)?;
+                    commit_block(&mut terminal, &lines)?;
                 }
                 Outcome::Failed(e) => {
-                    for line in app.finish_interrupted() {
-                        commit(&mut terminal, &line)?;
-                    }
-                    commit(
-                        &mut terminal,
-                        &ratatui::text::Line::from(format!("error: {e}"))
+                    let mut lines = app.finish_interrupted();
+                    lines.push(
+                        ratatui::text::Line::from(format!("error: {e}"))
                             .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
-                    )?;
+                    );
+                    blank_frame(&mut terminal)?;
+                    commit_block(&mut terminal, &lines)?;
                 }
                 Outcome::Aborted => {}
             }
@@ -308,30 +322,8 @@ pub async fn run_with(
             break;
         }
 
-        // 6. Render the live region; advance the spinner.
-        // Reactive viewport (Phase 6g): grows with content, shrinks idle.
-        let term_size = terminal.size()?;
-        let streaming_h = if app.streaming.is_empty() {
-            0
-        } else {
-            (term_size.height / 3).clamp(3, 12)
-        };
-        let desired = 3
-            + 1
-            + app.subagents.len() as u16
-            + streaming_h
-            + u16::from(app.pending_approval.is_some());
-        let new_height = desired.clamp(VIEWPORT_MIN, term_size.height.min(VIEWPORT_MAX));
-        if new_height != last_viewport_height {
-            let _ = terminal.resize(ratatui::layout::Rect::new(
-                0,
-                0,
-                term_size.width,
-                new_height,
-            ));
-            last_viewport_height = new_height;
-        }
-
+        // 6. Render the live region; advance the spinner. The region height
+        // is FIXED (see VIEWPORT_HEIGHT) — no mid-session resizes.
         app.spinner_tick += 1;
         terminal.draw(|frame| app.view(frame, frame.area()))?;
     }
@@ -345,14 +337,54 @@ pub async fn run_with(
     result
 }
 
+/// Blank the live region before committing lines into scrollback: every
+/// `insert_before` scrolls the terminal up, and whatever is painted in the
+/// viewport at that moment (streaming tail, working-status frame — even the
+/// bordered input box) rides into scrollback as a stale duplicate. Drawing
+/// an empty frame first makes the scrolled-up rows blank.
+fn blank_frame(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> anyhow::Result<()> {
+    // An empty draw emits nothing; terminal.clear() actually erases the
+    // viewport rows on screen and resets the back buffer, so the next
+    // insert_before/draw starts from a consistent state.
+    terminal.clear()?;
+    Ok(())
+}
+
 /// Commit one line into native scrollback above the live viewport.
 fn commit(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     line: &ratatui::text::Line<'static>,
 ) -> anyhow::Result<()> {
+    commit_block(terminal, std::slice::from_ref(line))
+}
+
+/// Commit a block of lines into scrollback in ONE `insert_before` call.
+/// Sequential 1-line inserts were the duplicated-answer bug: each insert
+/// scrolls the screen up one row, pushing the painted viewport content
+/// (the streaming tail) above the viewport one row at a time, where later
+/// inserts' clears could no longer reach it. A single H-line insert
+/// scrolls once and its non-sparse draw overwrites everything the scroll
+/// pushed up, so nothing stale survives.
+fn commit_block(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    lines: &[ratatui::text::Line<'static>],
+) -> anyhow::Result<()> {
     use ratatui::widgets::Widget as _;
-    terminal.insert_before(1, |buf| {
-        ratatui::widgets::Paragraph::new(line.clone()).render(buf.area, buf);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    terminal.insert_before(lines.len() as u16, |buf| {
+        for (i, line) in lines.iter().enumerate() {
+            let row = ratatui::layout::Rect {
+                x: 0,
+                y: i as u16,
+                width: buf.area.width,
+                height: 1,
+            };
+            ratatui::widgets::Paragraph::new(line.clone()).render(row, buf);
+        }
     })?;
     Ok(())
 }
