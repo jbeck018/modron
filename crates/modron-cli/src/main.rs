@@ -14,6 +14,7 @@
 
 pub mod acp;
 pub mod daemon;
+pub mod onboarding;
 use daemon as modron_daemon;
 pub mod auth;
 pub mod config;
@@ -342,6 +343,8 @@ fn init_tracing(verbose: bool) {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    // Source saved API keys from onboarding (Phase 12).
+    crate::onboarding::source_env_file();
     let cfg = config::load();
 
     let sessions_dir = cli
@@ -495,6 +498,39 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         use std::io::IsTerminal as _;
         if std::io::stdout().is_terminal() {
             let interactive = std::io::stdin().is_terminal();
+            // First-run onboarding (Phase 12): if no provider key exists,
+            // show the friendly setup screen instead of erroring later.
+            if !onboarding::has_any_key() {
+                let provider = onboarding::run_onboarding()?;
+                let mut onboarded = cli.clone();
+                onboarded.provider = None; // let config drive it
+                if provider == "mock" {
+                    onboarded.provider = Some(ProviderChoice::Mock);
+                }
+                let mcp = spawn_mcp_servers(&cfg).await?;
+                let notice = modron_upgrade_notice();
+                return modron_tui::run_with(
+                    |sinks| {
+                        let agent = build_agent_with(
+                            &onboarded,
+                            &cfg,
+                            true,
+                            AgentSinks {
+                                approver: Some(sinks.approver),
+                                on_delta: Some(sinks.on_delta),
+                                on_tool_event: Some(sinks.on_tool_event),
+                            },
+                            &mcp,
+                        )
+                        .expect("build agent after onboarding");
+                        (agent.engine, agent.resume)
+                    },
+                    onboarded.model.clone().unwrap_or_default(),
+                    notice,
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("{err:#}"));
+            }
             let mcp = spawn_mcp_servers(&cfg).await?;
             let notice = modron_upgrade_notice();
             let effective_cli = if cli.yolo {

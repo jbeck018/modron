@@ -93,7 +93,10 @@ fn sessions_list_shows_tokens_and_cost() {
     assert!(stdout.contains("est. cost"), "header: {stdout}");
     assert!(stdout.contains('$'), "a cost figure appears: {stdout}");
     // The demo run's usage appears as a positive number.
-    assert!(stdout.contains("5560") || stdout.matches(char::is_numeric).count() > 20, "usage data: {stdout}");
+    assert!(
+        stdout.contains("5560") || stdout.matches(char::is_numeric).count() > 20,
+        "usage data: {stdout}"
+    );
 }
 
 /// I1 at the CLI boundary: a piped one-shot run does NOT stream mid-answer
