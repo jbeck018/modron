@@ -163,7 +163,19 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
             },
             stop_reason: ToolUse,
         },
-        // Turn 3: a write call (shows the approval/checkpoint path).
+        // Turn 3 (CHILD's answer — the delegate's brief): the child engine
+        // shares this provider and consumes the next scripted response.
+        TurnResponse {
+            text: "Found 3 modules: core (engine + routing), cli (TUI + commands), and tools (bash/read/write/edit). The engine handles context assembly, model selection, and the agent loop.".into(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 600,
+                output_tokens: 150,
+                cached_input_tokens: 300,
+            },
+            stop_reason: EndTurn,
+        },
+        // Turn 4 (parent resumes): a write call (shows the approval/checkpoint path).
         TurnResponse {
             text: String::new(),
             tool_calls: vec![ToolCall {
@@ -178,7 +190,7 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
             },
             stop_reason: ToolUse,
         },
-        // Turn 4: a failing tool (shows the error styling).
+        // Turn 5: a failing tool (shows the error styling).
         TurnResponse {
             text: String::new(),
             tool_calls: vec![ToolCall {
@@ -193,7 +205,7 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
             },
             stop_reason: ToolUse,
         },
-        // Turn 5: the final answer with decent streaming.
+        // Turn 6: the final answer with decent streaming.
         TurnResponse {
             text: "Demo complete — you saw tool calls (bash/read/grep), \
 a delegate subagent, a file write with checkpoint, an error result, \
