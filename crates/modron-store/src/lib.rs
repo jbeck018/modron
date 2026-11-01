@@ -234,6 +234,7 @@ mod tests {
                     content: "42".into(),
                     is_error: false,
                     usage: None,
+                    meta: None,
                 },
             },
             SessionEvent::Usage {

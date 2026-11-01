@@ -101,12 +101,9 @@ fn brief_description(description: &str) -> String {
 /// project-memory cap and the <2k-token prompt budget.
 pub const MAX_USER_MEMORY_BYTES: usize = 4 * 1024;
 
-/// How many recent entry bodies the system prompt includes (index lines for
-/// the rest still appear, so the model knows what exists).
-const USER_MEMORY_ENTRY_LIMIT: usize = 5;
-
-/// Load the user-tier memory for a workspace: index + the 5 newest entry
-/// bodies from the [`MemoryStore`] under `memory_root`. Returns "" when the
+/// Load the user-tier memory for a workspace: the hot facts (injection-
+/// ordered oldest-first, cache-stable, usefulness-pruned via the stats
+/// ledger) from the [`MemoryStore`] under `memory_root`. Returns "" when the
 /// root/workspace has nothing yet or on any error — memory must never break a
 /// session. Byte-stable for identical store contents (cache-friendly prefix).
 pub fn load_user_memory(memory_root: &Path, working_dir: &Path) -> String {
@@ -120,16 +117,55 @@ pub fn load_user_memory(memory_root: &Path, working_dir: &Path) -> String {
             return String::new();
         }
     };
-    let content = store.read_entries(USER_MEMORY_ENTRY_LIMIT);
-    if content.trim().is_empty() {
+    // Reserve room for the header inside the cap.
+    let budget = MAX_USER_MEMORY_BYTES.saturating_sub(160);
+    let content = store.injectable_entries(budget);
+    if content.is_empty() {
         return String::new();
     }
-    let section = format!(
-        "Facts remembered from earlier sessions in this workspace (newest first):\n{content}"
-    );
-    truncate_bytes(&section, MAX_USER_MEMORY_BYTES)
+    format!(
+        "Facts remembered from earlier sessions in this workspace (use the \
+         memory_search tool to find the rest):\n{content}"
+    )
+    .trim_end()
+    .to_string()
+}
+
+/// The cross-project tier budget — durable preferences, kept tighter than
+/// the project tier.
+pub const MAX_GLOBAL_MEMORY_BYTES: usize = 2 * 1024;
+
+/// Load the global (cross-project) memory tier: durable user preferences
+/// that follow the user across workspaces. Same injection rules as the
+/// project tier. "" when empty — no dead headers.
+pub fn load_global_memory(memory_root: &Path) -> String {
+    if !memory_root.is_dir() {
+        return String::new();
+    }
+    let store = match MemoryStore::for_global(memory_root) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed resolving global memory; ignoring");
+            return String::new();
+        }
+    };
+    let content = store.injectable_entries(MAX_GLOBAL_MEMORY_BYTES.saturating_sub(160));
+    if content.is_empty() {
+        return String::new();
+    }
+    format!("Durable preferences (global, all projects):\n{content}")
         .trim_end()
         .to_string()
+}
+
+/// Append the labeled "## Global preferences" section to a base system
+/// prompt. Empty input returns `base_system` unchanged.
+pub fn with_global_memory(base_system: &str, global_memory: &str) -> String {
+    let trimmed = global_memory.trim();
+    if trimmed.is_empty() {
+        return base_system.to_string();
+    }
+    format!("{base_system}\n\n## Global preferences\n{trimmed}")
 }
 
 /// Append the labeled "## Persistent memory" section to a base system prompt.
@@ -279,7 +315,7 @@ mod tests {
     // -- User (auto) memory — Phase 1a M3 -----------------------------------
 
     #[test]
-    fn load_user_memory_reads_index_and_bodies_newest_first() {
+    fn load_user_memory_reads_bodies_oldest_first_cache_stable() {
         let root = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
@@ -298,36 +334,96 @@ mod tests {
         assert!(memory.contains("newer fact") && memory.contains("rust pinned to 1.99.1"));
         assert!(memory.contains("older fact") && memory.contains("use tabs"));
         assert!(
-            memory.find("newer fact").unwrap() < memory.find("older fact").unwrap(),
-            "newest first: {memory}"
+            memory.find("older fact").unwrap() < memory.find("newer fact").unwrap(),
+            "oldest first: {memory}"
         );
+
+        // The cache-stable property (Phase 13): appending a fact must leave
+        // the previous snapshot as a byte-exact prefix — only the tail grows,
+        // so the provider prefix cache keeps hitting.
+        store.append("third fact", "tail entry").unwrap();
+        let grown = load_user_memory(root.path(), work.path());
+        assert!(
+            grown.starts_with(&memory),
+            "previous snapshot must be a prefix:\n--- before ---\n{memory}\n--- after ---\n{grown}"
+        );
+        assert!(grown.ends_with("tail entry"), "{grown}");
     }
 
     #[test]
-    fn load_user_memory_includes_at_most_five_bodies() {
+    fn load_user_memory_over_budget_drops_newest_not_oldest() {
         let root = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
-        for i in 0..7 {
+        for i in 0..5 {
             store
                 .append(&format!("fact {i}"), &format!("body {i}"))
                 .unwrap();
         }
+        // Fill to the cap: ~3.5KB bodies total.
+        for i in 0..5 {
+            store
+                .append(
+                    &format!("big {i}"),
+                    &format!("{} ", "x".repeat(900)),
+                )
+                .unwrap();
+        }
         let memory = load_user_memory(root.path(), work.path());
+        assert!(
+            memory.len() <= MAX_USER_MEMORY_BYTES,
+            "{} bytes",
+            memory.len()
+        );
+        assert!(
+            memory.contains("fact 0") && !memory.contains("big 4"),
+            "budget trims the NEWEST (tail) — the cached prefix survives: {memory}"
+        );
+    }
+
+    #[test]
+    fn load_global_memory_and_with_global_memory() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(load_global_memory(root.path()), "", "empty global tier");
+
+        let global = MemoryStore::for_global(root.path()).unwrap();
+        global.append("editor", "user prefers helix").unwrap();
+        let section = load_global_memory(root.path());
+        assert!(section.contains("Durable preferences"), "{section}");
+        assert!(section.contains("helix"), "{section}");
+        assert!(
+            section.len() <= MAX_GLOBAL_MEMORY_BYTES,
+            "{} bytes",
+            section.len()
+        );
+
+        // Project tier stays isolated from global.
+        let work = tempfile::tempdir().unwrap();
+        let project = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
+        project.append("project fact", "workspace only").unwrap();
+        assert!(!load_global_memory(root.path()).contains("workspace only"));
+        assert!(
+            !load_user_memory(root.path(), work.path()).contains("helix"),
+            "global does not leak into the project tier"
+        );
+
         assert_eq!(
-            memory.matches("### ").count(),
-            5,
-            "bodies limited, index shows all 7"
+            with_global_memory("BASE", "  pref  "),
+            "BASE\n\n## Global preferences\npref"
         );
-        assert!(
-            memory.contains("fact 6") && memory.contains("body 6"),
-            "newest present"
-        );
-        assert!(
-            memory.contains("fact 0"),
-            "index line for the oldest still present"
-        );
-        assert!(!memory.contains("body 0"), "oldest body omitted");
+        assert_eq!(with_global_memory("BASE", ""), "BASE");
+    }
+
+    #[test]
+    fn load_global_memory_caps_at_2kb_on_char_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let global = MemoryStore::for_global(root.path()).unwrap();
+        for i in 0..3 {
+            global.append(&format!("pref {i}"), &"é".repeat(1200)).unwrap();
+        }
+        let memory = load_global_memory(root.path());
+        assert!(memory.len() <= MAX_GLOBAL_MEMORY_BYTES, "{} bytes", memory.len());
+        assert!(memory.is_char_boundary(memory.len()), "no split code points");
     }
 
     #[test]

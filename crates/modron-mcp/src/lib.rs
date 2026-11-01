@@ -377,6 +377,7 @@ impl Tool for McpTool {
                 content: result.content,
                 is_error: result.is_error,
                 usage: None,
+                meta: None,
             }),
             Err(e) => Err(modron_core::Error::Tool {
                 tool: self.qualified_name(),

@@ -51,7 +51,16 @@ impl Tool for RememberTool {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "Short label for the fact."},
-                    "body": {"type": "string", "description": "The fact itself, plain text."}
+                    "body": {"type": "string", "description": "The fact itself, plain text."},
+                    "scope": {"type": "string", "enum": ["project", "global"],
+                              "description": "project (default): this workspace. global: durable \
+                              user preference for ALL projects."},
+                    "kind": {"type": "string", "enum": ["fact", "breadcrumb"],
+                              "description": "fact (default): injected hot memory. breadcrumb: a \
+                              searchable trace item, never injected — use for observations and \
+                              dead ends worth finding later, not preferences."},
+                    "tags": {"type": "array", "items": {"type": "string"},
+                              "description": "Breadcrumb tags (ignored for facts)."}
                 },
                 "required": ["title", "body"]
             }),
@@ -81,6 +90,32 @@ impl Tool for RememberTool {
             return Ok(tool_err(NAME, "`body` must not be empty", REDUCE_CAP));
         }
 
+        let scope = arg_str(&args, "scope").unwrap_or("project");
+        let kind = arg_str(&args, "kind").unwrap_or("fact");
+        let tags: Vec<String> = args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !matches!(scope, "project" | "global") {
+            return Ok(tool_err(
+                NAME,
+                format!("`scope` must be \"project\" or \"global\", got {scope:?}"),
+                REDUCE_CAP,
+            ));
+        }
+        if !matches!(kind, "fact" | "breadcrumb") {
+            return Ok(tool_err(
+                NAME,
+                format!("`kind` must be \"fact\" or \"breadcrumb\", got {kind:?}"),
+                REDUCE_CAP,
+            ));
+        }
+
         let store = match MemoryStore::for_workspace(&self.memory_root, &ctx.working_dir) {
             Ok(store) => store,
             Err(err) => {
@@ -91,21 +126,56 @@ impl Tool for RememberTool {
                 ))
             }
         };
-        match store.append(title, body) {
-            Ok(entry) => Ok(ToolOutcome::ok(reduce_output(
-                format!(
-                    "remembered \"{}\" — saved to {} (will appear in future sessions in this \
-                     workspace)",
-                    entry.title,
-                    entry.path.display()
-                ),
-                REDUCE_CAP,
-            ))),
-            Err(err) => Ok(tool_err(
-                NAME,
-                format!("cannot save memory: {err}"),
-                REDUCE_CAP,
-            )),
+        let store = if scope == "global" {
+            match MemoryStore::for_global(&self.memory_root) {
+                Ok(store) => store,
+                Err(err) => {
+                    return Ok(tool_err(
+                        NAME,
+                        format!("cannot save global memory: {err}"),
+                        REDUCE_CAP,
+                    ))
+                }
+            }
+        } else {
+            store
+        };
+        match kind {
+            "breadcrumb" => {
+                let mut crumb_tags = tags;
+                crumb_tags.push(title.to_string());
+                match store.append_breadcrumb(body, &crumb_tags) {
+                    Ok(crumb) => Ok(ToolOutcome::ok(reduce_output(
+                        format!(
+                            "remembered breadcrumb {} ({scope}) — searchable via memory_search, \
+                             never injected into the prompt",
+                            crumb.id
+                        ),
+                        REDUCE_CAP,
+                    ))),
+                    Err(err) => Ok(tool_err(
+                        NAME,
+                        format!("cannot save memory: {err}"),
+                        REDUCE_CAP,
+                    )),
+                }
+            }
+            _ => match store.append(title, body) {
+                Ok(entry) => Ok(ToolOutcome::ok(reduce_output(
+                    format!(
+                        "remembered \"{}\" ({scope} fact) — saved to {} (injected into future \
+                         sessions until the curator prunes it)",
+                        entry.title,
+                        entry.path.display()
+                    ),
+                    REDUCE_CAP,
+                ))),
+                Err(err) => Ok(tool_err(
+                    NAME,
+                    format!("cannot save memory: {err}"),
+                    REDUCE_CAP,
+                )),
+            },
         }
     }
 }
@@ -218,6 +288,75 @@ mod tests {
         assert_ne!(store_a.slug(), store_b.slug());
         assert_eq!(store_a.read_entry("fact").unwrap().unwrap().trim(), "for a");
         assert_eq!(store_b.read_entry("fact").unwrap().unwrap().trim(), "for b");
+    }
+
+    #[tokio::test]
+    async fn global_scope_writes_the_cross_project_tier() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let out = run(
+            json!({"title": "editor", "body": "prefers helix", "scope": "global"}),
+            root.path(),
+            work.path(),
+        )
+        .await;
+        assert!(!out.is_error, "{out:?}");
+        let global = MemoryStore::for_global(root.path()).unwrap();
+        assert_eq!(
+            global.read_entry("editor").unwrap().unwrap().trim(),
+            "prefers helix"
+        );
+        // The project tier stays clean.
+        let project = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
+        assert!(project.read_entry("editor").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn breadcrumb_kind_never_touches_the_fact_index() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let out = run(
+            json!({
+                "title": "dead end",
+                "body": "retrying flaky gateway test 3x did not help",
+                "kind": "breadcrumb",
+                "tags": ["tests"]
+            }),
+            root.path(),
+            work.path(),
+        )
+        .await;
+        assert!(!out.is_error, "{out:?}");
+        assert!(out.content.contains("breadcrumb"), "{out:?}");
+        let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
+        assert_eq!(store.read_index(), "", "no fact injected");
+        let crumbs = store.breadcrumbs();
+        assert_eq!(crumbs.len(), 1);
+        assert!(crumbs[0].text.contains("gateway"));
+        assert!(crumbs[0].tags.contains(&"tests".to_string()));
+        assert!(crumbs[0].tags.contains(&"dead end".to_string()), "title becomes a tag");
+        // And it is searchable.
+        assert!(!store.search_breadcrumbs("gateway", 3).is_empty());
+    }
+
+    #[tokio::test]
+    async fn bad_scope_and_kind_are_rejected() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let out = run(
+            json!({"title": "t", "body": "b", "scope": "universal"}),
+            root.path(),
+            work.path(),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("scope"), "{out:?}");
+        let out = run(
+            json!({"title": "t", "body": "b", "kind": "rumor"}),
+            root.path(),
+            work.path(),
+        )
+        .await;
+        assert!(out.is_error && out.content.contains("kind"), "{out:?}");
     }
 
     #[test]

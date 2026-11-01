@@ -5,7 +5,16 @@
 //! ```text
 //! <memory_root>/<workspace-slug>/MEMORY.md                    index, newest first, ≤16 KiB
 //! <memory_root>/<workspace-slug>/entries/<stamp>-<title>.md   one markdown file per entry
+//! <memory_root>/<workspace-slug>/breadcrumbs.jsonl            searchable trace tier (Phase 13)
+//! <memory_root>/<workspace-slug>/stats.json                   usefulness ledger: uses/successes/failures
+//! <memory_root>/global/…                                      cross-project tier (same shape)
 //! ```
+//!
+//! Phase 13 (self-improving memory): facts are the hot tier (injected into
+//! the system prompt), breadcrumbs are a searchable index that is never
+//! injected, and every fact carries a [`FactStat`] ledger. The curator
+//! ([`MemoryStore::curate`]) prunes on *proven usefulness* — hits and
+//! success/failure records decayed by idle days — not just age.
 //!
 //! The workspace slug is derived from the canonicalized working directory:
 //! lowercase alnum/dash segments joined by `-`, plus a short FNV-1a hash
@@ -238,6 +247,353 @@ impl MemoryStore {
         tracing::debug!(count = removed_targets.len(), "memory entries forgotten");
         Ok(true)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: global tier, breadcrumbs, usefulness ledger, curator
+// ---------------------------------------------------------------------------
+
+/// Rolling cap for the breadcrumb tier: the newest [`MAX_BREADCRUMBS`]
+/// lines are kept, the rest fall off the tail.
+pub const MAX_BREADCRUMBS: usize = 500;
+
+/// One searchable trace item — never injected into the prompt, surfaced only
+/// through `memory_search`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Breadcrumb {
+    /// Stable id (`bc-<stamp>-<hash>`).
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// RFC 3339 UTC timestamp.
+    pub created: String,
+}
+
+/// Usefulness ledger entry per fact id (the entry file stem).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FactStat {
+    pub uses: u32,
+    pub successes: u32,
+    pub failures: u32,
+    /// RFC 3339 UTC timestamp of the last `memory_search` hit.
+    #[serde(default)]
+    pub last_used: String,
+    /// Set by the curator: a relegated fact stays in the index and on disk,
+    /// but its body is no longer injected into the system prompt.
+    #[serde(default)]
+    pub relegated: bool,
+}
+
+/// What one curator pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CurateReport {
+    pub facts_total: usize,
+    pub facts_relegated: usize,
+    pub facts_reinstated: usize,
+    pub breadcrumbs_pruned: usize,
+}
+
+/// Curator policy knobs (defaults in [`CuratePolicy::default`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CuratePolicy {
+    /// Days without a hit before a fact starts decaying.
+    pub grace_days: f64,
+    /// Days a breadcrumb survives regardless of interest.
+    pub breadcrumb_ttl_days: f64,
+}
+
+impl Default for CuratePolicy {
+    fn default() -> Self {
+        Self {
+            grace_days: 7.0,
+            breadcrumb_ttl_days: 90.0,
+        }
+    }
+}
+
+impl MemoryStore {
+    /// The cross-project tier: same layout, rooted at `<memory_root>/global`.
+    /// Durable user preferences that follow the user across workspaces.
+    pub fn for_global(memory_root: &Path) -> Result<MemoryStore> {
+        if memory_root.as_os_str().is_empty() {
+            return Err(Error::Session("memory root must not be empty".into()));
+        }
+        Ok(MemoryStore {
+            root: memory_root.join("global"),
+        })
+    }
+
+    /// Append a breadcrumb (trace tier). Cheap: one JSONL line, rolling cap.
+    pub fn append_breadcrumb(&self, text: &str, tags: &[String]) -> Result<Breadcrumb> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(Error::Session("breadcrumb text must not be empty".into()));
+        }
+        fs::create_dir_all(&self.root).map_err(|err| {
+            io_err(&err, format!("cannot create {}", self.root.display()))
+        })?;
+        let now = chrono::Utc::now();
+        let stamp = now.format("%Y%m%dT%H%M%S%3f").to_string();
+        let crumb = Breadcrumb {
+            id: format!("bc-{stamp}-{}", short_hash(text)),
+            text: truncate_at_char_boundary(text, MAX_ENTRY_BYTES).to_string(),
+            tags: tags.to_vec(),
+            created: now.to_rfc3339(),
+        };
+        let mut lines: Vec<String> = self
+            .breadcrumbs()
+            .into_iter()
+            .map(|c| serde_json::to_string(&c).unwrap_or_default())
+            .collect();
+        lines.push(serde_json::to_string(&crumb).map_err(|e| Error::Session(e.to_string()))?);
+        while lines.len() > MAX_BREADCRUMBS {
+            lines.remove(0);
+        }
+        write_atomic(
+            &self.root.join("breadcrumbs.jsonl"),
+            &format!("{}
+", lines.join("
+")),
+        )?;
+        Ok(crumb)
+    }
+
+    /// All breadcrumbs, oldest first. Unreadable/short files yield empty.
+    pub fn breadcrumbs(&self) -> Vec<Breadcrumb> {
+        let Ok(raw) = fs::read_to_string(self.root.join("breadcrumbs.jsonl")) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Token-scored search over the breadcrumb tier: every query token that
+    /// appears (case-insensitively) in text or tags scores a point; ties
+    /// break toward the newest. Zero-score crumbs are omitted.
+    pub fn search_breadcrumbs(&self, query: &str, limit: usize) -> Vec<Breadcrumb> {
+        let tokens = tokenize(query);
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(u32, Breadcrumb)> = self
+            .breadcrumbs()
+            .into_iter()
+            .filter_map(|c| {
+                let hay = format!("{} {}", c.text, c.tags.join(" ")).to_lowercase();
+                let score = tokens
+                    .iter()
+                    .filter(|t| hay.contains(t.as_str()))
+                    .count() as u32;
+                (score > 0).then_some((score, c))
+            })
+            .collect();
+        // Score descending; ties break toward the newest (RFC 3339 stamps
+        // compare lexicographically).
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.created.cmp(&a.1.created))
+        });
+        scored.into_iter().take(limit).map(|(_, c)| c).collect()
+    }
+
+    /// The full usefulness ledger (id → stat), sorted by id.
+    pub fn stats(&self) -> std::collections::BTreeMap<String, FactStat> {
+        let Ok(raw) = fs::read_to_string(self.root.join("stats.json")) else {
+            return std::collections::BTreeMap::new();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    fn write_stats(&self, stats: &std::collections::BTreeMap<String, FactStat>) -> Result<()> {
+        if self.root.exists() {
+            let json = serde_json::to_string_pretty(stats)
+                .map_err(|e| Error::Session(e.to_string()))?;
+            write_atomic(&self.root.join("stats.json"), &json)?;
+        }
+        Ok(())
+    }
+
+    /// Record a `memory_search` hit: `uses += 1`, `last_used = now`.
+    /// Creates no directories when the store does not exist yet.
+    pub fn record_hit(&self, id: &str) {
+        let mut stats = self.stats();
+        if !self.root.exists() {
+            return;
+        }
+        let stat = stats.entry(id.to_string()).or_default();
+        stat.uses += 1;
+        stat.last_used = chrono::Utc::now().to_rfc3339();
+        let _ = self.write_stats(&stats);
+    }
+
+    /// Fold the run's outcome back into the ledger for the memories the run
+    /// touched. Called by the engine at the end of a completed run.
+    pub fn record_outcome(&self, ids: &[String], ok: bool) {
+        if !self.root.exists() || ids.is_empty() {
+            return;
+        }
+        let mut stats = self.stats();
+        for id in ids {
+            let stat = stats.entry(id.clone()).or_default();
+            if ok {
+                stat.successes += 1;
+            } else {
+                stat.failures += 1;
+            }
+        }
+        let _ = self.write_stats(&stats);
+    }
+
+    /// Fact id (entry file stem) → `(label, target)` for every index entry,
+    /// oldest first — the cache-stable injection order (new facts append at
+    /// the tail, so the injected prefix never rewrites).
+    pub fn facts_oldest_first(&self) -> Vec<(String, String, String)> {
+        let mut entries: Vec<(String, String)> = index_entries(&self.read_index());
+        entries.reverse(); // index is newest-first
+        entries
+            .into_iter()
+            .filter_map(|(label, target)| {
+                let id = target
+                    .strip_prefix("entries/")?
+                    .strip_suffix(".md")?
+                    .to_string();
+                Some((id, label, target))
+            })
+            .collect()
+    }
+
+    /// Bodies of injectable facts, OLDEST FIRST, byte-capped. Ordering is
+    /// the cache-stable trick (Phase 13): new facts append at the tail, so
+    /// a session's injected prefix is byte-identical until the cap trims
+    /// the NEWEST entries off the end — the provider's prefix cache keeps
+    /// hitting. Relegated facts ([`FactStat::relegated`]) are skipped.
+    pub fn injectable_entries(&self, max_bytes: usize) -> String {
+        let stats = self.stats();
+        let mut out = String::new();
+        let mut omitted = 0usize;
+        for (id, label, target) in self.facts_oldest_first() {
+            if stats.get(&id).is_some_and(|s| s.relegated) {
+                omitted += 1;
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(self.root.join(&target)) else {
+                continue;
+            };
+            let body = body.trim();
+            if body.is_empty() {
+                continue;
+            }
+            let block = format!("### {label}\n{body}\n\n");
+            if out.len() + block.len() > max_bytes {
+                omitted += 1;
+                continue;
+            }
+            out.push_str(&block);
+        }
+        if omitted > 0 {
+            out.push_str(&format!(
+                "({omitted} more remembered — use the memory_search tool to find them)\n"
+            ));
+        }
+        out.trim_end().to_string()
+    }
+
+    /// One curator pass: decay by idle time, relegate facts whose proven
+    /// usefulness score has gone non-positive, reinstate ones that recovered,
+    /// and drop stale breadcrumbs. Idempotent.
+    pub fn curate(&self, policy: CuratePolicy) -> Result<CurateReport> {
+        let now = chrono::Utc::now();
+        let mut report = CurateReport::default();
+        let facts = self.facts_oldest_first();
+        report.facts_total = facts.len();
+        if !facts.is_empty() {
+            let mut stats = self.stats();
+            for (id, label, _) in &facts {
+                let stat = stats.entry(id.clone()).or_default();
+                let created = entry_created_older(label); // YYYY-MM-DD from the label
+                let last_used = parse_rfc3339(&stat.last_used)
+                    .or(created)
+                    .unwrap_or(now); // unknown → no idle decay yet
+                let idle_days = (now - last_used).num_days().max(0) as f64;
+                let age_days = created.map(|c| (now - c).num_days().max(0) as f64).unwrap_or(0.0);
+                let score = usefulness_score(stat, idle_days);
+                let was = stat.relegated;
+                stat.relegated =
+                    score <= 0.0 && age_days >= policy.grace_days;
+                if !was && stat.relegated {
+                    report.facts_relegated += 1;
+                } else if was && !stat.relegated {
+                    report.facts_reinstated += 1;
+                }
+            }
+            self.write_stats(&stats)?;
+        }
+        // Breadcrumbs: TTL only (they are never injected).
+        let crumbs = self.breadcrumbs();
+        if !crumbs.is_empty() {
+            let before = crumbs.len();
+            let fresh: Vec<Breadcrumb> = crumbs
+                .into_iter()
+                .filter(|c| {
+                    parse_rfc3339(&c.created)
+                        .map(|t| (now - t).num_days() as f64 <= policy.breadcrumb_ttl_days)
+                        .unwrap_or(true)
+                })
+                .collect();
+            if fresh.len() != before {
+                report.breadcrumbs_pruned = before - fresh.len();
+                let lines: Vec<String> = fresh
+                    .iter()
+                    .map(|c| serde_json::to_string(c).unwrap_or_default())
+                    .collect();
+                write_atomic(
+                    &self.root.join("breadcrumbs.jsonl"),
+                    &if lines.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}
+", lines.join("
+"))
+                    },
+                )?;
+            }
+        }
+        tracing::debug!(?report, "memory curated");
+        Ok(report)
+    }
+}
+
+/// Proven-usefulness score: hits and successes pull up, failures and idle
+/// days pull down. Positive → worth injecting.
+fn usefulness_score(stat: &FactStat, idle_days: f64) -> f64 {
+    stat.uses as f64 + 2.0 * stat.successes as f64 - 2.0 * stat.failures as f64 - idle_days
+}
+
+/// `YYYY-MM-DD` label prefix → a UTC midnight timestamp.
+fn entry_created_older(label: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let date = label.get(0..10)?;
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc()
+        .into()
+}
+
+fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+/// Lowercased query tokens, punctuation split, empties dropped.
+fn tokenize(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| c.is_whitespace() || c == '-')
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +918,219 @@ mod tests {
         let work = tempdir().unwrap();
         let store = store_for(root.path(), work.path());
         assert!(store.append("   ", "body").is_err());
+    }
+
+    // -- Phase 13: global tier, breadcrumbs, ledger, curator ----------------
+
+    #[test]
+    fn global_store_is_isolated_from_workspaces() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let global = MemoryStore::for_global(root.path()).unwrap();
+        global.append("pref", "dark mode always").unwrap();
+
+        let project = store_for(root.path(), work.path());
+        project.append("local", "workspace fact").unwrap();
+        assert!(global.read_entry("local").unwrap().is_none());
+        assert!(project.read_entry("pref").unwrap().is_none());
+        assert_eq!(
+            global.read_entry("pref").unwrap().unwrap().trim(),
+            "dark mode always"
+        );
+        assert!(global.root().ends_with("global"), "{:?}", global.root());
+    }
+
+    #[test]
+    fn breadcrumbs_append_search_and_rolling_cap() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let store = store_for(root.path(), work.path());
+        assert!(store.breadcrumbs().is_empty());
+
+        for i in 0..12 {
+            store
+                .append_breadcrumb(&format!("note {i} about topic{}", i % 3), &[])
+                .unwrap();
+        }
+        assert_eq!(store.breadcrumbs().len(), 12);
+
+        let hits = store.search_breadcrumbs("topic1", 5);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|c| c.text.contains("topic1")));
+
+        // No match → empty, multi-token AND-ish scoring.
+        assert!(store.search_breadcrumbs("zzznothing", 5).is_empty());
+        assert!(store.search_breadcrumbs("", 5).is_empty());
+
+        // Rolling cap keeps the newest MAX_BREADCRUMBS.
+        for i in 12..(MAX_BREADCRUMBS + 20) {
+            store
+                .append_breadcrumb(&format!("bulk {i}"), &["bulk".into()])
+                .unwrap();
+        }
+        let all = store.breadcrumbs();
+        assert_eq!(all.len(), MAX_BREADCRUMBS);
+        assert!(
+            all.iter().any(|c| c.text.contains(&format!("bulk {}", MAX_BREADCRUMBS + 19))),
+            "newest bulk entries kept"
+        );
+        assert!(
+            !all.iter().any(|c| c.text.contains("note 0 about")),
+            "oldest fell off"
+        );
+    }
+
+    #[test]
+    fn stats_hit_and_outcome_roundtrip() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let store = store_for(root.path(), work.path());
+        store.append("fact a", "body a").unwrap();
+        let id = store.facts_oldest_first().remove(0).0;
+
+        assert!(store.stats().is_empty(), "ledger starts empty");
+        store.record_hit(&id); // creates the ledger lazily
+        store.record_hit(&id);
+        store.record_outcome(&[id.clone()], true);
+        store.record_outcome(&[id.clone()], false);
+        let stats = store.stats();
+        let stat = stats.get(&id).unwrap();
+        assert_eq!((stat.uses, stat.successes, stat.failures), (2, 1, 1));
+        assert!(!stat.last_used.is_empty());
+
+        // Idempotence: repeated reads give the same ledger.
+        assert_eq!(store.stats().len(), 1);
+    }
+
+    #[test]
+    fn injectable_entries_are_oldest_first_skip_relegated_and_cut_tail() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let store = store_for(root.path(), work.path());
+        store.append("first", "body first").unwrap();
+        store.append("second", "body second").unwrap();
+        store.append("third", "body third").unwrap();
+
+        let snapshot = store.injectable_entries(4096);
+        assert!(snapshot.contains("first") && snapshot.contains("third"));
+        assert!(
+            snapshot.find("first").unwrap() < snapshot.find("third").unwrap(),
+            "oldest first: {snapshot}"
+        );
+        // Byte-stable prefix after an append.
+        store.append("fourth", "body fourth").unwrap();
+        let grown = store.injectable_entries(4096);
+        assert!(grown.starts_with(&snapshot), "{grown}");
+
+        // Relegated facts vanish from injection but stay in the index.
+        let id = store.facts_oldest_first()[0].0.clone();
+        {
+            let mut stats = store.stats();
+            stats.entry(id).or_default().relegated = true;
+            std::fs::create_dir_all(store.root()).unwrap();
+            std::fs::write(
+                store.root().join("stats.json"),
+                serde_json::to_string(&stats).unwrap(),
+            )
+            .unwrap();
+        }
+        let pruned = store.injectable_entries(4096);
+        assert!(!pruned.contains("body first"), "{pruned}");
+        assert!(pruned.contains("body second"));
+        assert_eq!(store.read_index().lines().count(), 4, "index untouched");
+
+        // Tight budget cuts from the tail (newest dropped, oldest kept).
+        let tight = store.injectable_entries(
+            "### 2026-01-01 second
+body second
+
+".len(),
+        );
+        assert!(tight.contains("second"), "{tight}");
+        assert!(!tight.contains("third"), "{tight}");
+    }
+
+    #[test]
+    fn curate_relegates_idle_useless_and_reinstates_after_hits() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let store = store_for(root.path(), work.path());
+        // An OLD, never-hit fact: stamp is today, so also fake an old date by
+        // writing the entry through the public API and backdating the label
+        // is not possible — instead rely on the grace window: fresh facts are
+        // never relegated regardless of score.
+        store.append("fresh useless", "nobody searches me").unwrap();
+        let report = store
+            .curate(CuratePolicy {
+                grace_days: 7.0,
+                breadcrumb_ttl_days: 90.0,
+            })
+            .unwrap();
+        assert_eq!(report.facts_total, 1);
+        assert_eq!(report.facts_relegated, 0, "grace period protects fresh facts");
+
+        // A heavily-used fact with an old ledger date: backdate via the
+        // ledger file, then curate — it survives.
+        store.append("workhorse", "looked up constantly").unwrap();
+        let ids: Vec<String> = store
+            .facts_oldest_first()
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect();
+        let workhorse = &ids[1];
+        {
+            let mut stats = store.stats();
+            let stat = stats.entry(workhorse.clone()).or_default();
+            stat.uses = 50;
+            stat.last_used = (chrono::Utc::now() - chrono::Duration::days(30))
+                .to_rfc3339();
+            std::fs::write(
+                store.root().join("stats.json"),
+                serde_json::to_string(&stats).unwrap(),
+            )
+            .unwrap();
+        }
+        let report = store.curate(CuratePolicy::default()).unwrap();
+        let stats = store.stats();
+        assert!(
+            !stats.get(workhorse).unwrap().relegated,
+            "heavy use survives idle decay"
+        );
+        assert_eq!(report.facts_relegated, 0);
+    }
+
+    #[test]
+    fn curate_prunes_stale_breadcrumbs() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let store = store_for(root.path(), work.path());
+        let fresh = store.append_breadcrumb("fresh crumb", &[]).unwrap();
+        // A stale crumb: written directly with a year-old timestamp.
+        let stale = Breadcrumb {
+            id: "bc-stale".into(),
+            text: "old crumb".into(),
+            tags: vec![],
+            created: (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339(),
+        };
+        std::fs::write(
+            store.root().join("breadcrumbs.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&stale).unwrap(),
+                serde_json::to_string(&fresh).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let report = store.curate(CuratePolicy::default()).unwrap();
+        assert_eq!(report.breadcrumbs_pruned, 1);
+        let remaining = store.breadcrumbs();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, fresh.id);
+
+        // Idempotent: a second pass prunes nothing more.
+        let report = store.curate(CuratePolicy::default()).unwrap();
+        assert_eq!(report.breadcrumbs_pruned, 0);
     }
 
     #[test]

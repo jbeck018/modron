@@ -434,6 +434,7 @@ impl modron_core::Tool for TestDelegateTool {
             content: report.brief,
             is_error: false,
             usage: Some(report.usage),
+            meta: None,
         })
     }
 }
@@ -558,4 +559,83 @@ async fn parallel_delegates_run_concurrently() {
         a.unwrap() < b.unwrap(),
         "order preserved under parallel execution"
     );
+}
+
+// -- Phase 13: memory feedback loop ------------------------------------------
+
+/// A tool that reports memory hits through ToolOutcome.meta, mimicking
+/// `memory_search` exactly as the engine sees it.
+struct FakeMemorySearch;
+
+#[async_trait::async_trait]
+impl modron_core::Tool for FakeMemorySearch {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_search".into(),
+            description: "test double".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &modron_core::ToolCtx,
+    ) -> modron_core::Result<ToolOutcome> {
+        let mut out = ToolOutcome::ok("found fact X");
+        out.meta = Some(serde_json::json!({"memory_hits": ["fact-x"]}));
+        Ok(out)
+    }
+}
+
+/// M1: a completed run folds a success into the ledger of every memory the
+/// run surfaced via ToolOutcome.meta.
+#[tokio::test]
+async fn memory_hits_fold_success_into_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory_root = tempfile::tempdir().unwrap();
+    // A fact on disk so the store exists and records survive.
+    modron_core::memory::MemoryStore::for_workspace(memory_root.path(), dir.path())
+        .unwrap()
+        .append("fact x", "the fact body")
+        .unwrap();
+
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::default());
+    let provider = MockProvider::new()
+        .then_response(tool_call_response("c1", "memory_search", json!({"query": "x"})))
+        .then_response(text_response("used it, done"));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FakeMemorySearch));
+    let mut providers = HashMap::new();
+    providers.insert(
+        "mock".to_string(),
+        Arc::new(provider) as Arc<dyn ModelProvider>,
+    );
+    let engine = Engine {
+        selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+        providers,
+        tools: Arc::new(registry),
+        store,
+        config: EngineConfig {
+            memory_root: Some(memory_root.path().to_path_buf()),
+            working_dir: dir.path().to_path_buf(),
+            ..EngineConfig::default()
+        },
+    };
+
+    let summary = engine.run_task("find the fact").await.unwrap();
+    assert_eq!(summary.answer, "used it, done");
+
+    let workspace = modron_core::memory::MemoryStore::for_workspace(
+        memory_root.path(),
+        dir.path(),
+    )
+    .unwrap();
+    let stats = workspace.stats();
+    // The scripted fact's id contains the title; find it by prefix.
+    let (id, stat) = stats
+        .iter()
+        .find(|(id, _)| id.contains("fact-x"))
+        .expect("ledger row for the hit fact");
+    assert_eq!(stat.successes, 1, "{id}: {stat:?}");
+    assert_eq!(stat.failures, 0);
 }

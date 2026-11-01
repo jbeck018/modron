@@ -239,6 +239,7 @@ impl Tool for DelegateTool {
                     content: body,
                     is_error: brief.is_empty(),
                     usage: Some(report.usage),
+                    meta: None,
                 })
             }
             Err(e) => Err(internal_tool_error(NAME, e.to_string())),

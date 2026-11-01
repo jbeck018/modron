@@ -151,6 +151,9 @@ impl Engine {
         let mut models_used: Vec<String> = Vec::new();
         let mut answer = String::new();
         let mut turns_since_compaction: u32 = 0;
+        // Phase 13: memory ids this run surfaced via memory_search — folded
+        // back into the usefulness ledger when the run completes.
+        let mut memory_hits: Vec<String> = Vec::new();
         let mut spend_usd = 0.0_f64;
 
         loop {
@@ -412,6 +415,16 @@ impl Engine {
                     result_bytes = outcome.content.len(),
                     "tool done"
                 );
+                if let Some(ids) = outcome
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("memory_hits"))
+                    .and_then(|v| v.as_array())
+                {
+                    memory_hits.extend(
+                        ids.iter().filter_map(|i| i.as_str().map(String::from)),
+                    );
+                }
                 // Delegated spend (Phase 5c A2): usage spent behind a tool's
                 // interface joins the governor and the run totals — honest
                 // accounting to the token.
@@ -455,6 +468,19 @@ impl Engine {
                     "stopping: cumulative token budget exceeded"
                 );
                 break;
+            }
+        }
+
+        // Phase 13 self-improving memory: a completed run is a success
+        // signal for every memory it surfaced. (Failures currently go
+        // unrecorded — an errored run returns Err before this point.)
+        if !memory_hits.is_empty() {
+            if let Some(root) = &self.config.memory_root {
+                if let Ok(store) =
+                    crate::memory::MemoryStore::for_workspace(root, &self.config.working_dir)
+                {
+                    store.record_outcome(&memory_hits, true);
+                }
             }
         }
 
@@ -514,11 +540,15 @@ impl Engine {
                 "{system}\n\n## Skills\n{index}\nCall the `skill` tool to load full instructions before following one."
             ),
         };
-        match &self.config.memory_root {
+        let system = match &self.config.memory_root {
             Some(root) => context::with_user_memory(
                 &system,
                 &context::load_user_memory(root, &self.config.working_dir),
             ),
+            None => system,
+        };
+        match &self.config.memory_root {
+            Some(root) => context::with_global_memory(&system, &context::load_global_memory(root)),
             None => system,
         }
     }

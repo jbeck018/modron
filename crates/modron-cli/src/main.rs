@@ -230,6 +230,11 @@ enum MemoryAction {
     Show { title: String },
     /// Delete every memory entry titled <title>.
     Forget { title: String },
+    /// Show the usefulness ledger (uses/successes/failures/relegated).
+    Stats,
+    /// Run the curator pass: decay + relegate useless facts, prune stale
+    /// breadcrumbs (Phase 13 self-improving memory).
+    Curate,
 }
 
 #[derive(Parser, Clone)]
@@ -2212,8 +2217,59 @@ fn run_memory(action: MemoryAction, sessions_dir: &Path, working_dir: &Path) -> 
                 anyhow::bail!("no memory entry titled '{title}' — see `modron memory list`");
             }
         }
+        MemoryAction::Stats => {
+            let stats = store.stats();
+            let facts = store.facts_oldest_first();
+            if facts.is_empty() && stats.is_empty() {
+                println!("no memory for this workspace yet ({})", store.root().display());
+                return Ok(());
+            }
+            println!("usefulness ledger ({} facts):", facts.len());
+            for (id, label, _) in facts {
+                let stat = stats.get(&id);
+                println!(
+                    "  {:<9} uses={:<3} ok={:<3} fail={:<3} {}",
+                    stat.map(|s| if s.relegated { "relegated" } else { "hot" })
+                        .unwrap_or("new"),
+                    stat.map(|s| s.uses).unwrap_or(0),
+                    stat.map(|s| s.successes).unwrap_or(0),
+                    stat.map(|s| s.failures).unwrap_or(0),
+                    entry_title_cli(&label),
+                );
+            }
+            let crumbs = store.breadcrumbs();
+            println!("breadcrumbs: {} (never injected; TTL-pruned by curate)", crumbs.len());
+        }
+        MemoryAction::Curate => {
+            let report = store
+                .curate(modron_core::memory::CuratePolicy::default())
+                .map_err(|e| anyhow::anyhow!("curate failed: {e}"))?;
+            println!(
+                "curated: {} facts ({} relegated, {} reinstated), {} breadcrumbs pruned",
+                report.facts_total, report.facts_relegated, report.facts_reinstated,
+                report.breadcrumbs_pruned
+            );
+            // The global tier gets the same treatment.
+            if let Ok(global) = MemoryStore::for_global(&memory_root) {
+                if global.root().exists() {
+                    let g = global
+                        .curate(modron_core::memory::CuratePolicy::default())
+                        .map_err(|e| anyhow::anyhow!("global curate failed: {e}"))?;
+                    println!(
+                        "global: {} facts ({} relegated, {} reinstated), {} breadcrumbs pruned",
+                        g.facts_total, g.facts_relegated, g.facts_reinstated,
+                        g.breadcrumbs_pruned
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// `{YYYY-MM-DD} {title}` → `{title}` (display helper for `memory stats`).
+fn entry_title_cli(label: &str) -> &str {
+    label.get(11..).unwrap_or(label)
 }
 
 /// `modron rewind` (C2): restore the last checkpointed file and print the

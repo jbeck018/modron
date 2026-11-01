@@ -181,6 +181,12 @@ pub struct ToolOutcome {
     /// and usage events so delegated work never escapes honest accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Structured extras the engine consumes (Phase 13 self-improving
+    /// memory): `memory_search` reports `{"memory_hits": [id, …]}` and the
+    /// engine folds the run's outcome back into those memories' ledger at
+    /// turn end. Tools that have nothing to report leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 impl ToolOutcome {
@@ -189,6 +195,7 @@ impl ToolOutcome {
             content: content.into(),
             is_error: false,
             usage: None,
+            meta: None,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
@@ -196,6 +203,7 @@ impl ToolOutcome {
             content: content.into(),
             is_error: true,
             usage: None,
+            meta: None,
         }
     }
 }

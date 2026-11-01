@@ -107,6 +107,7 @@ impl Tool for VerifyTool {
                     content,
                     is_error: !output.status.success(),
                     usage: None,
+                    meta: None,
                 })
             }
         }

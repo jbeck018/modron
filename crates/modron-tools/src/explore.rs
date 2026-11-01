@@ -90,6 +90,7 @@ impl Tool for ExploreTool {
                     content: body,
                     is_error: report.brief.is_empty(),
                     usage: Some(report.usage),
+                    meta: None,
                 })
             }
             Err(e) => Err(internal_tool_error(NAME, e.to_string())),
