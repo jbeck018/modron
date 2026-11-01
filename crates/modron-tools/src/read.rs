@@ -67,6 +67,11 @@ impl Tool for ReadTool {
                 ))
             }
         };
+        // Read-before-edit gate (Phase 13): a successful read unlocks the
+        // file for edit/write in this session.
+        if let Some(engine) = &ctx.engine {
+            engine.tools.read_gate.mark(&path);
+        }
 
         let mut out = String::new();
         let mut shown = 0usize;

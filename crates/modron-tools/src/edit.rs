@@ -75,6 +75,22 @@ impl Tool for EditTool {
         let replace_all = opt_bool(&args, "replace_all").unwrap_or(false);
         let path = resolve_path(&ctx.working_dir, raw_path);
 
+        // Hard read-before-edit gate (Phase 13): an existing file must have
+        // been read this session. Blind edits are the top source of
+        // destroyed-work bugs; the fix is one read away.
+        if let Some(engine) = &ctx.engine {
+            if path.is_file() && !engine.tools.read_gate.seen(&path) {
+                return Ok(tool_err(
+                    NAME,
+                    format!(
+                        "read-before-edit gate: read `{raw_path}` first — edits to files the \
+                         session has not read are blocked",
+                    ),
+                    MAX_BYTES,
+                ));
+            }
+        }
+
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(content) => content,
             Err(e) => {

@@ -59,6 +59,22 @@ impl Tool for WriteTool {
                 MAX_BYTES,
             ));
         }
+        // Hard read-before-edit gate (Phase 13): overwriting an existing
+        // file the session has not read is blocked; brand-new files are fine.
+        if let (Some(engine), Some(raw_path)) = (&ctx.engine, args.get("path").and_then(|v| v.as_str()))
+        {
+            let path = resolve_path(&ctx.working_dir, raw_path);
+            if path.is_file() && !engine.tools.read_gate.seen(&path) {
+                return Ok(tool_err(
+                    NAME,
+                    format!(
+                        "read-before-edit gate: read `{raw_path}` first — overwriting a file the \
+                         session has not read is blocked",
+                    ),
+                    MAX_BYTES,
+                ));
+            }
+        }
         let (Some(raw_path), Some(content)) = (arg_str(&args, "path"), arg_str(&args, "content"))
         else {
             return Ok(tool_err(NAME, "missing `path` or `content`", MAX_BYTES));

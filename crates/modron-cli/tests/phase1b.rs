@@ -264,7 +264,10 @@ async fn checkpoint_then_rewind_restores_file_and_truncates_transcript() {
     std::fs::write(dir.path().join("cfg.txt"), b"original").unwrap();
     let store: Arc<dyn SessionStore> =
         Arc::new(JsonlSessionStore::new(dir.path().join("sessions")));
+    // The read-before-edit gate (Phase 13) requires the file to be read
+    // before it may be overwritten — the script reads it first.
     let provider = MockProvider::new()
+        .then_response(tool_call_response("c0", "read", json!({"path": "cfg.txt"})))
         .then_response(tool_call_response(
             "c1",
             "write",

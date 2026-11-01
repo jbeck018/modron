@@ -257,9 +257,40 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutcome>;
 }
 
+/// Files read this session (canonicalized paths), backing the hard
+/// read-before-edit gate (Phase 13): `edit`/`write` refuse to touch an
+/// existing file the run has not read first — blind edits are blocked.
+/// Interior-mutable through `Arc` so every clone (and every `ToolCtx`
+/// engine handle) shares one set.
+#[derive(Clone, Default)]
+pub struct ReadGate {
+    read: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+}
+
+impl ReadGate {
+    /// Record a path as read (best-effort canonicalization).
+    pub fn mark(&self, path: &std::path::Path) {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.read.lock().unwrap().insert(canonical);
+    }
+    /// Has this exact file been read this session?
+    pub fn seen(&self, path: &std::path::Path) -> bool {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.read.lock().unwrap().contains(&canonical)
+    }
+    pub fn len(&self) -> usize {
+        self.read.lock().unwrap().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.read.lock().unwrap().is_empty()
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    /// Shared per-session read ledger (see [`ReadGate`]).
+    pub read_gate: ReadGate,
 }
 
 impl ToolRegistry {
