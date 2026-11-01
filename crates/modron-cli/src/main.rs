@@ -13,6 +13,8 @@
 //! writes; the answer and usage table go to stdout.
 
 pub mod acp;
+pub mod daemon;
+use daemon as modron_daemon;
 pub mod auth;
 pub mod config;
 pub mod evals;
@@ -105,6 +107,11 @@ enum Command {
     Upgrade,
     /// Diagnose your setup: keys, config, git, PDF support, terminal.
     Doctor,
+    /// Manage the background engine daemon (sessions survive terminal close).
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Subscription auth (EXPERIMENTAL): manage OAuth tokens for providers
     /// that support it (currently: claude).
     Auth {
@@ -162,6 +169,16 @@ enum Command {
         #[arg(long)]
         last: Option<usize>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum DaemonAction {
+    /// Start the daemon in the background.
+    Start,
+    /// Check if the daemon is running.
+    Status,
+    /// Stop the daemon.
+    Stop,
 }
 
 #[derive(Subcommand, Clone)]
@@ -384,6 +401,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // `modron doctor` — setup diagnostics (Phase 8).
     if let Some(Command::Doctor) = cli.command {
         return run_doctor(&cfg);
+    }
+
+    // `modron daemon …` — background engine management (Phase 9).
+    if let Some(Command::Daemon { action }) = &cli.command {
+        return run_daemon(action.clone(), &cli, &cfg).await;
     }
 
     // `modron auth …` — subscription token management (Phase 5d X3).
@@ -1113,6 +1135,57 @@ fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
         println!("some checks failed — see the ✗ lines above");
     }
     Ok(())
+}
+
+/// `modron daemon start|status|stop` (Phase 9): the persistent engine.
+async fn run_daemon(action: DaemonAction, cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
+    match action {
+        DaemonAction::Status => {
+            if modron_daemon::is_running() {
+                let pid = std::fs::read_to_string(modron_daemon::pid_file()?)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                println!(
+                    "daemon running (pid {pid}) — socket at {}",
+                    modron_daemon::socket_path()?.display()
+                );
+            } else {
+                println!("daemon not running — start with `modron daemon start`");
+            }
+            Ok(())
+        }
+        DaemonAction::Stop => {
+            if !modron_daemon::is_running() {
+                println!("daemon not running");
+                return Ok(());
+            }
+            // Connect and send stop.
+            use tokio::io::AsyncWriteExt;
+            if let Some(mut stream) = modron_daemon::connect().await? {
+                let msg = "{\"id\":1,\"method\":\"stop\",\"params\":{}}\n";
+                stream.write_all(msg.as_bytes()).await?;
+            }
+            // Wait for cleanup.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            println!("daemon stopped");
+            Ok(())
+        }
+        DaemonAction::Start => {
+            if modron_daemon::is_running() {
+                println!("daemon already running — `modron daemon status` for details");
+                return Ok(());
+            }
+            // Build the engine with the current config.
+            let mcp = spawn_mcp_servers(cfg).await?;
+            let agent =
+                build_agent_with(cli, cfg, false, AgentSinks::for_mode(false, false), &mcp)?;
+            let daemon = modron_daemon::Daemon::new(agent.engine);
+            println!("starting daemon (ctrl+c to stop)…");
+            daemon.run().await?;
+            Ok(())
+        }
+    }
 }
 
 /// Prepared MCP registration: one tool on one live server.
