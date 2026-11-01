@@ -331,7 +331,8 @@ mod tests {
         let loaded = reopened.load(id).await.unwrap();
         assert_eq!(loaded.len(), events.len() + 1);
         assert!(
-            matches!(loaded.last(), Some(SessionEvent::Message { message, .. }) if message.content == "again")
+            matches!(loaded.last(), Some(SessionEvent::Message { message, ..
+                }) if message.content == "again")
         );
     }
 

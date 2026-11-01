@@ -22,6 +22,17 @@ curl -fsSL https://raw.githubusercontent.com/jbeck018/modron/main/install.sh | b
 cargo install --locked --git https://github.com/jbeck018/modron
 ```
 
+## Attachments (multimodal)
+
+```sh
+modron "what's in this image?" --attach screenshot.png
+modron "summarize the spec" --attach spec.pdf --attach notes.md
+```
+
+Images (png/jpg/gif/webp) are sent as image content; text and PDF files are
+inlined as documents (PDF extraction uses `pdftotext` — `brew install
+poppler`).
+
 ## Upgrade
 
 ```sh

@@ -285,6 +285,11 @@ struct Cli {
     /// Verbose tracing (debug) on stderr; default logs info-level progress.
     #[arg(long, global = true)]
     verbose: bool,
+    /// Attach a file to the task (repeatable): images (png/jpg/gif/webp)
+    /// are sent as image content; text and PDF files are inlined as
+    /// documents. PDF extraction uses pdftotext when installed.
+    #[arg(long, global = true)]
+    attach: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -473,9 +478,32 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None => 0,
     };
 
+    let attachments = cli
+        .attach
+        .iter()
+        .map(|p| load_attachment(p))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if !attachments.is_empty() {
+        eprintln!(
+            "attached: {}",
+            attachments
+                .iter()
+                .map(|a| match a {
+                    modron_core::Attachment::Image { .. } => "image",
+                    modron_core::Attachment::Document { name, .. } => name,
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let summary = match cli.resume {
         Some(session_id) => agent.engine.run_task_resuming(session_id, &task).await?,
-        None => agent.engine.run_task(&task).await?,
+        None => {
+            agent
+                .engine
+                .run_task_with_attachments(&task, attachments)
+                .await?
+        }
     };
 
     // One load serves both stderr compaction progress and the usage table.
@@ -877,6 +905,76 @@ pub(crate) fn build_provider_shim(pid: &str) -> anyhow::Result<Arc<dyn ModelProv
                 anyhow::anyhow!(err.to_string()).context(format!("cannot start provider `{other}`"))
             },
         )?)),
+    })
+}
+
+/// Load one attached file as an [`Attachment`] (Phase 7): images
+/// base64-encoded by extension; text files inlined; PDFs via `pdftotext`
+/// when installed (skipped with an actionable error otherwise).
+pub(crate) fn load_attachment(path: &Path) -> anyhow::Result<modron_core::Attachment> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("cannot read attachment {}: {e}", path.display()))?;
+    let media_type = match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    };
+    if let Some(media_type) = media_type {
+        // Sanity: image magic bytes.
+        let looks_image = bytes.starts_with(&[0x89, b'P', b'N', b'G'])
+            || bytes.starts_with(&[0xFF, 0xD8])
+            || bytes.starts_with(b"GIF8")
+            || bytes.len() > 4 && &bytes[..4] == b"RIFF";
+        if !looks_image {
+            anyhow::bail!(
+                "{} has an image extension but is not an image",
+                path.display()
+            );
+        }
+        return Ok(modron_core::Attachment::Image {
+            media_type: media_type.to_string(),
+            data: modron_core::b64::encode(&bytes),
+        });
+    }
+    // PDF via pdftotext (Claude Code's system-tool approach).
+    if path.extension().and_then(|e| e.to_str()) == Some("pdf") {
+        let output = std::process::Command::new("pdftotext")
+            .arg(path)
+            .arg("-")
+            .output()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "pdftotext is not installed — brew install poppler (or attach text files)"
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!("pdftotext failed on {}", path.display());
+        }
+        return Ok(modron_core::Attachment::Document {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            text: String::from_utf8_lossy(&output.stdout).to_string(),
+        });
+    }
+    // Everything else: UTF-8 text document.
+    let text = String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "{} is neither an image nor UTF-8 text (supported: png/jpg/gif/webp, text, pdf)",
+            path.display()
+        )
+    })?;
+    Ok(modron_core::Attachment::Document {
+        name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        text,
     })
 }
 

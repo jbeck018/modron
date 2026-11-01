@@ -51,6 +51,16 @@ impl Engine {
     /// `max_total_tokens`. Tool failures (unknown tool, tool crash) become
     /// error `ToolOutcome`s the model can react to instead of aborting the run.
     pub async fn run_task(&self, task: &str) -> Result<RunSummary> {
+        self.run_task_with_attachments(task, Vec::new()).await
+    }
+
+    /// Run a task with multimodal attachments (Phase 7): images and
+    /// documents ride on the first user message.
+    pub async fn run_task_with_attachments(
+        &self,
+        task: &str,
+        attachments: Vec<crate::Attachment>,
+    ) -> Result<RunSummary> {
         if task.trim().is_empty() {
             return Err(Error::Config(
                 "empty task".into(),
@@ -67,7 +77,7 @@ impl Engine {
                 },
             )
             .await?;
-        let transcript = vec![Message::user(task)];
+        let transcript = vec![Message::user_with_attachments(task, attachments)];
         self.run_loop(meta.id, task, transcript).await
     }
 
@@ -332,6 +342,7 @@ impl Engine {
                 content: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
                 tool_call_id: None,
+                attachments: Vec::new(),
             };
             self.store
                 .append(

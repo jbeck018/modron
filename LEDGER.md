@@ -1237,3 +1237,26 @@ panics on drop inside tokio — the startup check uses the curl subprocess
 instead (matches install.sh, zero deps). Remaining: make the repo public (or
 ship tokens) for unauthenticated installs; the publish decision (crates.io,
 Homebrew) stays with you.
+
+---
+
+# Phase 7 — Multimodal attachments (opened/closed 2026-10-31)
+
+Claude Code-parity: images and documents as first-class inputs.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| M1 | Core: `Attachment` enum (Image { media_type, base64 data } / Document { name, text }) on `Message.attachments` (additive, serde-defaulted); `Engine::run_task_with_attachments` | DONE | 356 tests green |
+| M2 | Anthropic encoding: image blocks (base64 source) BEFORE text; documents inline as text blocks | DONE | fixture tests: block shape, ordering, document inlining |
+| M3 | OpenAI-compat encoding: image_url parts (data URIs) + text parts; plain messages stay strings (no regression) | DONE | fixture tests: parts array, data URI format, no-attachment regression |
+| M4 | CLI `--attach <path>` (repeatable): images by extension + magic-byte sanity; text inlined; PDF via pdftotext (poppler) with actionable missing-binary error | DONE | loader in main.rs |
+| V25 | LIVE verification: glm-5.3 read an attached document and answered correctly through the full stack | DONE | live run above |
+
+## Final verdict — Phase 7
+
+**Multimodal is live end-to-end on the paid plan.** `modron "describe this"
+--attach photo.png` works: the image rides the message as a base64 block
+(Anthropic) or data-URI part (OpenAI-compat), documents inline as text, PDFs
+extract via pdftotext. Token accounting flows through unchanged (the live
+run showed honest usage). Deferred: paste-from-clipboard in the TUI, image
+generation, and @-mention file completion in the TUI input.

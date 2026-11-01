@@ -305,7 +305,8 @@ async fn compaction_fires_once_shrinks_context_and_completes() {
         "the compaction call's usage is persisted right after the event"
     );
     assert!(
-        matches!(events.last(), Some(SessionEvent::Message { message, .. })
+        matches!(events.last(), Some(SessionEvent::Message { message, ..
+        })
             if message.content == "All done: two edge cases chosen."),
         "the final answer is the last event"
     );

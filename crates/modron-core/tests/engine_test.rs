@@ -163,20 +163,18 @@ async fn full_tool_loop_end_to_end() {
         matches!(events[1], SessionEvent::ModelSelected { ref model, .. } if model == "mock-model")
     );
     assert!(matches!(events[2], SessionEvent::Usage { .. }));
-    assert!(
-        matches!(events[3], SessionEvent::Message { ref message, .. }
-        if message.role == Role::Assistant && message.tool_calls.len() == 1)
-    );
+    assert!(matches!(events[3], SessionEvent::Message { ref message, ..
+        }
+        if message.role == Role::Assistant && message.tool_calls.len() == 1));
     assert!(
         matches!(events[4], SessionEvent::ToolResult { ref call_id, ref outcome }
         if call_id == "call_1" && !outcome.is_error)
     );
     assert!(matches!(events[5], SessionEvent::ModelSelected { .. }));
     assert!(matches!(events[6], SessionEvent::Usage { .. }));
-    assert!(
-        matches!(events[7], SessionEvent::Message { ref message, .. }
-        if message.role == Role::Assistant && message.content == "All done.")
-    );
+    assert!(matches!(events[7], SessionEvent::Message { ref message, ..
+        }
+        if message.role == Role::Assistant && message.content == "All done."));
 
     // Session title = first line of the task.
     let listed = engine.store.list().await.unwrap();
@@ -382,7 +380,8 @@ async fn resume_reconstructs_transcript_and_continues_same_session() {
         matches!(events_after.first(), Some(SessionEvent::Task { ref text }) if text == "start work")
     );
     assert!(
-        matches!(events_after.last(), Some(SessionEvent::Message { ref message, .. }) if message.content == "second answer")
+        matches!(events_after.last(), Some(SessionEvent::Message { ref message, ..
+        }) if message.content == "second answer")
     );
 }
 

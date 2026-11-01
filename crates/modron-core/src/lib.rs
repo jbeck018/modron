@@ -66,6 +66,28 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// User-attached multimodal inputs (Phase 7): images and documents
+    /// ride with the message; providers encode them per their wire format.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A multimodal attachment on a user message (Phase 7).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Attachment {
+    /// An image, base64-encoded with its MIME type.
+    Image {
+        media_type: String,
+        /// Raw base64 (no data: prefix).
+        data: String,
+    },
+    /// A text document, extracted and inlined.
+    Document {
+        name: String,
+        /// Extracted text (PDFs via pdftotext at the CLI layer, etc.).
+        text: String,
+    },
 }
 
 impl Message {
@@ -75,14 +97,24 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            attachments: Vec::new(),
         }
     }
+    /// A user message with multimodal attachments (Phase 7).
+    pub fn user_with_attachments(content: impl Into<String>, attachments: Vec<Attachment>) -> Self {
+        Self {
+            attachments,
+            ..Message::user(content)
+        }
+    }
+
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            attachments: Vec::new(),
         }
     }
     pub fn tool_result(call_id: impl Into<String>, outcome: &ToolOutcome) -> Self {
@@ -91,6 +123,7 @@ impl Message {
             content: outcome.content.clone(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            attachments: Vec::new(),
         }
     }
 }

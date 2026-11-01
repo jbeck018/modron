@@ -198,7 +198,10 @@ async fn mock_drives_real_tools_and_store_end_to_end() {
     assert!(
         matches!(events.first(), Some(SessionEvent::Task { text, .. }) if text.contains("marker"))
     );
-    assert!(events.iter().any(|e| matches!(e, SessionEvent::Message { message, .. } if message.role == Role::Assistant && !message.tool_calls.is_empty())));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Message { message, ..
+        } if message.role == Role::Assistant && !message.tool_calls.is_empty())));
     assert!(events.iter().any(|e| matches!(e, SessionEvent::ToolResult { call_id, .. } if call_id == "call-1" || call_id == "call-2")));
     assert!(events
         .iter()
@@ -256,7 +259,8 @@ async fn mock_drives_real_tools_and_store_end_to_end() {
         "resume appends to the same session log"
     );
     assert!(
-        matches!(events_after.last(), Some(SessionEvent::Message { message, .. }) if message.content == format!("resumed: {MARKER}"))
+        matches!(events_after.last(), Some(SessionEvent::Message { message, ..
+        }) if message.content == format!("resumed: {MARKER}"))
     );
 }
 

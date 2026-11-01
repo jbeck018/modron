@@ -382,12 +382,37 @@ pub fn build_body(req: &TurnRequest) -> Value {
 
     for message in &req.messages {
         let (role, blocks): (&'static str, Vec<Value>) = match message.role {
-            Role::User => (
-                "user",
-                vec![
-                    json!({ "type": "text", "text": non_empty(&message.content, "(empty message)") }),
-                ],
-            ),
+            Role::User => {
+                // Multimodal (Phase 7): attachments become content blocks
+                // BEFORE the text — Anthropic image blocks are base64
+                // sources; documents inline as text blocks.
+                let mut blocks: Vec<Value> = Vec::new();
+                for attachment in &message.attachments {
+                    match attachment {
+                        modron_core::Attachment::Image { media_type, data } => {
+                            blocks.push(json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": data,
+                                }
+                            }));
+                        }
+                        modron_core::Attachment::Document { name, text } => {
+                            blocks.push(json!({
+                                "type": "text",
+                                "text": format!("[Attached document: {name}]\n{text}")
+                            }));
+                        }
+                    }
+                }
+                blocks.push(json!({
+                    "type": "text",
+                    "text": non_empty(&message.content, "(empty message)")
+                }));
+                ("user", blocks)
+            }
             Role::Assistant => {
                 let mut blocks = Vec::new();
                 if !message.content.is_empty() {
@@ -656,6 +681,55 @@ mod tests {
             }],
             max_tokens: 8192,
         }
+    }
+
+    #[test]
+    fn attachments_encode_as_image_blocks() {
+        let req = TurnRequest {
+            model: "claude-sonnet-4-5".into(),
+            system: String::new(),
+            messages: vec![modron_core::Message::user_with_attachments(
+                "what is this?",
+                vec![modron_core::Attachment::Image {
+                    media_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                }],
+            )],
+            tools: Vec::new(),
+            max_tokens: 128,
+        };
+        let body = build_body(&req);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "aGVsbG8=");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "what is this?");
+    }
+
+    #[test]
+    fn documents_inline_as_text_blocks() {
+        let req = TurnRequest {
+            model: "claude-sonnet-4-5".into(),
+            system: String::new(),
+            messages: vec![modron_core::Message::user_with_attachments(
+                "summarize",
+                vec![modron_core::Attachment::Document {
+                    name: "notes.md".into(),
+                    text: "hello notes".into(),
+                }],
+            )],
+            tools: Vec::new(),
+            max_tokens: 128,
+        };
+        let body = build_body(&req);
+        let content = &body["messages"][0]["content"];
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[Attached document: notes.md]"));
+        assert!(content[0]["text"].as_str().unwrap().contains("hello notes"));
     }
 
     #[test]

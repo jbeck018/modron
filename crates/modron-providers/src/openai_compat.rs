@@ -325,7 +325,35 @@ pub fn build_body(req: &TurnRequest) -> Value {
     for message in &req.messages {
         match message.role {
             Role::User => {
-                messages.push(json!({ "role": "user", "content": message.content }));
+                // Multimodal (Phase 7): attachments become content parts —
+                // images as image_url data URIs, documents as text parts.
+                if message.attachments.is_empty() {
+                    messages.push(json!({ "role": "user", "content": message.content }));
+                } else {
+                    let mut parts: Vec<Value> = Vec::new();
+                    for attachment in &message.attachments {
+                        match attachment {
+                            modron_core::Attachment::Image { media_type, data } => {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{media_type};base64,{data}")
+                                    }
+                                }));
+                            }
+                            modron_core::Attachment::Document { name, text } => {
+                                parts.push(json!({
+                                    "type": "text",
+                                    "text": format!("[Attached document: {name}]\n{text}")
+                                }));
+                            }
+                        }
+                    }
+                    if !message.content.is_empty() {
+                        parts.push(json!({ "type": "text", "text": message.content }));
+                    }
+                    messages.push(json!({ "role": "user", "content": parts }));
+                }
             }
             Role::Tool => {
                 messages.push(json!({
@@ -604,6 +632,46 @@ mod tests {
             }],
             max_tokens: 8192,
         }
+    }
+
+    #[test]
+    fn attachments_encode_as_image_url_parts() {
+        let req = TurnRequest {
+            model: "glm-5.3".into(),
+            system: String::new(),
+            messages: vec![modron_core::Message::user_with_attachments(
+                "describe",
+                vec![modron_core::Attachment::Image {
+                    media_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                }],
+            )],
+            tools: Vec::new(),
+            max_tokens: 128,
+        };
+        let body = build_body(&req);
+        let content = &body["messages"][0]["content"];
+        assert!(content.is_array(), "multimodal content is a parts array");
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "describe");
+    }
+
+    #[test]
+    fn no_attachments_stay_plain_strings() {
+        let req = TurnRequest {
+            model: "glm-5.3".into(),
+            system: String::new(),
+            messages: vec![modron_core::Message::user("plain")],
+            tools: Vec::new(),
+            max_tokens: 128,
+        };
+        let body = build_body(&req);
+        assert_eq!(body["messages"][0]["content"], "plain");
     }
 
     #[test]
