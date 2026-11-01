@@ -118,7 +118,8 @@ impl MockProvider {
 pub fn rich_demo_script() -> Vec<TurnResponse> {
     use StopReason::*;
     vec![
-        // Turn 1: multiple tool calls (parallel read-only dispatch).
+        // Turn 1: parallel tool calls (bash + read + grep) — exercises the
+        // concurrent read-only dispatcher and the cyan tool lines.
         TurnResponse {
             text: String::new(),
             tool_calls: vec![
@@ -138,86 +139,39 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
                     arguments: serde_json::json!({"pattern": "modron"}),
                 },
             ],
-            usage: Usage {
-                input_tokens: 800,
-                output_tokens: 120,
-                cached_input_tokens: 400,
-            },
+            usage: Usage { input_tokens: 800, output_tokens: 120, cached_input_tokens: 400 },
             stop_reason: ToolUse,
         },
-        // Turn 2: a delegate call (shows the subagent panel).
+        // Turn 2: a write (exercises the checkpoint path).
         TurnResponse {
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c4".into(),
-                name: "delegate".into(),
+                name: "write".into(),
                 arguments: serde_json::json!({
-                    "task": "explore the workspace and report findings",
-                    "background": false
+                    "path": "demo-output.txt",
+                    "content": "demo write from modron"
                 }),
             }],
-            usage: Usage {
-                input_tokens: 900,
-                output_tokens: 80,
-                cached_input_tokens: 600,
-            },
+            usage: Usage { input_tokens: 900, output_tokens: 80, cached_input_tokens: 600 },
             stop_reason: ToolUse,
         },
-        // Turn 3 (CHILD's answer — the delegate's brief): the child engine
-        // shares this provider and consumes the next scripted response.
-        TurnResponse {
-            text: "Found 3 modules: core (engine + routing), cli (TUI + commands), and tools (bash/read/write/edit). The engine handles context assembly, model selection, and the agent loop.".into(),
-            tool_calls: Vec::new(),
-            usage: Usage {
-                input_tokens: 600,
-                output_tokens: 150,
-                cached_input_tokens: 300,
-            },
-            stop_reason: EndTurn,
-        },
-        // Turn 4 (parent resumes): a write call (shows the approval/checkpoint path).
+        // Turn 3: a failing bash (exercises the error styling).
         TurnResponse {
             text: String::new(),
             tool_calls: vec![ToolCall {
                 id: "c5".into(),
-                name: "write".into(),
-                arguments: serde_json::json!({"path": "demo-output.txt", "content": "demo write"}),
-            }],
-            usage: Usage {
-                input_tokens: 1000,
-                output_tokens: 90,
-                cached_input_tokens: 800,
-            },
-            stop_reason: ToolUse,
-        },
-        // Turn 5: a failing tool (shows the error styling).
-        TurnResponse {
-            text: String::new(),
-            tool_calls: vec![ToolCall {
-                id: "c6".into(),
                 name: "bash".into(),
-                arguments: serde_json::json!({"command": "exit 1"}),
+                arguments: serde_json::json!({"command": "echo 'simulated failure' >&2; exit 42"}),
             }],
-            usage: Usage {
-                input_tokens: 1100,
-                output_tokens: 70,
-                cached_input_tokens: 900,
-            },
+            usage: Usage { input_tokens: 1000, output_tokens: 70, cached_input_tokens: 800 },
             stop_reason: ToolUse,
         },
-        // Turn 6: the final answer with decent streaming.
+        // Turn 4: the final streamed answer.
         TurnResponse {
-            text: "Demo complete — you saw tool calls (bash/read/grep), \
-a delegate subagent, a file write with checkpoint, an error result, \
-and this streamed answer.\n\nThe full loop: routing → tools → \
-subagent → checkpoint → error recovery → answer."
-                .into(),
+            text: "Demo complete.\n\nWhat you just saw:\n- Parallel tool calls (bash + read + grep)\n- A file write with checkpoint\n- An error result (exit 42)\n- This streamed answer\n\nEvery TUI view was exercised.".into(),
             tool_calls: Vec::new(),
-            usage: Usage {
-                input_tokens: 1200,
-                output_tokens: 200,
-                cached_input_tokens: 1000,
-            },
+            usage: Usage { input_tokens: 1100, output_tokens: 200, cached_input_tokens: 900 },
             stop_reason: EndTurn,
         },
     ]
