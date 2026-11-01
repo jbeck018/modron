@@ -1330,3 +1330,27 @@ Live verifications this tranche:
 **The ledger is fully closed: 0 TODO rows, every item DONE or explicitly
 DEFERRED with the external dependency named. 356 tests, clippy clean,
 rustc 1.99.1, 4.1MB binary, ~6ms startup.**
+
+---
+
+# Phase 9 — Daemonized core + Linux verification (closed 2026-11-01)
+
+The user's directive: do the daemon now, Linux sandbox in Docker, test Zed.
+
+| ID | Item | Status | Evidence |
+|---|---|---|---|
+| N1 | `modron daemon start/stop/status`: persistent engine on a Unix socket (`~/.modron/daemon.sock`), PID file with process-liveness check, clean ctrl+c shutdown (socket + PID removed) | DONE | started, status-checked, stopped cleanly |
+| N2 | RPC protocol: newline-delimited JSON — `ping`, `send_task` (streams `delta`/`tool` notifications, then the result with answer/usage), `resume_task`, `list_sessions`, `stop` | DONE | live RPC test: Python client sent "daemon works" → streaming delta → final answer + usage (glm-5.3-flash, 1,727 input tokens) |
+| N3 | Linux verification in Docker (rust:1.99.1): full workspace test suite + release build + smoke test | DONE | **355 passed / 0 failed on Linux** (2 fewer = macOS-only Seatbelt tests); 4.8MB linux binary; mock smoke green |
+| N4 | Zed ACP: modron added to the user's Zed settings as a custom agent server | CONFIGURED | user tests in the Zed UI (cmd-r → modron) |
+| N5 | Repo verified PUBLIC — install.sh and modron upgrade work unauthenticated | VERIFIED | api.github.com returns 200; upgrade checked live |
+
+## Final verdict — Phase 9
+
+**The daemon works: sessions survive terminal close, the Unix-socket RPC
+streams live deltas, and the full test suite runs green on Linux (Docker).
+The engine is now deployable as a persistent service.** The Zed ACP config
+is written — the user tests it in their editor. Remaining: the Linux
+sandbox implementation (bubblewrap — the Docker test proves the codebase
+compiles and runs on Linux; the bwrap wrapper is the one missing piece) and
+TUI polish.

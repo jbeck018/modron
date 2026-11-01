@@ -22,6 +22,18 @@ curl -fsSL https://raw.githubusercontent.com/jbeck018/modron/main/install.sh | b
 cargo install --locked --git https://github.com/jbeck018/modron
 ```
 
+## Daemon (persistent sessions)
+
+```sh
+modron daemon start --provider zai --model glm-5.3-flash
+modron daemon status      # running? socket path?
+modron daemon stop
+```
+
+The daemon runs the engine on a Unix socket (`~/.modron/daemon.sock`) —
+sessions survive terminal close. RPC: newline-delimited JSON
+(`send_task` streams delta/tool notifications, then the result).
+
 ## Diagnostics
 
 ```sh
