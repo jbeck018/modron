@@ -105,8 +105,25 @@ pub async fn run_with(
     });
 
     // Terminal setup: inline viewport, raw mode, hidden cursor.
+    // Kitty keyboard protocol (kitty/Ghostty/WezTerm/iTerm2 3.5+): lets the
+    // terminal report modifiers on Enter, making shift+enter a real newline
+    // instead of a submit. The query returns quickly on any terminal that
+    // answers device attributes; unsupported ones ignore the push entirely.
+    let kitty_keyboard = crossterm::terminal::supports_keyboard_enhancement()
+        .unwrap_or(false);
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
+    if kitty_keyboard {
+        use crossterm::event::{
+            KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        };
+        let _ = crossterm::execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+    }
     // NO alternate screen: the normal buffer keeps native scrollback and
     // selectable text (Claude Code's inline pattern). The earlier
     // EnterAlternateScreen here was the black-void bug — the alt screen is
@@ -167,7 +184,7 @@ pub async fn run_with(
                 Span::styled("  model ", Style::default().fg(crate::DIM)),
                 Span::styled(model_label.clone(), Style::default()),
                 Span::styled(
-                    "  ·  enter send · esc interrupt · ctrl+o detail",
+                    "  ·  enter send · shift/alt+enter newline · \\+enter too · esc interrupt · ctrl+o detail",
                     Style::default().fg(crate::DIM),
                 ),
             ]),
@@ -330,6 +347,12 @@ pub async fn run_with(
 
     // Teardown: flush the last status as a plain line so scrollback keeps a
     // trace of the session, restore the terminal.
+    if kitty_keyboard {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     crossterm::terminal::disable_raw_mode()?;
     if let Some(id) = app.session_id {
         println!("session: {id} — resume with --resume {id}");

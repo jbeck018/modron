@@ -153,6 +153,13 @@ impl App {
                     self.transcript_mode = !self.transcript_mode;
                     return Action::None;
                 }
+                // Ctrl+J is raw LF — what a terminal sends when shift+enter
+                // is remapped to "\n" (the classic iTerm2 workaround). In
+                // raw mode crossterm reports it as exactly this.
+                KeyCode::Char('j') | KeyCode::Char('J') => {
+                    self.input.push('\n');
+                    return Action::None;
+                }
                 KeyCode::Char('c') => {
                     if self.running {
                         // Abort now; the run loop quits after the abort lands.
@@ -207,14 +214,28 @@ impl App {
             KeyCode::Enter
                 if key
                     .modifiers
-                    .contains(crossterm::event::KeyModifiers::SHIFT) =>
+                    .intersects(
+                        crossterm::event::KeyModifiers::SHIFT
+                            | crossterm::event::KeyModifiers::ALT,
+                    ) =>
             {
-                // Shift+Enter: newline (multi-line input, the editor
-                // convention every TUI uses).
+                // Newline, not submit. Shift+enter only reaches us with the
+                // SHIFT modifier on terminals that speak the kitty keyboard
+                // protocol (run.rs enables it when available); option/alt+
+                // enter sends ESC+CR everywhere else, which crossterm
+                // reports as Enter with ALT.
                 self.input.push('\n');
                 Action::None
             }
             KeyCode::Enter => {
+                // Backslash+Enter: line continuation — the universal
+                // fallback that works on every terminal (Claude Code's
+                // convention for terminals that cannot report shift+enter).
+                if self.input.ends_with('\\') {
+                    self.input.pop();
+                    self.input.push('\n');
+                    return Action::None;
+                }
                 let task = std::mem::take(&mut self.input);
                 if task.trim().is_empty() {
                     return Action::None;
@@ -454,7 +475,14 @@ impl App {
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
-        self.tool_lines.push(format!("❯ {task}"));
+        // A committed line renders as one screen row, so a multi-line task
+        // echoes as an indented block.
+        let mut lines = task.split('\n');
+        self.tool_lines
+            .push(format!("❯ {}", lines.next().unwrap_or_default()));
+        for line in lines {
+            self.tool_lines.push(format!("  {line}"));
+        }
     }
 
     /// The one-line status: spinner/model, tool in flight, or approval prompt.

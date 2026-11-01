@@ -355,3 +355,88 @@ fn context_meter_renders_the_bar() {
     let meter = app.context_meter();
     assert!(meter.contains("!compact"), "compaction warning: {meter}");
 }
+
+// ── Multi-line input (newline paths) ──────────────────────────────────────
+
+fn with_modifiers(
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(code, mods)
+}
+
+#[test]
+fn shift_enter_and_alt_enter_insert_newlines_not_submit() {
+    for (name, mods) in [
+        ("shift", crossterm::event::KeyModifiers::SHIFT),
+        ("alt", crossterm::event::KeyModifiers::ALT),
+    ] {
+        let mut app = App::default();
+        for c in "line one".chars() {
+            app.on_key(key(crossterm::event::KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_key(with_modifiers(
+                crossterm::event::KeyCode::Enter,
+                mods
+            )),
+            Action::None,
+            "{name}+enter must not submit"
+        );
+        for c in "line two".chars() {
+            app.on_key(key(crossterm::event::KeyCode::Char(c)));
+        }
+        assert_eq!(app.input, "line one\nline two", "{name}+enter");
+        // Plain enter still submits the whole multi-line task.
+        assert_eq!(
+            app.on_key(key(crossterm::event::KeyCode::Enter)),
+            Action::Submit("line one\nline two".into())
+        );
+    }
+}
+
+#[test]
+fn ctrl_j_inserts_a_newline() {
+    // Ctrl+J = raw LF: what a terminal sends when shift+enter is remapped
+    // to "\n" (the standard iTerm2 workaround).
+    let mut app = App::default();
+    for c in "top".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(c)));
+    }
+    assert_eq!(
+        app.on_key(ctrl(crossterm::event::KeyCode::Char('j'))),
+        Action::None
+    );
+    for c in "bottom".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(c)));
+    }
+    assert_eq!(app.input, "top\nbottom");
+}
+
+#[test]
+fn backslash_enter_continues_the_line() {
+    let mut app = App::default();
+    for c in "first\\".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(c)));
+    }
+    assert_eq!(
+        app.on_key(key(crossterm::event::KeyCode::Enter)),
+        Action::None,
+        "backslash+enter must not submit"
+    );
+    assert_eq!(app.input, "first\n");
+    for c in "second".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(c)));
+    }
+    assert_eq!(
+        app.on_key(key(crossterm::event::KeyCode::Enter)),
+        Action::Submit("first\nsecond".into())
+    );
+}
+
+#[test]
+fn multi_line_task_echoes_as_indented_block() {
+    let mut app = App::default();
+    app.begin_task("one\ntwo\nthree");
+    assert_eq!(app.tool_lines, vec!["❯ one", "  two", "  three"]);
+}
