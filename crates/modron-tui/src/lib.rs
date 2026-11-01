@@ -131,7 +131,12 @@ pub struct App {
 pub const ACCENT: Color = Color::Rgb(255, 159, 10);
 pub const DIM: Color = Color::DarkGray;
 
-const SPINNER: [&str; 8] = ["✶", "✻", "✽", "✶", "✳", "✻", "✼", "✽"];
+/// Mathematical spinner: rotating phase-space glyphs (quarter-circle phases,
+/// like a phase portrait rotating) — deliberately NOT Claude Code's braille.
+const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+/// Working spinner: calculus operators cycling (partial → nabla → delta →
+/// increment) — signals active computation.
+const SPINNER_WORKING: [&str; 4] = ["∂", "∇", "∆", "∇"];
 
 impl App {
     /// Apply a key press. Key filtering (releases vs presses) is the run
@@ -199,6 +204,16 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::SHIFT) =>
+            {
+                // Shift+Enter: newline (multi-line input, the editor
+                // convention every TUI uses).
+                self.input.push('\n');
+                Action::None
+            }
             KeyCode::Enter => {
                 let task = std::mem::take(&mut self.input);
                 if task.trim().is_empty() {
@@ -206,7 +221,7 @@ impl App {
                 }
                 // Slash commands are handled locally (dirge pattern) —
                 // they never reach the model.
-                if let Some(cmd) = SlashCommand::parse(&task) {
+                if let Some(cmd) = SlashCommand::parse(task.trim()) {
                     return self.handle_slash(cmd);
                 }
                 Action::Submit(task)
@@ -491,11 +506,11 @@ impl App {
         use ratatui::widgets::Paragraph;
 
         // Split: everything above vs the bordered input box (3 rows).
-        let outer = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(3), // bordered input
-        ])
-        .split(area);
+        // Input box height grows with multi-line content (3 base + 1/line).
+        let input_lines = self.input.matches('\n').count() as u16;
+        let input_height = (3 + input_lines).min(area.height.saturating_sub(2));
+        let outer =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).split(area);
         let top = outer[0];
         let input_area = outer[1];
 
@@ -597,13 +612,30 @@ impl App {
         } else {
             Style::default()
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
+        // Multi-line input: split on \n, render each as its own line with
+        // the prompt on the first.
+        let lines: Vec<Line> = if self.input.contains('\n') {
+            self.input
+                .split('\n')
+                .enumerate()
+                .map(|(i, line)| {
+                    if i == 0 {
+                        Line::from(vec![
+                            Span::styled("❯ ", Style::default().fg(ACCENT)),
+                            Span::styled(line.to_string(), Style::default()),
+                        ])
+                    } else {
+                        Line::from(format!("  {line}"))
+                    }
+                })
+                .collect()
+        } else {
+            vec![Line::from(vec![
                 Span::styled("❯ ", Style::default().fg(ACCENT)),
                 Span::styled(display_input.to_string(), input_style),
-            ])),
-            inner,
-        );
+            ])]
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
         // Blinking-style cursor block after the text (only when not running
         // and there's no placeholder shift).
         if !self.running && !self.input.is_empty() {
@@ -636,7 +668,11 @@ impl App {
     }
 
     fn styled_status_line(&self) -> Line<'static> {
-        let spinner = SPINNER[(self.spinner_tick as usize) % SPINNER.len()];
+        let spinner = if self.running {
+            SPINNER_WORKING[(self.spinner_tick as usize) % SPINNER_WORKING.len()]
+        } else {
+            SPINNER[(self.spinner_tick as usize) % SPINNER.len()]
+        };
         if self.running {
             let tool = self
                 .current_tool

@@ -290,7 +290,7 @@ fn cli_binary_mock_run_and_resume() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Mock run complete — the loop, tools, store, and budget all executed."),
+        stdout.contains("Demo complete"),
         "final answer on stdout:\n{stdout}"
     );
     assert!(
@@ -336,7 +336,7 @@ fn cli_binary_mock_run_and_resume() {
     );
     let resumed_stdout = String::from_utf8_lossy(&resumed.stdout);
     assert!(
-        resumed_stdout.contains("Mock run complete"),
+        resumed_stdout.contains("Demo complete"),
         "resumed answer:\n{resumed_stdout}"
     );
     assert!(

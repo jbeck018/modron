@@ -723,7 +723,7 @@ fn build_agent_with(
 
     let build_provider = |pid: &str| -> anyhow::Result<Arc<dyn ModelProvider>> {
         Ok(match pid {
-            "mock" => Arc::new(demo_provider()),
+            "mock" => Arc::new(modron_core::testing::rich_demo_provider()),
             other => Arc::new(RetryingProvider::new(provider_from_env(other).map_err(
                 |err| {
                     anyhow::anyhow!(err.to_string())
@@ -992,7 +992,7 @@ fn stdout_delta_sink() -> Arc<modron_core::DeltaSink> {
 /// agent builder and the multi-provider bench.
 pub(crate) fn build_provider_shim(pid: &str) -> anyhow::Result<Arc<dyn ModelProvider>> {
     Ok(match pid {
-        "mock" => Arc::new(demo_provider()),
+        "mock" => Arc::new(modron_core::testing::rich_demo_provider()),
         other => Arc::new(RetryingProvider::new(provider_from_env(other).map_err(
             |err| {
                 anyhow::anyhow!(err.to_string()).context(format!("cannot start provider `{other}`"))

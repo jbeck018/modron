@@ -50,7 +50,7 @@ fn chat_repl_runs_multi_turn_through_one_session() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("modron chat"), "banner: {stdout}");
     assert_eq!(
-        stdout.matches("Mock run complete").count(),
+        stdout.matches("Demo complete").count(),
         2,
         "two answers: {stdout}"
     );
@@ -117,7 +117,7 @@ fn one_shot_print_mode_does_not_double_print() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
-        stdout.matches("Mock run complete").count(),
+        stdout.matches("Demo complete").count(),
         1,
         "answer printed exactly once: {stdout}"
     );

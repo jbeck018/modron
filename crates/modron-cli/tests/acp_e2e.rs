@@ -121,7 +121,7 @@ fn acp_initialize_session_prompt_and_streaming() {
             .pointer("/params/update/content/text")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .contains("Mock run complete")),
+            .contains("Demo complete")),
         "streamed chunks carry the answer: {updates:?}"
     );
     let tool_calls = updates
@@ -149,7 +149,7 @@ fn acp_initialize_session_prompt_and_streaming() {
             .pointer("/params/update/content/text")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .contains("Mock run complete")),
+            .contains("Demo complete")),
         "resume streams a fresh answer: {updates:?}"
     );
 }

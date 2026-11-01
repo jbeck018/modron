@@ -112,6 +112,110 @@ impl MockProvider {
 /// returns the final answer. Requires `modron-tools`'s `bash` tool in the
 /// registry. Usage numbers are scripted like everything else in a mock — the
 /// CLI still reports them honestly as provider-reported.
+/// A rich demo that exercises EVERY TUI view: tool calls (start/done),
+/// streaming text, a delegate subagent, an error, and a final answer.
+/// This is what `modron --provider mock` shows — the review-everything script.
+pub fn rich_demo_script() -> Vec<TurnResponse> {
+    use StopReason::*;
+    vec![
+        // Turn 1: multiple tool calls (parallel read-only dispatch).
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo 'hello from bash'"}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "Cargo.toml"}),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({"pattern": "modron"}),
+                },
+            ],
+            usage: Usage {
+                input_tokens: 800,
+                output_tokens: 120,
+                cached_input_tokens: 400,
+            },
+            stop_reason: ToolUse,
+        },
+        // Turn 2: a delegate call (shows the subagent panel).
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c4".into(),
+                name: "delegate".into(),
+                arguments: serde_json::json!({
+                    "task": "explore the workspace and report findings",
+                    "background": false
+                }),
+            }],
+            usage: Usage {
+                input_tokens: 900,
+                output_tokens: 80,
+                cached_input_tokens: 600,
+            },
+            stop_reason: ToolUse,
+        },
+        // Turn 3: a write call (shows the approval/checkpoint path).
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c5".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path": "demo-output.txt", "content": "demo write"}),
+            }],
+            usage: Usage {
+                input_tokens: 1000,
+                output_tokens: 90,
+                cached_input_tokens: 800,
+            },
+            stop_reason: ToolUse,
+        },
+        // Turn 4: a failing tool (shows the error styling).
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c6".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "exit 1"}),
+            }],
+            usage: Usage {
+                input_tokens: 1100,
+                output_tokens: 70,
+                cached_input_tokens: 900,
+            },
+            stop_reason: ToolUse,
+        },
+        // Turn 5: the final answer with decent streaming.
+        TurnResponse {
+            text: "Demo complete — you saw tool calls (bash/read/grep), \
+a delegate subagent, a file write with checkpoint, an error result, \
+and this streamed answer.\n\nThe full loop: routing → tools → \
+subagent → checkpoint → error recovery → answer."
+                .into(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 1200,
+                output_tokens: 200,
+                cached_input_tokens: 1000,
+            },
+            stop_reason: EndTurn,
+        },
+    ]
+}
+
+/// Convenience: provider with the rich demo script.
+pub fn rich_demo_provider() -> MockProvider {
+    MockProvider::with_script(rich_demo_script()).then_repeat_last()
+}
+
 pub fn demo_script() -> Vec<TurnResponse> {
     vec![
         TurnResponse {
