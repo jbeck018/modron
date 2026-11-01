@@ -33,6 +33,57 @@ pub enum Action {
     Quit,
 }
 
+/// A parsed slash command (dirge/Claude Code pattern): `/name arg`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Exit,
+    Clear,
+    Compact,
+    Model(String),
+    Context,
+    Sessions,
+    Sandbox(String),
+    Unknown(String),
+}
+
+impl SlashCommand {
+    /// Parse `/name arg` from input; None if input doesn't start with `/`.
+    pub fn parse(input: &str) -> Option<Self> {
+        let trimmed = input.trim();
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+        let mut parts = trimmed[1..].splitn(2, ' ');
+        let cmd = parts.next().unwrap_or_default();
+        let arg = parts.next().unwrap_or_default().trim().to_string();
+        Some(match cmd {
+            "help" | "?" => SlashCommand::Help,
+            "exit" | "quit" | "q" => SlashCommand::Exit,
+            "clear" => SlashCommand::Clear,
+            "compact" => SlashCommand::Compact,
+            "model" => SlashCommand::Model(arg),
+            "context" => SlashCommand::Context,
+            "sessions" => SlashCommand::Sessions,
+            "sandbox" => SlashCommand::Sandbox(arg),
+            other => SlashCommand::Unknown(other.to_string()),
+        })
+    }
+
+    /// The help text shown by /help.
+    pub fn help_text() -> &'static str {
+        "/help          show this help\n\
+         /exit          quit the TUI\n\
+         /clear         clear the scrollback\n\
+         /compact       force a context compaction now\n\
+         /model <name>  switch models mid-session\n\
+         /context       show context usage breakdown\n\
+         /sessions      list recent sessions\n\
+         /sandbox <mode> off | seatbelt | bubblewrap\n\
+         (anything else is sent as a task to the agent)"
+    }
+}
+
 /// A tool call awaiting the user's y/n/a decision.
 pub struct PendingApproval {
     pub call: ToolCall,
@@ -68,6 +119,10 @@ pub struct App {
     pub upgrade_notice: Option<String>,
     /// Model label for the status line (set by the run loop).
     pub model_label: String,
+    /// The model's context window (for the meter bar).
+    pub context_window: u64,
+    /// Estimated current context usage (tokens, updated per turn).
+    pub context_used: u64,
     /// Live subagent rows (Phase 5h): id, label, turns, tokens, last_tool.
     pub subagents: Vec<(String, String, u32, u64, Option<String>)>,
 }
@@ -147,10 +202,14 @@ impl App {
             KeyCode::Enter => {
                 let task = std::mem::take(&mut self.input);
                 if task.trim().is_empty() {
-                    Action::None
-                } else {
-                    Action::Submit(task)
+                    return Action::None;
                 }
+                // Slash commands are handled locally (dirge pattern) —
+                // they never reach the model.
+                if let Some(cmd) = SlashCommand::parse(&task) {
+                    return self.handle_slash(cmd);
+                }
+                Action::Submit(task)
             }
             KeyCode::Backspace => {
                 self.input.pop();
@@ -165,6 +224,70 @@ impl App {
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    /// Handle a slash command locally (Phase 10): returns an Action.
+    /// Commands that need the run loop's help (quit, submit) map to Actions;
+    /// others update local state and return None.
+    fn handle_slash(&mut self, cmd: SlashCommand) -> Action {
+        match cmd {
+            SlashCommand::Exit => Action::Quit,
+            SlashCommand::Help => {
+                self.tool_lines.push(SlashCommand::help_text().to_string());
+                Action::None
+            }
+            SlashCommand::Clear => {
+                self.tool_lines.clear();
+                self.streaming.clear();
+                Action::None
+            }
+            SlashCommand::Compact => {
+                // Signal the run loop to force a compaction before the next
+                // turn; the engine handles it when context is over threshold.
+                self.tool_lines.push(
+                    "(compaction will trigger on the next turn if context is over threshold)"
+                        .to_string(),
+                );
+                Action::None
+            }
+            SlashCommand::Model(name) => {
+                if name.is_empty() {
+                    self.tool_lines
+                        .push(format!("current model: {}", self.model_label));
+                    self.tool_lines
+                        .push("usage: /model glm-5.3-flash".to_string());
+                } else {
+                    self.model_label = name.clone();
+                    self.tool_lines.push(format!(
+                        "switched to {name} (takes effect on the next turn)"
+                    ));
+                }
+                Action::None
+            }
+            SlashCommand::Context => {
+                let total = self.cumulative.total();
+                self.tool_lines.push(format!(
+                    "context usage: {total} tokens this session (input + output)\nmodel window: check /model for the current model\nest. remaining: the engine compacts at 80% of the model window"
+                ));
+                Action::None
+            }
+            SlashCommand::Sessions => {
+                self.tool_lines
+                    .push("(session listing: run `modron sessions` outside the TUI)".to_string());
+                Action::None
+            }
+            SlashCommand::Sandbox(mode) => {
+                self.tool_lines.push(format!(
+                    "sandbox: {mode} (takes effect on restart — the sandbox is set at launch)"
+                ));
+                Action::None
+            }
+            SlashCommand::Unknown(name) => {
+                self.tool_lines
+                    .push(format!("unknown command /{name} — try /help"));
+                Action::None
+            }
         }
     }
 
@@ -498,6 +621,20 @@ impl App {
     }
 
     /// The status line as styled spans (spinner accent, model dim, tokens).
+    /// A visual context-usage bar (dirge pattern): `▓▓▓░░░░░░░ 30%` —
+    /// shows a compact warning at 80%+ (the compaction trigger).
+    pub fn context_meter(&self) -> String {
+        if self.context_window == 0 {
+            return String::new();
+        }
+        let frac = (self.context_used as f64 / self.context_window as f64).min(1.0);
+        let filled = (frac * 10.0).round() as usize;
+        let bar: String = "▓".repeat(filled) + &"░".repeat(10 - filled);
+        let pct = (frac * 100.0) as u64;
+        let marker = if pct >= 80 { " !compact" } else { "" };
+        format!("{bar} {pct}%{marker}")
+    }
+
     fn styled_status_line(&self) -> Line<'static> {
         let spinner = SPINNER[(self.spinner_tick as usize) % SPINNER.len()];
         if self.running {
@@ -520,12 +657,13 @@ impl App {
                 Span::styled("  esc interrupt", Style::default().fg(DIM)),
             ])
         } else {
+            let meter = self.context_meter();
             Line::from(vec![
                 Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
                 Span::styled(self.model_label.clone(), Style::default().fg(DIM)),
                 Span::styled(
                     format!(
-                        " · {} tok · ctrl+o {}",
+                        " · {} tok · {meter} ctrl+o {}",
                         self.cumulative.total(),
                         if self.transcript_mode {
                             "full"

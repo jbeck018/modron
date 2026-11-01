@@ -21,7 +21,7 @@ modron-core = { path = "crates/modron-core" }
 modron-providers = { path = "crates/modron-providers" }
 modron-tools = { path = "crates/modron-tools" }
 modron-store = { path = "crates/modron-store" }
-modron-router = { path = "crates/modron-router" }
+modron-router = { path = "crates/modron-router", version = "0.1.0" }
 modron-tui = { path = "crates/modron-tui" }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "io-std", "sync", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }

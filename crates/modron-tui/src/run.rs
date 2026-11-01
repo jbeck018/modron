@@ -170,8 +170,11 @@ pub async fn run_with(
 
     let mut app = App {
         upgrade_notice,
-
         session_id: resume_session,
+        model_label: model_label.clone(),
+        context_window: modron_router::lookup(&model_label)
+            .map(|info| info.context_window)
+            .unwrap_or(0),
         ..App::default()
     };
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();

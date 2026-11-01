@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 modron-core = { path = "../modron-core", version = "0.1.0" }
+modron-router = { path = "../modron-router", version = "0.1.0" }
 modron-store = { path = "../modron-store", version = "0.1.0" }
 serde_json.workspace = true
 anyhow.workspace = true

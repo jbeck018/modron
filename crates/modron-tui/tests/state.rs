@@ -3,7 +3,7 @@
 //! real TTY and is intentionally thin.
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
-use modron_tui::{Action, App, PendingApproval};
+use modron_tui::{Action, App, PendingApproval, SlashCommand};
 use serde_json::json;
 use std::sync::mpsc;
 
@@ -297,4 +297,61 @@ fn running_view_shows_spinner_and_interrupt_hint() {
         frame.contains("working"),
         "working title on the border: {frame:?}"
     );
+}
+
+#[test]
+fn slash_commands_parse_and_route() {
+    assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
+    assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit));
+    assert_eq!(SlashCommand::parse("/q"), Some(SlashCommand::Exit));
+    assert_eq!(
+        SlashCommand::parse("/model glm-5.3-flash"),
+        Some(SlashCommand::Model("glm-5.3-flash".into()))
+    );
+    assert_eq!(
+        SlashCommand::parse("/bogus"),
+        Some(SlashCommand::Unknown("bogus".into()))
+    );
+    assert_eq!(SlashCommand::parse("regular task"), None);
+}
+
+#[test]
+fn slash_commands_are_handled_locally() {
+    let mut app = App::default();
+    // /help shows help text in the tool lines
+    app.on_key(key(crossterm::event::KeyCode::Char('/')));
+    for c in "help".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(c)));
+    }
+    let action = app.on_key(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(action, Action::None, "help is local, not submitted");
+    assert!(app.tool_lines.iter().any(|l| l.contains("/exit")));
+
+    // /exit quits
+    let mut app2 = App::default();
+    app2.input.push_str("/exit");
+    let action = app2.on_key(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(action, Action::Quit);
+
+    // /model switches
+    let mut app3 = App::default();
+    app3.input.push_str("/model glm-5.3");
+    app3.on_key(key(crossterm::event::KeyCode::Enter));
+    assert_eq!(app3.model_label, "glm-5.3");
+}
+
+#[test]
+fn context_meter_renders_the_bar() {
+    let mut app = App {
+        context_window: 100_000,
+        context_used: 50_000,
+        ..App::default()
+    };
+    let meter = app.context_meter();
+    assert!(meter.contains("50%"), "{meter}");
+    assert!(meter.contains("▓"), "bar characters: {meter}");
+
+    app.context_used = 85_000;
+    let meter = app.context_meter();
+    assert!(meter.contains("!compact"), "compaction warning: {meter}");
 }

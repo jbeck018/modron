@@ -1430,6 +1430,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "modron-core",
+ "modron-router",
  "modron-store",
  "ratatui",
  "serde_json",
