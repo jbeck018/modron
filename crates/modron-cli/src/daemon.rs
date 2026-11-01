@@ -16,10 +16,7 @@
 //!
 //! Methods: ping | send_task | resume_task | list_sessions | stop
 
-use modron_core::{
-    Engine, EngineConfig, RunSummary, SessionId, StreamDelta,
-    ToolActivity,
-};
+use modron_core::{Engine, EngineConfig, RunSummary, SessionId, StreamDelta, ToolActivity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;

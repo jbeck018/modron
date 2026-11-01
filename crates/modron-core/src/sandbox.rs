@@ -50,14 +50,22 @@ pub fn seatbelt_profile(workspace: &Path) -> String {
 /// `-p` inline form). Only `SandboxPolicy::Seatbelt` reaches this; callers
 /// on other platforms get an actionable error instead of a silent fallback.
 pub async fn run_sandboxed(command: &str, workspace: &Path) -> Result<std::process::Output> {
-    if !cfg!(target_os = "macos") {
-        return Err(Error::Config(
-            "sandbox=seatbelt".into(),
-            "Seatbelt is macOS-only; the Linux (bubblewrap) port is not implemented yet — \
-             run with --sandbox off (and an approval mode you trust) on this platform"
-                .into(),
-        ));
+    // Route to the platform executor.
+    match std::env::consts::OS {
+        "macos" => run_seatbelt(command, workspace).await,
+        "linux" => run_bubblewrap(command, workspace).await,
+        other => Err(Error::Config(
+            "sandbox".into(),
+            format!(
+                "no sandbox implementation for {other} — run with --sandbox off \
+                 (and an approval mode you trust) on this platform"
+            ),
+        )),
     }
+}
+
+/// macOS Seatbelt: `sandbox-exec -f <profile> sh -c <command>`.
+async fn run_seatbelt(command: &str, workspace: &Path) -> Result<std::process::Output> {
     let profile = seatbelt_profile(workspace);
     let dir = std::env::temp_dir().join(format!("modron-sb-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| {
@@ -93,11 +101,67 @@ pub async fn run_sandboxed(command: &str, workspace: &Path) -> Result<std::proce
     Ok(output)
 }
 
+/// Linux bubblewrap (`bwrap`): network denied via `--unshare-net`, the
+/// workspace bind-mounted read-write, everything else read-only or masked.
+/// Same posture as Seatbelt: no network, writes only in the workspace + tmp.
+async fn run_bubblewrap(command: &str, workspace: &Path) -> Result<std::process::Output> {
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    let output = tokio::process::Command::new("bwrap")
+        .arg("--unshare-net") // deny network
+        .arg("--unshare-ipc")
+        .arg("--dev-bind")
+        .arg("/dev")
+        .arg("/dev")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--bind")
+        .arg("/usr")
+        .arg("/usr") // read-only system
+        .arg("--ro-bind")
+        .arg("/etc")
+        .arg("/etc")
+        .arg("--ro-bind")
+        .arg("/bin")
+        .arg("/bin")
+        .arg("--ro-bind")
+        .arg("/lib")
+        .arg("/lib")
+        .arg("--ro-bind")
+        .arg("/lib64")
+        .arg("/lib64")
+        .arg("--tmpfs")
+        .arg("/tmp") // writable tmpfs for temp files
+        .arg("--bind")
+        .arg(&canonical)
+        .arg(&canonical) // the workspace (read-write)
+        .arg("--chdir")
+        .arg(&canonical)
+        .arg("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .await
+        .map_err(|e| {
+            Error::Config(
+                "bwrap".into(),
+                format!(
+                    "cannot spawn bwrap — is bubblewrap installed? \
+                     (apt install bubblewrap / dnf install bubblewrap): {e}"
+                ),
+            )
+        })?;
+    Ok(output)
+}
+
 /// Whether the `SandboxPolicy` can actually be honored on this platform.
 pub fn is_supported(policy: SandboxPolicy) -> bool {
     match policy {
         SandboxPolicy::Off => true,
         SandboxPolicy::Seatbelt => cfg!(target_os = "macos"),
+        SandboxPolicy::Bubblewrap => cfg!(target_os = "linux"),
     }
 }
 

@@ -210,9 +210,12 @@ pub enum SandboxPolicy {
     #[default]
     Off,
     /// macOS Seatbelt via `sandbox-exec`: network denied, file writes
-    /// limited to the working directory + system temp dirs. The Linux
-    /// (bubblewrap/seccomp) port is Phase-1 residual work.
+    /// limited to the working directory + system temp dirs.
     Seatbelt,
+    /// Linux bubblewrap (`bwrap`): same posture — network denied via
+    /// unshare-net, writes limited to the workspace + /tmp via tmpfs
+    /// overlays and read-only binds (Phase 9).
+    Bubblewrap,
 }
 
 /// Context handed to a tool execution.

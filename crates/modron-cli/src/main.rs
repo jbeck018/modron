@@ -65,6 +65,8 @@ enum SandboxChoice {
     Off,
     /// macOS Seatbelt: network denied, writes fenced to workspace + temp.
     Seatbelt,
+    /// Linux bubblewrap: network denied, workspace read-write, rest read-only.
+    Bubblewrap,
 }
 
 impl SandboxChoice {
@@ -72,6 +74,7 @@ impl SandboxChoice {
         match self {
             Self::Off => modron_core::SandboxPolicy::Off,
             Self::Seatbelt => modron_core::SandboxPolicy::Seatbelt,
+            Self::Bubblewrap => modron_core::SandboxPolicy::Bubblewrap,
         }
     }
 }
