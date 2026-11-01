@@ -3,7 +3,7 @@
 //! provider, pastes a key, and it's saved to `~/.config/modron/env` (0600)
 //! — sourced automatically on every subsequent launch.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// One provider option on the onboarding screen.
