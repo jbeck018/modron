@@ -1102,6 +1102,9 @@ fn build_agent_with(
             &reg.server,
             reg.info.clone(),
         )));
+        // Phase 13 dynamic discovery: MCP tools stay callable but leave the
+        // system prompt — the model finds them via tool_search.
+        registry.mark_on_demand(&reg.info.name);
     }
     // Personas (Phase 5c A2): catalog-resolve providers so delegates can
     // force (model, provider) pairs without a catalog dependency in core.

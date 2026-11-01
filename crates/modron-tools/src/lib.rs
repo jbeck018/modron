@@ -31,6 +31,7 @@ mod read;
 pub mod reduce;
 mod remember;
 mod skill;
+mod tool_search;
 pub mod validate;
 mod verify;
 mod write;
@@ -76,6 +77,7 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
         memory_root,
     )));
     registry.register(Arc::new(crate::minify::ReadMinifiedTool));
+    registry.register(Arc::new(crate::tool_search::ToolSearchTool));
     registry
 }
 
@@ -102,7 +104,7 @@ mod tests {
         let names: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
-            vec!["bash", "edit", "glob", "grep", "memory_search", "read", "read_minified", "remember", "write"],
+            vec!["bash", "edit", "glob", "grep", "memory_search", "read", "read_minified", "remember", "tool_search", "write"],
             "sorted spec names"
         );
     }

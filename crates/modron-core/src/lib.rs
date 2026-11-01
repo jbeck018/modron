@@ -291,6 +291,10 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     /// Shared per-session read ledger (see [`ReadGate`]).
     pub read_gate: ReadGate,
+    /// Tools hidden from the system prompt and surfaced on demand via
+    /// `tool_search` (Phase 13 dynamic discovery): registered and callable
+    /// as usual, just not paid for on every turn.
+    on_demand: std::collections::HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -300,6 +304,26 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let spec = tool.spec();
         self.tools.insert(spec.name.clone(), tool);
+    }
+    /// Mark a tool on-demand: hidden from the prompt, discoverable through
+    /// `tool_search`. Unknown names are ignored (registration order races).
+    pub fn mark_on_demand(&mut self, name: &str) {
+        self.on_demand.insert(name.to_string());
+    }
+    /// Whether `name` is on-demand.
+    pub fn is_on_demand(&self, name: &str) -> bool {
+        self.on_demand.contains(name)
+    }
+    /// Specs for the SYSTEM PROMPT: everything except on-demand tools.
+    pub fn specs_prompt(&self) -> Vec<ToolSpec> {
+        let mut v: Vec<_> = self
+            .tools
+            .values()
+            .map(|t| t.spec())
+            .filter(|s| !self.on_demand.contains(&s.name))
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)

@@ -140,7 +140,7 @@ impl Engine {
         task: &str,
         mut transcript: Vec<Message>,
     ) -> Result<RunSummary> {
-        let tool_specs = self.tools.specs();
+        let tool_specs = self.tools.specs_prompt();
         let system = self.assemble_system(&tool_specs);
         let mut governor =
             BudgetGovernor::new(self.config.max_total_tokens, self.config.max_input_tokens);
