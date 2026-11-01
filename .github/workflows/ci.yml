@@ -28,6 +28,25 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests (offline — the mock provider is the acceptance harness)
         run: cargo test --workspace
+      - name: Startup performance gate (the ~6ms promise — fails above 50ms)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo build --release
+          STARTUP=$(python3 -c "
+import subprocess, time
+times = []
+for _ in range(10):
+    t0 = time.perf_counter()
+    subprocess.run(['target/release/modron', '--version'], capture_output=True)
+    times.append((time.perf_counter() - t0) * 1000)
+times.sort()
+print(f'{times[5]:.0f}')
+")
+          echo "startup p50: ${STARTUP}ms"
+          if [ "$STARTUP" -gt 50 ]; then
+            echo "::error::startup regression: ${STARTUP}ms > 50ms budget"
+            exit 1
+          fi
 
   deny:
     name: supply chain (cargo-deny)
