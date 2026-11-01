@@ -22,7 +22,6 @@ pub mod upgrade;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use modron_core::memory::MemoryStore;
-use modron_core::testing::demo_provider;
 use modron_core::{
     estimate_tokens, CompactionPolicy, Engine, EngineConfig, ModelProvider, SessionEvent,
     SessionId, SessionStore, StreamDelta, ToolCall, Usage,
