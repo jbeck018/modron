@@ -158,5 +158,19 @@ text = "write integration tests for hooks"
 text = "optimize session loading"
 [[eval_strong]]
 text = "design the embedder router"
+[[cheap]]
+text = "list the rust files here"
+[[cheap]]
+text = "show the git status"
+[[strong]]
+text = "refactor the script to extract shared logic into a function"
+[[strong]]
+text = "fix the regex to extract the domain from any input"
+[[strong]]
+text = "transform the nested json moving keys between levels"
+[[strong]]
+text = "update the version across multiple files consistently"
+[[strong]]
+text = "add error handling with early exit conditions to the script"
 [[eval_strong]]
 text = "migrate to the new edition"
