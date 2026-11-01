@@ -22,6 +22,14 @@ curl -fsSL https://raw.githubusercontent.com/jbeck018/modron/main/install.sh | b
 cargo install --locked --git https://github.com/jbeck018/modron
 ```
 
+## Diagnostics
+
+```sh
+modron doctor    # check keys, config, git, PDF support, storage, terminal
+```
+
+Startup: ~6ms (single Rust binary, no runtime). Binary: 4.1MB.
+
 ## Attachments (multimodal)
 
 ```sh

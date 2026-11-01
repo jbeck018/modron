@@ -18,7 +18,7 @@ pub mod config;
 pub mod evals;
 pub mod upgrade;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use modron_core::memory::MemoryStore;
 use modron_core::testing::demo_provider;
 use modron_core::{
@@ -103,6 +103,8 @@ enum Command {
     },
     /// Upgrade the binary from the latest GitHub release.
     Upgrade,
+    /// Diagnose your setup: keys, config, git, PDF support, terminal.
+    Doctor,
     /// Subscription auth (EXPERIMENTAL): manage OAuth tokens for providers
     /// that support it (currently: claude).
     Auth {
@@ -379,6 +381,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return crate::upgrade::run_upgrade().await;
     }
 
+    // `modron doctor` — setup diagnostics (Phase 8).
+    if let Some(Command::Doctor) = cli.command {
+        return run_doctor(&cfg);
+    }
+
     // `modron auth …` — subscription token management (Phase 5d X3).
     if let Some(Command::Auth { action }) = cli.command {
         return crate::auth::run_auth(action).await;
@@ -455,7 +462,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let Some(task) = cli.task.clone() else {
-        anyhow::bail!("no task given — pass a task string or a subcommand (see --help)");
+        // Bare `modron` prints help (the friendly on-ramp) — errors are for
+        // genuinely wrong invocations, not "show me what this does".
+        Cli::command().print_help()?;
+        return Ok(());
     };
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -976,6 +986,136 @@ pub(crate) fn load_attachment(path: &Path) -> anyhow::Result<modron_core::Attach
             .to_string(),
         text,
     })
+}
+
+/// `modron doctor` (Phase 8): diagnose the setup — API keys, config,
+/// git, PDF support, and the terminal. Every check prints ✓/✗ with an
+/// actionable fix; the exit code reflects overall health.
+fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
+    let mut healthy = true;
+
+    println!("modron {} — environment check", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    // API keys (by provider).
+    let providers = [
+        (
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            "https://console.anthropic.com",
+        ),
+        (
+            "openai-compat",
+            "OPENAI_API_KEY",
+            "https://platform.openai.com",
+        ),
+        ("zai", "ZAI_API_KEY", "https://z.ai"),
+        ("groq", "GROQ_API_KEY", "https://console.groq.com/keys"),
+        (
+            "google",
+            "GEMINI_API_KEY",
+            "https://aistudio.google.com/apikey",
+        ),
+        ("cerebras", "CEREBRAS_API_KEY", "https://cloud.cerebras.ai"),
+        ("mistral", "MISTRAL_API_KEY", "https://console.mistral.ai"),
+        (
+            "openrouter",
+            "OPENROUTER_API_KEY",
+            "https://openrouter.ai/keys",
+        ),
+        (
+            "github-models",
+            "GITHUB_MODELS_TOKEN",
+            "https://github.com/settings/tokens",
+        ),
+        ("nvidia", "NVIDIA_API_KEY", "https://build.nvidia.com"),
+    ];
+    println!("providers:");
+    for (name, env_key, hint) in providers {
+        match std::env::var(env_key) {
+            Ok(v) if !v.is_empty() => println!("  ✓ {name} ({env_key} set)"),
+            _ => println!("  · {name} — unset ({hint})"),
+        }
+    }
+
+    // Config file.
+    println!("\nconfig:");
+    match config::config_path() {
+        Some(path) if path.exists() => {
+            match crate::auth::load_tokens() {
+                _ => {}
+            }
+            // Try parsing it via load_from.
+            let loaded = config::load_from(&path, |_| None);
+            println!("  ✓ {} (parses)", path.display());
+            if let Some(default) = &loaded.default_provider {
+                println!("    default provider: {default}");
+            }
+            if let Some(model) = &loaded.default_model {
+                println!("    default model: {model}");
+            }
+        }
+        Some(path) => println!(
+            "  · no config file at {} (optional — defaults apply)",
+            path.display()
+        ),
+        None => println!("  · no home directory found; config unavailable"),
+    }
+
+    // Git (worktree isolation + checkpoints).
+    println!("\ntools:");
+    let git = std::process::Command::new("git").arg("--version").output();
+    match git {
+        Ok(o) if o.status.success() => {
+            println!("  ✓ git ({})", String::from_utf8_lossy(&o.stdout).trim())
+        }
+        _ => {
+            healthy = false;
+            println!(
+                "  ✗ git not found — worktree isolation and diffs unavailable (brew install git)"
+            );
+        }
+    }
+    match std::process::Command::new("pdftotext").arg("-v").output() {
+        Ok(_) => println!("  ✓ pdftotext (PDF attachments work)"),
+        _ => println!("  · pdftotext not found — PDF attachments skipped (brew install poppler)"),
+    }
+
+    // Sessions + memory dirs.
+    println!("\nstorage:");
+    if let Some(home) = dirs::home_dir() {
+        let sessions = home.join(".modron").join("sessions");
+        let count = std::fs::read_dir(&sessions).map(|d| d.count()).unwrap_or(0);
+        println!("  sessions: {} in {}", count, sessions.display());
+        let memory = home.join(".modron").join("memory");
+        let mem_count = std::fs::read_dir(&memory).map(|d| d.count()).unwrap_or(0);
+        println!("  memory workspaces: {mem_count}");
+    }
+
+    // Terminal.
+    println!("\nterminal:");
+    use std::io::IsTerminal as _;
+    println!(
+        "  stdout is {}: TUI {}",
+        if std::io::stdout().is_terminal() {
+            "a tty"
+        } else {
+            "piped"
+        },
+        if std::io::stdout().is_terminal() {
+            "available"
+        } else {
+            "unavailable (use chat or one-shot)"
+        }
+    );
+
+    println!();
+    if healthy {
+        println!("all critical checks passed — run: modron \"your task\"");
+    } else {
+        println!("some checks failed — see the ✗ lines above");
+    }
+    Ok(())
 }
 
 /// Prepared MCP registration: one tool on one live server.

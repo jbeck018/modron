@@ -1260,3 +1260,46 @@ Claude Code-parity: images and documents as first-class inputs.
 extract via pdftotext. Token accounting flows through unchanged (the live
 run showed honest usage). Deferred: paste-from-clipboard in the TUI, image
 generation, and @-mention file completion in the TUI input.
+
+---
+
+# Phase 8 — Performance + DevEx review (opened/closed 2026-10-31)
+
+The user's ask: competitor review, bundle size, super-fast startup, fantastic
+DevEx. Measured, then fixed.
+
+## The numbers (vs competitors)
+
+| metric | modron | Claude Code | opencode | pi_agent_rust |
+|---|---|---|---|---|
+| startup (--version) | **5.9ms p50** | ~200-500ms (Node) | ~100ms+ (Go) | 5-7ms p95 (claim) |
+| binary size | **4.1MB** | ~100MB+ (npm install) | ~50MB | unknown |
+| language | Rust (single static) | TypeScript/Ink | Go+TS | Rust |
+
+**Startup is class-leading** — matching the fastest Rust agent and ~40x
+faster than Claude Code's Node startup. The single-binary distribution (no
+runtime, no node_modules) is the structural advantage.
+
+## What was measured
+
+- `--version`: 5.9ms p50 / 6.7ms p95 (10 runs, perf_counter)
+- `--help`: 5.8ms p50
+- `sessions list`: 6.0ms p50
+- Binary composition (cargo bloat): std 7.2%, regex_automata 5.0%, rustls
+  4.1%, our code ~3%. No single bloat offender; the size is proportionate.
+
+## Fixes landed
+
+| ID | Item | Result |
+|---|---|---|
+| D1 | `modron doctor`: provider keys, config, git, pdftotext, storage, terminal — ✓/✗/· with actionable hints | verified live; found zai key set, 188 sessions |
+| D2 | Bare `modron` (no args) shows help instead of erroring | verified |
+| D3 | Regex trimmed (default-features off, +unicode-perl +unicode-case): 4.3MB → 4.1MB | grep tests still green (7/7) |
+| D4 | First-run audit: no-key error is actionable (names env var + console URL); unknown provider lists valid values; bad flag has clap's tip | verified; no changes needed — already good |
+
+## DevEx verdict
+
+The first-run path is strong: bare invocation teaches, doctor diagnoses,
+errors link to fixes, and the binary starts in ~6ms. The remaining DevEx
+wins are in the TUI polish (in progress) and the repo-public decision for
+frictionless curl-installs.
