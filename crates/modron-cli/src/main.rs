@@ -268,9 +268,10 @@ struct Cli {
     /// memory root is derived as <this dir's parent>/memory.
     #[arg(long, global = true)]
     sessions_dir: Option<PathBuf>,
-    /// Continue this session id instead of starting a new one.
-    #[arg(long, global = true)]
-    resume: Option<SessionId>,
+    /// Continue a session: bare --resume picks the most recent; use
+    /// --resume=<id> for a specific one. (Claude Code / Codex convention.)
+    #[arg(long, global = true, num_args = 0..=1, require_equals = true)]
+    resume: Option<Option<SessionId>>,
     /// Autocompaction trigger: compact when the estimated context exceeds
     /// this fraction of --max-input-tokens (0 < t < 1; default 0.8).
     #[arg(long, global = true)]
@@ -283,6 +284,9 @@ struct Cli {
     /// otherwise (with an explanation on stderr).
     #[arg(long, global = true)]
     approve_all: bool,
+    /// Alias for --approve-all (the Claude Code / Codex convention).
+    #[arg(long, global = true)]
+    yolo: bool,
     /// Run as a named persona from [agents] in config (system prompt, forced
     /// model, tool lists).
     #[arg(long, global = true)]
@@ -487,8 +491,42 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let Some(task) = cli.task.clone() else {
-        // Bare `modron` prints help (the friendly on-ramp) — errors are for
-        // genuinely wrong invocations, not "show me what this does".
+        // Claude Code / Codex convention: bare `modron` opens the TUI when
+        // a terminal is attached; piped invocations get help.
+        use std::io::IsTerminal as _;
+        if std::io::stdout().is_terminal() {
+            let interactive = std::io::stdin().is_terminal();
+            let mcp = spawn_mcp_servers(&cfg).await?;
+            let notice = modron_upgrade_notice();
+            let effective_cli = if cli.yolo {
+                let mut c = cli.clone();
+                c.approve_all = true;
+                c
+            } else {
+                cli.clone()
+            };
+            return modron_tui::run_with(
+                |sinks| {
+                    let agent = build_agent_with(
+                        &effective_cli,
+                        &cfg,
+                        interactive,
+                        AgentSinks {
+                            approver: Some(sinks.approver),
+                            on_delta: Some(sinks.on_delta),
+                            on_tool_event: Some(sinks.on_tool_event),
+                        },
+                        &mcp,
+                    )
+                    .expect("build agent for tui");
+                    (agent.engine, agent.resume)
+                },
+                cli.model.clone().unwrap_or_default(),
+                notice,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:#}"));
+        }
         Cli::command().print_help()?;
         return Ok(());
     };
@@ -508,7 +546,27 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // usage table and compaction lines to THIS run (a resumed session already
     // carries past usage/compactions). Doubles as an early, actionable check
     // that a --resume id exists.
-    let usage_baseline = match cli.resume {
+    // Resolve --resume: explicit id wins; bare --resume picks the latest.
+    let resume_session_id: Option<SessionId> = match &cli.resume {
+        Some(Some(id)) => Some(*id),
+        Some(None) => {
+            let sessions = agent
+                .store
+                .list()
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot list sessions: {e}"))?;
+            match sessions.first() {
+                Some(meta) => {
+                    eprintln!("resuming: {} ({})", meta.id, meta.title);
+                    Some(meta.id)
+                }
+                None => anyhow::bail!("no sessions found — run a task first, then --resume"),
+            }
+        }
+        None => None,
+    };
+
+    let usage_baseline = match resume_session_id {
         Some(session_id) => agent.store.load(session_id).await?.len(),
         None => 0,
     };
@@ -531,7 +589,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .join(", ")
         );
     }
-    let summary = match cli.resume {
+    let summary = match resume_session_id {
         Some(session_id) => agent.engine.run_task_resuming(session_id, &task).await?,
         None => {
             agent
@@ -750,7 +808,7 @@ fn build_agent_with(
         memory_root: Some(memory_root.clone()),
         approvals: {
             let mut approvals = modron_core::ApprovalPolicy {
-                mode: if cli.approve_all {
+                mode: if cli.approve_all || cli.yolo {
                     modron_core::ApprovalMode::ApproveAll
                 } else {
                     modron_core::ApprovalMode::Ask
@@ -771,7 +829,7 @@ fn build_agent_with(
         })),
         // Honors a prior `modron rewind` of this session (C2): abandoned
         // events stay in the log but never re-enter context.
-        resume_from_event: cli.resume.and_then(|id| {
+        resume_from_event: cli.resume.flatten().and_then(|id| {
             let marker = sessions_dir.join(format!("{id}.rewind"));
             std::fs::read_to_string(&marker)
                 .ok()
@@ -789,7 +847,7 @@ fn build_agent_with(
             .sandbox
             .map(|choice| choice.policy())
             .unwrap_or_default(),
-        approver: if cli.approve_all {
+        approver: if cli.approve_all || cli.yolo {
             None
         } else {
             sinks.approver
@@ -864,7 +922,7 @@ fn build_agent_with(
     Ok(Agent {
         engine,
         store,
-        resume: cli.resume,
+        resume: cli.resume.flatten(),
     })
 }
 
