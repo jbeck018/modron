@@ -54,3 +54,70 @@ printf 'b=2\\n' > settings-c.txt
 """
 prompt = "Merge settings-a.txt, settings-c.txt and settings-b.txt into settings.txt — one key=value line per setting, sorted alphabetically by key, nothing else in the file."
 verify = "printf 'a=1\\nb=2\\nc=3\\n' | cmp -s - settings.txt"
+
+# ── Hard tier (Phase 8b): tasks that stress planning, multi-file state, and
+# error recovery — designed to separate models on QUALITY, not just completion.
+
+[[task]]
+id = "refactor-extract-function"
+setup = """
+cat > calc.sh << 'INNER'
+#!/usr/bin/env bash
+result=$((10 + 20))
+echo "sum: $result"
+result2=$((result * 2))
+echo "doubled: $result2"
+result3=$((result2 - 5))
+echo "adjusted: $result3"
+INNER
+chmod +x calc.sh
+"""
+prompt = "Refactor calc.sh: extract the arithmetic into a shell function called compute() that takes two args (operation and value), so the script calls compute three times. The output must be byte-identical to the current behavior."
+verify = "[ \"$(bash calc.sh)\" = \"$(printf 'sum: 30\\ndoubled: 60\\nadjusted: 55')\" ] && grep -q 'compute' calc.sh && [ \"$(grep -c 'compute' calc.sh)\" -ge 3 ]"
+
+[[task]]
+id = "fix-regex-extraction"
+setup = """
+cat > extract.sh << 'INNER'
+#!/usr/bin/env bash
+echo "user@example.com" | sed 's/.*@//' 
+INNER
+cat > test_extract.sh << 'INNER'
+#!/usr/bin/env bash
+domain="$(bash extract.sh)"
+if [ "$domain" = "example.com" ]; then echo PASS; exit 0; else echo "FAIL: got '$domain'"; exit 1; fi
+INNER
+chmod +x extract.sh test_extract.sh
+"""
+prompt = "extract.sh should extract the domain from any email address passed as its first argument (not hardcoded). Make test_extract.sh pass — it runs extract.sh with no argument and expects 'example.com' from the piped input. Also verify: extract.sh someone@other.org should print other.org"
+verify = "./test_extract.sh && [ \"$(bash extract.sh someone@other.org)\" = \"other.org\" ]"
+
+[[task]]
+id = "json-transform-nested"
+setup = """
+cat > data.json << 'INNER'
+{"users": [{"name": "alice", "settings": {"theme": "dark", "notif": true}}, {"name": "bob", "settings": {"theme": "light", "notif": false}}]}
+INNER
+"""
+prompt = "Transform data.json: for each user, move settings.theme to a top-level 'theme' key on the user object, and remove the settings object entirely. Keep everything else. Write the result back to data.json."
+verify = "grep -q '\"theme\": \"dark\"' data.json && grep -q '\"theme\": \"light\"' data.json && ! grep -q 'settings' data.json && grep -q '\"name\": \"alice\"' data.json && grep -q '\"notif\": true' data.json"
+
+[[task]]
+id = "multi-file-consistency"
+setup = """
+printf 'VERSION=1.0.0\\n' > version-a.env
+printf 'version=1.0.0\\n' > version-b.env
+printf '# version file\\n' > readme.txt
+"""
+prompt = "The project version is changing to 2.0.0. Update version-a.env (uppercase key), version-b.env (lowercase key), and readme.txt (add a line 'Version: 2.0.0' at the end). All three must be consistent."
+verify = "grep -q 'VERSION=2.0.0' version-a.env && grep -q 'version=2.0.0' version-b.env && grep -q 'Version: 2.0.0' readme.txt && ! grep -q '1.0.0' version-a.env && ! grep -q '1.0.0' version-b.env"
+
+[[task]]
+id = "error-recovery-chain"
+setup = """
+printf '#!/usr/bin/env bash\\necho step1\\n' > run.sh
+printf 'step1' > expected.txt
+chmod +x run.sh
+"""
+prompt = "run.sh needs to do three things: print step1, print step2, print step3 (each on its own line, in order). But there's a catch: after printing step2, it should check if a file named 'halt' exists — if it does, exit with code 1 BEFORE printing step3. Update expected.txt to contain the correct 3-line output for the normal (no halt file) case. Then verify both paths work."
+verify = "[ \"$(bash run.sh)\" = \"$(printf 'step1\\nstep2\\nstep3')\" ] && touch halt && bash run.sh 2>/dev/null; rc=$?; rm -f halt; [ $rc -eq 1 ] && [ \"$(cat expected.txt)\" = \"$(printf 'step1\\nstep2\\nstep3')\" ]"
