@@ -325,7 +325,7 @@ fn cli_binary_mock_run_and_resume() {
         .args(["--provider", "mock"])
         .arg("--sessions-dir")
         .arg(&sessions_dir)
-        .args(["--resume=", session_id])
+        .arg(format!("--resume={session_id}"))
         .output()
         .unwrap();
     assert!(
