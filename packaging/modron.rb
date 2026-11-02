@@ -3,9 +3,9 @@ class Modron < Formula
   desc "Token-efficient Rust AI coding agent harness"
   homepage "https://github.com/jbeck018/modron"
   url "https://github.com/jbeck018/modron.git",
-      tag:      "v0.1.0",
+      tag:      "v0.1.1",
       revision: "adecea0a9b066c3962ea85008f1ac58150bdb796"
-  version "0.1.0"
+  version "0.1.1"
   license "MIT"
 
   depends_on "rust" => :build

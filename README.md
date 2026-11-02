@@ -5,7 +5,7 @@ how smart the agent is; the harness decides how fast, safe, and expensive that
 intelligence is to use.** Read the founding document in [PLAN.md](PLAN.md); the live
 work ledger is [LEDGER.md](LEDGER.md).
 
-Status: **v0.1.0 — release train, ACP permissions, MCP inspection, bench** — one-shot CLI + `modron chat` REPL with
+Status: **v0.1.1 — self-improving memory, goal runs, LSP diagnostics, image paste** — one-shot CLI + `modron chat` REPL with
 live streaming answers, interactive approvals (Ask prompts on your terminal), agent
 engine loop, Anthropic + OpenAI-compatible + **Z.ai** providers (SSE streaming
 proven at the wire level), 6 essential tools behind an approval gate + optional

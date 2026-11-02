@@ -12,17 +12,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-modron-core = { path = "crates/modron-core", version = "0.1.0" }
-modron-providers = { path = "crates/modron-providers", version = "0.1.0" }
-modron-tools = { path = "crates/modron-tools", version = "0.1.0" }
-modron-store = { path = "crates/modron-store", version = "0.1.0" }
-modron-router = { path = "crates/modron-router", version = "0.1.0" }
-modron-tui = { path = "crates/modron-tui", version = "0.1.0" }
+modron-core = { path = "crates/modron-core", version = "0.1.1" }
+modron-providers = { path = "crates/modron-providers", version = "0.1.1" }
+modron-tools = { path = "crates/modron-tools", version = "0.1.1" }
+modron-store = { path = "crates/modron-store", version = "0.1.1" }
+modron-router = { path = "crates/modron-router", version = "0.1.1" }
+modron-tui = { path = "crates/modron-tui", version = "0.1.1" }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "io-std", "sync", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
