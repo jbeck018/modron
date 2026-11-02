@@ -5,7 +5,7 @@
 use modron_core::testing::{MockProvider, StaticSelector};
 use modron_core::{
     hooks::HookConfig, ApprovalMode, ApprovalPolicy, Engine, EngineConfig, ModelProvider,
-    SandboxPolicy, SessionEvent, SessionStore, StopReason, ToolCall, TurnResponse, Usage,
+    SessionEvent, SessionStore, StopReason, ToolCall, TurnResponse, Usage,
 };
 use modron_providers::provider_from_env;
 use modron_store::JsonlSessionStore;
@@ -179,7 +179,7 @@ async fn seatbelt_sandbox_blocks_network_allows_workspace_writes() {
             allow: Vec::new(),
             deny: Vec::new(),
         };
-        cfg.sandbox = SandboxPolicy::Seatbelt;
+        cfg.sandbox = modron_core::SandboxPolicy::Seatbelt;
     });
 
     let summary = engine.run_task("probe the sandbox").await.unwrap();
