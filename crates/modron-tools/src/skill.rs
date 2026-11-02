@@ -28,10 +28,11 @@ impl SkillTool {
         }
     }
 
-    /// The skill index for the system prompt: `- name: description` per
-    /// skill, byte-capped. Empty when no skills exist.
+    /// The skill index: `- name: description` per skill, byte-capped.
+    /// Repo skills first; built-in methodology skills follow unless a
+    /// repo skill already owns the name.
     pub fn index(&self) -> String {
-        let mut entries: Vec<String> = Vec::new();
+        let mut entries: Vec<(String, String)> = Vec::new();
         for root in &self.roots {
             let Ok(read_dir) = std::fs::read_dir(root) else {
                 continue;
@@ -42,16 +43,24 @@ impl SkillTool {
                     continue;
                 };
                 let (name, description) = parse_frontmatter(&text);
-                entries.push(format!(
-                    "- {}: {}",
+                entries.push((
                     name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                    description.unwrap_or_else(|| "(no description)".to_string())
+                    description.unwrap_or_else(|| "(no description)".to_string()),
                 ));
             }
         }
-        let mut out = entries.join("\n");
-        if out.len() > 2048 {
-            let cut: String = out.chars().take(2048).collect();
+        for (name, description, _) in modron_core::builtin_skills::BUILTIN_SKILLS {
+            if !entries.iter().any(|(n, _)| n == name) {
+                entries.push((name.to_string(), description.to_string()));
+            }
+        }
+        let mut out = entries
+            .iter()
+            .map(|(name, description)| format!("- {name}: {description}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if out.len() > 3072 {
+            let cut: String = out.chars().take(3072).collect();
             out = format!("{cut}…");
         }
         out
@@ -66,7 +75,8 @@ impl SkillTool {
             let (_, body) = split_frontmatter(&text);
             return Some(body);
         }
-        None
+        // Built-in skills ship with the binary.
+        modron_core::builtin_skills::builtin_skill_body(name).map(|text| split_frontmatter(text).1)
     }
 }
 
@@ -107,10 +117,11 @@ impl Tool for SkillTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: NAME.to_string(),
-            description: "Load the full instructions of a repo skill (SKILL.md). The index of \
+            description:
+                "Load the full instructions of a skill (repo SKILL.md or built-in). The index of \
                           available skills is in your system prompt; call this before following \
                           a skill's workflow."
-                .to_string(),
+                    .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {"name": {"type": "string", "description": "Skill directory name."}},
@@ -315,9 +326,65 @@ mod gallery_compat_tests {
         let index = tool.index();
         assert!(index.ends_with("…"), "index capped with an elision marker");
         assert!(
-            index.len() < 2200,
-            "index stays near the 2KB budget: {}",
+            index.len() < 3300,
+            "index stays near the 3KB budget: {}",
             index.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn builtin_skill_bodies_load_without_a_repo() {
+        let dir = tempfile::tempdir().unwrap(); // no skills dirs at all
+        let tool = SkillTool::for_working_dir(dir.path());
+        let outcome = tool
+            .execute(
+                serde_json::json!({"name": "subagent-driven-development"}),
+                &ToolCtx::new("."),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert!(outcome.content.contains("leader"), "{}", outcome.content);
+        assert!(
+            !outcome.content.contains("description:"),
+            "frontmatter stripped"
+        );
+        // The index lists the built-ins even with no repo skills.
+        assert!(tool.index().contains("systematic-debugging"));
+    }
+
+    #[tokio::test]
+    async fn repo_skill_overrides_the_builtin_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("brainstorming");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: brainstorming\ndescription: Ours.\n---\nOUR PROCESS",
+        )
+        .unwrap();
+        let tool = SkillTool::for_working_dir(dir.path());
+        let outcome = tool
+            .execute(
+                serde_json::json!({"name": "brainstorming"}),
+                &ToolCtx::new("."),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.content.contains("OUR PROCESS"));
+        assert!(
+            !outcome.content.contains("superpowers"),
+            "builtin body replaced"
+        );
+        assert_eq!(tool.index().matches("brainstorming").count(), 1);
     }
 }

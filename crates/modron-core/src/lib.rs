@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub mod auth;
 pub mod b64;
 pub mod budget;
+pub mod builtin_skills;
 pub mod compact;
 pub mod context;
 pub mod engine;

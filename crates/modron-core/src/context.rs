@@ -515,7 +515,7 @@ mod tests {
 /// The system prompt carries only this index; bodies load via the `skill`
 /// tool on demand. Byte-capped at 2KB.
 pub fn load_skills_index(working_dir: &std::path::Path) -> String {
-    let mut entries: Vec<String> = Vec::new();
+    let mut entries: Vec<(String, String)> = Vec::new();
     for root in [
         working_dir.join(".modron").join("skills"),
         working_dir.join(".claude").join("skills"),
@@ -528,16 +528,26 @@ pub fn load_skills_index(working_dir: &std::path::Path) -> String {
                 continue;
             };
             let (name, description) = parse_skill_frontmatter(&text);
-            entries.push(format!(
-                "- {}: {}",
+            entries.push((
                 name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                description.unwrap_or_else(|| "(no description)".to_string())
+                description.unwrap_or_else(|| "(no description)".to_string()),
             ));
         }
     }
-    let mut out = entries.join("\n");
-    if out.len() > 2048 {
-        let cut: String = out.chars().take(2048).collect();
+    // Built-in methodology skills ship with the binary; a repo skill with
+    // the same name overrides its line (and its body, at load time).
+    for (name, description, _) in crate::builtin_skills::BUILTIN_SKILLS {
+        if !entries.iter().any(|(n, _)| n == name) {
+            entries.push((name.to_string(), description.to_string()));
+        }
+    }
+    let mut out = entries
+        .iter()
+        .map(|(name, description)| format!("- {name}: {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if out.len() > 3072 {
+        let cut: String = out.chars().take(3072).collect();
         out = format!("{cut}…");
     }
     out
@@ -588,8 +598,26 @@ mod skills_tests {
     }
 
     #[test]
-    fn no_skills_dir_is_empty() {
+    fn no_skills_dir_still_lists_builtins() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_skills_index(dir.path()), "");
+        let index = load_skills_index(dir.path());
+        // Built-in methodology skills ship with the binary.
+        assert!(index.contains("subagent-driven-development"), "{index}");
+        assert!(index.contains("test-driven-development"), "{index}");
+        // A repo skill overrides its built-in twin's line exactly once.
+        let skill = dir
+            .path()
+            .join(".modron")
+            .join("skills")
+            .join("brainstorming");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: brainstorming\ndescription: OURS.\n---\nbody",
+        )
+        .unwrap();
+        let index = load_skills_index(dir.path());
+        assert_eq!(index.matches("brainstorming").count(), 1, "{index}");
+        assert!(index.contains("OURS."), "{index}");
     }
 }

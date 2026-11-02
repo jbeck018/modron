@@ -1155,11 +1155,11 @@ fn build_agent_with(
     registry.register(Arc::new(modron_tools::ExploreTool));
     registry.register(Arc::new(modron_tools::DelegateStatusTool));
     registry.register(Arc::new(modron_tools::MergeWorktreeTool));
-    if !modron_core::context::load_skills_index(&working_dir).is_empty() {
-        registry.register(Arc::new(modron_tools::SkillTool::for_working_dir(
-            &working_dir,
-        )));
-    }
+    // Built-in methodology skills ship with the binary, so the tool is
+    // always registered (repo skills still add/override on top).
+    registry.register(Arc::new(modron_tools::SkillTool::for_working_dir(
+        &working_dir,
+    )));
     for reg in mcp {
         registry.register(Arc::new(modron_mcp::McpTool::new(
             Arc::clone(&reg.handle),
