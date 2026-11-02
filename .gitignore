@@ -2,3 +2,4 @@
 *.session.jsonl
 .env
 demo-output.txt
+.DS_Store
