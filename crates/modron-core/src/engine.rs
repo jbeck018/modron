@@ -97,6 +97,18 @@ impl Engine {
     /// resumed session continues from the compacted context, not the full
     /// history (see [`reconstruct_transcript`]).
     pub async fn run_task_resuming(&self, session_id: SessionId, task: &str) -> Result<RunSummary> {
+        self.run_task_resuming_with_attachments(session_id, task, Vec::new())
+            .await
+    }
+
+    /// Continue a session with multimodal attachments (Phase 14 image
+    /// paste): the attachments ride on the new user message.
+    pub async fn run_task_resuming_with_attachments(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        attachments: Vec<crate::Attachment>,
+    ) -> Result<RunSummary> {
         if task.trim().is_empty() {
             return Err(Error::Config(
                 "empty task".into(),
@@ -127,7 +139,7 @@ impl Engine {
                 },
             )
             .await?;
-        transcript.push(Message::user(task));
+        transcript.push(Message::user_with_attachments(task, attachments));
         self.run_loop(session_id, task, transcript).await
     }
 

@@ -113,6 +113,12 @@ pub async fn run_with(
         .unwrap_or(false);
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
+    // Bracketed paste (ctrl+V in most terminals delivers a paste event):
+    // multi-line pastes enter the input instead of submitting.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste
+    );
     if kitty_keyboard {
         use crossterm::event::{
             KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -244,20 +250,69 @@ pub async fn run_with(
 
         // 3. Poll keyboard (raw mode).
         if crossterm::event::poll(TICK)? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            match crossterm::event::read()? {
+                crossterm::event::Event::Paste(text) => {
+                    // Bracketed paste: multi-line text enters the input
+                    // verbatim — the terminal told us it is a paste, so it
+                    // must never submit.
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    app.input.push_str(&text);
+                    continue;
+                }
+                crossterm::event::Event::Key(key) => {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     match app.on_key(key) {
                         crate::Action::None => {}
+                        crate::Action::PasteImage => {
+                            // ctrl+V: image → staged attachment; text → into
+                            // the input. Bounded so a hung clipboard service
+                            // cannot hang the TUI.
+                            let started = std::time::Instant::now();
+                            match tokio::task::spawn_blocking(crate::clipboard::harvest)
+                                .await
+                                .unwrap_or(crate::clipboard::ClipboardContent::Empty)
+                            {
+                                crate::clipboard::ClipboardContent::Image(path) => {
+                                    match app.attach_image(&path) {
+                                        Some(chip) => app.status_note = Some(format!(
+                                            "attached {chip} (goes with your next message)"
+                                        )),
+                                        None => app.status_note =
+                                            Some("clipboard image unreadable".into()),
+                                    }
+                                }
+                                crate::clipboard::ClipboardContent::Text(text) => {
+                                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                                    app.input.push_str(&text);
+                                }
+                                crate::clipboard::ClipboardContent::Empty => {
+                                    app.status_note =
+                                        Some("clipboard empty".into());
+                                }
+                            }
+                            let _ = started; // bounded by the harvest timeout itself
+                        }
                         crate::Action::Submit(task) => {
                             let task = app.task_with_goal(&task);
                             app.begin_task(&task);
+                            let attachments = app.take_attachments();
                             let engine = engine.clone();
                             let done = done_tx.clone();
                             let session = app.session_id;
                             engine_task = Some(tokio::spawn(async move {
                                 let outcome = match session {
-                                    Some(id) => engine.run_task_resuming(id, &task).await,
-                                    None => engine.run_task(&task).await,
+                                    Some(id) => {
+                                        engine
+                                            .run_task_resuming_with_attachments(
+                                                id, &task, attachments,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        engine
+                                            .run_task_with_attachments(&task, attachments)
+                                            .await
+                                    }
                                 };
                                 match outcome {
                                     Ok(summary) => {
@@ -288,6 +343,8 @@ pub async fn run_with(
                         }
                     }
                 }
+                }
+                _ => {}
             }
         }
 
@@ -385,6 +442,10 @@ pub async fn run_with(
             crossterm::event::PopKeyboardEnhancementFlags
         );
     }
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste
+    );
     crossterm::terminal::disable_raw_mode()?;
     if let Some(id) = app.session_id {
         println!("session: {id} — resume with --resume {id}");

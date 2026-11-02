@@ -12,6 +12,7 @@
 //! The terminal loop lives in [`run`].
 
 pub mod run;
+pub mod clipboard;
 pub mod theme;
 pub use theme::Theme;
 pub use run::{run_with, TuiConfig, TuiSinks};
@@ -33,6 +34,9 @@ pub enum Action {
     Abort,
     /// Quit the TUI (ctrl+c while idle; ctrl+c during a turn aborts first).
     Quit,
+    /// Paste (ctrl+V): harvest the clipboard — image → attachment, text →
+    /// inserted into the input.
+    PasteImage,
 }
 
 /// A parsed slash command (dirge/Claude Code pattern): `/name arg`.
@@ -212,6 +216,10 @@ pub struct App {
     pub goal: Option<String>,
     /// Active color theme (/theme <name> switches live).
     pub theme: Theme,
+    /// Pending multimodal attachments (ctrl+V images) for the next task.
+    pub attachments: Vec<modron_core::Attachment>,
+    /// Display labels for the pending attachments (rendered as chips).
+    pub attachment_chips: Vec<String>,
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
@@ -260,6 +268,9 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Char('J') => {
                     self.input.push('\n');
                     return Action::None;
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return Action::PasteImage;
                 }
                 KeyCode::Char('c') => {
                     if self.running {
@@ -675,7 +686,6 @@ impl App {
                 usage.total(),
                 turns,
                 {
-        let t = self.theme.resolved();
                     let all = usage.input_tokens + usage.cached_input_tokens;
                     if all > 0 {
                         format!(
@@ -732,6 +742,44 @@ impl App {
         }
     }
 
+    /// Attach a clipboard image (ctrl+V): loads, base64s, and stages it for
+    /// the next submit. Returns the chip label.
+    pub fn attach_image(&mut self, path: &std::path::Path) -> Option<String> {
+        let media = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            _ => return None,
+        };
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let chip = format!(
+            "[img {} · {} KiB]",
+            path.file_name()?.to_string_lossy(),
+            bytes.len() / 1024
+        );
+        self.attachments.push(modron_core::Attachment::Image {
+            media_type: media.to_string(),
+            data: modron_core::b64::encode(&bytes),
+        });
+        self.attachment_chips.push(chip.clone());
+        Some(chip)
+    }
+
+    /// Consume staged attachments (called on submit).
+    pub fn take_attachments(&mut self) -> Vec<modron_core::Attachment> {
+        self.attachment_chips.clear();
+        std::mem::take(&mut self.attachments)
+    }
+
     /// The task text actually submitted: the raw input plus the goal
     /// stop-condition rider when /goal is active.
     pub fn task_with_goal(&self, task: &str) -> String {
@@ -770,8 +818,13 @@ impl App {
                     .unwrap_or_default()
             );
         }
+        let note = self
+            .status_note
+            .as_ref()
+            .map(|n| format!(" · {n}"))
+            .unwrap_or_default();
         format!(
-            "{spinner} idle · {} tok · {} · ctrl+o {} · esc clears input",
+            "{spinner} idle · {} tok ·{note} {} · ctrl+o {} · esc clears input",
             self.cumulative.total(),
             self.session_id
                 .map(|id| format!("session {}", &id.to_string()[..8]))
@@ -901,6 +954,13 @@ impl App {
         let inner = block.inner(input_area);
         frame.render_widget(block, input_area);
 
+        // Pending-attachment chips ride as the first line inside the box.
+        let chips = if self.attachment_chips.is_empty() {
+            None
+        } else {
+            Some(self.attachment_chips.join(" "))
+        };
+
         // Input text; cursor rendered as a block at the text end.
         let display_input = if self.input.is_empty() && !self.running {
             "type a task…" // placeholder
@@ -914,7 +974,11 @@ impl App {
         };
         // Multi-line input: split on \n, render each as its own line with
         // the prompt on the first.
-        let lines: Vec<Line> = if self.input.contains('\n') {
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(chips) = chips {
+            lines.push(Line::from(chips).style(Style::default().fg(th.accent)));
+        }
+        let input_lines: Vec<Line> = if self.input.contains('\n') {
             self.input
                 .split('\n')
                 .enumerate()
@@ -935,6 +999,7 @@ impl App {
                 Span::styled(display_input.to_string(), input_style),
             ])]
         };
+        lines.extend(input_lines);
         frame.render_widget(Paragraph::new(lines), inner);
         // Blinking-style cursor block after the text (only when not running
         // and there's no placeholder shift).
