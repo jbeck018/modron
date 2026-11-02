@@ -160,6 +160,17 @@ pub async fn run_with(
         context_window: modron_router::lookup(&model_label)
             .map(|info| info.context_window)
             .unwrap_or(0),
+        // Menu inputs (personas, tool list, current model) come from the
+        // engine the loop owns.
+        personas: engine.config.personas.keys().cloned().collect(),
+        tool_names: engine
+            .tools
+            .specs()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect(),
+        current_model: engine.config.default_model.clone(),
+        current_theme: "modron".to_string(),
         ..App::default()
     };
 
@@ -616,6 +627,42 @@ async fn run_pending_command(
             }
             lines
         }
+        // /model: the engine's own default switches here (each submit
+        // clones it, so the change lands from the next turn on).
+        PendingCommand::Model(name) => {
+            engine.config.default_model = name.clone();
+            let detail = modron_router::lookup(&name).map(|m| {
+                format!(
+                    " — provider {}, {}k window",
+                    m.provider,
+                    m.context_window / 1000
+                )
+            });
+            vec![match detail {
+                Some(d) => format!("model: {name}{d} (applies from the next turn)"),
+                None => {
+                    format!("model: {name} (unknown to the catalog; applies from the next turn)")
+                }
+            }]
+        }
+        // /sandbox: switch the policy for future tool calls.
+        PendingCommand::Sandbox(mode) => match mode.as_str() {
+            "off" => {
+                engine.config.sandbox = modron_core::SandboxPolicy::Off;
+                vec!["sandbox: off (approval gates only)".into()]
+            }
+            "seatbelt" => {
+                engine.config.sandbox = modron_core::SandboxPolicy::Seatbelt;
+                vec!["sandbox: seatbelt — applies to future tool calls".into()]
+            }
+            "bubblewrap" => {
+                engine.config.sandbox = modron_core::SandboxPolicy::Bubblewrap;
+                vec!["sandbox: bubblewrap — applies to future tool calls".into()]
+            }
+            other => vec![format!(
+                "usage: /sandbox off|seatbelt|bubblewrap (got {other:?})"
+            )],
+        },
         PendingCommand::Agent(name) => {
             let name = name.trim().to_string();
             if name.is_empty() {

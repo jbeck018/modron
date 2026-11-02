@@ -620,17 +620,35 @@ fn reasoning_deltas_display_only_when_enabled() {
 // ── Theme system (Phase 14) ────────────────────────────────────────────────
 
 #[test]
-fn theme_slash_lists_and_switches() {
+fn theme_slash_opens_menu_and_switches() {
     let mut app = App::default();
     assert_eq!(app.theme.name, "modron");
+    // Bare /theme opens the interactive picker (built-ins listed).
     app.handle_slash_test(SlashCommand::Theme(String::new()));
-    assert!(
-        history_text(&app)
-            .iter()
-            .any(|l| l.contains("midnight") && l.contains("mono")),
-        "{:?}",
-        history_text(&app)
-    );
+    let menu = app.menu.as_ref().expect("theme menu");
+    let labels: Vec<&str> = menu.options.iter().map(|o| o.label.as_str()).collect();
+    assert!(labels.iter().any(|l| l.contains("midnight")), "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("mono")), "{labels:?}");
+    // Selecting an option through the menu switches the theme.
+    let target = menu
+        .options
+        .iter()
+        .find(|o| o.label.contains("midnight"))
+        .map(|o| o.label.trim_start_matches("● ").to_string())
+        .unwrap();
+    let index = menu
+        .options
+        .iter()
+        .position(|o| o.label.contains("midnight"))
+        .unwrap();
+    for _ in 0..index {
+        app.on_key(key(crossterm::event::KeyCode::Down));
+    }
+    app.on_key(key(crossterm::event::KeyCode::Enter));
+    assert!(app.menu.is_none(), "menu closes on selection");
+    assert_eq!(app.theme.name, target);
+    assert_eq!(app.current_theme, target);
+    // Typed switch still works (muscle memory path).
     app.handle_slash_test(SlashCommand::Theme("midnight".into()));
     assert_eq!(app.theme.name, "midnight");
     assert_eq!(
@@ -645,6 +663,136 @@ fn theme_slash_lists_and_switches() {
             .any(|l| l.contains("unknown theme")),
         "{:?}",
         history_text(&app)
+    );
+}
+
+// ── Interactive command menus (bare arg-commands open pickers) ─────────────
+
+#[test]
+fn model_menu_lists_catalog_and_switches_the_engine_model() {
+    use crossterm::event::KeyCode;
+    let mut app = App {
+        current_model: "glm-5.3".into(),
+        ..App::default()
+    };
+
+    app.handle_slash_test(SlashCommand::Model(String::new()));
+    let menu = app.menu.as_ref().expect("model menu");
+    assert!(
+        menu.options.len() >= 10,
+        "whole catalog listed: {}",
+        menu.options.len()
+    );
+    assert!(
+        menu.options
+            .iter()
+            .any(|o| o.label.contains("glm-5.3-flash")),
+        "{:?}",
+        menu.options.iter().map(|o| &o.label).collect::<Vec<_>>()
+    );
+    // The current model is marked and preselected.
+    assert!(
+        menu.options[menu.selected].label.contains("●"),
+        "current model preselected: {:?}",
+        menu.options[menu.selected].label
+    );
+
+    // Enter re-dispatches the selected model: the engine switch is parked
+    // (the label alone would lie about taking effect).
+    app.on_key(key(KeyCode::Enter));
+    assert!(app.menu.is_none());
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::Model(ref n)) if n == "glm-5.3"
+    ));
+
+    // Esc closes without side effects.
+    let mut app2 = App::default();
+    app2.handle_slash_test(SlashCommand::Model(String::new()));
+    app2.on_key(key(KeyCode::Esc));
+    assert!(app2.menu.is_none());
+    assert_eq!(app2.pending_command, None);
+}
+
+#[test]
+fn sandbox_and_mode_menus_park_pending_commands() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Sandbox(String::new()));
+    assert!(app.menu.as_ref().unwrap().options.len() == 3);
+    app.on_key(key(KeyCode::Down)); // seatbelt
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::Sandbox(ref m)) if m == "seatbelt"
+    ));
+
+    app.handle_slash_test(SlashCommand::Mode(String::new()));
+    app.on_key(key(KeyCode::Down)); // yolo
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::Mode(ref m)) if m == "yolo"
+    ));
+}
+
+#[test]
+fn persona_and_tool_menus_list_injected_names() {
+    use crossterm::event::KeyCode;
+    let mut app = App {
+        personas: vec!["reviewer".into(), "explorer".into()],
+        tool_names: vec!["bash".into(), "read".into()],
+        ..App::default()
+    };
+
+    app.handle_slash_test(SlashCommand::Agent(String::new()));
+    assert_eq!(app.menu.as_ref().unwrap().options.len(), 2);
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::Agent(ref n)) if n == "explorer"
+    ));
+
+    app.handle_slash_test(SlashCommand::Allow(String::new()));
+    assert_eq!(app.menu.as_ref().unwrap().options.len(), 2);
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::Allow(ref t)) if t == "bash"
+    ));
+
+    app.handle_slash_test(SlashCommand::Deny(String::new()));
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::Deny(ref t)) if t == "bash"
+    ));
+
+    // Empty persona registry: no empty menu — a plain note explains.
+    let mut bare = App::default();
+    bare.handle_slash_test(SlashCommand::Agent(String::new()));
+    assert!(bare.menu.is_none());
+    assert_eq!(bare.pending_command, None);
+    assert!(
+        history_text(&bare)
+            .iter()
+            .any(|l| l.contains("no personas configured")),
+        "{:?}",
+        history_text(&bare)
+    );
+}
+
+#[test]
+fn model_menu_renders_with_detail_column() {
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Model(String::new()));
+    let frame = render(&mut app, 110, 24);
+    assert!(frame.contains("model —"), "title: {frame:?}");
+    assert!(frame.contains("menu open"), "placeholder: {frame:?}");
+    assert!(
+        frame.contains(" · ") || frame.contains("k"),
+        "provider/window detail: {frame:?}"
     );
 }
 

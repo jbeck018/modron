@@ -131,6 +131,11 @@ pub enum PendingCommand {
     /// run loop spawns start→finish; the interim user code shows in the
     /// modal; Esc cancels).
     ChatGptLogin,
+    /// /model <name>: switch the engine's model for future turns (the
+    /// TUI label updates locally too).
+    Model(String),
+    /// /sandbox <mode>: switch the sandbox policy for future turns.
+    Sandbox(String),
     Agent(String),
     Allow(String),
     Deny(String),
@@ -155,18 +160,18 @@ impl SlashCommand {
         ("clear", "clear the scrollback"),
         ("compact", "force a context compaction now"),
         ("compress", "alias of /compact"),
-        ("model", "switch models mid-session"),
+        ("model", "switch models (opens a picker)"),
         ("context", "show context usage breakdown"),
         ("sessions", "list recent sessions"),
-        ("sandbox", "off | seatbelt | bubblewrap"),
+        ("sandbox", "choose sandbox mode (picker)"),
         ("reasoning", "toggle streamed-reasoning display"),
         ("thinking", "alias of /reasoning"),
         ("btw", "quick side question, no tools"),
-        ("agent", "list or switch personas"),
+        ("agent", "switch persona (picker)"),
         ("persona", "alias of /agent"),
-        ("allow", "allow a tool for the session"),
-        ("deny", "deny a tool for the session"),
-        ("mode", "approval mode: ask | yolo"),
+        ("allow", "allow a tool (picker)"),
+        ("deny", "deny a tool (picker)"),
+        ("mode", "approval mode picker: ask | yolo"),
         ("tasks", "background delegate status"),
         ("worktree", "list delegate worktrees"),
         ("worktrees", "alias of /worktree"),
@@ -177,7 +182,7 @@ impl SlashCommand {
         ("code-review", "alias of /review"),
         ("goal", "stop condition for long runs"),
         ("learn", "distill this session into a SKILL.md"),
-        ("theme", "switch color theme"),
+        ("theme", "switch color theme (picker)"),
         ("auth", "open the auth manager (view/sign-in/remove)"),
         ("login", "alias of /auth"),
     ];
@@ -329,6 +334,28 @@ fn auth_row_status(info: &modron_core::auth::ProviderInfo) -> String {
     }
 }
 
+/// A generic interactive picker — the arg-less form of a slash command
+/// that takes one (the Claude Code/opencode convention): bare `/model`,
+/// `/theme`, `/sandbox`, `/mode`, `/agent`, `/allow`, `/deny` open a list
+/// instead of demanding remembered syntax. Enter re-dispatches the
+/// equivalent typed command, so menus and muscle memory share one path.
+#[derive(Clone, Debug)]
+pub struct Menu {
+    pub title: String,
+    pub options: Vec<MenuOption>,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MenuOption {
+    /// The option itself (model name, theme name, ...).
+    pub label: String,
+    /// Dim right-hand hint (provider, platform, ...).
+    pub detail: String,
+    /// The command Enter runs — identical to typing it.
+    pub command: SlashCommand,
+}
+
 /// A tool call awaiting the user's y/n/a decision.
 pub struct PendingApproval {
     pub call: ToolCall,
@@ -405,8 +432,21 @@ pub struct App {
     /// The input box's inner area as of the last render — maps mouse
     /// clicks to cursor positions.
     pub last_input_inner: ratatui::layout::Rect,
-    /// The interactive auth wizard (modal; owns all keys while open).
+    /// The interactive auth manager (modal; owns all keys while open).
     pub auth_flow: Option<AuthFlow>,
+    /// An interactive menu — the arg-less form of a slash command that
+    /// takes one (`/model`, `/theme`, ...). Mutually exclusive with the
+    /// auth manager; owns all keys while open.
+    pub menu: Option<Menu>,
+    /// Persona names, injected by the run loop (feeds /agent's menu).
+    pub personas: Vec<String>,
+    /// Registered tool names, injected by the run loop (feeds /allow and
+    /// /deny menus).
+    pub tool_names: Vec<String>,
+    /// The engine's current model (preselects /model's menu row).
+    pub current_model: String,
+    /// The active theme name (marks /theme's menu row).
+    pub current_theme: String,
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
@@ -507,6 +547,11 @@ impl App {
         // for the next task).
         if self.running && key.code == KeyCode::Esc {
             return Action::Abort;
+        }
+
+        // An open menu (arg-less /model, /theme, ...) owns every key.
+        if let Some(menu) = self.menu.take() {
+            return self.menu_key(menu, key);
         }
 
         // Interactive auth wizard: the modal owns every key while open
@@ -813,9 +858,211 @@ impl App {
         Action::None
     }
 
+    /// Handle a key inside an open menu: arrows move, Enter re-dispatches
+    /// the selected option's command (the same path as typing it), Esc
+    /// closes.
+    fn menu_key(&mut self, mut menu: Menu, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
+        if menu.options.is_empty() {
+            self.menu = None;
+            return Action::None;
+        }
+        let len = menu.options.len();
+        menu.selected = menu.selected.min(len - 1);
+        match key.code {
+            KeyCode::Up => {
+                menu.selected = (menu.selected + len - 1) % len;
+                self.menu = Some(menu);
+            }
+            KeyCode::Down => {
+                menu.selected = (menu.selected + 1) % len;
+                self.menu = Some(menu);
+            }
+            KeyCode::Esc => {} // close
+            KeyCode::Enter | KeyCode::Tab => {
+                let command = menu.options[menu.selected].command.clone();
+                self.menu = None;
+                return self.handle_slash(command);
+            }
+            _ => self.menu = Some(menu),
+        }
+        Action::None
+    }
+
+    /// `/model` with no argument: the whole catalog as a picker, the
+    /// current model marked and preselected.
+    pub fn open_model_menu(&mut self) {
+        let current = self.current_model.clone();
+        let mut selected = 0;
+        let mut options = Vec::new();
+        for (i, m) in modron_router::catalog().iter().enumerate() {
+            let is_current = m.name == current;
+            if is_current {
+                selected = i;
+            }
+            options.push(MenuOption {
+                label: if is_current {
+                    format!("● {}", m.name)
+                } else {
+                    m.name.clone()
+                },
+                detail: format!("{} · {}k", m.provider, m.context_window / 1000),
+                command: SlashCommand::Model(m.name.clone()),
+            });
+        }
+        self.auth_flow = None;
+        self.menu = Some(Menu {
+            title: "model — ↑/↓ choose · enter switch · esc close".to_string(),
+            options,
+            selected,
+        });
+    }
+
+    /// `/theme` with no argument: built-in + user themes, current marked.
+    pub fn open_theme_menu(&mut self) {
+        let current = self.current_theme.clone();
+        let mut selected = 0;
+        let mut options = Vec::new();
+        for (i, name) in Theme::available(&crate::theme_dir())
+            .into_iter()
+            .enumerate()
+        {
+            if name == current {
+                selected = i;
+            }
+            options.push(MenuOption {
+                label: if name == current {
+                    format!("● {name}")
+                } else {
+                    name.clone()
+                },
+                detail: String::new(),
+                command: SlashCommand::Theme(name),
+            });
+        }
+        self.auth_flow = None;
+        self.menu = Some(Menu {
+            title: "theme — ↑/↓ choose · enter switch · esc close".to_string(),
+            options,
+            selected,
+        });
+    }
+
+    /// `/sandbox` with no argument: the three policies with plain-language
+    /// detail.
+    pub fn open_sandbox_menu(&mut self) {
+        let options = [
+            ("off", "no OS sandbox (approval gates only)"),
+            (
+                "seatbelt",
+                "macOS: network denied, writes stay in the workspace",
+            ),
+            (
+                "bubblewrap",
+                "Linux: network denied, writes stay in the workspace",
+            ),
+        ]
+        .iter()
+        .map(|(mode, detail)| MenuOption {
+            label: (*mode).to_string(),
+            detail: detail.to_string(),
+            command: SlashCommand::Sandbox((*mode).to_string()),
+        })
+        .collect();
+        self.auth_flow = None;
+        self.menu = Some(Menu {
+            title: "sandbox — ↑/↓ choose · enter set · esc close".to_string(),
+            options,
+            selected: 0,
+        });
+    }
+
+    /// `/mode` with no argument: approval modes.
+    pub fn open_mode_menu(&mut self) {
+        let options = vec![
+            MenuOption {
+                label: "ask".to_string(),
+                detail: "mutating tools prompt y/n/a".to_string(),
+                command: SlashCommand::Mode("ask".to_string()),
+            },
+            MenuOption {
+                label: "yolo".to_string(),
+                detail: "mutating tools auto-approved".to_string(),
+                command: SlashCommand::Mode("yolo".to_string()),
+            },
+        ];
+        self.auth_flow = None;
+        self.menu = Some(Menu {
+            title: "approval mode — ↑/↓ choose · enter set · esc close".to_string(),
+            options,
+            selected: 0,
+        });
+    }
+
+    /// `/agent` with no argument: the configured personas.
+    pub fn open_persona_menu(&mut self) {
+        if self.personas.is_empty() {
+            self.note("no personas configured — define [agents.<name>] in config.toml");
+            return;
+        }
+        let options = self
+            .personas
+            .iter()
+            .map(|name| MenuOption {
+                label: name.clone(),
+                detail: String::new(),
+                command: SlashCommand::Agent(name.clone()),
+            })
+            .collect();
+        self.auth_flow = None;
+        self.menu = Some(Menu {
+            title: "persona — ↑/↓ choose · enter switch · esc close".to_string(),
+            options,
+            selected: 0,
+        });
+    }
+
+    /// `/allow` or `/deny` with no argument: the registered tools.
+    pub fn open_tool_menu(&mut self, allow: bool) {
+        if self.tool_names.is_empty() {
+            // Fall back to the pending listing (same as before menus).
+            self.pending_command = Some(if allow {
+                PendingCommand::Allow(String::new())
+            } else {
+                PendingCommand::Deny(String::new())
+            });
+            return;
+        }
+        let options = self
+            .tool_names
+            .iter()
+            .map(|name| MenuOption {
+                label: name.clone(),
+                detail: String::new(),
+                command: if allow {
+                    SlashCommand::Allow(name.clone())
+                } else {
+                    SlashCommand::Deny(name.clone())
+                },
+            })
+            .collect();
+        self.auth_flow = None;
+        self.menu = Some(Menu {
+            title: format!(
+                "{} — ↑/↓ choose · enter apply · esc close",
+                if allow { "allow tool" } else { "deny tool" }
+            ),
+            options,
+            selected: 0,
+        });
+    }
+
     /// Route pasted text: into the auth flow's key buffer when the wizard
     /// is waiting for a key, into the normal input otherwise.
     pub fn paste_into_auth_or_input(&mut self, text: &str) {
+        if self.menu.is_some() {
+            return; // an open menu owns the keyboard; paste is ignored
+        }
         if let Some(AuthFlow::KeyEntry { input, .. }) = &mut self.auth_flow {
             input.push_str(text);
         } else {
@@ -986,10 +1233,16 @@ impl App {
             }
             SlashCommand::Model(name) => {
                 if name.is_empty() {
-                    self.note(format!("current model: {}", self.model_label));
-                    self.note("usage: /model glm-5.3-flash");
+                    self.open_model_menu();
                 } else {
                     self.model_label = name.clone();
+                    self.current_model = name.clone();
+                    if let Some(info) = modron_router::lookup(&name) {
+                        self.context_window = info.context_window;
+                    }
+                    // The engine itself switches in the run loop (each
+                    // submit clones it) — the label alone would lie.
+                    self.pending_command = Some(PendingCommand::Model(name.clone()));
                     self.note(format!(
                         "switched to {name} (takes effect on the next turn)"
                     ));
@@ -1008,9 +1261,13 @@ impl App {
                 Action::None
             }
             SlashCommand::Sandbox(mode) => {
-                self.note(format!(
-                    "sandbox: {mode} (takes effect on restart — the sandbox is set at launch)"
-                ));
+                if mode.is_empty() {
+                    self.open_sandbox_menu();
+                } else {
+                    // Applied to future tool calls by the run loop (each
+                    // submit clones the engine).
+                    self.pending_command = Some(PendingCommand::Sandbox(mode));
+                }
                 Action::None
             }
             SlashCommand::Reasoning => {
@@ -1037,6 +1294,7 @@ impl App {
                 if arg.is_empty() || arg == "add" || arg == "manage" {
                     // The interactive manager: view status, add/replace,
                     // sign in, remove.
+                    self.menu = None;
                     self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
                 } else {
                     self.pending_command = Some(PendingCommand::Auth(arg.to_string()));
@@ -1044,19 +1302,35 @@ impl App {
                 Action::None
             }
             SlashCommand::Agent(name) => {
-                self.pending_command = Some(PendingCommand::Agent(name));
+                if name.is_empty() {
+                    self.open_persona_menu();
+                } else {
+                    self.pending_command = Some(PendingCommand::Agent(name));
+                }
                 Action::None
             }
             SlashCommand::Allow(tool) => {
-                self.pending_command = Some(PendingCommand::Allow(tool));
+                if tool.is_empty() {
+                    self.open_tool_menu(true);
+                } else {
+                    self.pending_command = Some(PendingCommand::Allow(tool));
+                }
                 Action::None
             }
             SlashCommand::Deny(tool) => {
-                self.pending_command = Some(PendingCommand::Deny(tool));
+                if tool.is_empty() {
+                    self.open_tool_menu(false);
+                } else {
+                    self.pending_command = Some(PendingCommand::Deny(tool));
+                }
                 Action::None
             }
             SlashCommand::Mode(mode) => {
-                self.pending_command = Some(PendingCommand::Mode(mode));
+                if mode.is_empty() {
+                    self.open_mode_menu();
+                } else {
+                    self.pending_command = Some(PendingCommand::Mode(mode));
+                }
                 Action::None
             }
             SlashCommand::Tasks => {
@@ -1123,20 +1397,16 @@ impl App {
             SlashCommand::Theme(name) => {
                 let name = name.trim();
                 if name.is_empty() {
-                    let dir = crate::theme_dir();
-                    let names = Theme::available(&dir);
-                    self.push_lines(format!(
-                        "themes: {} (switch: /theme <name>; drop <name>.json in {})",
-                        names.join(", "),
-                        dir.display()
-                    ));
+                    self.open_theme_menu();
                 } else if Theme::builtin_names().contains(&name) {
                     self.theme = Theme::builtin(name);
+                    self.current_theme = name.to_string();
                     self.note(format!("theme: {name}"));
                 } else {
                     match Theme::load(&crate::theme_dir(), name) {
                         Some(theme) => {
                             self.theme = theme;
+                            self.current_theme = name.to_string();
                             self.note(format!("theme: {name}"));
                         }
                         None => self.note(format!(
@@ -1473,7 +1743,7 @@ impl App {
             .min(8)
             .min(area.height.saturating_sub(2));
 
-        let matches = if self.auth_flow.is_none() {
+        let matches = if self.auth_flow.is_none() && self.menu.is_none() {
             self.slash_matches()
         } else {
             Vec::new()
@@ -1481,15 +1751,20 @@ impl App {
         let sel = self.slash_selected.min(matches.len().saturating_sub(1));
         let popup_h = (matches.len() as u16).min(5);
 
-        // The auth manager modal takes the same slot as the slash popup.
-        let flow_h = match &self.auth_flow {
-            None => 0,
-            Some(AuthFlow::Picker { .. }) => {
-                (modron_core::auth::provider_registry().len() as u16 + 1).min(8)
+        // The auth manager / command menus take the same slot as the
+        // slash popup.
+        let flow_h = if let Some(menu) = &self.menu {
+            (menu.options.len() as u16 + 1).min(8)
+        } else {
+            match &self.auth_flow {
+                None => 0,
+                Some(AuthFlow::Picker { .. }) => {
+                    (modron_core::auth::provider_registry().len() as u16 + 1).min(8)
+                }
+                Some(AuthFlow::MethodChoice { info, .. }) => auth_methods(info).len() as u16 + 1,
+                Some(AuthFlow::KeyEntry { .. }) => 4,
+                Some(AuthFlow::WaitingOAuth { .. }) => 3,
             }
-            Some(AuthFlow::MethodChoice { info, .. }) => auth_methods(info).len() as u16 + 1,
-            Some(AuthFlow::KeyEntry { .. }) => 4,
-            Some(AuthFlow::WaitingOAuth { .. }) => 3,
         };
 
         let mut rows: Vec<Constraint> = vec![Constraint::Min(1)]; // scrollback
@@ -1738,6 +2013,38 @@ impl App {
             idx += 1;
         }
 
+        // ── Interactive command menu (/model, /theme, ...) ──
+        if let Some(menu) = &self.menu {
+            let len = menu.options.len();
+            let sel = menu.selected.min(len.saturating_sub(1));
+            // Same window math as the auth picker: 8 modal rows = 1
+            // header + up to 7 options.
+            let vis = len.min(7);
+            let start = sel.saturating_sub(vis - 1).min(len - vis);
+            let mut lines =
+                vec![Line::from(format!("  {}", menu.title)).style(Style::default().fg(th.dim))];
+            for (i, option) in menu.options.iter().enumerate().skip(start).take(vis) {
+                let selected_here = i == sel;
+                let pointer = if selected_here { "  ❯ " } else { "    " };
+                let style = if selected_here {
+                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(pointer.to_string(), Style::default().fg(th.accent)),
+                    Span::styled(option.label.clone(), style),
+                    if option.detail.is_empty() {
+                        Span::raw(String::new())
+                    } else {
+                        Span::styled(format!("  {}", option.detail), Style::default().fg(th.dim))
+                    },
+                ]));
+            }
+            frame.render_widget(Paragraph::new(lines), chunks[idx]);
+            idx += 1;
+        }
+
         // Slash-command popup (window around the highlight when the
         // filtered list outgrows the space).
         if popup_h > 0 {
@@ -1820,6 +2127,8 @@ impl App {
         if self.input.is_empty() {
             let (text, style) = if self.auth_flow.is_some() {
                 ("auth manager — esc to close", Style::default().fg(th.dim))
+            } else if self.menu.is_some() {
+                ("menu open — esc to close", Style::default().fg(th.dim))
             } else if self.running {
                 ("", Style::default())
             } else {
