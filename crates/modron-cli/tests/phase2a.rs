@@ -24,7 +24,13 @@ fn modron_bin() -> &'static str {
 fn usage_dashboard_aggregates_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
+    // Isolate the config: the developer's real config.toml may carry a
+    // saved default model (the /model menu's save-as-default), which
+    // would change the demo's model row.
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
     let run = Command::new(modron_bin())
+        .env("MODRON_CONFIG", config_dir.to_str().unwrap())
         .args([
             "demo",
             "--provider",
@@ -38,6 +44,7 @@ fn usage_dashboard_aggregates_sessions() {
     assert!(run.status.success());
 
     let out = Command::new(modron_bin())
+        .env("MODRON_CONFIG", config_dir.to_str().unwrap())
         .args(["usage", "--sessions-dir", sessions.to_str().unwrap()])
         .output()
         .unwrap();

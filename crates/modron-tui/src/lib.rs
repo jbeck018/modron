@@ -345,6 +345,15 @@ fn auth_row_status(info: &modron_core::auth::ProviderInfo) -> String {
     }
 }
 
+/// Case-insensitive substring match for list filters.
+fn list_matches(filter: &str, fields: &[&str]) -> bool {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    fields.iter().any(|s| s.to_lowercase().contains(&needle))
+}
+
 /// A generic interactive picker — the arg-less form of a slash command
 /// that takes one (the Claude Code/opencode convention): bare `/model`,
 /// `/theme`, `/sandbox`, `/mode`, `/agent`, `/allow`, `/deny` open a list
@@ -465,6 +474,9 @@ pub struct App {
     pub last_tool_strip: ratatui::layout::Rect,
     /// The tool panel's rect from the last render (outside-click close).
     pub last_tool_panel: ratatui::layout::Rect,
+    /// Type-to-filter query for open list modals (menus + the auth
+    /// picker). Cleared when a modal opens/closes; Esc clears it first.
+    pub list_filter: String,
     /// The input box's inner area as of the last render — maps mouse
     /// clicks to cursor positions.
     pub last_input_inner: ratatui::layout::Rect,
@@ -964,7 +976,30 @@ impl App {
         use crossterm::event::KeyCode;
         match flow {
             AuthFlow::Picker { selected } => {
-                let len = modron_core::auth::provider_registry().len();
+                // Type-to-filter over the provider rows (name, id, status);
+                // Enter opens the highlighted match.
+                let matches = self.filtered_registry_indices();
+                if matches.is_empty() {
+                    match key.code {
+                        KeyCode::Backspace => {
+                            self.list_filter.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            self.list_filter.push(c);
+                        }
+                        KeyCode::Esc => {
+                            if self.list_filter.is_empty() {
+                                self.auth_flow = None;
+                            } else {
+                                self.list_filter.clear();
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
+                    return Action::None;
+                }
+                let len = matches.len();
                 let selected = selected.min(len - 1);
                 match key.code {
                     KeyCode::Up => {
@@ -977,9 +1012,26 @@ impl App {
                             selected: (selected + 1) % len,
                         });
                     }
-                    KeyCode::Esc => {} // close the manager
+                    KeyCode::Backspace => {
+                        self.list_filter.pop();
+                        self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
+                    }
+                    KeyCode::Char(c) => {
+                        self.list_filter.push(c);
+                        self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
+                    }
+                    KeyCode::Esc => {
+                        if self.list_filter.is_empty() {
+                            // close the manager
+                        } else {
+                            self.list_filter.clear();
+                            self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
+                        }
+                    }
                     KeyCode::Enter | KeyCode::Tab => {
-                        if let Some(info) = modron_core::auth::provider_registry().get(selected) {
+                        if let Some(info) =
+                            modron_core::auth::provider_registry().get(matches[selected])
+                        {
                             self.auth_flow = Some(AuthFlow::MethodChoice {
                                 info: info.clone(),
                                 selected: 0,
@@ -1137,16 +1189,37 @@ impl App {
         Action::None
     }
 
-    /// Handle a key inside an open menu: arrows move, Enter re-dispatches
-    /// the selected option's command (the same path as typing it), Esc
-    /// closes.
+    /// Handle a key inside an open menu: typing filters (label + detail),
+    /// arrows move within the matches, Enter re-dispatches the selected
+    /// option's command (the same path as typing it), Esc clears an
+    /// active filter before closing. Shift+S on a model row saves it as
+    /// the default (plain letters belong to the filter).
     fn menu_key(&mut self, mut menu: Menu, key: crossterm::event::KeyEvent) -> Action {
         use crossterm::event::KeyCode;
-        if menu.options.is_empty() {
-            self.menu = None;
+        let matches = self.filtered_menu_indices(&menu);
+        if matches.is_empty() {
+            // Nothing matches: only editing the filter or leaving helps.
+            match key.code {
+                KeyCode::Backspace => {
+                    self.list_filter.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.list_filter.push(c);
+                }
+                KeyCode::Esc => {
+                    if self.list_filter.is_empty() {
+                        self.menu = None;
+                    } else {
+                        self.list_filter.clear();
+                    }
+                }
+                _ => {}
+            }
+            menu.selected = 0;
+            self.menu = Some(menu);
             return Action::None;
         }
-        let len = menu.options.len();
+        let len = matches.len();
         menu.selected = menu.selected.min(len - 1);
         match key.code {
             KeyCode::Up => {
@@ -1157,17 +1230,33 @@ impl App {
                 menu.selected = (menu.selected + 1) % len;
                 self.menu = Some(menu);
             }
-            KeyCode::Esc => {} // close
+            KeyCode::Esc => {
+                if self.list_filter.is_empty() {
+                    // close
+                } else {
+                    self.list_filter.clear();
+                    menu.selected = 0;
+                    self.menu = Some(menu);
+                }
+            }
+            KeyCode::Backspace => {
+                self.list_filter.pop();
+                menu.selected = 0;
+                self.menu = Some(menu);
+            }
             KeyCode::Enter | KeyCode::Tab => {
-                let command = menu.options[menu.selected].command.clone();
+                let command = menu.options[matches[menu.selected]].command.clone();
                 self.menu = None;
+                self.list_filter.clear();
                 return self.handle_slash(command);
             }
-            // `s` on a model row: switch AND persist as the default.
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                if let SlashCommand::Model(name) = &menu.options[menu.selected].command {
+            // Shift+S on a model row: switch AND persist as the default.
+            KeyCode::Char('S') => {
+                let option = &menu.options[matches[menu.selected]];
+                if let SlashCommand::Model(name) = &option.command {
                     let name = name.clone();
                     self.menu = None;
+                    self.list_filter.clear();
                     self.model_label = name.clone();
                     self.current_model = name.clone();
                     if let Some(info) = modron_router::lookup(&name) {
@@ -1178,11 +1267,36 @@ impl App {
                         save_default: true,
                     });
                     self.note(format!("switched to {name} and saving it as the default"));
+                } else {
+                    self.menu = Some(menu);
                 }
+            }
+            KeyCode::Char(c) => {
+                self.list_filter.push(c);
+                menu.selected = 0;
+                self.menu = Some(menu);
             }
             _ => self.menu = Some(menu),
         }
         Action::None
+    }
+
+    /// Test seam: how many menu options match the active filter.
+    pub fn filtered_menu_indices_count(&self) -> usize {
+        self.menu
+            .as_ref()
+            .map(|m| self.filtered_menu_indices(m).len())
+            .unwrap_or(0)
+    }
+
+    /// Indices of the menu options matching the active filter.
+    fn filtered_menu_indices(&self, menu: &Menu) -> Vec<usize> {
+        menu.options
+            .iter()
+            .enumerate()
+            .filter(|(_, option)| list_matches(&self.list_filter, &[&option.label, &option.detail]))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// `/model` with no argument: the whole catalog as a picker, the
@@ -1206,9 +1320,10 @@ impl App {
                 command: SlashCommand::Model(m.name.clone()),
             });
         }
+        self.list_filter.clear();
         self.auth_flow = None;
         self.menu = Some(Menu {
-            title: "model — ↑/↓ · enter switch · s switch+save default · esc close".to_string(),
+            title: "model — type to filter · enter switch · S save default".to_string(),
             options,
             selected,
         });
@@ -1236,6 +1351,7 @@ impl App {
                 command: SlashCommand::Theme(name),
             });
         }
+        self.list_filter.clear();
         self.auth_flow = None;
         self.menu = Some(Menu {
             title: "theme — ↑/↓ choose · enter switch · esc close".to_string(),
@@ -1265,6 +1381,7 @@ impl App {
             command: SlashCommand::Sandbox((*mode).to_string()),
         })
         .collect();
+        self.list_filter.clear();
         self.auth_flow = None;
         self.menu = Some(Menu {
             title: "sandbox — ↑/↓ choose · enter set · esc close".to_string(),
@@ -1287,6 +1404,7 @@ impl App {
                 command: SlashCommand::Mode("yolo".to_string()),
             },
         ];
+        self.list_filter.clear();
         self.auth_flow = None;
         self.menu = Some(Menu {
             title: "approval mode — ↑/↓ choose · enter set · esc close".to_string(),
@@ -1310,6 +1428,7 @@ impl App {
                 command: SlashCommand::Agent(name.clone()),
             })
             .collect();
+        self.list_filter.clear();
         self.auth_flow = None;
         self.menu = Some(Menu {
             title: "persona — ↑/↓ choose · enter switch · esc close".to_string(),
@@ -1342,6 +1461,7 @@ impl App {
                 },
             })
             .collect();
+        self.list_filter.clear();
         self.auth_flow = None;
         self.menu = Some(Menu {
             title: format!(
@@ -1513,6 +1633,21 @@ impl App {
     /// A mouse click inside the input box positions the cursor. `column`
     /// and `row` are terminal-wide coordinates (from crossterm); clicks
     /// outside the input's inner area are ignored.
+    /// Registry indices matching the active filter (name, id, status).
+    fn filtered_registry_indices(&self) -> Vec<usize> {
+        modron_core::auth::provider_registry()
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| {
+                list_matches(
+                    &self.list_filter,
+                    &[info.name, info.provider_id, &auth_row_status(info)],
+                )
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     pub fn on_click(&mut self, column: u16, row: u16) {
         // The expanded tool panel: any click OUTSIDE it collapses it.
         if self.tool_panel.is_some() {
@@ -1814,6 +1949,7 @@ impl App {
                     // The interactive manager: view status, add/replace,
                     // sign in, remove.
                     self.menu = None;
+                    self.list_filter.clear();
                     self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
                 } else {
                     self.pending_command = Some(PendingCommand::Auth(arg.to_string()));
@@ -2381,12 +2517,14 @@ impl App {
         // The auth manager / command menus take the same slot as the
         // slash popup.
         let flow_h = if let Some(menu) = &self.menu {
-            (menu.options.len() as u16 + 1).min(8)
+            let n = self.filtered_menu_indices(menu).len() as u16;
+            (n + 1).min(8).max(if n == 0 { 2 } else { 1 })
         } else {
             match &self.auth_flow {
                 None => 0,
                 Some(AuthFlow::Picker { .. }) => {
-                    (modron_core::auth::provider_registry().len() as u16 + 1).min(8)
+                    let n = self.filtered_registry_indices().len() as u16;
+                    (n + 1).min(8).max(if n == 0 { 2 } else { 1 })
                 }
                 Some(AuthFlow::MethodChoice { info, .. }) => auth_methods(info).len() as u16 + 1,
                 Some(AuthFlow::KeyEntry { .. }) => 4,
@@ -2593,16 +2731,32 @@ impl App {
             let lines: Vec<Line> = match flow {
                 AuthFlow::Picker { selected } => {
                     let registry = modron_core::auth::provider_registry();
-                    let len = registry.len();
-                    let sel = (*selected).min(len - 1);
+                    let matches = self.filtered_registry_indices();
+                    let len = matches.len().max(1);
+                    let sel = (*selected).min(len.saturating_sub(1));
                     // Window: 8 modal rows = 1 header + up to 7 rows,
                     // scrolled to keep the highlight visible.
-                    let vis = len.min(7);
-                    let start = sel.saturating_sub(vis - 1).min(len - vis);
-                    let mut lines =
-                        vec![Line::from("  auth — ↑/↓ choose · enter manage · esc close")
-                            .style(Style::default().fg(th.dim))];
-                    for (i, info) in registry.iter().enumerate().skip(start).take(vis) {
+                    let vis = matches.len().min(7);
+                    let start = sel.saturating_sub(vis.max(1) - 1).min(len - vis.max(1));
+                    let header = if self.list_filter.is_empty() {
+                        "  auth — type to filter · enter manage · esc close".to_string()
+                    } else {
+                        format!("  auth · filter: {:?}", self.list_filter)
+                    };
+                    let mut lines = vec![Line::from(header).style(Style::default().fg(th.dim))];
+                    if matches.is_empty() {
+                        lines.push(
+                            Line::from("  (no matches — backspace edits the filter)")
+                                .style(Style::default().fg(th.dim)),
+                        );
+                    }
+                    for (i, info) in matches
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(vis)
+                        .map(|(i, opt)| (i, &registry[*opt]))
+                    {
                         let selected_here = i == sel;
                         let pointer = if selected_here { "  ❯ " } else { "    " };
                         let style = if selected_here {
@@ -2710,15 +2864,32 @@ impl App {
 
         // ── Interactive command menu (/model, /theme, ...) ──
         if let Some(menu) = &self.menu {
-            let len = menu.options.len();
+            let matches = self.filtered_menu_indices(menu);
+            let len = matches.len().max(1);
             let sel = menu.selected.min(len.saturating_sub(1));
             // Same window math as the auth picker: 8 modal rows = 1
             // header + up to 7 options.
-            let vis = len.min(7);
-            let start = sel.saturating_sub(vis - 1).min(len - vis);
-            let mut lines =
-                vec![Line::from(format!("  {}", menu.title)).style(Style::default().fg(th.dim))];
-            for (i, option) in menu.options.iter().enumerate().skip(start).take(vis) {
+            let vis = matches.len().min(7);
+            let start = sel.saturating_sub(vis.max(1) - 1).min(len - vis.max(1));
+            let header = if self.list_filter.is_empty() {
+                format!("  {}", menu.title)
+            } else {
+                format!("  {} · filter: {:?}", menu.title, self.list_filter)
+            };
+            let mut lines = vec![Line::from(header).style(Style::default().fg(th.dim))];
+            if matches.is_empty() {
+                lines.push(
+                    Line::from("  (no matches — backspace edits the filter)")
+                        .style(Style::default().fg(th.dim)),
+                );
+            }
+            for (i, option) in matches
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(vis)
+                .map(|(i, opt)| (i, &menu.options[*opt]))
+            {
                 let selected_here = i == sel;
                 let pointer = if selected_here { "  ❯ " } else { "    " };
                 let style = if selected_here {

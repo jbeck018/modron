@@ -1631,7 +1631,7 @@ fn model_menu_s_key_saves_as_default_and_config_writer_roundtrips() {
     };
     app.handle_slash_test(SlashCommand::Model(String::new()));
     app.on_key(key(KeyCode::Down)); // a different row
-    app.on_key(key(KeyCode::Char('s')));
+    app.on_key(key(KeyCode::Char('S'))); // shift+S saves as default
     assert!(app.menu.is_none());
     match &app.pending_command {
         Some(PendingCommand::Model { name, save_default }) => {
@@ -1742,4 +1742,56 @@ fn tool_summary_counts_and_panel_expand_flow() {
     app.hist_geom = (0, idx + 1, true, 0);
     app.begin_selection(0, idx as u16);
     assert!(app.tool_panel.is_some(), "summary click expands");
+}
+
+#[test]
+fn menus_and_auth_picker_filter_as_you_type() {
+    use crossterm::event::KeyCode;
+    // /model: typing narrows the catalog; enter picks the first match;
+    // backspace widens; esc clears the filter before closing.
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Model(String::new()));
+    for c in "gpt".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    assert!(app.filtered_menu_indices_count() >= 1, "gpt models match");
+    let frame = render(&mut app, 100, 24);
+    assert!(frame.contains("filter: \"gpt\""), "{frame:?}");
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::Model { ref name, .. }) if name.starts_with("gpt")
+    ));
+    assert!(app.list_filter.is_empty(), "cleared after selection");
+
+    // Backspace edits the filter; esc clears it first, then closes.
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Model(String::new()));
+    for c in "zzz".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    assert!(app.menu.is_some());
+    let frame = render(&mut app, 100, 24);
+    assert!(frame.contains("no matches"), "{frame:?}");
+    app.on_key(key(KeyCode::Backspace));
+    assert_eq!(app.list_filter, "zz");
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.menu.is_some(), "esc clears the filter first");
+    assert!(app.list_filter.is_empty());
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.menu.is_none(), "second esc closes");
+
+    // /auth picker: filter to the z.ai row and open its method choice.
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
+    for c in "zai".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Enter));
+    match &app.auth_flow {
+        Some(AuthFlow::MethodChoice { info, .. }) => {
+            assert_eq!(info.provider_id, "zai")
+        }
+        other => panic!("filter should land on z.ai, got {other:?}"),
+    }
 }
