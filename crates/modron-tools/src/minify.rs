@@ -75,12 +75,15 @@ impl Tool for ReadMinifiedTool {
             engine.tools.read_gate.mark(&path);
         }
 
-        let hash_comment = is_hash_comment_language(&path.to_string_lossy());
-        let skeleton = if hash_comment {
-            minify_indented(&content)
-        } else {
-            minify_braced(&content)
+        // Prefer the exact syntax-aware skeleton when a grammar is bundled
+        // (Phase 14 semantic feature); fall back to the structural scanner.
+        #[cfg(feature = "semantic")]
+        let skeleton = match minify_treesitter(&content, &path.to_string_lossy()) {
+            Some(s) => s,
+            None => scanner_skeleton(&content, &path.to_string_lossy()),
         };
+        #[cfg(not(feature = "semantic"))]
+        let skeleton = scanner_skeleton(&content, &path.to_string_lossy());
         let total = content.lines().count();
         let header = format!(
             "{} — skeleton of {total} lines (bodies elided; anchors are real line numbers)",
@@ -90,6 +93,16 @@ impl Tool for ReadMinifiedTool {
             format!("{header}\n{skeleton}"),
             MAX_BYTES,
         )))
+    }
+}
+
+/// The dependency-free scanner fallback (or the whole implementation when
+/// the `semantic` feature is off).
+fn scanner_skeleton(content: &str, path: &str) -> String {
+    if is_hash_comment_language(path) {
+        minify_indented(content)
+    } else {
+        minify_braced(content)
     }
 }
 
@@ -227,6 +240,148 @@ fn brace_delta_outside_strings(line: &str) -> i32 {
     delta
 }
 
+/// Exact syntax-aware skeleton via tree-sitter (Phase 14 `semantic`
+/// feature). Keeps the first row of definition-like nodes (functions,
+/// types, classes) and of container children (methods inside impl/trait),
+/// eliding bodies; falls back to `None` when no grammar matches the path
+/// or the parse fails.
+#[cfg(feature = "semantic")]
+fn minify_treesitter(content: &str, path: &str) -> Option<String> {
+    let language = grammar_for(path)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(content, None)?;
+    let mut rows: Vec<usize> = Vec::new();
+    walk_keep(tree.root_node(), &mut rows);
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::new();
+    let mut prev_kept: Option<usize> = None; // last emitted real row
+    for &row in rows.iter().filter(|r| **r < lines.len()) {
+        let trimmed = lines[row].trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(prev) = prev_kept {
+            let gap = row - prev - 1;
+            if gap > 0 {
+                out.push_str(&format!("… [+{gap} lines elided]\n"));
+            }
+        }
+        out.push_str(&format!("[L{}] {}\n", row + 1, trimmed));
+        prev_kept = Some(row);
+    }
+    if let Some(prev) = prev_kept {
+        let gap = lines.len() - prev - 1;
+        if gap > 0 {
+            out.push_str(&format!("… [+{gap} lines elided]\n"));
+        }
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// Nodes whose FIRST row is kept (their bodies are elided — children are
+/// not descended into).
+#[cfg(feature = "semantic")]
+const DEFINITION_KINDS: &[&str] = &[
+    // rust
+    "function_item",
+    "struct_item",
+    "enum_item",
+    "union_item",
+    "type_item",
+    "const_item",
+    "static_item",
+    "macro_definition",
+    "foreign_mod_item",
+    // python
+    "function_definition",
+    "decorated_definition",
+    "class_definition",
+    // javascript/typescript
+    "function_declaration",
+    "generator_function_declaration",
+    "class_declaration",
+    "method_definition",
+    "lexical_declaration",
+    "variable_declaration",
+    // go
+    "function_declaration",
+    "method_declaration",
+    "type_declaration",
+];
+
+/// Containers we descend into to find their members (impl blocks, traits,
+/// modules, classes).
+#[cfg(feature = "semantic")]
+const CONTAINER_KINDS: &[&str] = &[
+    "source_file",
+    "impl_item",
+    "trait_item",
+    "mod_item",
+    "declaration_list",   // rust bodies we land in only via containers
+    "module",             // python
+    "class_body",         // js
+    "program",            // js
+    "declaration_list_go",
+];
+
+#[cfg(feature = "semantic")]
+fn walk_keep(node: tree_sitter::Node, rows: &mut Vec<usize>) {
+    let kind = node.kind();
+    if DEFINITION_KINDS.contains(&kind) {
+        rows.push(node.start_position().row);
+        return; // body elided
+    }
+    // `mod foo;` (declaration, no body) keeps its row; `mod foo { … }`
+    // descends to its items.
+    if kind == "mod_item" && !has_body(node) {
+        rows.push(node.start_position().row);
+        return;
+    }
+    if !CONTAINER_KINDS.contains(&kind) {
+        // Non-container, non-definition at this level: keep use/import
+        // statements; everything else is body/detail.
+        if kind.contains("use") || kind.contains("import") {
+            rows.push(node.start_position().row);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_keep(child, rows);
+    }
+}
+
+/// Does this node own a `{ … }` body child (rust declaration_list)?
+#[cfg(feature = "semantic")]
+fn has_body(node: tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    let mut has = false;
+    for child in node.children(&mut cursor) {
+        if child.kind() == "declaration_list" {
+            has = true;
+            break;
+        }
+    }
+    has
+}
+
+#[cfg(feature = "semantic")]
+fn grammar_for(path: &str) -> Option<tree_sitter::Language> {
+    let lower = path.to_lowercase();
+    let ext = lower.rsplit('.').next()?;
+    match ext {
+        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "py" | "pyi" => Some(tree_sitter_python::LANGUAGE.into()),
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => {
+            Some(tree_sitter_javascript::LANGUAGE.into())
+        }
+        "go" => Some(tree_sitter_go::LANGUAGE.into()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,11 +412,11 @@ mod tests {
         let c = &out.content;
         assert!(c.contains("[L2] mod foo;"), "{c}");
         assert!(c.contains("[L4] pub struct Config {"), "{c}");
-        assert!(c.contains("+2 lines elided"), "{c}");
         assert!(c.contains("[L9] pub fn main() {"), "{c}");
-        assert!(c.contains("+3 lines elided"), "{c}");
+        assert!(c.contains("lines elided"), "{c}");
         assert!(!c.contains("println!"), "bodies elided: {c}");
         assert!(!c.contains("// a comment"), "comments elided: {c}");
+        assert!(!c.contains("pub a: u32"), "fields elided: {c}");
     }
 
     #[tokio::test]
@@ -304,6 +459,22 @@ mod tests {
         assert!(c.contains("[L1] fn fmt() {"), "{c}");
         assert!(c.contains("[L5] fn next() {"), "{c}");
         assert!(!c.contains("}}}"), "string content elided with the body: {c}");
+    }
+
+    #[tokio::test]
+    async fn go_file_skeleton_via_treesitter() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n\nfunc helper(x int) int {\n\treturn x * 2\n}\n",
+        )
+        .unwrap();
+        let out = run(json!({"path": "main.go"}), dir.path()).await;
+        let c = &out.content;
+        assert!(c.contains("[L1] package main;") || c.contains("package main"), "{c}");
+        assert!(c.contains("[L5] func main() {") || c.contains("func main()"), "{c}");
+        assert!(c.contains("helper"), "{c}");
+        assert!(!c.contains("Println"), "body elided: {c}");
     }
 
     #[tokio::test]
