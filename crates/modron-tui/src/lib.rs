@@ -451,6 +451,20 @@ pub struct App {
     /// History-zone width from the last render — committed lines wrap to
     /// it at push time so long content stays readable.
     pub last_hist_width: u16,
+    /// This turn's tool events (grouped view: the history stays clean,
+    /// one summary line lands at turn end; the panel expands on demand).
+    pub turn_tools: Vec<ToolEvent>,
+    /// Committed summary lines -> their events, newest last (capped) —
+    /// clicking a summary line re-opens the panel for that turn.
+    pub tool_log: Vec<(usize, Vec<ToolEvent>)>,
+    /// The expanded tool-activity overlay (events snapshot).
+    pub tool_panel: Option<Vec<ToolEvent>>,
+    /// Scroll offset of the expanded tool panel.
+    pub tool_panel_scroll: usize,
+    /// The live tool strip's rect from the last render (click target).
+    pub last_tool_strip: ratatui::layout::Rect,
+    /// The tool panel's rect from the last render (outside-click close).
+    pub last_tool_panel: ratatui::layout::Rect,
     /// The input box's inner area as of the last render — maps mouse
     /// clicks to cursor positions.
     pub last_input_inner: ratatui::layout::Rect,
@@ -484,6 +498,43 @@ pub struct App {
 pub struct Selection {
     pub anchor: (usize, u16),
     pub head: (usize, u16),
+}
+
+/// One grouped tool event for the collapsed tool view.
+#[derive(Clone, Debug)]
+pub struct ToolEvent {
+    pub name: String,
+    /// Output size in bytes (filled at Done).
+    pub bytes: Option<u64>,
+    pub is_error: bool,
+    pub done: bool,
+}
+
+impl ToolEvent {
+    /// The row as shown in the expanded panel, e.g. `✓ read — 2.1 KB` or
+    /// `● bash …`.
+    pub fn summary(&self) -> String {
+        if !self.done {
+            format!("● {} …", self.name)
+        } else {
+            let mark = if self.is_error { "✗" } else { "✓" };
+            match self.bytes {
+                Some(b) => format!("{mark} {} — {}", self.name, human_bytes(b)),
+                None => format!("{mark} {}", self.name),
+            }
+        }
+    }
+}
+
+/// `2.1 KB`-style byte sizes for the tool panel.
+fn human_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// One DISPLAY row of the input box: a logical line (or a slice of one,
@@ -647,6 +698,16 @@ impl App {
                     self.transcript_mode = !self.transcript_mode;
                     return Action::None;
                 }
+                // ctrl+t: expand the grouped tool activity (Esc closes).
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    let events = self.latest_tool_events();
+                    if events.is_empty() {
+                        self.note("no tool activity yet");
+                    } else {
+                        self.open_tool_panel(events);
+                    }
+                    return Action::None;
+                }
                 // Ctrl+J is raw LF — what a terminal sends when shift+enter
                 // is remapped to "\n" (the classic iTerm2 workaround). In
                 // raw mode crossterm reports it as exactly this.
@@ -698,6 +759,28 @@ impl App {
                     self.pending_approval = Some(pending);
                     return Action::None;
                 }
+            }
+        }
+
+        // The expanded tool panel owns the keyboard while open (Esc must
+        // close it, not abort a running turn).
+        if self.tool_panel.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.tool_panel = None;
+                    return Action::None;
+                }
+                KeyCode::Up => {
+                    self.tool_panel_scroll = self.tool_panel_scroll.saturating_sub(1);
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    let len = self.tool_panel.as_ref().map_or(0, |e| e.len());
+                    self.tool_panel_scroll =
+                        (self.tool_panel_scroll + 1).min(len.saturating_sub(1));
+                    return Action::None;
+                }
+                _ => return Action::None,
             }
         }
 
@@ -1431,6 +1514,23 @@ impl App {
     /// and `row` are terminal-wide coordinates (from crossterm); clicks
     /// outside the input's inner area are ignored.
     pub fn on_click(&mut self, column: u16, row: u16) {
+        // The expanded tool panel: any click OUTSIDE it collapses it.
+        if self.tool_panel.is_some() {
+            let panel = self.last_tool_panel;
+            if row < panel.y || row >= panel.y + panel.height {
+                self.tool_panel = None;
+            }
+            return;
+        }
+        // The live tool strip opens the panel.
+        let strip = self.last_tool_strip;
+        if strip.height > 0 && row >= strip.y && row < strip.y + strip.height {
+            let events = self.turn_tools.clone();
+            if !events.is_empty() {
+                self.open_tool_panel(events);
+            }
+            return;
+        }
         let inner = self.last_input_inner;
         if inner.width == 0 || row < inner.y || row >= inner.y + inner.height {
             // Outside the input box: start a text selection in the
@@ -1473,8 +1573,15 @@ impl App {
         Some(start + rel)
     }
 
-    /// Mouse press in the history zone: anchor a selection there.
+    /// Mouse press in the history zone: anchor a selection there —
+    /// unless the row is a grouped tool summary, which expands instead.
     pub fn begin_selection(&mut self, column: u16, row: u16) {
+        if let Some(idx) = self.history_index_at(row) {
+            if let Some((_, events)) = self.tool_log.iter().find(|(i, _)| *i == idx) {
+                self.open_tool_panel(events.clone());
+                return;
+            }
+        }
         if let Some(idx) = self.history_index_at(row) {
             self.selection = Some(Selection {
                 anchor: (idx, column),
@@ -1855,9 +1962,15 @@ impl App {
         match activity {
             ToolActivity::Start { name } => {
                 self.current_tool = Some(name.clone());
-                let style = Style::default().fg(self.theme.resolved().tool);
-                self.history
-                    .push(Line::from(format!("● {name} …")).style(style));
+                // Grouped view: tools never hit the scrollback one by one
+                // (the wall of `● glob` lines made sessions unreadable);
+                // the live strip shows the latest, the panel expands.
+                self.turn_tools.push(ToolEvent {
+                    name,
+                    bytes: None,
+                    is_error: false,
+                    done: false,
+                });
             }
             ToolActivity::Done {
                 name,
@@ -1865,10 +1978,23 @@ impl App {
                 bytes,
             } => {
                 self.current_tool = None;
-                let mark = if is_error { "error" } else { "done" };
-                let style = Style::default().fg(self.theme.resolved().tool);
-                self.history
-                    .push(Line::from(format!("● {name} — {mark} ({bytes} B)")).style(style));
+                if let Some(event) = self
+                    .turn_tools
+                    .iter_mut()
+                    .rev()
+                    .find(|e| e.name == name && !e.done)
+                {
+                    event.done = true;
+                    event.is_error = is_error;
+                    event.bytes = Some(bytes as u64);
+                } else {
+                    self.turn_tools.push(ToolEvent {
+                        name,
+                        bytes: Some(bytes as u64),
+                        is_error,
+                        done: true,
+                    });
+                }
             }
             ToolActivity::SubagentStarted { id, label } => {
                 self.subagents.push(SwarmRow {
@@ -1947,6 +2073,80 @@ impl App {
 
     /// A turn ended: returns the lines to flush into scrollback (tool
     /// activity, then the answer — or the interruption note).
+    /// Commit this turn's tool events as one grouped summary line and
+    /// remember them for the expandable panel (capped at 20 turns).
+    fn commit_tool_summary(&mut self) {
+        if self.turn_tools.is_empty() {
+            return;
+        }
+        let summary = self.tool_summary_line();
+        let index = self.history.len();
+        let t = self.theme.resolved();
+        // One row only — it is the click target for the expandable panel.
+        let row = wrap_line(
+            &Line::from(summary).style(Style::default().fg(t.tool)),
+            self.hist_wrap_width(),
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+        self.history.push(row);
+        self.tool_log
+            .push((index, std::mem::take(&mut self.turn_tools)));
+        let len = self.tool_log.len();
+        if len > 20 {
+            self.tool_log.drain(..len - 20);
+        }
+    }
+
+    /// `⏺ 21 tools · glob ×9 · read ×8 …` — counts, biggest first.
+    fn tool_summary_line(&self) -> String {
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for event in &self.turn_tools {
+            *counts.entry(event.name.as_str()).or_default() += 1;
+        }
+        let mut parts: Vec<(usize, &str)> = counts.into_iter().map(|(n, c)| (c, n)).collect();
+        parts.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        let total: usize = parts.iter().map(|(c, _)| *c).sum();
+        let shown: Vec<String> = parts
+            .iter()
+            .take(4)
+            .map(|(c, n)| {
+                if *c > 1 {
+                    format!("{n} ×{c}")
+                } else {
+                    n.to_string()
+                }
+            })
+            .collect();
+        let mut line = format!("⏺ {total} tools · {}", shown.join(" · "));
+        if parts.len() > 4 {
+            line.push_str(" · …");
+        }
+        if total == 1 {
+            line = format!("⏺ 1 tool · {}", parts[0].1);
+        }
+        line
+    }
+
+    /// Open the expanded panel for a set of events (current turn or a
+    /// logged one), scrolled to the bottom.
+    pub fn open_tool_panel(&mut self, events: Vec<ToolEvent>) {
+        self.tool_panel_scroll = events.len().saturating_sub(1);
+        self.tool_panel = Some(events);
+    }
+
+    /// The current-turn events, or the newest logged turn's.
+    fn latest_tool_events(&self) -> Vec<ToolEvent> {
+        if !self.turn_tools.is_empty() {
+            return self.turn_tools.clone();
+        }
+        self.tool_log
+            .last()
+            .map(|(_, e)| e.clone())
+            .unwrap_or_default()
+    }
+
     pub fn finish_turn(
         &mut self,
         answer: String,
@@ -1965,6 +2165,10 @@ impl App {
         self.cumulative.input_tokens += usage.input_tokens;
         self.cumulative.output_tokens += usage.output_tokens;
         self.cumulative.cached_input_tokens += usage.cached_input_tokens;
+
+        // The turn's tool activity lands as ONE grouped summary line
+        // (click it — or ctrl+t — to expand the full log).
+        self.commit_tool_summary();
 
         // Commit into the internal scrollback (returned for tests).
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2006,6 +2210,7 @@ impl App {
     pub fn finish_interrupted(&mut self) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
         self.running = false;
+        self.commit_tool_summary();
         self.streaming.clear();
         self.current_tool = None;
         self.status_note =
@@ -2024,6 +2229,7 @@ impl App {
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
+        self.turn_tools.clear();
         // The task echoes into the scrollback as an indented block,
         // wrapped to the history width so long messages stay readable.
         let mut lines = task.split('\n');
@@ -2188,9 +2394,20 @@ impl App {
             }
         };
 
+        let tool_panel_rows = self.tool_panel.as_ref().map_or(0, |events| {
+            (events.len() as u16 + 2).min((area.height / 2).max(4))
+        });
+        let tool_strip_rows =
+            (self.running && !self.turn_tools.is_empty() && self.tool_panel.is_none()) as u16;
         let mut rows: Vec<Constraint> = vec![Constraint::Min(1)]; // scrollback
         if !self.subagents.is_empty() {
             rows.push(Constraint::Length(self.subagents.len() as u16 + 1));
+        }
+        if tool_panel_rows > 0 {
+            rows.push(Constraint::Length(tool_panel_rows));
+        }
+        if tool_strip_rows > 0 {
+            rows.push(Constraint::Length(1));
         }
         rows.push(if self.pending_approval.is_some() {
             Constraint::Length(2)
@@ -2305,6 +2522,54 @@ impl App {
             }
             frame.render_widget(Paragraph::new(lines), chunks[idx]);
             idx += 1;
+        }
+
+        // ── Expanded tool-activity panel (ctrl+t / click) ──
+        if let Some(events) = &self.tool_panel {
+            let len = events.len();
+            let vis = (len + 2).min((area.height / 2).max(4) as usize) - 2;
+            self.tool_panel_scroll = self.tool_panel_scroll.min(len.saturating_sub(1));
+            let start = self
+                .tool_panel_scroll
+                .saturating_sub(vis.saturating_sub(1))
+                .min(len.saturating_sub(vis));
+            let mut lines =
+                vec![
+                    Line::from(format!("  tool activity ({len}) — ↑/↓ scroll · esc close"))
+                        .style(Style::default().fg(th.dim)),
+                ];
+            for event in events.iter().skip(start).take(vis) {
+                let style = if event.is_error {
+                    Style::default().fg(th.error)
+                } else {
+                    Style::default().fg(th.tool)
+                };
+                lines.push(Line::from(format!("  {}", event.summary())).style(style));
+            }
+            frame.render_widget(Paragraph::new(lines), chunks[idx]);
+            self.last_tool_panel = chunks[idx];
+            idx += 1;
+        } else {
+            self.last_tool_panel = ratatui::layout::Rect::default();
+        }
+
+        // ── Live tool strip: the LATEST tool + count (grouped view) ──
+        if tool_strip_rows > 0 {
+            let latest = self
+                .turn_tools
+                .last()
+                .map(|e| e.summary())
+                .unwrap_or_default();
+            let line = Line::from(format!(
+                "  {latest} · {} tools this turn — ctrl+t to expand",
+                self.turn_tools.len()
+            ))
+            .style(Style::default().fg(th.tool));
+            frame.render_widget(Paragraph::new(vec![line]), chunks[idx]);
+            self.last_tool_strip = chunks[idx];
+            idx += 1;
+        } else {
+            self.last_tool_strip = ratatui::layout::Rect::default();
         }
 
         if self.pending_approval.is_some() {

@@ -186,10 +186,12 @@ fn tool_lines_render_start_and_done() {
         is_error: false,
         bytes: 42,
     });
-    let hist = history_text(&app);
-    assert_eq!(hist.len(), 2);
-    assert!(hist[0].contains("● bash …"));
-    assert!(hist[1].contains("done (42 B)"));
+    // Grouped view: events accumulate; the scrollback stays clean.
+    assert!(history_text(&app).is_empty(), "no per-tool history lines");
+    assert_eq!(app.turn_tools.len(), 1);
+    assert!(app.turn_tools[0].done);
+    assert!(app.turn_tools[0].summary().contains("bash"));
+    assert!(app.turn_tools[0].summary().contains("42 B"));
     assert!(app.current_tool.is_none());
 }
 
@@ -214,13 +216,16 @@ fn finish_turn_flushes_tools_and_answer_and_updates_totals() {
         1,
         id,
     );
-    // Tool activity went into the history at event time; finish_turn
-    // appends the answer + usage and returns exactly those.
+    // The turn's tools land as ONE grouped summary line before the answer.
     assert!(
-        history_text(&app).iter().any(|l| l.contains("● bash")),
-        "tool lines in history: {:?}",
+        history_text(&app)
+            .iter()
+            .any(|l| l.contains("1 tool · bash")),
+        "grouped summary in history: {:?}",
         history_text(&app)
     );
+    assert_eq!(app.tool_log.len(), 1, "logged for the expandable panel");
+    assert!(app.turn_tools.is_empty(), "cleared for the next turn");
     assert!(lines.iter().any(|l| line_text(l) == "the full answer"));
     assert!(
         history_text(&app).iter().any(|l| l == "the full answer"),
@@ -1690,4 +1695,51 @@ fn zai_browser_sign_in_parks_the_login_flow() {
         app.auth_flow,
         Some(AuthFlow::MethodChoice { info: ref i, .. }) if i.provider_id == "zai"
     ));
+}
+
+#[test]
+fn tool_summary_counts_and_panel_expand_flow() {
+    use crossterm::event::KeyCode;
+    use modron_core::ToolActivity;
+    let mut app = App::default();
+    app.begin_task("do things");
+    for name in ["glob", "glob", "glob", "read", "read", "grep"] {
+        app.on_tool(ToolActivity::Start { name: name.into() });
+        app.on_tool(ToolActivity::Done {
+            name: name.into(),
+            is_error: false,
+            bytes: 100,
+        });
+    }
+    let id = modron_core::SessionId::new_v4();
+    app.finish_turn("done".into(), Usage::default(), 1, 6, id);
+    // Counts, biggest first, capped display.
+    let summary = history_text(&app)
+        .into_iter()
+        .find(|l| l.starts_with("⏺"))
+        .expect("summary line");
+    assert!(summary.contains("6 tools"), "{summary}");
+    assert!(summary.contains("glob ×3"), "{summary}");
+    assert!(summary.contains("read ×2"), "{summary}");
+    assert!(summary.contains("grep"), "{summary}");
+
+    // ctrl+t opens the panel with the logged events; Esc closes without
+    // aborting a running turn.
+    assert!(app.tool_panel.is_none());
+    app.on_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('t'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert!(app.tool_panel.is_some());
+    assert_eq!(app.tool_panel.as_ref().unwrap().len(), 6);
+    app.running = true;
+    let action = app.on_key(key(KeyCode::Esc));
+    assert!(app.tool_panel.is_none(), "esc closes the panel");
+    assert!(!matches!(action, crate::Action::Abort), "esc consumed");
+
+    // Clicking the summary line in history re-opens that turn's log.
+    let (idx, _) = app.tool_log[0].clone();
+    app.hist_geom = (0, idx + 1, true, 0);
+    app.begin_selection(0, idx as u16);
+    assert!(app.tool_panel.is_some(), "summary click expands");
 }
