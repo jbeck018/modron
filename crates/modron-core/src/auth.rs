@@ -111,7 +111,7 @@ pub fn provider_info(provider_id: &str) -> Option<ProviderInfo> {
 /// Whether a provider offers the in-app browser sign-in (OAuth) in
 /// addition to API keys.
 pub fn oauth_capable(provider_id: &str) -> bool {
-    matches!(provider_id, "anthropic" | "openai-compat")
+    matches!(provider_id, "anthropic" | "openai-compat" | "zai")
 }
 
 /// Whether stored sign-in tokens exist for an OAuth-capable provider
@@ -281,7 +281,7 @@ mod tests {
         for info in &reg {
             assert_eq!(
                 oauth_capable(info.provider_id),
-                matches!(info.provider_id, "anthropic" | "openai-compat"),
+                matches!(info.provider_id, "anthropic" | "openai-compat" | "zai"),
                 "{}",
                 info.provider_id
             );
@@ -644,6 +644,256 @@ pub mod oauth {
             }
         }
         code.ok_or_else(|| anyhow!("callback URL missing code"))
+    }
+
+    /// ── Z.ai (GLM Coding Plan) browser sign-in ────────────────────────
+    ///
+    /// Mirrors ZCode's desktop "Individual Plan" sign-in (community
+    /// reverse-engineered, e.g. oh-my-pi #6385): an authorization-code
+    /// flow with NO PKCE against chat.z.ai, a non-standard JSON token
+    /// exchange on zcode.z.ai, then Z.ai's business API provisions a
+    /// DURABLE `id.secret` API key (named in the console) that works
+    /// exactly like a console-issued `ZAI_API_KEY` — so the result is
+    /// saved to the env file, not a token store.
+    pub mod zai {
+        use super::*;
+
+        /// ZCode's public OAuth client id.
+        pub const CLIENT_ID: &str = "client_P8X5CMWmlaRO9gyO-KSqtg";
+        pub const AUTHORIZE_URL: &str = "https://chat.z.ai/api/oauth/authorize";
+        pub const TOKEN_URL: &str = "https://zcode.z.ai/api/v1/oauth/token";
+        pub const BIZ_BASE: &str = "https://api.z.ai";
+        /// Exchanges the short-lived OAuth token for a business token.
+        pub const BUSINESS_LOGIN_URL: &str = "https://api.z.ai/api/auth/z/login";
+        /// The name of the API key we mint (visible in the Z.ai console).
+        pub const KEY_NAME: &str = "modron";
+
+        /// A prepared sign-in: show `url`, then wait for the callback.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ZaiLoginSession {
+            pub url: String,
+            pub state: String,
+            pub port: u16,
+        }
+
+        /// Prepare a sign-in: random state + probed callback port + the
+        /// authorize URL (no PKCE, no scopes — verbatim what ZCode sends).
+        pub fn prepare_login() -> anyhow::Result<ZaiLoginSession> {
+            let state = base64url_nopad(&rand_bytes()?);
+            let port = super::probe_callback_port();
+            let redirect = format!("http://localhost:{port}/callback");
+            let encoded = redirect.replace(':', "%3A").replace('/', "%2F");
+            Ok(ZaiLoginSession {
+                url: format!(
+                    "{AUTHORIZE_URL}?redirect_uri={encoded}&response_type=code&client_id={CLIENT_ID}&state={state}"
+                ),
+                state,
+                port,
+            })
+        }
+
+        /// Z.ai's `{code, msg, data, success}` envelope: the OAuth token
+        /// endpoint signals success with code 0, the business API with
+        /// 200/success. Bodies without the wrapper pass through.
+        fn unwrap_envelope(body: &Value, op: &str) -> anyhow::Result<Value> {
+            let code_ok = match body.get("code") {
+                None => true,
+                Some(Value::Number(n)) => n.as_i64() == Some(0) || n.as_i64() == Some(200),
+                Some(Value::String(s)) => s == "0" || s == "200",
+                Some(_) => false,
+            };
+            let success_ok = body.get("success").and_then(Value::as_bool).unwrap_or(true);
+            if !code_ok || !success_ok {
+                let msg = body
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no message)");
+                return Err(anyhow!("z.ai {op} failed: {msg}"));
+            }
+            Ok(body.get("data").cloned().unwrap_or_else(|| body.clone()))
+        }
+
+        /// Exchange the callback code (non-standard JSON: no grant_type).
+        /// Returns the short-lived OAuth access token (+ account email).
+        pub async fn exchange_token_at(
+            token_url: &str,
+            code: &str,
+            state: &str,
+            port: u16,
+        ) -> anyhow::Result<(String, Option<String>)> {
+            let client = reqwest::Client::new();
+            let response = client
+                .post(token_url)
+                .json(&json!({
+                    "provider": "zai",
+                    "code": code,
+                    "redirect_uri": format!("http://localhost:{port}/callback"),
+                    "state": state,
+                }))
+                .send()
+                .await?;
+            let body: Value = response.json().await?;
+            let data = unwrap_envelope(&body, "token exchange")?;
+            let access = data
+                .pointer("/zai/access_token")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("token response missing access token"))?
+                .to_string();
+            let email = data
+                .pointer("/user/email")
+                .and_then(Value::as_str)
+                .map(String::from);
+            Ok((access, email))
+        }
+
+        /// Exchange the OAuth token for a business token (the biz API
+        /// rejects the raw OAuth token).
+        pub async fn business_login_at(url: &str, oauth_token: &str) -> anyhow::Result<String> {
+            let client = reqwest::Client::new();
+            let response = client
+                .post(url)
+                .json(&json!({ "token": oauth_token }))
+                .send()
+                .await?;
+            let body: Value = response.json().await?;
+            let data = unwrap_envelope(&body, "business login")?;
+            let token = ["access_token", "accessToken"]
+                .iter()
+                .find_map(|k| data.get(*k).and_then(Value::as_str))
+                .ok_or_else(|| anyhow!("business login returned no access token"))?;
+            Ok(token.to_string())
+        }
+
+        /// Coerce an api-keys list response (bare array or wrapper) to a vec.
+        fn as_key_array(value: &Value) -> Vec<&Value> {
+            if let Some(arr) = value.as_array() {
+                return arr.iter().collect();
+            }
+            for field in ["list", "keys", "apiKeys", "records"] {
+                if let Some(arr) = value.get(field).and_then(Value::as_array) {
+                    return arr.iter().collect();
+                }
+            }
+            Vec::new()
+        }
+
+        /// Provision the durable `id.secret` key: resolve the default
+        /// organization/project, reuse (or create) the named key, and
+        /// fetch its secret via the copy endpoint (list entries mask it).
+        pub async fn mint_key_at(
+            biz_base: &str,
+            biz_token: &str,
+            key_name: &str,
+        ) -> anyhow::Result<String> {
+            let client = reqwest::Client::new();
+            let auth_header = format!("Bearer {biz_token}");
+
+            let customer = client
+                .get(format!("{biz_base}/api/biz/customer/getCustomerInfo"))
+                .header("Authorization", &auth_header)
+                .send()
+                .await?
+                .json::<Value>()
+                .await?;
+            let customer = unwrap_envelope(&customer, "customer lookup")?;
+            let orgs = customer
+                .get("organizations")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let org = orgs
+                .iter()
+                .find(|o| o.get("isDefault").and_then(Value::as_bool) == Some(true))
+                .or_else(|| orgs.first())
+                .ok_or_else(|| anyhow!("no organization on the account"))?;
+            let projects = org
+                .get("projects")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let project = projects
+                .iter()
+                .find(|p| p.get("isDefault").and_then(Value::as_bool) == Some(true))
+                .or_else(|| projects.first())
+                .ok_or_else(|| anyhow!("no project on the account"))?;
+            let organization_id = org
+                .get("organizationId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("organization carries no organizationId"))?;
+            let project_id = project
+                .get("projectId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("project carries no projectId"))?;
+
+            let keys_url = format!(
+                "{biz_base}/api/biz/v1/organization/{organization_id}/projects/{project_id}/api_keys"
+            );
+            let listed = client
+                .get(&keys_url)
+                .header("Authorization", &auth_header)
+                .send()
+                .await?
+                .json::<Value>()
+                .await?;
+            let listed = unwrap_envelope(&listed, "api key list")?;
+            let existing = as_key_array(&listed)
+                .into_iter()
+                .find(|k| k.get("name").and_then(Value::as_str) == Some(key_name));
+            let key_record = match existing {
+                Some(k) => k.clone(),
+                None => {
+                    let created = client
+                        .post(&keys_url)
+                        .header("Authorization", &auth_header)
+                        .json(&json!({ "name": key_name }))
+                        .send()
+                        .await?
+                        .json::<Value>()
+                        .await?;
+                    unwrap_envelope(&created, "api key create")?
+                }
+            };
+            let api_key = key_record
+                .get("apiKey")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("key provisioning returned no apiKey"))?;
+
+            // The copy endpoint always returns the FULL secret (list
+            // entries mask it; the create response is unreliable).
+            let copied = client
+                .get(format!("{keys_url}/copy/{}", urlencode(api_key)))
+                .header("Authorization", &auth_header)
+                .send()
+                .await?
+                .json::<Value>()
+                .await?;
+            let copied = unwrap_envelope(&copied, "api key copy")?;
+            let secret = copied
+                .get("secretKey")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("api key copy returned no secretKey"))?;
+            Ok(format!("{api_key}.{secret}"))
+        }
+
+        /// Minimal path-segment escaping for the key id in the copy URL.
+        fn urlencode(s: &str) -> String {
+            s.replace('%', "%25")
+                .replace('/', "%2F")
+                .replace(':', "%3A")
+        }
+
+        /// Complete a sign-in after the browser callback: returns the
+        /// durable `id.secret` key (save as `ZAI_API_KEY`) + email.
+        pub async fn finish(
+            code: &str,
+            state: &str,
+            port: u16,
+        ) -> anyhow::Result<(String, Option<String>)> {
+            let (access, email) = exchange_token_at(TOKEN_URL, code, state, port).await?;
+            let biz = business_login_at(BUSINESS_LOGIN_URL, &access).await?;
+            let key = mint_key_at(BIZ_BASE, &biz, KEY_NAME).await?;
+            Ok((key, email))
+        }
     }
 
     /// ── ChatGPT (OpenAI Codex) subscription login ─────────────────────
@@ -1150,6 +1400,129 @@ pub mod oauth {
                 "{request}"
             );
             assert!(request.contains(r#""code_verifier":"vvvv"#), "{request}");
+        }
+
+        #[test]
+        fn zai_authorize_url_matches_zcode_shape() {
+            let session = zai::prepare_login().unwrap();
+            assert!(
+                session
+                    .url
+                    .starts_with("https://chat.z.ai/api/oauth/authorize?"),
+                "{}",
+                session.url
+            );
+            assert!(
+                session.url.contains("response_type=code"),
+                "{}}}",
+                session.url
+            );
+            assert!(
+                session
+                    .url
+                    .contains("client_id=client_P8X5CMWmlaRO9gyO-KSqtg"),
+                "{}",
+                session.url
+            );
+            // No PKCE, no scopes — verbatim ZCode shape.
+            assert!(!session.url.contains("code_challenge"), "{}}}", session.url);
+            assert!(!session.url.contains("scope"), "{}}}", session.url);
+            assert!(session.url.contains(&format!("state={}", session.state)));
+        }
+
+        #[tokio::test]
+        async fn zai_flow_mints_durable_key_on_the_wire() {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            // Scripted sequence: token exchange (envelope code 0), business
+            // login (code 200), customer info, empty key list, key create,
+            // key copy (secret).
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let token_url = format!("http://{addr}/oauth/token");
+            let biz_login = format!("http://{addr}/auth/z/login");
+            let biz_base = format!("http://{addr}");
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let respond = |status: &str, body: String| {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf = [0u8; 8192];
+                    let n = sock.read(&mut buf).unwrap();
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = format!(
+                        "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                    request
+                };
+                let r = respond(
+                    "HTTP/1.1 200 OK",
+                    r#"{"code":0,"data":{"zai":{"access_token":"oa-1"},"user":{"email":"dev@example.com","id":7}}}"#.into(),
+                );
+                let _ = tx.send(r);
+                let r = respond(
+                    "HTTP/1.1 200 OK",
+                    r#"{"code":200,"success":true,"data":{"access_token":"biz-1"}}"#.into(),
+                );
+                let _ = tx.send(r);
+                let r = respond(
+                    "HTTP/1.1 200 OK",
+                    r#"{"code":200,"data":{"organizations":[{"organizationId":"org-9","isDefault":true,"projects":[{"projectId":"proj-1","isDefault":true}]}]}}"#.into(),
+                );
+                let _ = tx.send(r);
+                let r = respond("HTTP/1.1 200 OK", r#"{"code":200,"data":[]}"#.into());
+                let _ = tx.send(r);
+                let r = respond(
+                    "HTTP/1.1 200 OK",
+                    r#"{"code":200,"data":{"apiKey":"id123","name":"modron"}}"#.into(),
+                );
+                let _ = tx.send(r);
+                let r = respond(
+                    "HTTP/1.1 200 OK",
+                    r#"{"code":200,"data":{"secretKey":"sec456"}}"#.into(),
+                );
+                let _ = tx.send(r);
+            });
+
+            let (access, email) = zai::exchange_token_at(&token_url, "c-1", "st", 54545)
+                .await
+                .unwrap();
+            assert_eq!(access, "oa-1");
+            assert_eq!(email.as_deref(), Some("dev@example.com"));
+
+            let biz = zai::business_login_at(&biz_login, &access).await.unwrap();
+            assert_eq!(biz, "biz-1");
+
+            let key = zai::mint_key_at(&biz_base, &biz, "modron").await.unwrap();
+            assert_eq!(key, "id123.sec456", "durable id.secret form");
+
+            // Wire-shape assertions: non-standard exchange body, bearer
+            // auth on the business calls, org/project paths, copy URL.
+            let mut requests = Vec::new();
+            while let Ok(r) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                requests.push(r);
+            }
+            let all = requests.join("\n---\n");
+            assert!(
+                all.contains(r#""provider":"zai""#),
+                "non-standard exchange body: {all}"
+            );
+            assert!(
+                all.to_ascii_lowercase()
+                    .contains("authorization: bearer biz-1"),
+                "{all}"
+            );
+            assert!(
+                all.contains("/api/biz/v1/organization/org-9/projects/proj-1/api_keys"),
+                "{all}"
+            );
+            assert!(
+                all.contains("/api/biz/v1/organization/org-9/projects/proj-1/api_keys/copy/id123"),
+                "{all}"
+            );
+            assert!(all.contains("/api/biz/customer/getCustomerInfo"), "{all}");
         }
 
         #[tokio::test]

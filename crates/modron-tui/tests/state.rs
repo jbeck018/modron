@@ -1662,3 +1662,32 @@ fn model_menu_s_key_saves_as_default_and_config_writer_roundtrips() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn zai_browser_sign_in_parks_the_login_flow() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
+    // Registry order: anthropic(0), openai(1), zai(2).
+    for _ in 0..2 {
+        app.on_key(key(KeyCode::Down));
+    }
+    app.on_key(key(KeyCode::Enter)); // method choice
+    app.on_key(key(KeyCode::Down)); // browser sign-in
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::WaitingOAuth { info: ref i, ref url, user_code: None })
+            if i.provider_id == "zai" && url.starts_with("https://chat.z.ai/api/oauth/authorize")
+    ));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::ZaiLogin { .. })
+    ));
+    // Esc backs out to the method screen.
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::MethodChoice { info: ref i, .. }) if i.provider_id == "zai"
+    ));
+}

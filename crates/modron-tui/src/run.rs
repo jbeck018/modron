@@ -414,6 +414,42 @@ pub async fn run_with(
                 .await;
                 let _ = tx.send(OAuthProgress::Done { gen, result });
             }));
+        } else if matches!(app.pending_command, Some(PendingCommand::ZaiLogin { .. })) {
+            let Some(PendingCommand::ZaiLogin { session }) = app.pending_command.take() else {
+                unreachable!("matches! guard above")
+            };
+            oauth_generation += 1;
+            let gen = oauth_generation;
+            let tx = oauth_tx.clone();
+            oauth_task = Some(tokio::spawn(async move {
+                let result: anyhow::Result<String> = async {
+                    // Listener first, then the browser (same race rule as
+                    // the Claude flow).
+                    let code = modron_core::auth::oauth::wait_for_callback(
+                        session.port,
+                        &session.state,
+                        Some(&session.url),
+                    )
+                    .await?;
+                    let (key, email) =
+                        modron_core::auth::oauth::zai::finish(&code, &session.state, session.port)
+                            .await?;
+                    // The minted id.secret key IS a ZAI_API_KEY: save it to
+                    // the shared env file so every launch picks it up.
+                    let path = modron_core::auth::env_file()
+                        .map_err(|e| anyhow::anyhow!("cannot resolve env file: {e}"))?;
+                    modron_core::auth::set_key_in_env_file(&path, "ZAI_API_KEY", &key)
+                        .map_err(|e| anyhow::anyhow!("cannot save key: {e}"))?;
+                    std::env::set_var("ZAI_API_KEY", &key);
+                    Ok(format!(
+                        "✓ z.ai signed in{} — GLM Coding Plan key saved ({}) — use `--provider zai`",
+                        email.map(|e| format!(" ({e})")).unwrap_or_default(),
+                        modron_core::auth::mask_key(&key)
+                    ))
+                }
+                .await;
+                let _ = tx.send(OAuthProgress::Done { gen, result });
+            }));
         } else if matches!(app.pending_command, Some(PendingCommand::ChatGptLogin)) {
             app.pending_command = None;
             oauth_generation += 1;
@@ -682,6 +718,9 @@ async fn run_pending_command(
             lines
         }
         // /sandbox: switch the policy for future tool calls.
+        // Z.ai sign-in never reaches this queue (the OAuth spawn arm
+        // consumes it), but the match must stay exhaustive.
+        PendingCommand::ZaiLogin { .. } => Vec::new(),
         PendingCommand::Sandbox(mode) => match mode.as_str() {
             "off" => {
                 engine.config.sandbox = modron_core::SandboxPolicy::Off;

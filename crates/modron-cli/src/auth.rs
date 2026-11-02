@@ -50,6 +50,10 @@ async fn add_provider_wizard() -> anyhow::Result<()> {
         "   g  ChatGPT (OpenAI)      sign in with your ChatGPT plan"
     )?;
     writeln!(stdout, "   o  Claude subscription   OAuth in the browser")?;
+    writeln!(
+        stdout,
+        "   z  Z.ai (GLM Plan)      sign in — mints an API key"
+    )?;
     writeln!(stdout)?;
     write!(stdout, "  choice: ")?;
     stdout.flush()?;
@@ -62,6 +66,9 @@ async fn add_provider_wizard() -> anyhow::Result<()> {
     }
     if choice.eq_ignore_ascii_case("g") {
         return chatgpt_login().await;
+    }
+    if choice.eq_ignore_ascii_case("z") {
+        return zai_login().await;
     }
     let num: u8 = choice
         .parse()
@@ -166,6 +173,33 @@ fn logout(provider: Option<&str>) -> anyhow::Result<()> {
 
 /// Terminal ChatGPT device flow: prints the code + URL, polls until the
 /// browser sign-in completes, saves tokens.
+/// Z.ai browser sign-in: mints a durable API key saved as ZAI_API_KEY.
+async fn zai_login() -> anyhow::Result<()> {
+    use modron_core::auth::oauth::zai;
+    let session = zai::prepare_login()?;
+    println!("1. Opening the Z.ai sign-in page in your browser (or paste manually):");
+    println!("{}", session.url);
+    println!("2. Waiting for the localhost:{} callback …", session.port);
+
+    let code = modron_core::auth::oauth::wait_for_callback(
+        session.port,
+        &session.state,
+        Some(&session.url),
+    )
+    .await?;
+    let (key, email) = zai::finish(&code, &session.state, session.port).await?;
+    let path =
+        modron_core::auth::env_file().map_err(|e| anyhow!("cannot resolve env file: {e}"))?;
+    modron_core::auth::set_key_in_env_file(&path, "ZAI_API_KEY", &key)?;
+    std::env::set_var("ZAI_API_KEY", &key);
+    println!(
+        "✓ z.ai signed in{} — GLM Coding Plan key saved ({}) — use `--provider zai`",
+        email.map(|e| format!(" ({e})")).unwrap_or_default(),
+        modron_core::auth::mask_key(&key)
+    );
+    Ok(())
+}
+
 async fn chatgpt_login() -> anyhow::Result<()> {
     use modron_core::auth::oauth::chatgpt;
     let device = chatgpt::start().await?;

@@ -131,6 +131,12 @@ pub enum PendingCommand {
     /// run loop spawns start→finish; the interim user code shows in the
     /// modal; Esc cancels).
     ChatGptLogin,
+    /// The interactive flow's Z.ai row: browser sign-in that mints a
+    /// durable API key (the run loop spawns the callback + mint; the
+    /// key is saved as ZAI_API_KEY).
+    ZaiLogin {
+        session: modron_core::auth::oauth::zai::ZaiLoginSession,
+    },
     /// /model <name>: switch the engine's model for future turns (the
     /// provider follows the model). `save_default` also persists the
     /// choice to config.toml.
@@ -299,6 +305,7 @@ impl AuthMethod {
             AuthMethod::ApiKey => format!("paste an API key ({})", info.env_var),
             AuthMethod::BrowserSignIn => match info.provider_id {
                 "anthropic" => "sign in with Claude subscription (browser)".to_string(),
+                "zai" => "sign in with Z.ai / GLM Coding Plan (browser)".to_string(),
                 _ => "sign in with ChatGPT (browser)".to_string(),
             },
             AuthMethod::Remove => "remove saved credentials".to_string(),
@@ -944,6 +951,22 @@ impl App {
                                         let url = session.url.clone();
                                         self.pending_command =
                                             Some(PendingCommand::OAuthLogin { session });
+                                        self.auth_flow = Some(AuthFlow::WaitingOAuth {
+                                            info,
+                                            url,
+                                            user_code: None,
+                                        });
+                                    }
+                                    Err(e) => self.note(format!("cannot start OAuth: {e}")),
+                                }
+                            } else if info.provider_id == "zai" {
+                                // Z.ai: browser sign-in that mints a durable
+                                // API key; the run loop spawns the rest.
+                                match modron_core::auth::oauth::zai::prepare_login() {
+                                    Ok(session) => {
+                                        let url = session.url.clone();
+                                        self.pending_command =
+                                            Some(PendingCommand::ZaiLogin { session });
                                         self.auth_flow = Some(AuthFlow::WaitingOAuth {
                                             info,
                                             url,
