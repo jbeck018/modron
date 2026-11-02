@@ -193,11 +193,7 @@ fn relay_oversized(text: &str) -> String {
     }
     let dir = std::env::temp_dir().join("modron-relay");
     let _ = std::fs::create_dir_all(&dir);
-    let name = format!(
-        "{}-{}.txt",
-        chrono_now_compact(),
-        fnv8(text.as_bytes()),
-    );
+    let name = format!("{}-{}.txt", chrono_now_compact(), fnv8(text.as_bytes()),);
     let path = dir.join(name);
     if std::fs::write(&path, text).is_err() {
         // Relay is best-effort: fall back to the old hard cap.
@@ -224,10 +220,13 @@ fn relay_oversized(text: &str) -> String {
 
 fn chrono_now_compact() -> String {
     // std::time only: seconds since the epoch keep the filename sortable.
-    format!("{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0))
+    format!(
+        "{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    )
 }
 
 fn fnv8(bytes: &[u8]) -> String {
@@ -332,19 +331,12 @@ mod tests {
     async fn oversized_output_is_relayed_to_disk_with_head_and_tail() {
         let dir = tempdir().unwrap();
         // ~700KB of numbered lines — over the relay threshold.
-        let out = run(
-            json!({"command": "seq 1 100000"}),
-            dir.path(),
-        )
-        .await;
+        let out = run(json!({"command": "seq 1 100000"}), dir.path()).await;
         assert!(!out.is_error, "{out:?}");
         // Head and tail survive, the middle is relayed to a file.
         assert!(out.content.starts_with("1\n"), "head first lines: {out:?}");
         assert!(out.content.contains("100000"), "tail last lines: {out:?}");
-        assert!(
-            out.content.contains("relayed to"),
-            "relay marker: {out:?}"
-        );
+        assert!(out.content.contains("relayed to"), "relay marker: {out:?}");
         assert!(
             out.content.contains("read it with the `read` tool"),
             "{out:?}"
@@ -361,10 +353,9 @@ mod tests {
             .take_while(|c| *c != ' ' && *c != '\n')
             .collect();
         let file_name = rel.strip_prefix("modron-relay/").unwrap_or(&rel);
-        let full = std::fs::read_to_string(
-            std::env::temp_dir().join("modron-relay").join(file_name),
-        )
-        .unwrap_or_default();
+        let full =
+            std::fs::read_to_string(std::env::temp_dir().join("modron-relay").join(file_name))
+                .unwrap_or_default();
         assert!(full.lines().count() == 100_000, "full output relayed");
     }
 

@@ -330,9 +330,8 @@ impl MemoryStore {
         if text.is_empty() {
             return Err(Error::Session("breadcrumb text must not be empty".into()));
         }
-        fs::create_dir_all(&self.root).map_err(|err| {
-            io_err(&err, format!("cannot create {}", self.root.display()))
-        })?;
+        fs::create_dir_all(&self.root)
+            .map_err(|err| io_err(&err, format!("cannot create {}", self.root.display())))?;
         let now = chrono::Utc::now();
         let stamp = now.format("%Y%m%dT%H%M%S%3f").to_string();
         let crumb = Breadcrumb {
@@ -352,9 +351,14 @@ impl MemoryStore {
         }
         write_atomic(
             &self.root.join("breadcrumbs.jsonl"),
-            &format!("{}
-", lines.join("
-")),
+            &format!(
+                "{}
+",
+                lines.join(
+                    "
+"
+                )
+            ),
         )?;
         Ok(crumb)
     }
@@ -382,19 +386,13 @@ impl MemoryStore {
             .into_iter()
             .filter_map(|c| {
                 let hay = format!("{} {}", c.text, c.tags.join(" ")).to_lowercase();
-                let score = tokens
-                    .iter()
-                    .filter(|t| hay.contains(t.as_str()))
-                    .count() as u32;
+                let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count() as u32;
                 (score > 0).then_some((score, c))
             })
             .collect();
         // Score descending; ties break toward the newest (RFC 3339 stamps
         // compare lexicographically).
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| b.1.created.cmp(&a.1.created))
-        });
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.created.cmp(&a.1.created)));
         scored.into_iter().take(limit).map(|(_, c)| c).collect()
     }
 
@@ -408,8 +406,8 @@ impl MemoryStore {
 
     fn write_stats(&self, stats: &std::collections::BTreeMap<String, FactStat>) -> Result<()> {
         if self.root.exists() {
-            let json = serde_json::to_string_pretty(stats)
-                .map_err(|e| Error::Session(e.to_string()))?;
+            let json =
+                serde_json::to_string_pretty(stats).map_err(|e| Error::Session(e.to_string()))?;
             write_atomic(&self.root.join("stats.json"), &json)?;
         }
         Ok(())
@@ -513,15 +511,14 @@ impl MemoryStore {
             for (id, label, _) in &facts {
                 let stat = stats.entry(id.clone()).or_default();
                 let created = entry_created_older(label); // YYYY-MM-DD from the label
-                let last_used = parse_rfc3339(&stat.last_used)
-                    .or(created)
-                    .unwrap_or(now); // unknown → no idle decay yet
+                let last_used = parse_rfc3339(&stat.last_used).or(created).unwrap_or(now); // unknown → no idle decay yet
                 let idle_days = (now - last_used).num_days().max(0) as f64;
-                let age_days = created.map(|c| (now - c).num_days().max(0) as f64).unwrap_or(0.0);
+                let age_days = created
+                    .map(|c| (now - c).num_days().max(0) as f64)
+                    .unwrap_or(0.0);
                 let score = usefulness_score(stat, idle_days);
                 let was = stat.relegated;
-                stat.relegated =
-                    score <= 0.0 && age_days >= policy.grace_days;
+                stat.relegated = score <= 0.0 && age_days >= policy.grace_days;
                 if !was && stat.relegated {
                     report.facts_relegated += 1;
                 } else if was && !stat.relegated {
@@ -553,9 +550,14 @@ impl MemoryStore {
                     &if lines.is_empty() {
                         String::new()
                     } else {
-                        format!("{}
-", lines.join("
-"))
+                        format!(
+                            "{}
+",
+                            lines.join(
+                                "
+"
+                            )
+                        )
                     },
                 )?;
             }
@@ -971,7 +973,8 @@ mod tests {
         let all = store.breadcrumbs();
         assert_eq!(all.len(), MAX_BREADCRUMBS);
         assert!(
-            all.iter().any(|c| c.text.contains(&format!("bulk {}", MAX_BREADCRUMBS + 19))),
+            all.iter()
+                .any(|c| c.text.contains(&format!("bulk {}", MAX_BREADCRUMBS + 19))),
             "newest bulk entries kept"
         );
         assert!(
@@ -991,8 +994,8 @@ mod tests {
         assert!(store.stats().is_empty(), "ledger starts empty");
         store.record_hit(&id); // creates the ledger lazily
         store.record_hit(&id);
-        store.record_outcome(&[id.clone()], true);
-        store.record_outcome(&[id.clone()], false);
+        store.record_outcome(std::slice::from_ref(&id), true);
+        store.record_outcome(std::slice::from_ref(&id), false);
         let stats = store.stats();
         let stat = stats.get(&id).unwrap();
         assert_eq!((stat.uses, stat.successes, stat.failures), (2, 1, 1));
@@ -1044,7 +1047,8 @@ mod tests {
             "### 2026-01-01 second
 body second
 
-".len(),
+"
+            .len(),
         );
         assert!(tight.contains("second"), "{tight}");
         assert!(!tight.contains("third"), "{tight}");
@@ -1067,7 +1071,10 @@ body second
             })
             .unwrap();
         assert_eq!(report.facts_total, 1);
-        assert_eq!(report.facts_relegated, 0, "grace period protects fresh facts");
+        assert_eq!(
+            report.facts_relegated, 0,
+            "grace period protects fresh facts"
+        );
 
         // A heavily-used fact with an old ledger date: backdate via the
         // ledger file, then curate — it survives.
@@ -1082,8 +1089,7 @@ body second
             let mut stats = store.stats();
             let stat = stats.entry(workhorse.clone()).or_default();
             stat.uses = 50;
-            stat.last_used = (chrono::Utc::now() - chrono::Duration::days(30))
-                .to_rfc3339();
+            stat.last_used = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
             std::fs::write(
                 store.root().join("stats.json"),
                 serde_json::to_string(&stats).unwrap(),

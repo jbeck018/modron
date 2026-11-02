@@ -601,7 +601,11 @@ async fn memory_hits_fold_success_into_the_ledger() {
 
     let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::default());
     let provider = MockProvider::new()
-        .then_response(tool_call_response("c1", "memory_search", json!({"query": "x"})))
+        .then_response(tool_call_response(
+            "c1",
+            "memory_search",
+            json!({"query": "x"}),
+        ))
         .then_response(text_response("used it, done"));
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(FakeMemorySearch));
@@ -625,11 +629,8 @@ async fn memory_hits_fold_success_into_the_ledger() {
     let summary = engine.run_task("find the fact").await.unwrap();
     assert_eq!(summary.answer, "used it, done");
 
-    let workspace = modron_core::memory::MemoryStore::for_workspace(
-        memory_root.path(),
-        dir.path(),
-    )
-    .unwrap();
+    let workspace =
+        modron_core::memory::MemoryStore::for_workspace(memory_root.path(), dir.path()).unwrap();
     let stats = workspace.stats();
     // The scripted fact's id contains the title; find it by prefix.
     let (id, stat) = stats

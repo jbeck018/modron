@@ -80,7 +80,15 @@ impl Tool for DiagnosticsTool {
         let lsp_lines: Vec<String> = tokio::task::spawn_blocking(|| {
             crate::lsp::wait_diagnostics(2500, "")
                 .into_iter()
-                .map(|d| format!("{}:{}: [{}] {}", d.file, d.line, d.severity_label(), d.message))
+                .map(|d| {
+                    format!(
+                        "{}:{}: [{}] {}",
+                        d.file,
+                        d.line,
+                        d.severity_label(),
+                        d.message
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .await
@@ -88,11 +96,16 @@ impl Tool for DiagnosticsTool {
         let lsp_report = if lsp_lines.is_empty() {
             String::new()
         } else {
-            format!("live language-server diagnostics:
+            format!(
+                "live language-server diagnostics:
 {}
 
-", lsp_lines.join("
-"))
+",
+                lsp_lines.join(
+                    "
+"
+                )
+            )
         };
 
         let output = tokio::process::Command::new("sh")
@@ -161,7 +174,7 @@ fn detect(dir: &std::path::Path) -> Option<(String, String)> {
     } else if has("pyproject.toml") || has("setup.py") {
         Some((
             "python compileall".into(),
-            format!("python3 -m compileall -q ."),
+            "python3 -m compileall -q .".to_string(),
         ))
     } else {
         None
@@ -184,10 +197,7 @@ mod tests {
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.to_path_buf(),
         };
-        DiagnosticsTool
-            .execute(args, &ctx)
-            .await
-            .expect("execute")
+        DiagnosticsTool.execute(args, &ctx).await.expect("execute")
     }
 
     #[tokio::test]
@@ -228,7 +238,11 @@ mod tests {
             "[package]\nname = \"diagclean\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join("src").join("lib.rs"), "pub fn ok() -> u32 { 1 }\n").unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "pub fn ok() -> u32 { 1 }\n",
+        )
+        .unwrap();
         let out = run(json!({}), dir.path()).await;
         assert!(!out.is_error, "{out:?}");
         assert!(out.content.contains("clean"), "{out:?}");
@@ -237,7 +251,11 @@ mod tests {
     #[tokio::test]
     async fn python_syntax_error_surfaces() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname = \"p\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"p\"\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("bad.py"), "def f(:\n").unwrap();
         let out = run(json!({}), dir.path()).await;
         assert!(out.is_error, "{out:?}");
@@ -247,7 +265,11 @@ mod tests {
     #[tokio::test]
     async fn command_override_runs() {
         let dir = tempdir().unwrap();
-        let out = run(json!({"command": "echo custom-checker && false"}), dir.path()).await;
+        let out = run(
+            json!({"command": "echo custom-checker && false"}),
+            dir.path(),
+        )
+        .await;
         assert!(out.is_error, "{out:?}");
         assert!(out.content.contains("custom-checker"), "{out:?}");
     }

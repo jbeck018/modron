@@ -71,9 +71,7 @@ fn server_command(lang: &str) -> Option<(&'static str, Vec<&'static str>)> {
         "rust" => Some(("rust-analyzer", vec![])),
         "go" => Some(("gopls", vec!["serve", "--stdio"])),
         "python" => Some(("pyright-langserver", vec!["--stdio"])),
-        "typescript" | "javascript" => {
-            Some(("typescript-language-server", vec!["--stdio"]))
-        }
+        "typescript" | "javascript" => Some(("typescript-language-server", vec!["--stdio"])),
         _ => None,
     }
 }
@@ -139,12 +137,7 @@ pub fn server_for(lang: &str) -> Option<Arc<LspServer>> {
 impl LspServer {
     /// Spawn + initialize. Synchronous by design: called from spawn_blocking
     /// (edit tools run it inline; the write is local and fast).
-    pub fn spawn(
-        lang: &'static str,
-        bin: &str,
-        args: &[&str],
-        root: &Path,
-    ) -> Option<LspServer> {
+    pub fn spawn(lang: &'static str, bin: &str, args: &[&str], root: &Path) -> Option<LspServer> {
         let mut child = std::process::Command::new(bin)
             .args(args)
             .current_dir(root)
@@ -167,7 +160,7 @@ impl LspServer {
         // Reader task: owns stdout, fills the diagnostics table, answers
         // nothing (server->client requests are ignored).
         std::thread::spawn(move || reader_loop(stdout, diagnostics));
-        server.initialize(root).then(|| server)
+        server.initialize(root).then_some(server)
     }
 
     fn initialize(&self, root: &Path) -> bool {
@@ -194,12 +187,7 @@ impl LspServer {
 
     /// Send a request and wait (bounded) for its response. Only
     /// `initialize` uses this; other calls are notifications.
-    fn request_raw(
-        &self,
-        id: u64,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Option<()> {
+    fn request_raw(&self, id: u64, method: &str, params: serde_json::Value) -> Option<()> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -306,10 +294,7 @@ pub fn wait_diagnostics(ms: u64, uri_contains: &str) -> Vec<Diag> {
 }
 
 /// Reader: parse framed messages; store publishDiagnostics payloads.
-fn reader_loop(
-    stdout: std::process::ChildStdout,
-    table: Arc<Mutex<HashMap<String, Vec<Diag>>>>,
-) {
+fn reader_loop(stdout: std::process::ChildStdout, table: Arc<Mutex<HashMap<String, Vec<Diag>>>>) {
     let mut reader = std::io::BufReader::new(stdout);
     loop {
         // Header lines until an empty line.
@@ -337,9 +322,11 @@ fn reader_loop(
         let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&body) else {
             continue;
         };
-        if msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
-        {
-            let params = msg.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        if msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
+            let params = msg
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let uri = params
                 .get("uri")
                 .and_then(|u| u.as_str())
@@ -355,14 +342,9 @@ fn reader_loop(
                         .filter_map(|item| {
                             Some(Diag {
                                 file: file.clone(),
-                                line: item
-                                    .pointer("/range/start/line")?
-                                    .as_u64()? as u32
-                                    + 1,
-                                severity: item
-                                    .get("severity")
-                                    .and_then(|s| s.as_u64())
-                                    .unwrap_or(4) as u8,
+                                line: item.pointer("/range/start/line")?.as_u64()? as u32 + 1,
+                                severity: item.get("severity").and_then(|s| s.as_u64()).unwrap_or(4)
+                                    as u8,
                                 message: item
                                     .get("message")?
                                     .as_str()?
@@ -449,7 +431,10 @@ while True:
         server.did_write(&target, "fn broken() {}\n");
         // Poll this server directly (wait_diagnostics reads the process
         // registry, which the test bypasses by spawning directly).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Generous bound: under parallel test load the fake server's
+        // spawn + publish can exceed a tight window; this is a correctness
+        // test, not a latency one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let diags = loop {
             let d = server.all_diagnostics();
             if !d.is_empty() || std::time::Instant::now() >= deadline {
@@ -488,12 +473,7 @@ mod live_tests {
         // edit/write tools always persist before did_write, so the test
         // must too.
         std::fs::write(&lib, "pub fn broken() -> u32 { \"not a number\" }\n").unwrap();
-        let server = match LspServer::spawn(
-            "rust",
-            "rust-analyzer",
-            &[],
-            dir.path(),
-        ) {
+        let server = match LspServer::spawn("rust", "rust-analyzer", &[], dir.path()) {
             Some(s) => Arc::new(s),
             None => {
                 eprintln!("rust-analyzer not available — skipping");
@@ -510,7 +490,10 @@ mod live_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         };
-        let ours: Vec<&Diag> = diags.iter().filter(|d| d.file.ends_with("lib.rs")).collect();
+        let ours: Vec<&Diag> = diags
+            .iter()
+            .filter(|d| d.file.ends_with("lib.rs"))
+            .collect();
         assert!(
             ours.iter().any(|d| d.severity_label() == "error"),
             "expected a live error diagnostic, got {ours:#?}"

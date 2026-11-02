@@ -150,9 +150,11 @@ mod tests {
 
     #[test]
     fn invalid_hex_falls_back_never_breaks() {
-        let mut t = Theme::default();
-        t.accent = "not-a-color".into();
-        t.dim = "#123".into(); // wrong length
+        let t = Theme {
+            accent: "not-a-color".into(),
+            dim: "#123".into(), // wrong length
+            ..Theme::default()
+        };
         let r = t.resolved();
         assert_eq!(r.accent, Color::Rgb(255, 159, 10), "bad accent → default");
         assert_eq!(r.dim, Color::Rgb(88, 88, 88), "bad dim → default");

@@ -334,7 +334,10 @@ mod tests {
         assert_eq!(crumbs.len(), 1);
         assert!(crumbs[0].text.contains("gateway"));
         assert!(crumbs[0].tags.contains(&"tests".to_string()));
-        assert!(crumbs[0].tags.contains(&"dead end".to_string()), "title becomes a tag");
+        assert!(
+            crumbs[0].tags.contains(&"dead end".to_string()),
+            "title becomes a tag"
+        );
         // And it is searchable.
         assert!(!store.search_breadcrumbs("gateway", 3).is_empty());
     }

@@ -81,10 +81,7 @@ impl Tool for ToolSearchTool {
         for tool in engine.tools.specs() {
             let on_demand = engine.tools.is_on_demand(&tool.name);
             let hay = format!("{} {}", tool.name, tool.description).to_lowercase();
-            let score = tokens
-                .iter()
-                .filter(|t| hay.contains(t.as_str()))
-                .count() as u32;
+            let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count() as u32;
             if score == 0 {
                 continue;
             }
@@ -101,7 +98,11 @@ impl Tool for ToolSearchTool {
                     tool.name,
                     if on_demand { " (on-demand)" } else { "" },
                     first_line(&tool.description),
-                    if params.is_empty() { "none".to_string() } else { params.join(", ") },
+                    if params.is_empty() {
+                        "none".to_string()
+                    } else {
+                        params.join(", ")
+                    },
                 ),
             ));
         }
@@ -115,7 +116,7 @@ impl Tool for ToolSearchTool {
                 REDUCE_CAP,
             )));
         }
-        lines.sort_by(|a, b| b.0.cmp(&a.0));
+        lines.sort_by_key(|a| std::cmp::Reverse(a.0));
         let rendered = lines
             .into_iter()
             .take(limit)
@@ -127,12 +128,7 @@ impl Tool for ToolSearchTool {
 }
 
 fn first_line(description: &str) -> String {
-    description
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    description.lines().next().unwrap_or("").trim().to_string()
 }
 
 #[cfg(test)]
@@ -161,12 +157,8 @@ mod tests {
         registry.mark_on_demand("mcp__github__create_issue");
         registry.mark_on_demand("mcp__slack__post");
 
-        let mut providers: HashMap<String, Arc<dyn modron_core::ModelProvider>> =
-            HashMap::new();
-        providers.insert(
-            "mock".into(),
-            Arc::new(MockProvider::new()),
-        );
+        let mut providers: HashMap<String, Arc<dyn modron_core::ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::new(MockProvider::new()));
         let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::default());
         Engine {
             selector: Arc::new(StaticSelector::new("mock-model", "mock")),
@@ -191,11 +183,7 @@ mod tests {
                 parameters: json!({"type": "object", "properties": {"repo": {"type": "string"}}}),
             }
         }
-        async fn execute(
-            &self,
-            _args: Value,
-            _ctx: &ToolCtx,
-        ) -> Result<ToolOutcome> {
+        async fn execute(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
             Ok(ToolOutcome::ok("unused"))
         }
     }
@@ -214,7 +202,9 @@ mod tests {
         let engine = engine_with_tools();
         // The prompt must NOT carry the on-demand tools…
         let prompt_specs = engine.tools.specs_prompt();
-        assert!(prompt_specs.iter().all(|s| s.name != "mcp__github__create_issue"));
+        assert!(prompt_specs
+            .iter()
+            .all(|s| s.name != "mcp__github__create_issue"));
         assert!(prompt_specs.iter().all(|s| s.name != "mcp__slack__post"));
         // …but they stay callable…
         assert!(engine.tools.get("mcp__github__create_issue").is_some());
@@ -222,7 +212,8 @@ mod tests {
         let out = run(json!({"query": "github issue"}), &engine).await;
         assert!(!out.is_error, "{out:?}");
         assert!(
-            out.content.contains("mcp__github__create_issue (on-demand)"),
+            out.content
+                .contains("mcp__github__create_issue (on-demand)"),
             "{out:?}"
         );
         assert!(out.content.contains("params: repo"), "{out:?}");
@@ -240,6 +231,9 @@ mod tests {
     async fn no_match_is_clean() {
         let engine = engine_with_tools();
         let out = run(json!({"query": "zzz"}), &engine).await;
-        assert!(!out.is_error && out.content.contains("no tools matched"), "{out:?}");
+        assert!(
+            !out.is_error && out.content.contains("no tools matched"),
+            "{out:?}"
+        );
     }
 }

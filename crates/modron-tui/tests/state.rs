@@ -376,10 +376,7 @@ fn shift_enter_and_alt_enter_insert_newlines_not_submit() {
             app.on_key(key(crossterm::event::KeyCode::Char(c)));
         }
         assert_eq!(
-            app.on_key(with_modifiers(
-                crossterm::event::KeyCode::Enter,
-                mods
-            )),
+            app.on_key(with_modifiers(crossterm::event::KeyCode::Enter, mods)),
             Action::None,
             "{name}+enter must not submit"
         );
@@ -445,14 +442,26 @@ fn multi_line_task_echoes_as_indented_block() {
 
 #[test]
 fn new_slash_commands_parse_with_aliases() {
-    assert_eq!(SlashCommand::parse("/compress"), Some(SlashCommand::Compact));
-    assert_eq!(SlashCommand::parse("/review"), Some(SlashCommand::CodeReview));
+    assert_eq!(
+        SlashCommand::parse("/compress"),
+        Some(SlashCommand::Compact)
+    );
+    assert_eq!(
+        SlashCommand::parse("/review"),
+        Some(SlashCommand::CodeReview)
+    );
     assert_eq!(
         SlashCommand::parse("/code-review"),
         Some(SlashCommand::CodeReview)
     );
-    assert_eq!(SlashCommand::parse("/reasoning"), Some(SlashCommand::Reasoning));
-    assert_eq!(SlashCommand::parse("/thinking"), Some(SlashCommand::Reasoning));
+    assert_eq!(
+        SlashCommand::parse("/reasoning"),
+        Some(SlashCommand::Reasoning)
+    );
+    assert_eq!(
+        SlashCommand::parse("/thinking"),
+        Some(SlashCommand::Reasoning)
+    );
     assert_eq!(
         SlashCommand::parse("/btw what is this?"),
         Some(SlashCommand::Btw("what is this?".into()))
@@ -471,12 +480,12 @@ fn new_slash_commands_parse_with_aliases() {
 fn reasoning_toggles_and_btw_submits_no_tools_rider() {
     let mut app = App::default();
     assert!(!app.show_reasoning);
-    assert_eq!(app.on_key(key(crossterm::event::KeyCode::Enter)), Action::None);
-    // /reasoning via direct handler
     assert_eq!(
-        app.handle_slash_test(SlashCommand::Reasoning),
+        app.on_key(key(crossterm::event::KeyCode::Enter)),
         Action::None
     );
+    // /reasoning via direct handler
+    assert_eq!(app.handle_slash_test(SlashCommand::Reasoning), Action::None);
     assert!(app.show_reasoning);
 
     let mut app = App::default();
@@ -513,7 +522,10 @@ fn goal_sets_clears_and_rides_along_on_tasks() {
     assert!(ridden.contains("GOAL COMPLETE"), "{ridden}");
     // begin_task echoes the goal line.
     app.begin_task(&ridden);
-    assert!(app.tool_lines.iter().any(|l| l.contains("[goal: all tests green]")));
+    assert!(app
+        .tool_lines
+        .iter()
+        .any(|l| l.contains("[goal: all tests green]")));
     // Bare /goal clears.
     app.handle_slash_test(SlashCommand::Goal(String::new()));
     assert!(app.goal.is_none());
@@ -525,7 +537,10 @@ fn learn_submits_a_skill_distillation_task() {
     let mut app = App::default();
     match app.handle_slash_test(SlashCommand::Learn("deploy flow".into())) {
         Action::Submit(task) => {
-            assert!(task.contains(".modron/skills/deploy-flow/SKILL.md"), "{task}");
+            assert!(
+                task.contains(".modron/skills/deploy-flow/SKILL.md"),
+                "{task}"
+            );
             assert!(task.contains("description:"), "{task}");
         }
         other => panic!("learn must submit: {other:?}"),
@@ -536,10 +551,22 @@ fn learn_submits_a_skill_distillation_task() {
 fn engine_powered_commands_park_as_pending() {
     let mut app = App::default();
     for (cmd, pending) in [
-        (SlashCommand::Agent("reviewer".into()), PendingCommand::Agent("reviewer".into())),
-        (SlashCommand::Allow("bash".into()), PendingCommand::Allow("bash".into())),
-        (SlashCommand::Deny("write".into()), PendingCommand::Deny("write".into())),
-        (SlashCommand::Mode("yolo".into()), PendingCommand::Mode("yolo".into())),
+        (
+            SlashCommand::Agent("reviewer".into()),
+            PendingCommand::Agent("reviewer".into()),
+        ),
+        (
+            SlashCommand::Allow("bash".into()),
+            PendingCommand::Allow("bash".into()),
+        ),
+        (
+            SlashCommand::Deny("write".into()),
+            PendingCommand::Deny("write".into()),
+        ),
+        (
+            SlashCommand::Mode("yolo".into()),
+            PendingCommand::Mode("yolo".into()),
+        ),
         (SlashCommand::Tasks, PendingCommand::Tasks),
         (SlashCommand::Worktree, PendingCommand::Worktree),
         (
@@ -550,7 +577,10 @@ fn engine_powered_commands_park_as_pending() {
     ] {
         app.pending_command = None;
         assert_eq!(app.handle_slash_test(cmd), Action::None);
-        assert_eq!(app.pending_command.as_ref(), Some(&pending) as Option<&PendingCommand>);
+        assert_eq!(
+            app.pending_command.as_ref(),
+            Some(&pending) as Option<&PendingCommand>
+        );
     }
 }
 
@@ -575,7 +605,9 @@ fn theme_slash_lists_and_switches() {
     assert_eq!(app.theme.name, "modron");
     app.handle_slash_test(SlashCommand::Theme(String::new()));
     assert!(
-        app.tool_lines.iter().any(|l| l.contains("midnight") && l.contains("mono")),
+        app.tool_lines
+            .iter()
+            .any(|l| l.contains("midnight") && l.contains("mono")),
         "{:?}",
         app.tool_lines
     );

@@ -140,11 +140,7 @@ mod tests {
         assert!(!out.goal_met);
         assert_eq!(out.iterations, 3);
         // One stable session across iterations.
-        let events = engine
-            .store
-            .load(out.summary.session_id)
-            .await
-            .unwrap();
+        let events = engine.store.load(out.summary.session_id).await.unwrap();
         let tasks = events
             .iter()
             .filter(|e| matches!(e, crate::SessionEvent::Task { .. }))

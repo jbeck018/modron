@@ -109,25 +109,17 @@ pub async fn run_with(
     // terminal report modifiers on Enter, making shift+enter a real newline
     // instead of a submit. The query returns quickly on any terminal that
     // answers device attributes; unsupported ones ignore the push entirely.
-    let kitty_keyboard = crossterm::terminal::supports_keyboard_enhancement()
-        .unwrap_or(false);
+    let kitty_keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
     // Bracketed paste (ctrl+V in most terminals delivers a paste event):
     // multi-line pastes enter the input instead of submitting.
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableBracketedPaste
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     if kitty_keyboard {
-        use crossterm::event::{
-            KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-        };
+        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
         let _ = crossterm::execute!(
             stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            )
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
     // NO alternate screen: the normal buffer keeps native scrollback and
@@ -155,9 +147,7 @@ pub async fn run_with(
                 crossterm::terminal::size()
                     .map(|(_, r)| r)
                     .unwrap_or(24)
-                    .saturating_sub(1)
-                    .min(VIEWPORT_HEIGHT)
-                    .max(3),
+                    .clamp(4, VIEWPORT_HEIGHT + 1),
             ),
         },
     )?;
@@ -259,8 +249,9 @@ pub async fn run_with(
                     app.input.push_str(&text);
                     continue;
                 }
-                crossterm::event::Event::Key(key) => {
-                if key.kind == crossterm::event::KeyEventKind::Press {
+                crossterm::event::Event::Key(key)
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
                     match app.on_key(key) {
                         crate::Action::None => {}
                         crate::Action::PasteImage => {
@@ -274,11 +265,15 @@ pub async fn run_with(
                             {
                                 crate::clipboard::ClipboardContent::Image(path) => {
                                     match app.attach_image(&path) {
-                                        Some(chip) => app.status_note = Some(format!(
-                                            "attached {chip} (goes with your next message)"
-                                        )),
-                                        None => app.status_note =
-                                            Some("clipboard image unreadable".into()),
+                                        Some(chip) => {
+                                            app.status_note = Some(format!(
+                                                "attached {chip} (goes with your next message)"
+                                            ))
+                                        }
+                                        None => {
+                                            app.status_note =
+                                                Some("clipboard image unreadable".into())
+                                        }
                                     }
                                 }
                                 crate::clipboard::ClipboardContent::Text(text) => {
@@ -286,8 +281,7 @@ pub async fn run_with(
                                     app.input.push_str(&text);
                                 }
                                 crate::clipboard::ClipboardContent::Empty => {
-                                    app.status_note =
-                                        Some("clipboard empty".into());
+                                    app.status_note = Some("clipboard empty".into());
                                 }
                             }
                             let _ = started; // bounded by the harvest timeout itself
@@ -304,14 +298,14 @@ pub async fn run_with(
                                     Some(id) => {
                                         engine
                                             .run_task_resuming_with_attachments(
-                                                id, &task, attachments,
+                                                id,
+                                                &task,
+                                                attachments,
                                             )
                                             .await
                                     }
                                     None => {
-                                        engine
-                                            .run_task_with_attachments(&task, attachments)
-                                            .await
+                                        engine.run_task_with_attachments(&task, attachments).await
                                     }
                                 };
                                 match outcome {
@@ -342,7 +336,6 @@ pub async fn run_with(
                             break;
                         }
                     }
-                }
                 }
                 _ => {}
             }
@@ -412,10 +405,10 @@ pub async fn run_with(
                 }
                 Outcome::Failed(e) => {
                     let mut lines = app.finish_interrupted();
-                    lines.push(
-                        ratatui::text::Line::from(format!("error: {e}"))
-                            .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
-                    );
+                    lines
+                        .push(ratatui::text::Line::from(format!("error: {e}")).style(
+                            ratatui::style::Style::default().fg(ratatui::style::Color::Red),
+                        ));
                     blank_frame(&mut terminal)?;
                     commit_block(&mut terminal, &lines)?;
                 }
@@ -442,10 +435,7 @@ pub async fn run_with(
             crossterm::event::PopKeyboardEnhancementFlags
         );
     }
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableBracketedPaste
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     crossterm::terminal::disable_raw_mode()?;
     if let Some(id) = app.session_id {
         println!("session: {id} — resume with --resume {id}");
@@ -467,11 +457,12 @@ async fn run_pending_command(
             if name.is_empty() {
                 let personas: Vec<String> = engine.config.personas.keys().cloned().collect();
                 if personas.is_empty() {
-                    vec![
-                        "no personas configured — define [agents.<name>] in config.toml".into(),
-                    ]
+                    vec!["no personas configured — define [agents.<name>] in config.toml".into()]
                 } else {
-                    vec![format!("personas: {} (switch: /agent <name>)", personas.join(", "))]
+                    vec![format!(
+                        "personas: {} (switch: /agent <name>)",
+                        personas.join(", ")
+                    )]
                 }
             } else if let Some(persona) = engine.config.personas.get(&name).cloned() {
                 if let Some(system) = persona.system.clone() {
@@ -485,11 +476,19 @@ async fn run_pending_command(
                 }
                 engine.config.approvals.allow.extend(persona.allow.clone());
                 engine.config.approvals.deny.extend(persona.deny.clone());
-                vec![format!("switched to persona `{name}` (model/provider follow if set)")]
+                vec![format!(
+                    "switched to persona `{name}` (model/provider follow if set)"
+                )]
             } else {
                 vec![format!(
                     "unknown persona `{name}` — configured: {}",
-                    engine.config.personas.keys().cloned().collect::<Vec<_>>().join(", ")
+                    engine
+                        .config
+                        .personas
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )]
             }
         }
@@ -555,25 +554,23 @@ async fn run_pending_command(
                         vec![format!("worktrees: {}", names.join(", "))]
                     }
                 }
-                Err(_) => vec![format!("no worktrees yet (created by delegate isolate:true)")],
+                Err(_) => vec!["no worktrees yet (created by delegate isolate:true)".to_string()],
             }
         }
         PendingCommand::Issues(arg) => run_issues(engine, &arg),
-        PendingCommand::Fork => {
-            match app.session_id {
-                Some(id) => match engine.store.fork(id).await {
-                    Ok(new) => {
-                        app.session_id = Some(new);
-                        vec![format!(
-                            "forked: new branch {new} (active now; the original is untouched — \
+        PendingCommand::Fork => match app.session_id {
+            Some(id) => match engine.store.fork(id).await {
+                Ok(new) => {
+                    app.session_id = Some(new);
+                    vec![format!(
+                        "forked: new branch {new} (active now; the original is untouched — \
                              resume it with --resume {id})"
-                        )]
-                    }
-                    Err(e) => vec![format!("fork failed: {e}")],
-                },
-                None => vec!["no session yet — send a task first, then /fork".into()],
-            }
-        }
+                    )]
+                }
+                Err(e) => vec![format!("fork failed: {e}")],
+            },
+            None => vec!["no session yet — send a task first, then /fork".into()],
+        },
     }
 }
 
@@ -583,13 +580,11 @@ fn run_issues(engine: &Engine, arg: &str) -> Vec<String> {
     let Some(root) = engine.config.memory_root.clone() else {
         return vec!["memory not configured — issues live with memory".into()];
     };
-    let store = match modron_core::memory::MemoryStore::for_workspace(
-        &root,
-        &engine.config.working_dir,
-    ) {
-        Ok(store) => store,
-        Err(e) => return vec![format!("cannot open memory store: {e}")],
-    };
+    let store =
+        match modron_core::memory::MemoryStore::for_workspace(&root, &engine.config.working_dir) {
+            Ok(store) => store,
+            Err(e) => return vec![format!("cannot open memory store: {e}")],
+        };
     let path = store.root().join("issues.jsonl");
     let mut issues: Vec<(bool, String)> = std::fs::read_to_string(&path)
         .unwrap_or_default()
@@ -607,9 +602,7 @@ fn run_issues(engine: &Engine, arg: &str) -> Vec<String> {
             issues.push((true, text.trim().to_string()));
             let body: String = issues
                 .iter()
-                .map(|(open, t)| {
-                    format!("{}\u{1f}{t}\n", if *open { 1 } else { 0 })
-                })
+                .map(|(open, t)| format!("{}\u{1f}{t}\n", if *open { 1 } else { 0 }))
                 .collect();
             let _ = std::fs::create_dir_all(store.root());
             if let Err(e) = std::fs::write(&path, body) {
@@ -624,9 +617,7 @@ fn run_issues(engine: &Engine, arg: &str) -> Vec<String> {
                 issues[i - 1].0 = false;
                 let body: String = issues
                     .iter()
-                    .map(|(open, t)| {
-                        format!("{}\u{1f}{t}\n", if *open { 1 } else { 0 })
-                    })
+                    .map(|(open, t)| format!("{}\u{1f}{t}\n", if *open { 1 } else { 0 }))
                     .collect();
                 let _ = std::fs::create_dir_all(store.root());
                 if let Err(e) = std::fs::write(&path, body) {

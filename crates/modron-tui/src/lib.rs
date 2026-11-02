@@ -11,11 +11,11 @@
 //! This module is the pure state machine (`App`) — no TTY required to test.
 //! The terminal loop lives in [`run`].
 
-pub mod run;
 pub mod clipboard;
+pub mod run;
 pub mod theme;
-pub use theme::Theme;
 pub use run::{run_with, TuiConfig, TuiSinks};
+pub use theme::Theme;
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
 use ratatui::style::{Color, Modifier, Style};
@@ -338,12 +338,9 @@ impl App {
 
         match key.code {
             KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(
-                        crossterm::event::KeyModifiers::SHIFT
-                            | crossterm::event::KeyModifiers::ALT,
-                    ) =>
+                if key.modifiers.intersects(
+                    crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::ALT,
+                ) =>
             {
                 // Newline, not submit. Shift+enter only reaches us with the
                 // SHIFT modifier on terminals that speak the kitty keyboard
@@ -529,7 +526,8 @@ impl App {
             SlashCommand::Goal(condition) => {
                 if condition.trim().is_empty() {
                     self.goal = None;
-                    self.tool_lines.push("goal cleared — tasks run normally again".into());
+                    self.tool_lines
+                        .push("goal cleared — tasks run normally again".into());
                 } else {
                     self.goal = Some(condition.trim().to_string());
                     self.push_lines(format!(
@@ -542,7 +540,11 @@ impl App {
                 Action::None
             }
             SlashCommand::Learn(title) => {
-                let slug = slugish(if title.is_empty() { "session-skill" } else { &title });
+                let slug = slugish(if title.is_empty() {
+                    "session-skill"
+                } else {
+                    &title
+                });
                 Action::Submit(format!(
                     "Distill this session into a reusable skill. Write the file \
                      .modron/skills/{slug}/SKILL.md with `---` frontmatter (name: {slug}, \
@@ -785,8 +787,7 @@ impl App {
             self.tool_lines.push(format!("  {line}"));
         }
         if let Some(goal) = self.goal.clone() {
-            self.tool_lines
-                .push(format!("  [goal: {goal}]"));
+            self.tool_lines.push(format!("  [goal: {goal}]"));
         }
     }
 
@@ -926,7 +927,8 @@ impl App {
         if !self.reasoning.is_empty() {
             let tail = streaming_tail(&self.reasoning, 2, chunks[0].width as usize);
             frame.render_widget(
-                Paragraph::new(tail).style(Style::default().fg(th.dim).add_modifier(Modifier::ITALIC)),
+                Paragraph::new(tail)
+                    .style(Style::default().fg(th.dim).add_modifier(Modifier::ITALIC)),
                 chunks[0],
             );
             idx += 1;
@@ -985,11 +987,8 @@ impl App {
             let hint = "y = allow once · a = allow for this run · n/Esc = deny";
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(self.status_line()).style(
-                        Style::default()
-                            .add_modifier(Modifier::BOLD)
-                            .fg(th.warning),
-                    ),
+                    Line::from(self.status_line())
+                        .style(Style::default().add_modifier(Modifier::BOLD).fg(th.warning)),
                     Line::from(hint).style(Style::default().fg(th.dim)),
                 ]),
                 chunks[idx],
@@ -1073,8 +1072,9 @@ impl App {
                     .buffer_mut()
                     .cell_mut(ratatui::layout::Position::new(cursor_x, cursor_y))
                 {
-        let th = self.theme.resolved();
-                    cell.set_symbol("▎").set_style(Style::default().fg(th.accent));
+                    let th = self.theme.resolved();
+                    cell.set_symbol("▎")
+                        .set_style(Style::default().fg(th.accent));
                 }
             }
         }

@@ -380,7 +380,9 @@ fn init_tracing(verbose: bool, tui: bool) {
                 .with_ansi(false)
                 .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
                 .init();
-            tracing::info!("modron TUI session — logs routed to file (stderr corrupts the viewport)");
+            tracing::info!(
+                "modron TUI session — logs routed to file (stderr corrupts the viewport)"
+            );
             return;
         }
         // Log file unopenable: protect the TUI — cap stderr at warn.
@@ -824,13 +826,10 @@ impl AgentSinks {
     }
 }
 
-/// Assemble provider + tools + store + config from flags/config (Phase-1c
-/// I3 refactor): one construction path for the one-shot run and chat mode.
-/// - `interactive`: attach the /dev/tty approver when a terminal is present,
-///   so Ask mode prompts instead of blocking.
-/// - `stream`: attach the stdout delta sink (chat mode streams answers live).
-/// First provider (besides `unavailable`) whose key is set — the no-key
-/// startup fallback scans common providers in rough preference order.
+/// First provider (besides `unavailable`) whose key is set.
+///
+/// The no-key startup fallback scans common providers in rough preference
+/// order.
 pub(crate) fn detect_available_provider(unavailable: &str) -> Option<String> {
     let candidates = [
         ("zai", "ZAI_API_KEY"),
@@ -846,8 +845,7 @@ pub(crate) fn detect_available_provider(unavailable: &str) -> Option<String> {
     candidates
         .iter()
         .find(|(pid, env)| {
-            *pid != unavailable
-                && std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false)
+            *pid != unavailable && std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false)
         })
         .map(|(pid, _)| pid.to_string())
 }
@@ -880,6 +878,11 @@ fn tui_model_label(cli: &Cli, cfg: &config::Config) -> String {
         })
 }
 
+/// Assemble provider + tools + store + config from flags/config (Phase-1c
+/// I3 refactor): one construction path for the one-shot run and chat mode.
+/// - `interactive`: attach the /dev/tty approver when a terminal is present,
+///   so Ask mode prompts instead of blocking.
+/// - `stream`: attach the stdout delta sink (chat mode streams answers live).
 fn build_agent_with(
     cli: &Cli,
     cfg: &config::Config,
@@ -2257,7 +2260,10 @@ fn run_memory(action: MemoryAction, sessions_dir: &Path, working_dir: &Path) -> 
             let stats = store.stats();
             let facts = store.facts_oldest_first();
             if facts.is_empty() && stats.is_empty() {
-                println!("no memory for this workspace yet ({})", store.root().display());
+                println!(
+                    "no memory for this workspace yet ({})",
+                    store.root().display()
+                );
                 return Ok(());
             }
             println!("usefulness ledger ({} facts):", facts.len());
@@ -2274,7 +2280,10 @@ fn run_memory(action: MemoryAction, sessions_dir: &Path, working_dir: &Path) -> 
                 );
             }
             let crumbs = store.breadcrumbs();
-            println!("breadcrumbs: {} (never injected; TTL-pruned by curate)", crumbs.len());
+            println!(
+                "breadcrumbs: {} (never injected; TTL-pruned by curate)",
+                crumbs.len()
+            );
         }
         MemoryAction::Curate => {
             let report = store
@@ -2282,7 +2291,9 @@ fn run_memory(action: MemoryAction, sessions_dir: &Path, working_dir: &Path) -> 
                 .map_err(|e| anyhow::anyhow!("curate failed: {e}"))?;
             println!(
                 "curated: {} facts ({} relegated, {} reinstated), {} breadcrumbs pruned",
-                report.facts_total, report.facts_relegated, report.facts_reinstated,
+                report.facts_total,
+                report.facts_relegated,
+                report.facts_reinstated,
                 report.breadcrumbs_pruned
             );
             // The global tier gets the same treatment.
@@ -2293,8 +2304,7 @@ fn run_memory(action: MemoryAction, sessions_dir: &Path, working_dir: &Path) -> 
                         .map_err(|e| anyhow::anyhow!("global curate failed: {e}"))?;
                     println!(
                         "global: {} facts ({} relegated, {} reinstated), {} breadcrumbs pruned",
-                        g.facts_total, g.facts_relegated, g.facts_reinstated,
-                        g.breadcrumbs_pruned
+                        g.facts_total, g.facts_relegated, g.facts_reinstated, g.breadcrumbs_pruned
                     );
                 }
             }

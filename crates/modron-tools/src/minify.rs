@@ -109,9 +109,11 @@ fn scanner_skeleton(content: &str, path: &str) -> String {
 /// Python/shell-style paths: `#` starts a comment.
 fn is_hash_comment_language(path: &str) -> bool {
     let lower = path.to_lowercase();
-    [".py", ".sh", ".bash", ".zsh", ".yaml", ".yml", ".toml", ".rb"]
-        .iter()
-        .any(|ext| lower.ends_with(ext))
+    [
+        ".py", ".sh", ".bash", ".zsh", ".yaml", ".yml", ".toml", ".rb",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
 }
 
 /// Brace-language skeleton: track depth outside string literals; when a line
@@ -194,12 +196,10 @@ fn minify_indented(content: &str) -> String {
                 skipped += 1;
                 continue;
             }
-            Some(_) => {
-                if skipped > 0 {
-                    out.push_str(&format!("… [+{skipped} lines elided]\n"));
-                    skipped = 0;
-                }
+            Some(_) if skipped > 0 => {
+                out.push_str(&format!("… [+{skipped} lines elided]\n"));
             }
+            Some(_) => {}
             None => {}
         }
         header_indent = if trimmed.ends_with(':') {
@@ -319,10 +319,10 @@ const CONTAINER_KINDS: &[&str] = &[
     "impl_item",
     "trait_item",
     "mod_item",
-    "declaration_list",   // rust bodies we land in only via containers
-    "module",             // python
-    "class_body",         // js
-    "program",            // js
+    "declaration_list", // rust bodies we land in only via containers
+    "module",           // python
+    "class_body",       // js
+    "program",          // js
     "declaration_list_go",
 ];
 
@@ -393,10 +393,7 @@ mod tests {
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.to_path_buf(),
         };
-        ReadMinifiedTool
-            .execute(args, &ctx)
-            .await
-            .expect("execute")
+        ReadMinifiedTool.execute(args, &ctx).await.expect("execute")
     }
 
     #[tokio::test]
@@ -458,7 +455,10 @@ mod tests {
         let c = &out.content;
         assert!(c.contains("[L1] fn fmt() {"), "{c}");
         assert!(c.contains("[L5] fn next() {"), "{c}");
-        assert!(!c.contains("}}}"), "string content elided with the body: {c}");
+        assert!(
+            !c.contains("}}}"),
+            "string content elided with the body: {c}"
+        );
     }
 
     #[tokio::test]
@@ -471,8 +471,14 @@ mod tests {
         .unwrap();
         let out = run(json!({"path": "main.go"}), dir.path()).await;
         let c = &out.content;
-        assert!(c.contains("[L1] package main;") || c.contains("package main"), "{c}");
-        assert!(c.contains("[L5] func main() {") || c.contains("func main()"), "{c}");
+        assert!(
+            c.contains("[L1] package main;") || c.contains("package main"),
+            "{c}"
+        );
+        assert!(
+            c.contains("[L5] func main() {") || c.contains("func main()"),
+            "{c}"
+        );
         assert!(c.contains("helper"), "{c}");
         assert!(!c.contains("Println"), "body elided: {c}");
     }

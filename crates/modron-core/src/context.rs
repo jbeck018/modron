@@ -363,10 +363,7 @@ mod tests {
         // Fill to the cap: ~3.5KB bodies total.
         for i in 0..5 {
             store
-                .append(
-                    &format!("big {i}"),
-                    &format!("{} ", "x".repeat(900)),
-                )
+                .append(&format!("big {i}"), &format!("{} ", "x".repeat(900)))
                 .unwrap();
         }
         let memory = load_user_memory(root.path(), work.path());
@@ -419,11 +416,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let global = MemoryStore::for_global(root.path()).unwrap();
         for i in 0..3 {
-            global.append(&format!("pref {i}"), &"é".repeat(1200)).unwrap();
+            global
+                .append(&format!("pref {i}"), &"é".repeat(1200))
+                .unwrap();
         }
         let memory = load_global_memory(root.path());
-        assert!(memory.len() <= MAX_GLOBAL_MEMORY_BYTES, "{} bytes", memory.len());
-        assert!(memory.is_char_boundary(memory.len()), "no split code points");
+        assert!(
+            memory.len() <= MAX_GLOBAL_MEMORY_BYTES,
+            "{} bytes",
+            memory.len()
+        );
+        assert!(
+            memory.is_char_boundary(memory.len()),
+            "no split code points"
+        );
     }
 
     #[test]

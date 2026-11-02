@@ -433,9 +433,7 @@ impl Engine {
                     .and_then(|m| m.get("memory_hits"))
                     .and_then(|v| v.as_array())
                 {
-                    memory_hits.extend(
-                        ids.iter().filter_map(|i| i.as_str().map(String::from)),
-                    );
+                    memory_hits.extend(ids.iter().filter_map(|i| i.as_str().map(String::from)));
                 }
                 // Delegated spend (Phase 5c A2): usage spent behind a tool's
                 // interface joins the governor and the run totals — honest

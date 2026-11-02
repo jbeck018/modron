@@ -24,11 +24,11 @@ mod delegate;
 mod diagnostics;
 mod edit;
 mod explore;
+mod glob;
+mod grep;
+mod lsp;
 mod memory_search;
 mod minify;
-mod glob;
-mod lsp;
-mod grep;
 mod read;
 pub mod reduce;
 mod remember;
@@ -107,7 +107,19 @@ mod tests {
         let names: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
-            vec!["bash", "diagnostics", "edit", "glob", "grep", "memory_search", "read", "read_minified", "remember", "tool_search", "write"],
+            vec![
+                "bash",
+                "diagnostics",
+                "edit",
+                "glob",
+                "grep",
+                "memory_search",
+                "read",
+                "read_minified",
+                "remember",
+                "tool_search",
+                "write"
+            ],
             "sorted spec names"
         );
     }

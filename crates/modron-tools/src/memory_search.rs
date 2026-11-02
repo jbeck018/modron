@@ -80,7 +80,7 @@ impl Tool for MemorySearchTool {
             return Ok(tool_err(NAME, "`query` must not be empty", REDUCE_CAP));
         }
 
-        let tokens = tokenize(&query);
+        let tokens = tokenize(query);
         if tokens.is_empty() {
             return Ok(ToolOutcome::ok(reduce_output(
                 "no usable keywords in query",
@@ -88,13 +88,16 @@ impl Tool for MemorySearchTool {
             )));
         }
 
-        let project =
-            match MemoryStore::for_workspace(&self.memory_root, &ctx.working_dir) {
-                Ok(store) => store,
-                Err(err) => {
-                    return Ok(tool_err(NAME, format!("cannot open memory: {err}"), REDUCE_CAP))
-                }
-            };
+        let project = match MemoryStore::for_workspace(&self.memory_root, &ctx.working_dir) {
+            Ok(store) => store,
+            Err(err) => {
+                return Ok(tool_err(
+                    NAME,
+                    format!("cannot open memory: {err}"),
+                    REDUCE_CAP,
+                ))
+            }
+        };
         let global = MemoryStore::for_global(&self.memory_root).ok();
 
         let mut project_hits: Vec<String> = Vec::new();
@@ -103,13 +106,9 @@ impl Tool for MemorySearchTool {
 
         // Project facts (hot tier).
         for (id, label, target) in project.facts_oldest_first() {
-            let body = std::fs::read_to_string(project.root().join(&target))
-                .unwrap_or_default();
+            let body = std::fs::read_to_string(project.root().join(&target)).unwrap_or_default();
             let hay = format!("{label} {body}").to_lowercase();
-            let score = tokens
-                .iter()
-                .filter(|t| hay.contains(t.as_str()))
-                .count() as u32;
+            let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count() as u32;
             if score > 0 {
                 lines.push((
                     score,
@@ -121,13 +120,9 @@ impl Tool for MemorySearchTool {
         // Global preferences.
         if let Some(store) = &global {
             for (id, label, target) in store.facts_oldest_first() {
-                let body = std::fs::read_to_string(store.root().join(&target))
-                    .unwrap_or_default();
+                let body = std::fs::read_to_string(store.root().join(&target)).unwrap_or_default();
                 let hay = format!("{label} {body}").to_lowercase();
-                let score = tokens
-                    .iter()
-                    .filter(|t| hay.contains(t.as_str()))
-                    .count() as u32;
+                let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count() as u32;
                 if score > 0 {
                     lines.push((
                         score,
@@ -138,12 +133,9 @@ impl Tool for MemorySearchTool {
             }
         }
         // Breadcrumbs (trace tier; no ledger — TTL-pruned only).
-        for crumb in project.search_breadcrumbs(&query, limit) {
+        for crumb in project.search_breadcrumbs(query, limit) {
             let hay = format!("{} {}", crumb.text, crumb.tags.join(" ")).to_lowercase();
-            let score = tokens
-                .iter()
-                .filter(|t| hay.contains(t.as_str()))
-                .count() as u32;
+            let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count() as u32;
             lines.push((score, format!("- [trace] {}: {}", crumb.id, crumb.text)));
         }
 
@@ -153,7 +145,7 @@ impl Tool for MemorySearchTool {
                 REDUCE_CAP,
             )));
         }
-        lines.sort_by(|a, b| b.0.cmp(&a.0));
+        lines.sort_by_key(|a| std::cmp::Reverse(a.0));
         let rendered: String = lines
             .into_iter()
             .take(limit)
@@ -228,15 +220,14 @@ mod tests {
         let root = tempdir().unwrap();
         let work = tempdir().unwrap();
         let store = MemoryStore::for_workspace(root.path(), work.path()).unwrap();
-        store.append("rust version", "pinned to 1.99.1 for seatbelt tests").unwrap();
-        store.append("unrelated", "a completely different topic").unwrap();
+        store
+            .append("rust version", "pinned to 1.99.1 for seatbelt tests")
+            .unwrap();
+        store
+            .append("unrelated", "a completely different topic")
+            .unwrap();
 
-        let out = run(
-            json!({"query": "rust version"}),
-            root.path(),
-            work.path(),
-        )
-        .await;
+        let out = run(json!({"query": "rust version"}), root.path(), work.path()).await;
         assert!(!out.is_error, "{out:?}");
         assert!(out.content.contains("[fact]"), "{out:?}");
         assert!(out.content.contains("rust version"), "{out:?}");
@@ -264,7 +255,9 @@ mod tests {
             .append_breadcrumb("fixed flaky test in gateway module", &["tests".into()])
             .unwrap();
         let global = MemoryStore::for_global(root.path()).unwrap();
-        global.append("editor", "user prefers helix, never vim").unwrap();
+        global
+            .append("editor", "user prefers helix, never vim")
+            .unwrap();
 
         let out = run(json!({"query": "gateway flaky"}), root.path(), work.path()).await;
         assert!(out.content.contains("[trace]"), "{out:?}");

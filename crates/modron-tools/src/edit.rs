@@ -140,22 +140,18 @@ impl Tool for EditTool {
         // re-lint; the `diagnostics` tool collects the result.
         let updated_owned = updated.clone();
         let lsp_path = path.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            crate::lsp::did_write(&lsp_path, &updated_owned)
-        })
-        .await;
+        let _ =
+            tokio::task::spawn_blocking(move || crate::lsp::did_write(&lsp_path, &updated_owned))
+                .await;
         // Diff rail (Phase 14, jcode pattern): the change surfaced in the
         // tool result itself, so the next turn (and the human) sees what
         // moved where without a re-read.
-        let rail = diff_rail(
-            &path.display().to_string(),
-            &updated,
-            old,
-            new,
-            replace_all,
-        );
+        let rail = diff_rail(&path.display().to_string(), &updated, old, new, replace_all);
         Ok(ToolOutcome::ok(reduce_output(
-            format!("replaced {replaced} occurrence(s) in {}\n{rail}", path.display()),
+            format!(
+                "replaced {replaced} occurrence(s) in {}\n{rail}",
+                path.display()
+            ),
             MAX_BYTES,
         )))
     }

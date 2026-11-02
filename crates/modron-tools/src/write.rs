@@ -61,7 +61,8 @@ impl Tool for WriteTool {
         }
         // Hard read-before-edit gate (Phase 13): overwriting an existing
         // file the session has not read is blocked; brand-new files are fine.
-        if let (Some(engine), Some(raw_path)) = (&ctx.engine, args.get("path").and_then(|v| v.as_str()))
+        if let (Some(engine), Some(raw_path)) =
+            (&ctx.engine, args.get("path").and_then(|v| v.as_str()))
         {
             let path = resolve_path(&ctx.working_dir, raw_path);
             if path.is_file() && !engine.tools.read_gate.seen(&path) {
