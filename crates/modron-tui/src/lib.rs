@@ -12,6 +12,8 @@
 //! The terminal loop lives in [`run`].
 
 pub mod run;
+pub mod theme;
+pub use theme::Theme;
 pub use run::{run_with, TuiConfig, TuiSinks};
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
@@ -71,6 +73,8 @@ pub enum SlashCommand {
     Goal(String),
     /// Distill the current session into a reusable SKILL.md.
     Learn(String),
+    /// Switch color theme (built-ins + ~/.config/modron/themes/*.json).
+    Theme(String),
     /// Alias kept for muscle memory.
     Compress,
     Unknown(String),
@@ -124,6 +128,7 @@ impl SlashCommand {
             "code-review" | "review" => SlashCommand::CodeReview,
             "goal" => SlashCommand::Goal(arg),
             "learn" => SlashCommand::Learn(arg),
+            "theme" => SlashCommand::Theme(arg),
             "compress" => SlashCommand::Compact,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -205,11 +210,27 @@ pub struct App {
     /// Natural-language stop condition (/goal), attached to subsequent
     /// tasks until cleared with a bare `/goal`.
     pub goal: Option<String>,
+    /// Active color theme (/theme <name> switches live).
+    pub theme: Theme,
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
+/// These are the DEFAULT-THEME values; live rendering goes through
+/// `App.theme` (switchable with /theme).
 pub const ACCENT: Color = Color::Rgb(255, 159, 10);
 pub const DIM: Color = Color::DarkGray;
+
+/// Where user theme JSON files live (MODRON_CONFIG or ~/.config/modron/themes).
+pub fn theme_dir() -> std::path::PathBuf {
+    std::env::var("MODRON_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".config")
+                .join("modron")
+        })
+        .join("themes")
+}
 
 /// Mathematical spinner: rotating phase-space glyphs (quarter-circle phases,
 /// like a phase portrait rotating) — deliberately NOT Claude Code's braille.
@@ -505,6 +526,33 @@ impl App {
                      Create the directories. Then reply with just the path you wrote."
                 ))
             }
+            SlashCommand::Theme(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    let dir = crate::theme_dir();
+                    let names = Theme::available(&dir);
+                    self.push_lines(format!(
+                        "themes: {} (switch: /theme <name>; drop <name>.json in {})",
+                        names.join(", "),
+                        dir.display()
+                    ));
+                } else if Theme::builtin_names().contains(&name) {
+                    self.theme = Theme::builtin(name);
+                    self.tool_lines.push(format!("theme: {name}"));
+                } else {
+                    match Theme::load(&crate::theme_dir(), name) {
+                        Some(theme) => {
+                            self.theme = theme;
+                            self.tool_lines.push(format!("theme: {name}"));
+                        }
+                        None => self.tool_lines.push(format!(
+                            "unknown theme {name:?} — available: {}",
+                            Theme::available(&crate::theme_dir()).join(", ")
+                        )),
+                    }
+                }
+                Action::None
+            }
             SlashCommand::Compress => self.handle_slash(SlashCommand::Compact),
             SlashCommand::Unknown(name) => {
                 self.tool_lines
@@ -595,6 +643,7 @@ impl App {
         _tool_calls: u32,
         session_id: modron_core::SessionId,
     ) -> Vec<Line<'static>> {
+        let t = self.theme.resolved();
         self.running = false;
         self.streaming.clear();
         self.reasoning.clear();
@@ -608,12 +657,12 @@ impl App {
         // Styled scrollback: tool lines dim-cyan, answer default, meta dim.
         let mut lines: Vec<Line<'static>> = Vec::new();
         for tool in std::mem::take(&mut self.tool_lines) {
-            lines.push(Line::from(tool).style(Style::default().fg(Color::Cyan)));
+            lines.push(Line::from(tool).style(Style::default().fg(t.tool)));
         }
         if answer.is_empty() {
             lines.push(
                 Line::from("(no answer — turn/budget limit hit; see transcript)")
-                    .style(Style::default().fg(Color::Yellow)),
+                    .style(Style::default().fg(t.warning)),
             );
         } else {
             for line in answer.lines() {
@@ -626,6 +675,7 @@ impl App {
                 usage.total(),
                 turns,
                 {
+        let t = self.theme.resolved();
                     let all = usage.input_tokens + usage.cached_input_tokens;
                     if all > 0 {
                         format!(
@@ -637,7 +687,7 @@ impl App {
                     }
                 }
             ))
-            .style(Style::default().fg(DIM)),
+            .style(Style::default().fg(t.dim)),
         );
         lines.push(Line::from(""));
         lines
@@ -645,6 +695,7 @@ impl App {
 
     /// The turn was interrupted: flush partial tool lines + a note.
     pub fn finish_interrupted(&mut self) -> Vec<Line<'static>> {
+        let t = self.theme.resolved();
         self.running = false;
         self.streaming.clear();
         self.current_tool = None;
@@ -652,11 +703,11 @@ impl App {
             Some("interrupted — partial work is persisted; resume with --resume".into());
         let mut lines: Vec<Line<'static>> = Vec::new();
         for tool in std::mem::take(&mut self.tool_lines) {
-            lines.push(Line::from(tool).style(Style::default().fg(Color::Cyan)));
+            lines.push(Line::from(tool).style(Style::default().fg(t.tool)));
         }
         lines.push(
             Line::from("(interrupted — partial work is persisted; resume with --resume)")
-                .style(Style::default().fg(Color::Yellow)),
+                .style(Style::default().fg(t.warning)),
         );
         lines.push(Line::from(""));
         lines
@@ -738,6 +789,7 @@ impl App {
     /// input box at the bottom, color throughout (accent for activity, dim
     /// for meta, cyan for tools, red for errors).
     pub fn view(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let th = self.theme.resolved();
         use ratatui::layout::{Constraint, Layout};
         use ratatui::widgets::Paragraph;
 
@@ -773,7 +825,7 @@ impl App {
         if !self.reasoning.is_empty() {
             let tail = streaming_tail(&self.reasoning, 2, chunks[0].width as usize);
             frame.render_widget(
-                Paragraph::new(tail).style(Style::default().fg(DIM).add_modifier(Modifier::ITALIC)),
+                Paragraph::new(tail).style(Style::default().fg(th.dim).add_modifier(Modifier::ITALIC)),
                 chunks[0],
             );
             idx += 1;
@@ -794,9 +846,9 @@ impl App {
                 .iter()
                 .map(|(id, label, turns, tokens, last)| {
                     let (state_str, color) = match last {
-                        Some(t) if t == "done" => (t.clone(), Color::Green),
-                        Some(t) if t == "failed" => (t.clone(), Color::Red),
-                        _ => (format!("turn {turns} · {tokens} tok"), ACCENT),
+                        Some(t) if t == "done" => (t.clone(), th.success),
+                        Some(t) if t == "failed" => (t.clone(), th.error),
+                        _ => (format!("turn {turns} · {tokens} tok"), th.accent),
                     };
                     let display = if label.is_empty() {
                         id.clone()
@@ -804,8 +856,8 @@ impl App {
                         label.clone()
                     };
                     Line::from(vec![
-                        Span::styled("  ⏵ ", Style::default().fg(ACCENT)),
-                        Span::styled(format!("[{display}] "), Style::default().fg(DIM)),
+                        Span::styled("  ⏵ ", Style::default().fg(th.accent)),
+                        Span::styled(format!("[{display}] "), Style::default().fg(th.dim)),
                         Span::styled(state_str, Style::default().fg(color)),
                     ])
                 })
@@ -821,9 +873,9 @@ impl App {
                     Line::from(self.status_line()).style(
                         Style::default()
                             .add_modifier(Modifier::BOLD)
-                            .fg(Color::Yellow),
+                            .fg(th.warning),
                     ),
-                    Line::from(hint).style(Style::default().fg(DIM)),
+                    Line::from(hint).style(Style::default().fg(th.dim)),
                 ]),
                 chunks[idx],
             );
@@ -833,7 +885,7 @@ impl App {
         }
 
         // ── Bordered input box ──
-        let border_color = if self.running { ACCENT } else { DIM };
+        let border_color = if self.running { th.accent } else { th.dim };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -856,7 +908,7 @@ impl App {
             &self.input
         };
         let input_style = if self.input.is_empty() && !self.running {
-            Style::default().fg(DIM)
+            Style::default().fg(th.dim)
         } else {
             Style::default()
         };
@@ -869,7 +921,7 @@ impl App {
                 .map(|(i, line)| {
                     if i == 0 {
                         Line::from(vec![
-                            Span::styled("❯ ", Style::default().fg(ACCENT)),
+                            Span::styled("❯ ", Style::default().fg(th.accent)),
                             Span::styled(line.to_string(), Style::default()),
                         ])
                     } else {
@@ -879,7 +931,7 @@ impl App {
                 .collect()
         } else {
             vec![Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(ACCENT)),
+                Span::styled("❯ ", Style::default().fg(th.accent)),
                 Span::styled(display_input.to_string(), input_style),
             ])]
         };
@@ -894,7 +946,8 @@ impl App {
                     .buffer_mut()
                     .cell_mut(ratatui::layout::Position::new(cursor_x, cursor_y))
                 {
-                    cell.set_symbol("▎").set_style(Style::default().fg(ACCENT));
+        let th = self.theme.resolved();
+                    cell.set_symbol("▎").set_style(Style::default().fg(th.accent));
                 }
             }
         }
@@ -916,6 +969,7 @@ impl App {
     }
 
     fn styled_status_line(&self) -> Line<'static> {
+        let t = self.theme.resolved();
         let spinner = if self.running {
             SPINNER_WORKING[(self.spinner_tick as usize) % SPINNER_WORKING.len()]
         } else {
@@ -928,23 +982,23 @@ impl App {
                 .map(|t| format!(" · {t}"))
                 .unwrap_or_default();
             Line::from(vec![
-                Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
-                Span::styled(self.model_label.clone(), Style::default().fg(DIM)),
+                Span::styled(format!("{spinner} "), Style::default().fg(t.accent)),
+                Span::styled(self.model_label.clone(), Style::default().fg(t.dim)),
                 Span::styled(
                     format!(
                         " turn {} · {} tok{tool}",
                         self.turn_count + 1,
                         self.cumulative.total()
                     ),
-                    Style::default().fg(DIM),
+                    Style::default().fg(t.dim),
                 ),
-                Span::styled("  esc interrupt", Style::default().fg(DIM)),
+                Span::styled("  esc interrupt", Style::default().fg(t.dim)),
             ])
         } else {
             let meter = self.context_meter();
             Line::from(vec![
-                Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
-                Span::styled(self.model_label.clone(), Style::default().fg(DIM)),
+                Span::styled(format!("{spinner} "), Style::default().fg(t.accent)),
+                Span::styled(self.model_label.clone(), Style::default().fg(t.dim)),
                 Span::styled(
                     format!(
                         " · {} tok · {meter} ctrl+o {}",
@@ -955,7 +1009,7 @@ impl App {
                             "compact"
                         }
                     ),
-                    Style::default().fg(DIM),
+                    Style::default().fg(t.dim),
                 ),
             ])
         }

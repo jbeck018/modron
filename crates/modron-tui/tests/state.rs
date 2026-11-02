@@ -566,3 +566,30 @@ fn reasoning_deltas_display_only_when_enabled() {
     assert_eq!(app.reasoning, "chain of");
     assert_eq!(app.streaming, "answer");
 }
+
+// ── Theme system (Phase 14) ────────────────────────────────────────────────
+
+#[test]
+fn theme_slash_lists_and_switches() {
+    let mut app = App::default();
+    assert_eq!(app.theme.name, "modron");
+    app.handle_slash_test(SlashCommand::Theme(String::new()));
+    assert!(
+        app.tool_lines.iter().any(|l| l.contains("midnight") && l.contains("mono")),
+        "{:?}",
+        app.tool_lines
+    );
+    app.handle_slash_test(SlashCommand::Theme("midnight".into()));
+    assert_eq!(app.theme.name, "midnight");
+    assert_eq!(
+        app.theme.resolved().accent,
+        ratatui::style::Color::Rgb(122, 162, 247)
+    );
+    app.handle_slash_test(SlashCommand::Theme("no-such-theme".into()));
+    assert_eq!(app.theme.name, "midnight", "unknown theme does not switch");
+    assert!(
+        app.tool_lines.iter().any(|l| l.contains("unknown theme")),
+        "{:?}",
+        app.tool_lines
+    );
+}

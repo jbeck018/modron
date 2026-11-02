@@ -136,8 +136,18 @@ impl Tool for EditTool {
                 MAX_BYTES,
             ));
         }
+        // Diff rail (Phase 14, jcode pattern): the change surfaced in the
+        // tool result itself, so the next turn (and the human) sees what
+        // moved where without a re-read.
+        let rail = diff_rail(
+            &path.display().to_string(),
+            &updated,
+            old,
+            new,
+            replace_all,
+        );
         Ok(ToolOutcome::ok(reduce_output(
-            format!("replaced {replaced} occurrence(s) in {}", path.display()),
+            format!("replaced {replaced} occurrence(s) in {}\n{rail}", path.display()),
             MAX_BYTES,
         )))
     }
@@ -157,6 +167,41 @@ fn is_protected_path(path: &str) -> bool {
         let s = c.as_os_str().to_string_lossy();
         s == ".modron" || s == ".claude" || s == ".git"
     })
+}
+
+/// Compact `file:line` rail of the change: for single replacements the
+/// exact line; for replace_all, every affected line (capped).
+fn diff_rail(path: &str, updated: &str, old: &str, new: &str, all: bool) -> String {
+    let mut out = String::new();
+    let mut hits = 0usize;
+    let mut search_from = 0usize;
+    while let Some(pos) = updated[search_from..].find(new) {
+        let abs = search_from + pos;
+        let line_no = updated[..abs].matches('\n').count() + 1;
+        out.push_str(&format!("{path}:{line_no}\n"));
+        for line in old.lines().take(3) {
+            out.push_str(&format!("- {line}\n"));
+        }
+        if old.lines().count() > 3 {
+            out.push_str(&format!("- … (+{} lines)\n", old.lines().count() - 3));
+        }
+        for line in new.lines().take(3) {
+            out.push_str(&format!("+ {line}\n"));
+        }
+        if new.lines().count() > 3 {
+            out.push_str(&format!("+ … (+{} lines)\n", new.lines().count() - 3));
+        }
+        hits += 1;
+        search_from = abs + new.len();
+        if !all {
+            break;
+        }
+        if hits >= 5 {
+            out.push_str(&format!("{path}: … (more occurrences below the cap)\n"));
+            break;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -247,5 +292,47 @@ mod tests {
         .await;
         assert!(out.is_error, "{out:?}");
         assert!(out.content.contains("cannot read"), "{out:?}");
+    }
+}
+
+// -- Phase 14: diff rails ----------------------------------------------------
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn edit_output_carries_a_line_anchored_rail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        // The gate needs a read first: simulate by marking via a read tool.
+        let read_ctx = ToolCtx {
+            engine: None,
+            sandbox: modron_core::SandboxPolicy::Off,
+            working_dir: dir.path().to_path_buf(),
+        };
+        crate::ReadTool
+            .execute(json!({"path": "f.txt"}), &read_ctx)
+            .await
+            .expect("read");
+        // No engine in the test ctx → the gate is inactive by design; run edit.
+        let ctx = ToolCtx {
+            engine: None,
+            sandbox: modron_core::SandboxPolicy::Off,
+            working_dir: dir.path().to_path_buf(),
+        };
+        let out = EditTool
+            .execute(
+                json!({"path": "f.txt", "old_string": "beta", "new_string": "BETA"}),
+                &ctx,
+            )
+            .await
+            .expect("edit");
+        assert!(!out.is_error, "{out:?}");
+        assert!(out.content.contains("replaced 1 occurrence"), "{out:?}");
+        assert!(out.content.contains(":2\n"), "line anchor: {out:?}");
+        assert!(out.content.contains("- beta"), "{out:?}");
+        assert!(out.content.contains("+ BETA"), "{out:?}");
     }
 }

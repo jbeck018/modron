@@ -1438,6 +1438,7 @@ dependencies = [
  "modron-router",
  "modron-store",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
