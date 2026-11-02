@@ -3,7 +3,7 @@
 //! real TTY and is intentionally thin.
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
-use modron_tui::{Action, App, PendingApproval, PendingCommand, SlashCommand};
+use modron_tui::{Action, App, AuthFlow, PendingApproval, PendingCommand, SlashCommand};
 use serde_json::json;
 use std::sync::mpsc;
 
@@ -1044,5 +1044,120 @@ fn auth_slash_parks_a_pending_command_with_args() {
     assert_eq!(
         SlashCommand::parse("/auth set zai sk-1"),
         Some(SlashCommand::Auth("set zai sk-1".into()))
+    );
+}
+
+#[test]
+fn auth_wizard_flows_picker_to_saved_key() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth("add".into()));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::Picker { selected: 0 })
+    ));
+
+    // Navigate to groq (registry order: zai, anthropic, openai-compat,
+    // google, groq at index 4) and enter key-entry.
+    for _ in 0..4 {
+        app.on_key(key(KeyCode::Down));
+    }
+    app.on_key(key(KeyCode::Enter));
+    match &app.auth_flow {
+        Some(AuthFlow::KeyEntry { info, .. }) => assert_eq!(info.provider_id, "groq"),
+        other => panic!("expected key entry, got {other:?}"),
+    }
+
+    // Typed chars land in the wizard buffer, never the main input.
+    for c in "gk-live-secret".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Backspace));
+    assert!(app.input.is_empty(), "main input untouched");
+
+    // Enter saves: parks AuthSave (masked later by the run loop) and
+    // closes the modal.
+    app.on_key(key(KeyCode::Enter));
+    assert!(app.auth_flow.is_none());
+    match &app.pending_command {
+        Some(PendingCommand::AuthSave { name, env_var, key }) => {
+            assert_eq!(env_var, "GROQ_API_KEY");
+            assert_eq!(key, "gk-live-secre");
+            assert!(name.contains("Groq"));
+        }
+        other => panic!("expected AuthSave, got {other:?}"),
+    }
+    // The raw key never renders into the scrollback.
+    assert!(
+        !history_text(&app).iter().any(|l| l.contains("secret")),
+        "{:?}",
+        history_text(&app)
+    );
+
+    // Esc at any stage cancels without side effects.
+    let mut app2 = App::default();
+    app2.handle_slash_test(SlashCommand::Auth("add".into()));
+    app2.on_key(key(KeyCode::Esc));
+    assert!(app2.auth_flow.is_none());
+    assert!(app2.pending_command.is_none());
+}
+
+#[test]
+fn auth_wizard_oauth_row_parks_a_browser_login() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth("add".into()));
+    for _ in 0..modron_core::auth::provider_registry().len() {
+        app.on_key(key(KeyCode::Down));
+    }
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(app.auth_flow, Some(AuthFlow::WaitingOAuth { .. })));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::OAuthLogin { .. })
+    ));
+    // Esc cancels the modal; the run loop aborts the spawned flow when it
+    // sees the modal gone.
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.auth_flow.is_none());
+}
+
+#[test]
+fn auth_wizard_renders_picker_and_masks_the_key() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth("add".into()));
+    let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("add a provider"), "{frame:?}");
+    assert!(frame.contains("Z.ai"), "{frame:?}");
+
+    // Scrolling to the bottom brings the OAuth row into the window.
+    for _ in 0..modron_core::auth::provider_registry().len() {
+        app.on_key(key(KeyCode::Down));
+    }
+    let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("Claude subscription"), "{frame:?}");
+    // Back to the top for the key-entry leg of the test.
+    app.on_key(key(KeyCode::Up));
+    for _ in 1..modron_core::auth::provider_registry().len() {
+        app.on_key(key(KeyCode::Up));
+    }
+    app.on_key(key(KeyCode::Enter)); // first provider (zai) → key entry
+    for c in "sk-secret-value".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("•••"), "masked dots: {frame:?}");
+    assert!(
+        !frame.contains("sk-secret-value"),
+        "raw key never rendered: {frame:?}"
+    );
+    assert!(
+        frame.contains("ZAI_API_KEY"),
+        "names the env var: {frame:?}"
+    );
+    assert!(
+        frame.contains("auth wizard open"),
+        "input box signals the modal: {frame:?}"
     );
 }

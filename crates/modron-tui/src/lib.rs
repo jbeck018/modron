@@ -109,6 +109,17 @@ pub enum SlashCommand {
 pub enum PendingCommand {
     /// /auth — credential status / set / remove against the shared store.
     Auth(String),
+    /// The interactive flow's Enter on a key: save it (masked in output).
+    AuthSave {
+        name: String,
+        env_var: String,
+        key: String,
+    },
+    /// The interactive flow's OAuth row: run the browser flow (the run
+    /// loop spawns it; Esc on the flow cancels).
+    OAuthLogin {
+        session: modron_core::auth::oauth::LoginSession,
+    },
     Agent(String),
     Allow(String),
     Deny(String),
@@ -226,6 +237,23 @@ impl SlashCommand {
     }
 }
 
+/// The interactive auth wizard (`/auth add`): a modal that owns the keys.
+#[derive(Clone, Debug)]
+pub enum AuthFlow {
+    /// Choosing a provider: index into the registry, with one extra
+    /// final row for the Claude-subscription OAuth browser flow.
+    Picker { selected: usize },
+    /// Pasting/typing the key for the chosen provider. Append-only buffer
+    /// (keys are pasted, not edited); rendered masked.
+    KeyEntry {
+        info: modron_core::auth::ProviderInfo,
+        input: String,
+    },
+    /// The OAuth browser flow is running (spawned in the run loop); Esc
+    /// cancels.
+    WaitingOAuth { url: String },
+}
+
 /// A tool call awaiting the user's y/n/a decision.
 pub struct PendingApproval {
     pub call: ToolCall,
@@ -302,6 +330,8 @@ pub struct App {
     /// The input box's inner area as of the last render — maps mouse
     /// clicks to cursor positions.
     pub last_input_inner: ratatui::layout::Rect,
+    /// The interactive auth wizard (modal; owns all keys while open).
+    pub auth_flow: Option<AuthFlow>,
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
@@ -402,6 +432,12 @@ impl App {
         // for the next task).
         if self.running && key.code == KeyCode::Esc {
             return Action::Abort;
+        }
+
+        // Interactive auth wizard: the modal owns every key while open
+        // (except the global ctrl+ shortcuts handled above).
+        if let Some(flow) = self.auth_flow.take() {
+            return self.auth_flow_key(flow, key);
         }
 
         // Slash-command popup (input is a bare `/word` prefix): arrows move
@@ -536,6 +572,97 @@ impl App {
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    /// Handle a key inside the auth wizard modal. Takes the flow by value
+    /// and puts it back (or transitions/clears it).
+    fn auth_flow_key(&mut self, flow: AuthFlow, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
+        match flow {
+            AuthFlow::Picker { selected } => {
+                let len = modron_core::auth::provider_registry().len() + 1;
+                let selected = selected.min(len - 1);
+                match key.code {
+                    KeyCode::Up => {
+                        self.auth_flow = Some(AuthFlow::Picker {
+                            selected: (selected + len - 1) % len,
+                        });
+                    }
+                    KeyCode::Down => {
+                        self.auth_flow = Some(AuthFlow::Picker {
+                            selected: (selected + 1) % len,
+                        });
+                    }
+                    KeyCode::Esc => {} // cancel
+                    KeyCode::Enter | KeyCode::Tab => {
+                        let registry = modron_core::auth::provider_registry();
+                        if let Some(info) = registry.get(selected) {
+                            self.auth_flow = Some(AuthFlow::KeyEntry {
+                                info: info.clone(),
+                                input: String::new(),
+                            });
+                        } else {
+                            // The OAuth row: prepare now (pure), park the
+                            // session for the run loop to spawn.
+                            match modron_core::auth::oauth::prepare_login() {
+                                Ok(session) => {
+                                    let url = session.url.clone();
+                                    self.pending_command =
+                                        Some(PendingCommand::OAuthLogin { session });
+                                    self.auth_flow = Some(AuthFlow::WaitingOAuth { url });
+                                }
+                                Err(e) => self.note(format!("cannot start OAuth: {e}")),
+                            }
+                        }
+                    }
+                    _ => self.auth_flow = Some(AuthFlow::Picker { selected }),
+                }
+            }
+            AuthFlow::KeyEntry { info, mut input } => {
+                match key.code {
+                    KeyCode::Char(c) => input.push(c),
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Enter => {
+                        if input.trim().is_empty() {
+                            self.note("no key entered — nothing saved");
+                        } else {
+                            self.pending_command = Some(PendingCommand::AuthSave {
+                                name: info.name.to_string(),
+                                env_var: info.env_var.to_string(),
+                                key: input.trim().to_string(),
+                            });
+                        }
+                        // Flow ends either way; the saved note lands in the
+                        // history masked.
+                    }
+                    KeyCode::Esc => {} // cancel without saving
+                    _ => {}
+                }
+                if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    self.auth_flow = Some(AuthFlow::KeyEntry { info, input });
+                }
+            }
+            AuthFlow::WaitingOAuth { url } => match key.code {
+                // Esc cancels; the run loop aborts the spawned flow when it
+                // sees the modal gone.
+                KeyCode::Esc => {}
+                _ => self.auth_flow = Some(AuthFlow::WaitingOAuth { url }),
+            },
+        }
+        Action::None
+    }
+
+    /// Route pasted text: into the auth flow's key buffer when the wizard
+    /// is waiting for a key, into the normal input otherwise.
+    pub fn paste_into_auth_or_input(&mut self, text: &str) {
+        if let Some(AuthFlow::KeyEntry { input, .. }) = &mut self.auth_flow {
+            input.push_str(text);
+        } else {
+            self.input.push_str(text);
+            self.cursor = self.input.chars().count();
         }
     }
 
@@ -748,7 +875,11 @@ impl App {
                 ))
             }
             SlashCommand::Auth(arg) => {
-                self.pending_command = Some(PendingCommand::Auth(arg));
+                if arg.trim() == "add" {
+                    self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
+                } else {
+                    self.pending_command = Some(PendingCommand::Auth(arg));
+                }
                 Action::None
             }
             SlashCommand::Agent(name) => {
@@ -1181,9 +1312,23 @@ impl App {
             .min(8)
             .min(area.height.saturating_sub(2));
 
-        let matches = self.slash_matches();
+        let matches = if self.auth_flow.is_none() {
+            self.slash_matches()
+        } else {
+            Vec::new()
+        };
         let sel = self.slash_selected.min(matches.len().saturating_sub(1));
         let popup_h = (matches.len() as u16).min(5);
+
+        // The auth wizard modal takes the same slot as the slash popup.
+        let flow_h = match &self.auth_flow {
+            None => 0,
+            Some(AuthFlow::Picker { .. }) => {
+                (modron_core::auth::provider_registry().len() as u16 + 1 + 1).min(8)
+            }
+            Some(AuthFlow::KeyEntry { .. }) => 4,
+            Some(AuthFlow::WaitingOAuth { .. }) => 3,
+        };
 
         let mut rows: Vec<Constraint> = vec![Constraint::Min(1)]; // scrollback
         if !self.subagents.is_empty() {
@@ -1194,6 +1339,9 @@ impl App {
         } else {
             Constraint::Length(1)
         });
+        if flow_h > 0 {
+            rows.push(Constraint::Length(flow_h));
+        }
         if popup_h > 0 {
             rows.push(Constraint::Length(popup_h));
         }
@@ -1308,6 +1456,76 @@ impl App {
         }
         idx += 1;
 
+        // ── Interactive auth wizard modal ──
+        if let Some(flow) = &self.auth_flow {
+            let lines: Vec<Line> = match flow {
+                AuthFlow::Picker { selected } => {
+                    let registry = modron_core::auth::provider_registry();
+                    // Registry rows + the final OAuth row.
+                    let entries: Vec<(&str, &str)> = registry
+                        .iter()
+                        .map(|i| (i.name, i.note))
+                        .chain(std::iter::once((
+                            "Claude subscription",
+                            "OAuth in the browser",
+                        )))
+                        .collect();
+                    let len = entries.len();
+                    let sel = (*selected).min(len - 1);
+                    // Window: 8 modal rows = 1 header + up to 7 entries,
+                    // scrolled to keep the highlight visible.
+                    let vis = len.min(7);
+                    let start = sel.saturating_sub(vis - 1).min(len - vis);
+                    let mut lines = vec![Line::from(
+                        "  add a provider — ↑/↓ choose · enter select · esc cancel",
+                    )
+                    .style(Style::default().fg(th.dim))];
+                    for (i, (name, note)) in entries.iter().enumerate().skip(start).take(vis) {
+                        let selected_here = i == sel;
+                        let pointer = if selected_here { "  ❯ " } else { "    " };
+                        let style = if selected_here {
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(pointer.to_string(), Style::default().fg(th.accent)),
+                            Span::styled(format!("{name:<20} {note}"), style),
+                        ]));
+                    }
+                    lines
+                }
+                AuthFlow::KeyEntry { info, input } => {
+                    let masked = "•".repeat(input.chars().count());
+                    vec![
+                        Line::from(format!("  {} — get a key: {}", info.name, info.key_url))
+                            .style(Style::default().fg(th.dim)),
+                        Line::from(vec![
+                            Span::styled(
+                                format!("  paste {} ", info.env_var),
+                                Style::default().fg(th.accent),
+                            ),
+                            Span::styled(masked, Style::default()),
+                            Span::styled("▎", Style::default().fg(th.accent)),
+                        ]),
+                        Line::from("  enter save · esc cancel (ctrl+V pastes)")
+                            .style(Style::default().fg(th.dim)),
+                        Line::from(""),
+                    ]
+                }
+                AuthFlow::WaitingOAuth { url } => vec![
+                    Line::from("  claude subscription — OAuth")
+                        .style(Style::default().fg(th.accent)),
+                    Line::from(format!("  open in a browser: {url}"))
+                        .style(Style::default().fg(th.dim)),
+                    Line::from("  waiting for the callback… esc cancels")
+                        .style(Style::default().fg(th.dim)),
+                ],
+            };
+            frame.render_widget(Paragraph::new(lines), chunks[idx]);
+            idx += 1;
+        }
+
         // Slash-command popup (window around the highlight when the
         // filtered list outgrows the space).
         if popup_h > 0 {
@@ -1388,7 +1606,12 @@ impl App {
         }
         let scroll = self.input_scroll as usize;
         if self.input.is_empty() {
-            let (text, style) = if self.running {
+            let (text, style) = if self.auth_flow.is_some() {
+                (
+                    "auth wizard open — esc to cancel",
+                    Style::default().fg(th.dim),
+                )
+            } else if self.running {
                 ("", Style::default())
             } else {
                 (

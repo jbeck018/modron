@@ -183,6 +183,11 @@ pub async fn run_with(
         app.push_history(welcome);
     }
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
+    // OAuth outcomes: Result<(TokenSet, url), error> from the spawned flow.
+    let (oauth_tx, mut oauth_rx) = tokio::sync::mpsc::unbounded_channel::<
+        anyhow::Result<(modron_core::auth::oauth::TokenSet, String)>,
+    >();
+    let mut oauth_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
@@ -226,10 +231,10 @@ pub async fn run_with(
                 crossterm::event::Event::Paste(text) => {
                     // Bracketed paste: multi-line text enters the input
                     // verbatim — the terminal told us it is a paste, so it
-                    // must never submit.
+                    // must never submit. The auth wizard's key entry takes
+                    // precedence when open.
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                    app.input.push_str(&text);
-                    app.cursor = app.input.chars().count();
+                    app.paste_into_auth_or_input(&text);
                     continue;
                 }
                 crossterm::event::Event::Mouse(me) => match me.kind {
@@ -269,8 +274,7 @@ pub async fn run_with(
                                 }
                                 crate::clipboard::ClipboardContent::Text(text) => {
                                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                                    app.input.push_str(&text);
-                                    app.cursor = app.input.chars().count();
+                                    app.paste_into_auth_or_input(&text);
                                 }
                                 crate::clipboard::ClipboardContent::Empty => {
                                     app.status_note = Some("clipboard empty".into());
@@ -333,10 +337,54 @@ pub async fn run_with(
 
         // 3b. Slash commands needing engine/store powers (Phase 14): the
         //     App parks a PendingCommand; execute it here — the result
-        //     lines land in the internal scrollback.
-        if let Some(cmd) = app.pending_command.take() {
+        //     lines land in the internal scrollback. The OAuth login is
+        //     the exception: it waits on a browser round-trip, so it runs
+        //     as a spawned task (the TUI keeps rendering; Esc on the modal
+        //     cancels it).
+        // NOTE: peek with matches! before take() — an `if let` over
+        // `.take()` drops the value when the pattern fails.
+        if matches!(app.pending_command, Some(PendingCommand::OAuthLogin { .. })) {
+            let Some(PendingCommand::OAuthLogin { session }) = app.pending_command.take() else {
+                unreachable!("matches! guard above")
+            };
+            let tx = oauth_tx.clone();
+            oauth_task = Some(tokio::spawn(async move {
+                let result =
+                    match modron_core::auth::oauth::wait_for_callback(session.port, &session.state)
+                        .await
+                    {
+                        Ok(code) => modron_core::auth::oauth::exchange_code(&session, &code)
+                            .await
+                            .map(|tokens| (tokens, session.url.clone())),
+                        Err(e) => Err(e),
+                    };
+                let _ = tx.send(result);
+            }));
+        } else if let Some(cmd) = app.pending_command.take() {
             for line in run_pending_command(&mut engine, &mut app, cmd).await {
                 app.note(line);
+            }
+        }
+
+        // 3c. OAuth outcome: save tokens (or report the error) and close
+        //     the modal. A cancelled modal aborts the task instead.
+        if app.auth_flow.is_none() {
+            if let Some(task) = oauth_task.take() {
+                task.abort();
+            }
+        }
+        while let Ok(result) = oauth_rx.try_recv() {
+            oauth_task = None;
+            app.auth_flow = None;
+            match result {
+                Ok((tokens, _url)) => match modron_core::auth::oauth::save_tokens(&tokens) {
+                    Ok(()) => app.note(format!(
+                        "✓ claude subscription tokens saved ({}) — use `modron auth status`",
+                        modron_core::auth::mask_key(&tokens.access_token)
+                    )),
+                    Err(e) => app.note(format!("cannot save tokens: {e}")),
+                },
+                Err(e) => app.note(format!("oauth failed: {e}")),
             }
         }
 
@@ -426,6 +474,25 @@ async fn run_pending_command(
         // save, `remove <provider>` = forget. The key never reaches the
         // model — slash commands are handled entirely locally.
         PendingCommand::Auth(arg) => run_auth_command(&arg),
+        // The interactive flow's key: same store path as `/auth <p> <k>`,
+        // with the key echoed masked only.
+        PendingCommand::AuthSave { name, env_var, key } => {
+            match modron_core::auth::env_file()
+                .map_err(|e| e.to_string())
+                .and_then(|p| {
+                    modron_core::auth::set_key_in_env_file(&p, &env_var, &key)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(()) => {
+                    std::env::set_var(&env_var, &key);
+                    vec![format!(
+                        "✓ {name} key saved ({}) — ready; takes effect on your next launch if already running",
+                        modron_core::auth::mask_key(&key)
+                    )]
+                }
+                Err(e) => vec![format!("cannot save key: {e}")],
+            }
+        }
         PendingCommand::Agent(name) => {
             let name = name.trim().to_string();
             if name.is_empty() {
@@ -532,6 +599,9 @@ async fn run_pending_command(
             }
         }
         PendingCommand::Issues(arg) => run_issues(engine, &arg),
+        // OAuthLogin never reaches here — the run loop spawns it before
+        // run_pending_command is called (it waits on a browser round-trip).
+        PendingCommand::OAuthLogin { .. } => Vec::new(),
         PendingCommand::Fork => match app.session_id {
             Some(id) => match engine.store.fork(id).await {
                 Ok(new) => {

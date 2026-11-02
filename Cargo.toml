@@ -23,7 +23,7 @@ modron-tools = { path = "crates/modron-tools", version = "0.1.1" }
 modron-store = { path = "crates/modron-store", version = "0.1.1" }
 modron-router = { path = "crates/modron-router", version = "0.1.1" }
 modron-tui = { path = "crates/modron-tui", version = "0.1.1" }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "io-std", "sync", "fs", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "io-std", "sync", "fs", "signal", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

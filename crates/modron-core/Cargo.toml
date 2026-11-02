@@ -14,6 +14,11 @@ uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 futures.workspace = true
+# OAuth device/browser flows (modron_core::auth::oauth) — shared by the
+# CLI `auth login` command and the TUI's interactive flow. Already linked
+# into the binary via modron-providers.
+reqwest.workspace = true
+sha2.workspace = true
 # Real dependency (not dev): hooks (H1) spawn hook processes with timeouts,
 # matching the providers-crate precedent for retry backoff.
 tokio.workspace = true
