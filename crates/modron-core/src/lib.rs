@@ -473,6 +473,18 @@ pub trait SessionStore: Send + Sync {
         let _ = id;
         Ok(false)
     }
+    /// Fork a session: copy the full event log under a fresh id and return
+    /// it (Phase 14 /fork — branch a conversation). The source is untouched;
+    /// both branches then evolve independently. Default: event-by-event
+    /// copy through `load` + `append`, which every store already supports.
+    async fn fork(&self, from: SessionId) -> Result<SessionId> {
+        let events = self.load(from).await?;
+        let new = SessionId::new_v4();
+        for event in &events {
+            self.append(new, event).await?;
+        }
+        Ok(new)
+    }
 }
 
 // ---------------------------------------------------------------------------

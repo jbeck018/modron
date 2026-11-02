@@ -44,7 +44,51 @@ pub enum SlashCommand {
     Context,
     Sessions,
     Sandbox(String),
+    /// Toggle rendering of streamed model reasoning.
+    Reasoning,
+    /// Quick side question — answered without tools.
+    Btw(String),
+    /// List personas or switch (`/agent reviewer`).
+    Agent(String),
+    /// Session tool allow/deny lists (`/allow bash`, `/deny write`).
+    Allow(String),
+    Deny(String),
+    /// Approval mode: ask | yolo.
+    Mode(String),
+    /// Background delegate status.
+    Tasks,
+    /// List delegate worktrees.
+    Worktree,
+    /// Issue board: list, or `/issues add <text>`.
+    Issues(String),
+    /// Branch the conversation (fork the session log).
+    Fork,
+    /// Plan-first mode: submit a task constrained to planning.
+    Plan(String),
+    /// Review the working diff.
+    CodeReview,
+    /// Set/clear a natural-language stop condition for long runs.
+    Goal(String),
+    /// Distill the current session into a reusable SKILL.md.
+    Learn(String),
+    /// Alias kept for muscle memory.
+    Compress,
     Unknown(String),
+}
+
+/// A slash command that needs the run loop's powers (engine mutation, tool
+/// execution, store access). `App::handle_slash` parks one here; the loop
+/// drains and executes it, then commits the result lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingCommand {
+    Agent(String),
+    Allow(String),
+    Deny(String),
+    Mode(String),
+    Tasks,
+    Worktree,
+    Issues(String),
+    Fork,
 }
 
 impl SlashCommand {
@@ -66,20 +110,48 @@ impl SlashCommand {
             "context" => SlashCommand::Context,
             "sessions" => SlashCommand::Sessions,
             "sandbox" => SlashCommand::Sandbox(arg),
+            "reasoning" | "thinking" => SlashCommand::Reasoning,
+            "btw" => SlashCommand::Btw(arg),
+            "agent" | "persona" => SlashCommand::Agent(arg),
+            "allow" => SlashCommand::Allow(arg),
+            "deny" => SlashCommand::Deny(arg),
+            "mode" => SlashCommand::Mode(arg),
+            "tasks" => SlashCommand::Tasks,
+            "worktree" | "worktrees" => SlashCommand::Worktree,
+            "issues" => SlashCommand::Issues(arg),
+            "fork" => SlashCommand::Fork,
+            "plan" => SlashCommand::Plan(arg),
+            "code-review" | "review" => SlashCommand::CodeReview,
+            "goal" => SlashCommand::Goal(arg),
+            "learn" => SlashCommand::Learn(arg),
+            "compress" => SlashCommand::Compact,
             other => SlashCommand::Unknown(other.to_string()),
         })
     }
 
     /// The help text shown by /help.
     pub fn help_text() -> &'static str {
-        "/help          show this help\n\
-         /exit          quit the TUI\n\
-         /clear         clear the scrollback\n\
-         /compact       force a context compaction now\n\
-         /model <name>  switch models mid-session\n\
-         /context       show context usage breakdown\n\
-         /sessions      list recent sessions\n\
-         /sandbox <mode> off | seatbelt | bubblewrap\n\
+        "/help            show this help\n\
+         /exit            quit the TUI\n\
+         /clear           clear the scrollback\n\
+         /compact         force a context compaction now\n\
+         /model <name>    switch models mid-session\n\
+         /context         show context usage breakdown\n\
+         /sessions        list recent sessions\n\
+         /sandbox <mode>  off | seatbelt | bubblewrap\n\
+         /reasoning       toggle streamed-reasoning display\n\
+         /btw <question>  quick side question, no tools\n\
+         /agent [name]    list or switch personas\n\
+         /allow|/deny <tool>  session tool permissions\n\
+         /mode ask|yolo   approval mode\n\
+         /tasks           background delegate status\n\
+         /worktree        list delegate worktrees\n\
+         /issues [add <text>]  the project issue board\n\
+         /fork            branch this conversation\n\
+         /plan <task>     plan first, no edits until approved\n\
+         /review          review the working diff\n\
+         /goal <condition>  stop condition for long autonomous runs\n\
+         /learn [title]   distill this session into a SKILL.md\n\
          (anything else is sent as a task to the agent)"
     }
 }
@@ -125,6 +197,14 @@ pub struct App {
     pub context_used: u64,
     /// Live subagent rows (Phase 5h): id, label, turns, tokens, last_tool.
     pub subagents: Vec<(String, String, u32, u64, Option<String>)>,
+    /// A slash command awaiting run-loop execution (engine/store powers).
+    pub pending_command: Option<PendingCommand>,
+    /// Streamed model reasoning (shown when `show_reasoning`).
+    pub reasoning: String,
+    pub show_reasoning: bool,
+    /// Natural-language stop condition (/goal), attached to subsequent
+    /// tasks until cleared with a bare `/goal`.
+    pub goal: Option<String>,
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
@@ -263,6 +343,20 @@ impl App {
         }
     }
 
+    /// Push text as one tool line per row (a committed line renders as one
+    /// screen row, so embedded newlines must be split).
+    fn push_lines(&mut self, text: impl Into<String>) {
+        for line in text.into().lines() {
+            self.tool_lines.push(line.to_string());
+        }
+    }
+
+    /// Handle a slash command locally (Phase 10): returns an Action.
+    #[doc(hidden)]
+    pub fn handle_slash_test(&mut self, cmd: SlashCommand) -> Action {
+        self.handle_slash(cmd)
+    }
+
     /// Handle a slash command locally (Phase 10): returns an Action.
     /// Commands that need the run loop's help (quit, submit) map to Actions;
     /// others update local state and return None.
@@ -270,7 +364,7 @@ impl App {
         match cmd {
             SlashCommand::Exit => Action::Quit,
             SlashCommand::Help => {
-                self.tool_lines.push(SlashCommand::help_text().to_string());
+                self.push_lines(SlashCommand::help_text());
                 Action::None
             }
             SlashCommand::Clear => {
@@ -303,7 +397,7 @@ impl App {
             }
             SlashCommand::Context => {
                 let total = self.cumulative.total();
-                self.tool_lines.push(format!(
+                self.push_lines(format!(
                     "context usage: {total} tokens this session (input + output)\nmodel window: check /model for the current model\nest. remaining: the engine compacts at 80% of the model window"
                 ));
                 Action::None
@@ -319,6 +413,99 @@ impl App {
                 ));
                 Action::None
             }
+            SlashCommand::Reasoning => {
+                self.show_reasoning = !self.show_reasoning;
+                self.reasoning.clear();
+                self.tool_lines.push(format!(
+                    "reasoning display: {}",
+                    if self.show_reasoning { "on" } else { "off" }
+                ));
+                Action::None
+            }
+            SlashCommand::Btw(question) => {
+                if question.trim().is_empty() {
+                    self.tool_lines.push("usage: /btw <quick question>".into());
+                    return Action::None;
+                }
+                Action::Submit(format!(
+                    "{question}\n\n(Quick side question: answer directly from what you \
+                     already know — do not use tools.)"
+                ))
+            }
+            SlashCommand::Agent(name) => {
+                self.pending_command = Some(PendingCommand::Agent(name));
+                Action::None
+            }
+            SlashCommand::Allow(tool) => {
+                self.pending_command = Some(PendingCommand::Allow(tool));
+                Action::None
+            }
+            SlashCommand::Deny(tool) => {
+                self.pending_command = Some(PendingCommand::Deny(tool));
+                Action::None
+            }
+            SlashCommand::Mode(mode) => {
+                self.pending_command = Some(PendingCommand::Mode(mode));
+                Action::None
+            }
+            SlashCommand::Tasks => {
+                self.pending_command = Some(PendingCommand::Tasks);
+                Action::None
+            }
+            SlashCommand::Worktree => {
+                self.pending_command = Some(PendingCommand::Worktree);
+                Action::None
+            }
+            SlashCommand::Issues(arg) => {
+                self.pending_command = Some(PendingCommand::Issues(arg));
+                Action::None
+            }
+            SlashCommand::Fork => {
+                self.pending_command = Some(PendingCommand::Fork);
+                Action::None
+            }
+            SlashCommand::Plan(task) => {
+                if task.trim().is_empty() {
+                    self.tool_lines.push("usage: /plan <task>".into());
+                    return Action::None;
+                }
+                Action::Submit(format!(
+                    "{task}\n\n(Plan first: produce a concrete, step-by-step plan with file \
+                     references. Do NOT edit any files yet — wait for approval.)"
+                ))
+            }
+            SlashCommand::CodeReview => Action::Submit(
+                "Review the working tree: run `git diff` (and `git status`), then report \
+                 findings only — bugs, risks, and gaps, each with file:line references. \
+                 Do not fix anything."
+                    .into(),
+            ),
+            SlashCommand::Goal(condition) => {
+                if condition.trim().is_empty() {
+                    self.goal = None;
+                    self.tool_lines.push("goal cleared — tasks run normally again".into());
+                } else {
+                    self.goal = Some(condition.trim().to_string());
+                    self.push_lines(format!(
+                        "goal set: {}\n(every task now runs until you say it's met, the \
+                         budget caps hit, or the model reports GOAL COMPLETE; clear with a \
+                         bare /goal)",
+                        condition.trim()
+                    ));
+                }
+                Action::None
+            }
+            SlashCommand::Learn(title) => {
+                let slug = slugish(if title.is_empty() { "session-skill" } else { &title });
+                Action::Submit(format!(
+                    "Distill this session into a reusable skill. Write the file \
+                     .modron/skills/{slug}/SKILL.md with `---` frontmatter (name: {slug}, \
+                     description: one line) followed by a concise, step-by-step workflow \
+                     capturing what actually worked here (commands, file paths, pitfalls). \
+                     Create the directories. Then reply with just the path you wrote."
+                ))
+            }
+            SlashCommand::Compress => self.handle_slash(SlashCommand::Compact),
             SlashCommand::Unknown(name) => {
                 self.tool_lines
                     .push(format!("unknown command /{name} — try /help"));
@@ -331,7 +518,11 @@ impl App {
     pub fn on_delta(&mut self, delta: StreamDelta) {
         match delta {
             StreamDelta::Text(t) => self.streaming.push_str(&t),
-            StreamDelta::Reasoning(_) => {}
+            StreamDelta::Reasoning(t) => {
+                if self.show_reasoning {
+                    self.reasoning.push_str(&t);
+                }
+            }
             StreamDelta::Done => {}
         }
     }
@@ -406,6 +597,7 @@ impl App {
     ) -> Vec<Line<'static>> {
         self.running = false;
         self.streaming.clear();
+        self.reasoning.clear();
         self.current_tool = None;
         self.turn_count = turns;
         self.session_id = Some(session_id);
@@ -483,6 +675,22 @@ impl App {
         for line in lines {
             self.tool_lines.push(format!("  {line}"));
         }
+        if let Some(goal) = self.goal.clone() {
+            self.tool_lines
+                .push(format!("  [goal: {goal}]"));
+        }
+    }
+
+    /// The task text actually submitted: the raw input plus the goal
+    /// stop-condition rider when /goal is active.
+    pub fn task_with_goal(&self, task: &str) -> String {
+        match &self.goal {
+            Some(goal) => format!(
+                "{task}\n\n(Goal for this run: {goal}. Keep working across turns until it \
+                 is met, then end your final message with the exact line: GOAL COMPLETE)"
+            ),
+            None => task.to_string(),
+        }
     }
 
     /// The one-line status: spinner/model, tool in flight, or approval prompt.
@@ -542,8 +750,12 @@ impl App {
         let top = outer[0];
         let input_area = outer[1];
 
-        // Top zone rows: streaming (fills), subagents, approval/status.
+        // Top zone rows: reasoning tail, streaming (fills), subagents,
+        // approval/status.
         let mut rows: Vec<Constraint> = Vec::new();
+        if !self.reasoning.is_empty() {
+            rows.push(Constraint::Length(2));
+        }
         if !self.streaming.is_empty() {
             rows.push(Constraint::Min(1));
         }
@@ -558,6 +770,14 @@ impl App {
         let chunks = Layout::vertical(rows).split(top);
 
         let mut idx = 0;
+        if !self.reasoning.is_empty() {
+            let tail = streaming_tail(&self.reasoning, 2, chunks[0].width as usize);
+            frame.render_widget(
+                Paragraph::new(tail).style(Style::default().fg(DIM).add_modifier(Modifier::ITALIC)),
+                chunks[0],
+            );
+            idx += 1;
+        }
         if !self.streaming.is_empty() {
             let tail = streaming_tail(
                 &self.streaming,
@@ -763,6 +983,19 @@ pub fn streaming_tail(text: &str, max_lines: usize, width: usize) -> Vec<Line<'s
         .iter()
         .map(|l| Line::from(l.clone()))
         .collect()
+}
+
+/// Lowercase kebab slug for skill names from a title.
+fn slugish(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').chars().take(48).collect()
 }
 
 fn short(s: &str, max_chars: usize) -> String {

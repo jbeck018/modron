@@ -7,7 +7,7 @@
 //! over std channels; approvals queue into a shared slot and park the engine
 //! task via `tokio::task::block_in_place` until the user decides.
 
-use crate::{App, PendingApproval};
+use crate::{App, PendingApproval, PendingCommand};
 use modron_core::{
     Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
     ToolActivitySink, ToolCall,
@@ -85,7 +85,7 @@ pub async fn run_with(
     let delta_sink_tx = delta_tx.clone();
     let tool_tx = delta_tx.clone();
     let approval_for_builder = approval.clone();
-    let (engine, resume_session) = build(TuiSinks {
+    let (mut engine, resume_session) = build(TuiSinks {
         on_delta: Arc::new(move |delta| {
             let _ = delta_sink_tx.send(DeltaOrTool::Delta(delta));
         }),
@@ -249,6 +249,7 @@ pub async fn run_with(
                     match app.on_key(key) {
                         crate::Action::None => {}
                         crate::Action::Submit(task) => {
+                            let task = app.task_with_goal(&task);
                             app.begin_task(&task);
                             let engine = engine.clone();
                             let done = done_tx.clone();
@@ -288,6 +289,37 @@ pub async fn run_with(
                     }
                 }
             }
+        }
+
+        // 3b. Slash commands needing engine/store powers (Phase 14): the
+        //     App parks a PendingCommand; execute it here, then commit the
+        //     result lines immediately (not at the next turn's end).
+        if let Some(cmd) = app.pending_command.take() {
+            let mut lines = run_pending_command(&mut engine, &mut app, cmd).await;
+            lines.extend(std::mem::take(&mut app.tool_lines));
+            if !lines.is_empty() {
+                blank_frame(&mut terminal)?;
+                let owned: Vec<ratatui::text::Line<'static>> = lines
+                    .into_iter()
+                    .map(|l| {
+                        ratatui::text::Line::from(l)
+                            .style(ratatui::style::Style::default().fg(crate::DIM))
+                    })
+                    .collect();
+                commit_block(&mut terminal, &owned)?;
+            }
+        } else if !app.running && !app.tool_lines.is_empty() {
+            // Purely local slash output (/help, /model, …): show it now
+            // instead of waiting for the next completed turn.
+            let lines: Vec<ratatui::text::Line<'static>> = std::mem::take(&mut app.tool_lines)
+                .into_iter()
+                .map(|l| {
+                    ratatui::text::Line::from(l)
+                        .style(ratatui::style::Style::default().fg(crate::DIM))
+                })
+                .collect();
+            blank_frame(&mut terminal)?;
+            commit_block(&mut terminal, &lines)?;
         }
 
         // 4. Approve-rest mirror: when the user pressed `a`, future approvals
@@ -358,6 +390,204 @@ pub async fn run_with(
         println!("session: {id} — resume with --resume {id}");
     }
     result
+}
+
+/// Execute a parked slash command against the engine/store. Returns the
+/// lines to commit. Engine mutations apply to every FUTURE turn (each
+/// submit clones the engine).
+async fn run_pending_command(
+    engine: &mut Engine,
+    app: &mut App,
+    cmd: PendingCommand,
+) -> Vec<String> {
+    match cmd {
+        PendingCommand::Agent(name) => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                let personas: Vec<String> = engine.config.personas.keys().cloned().collect();
+                if personas.is_empty() {
+                    vec![
+                        "no personas configured — define [agents.<name>] in config.toml".into(),
+                    ]
+                } else {
+                    vec![format!("personas: {} (switch: /agent <name>)", personas.join(", "))]
+                }
+            } else if let Some(persona) = engine.config.personas.get(&name).cloned() {
+                if let Some(system) = persona.system.clone() {
+                    engine.config.system = system;
+                }
+                if let Some(model) = persona.model.clone() {
+                    engine.config.default_model = model;
+                }
+                if let Some(provider) = persona.provider.clone() {
+                    engine.config.default_provider = provider;
+                }
+                engine.config.approvals.allow.extend(persona.allow.clone());
+                engine.config.approvals.deny.extend(persona.deny.clone());
+                vec![format!("switched to persona `{name}` (model/provider follow if set)")]
+            } else {
+                vec![format!(
+                    "unknown persona `{name}` — configured: {}",
+                    engine.config.personas.keys().cloned().collect::<Vec<_>>().join(", ")
+                )]
+            }
+        }
+        PendingCommand::Allow(tool) => {
+            let tool = tool.trim().to_string();
+            if tool.is_empty() {
+                return vec![format!(
+                    "allow list: {} (add: /allow <tool>)",
+                    engine.config.approvals.allow.join(", ")
+                )];
+            }
+            engine.config.approvals.allow.push(tool.clone());
+            vec![format!("`{tool}` allowed for the rest of the session")]
+        }
+        PendingCommand::Deny(tool) => {
+            let tool = tool.trim().to_string();
+            if tool.is_empty() {
+                return vec![format!(
+                    "deny list: {} (add: /deny <tool>)",
+                    engine.config.approvals.deny.join(", ")
+                )];
+            }
+            engine.config.approvals.deny.push(tool.clone());
+            vec![format!("`{tool}` denied for the rest of the session")]
+        }
+        PendingCommand::Mode(mode) => match mode.trim() {
+            "ask" => {
+                engine.config.approvals.mode = modron_core::ApprovalMode::Ask;
+                vec!["approval mode: ask (mutating tools prompt)".into()]
+            }
+            "yolo" | "auto" => {
+                engine.config.approvals.mode = modron_core::ApprovalMode::ApproveAll;
+                vec!["approval mode: yolo (mutating tools auto-approved)".into()]
+            }
+            other => vec![format!("usage: /mode ask|yolo (got {other:?})")],
+        },
+        PendingCommand::Tasks => {
+            // Run the delegate_status tool directly through the registry.
+            let ctx = modron_core::ToolCtx {
+                sandbox: engine.config.sandbox,
+                working_dir: engine.config.working_dir.clone(),
+                engine: Some(std::sync::Arc::new(engine.clone())),
+            };
+            match engine.tools.get("delegate_status") {
+                Some(tool) => match tool.execute(serde_json::json!({}), &ctx).await {
+                    Ok(outcome) => vec![outcome.content],
+                    Err(e) => vec![format!("delegate_status failed: {e}")],
+                },
+                None => vec!["delegate_status tool not registered in this build".into()],
+            }
+        }
+        PendingCommand::Worktree => {
+            let dir = engine.config.working_dir.join(".modron").join("worktrees");
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    let names: Vec<String> = entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect();
+                    if names.is_empty() {
+                        vec![format!("no worktrees under {}", dir.display())]
+                    } else {
+                        vec![format!("worktrees: {}", names.join(", "))]
+                    }
+                }
+                Err(_) => vec![format!("no worktrees yet (created by delegate isolate:true)")],
+            }
+        }
+        PendingCommand::Issues(arg) => run_issues(engine, &arg),
+        PendingCommand::Fork => {
+            match app.session_id {
+                Some(id) => match engine.store.fork(id).await {
+                    Ok(new) => {
+                        app.session_id = Some(new);
+                        vec![format!(
+                            "forked: new branch {new} (active now; the original is untouched — \
+                             resume it with --resume {id})"
+                        )]
+                    }
+                    Err(e) => vec![format!("fork failed: {e}")],
+                },
+                None => vec!["no session yet — send a task first, then /fork".into()],
+            }
+        }
+    }
+}
+
+/// /issues — a tiny per-project board in the workspace memory store:
+/// `<memory_root>/<slug>/issues.jsonl` with `open` state.
+fn run_issues(engine: &Engine, arg: &str) -> Vec<String> {
+    let Some(root) = engine.config.memory_root.clone() else {
+        return vec!["memory not configured — issues live with memory".into()];
+    };
+    let store = match modron_core::memory::MemoryStore::for_workspace(
+        &root,
+        &engine.config.working_dir,
+    ) {
+        Ok(store) => store,
+        Err(e) => return vec![format!("cannot open memory store: {e}")],
+    };
+    let path = store.root().join("issues.jsonl");
+    let mut issues: Vec<(bool, String)> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.splitn(2, '\u{1f}');
+            let open = parts.next()? == "1";
+            let text = parts.next()?.to_string();
+            Some((open, text))
+        })
+        .collect();
+    let arg = arg.trim();
+    if let Some(text) = arg.strip_prefix("add ") {
+        if !text.trim().is_empty() {
+            issues.push((true, text.trim().to_string()));
+            let body: String = issues
+                .iter()
+                .map(|(open, t)| {
+                    format!("{}\u{1f}{t}\n", if *open { 1 } else { 0 })
+                })
+                .collect();
+            let _ = std::fs::create_dir_all(store.root());
+            if let Err(e) = std::fs::write(&path, body) {
+                return vec![format!("cannot write issues: {e}")];
+            }
+            return vec![format!("issue added: {}", text.trim())];
+        }
+    }
+    if let Some(idx) = arg.strip_prefix("done ") {
+        if let Ok(i) = idx.trim().parse::<usize>() {
+            if i > 0 && i <= issues.len() {
+                issues[i - 1].0 = false;
+                let body: String = issues
+                    .iter()
+                    .map(|(open, t)| {
+                        format!("{}\u{1f}{t}\n", if *open { 1 } else { 0 })
+                    })
+                    .collect();
+                let _ = std::fs::create_dir_all(store.root());
+                if let Err(e) = std::fs::write(&path, body) {
+                    return vec![format!("cannot write issues: {e}")];
+                }
+                return vec![format!("issue {i} closed")];
+            }
+        }
+        return vec!["usage: /issues done <number>".into()];
+    }
+    if issues.is_empty() {
+        return vec!["no issues — add one with /issues add <text>".into()];
+    }
+    let mut out = vec!["issues:".to_string()];
+    for (i, (open, text)) in issues.iter().enumerate() {
+        out.push(format!(
+            "  {}. [{}] {text}",
+            i + 1,
+            if *open { "open" } else { "done" }
+        ));
+    }
+    out
 }
 
 /// Blank the live region before committing lines into scrollback: every

@@ -3,7 +3,7 @@
 //! real TTY and is intentionally thin.
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
-use modron_tui::{Action, App, PendingApproval, SlashCommand};
+use modron_tui::{Action, App, PendingApproval, PendingCommand, SlashCommand};
 use serde_json::json;
 use std::sync::mpsc;
 
@@ -439,4 +439,130 @@ fn multi_line_task_echoes_as_indented_block() {
     let mut app = App::default();
     app.begin_task("one\ntwo\nthree");
     assert_eq!(app.tool_lines, vec!["❯ one", "  two", "  three"]);
+}
+
+// ── Slash command expansion (Phase 14) ────────────────────────────────────
+
+#[test]
+fn new_slash_commands_parse_with_aliases() {
+    assert_eq!(SlashCommand::parse("/compress"), Some(SlashCommand::Compact));
+    assert_eq!(SlashCommand::parse("/review"), Some(SlashCommand::CodeReview));
+    assert_eq!(
+        SlashCommand::parse("/code-review"),
+        Some(SlashCommand::CodeReview)
+    );
+    assert_eq!(SlashCommand::parse("/reasoning"), Some(SlashCommand::Reasoning));
+    assert_eq!(SlashCommand::parse("/thinking"), Some(SlashCommand::Reasoning));
+    assert_eq!(
+        SlashCommand::parse("/btw what is this?"),
+        Some(SlashCommand::Btw("what is this?".into()))
+    );
+    assert_eq!(
+        SlashCommand::parse("/allow bash"),
+        Some(SlashCommand::Allow("bash".into()))
+    );
+    assert_eq!(
+        SlashCommand::parse("/goal tests pass"),
+        Some(SlashCommand::Goal("tests pass".into()))
+    );
+}
+
+#[test]
+fn reasoning_toggles_and_btw_submits_no_tools_rider() {
+    let mut app = App::default();
+    assert!(!app.show_reasoning);
+    assert_eq!(app.on_key(key(crossterm::event::KeyCode::Enter)), Action::None);
+    // /reasoning via direct handler
+    assert_eq!(
+        app.handle_slash_test(SlashCommand::Reasoning),
+        Action::None
+    );
+    assert!(app.show_reasoning);
+
+    let mut app = App::default();
+    match app.handle_slash_test(SlashCommand::Btw("how big is it?".into())) {
+        Action::Submit(task) => {
+            assert!(task.contains("how big is it?"));
+            assert!(task.contains("do not use tools"), "{task}");
+        }
+        other => panic!("btw must submit: {other:?}"),
+    }
+}
+
+#[test]
+fn plan_and_review_submit_constrained_tasks() {
+    let mut app = App::default();
+    match app.handle_slash_test(SlashCommand::Plan("add auth".into())) {
+        Action::Submit(task) => assert!(task.contains("Do NOT edit any files"), "{task}"),
+        other => panic!("plan must submit: {other:?}"),
+    }
+    match app.handle_slash_test(SlashCommand::CodeReview) {
+        Action::Submit(task) => assert!(task.contains("git diff"), "{task}"),
+        other => panic!("review must submit: {other:?}"),
+    }
+}
+
+#[test]
+fn goal_sets_clears_and_rides_along_on_tasks() {
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Goal("all tests green".into()));
+    assert_eq!(app.goal.as_deref(), Some("all tests green"));
+    let ridden = app.task_with_goal("fix the flaky test");
+    assert!(ridden.starts_with("fix the flaky test"), "{ridden}");
+    assert!(ridden.contains("all tests green"), "{ridden}");
+    assert!(ridden.contains("GOAL COMPLETE"), "{ridden}");
+    // begin_task echoes the goal line.
+    app.begin_task(&ridden);
+    assert!(app.tool_lines.iter().any(|l| l.contains("[goal: all tests green]")));
+    // Bare /goal clears.
+    app.handle_slash_test(SlashCommand::Goal(String::new()));
+    assert!(app.goal.is_none());
+    assert_eq!(app.task_with_goal("next"), "next");
+}
+
+#[test]
+fn learn_submits_a_skill_distillation_task() {
+    let mut app = App::default();
+    match app.handle_slash_test(SlashCommand::Learn("deploy flow".into())) {
+        Action::Submit(task) => {
+            assert!(task.contains(".modron/skills/deploy-flow/SKILL.md"), "{task}");
+            assert!(task.contains("description:"), "{task}");
+        }
+        other => panic!("learn must submit: {other:?}"),
+    }
+}
+
+#[test]
+fn engine_powered_commands_park_as_pending() {
+    let mut app = App::default();
+    for (cmd, pending) in [
+        (SlashCommand::Agent("reviewer".into()), PendingCommand::Agent("reviewer".into())),
+        (SlashCommand::Allow("bash".into()), PendingCommand::Allow("bash".into())),
+        (SlashCommand::Deny("write".into()), PendingCommand::Deny("write".into())),
+        (SlashCommand::Mode("yolo".into()), PendingCommand::Mode("yolo".into())),
+        (SlashCommand::Tasks, PendingCommand::Tasks),
+        (SlashCommand::Worktree, PendingCommand::Worktree),
+        (
+            SlashCommand::Issues("add flaky test".into()),
+            PendingCommand::Issues("add flaky test".into()),
+        ),
+        (SlashCommand::Fork, PendingCommand::Fork),
+    ] {
+        app.pending_command = None;
+        assert_eq!(app.handle_slash_test(cmd), Action::None);
+        assert_eq!(app.pending_command.as_ref(), Some(&pending) as Option<&PendingCommand>);
+    }
+}
+
+#[test]
+fn reasoning_deltas_display_only_when_enabled() {
+    use modron_core::StreamDelta;
+    let mut app = App::default();
+    app.on_delta(StreamDelta::Reasoning("chain".into()));
+    assert!(app.reasoning.is_empty(), "hidden by default");
+    app.show_reasoning = true;
+    app.on_delta(StreamDelta::Reasoning("chain of".into()));
+    app.on_delta(StreamDelta::Text("answer".into()));
+    assert_eq!(app.reasoning, "chain of");
+    assert_eq!(app.streaming, "answer");
 }
