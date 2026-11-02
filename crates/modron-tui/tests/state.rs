@@ -7,6 +7,18 @@ use modron_tui::{Action, App, PendingApproval, PendingCommand, SlashCommand};
 use serde_json::json;
 use std::sync::mpsc;
 
+fn history_text(app: &App) -> Vec<String> {
+    app.history
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
+}
+
 fn line_text(line: &ratatui::text::Line) -> String {
     line.spans
         .iter()
@@ -174,9 +186,10 @@ fn tool_lines_render_start_and_done() {
         is_error: false,
         bytes: 42,
     });
-    assert_eq!(app.tool_lines.len(), 2);
-    assert!(app.tool_lines[0].contains("● bash …"));
-    assert!(app.tool_lines[1].contains("done (42 B)"));
+    let hist = history_text(&app);
+    assert_eq!(hist.len(), 2);
+    assert!(hist[0].contains("● bash …"));
+    assert!(hist[1].contains("done (42 B)"));
     assert!(app.current_tool.is_none());
 }
 
@@ -201,11 +214,18 @@ fn finish_turn_flushes_tools_and_answer_and_updates_totals() {
         1,
         id,
     );
+    // Tool activity went into the history at event time; finish_turn
+    // appends the answer + usage and returns exactly those.
     assert!(
-        lines.iter().any(|l| line_text(l).contains("● bash")),
-        "tool lines flush: {lines:?}"
+        history_text(&app).iter().any(|l| l.contains("● bash")),
+        "tool lines in history: {:?}",
+        history_text(&app)
     );
     assert!(lines.iter().any(|l| line_text(l) == "the full answer"));
+    assert!(
+        history_text(&app).iter().any(|l| l == "the full answer"),
+        "answer committed to history"
+    );
     assert_eq!(app.cumulative.total(), 120);
     assert!(app.session_id == Some(id));
     assert!(!app.running);
@@ -326,7 +346,7 @@ fn slash_commands_are_handled_locally() {
     }
     let action = app.on_key(key(crossterm::event::KeyCode::Enter));
     assert_eq!(action, Action::None, "help is local, not submitted");
-    assert!(app.tool_lines.iter().any(|l| l.contains("/exit")));
+    assert!(history_text(&app).iter().any(|l| l.contains("/exit")));
 
     // /exit quits
     let mut app2 = App::default();
@@ -436,7 +456,7 @@ fn backslash_enter_continues_the_line() {
 fn multi_line_task_echoes_as_indented_block() {
     let mut app = App::default();
     app.begin_task("one\ntwo\nthree");
-    assert_eq!(app.tool_lines, vec!["❯ one", "  two", "  three"]);
+    assert_eq!(history_text(&app), vec!["❯ one", "  two", "  three"]);
 }
 
 // ── Slash command expansion (Phase 14) ────────────────────────────────────
@@ -523,8 +543,7 @@ fn goal_sets_clears_and_rides_along_on_tasks() {
     assert!(ridden.contains("GOAL COMPLETE"), "{ridden}");
     // begin_task echoes the goal line.
     app.begin_task(&ridden);
-    assert!(app
-        .tool_lines
+    assert!(history_text(&app)
         .iter()
         .any(|l| l.contains("[goal: all tests green]")));
     // Bare /goal clears.
@@ -606,11 +625,11 @@ fn theme_slash_lists_and_switches() {
     assert_eq!(app.theme.name, "modron");
     app.handle_slash_test(SlashCommand::Theme(String::new()));
     assert!(
-        app.tool_lines
+        history_text(&app)
             .iter()
             .any(|l| l.contains("midnight") && l.contains("mono")),
         "{:?}",
-        app.tool_lines
+        history_text(&app)
     );
     app.handle_slash_test(SlashCommand::Theme("midnight".into()));
     assert_eq!(app.theme.name, "midnight");
@@ -621,9 +640,11 @@ fn theme_slash_lists_and_switches() {
     app.handle_slash_test(SlashCommand::Theme("no-such-theme".into()));
     assert_eq!(app.theme.name, "midnight", "unknown theme does not switch");
     assert!(
-        app.tool_lines.iter().any(|l| l.contains("unknown theme")),
+        history_text(&app)
+            .iter()
+            .any(|l| l.contains("unknown theme")),
         "{:?}",
-        app.tool_lines
+        history_text(&app)
     );
 }
 
@@ -929,4 +950,72 @@ fn long_multiline_input_scrolls_to_keep_the_cursor_visible() {
     assert!(frame.contains("line 8"), "last line visible: {frame:?}");
     assert!(frame.contains("line 8▎"), "cursor on it: {frame:?}");
     assert!(!frame.contains("line 1\n"), "first line scrolled out");
+}
+
+#[test]
+fn internal_scrollback_pages_and_follows() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    for i in 0..50 {
+        app.note(format!("line {i}"));
+    }
+    app.last_history_height = 10;
+
+    // Following the tail: the last lines are the window.
+    let frame = render(&mut app, 80, 16);
+    assert!(frame.contains("line 49"), "tail visible: {frame:?}");
+    assert!(!frame.contains("line 0\n"), "top scrolled out");
+
+    // PageUp scrolls up a page (the render set the page height to 12:
+    // 16 rows - 1 status - 3 input); the indicator appears.
+    assert_eq!(app.on_key(key(KeyCode::PageUp)), Action::None);
+    assert_eq!(app.history_offset, 12);
+    let frame = render(&mut app, 80, 16);
+    assert!(frame.contains("lines above"), "scroll indicator: {frame:?}");
+    assert!(!frame.contains("line 49\n"), "tail left the window");
+
+    // New content while scrolled does NOT move the view.
+    app.note("line 50");
+    assert_eq!(app.history_offset, 12, "anchored while scrolled");
+
+    // PageDown beyond the bottom clamps to live; Esc then clears the input.
+    app.on_key(key(KeyCode::PageDown));
+    assert_eq!(app.history_offset, 0);
+    app.on_key(key(KeyCode::PageDown)); // clamps at live
+    app.input = "leftover".into();
+    app.cursor = 8;
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.input.is_empty(), "esc clears input once live");
+
+    // Scrolled-up Esc jumps to live instead of clearing.
+    app.on_key(key(KeyCode::PageUp));
+    app.input = "keep me".into();
+    app.cursor = 7;
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(app.input, "keep me", "input kept on the jump-to-live esc");
+    assert_eq!(app.history_offset, 0);
+
+    // Wheel steps (scroll_history) clamp at both ends.
+    app.scroll_history(999);
+    assert_eq!(app.history_offset, 50);
+    app.scroll_history(-999);
+    assert_eq!(app.history_offset, 0);
+}
+
+#[test]
+fn streaming_renders_as_live_tail_in_the_history_zone() {
+    let mut app = App {
+        running: true,
+        model_label: "glm-5.3".into(),
+        ..App::default()
+    };
+    app.note("committed line");
+    app.on_delta(StreamDelta::Text("streaming answer text".into()));
+    let frame = render(&mut app, 80, 10);
+    assert!(frame.contains("committed line"), "history shows: {frame:?}");
+    assert!(
+        frame.contains("streaming answer text"),
+        "live tail below history: {frame:?}"
+    );
+    assert!(frame.contains("working"), "working title: {frame:?}");
 }

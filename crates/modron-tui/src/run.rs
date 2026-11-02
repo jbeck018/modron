@@ -1,11 +1,13 @@
-//! The TUI run loop: inline viewport + crossterm events + engine task.
+//! The TUI run loop: fullscreen alternate screen + crossterm events +
+//! engine task.
 //!
-//! Threading model (see LEDGER Phase 1d): the render loop owns the terminal
-//! and polls at ~20fps (no 60fps chase — Claude Code's alt-screen mode exists
-//! because of redraw cost, and we avoid that cost by only rendering the live
-//! region). The engine runs on the Tokio runtime; deltas/tool events arrive
-//! over std channels; approvals queue into a shared slot and park the engine
-//! task via `tokio::task::block_in_place` until the user decides.
+//! Threading model: the render loop owns the terminal and redraws the full
+//! screen each tick (~20fps — the alt screen makes whole-frame redraws the
+//! simple, deterministic option; the scrollback is app state, so no
+//! insert_before games). The engine runs on the Tokio runtime; deltas/tool
+//! events arrive over std channels; approvals queue into a shared slot and
+//! park the engine task via `tokio::task::block_in_place` until the user
+//! decides.
 
 use crate::{App, PendingApproval, PendingCommand};
 use modron_core::{
@@ -37,12 +39,7 @@ pub struct TuiConfig {
     pub model_label: String,
 }
 
-/// Fixed live-region height: input box + status + streaming tail. The
-/// earlier reactive grow/shrink viewport repositioned ratatui's inline
-/// region mid-session and left stale frames frozen in scrollback (the
-/// ghost "working" input box). A fixed region with internal flex layout
-/// (streaming/subagents/approval trade space inside it) is deterministic.
-const VIEWPORT_HEIGHT: u16 = 10;
+/// Poll cadence for crossterm events (and the spinner tick).
 const TICK: Duration = Duration::from_millis(50);
 
 /// Shared approval slot: the engine-side approver queues a call; the render
@@ -128,37 +125,28 @@ pub async fn run_with(
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
-    // NO alternate screen: the normal buffer keeps native scrollback and
-    // selectable text (Claude Code's inline pattern). The earlier
-    // EnterAlternateScreen here was the black-void bug — the alt screen is
-    // an empty buffer with no history.
-    //
-    // Bottom anchoring: push the cursor to the terminal's last row before
-    // creating the inline viewport, so the input box pins to the bottom
-    // (like a chat). The padding lines scroll away as content commits.
-    {
-        use std::io::Write as _;
-        let rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
-        for _ in 0..rows.saturating_sub(1) {
-            let _ = writeln!(stdout);
-        }
-        let _ = stdout.flush();
-    }
+    // Fullscreen: the alternate screen is the TUI's own canvas and the
+    // scrollback lives INSIDE it (pgup/pgdn, wheel) — scrolling no longer
+    // moves the whole terminal session. The earlier inline-viewport design
+    // (Phase 1d) traded this away for native selection; that trade is
+    // reversed by user direction.
+    let _ = crossterm::terminal::Clear(crossterm::terminal::ClearType::All);
+    let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = ratatui::Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(
-                // Fit small terminals, but never resize after this.
-                crossterm::terminal::size()
-                    .map(|(_, r)| r)
-                    .unwrap_or(24)
-                    .clamp(4, VIEWPORT_HEIGHT + 1),
-            ),
-        },
-    )?;
+    let mut terminal = ratatui::Terminal::new(backend)?;
 
-    // Welcome banner (Phase 6g): the TUI opens onto content, not a void.
+    let mut app = App {
+        upgrade_notice,
+        session_id: resume_session,
+        model_label: model_label.clone(),
+        context_window: modron_router::lookup(&model_label)
+            .map(|info| info.context_window)
+            .unwrap_or(0),
+        ..App::default()
+    };
+
+    // Welcome banner (Phase 6g): the TUI opens onto content, not a void —
+    // now the first lines of the internal scrollback.
     {
         use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
@@ -186,26 +174,14 @@ pub async fn run_with(
                 Span::styled("  model ", Style::default().fg(crate::DIM)),
                 Span::styled(model_label.clone(), Style::default()),
                 Span::styled(
-                    "  ·  enter send · shift/alt+enter newline · \\+enter too · esc interrupt · ctrl+o detail",
+                    "  ·  enter send · shift/alt+enter newline · pgup/pgdn scroll · esc interrupt/live",
                     Style::default().fg(crate::DIM),
                 ),
             ]),
             Line::from(""),
         ];
-        for line in &welcome {
-            let _ = commit(&mut terminal, line);
-        }
+        app.push_history(welcome);
     }
-
-    let mut app = App {
-        upgrade_notice,
-        session_id: resume_session,
-        model_label: model_label.clone(),
-        context_window: modron_router::lookup(&model_label)
-            .map(|info| info.context_window)
-            .unwrap_or(0),
-        ..App::default()
-    };
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
     #[allow(unused_assignments)]
@@ -256,14 +232,14 @@ pub async fn run_with(
                     app.cursor = app.input.chars().count();
                     continue;
                 }
-                crossterm::event::Event::Mouse(me) => {
-                    if let crossterm::event::MouseEventKind::Down(
-                        crossterm::event::MouseButton::Left,
-                    ) = me.kind
-                    {
-                        app.on_click(me.column, me.row);
+                crossterm::event::Event::Mouse(me) => match me.kind {
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        app.on_click(me.column, me.row)
                     }
-                }
+                    crossterm::event::MouseEventKind::ScrollUp => app.scroll_history(3),
+                    crossterm::event::MouseEventKind::ScrollDown => app.scroll_history(-3),
+                    _ => {}
+                },
                 crossterm::event::Event::Key(key)
                     if key.kind == crossterm::event::KeyEventKind::Press =>
                 {
@@ -340,9 +316,7 @@ pub async fn run_with(
                                 // Give the runtime a beat to cancel.
                                 tokio::time::sleep(Duration::from_millis(30)).await;
                             }
-                            blank_frame(&mut terminal)?;
-                            let lines = app.finish_interrupted();
-                            commit_block(&mut terminal, &lines)?;
+                            app.finish_interrupted();
                         }
                         crate::Action::Quit => {
                             if let Some(task) = engine_task.take() {
@@ -358,34 +332,12 @@ pub async fn run_with(
         }
 
         // 3b. Slash commands needing engine/store powers (Phase 14): the
-        //     App parks a PendingCommand; execute it here, then commit the
-        //     result lines immediately (not at the next turn's end).
+        //     App parks a PendingCommand; execute it here — the result
+        //     lines land in the internal scrollback.
         if let Some(cmd) = app.pending_command.take() {
-            let mut lines = run_pending_command(&mut engine, &mut app, cmd).await;
-            lines.extend(std::mem::take(&mut app.tool_lines));
-            if !lines.is_empty() {
-                blank_frame(&mut terminal)?;
-                let owned: Vec<ratatui::text::Line<'static>> = lines
-                    .into_iter()
-                    .map(|l| {
-                        ratatui::text::Line::from(l)
-                            .style(ratatui::style::Style::default().fg(crate::DIM))
-                    })
-                    .collect();
-                commit_block(&mut terminal, &owned)?;
+            for line in run_pending_command(&mut engine, &mut app, cmd).await {
+                app.note(line);
             }
-        } else if !app.running && !app.tool_lines.is_empty() {
-            // Purely local slash output (/help, /model, …): show it now
-            // instead of waiting for the next completed turn.
-            let lines: Vec<ratatui::text::Line<'static>> = std::mem::take(&mut app.tool_lines)
-                .into_iter()
-                .map(|l| {
-                    ratatui::text::Line::from(l)
-                        .style(ratatui::style::Style::default().fg(crate::DIM))
-                })
-                .collect();
-            blank_frame(&mut terminal)?;
-            commit_block(&mut terminal, &lines)?;
         }
 
         // 4. Approve-rest mirror: when the user pressed `a`, future approvals
@@ -408,25 +360,22 @@ pub async fn run_with(
             }
             match outcome {
                 Outcome::Done(summary) => {
-                    let mut lines = app.swarm_summary();
-                    lines.extend(app.finish_turn(
+                    let swarm = app.swarm_summary();
+                    app.push_history(swarm);
+                    app.finish_turn(
                         summary.answer.clone(),
                         summary.usage,
                         summary.turns,
                         summary.tool_calls,
                         summary.session_id,
-                    ));
-                    blank_frame(&mut terminal)?;
-                    commit_block(&mut terminal, &lines)?;
+                    );
                 }
                 Outcome::Failed(e) => {
-                    let mut lines = app.finish_interrupted();
-                    lines
-                        .push(ratatui::text::Line::from(format!("error: {e}")).style(
-                            ratatui::style::Style::default().fg(ratatui::style::Color::Red),
-                        ));
-                    blank_frame(&mut terminal)?;
-                    commit_block(&mut terminal, &lines)?;
+                    app.finish_interrupted();
+                    let red = ratatui::style::Style::default().fg(ratatui::style::Color::Red);
+                    app.push_history(vec![
+                        ratatui::text::Line::from(format!("error: {e}")).style(red)
+                    ]);
                 }
                 Outcome::Aborted => {}
             }
@@ -437,14 +386,13 @@ pub async fn run_with(
             break;
         }
 
-        // 6. Render the live region; advance the spinner. The region height
-        // is FIXED (see VIEWPORT_HEIGHT) — no mid-session resizes.
+        // 6. Render the full screen; advance the spinner.
         app.spinner_tick += 1;
         terminal.draw(|frame| app.view(frame, frame.area()))?;
     }
 
-    // Teardown: flush the last status as a plain line so scrollback keeps a
-    // trace of the session, restore the terminal.
+    // Teardown: restore the terminal, then print the session id into the
+    // NORMAL buffer (it scrolls away with the alt screen otherwise).
     if kitty_keyboard {
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -456,6 +404,7 @@ pub async fn run_with(
         crossterm::event::DisableBracketedPaste,
         crossterm::event::DisableMouseCapture
     );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
     crossterm::terminal::disable_raw_mode()?;
     if let Some(id) = app.session_id {
         println!("session: {id} — resume with --resume {id}");
@@ -660,58 +609,6 @@ fn run_issues(engine: &Engine, arg: &str) -> Vec<String> {
         ));
     }
     out
-}
-
-/// Blank the live region before committing lines into scrollback: every
-/// `insert_before` scrolls the terminal up, and whatever is painted in the
-/// viewport at that moment (streaming tail, working-status frame — even the
-/// bordered input box) rides into scrollback as a stale duplicate. Drawing
-/// an empty frame first makes the scrolled-up rows blank.
-fn blank_frame(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-) -> anyhow::Result<()> {
-    // An empty draw emits nothing; terminal.clear() actually erases the
-    // viewport rows on screen and resets the back buffer, so the next
-    // insert_before/draw starts from a consistent state.
-    terminal.clear()?;
-    Ok(())
-}
-
-/// Commit one line into native scrollback above the live viewport.
-fn commit(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    line: &ratatui::text::Line<'static>,
-) -> anyhow::Result<()> {
-    commit_block(terminal, std::slice::from_ref(line))
-}
-
-/// Commit a block of lines into scrollback in ONE `insert_before` call.
-/// Sequential 1-line inserts were the duplicated-answer bug: each insert
-/// scrolls the screen up one row, pushing the painted viewport content
-/// (the streaming tail) above the viewport one row at a time, where later
-/// inserts' clears could no longer reach it. A single H-line insert
-/// scrolls once and its non-sparse draw overwrites everything the scroll
-/// pushed up, so nothing stale survives.
-fn commit_block(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    lines: &[ratatui::text::Line<'static>],
-) -> anyhow::Result<()> {
-    use ratatui::widgets::Widget as _;
-    if lines.is_empty() {
-        return Ok(());
-    }
-    terminal.insert_before(lines.len() as u16, |buf| {
-        for (i, line) in lines.iter().enumerate() {
-            let row = ratatui::layout::Rect {
-                x: 0,
-                y: i as u16,
-                width: buf.area.width,
-                height: 1,
-            };
-            ratatui::widgets::Paragraph::new(line.clone()).render(row, buf);
-        }
-    })?;
-    Ok(())
 }
 
 enum DeltaOrTool {

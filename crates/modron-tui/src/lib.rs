@@ -1,12 +1,13 @@
-//! modron-tui — the inline-viewport terminal UI (Phase 1d).
+//! modron-tui — the fullscreen terminal UI.
 //!
-//! Design lessons baked in (see LEDGER Phase 1d): Claude Code's inline
-//! pattern — completed content is committed to the native scrollback via
-//! `Terminal::insert_before`, and only the live region (status, streaming
-//! tail, input, approval prompt) is the managed viewport, so output stays
-//! selectable and terminal-scrollable. No alternate screen; no 60fps chase.
-//! Esc interrupts the running turn; ctrl+o toggles transcript detail;
-//! approvals render inline with y/n/a.
+//! Design history: Phase 1d used Claude Code's inline pattern (committed
+//! content via `Terminal::insert_before` into the native scrollback, a
+//! fixed live region below). That kept native text selection but scrolled
+//! the whole terminal session, so the TUI now owns the FULL screen
+//! (alternate screen) with an internal scrollback you page through with
+//! pgup/pgdn, the mouse wheel, and esc-to-live. Esc interrupts the
+//! running turn; ctrl+o toggles transcript detail; approvals render
+//! inline with y/n/a; the input is a real cursor field (arrows + click).
 //!
 //! This module is the pure state machine (`App`) — no TTY required to test.
 //! The terminal loop lives in [`run`].
@@ -229,10 +230,18 @@ pub struct App {
     pub input: String,
     /// Is a task running? (An approval can be pending while running.)
     pub running: bool,
-    /// Assistant text streamed so far this turn.
+    /// Assistant text streamed so far this turn (rendered as the live tail
+    /// of the history zone; committed to `history` at turn end).
     pub streaming: String,
-    /// Completed tool lines this turn (flushed to scrollback on turn end).
-    pub tool_lines: Vec<String>,
+    /// The TUI's own scrollback (fullscreen mode): completed lines live
+    /// here, never in the terminal's native buffer.
+    pub history: Vec<Line<'static>>,
+    /// Lines scrolled up from the bottom of `history` (0 = following the
+    /// live tail). New content does NOT move the view while scrolled.
+    pub history_offset: usize,
+    /// History zone height from the last render (the page step for
+    /// PgUp/PgDn and the offset clamp).
+    pub last_history_height: u16,
     /// Tool currently executing (for the spinner line).
     pub current_tool: Option<String>,
     pub pending_approval: Option<PendingApproval>,
@@ -491,9 +500,26 @@ impl App {
                 self.move_input_line(false);
                 Action::None
             }
+            // Internal scrollback paging (fullscreen mode).
+            KeyCode::PageUp => {
+                let page = (self.last_history_height as i32).max(3);
+                self.scroll_history(page);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                let page = (self.last_history_height as i32).max(3);
+                self.scroll_history(-page);
+                Action::None
+            }
+            // Esc while idle: back to the live tail first, then clear the
+            // input on a second press.
             KeyCode::Esc if !self.running => {
-                self.input.clear();
-                self.cursor = 0;
+                if self.history_offset > 0 {
+                    self.history_offset = 0;
+                } else {
+                    self.input.clear();
+                    self.cursor = 0;
+                }
                 Action::None
             }
             KeyCode::Char(c) => {
@@ -607,12 +633,31 @@ impl App {
             .collect()
     }
 
-    /// Push text as one tool line per row (a committed line renders as one
-    /// screen row, so embedded newlines must be split).
+    /// Commit lines into the internal scrollback. When the user is
+    /// scrolled up, the view stays anchored (offset unchanged).
+    pub fn push_history(&mut self, lines: Vec<Line<'static>>) {
+        self.history.extend(lines);
+    }
+
+    /// A dim meta line into the scrollback (slash-command output).
+    pub fn note(&mut self, text: impl Into<String>) {
+        let dim = Style::default().fg(self.theme.resolved().dim);
+        self.history.push(Line::from(text.into()).style(dim));
+    }
+
+    /// Push multi-line text as one dim row per line.
     fn push_lines(&mut self, text: impl Into<String>) {
+        let dim = Style::default().fg(self.theme.resolved().dim);
         for line in text.into().lines() {
-            self.tool_lines.push(line.to_string());
+            self.history.push(Line::from(line.to_string()).style(dim));
         }
+    }
+
+    /// Scroll the internal history: positive lines go up (older), negative
+    /// goes back down; 0 offset = following the live tail.
+    pub fn scroll_history(&mut self, up: i32) {
+        let max = self.history.len().saturating_sub(1) as i32;
+        self.history_offset = (self.history_offset as i32 + up).clamp(0, max) as usize;
     }
 
     /// Handle a slash command locally (Phase 10): returns an Action.
@@ -632,28 +677,27 @@ impl App {
                 Action::None
             }
             SlashCommand::Clear => {
-                self.tool_lines.clear();
+                self.history.clear();
+                self.history_offset = 0;
                 self.streaming.clear();
+                self.reasoning.clear();
                 Action::None
             }
             SlashCommand::Compact => {
                 // Signal the run loop to force a compaction before the next
                 // turn; the engine handles it when context is over threshold.
-                self.tool_lines.push(
-                    "(compaction will trigger on the next turn if context is over threshold)"
-                        .to_string(),
+                self.note(
+                    "(compaction will trigger on the next turn if context is over threshold)",
                 );
                 Action::None
             }
             SlashCommand::Model(name) => {
                 if name.is_empty() {
-                    self.tool_lines
-                        .push(format!("current model: {}", self.model_label));
-                    self.tool_lines
-                        .push("usage: /model glm-5.3-flash".to_string());
+                    self.note(format!("current model: {}", self.model_label));
+                    self.note("usage: /model glm-5.3-flash");
                 } else {
                     self.model_label = name.clone();
-                    self.tool_lines.push(format!(
+                    self.note(format!(
                         "switched to {name} (takes effect on the next turn)"
                     ));
                 }
@@ -667,12 +711,11 @@ impl App {
                 Action::None
             }
             SlashCommand::Sessions => {
-                self.tool_lines
-                    .push("(session listing: run `modron sessions` outside the TUI)".to_string());
+                self.note("(session listing: run `modron sessions` outside the TUI)");
                 Action::None
             }
             SlashCommand::Sandbox(mode) => {
-                self.tool_lines.push(format!(
+                self.note(format!(
                     "sandbox: {mode} (takes effect on restart — the sandbox is set at launch)"
                 ));
                 Action::None
@@ -680,7 +723,7 @@ impl App {
             SlashCommand::Reasoning => {
                 self.show_reasoning = !self.show_reasoning;
                 self.reasoning.clear();
-                self.tool_lines.push(format!(
+                self.note(format!(
                     "reasoning display: {}",
                     if self.show_reasoning { "on" } else { "off" }
                 ));
@@ -688,7 +731,7 @@ impl App {
             }
             SlashCommand::Btw(question) => {
                 if question.trim().is_empty() {
-                    self.tool_lines.push("usage: /btw <quick question>".into());
+                    self.note("usage: /btw <quick question>");
                     return Action::None;
                 }
                 Action::Submit(format!(
@@ -730,7 +773,7 @@ impl App {
             }
             SlashCommand::Plan(task) => {
                 if task.trim().is_empty() {
-                    self.tool_lines.push("usage: /plan <task>".into());
+                    self.note("usage: /plan <task>");
                     return Action::None;
                 }
                 Action::Submit(format!(
@@ -747,8 +790,7 @@ impl App {
             SlashCommand::Goal(condition) => {
                 if condition.trim().is_empty() {
                     self.goal = None;
-                    self.tool_lines
-                        .push("goal cleared — tasks run normally again".into());
+                    self.note("goal cleared — tasks run normally again");
                 } else {
                     self.goal = Some(condition.trim().to_string());
                     self.push_lines(format!(
@@ -786,14 +828,14 @@ impl App {
                     ));
                 } else if Theme::builtin_names().contains(&name) {
                     self.theme = Theme::builtin(name);
-                    self.tool_lines.push(format!("theme: {name}"));
+                    self.note(format!("theme: {name}"));
                 } else {
                     match Theme::load(&crate::theme_dir(), name) {
                         Some(theme) => {
                             self.theme = theme;
-                            self.tool_lines.push(format!("theme: {name}"));
+                            self.note(format!("theme: {name}"));
                         }
-                        None => self.tool_lines.push(format!(
+                        None => self.note(format!(
                             "unknown theme {name:?} — available: {}",
                             Theme::available(&crate::theme_dir()).join(", ")
                         )),
@@ -803,8 +845,7 @@ impl App {
             }
             SlashCommand::Compress => self.handle_slash(SlashCommand::Compact),
             SlashCommand::Unknown(name) => {
-                self.tool_lines
-                    .push(format!("unknown command /{name} — try /help"));
+                self.note(format!("unknown command /{name} — try /help"));
                 Action::None
             }
         }
@@ -828,7 +869,9 @@ impl App {
         match activity {
             ToolActivity::Start { name } => {
                 self.current_tool = Some(name.clone());
-                self.tool_lines.push(format!("● {name} …"));
+                let style = Style::default().fg(self.theme.resolved().tool);
+                self.history
+                    .push(Line::from(format!("● {name} …")).style(style));
             }
             ToolActivity::Done {
                 name,
@@ -837,8 +880,9 @@ impl App {
             } => {
                 self.current_tool = None;
                 let mark = if is_error { "error" } else { "done" };
-                self.tool_lines
-                    .push(format!("● {name} — {mark} ({bytes} B)"));
+                let style = Style::default().fg(self.theme.resolved().tool);
+                self.history
+                    .push(Line::from(format!("● {name} — {mark} ({bytes} B)")).style(style));
             }
             ToolActivity::SubagentStarted { id, label } => {
                 self.subagents.push(SwarmRow {
@@ -936,11 +980,8 @@ impl App {
         self.cumulative.output_tokens += usage.output_tokens;
         self.cumulative.cached_input_tokens += usage.cached_input_tokens;
 
-        // Styled scrollback: tool lines dim-cyan, answer default, meta dim.
+        // Commit into the internal scrollback (returned for tests).
         let mut lines: Vec<Line<'static>> = Vec::new();
-        for tool in std::mem::take(&mut self.tool_lines) {
-            lines.push(Line::from(tool).style(Style::default().fg(t.tool)));
-        }
         if answer.is_empty() {
             lines.push(
                 Line::from("(no answer — turn/budget limit hit; see transcript)")
@@ -971,10 +1012,11 @@ impl App {
             .style(Style::default().fg(t.dim)),
         );
         lines.push(Line::from(""));
+        self.history.extend(lines.clone());
         lines
     }
 
-    /// The turn was interrupted: flush partial tool lines + a note.
+    /// The turn was interrupted: note it in the scrollback.
     pub fn finish_interrupted(&mut self) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
         self.running = false;
@@ -982,15 +1024,12 @@ impl App {
         self.current_tool = None;
         self.status_note =
             Some("interrupted — partial work is persisted; resume with --resume".into());
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for tool in std::mem::take(&mut self.tool_lines) {
-            lines.push(Line::from(tool).style(Style::default().fg(t.tool)));
-        }
-        lines.push(
+        let lines = vec![
             Line::from("(interrupted — partial work is persisted; resume with --resume)")
                 .style(Style::default().fg(t.warning)),
-        );
-        lines.push(Line::from(""));
+            Line::from(""),
+        ];
+        self.history.extend(lines.clone());
         lines
     }
 
@@ -999,16 +1038,18 @@ impl App {
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
-        // A committed line renders as one screen row, so a multi-line task
-        // echoes as an indented block.
+        // The task echoes into the scrollback as an indented block.
         let mut lines = task.split('\n');
-        self.tool_lines
-            .push(format!("❯ {}", lines.next().unwrap_or_default()));
+        let accent = Style::default().fg(self.theme.resolved().accent);
+        self.history
+            .push(Line::from(format!("❯ {}", lines.next().unwrap_or_default())).style(accent));
         for line in lines {
-            self.tool_lines.push(format!("  {line}"));
+            self.history.push(Line::from(format!("  {line}")));
         }
         if let Some(goal) = self.goal.clone() {
-            self.tool_lines.push(format!("  [goal: {goal}]"));
+            let dim = Style::default().fg(self.theme.resolved().dim);
+            self.history
+                .push(Line::from(format!("  [goal: {goal}]")).style(dim));
         }
     }
 
@@ -1117,85 +1158,87 @@ impl App {
         use ratatui::layout::{Constraint, Layout};
         use ratatui::widgets::Paragraph;
 
-        // Split: everything above vs the bordered input box. The box grows
-        // with its content (2 borders + chips row + one row per text line)
-        // up to 8 rows, then scrolls internally.
+        // Fullscreen layout, bottom-up: the bordered input box, the slash
+        // popup, the status line, the subagent panel — everything above is
+        // the internal scrollback. The box grows with its content (2
+        // borders + chips row + one row per text line) up to 8 rows, then
+        // scrolls internally.
         let chip_rows = (!self.attachment_chips.is_empty()) as u16;
         let text_rows = self.input.matches('\n').count() as u16 + 1;
         let input_height = (2 + chip_rows + text_rows)
             .min(8)
             .min(area.height.saturating_sub(2));
-        let outer =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).split(area);
-        let top = outer[0];
-        let input_area = outer[1];
 
-        // Slash-command popup: the filtered catalog rows live between the
-        // status line and the input box. Capped at 5 rows and by whatever
-        // height remains in the top zone — the viewport is fixed-size, so
-        // the popup must never push the other sections out.
         let matches = self.slash_matches();
         let sel = self.slash_selected.min(matches.len().saturating_sub(1));
-        let popup_h = if matches.is_empty() {
-            0
-        } else {
-            let mut reserved: u16 = if self.pending_approval.is_some() {
-                2
-            } else {
-                1
-            };
-            if !self.reasoning.is_empty() {
-                reserved += 2;
-            }
-            if !self.streaming.is_empty() {
-                reserved += 1;
-            }
-            reserved += self.subagents.len() as u16;
-            let avail = top.height.saturating_sub(reserved);
-            (matches.len() as u16).min(5).min(avail)
-        };
+        let popup_h = (matches.len() as u16).min(5);
 
-        // Top zone rows: reasoning tail, streaming (fills), subagents,
-        // approval/status.
-        let mut rows: Vec<Constraint> = Vec::new();
-        if !self.reasoning.is_empty() {
-            rows.push(Constraint::Length(2));
-        }
-        if !self.streaming.is_empty() {
-            rows.push(Constraint::Min(1));
-        }
+        let mut rows: Vec<Constraint> = vec![Constraint::Min(1)]; // scrollback
         if !self.subagents.is_empty() {
-            rows.push(Constraint::Length(self.subagents.len() as u16));
+            rows.push(Constraint::Length(self.subagents.len() as u16 + 1));
         }
-        if self.pending_approval.is_some() {
-            rows.push(Constraint::Length(2));
+        rows.push(if self.pending_approval.is_some() {
+            Constraint::Length(2)
         } else {
-            rows.push(Constraint::Length(1));
-        }
+            Constraint::Length(1)
+        });
         if popup_h > 0 {
             rows.push(Constraint::Length(popup_h));
         }
-        let chunks = Layout::vertical(rows).split(top);
+        rows.push(Constraint::Length(input_height));
+        let chunks = Layout::vertical(rows).split(area);
+        let input_area = chunks[chunks.len() - 1];
 
-        let mut idx = 0;
-        if !self.reasoning.is_empty() {
-            let tail = streaming_tail(&self.reasoning, 2, chunks[0].width as usize);
-            frame.render_widget(
-                Paragraph::new(tail)
-                    .style(Style::default().fg(th.dim).add_modifier(Modifier::ITALIC)),
-                chunks[0],
-            );
-            idx += 1;
+        // ── Internal scrollback ──
+        let hist_area = chunks[0];
+        self.last_history_height = hist_area.height;
+        self.history_offset = self
+            .history_offset
+            .min(self.history.len().saturating_sub(1));
+        let following = self.history_offset == 0;
+        let mut body = hist_area.height as usize;
+        if !following {
+            body = body.saturating_sub(1); // the "lines above" indicator
         }
-        if !self.streaming.is_empty() {
-            let tail = streaming_tail(
-                &self.streaming,
-                chunks[idx].height as usize,
-                chunks[idx].width as usize,
-            );
-            frame.render_widget(Paragraph::new(tail), chunks[idx]);
-            idx += 1;
+        // Live tails (reasoning above the answer) render below the
+        // committed lines while following.
+        let mut tails: Vec<Line> = Vec::new();
+        if following {
+            if !self.reasoning.is_empty() {
+                tails.extend(
+                    streaming_tail(&self.reasoning, 2, hist_area.width as usize)
+                        .into_iter()
+                        .map(|l| {
+                            l.style(Style::default().fg(th.dim).add_modifier(Modifier::ITALIC))
+                        }),
+                );
+            }
+            if !self.streaming.is_empty() {
+                let left = body.saturating_sub(tails.len()).max(1);
+                tails.extend(streaming_tail(
+                    &self.streaming,
+                    left,
+                    hist_area.width as usize,
+                ));
+            }
+            body = body.saturating_sub(tails.len());
         }
+        let end = self.history.len() - self.history_offset;
+        let start = end.saturating_sub(body);
+        let mut hist: Vec<Line> = Vec::new();
+        if !following {
+            let indicator = if start == 0 {
+                "↑ top of session · pgdn scroll · esc live".to_string()
+            } else {
+                format!("↑ {start} lines above · pgup/pgdn scroll · esc live")
+            };
+            hist.push(Line::from(indicator).style(Style::default().fg(th.dim)));
+        }
+        hist.extend(self.history[start..end].iter().cloned());
+        hist.extend(tails);
+        frame.render_widget(Paragraph::new(hist), hist_area);
+
+        let mut idx = 1;
 
         if !self.subagents.is_empty() {
             let active = self.subagents.iter().filter(|r| r.done.is_none()).count();
