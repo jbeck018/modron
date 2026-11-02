@@ -405,9 +405,10 @@ pub mod oauth {
         parse_callback_url(&callback_url, expected_state)
     }
 
-    /// Exchange the callback code for tokens (authorization_code grant).
-    /// OAuth2 token endpoints require form encoding — the Anthropic
-    /// endpoint rejects JSON bodies with "Invalid request format".
+    /// Exchange the callback code for tokens. Anthropic's endpoint is
+    /// CUSTOM JSON (not the RFC form encoding) and requires `state` in
+    /// the body — learned live: form encoding or a missing state both
+    /// answer "Invalid request format".
     pub async fn exchange_code(session: &LoginSession, code: &str) -> anyhow::Result<TokenSet> {
         exchange_code_at(TOKEN_URL, session, code).await
     }
@@ -422,25 +423,31 @@ pub mod oauth {
         let client = reqwest::Client::new();
         let response = client
             .post(token_url)
-            .form(&token_exchange_form(code, &session.verifier, session.port))
+            .json(&token_exchange_body(
+                code,
+                &session.state,
+                &session.verifier,
+                session.port,
+            ))
             .send()
             .await?;
+        // No error_for_status: this endpoint answers 200 with an error
+        // JSON body, and the body is the diagnostic worth surfacing.
         let body: Value = response.json().await?;
         parse_token_response(&body)
     }
 
-    /// The form fields of the authorization_code exchange.
-    pub fn token_exchange_form(code: &str, verifier: &str, port: u16) -> Vec<(String, String)> {
-        vec![
-            ("grant_type".to_string(), "authorization_code".to_string()),
-            ("code".to_string(), code.to_string()),
-            (
-                "redirect_uri".to_string(),
-                format!("http://localhost:{port}/callback"),
-            ),
-            ("client_id".to_string(), CLIENT_ID.to_string()),
-            ("code_verifier".to_string(), verifier.to_string()),
-        ]
+    /// The JSON body of the authorization_code exchange (mirrors Claude
+    /// Code's reverse-engineered request — state included).
+    pub fn token_exchange_body(code: &str, state: &str, verifier: &str, port: u16) -> Value {
+        json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "state": state,
+            "client_id": CLIENT_ID,
+            "redirect_uri": format!("http://localhost:{port}/callback"),
+            "code_verifier": verifier,
+        })
     }
 
     /// PKCE pair: (verifier, S256 challenge). Verifier is 64 chars from
@@ -746,21 +753,34 @@ pub mod oauth {
                     .id_token
                     .as_deref()
                     .ok_or_else(|| anyhow!("token response missing id_token"))?;
+                // Account id: nested (or legacy top-level) JWT claim,
+                // with the token response body as a last resort.
                 let account = account_id(id_token)
+                    .or_else(|| {
+                        body.get("account_id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
                     .ok_or_else(|| anyhow!("id token carries no chatgpt_account_id claim"))?;
                 return Ok((tokens, account));
             }
         }
 
-        /// Extract `chatgpt_account_id` from an OIDC id token (JWT payload,
-        /// signature NOT verified — the token came from the token endpoint
-        /// over TLS, and we only read our own account id from it).
+        /// Extract `chatgpt_account_id` from an OIDC id token. Current
+        /// OpenAI tokens nest it under the `https://api.openai.com/auth`
+        /// claim object; older ones carried it top-level (both accepted).
+        /// Signature NOT verified — the token came from the token
+        /// endpoint over TLS, and we only read our own account id.
         pub fn account_id(id_token: &str) -> Option<String> {
             let payload_b64 = id_token.split('.').nth(1)?;
             let decoded = base64url_decode(payload_b64)?;
             let value: Value = serde_json::from_slice(&decoded).ok()?;
+            if let Some(id) = value.get("chatgpt_account_id").and_then(Value::as_str) {
+                return Some(id.to_string());
+            }
             value
-                .get("chatgpt_account_id")
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
                 .and_then(Value::as_str)
                 .map(String::from)
         }
@@ -901,10 +921,16 @@ pub mod oauth {
 
         #[test]
         fn chatgpt_account_id_extracts_from_jwt() {
-            // payload {"chatgpt_account_id":"acc-123"} in base64url
+            // Legacy top-level claim.
             let payload = base64url_nopad(br#"{"chatgpt_account_id":"acc-123"}"#);
             let jwt = format!("header.{payload}.signature");
             assert_eq!(chatgpt::account_id(&jwt).as_deref(), Some("acc-123"));
+            // Current tokens nest it under the auth namespace.
+            let nested = base64url_nopad(
+                br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc-456"}}"#,
+            );
+            let jwt = format!("header.{nested}.signature");
+            assert_eq!(chatgpt::account_id(&jwt).as_deref(), Some("acc-456"));
             assert_eq!(chatgpt::account_id("not-a-jwt"), None);
             assert_eq!(chatgpt::account_id("a.b.c"), None); // payload not JSON
         }
@@ -1025,12 +1051,12 @@ pub mod oauth {
         }
 
         #[tokio::test]
-        async fn token_exchange_is_form_encoded_on_the_wire() {
+        async fn token_exchange_is_custom_json_with_state_on_the_wire() {
             use std::io::{Read, Write};
             use std::net::TcpListener;
-            // OAuth2 token endpoints reject JSON with "Invalid request
-            // format" (learned live against Anthropic's endpoint): prove
-            // the request is form-encoded with all five fields.
+            // Anthropic's token endpoint is CUSTOM: JSON body (not the
+            // RFC form encoding) WITH the state field — omitting either
+            // gets "Invalid request format" (learned live twice).
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let token_url = format!("http://{addr}/oauth/token");
@@ -1051,7 +1077,7 @@ pub mod oauth {
             });
             let session = LoginSession {
                 url: String::new(),
-                state: "s".into(),
+                state: "st-1".into(),
                 verifier: "v".repeat(50),
                 port: 54545,
             };
@@ -1063,19 +1089,23 @@ pub mod oauth {
             assert!(
                 request
                     .to_ascii_lowercase()
-                    .contains("content-type: application/x-www-form-urlencoded"),
-                "form content type: {request}"
+                    .contains("content-type: application/json"),
+                "json content type: {request}"
             );
             assert!(
-                request.contains("grant_type=authorization_code"),
+                request.contains(r#""grant_type":"authorization_code""#),
                 "{request}"
             );
-            assert!(request.contains("code=code-1"), "{request}");
+            assert!(request.contains(r#""code":"code-1""#), "{request}");
             assert!(
-                request.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback"),
+                request.contains(r#""state":"st-1""#),
+                "state is required: {request}"
+            );
+            assert!(
+                request.contains(r#""redirect_uri":"http://localhost:54545/callback""#),
                 "{request}"
             );
-            assert!(request.contains("code_verifier=vvvv"), "{request}");
+            assert!(request.contains(r#""code_verifier":"vvvv"#), "{request}");
         }
     }
 }

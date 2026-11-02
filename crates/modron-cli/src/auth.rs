@@ -184,7 +184,7 @@ async fn chatgpt_login() -> anyhow::Result<()> {
         account_id: account,
     })?;
     println!(
-        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (models gpt-5, gpt-5-codex, gpt-5-mini)",
+        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (models gpt-6-astra, gpt-5.6-sol)",
         modron_core::auth::mask_key(&tokens.access_token)
     );
     Ok(())

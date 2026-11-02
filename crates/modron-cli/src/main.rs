@@ -41,6 +41,9 @@ enum ProviderChoice {
     Anthropic,
     /// Any OpenAI-compatible endpoint (OpenAI, OpenRouter, DeepSeek, Ollama…).
     OpenaiCompat,
+    /// ChatGPT subscription sign-in (Responses API on the ChatGPT
+    /// backend; tokens from `/auth` → OpenAI → sign in with browser).
+    Chatgpt,
     /// Keyless scripted demo provider (no network, runs the built-in script).
     Mock,
     /// Z.ai (Zhipu) GLM models — OpenAI-compatible, key via `ZAI_API_KEY`.
@@ -52,6 +55,7 @@ impl ProviderChoice {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenaiCompat => "openai-compat",
+            Self::Chatgpt => "chatgpt",
             Self::Mock => "mock",
             Self::Zai => "zai",
         }

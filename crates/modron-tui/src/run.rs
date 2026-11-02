@@ -270,6 +270,21 @@ pub async fn run_with(
                     crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                         app.on_click(me.column, me.row)
                     }
+                    crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                        app.extend_selection(me.column, me.row)
+                    }
+                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                        // Selection release: copy to the system clipboard.
+                        if let Some(text) = app.take_selected_text() {
+                            let chars = text.chars().count();
+                            if crate::clipboard::copy_text(&text) {
+                                app.status_note = Some(format!("copied {chars} chars"));
+                            } else {
+                                app.status_note =
+                                    Some("selection made — no clipboard tool found".into());
+                            }
+                        }
+                    }
                     crossterm::event::MouseEventKind::ScrollUp => app.scroll_history(3),
                     crossterm::event::MouseEventKind::ScrollDown => app.scroll_history(-3),
                     _ => {}
@@ -425,7 +440,7 @@ pub async fn run_with(
                         },
                     )?;
                     Ok(format!(
-                        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (gpt-5-codex, gpt-5-mini)",
+                        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (models gpt-6-astra, gpt-5.6-sol)",
                         modron_core::auth::mask_key(&tokens.access_token)
                     ))
                 }

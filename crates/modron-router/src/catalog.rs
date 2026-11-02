@@ -41,16 +41,40 @@ output_per_m = 5.0
 tier = "cheap"
 
 # ChatGPT subscription models (OAuth sign-in, plan-billed: 0/0 pricing).
-# Model NAMES are unique catalog-wide, so the chatgpt provider carries the
-# codex variant; gpt-5/gpt-5-mini also work with `--provider chatgpt` (the
-# forced provider wins over the catalog's per-name provider).
+# The lineup is whatever /backend-api/codex/models returns for the signed
+# in account (verified live 2026-11-02); other names 400 with
+# "model is not supported when using Codex with a ChatGPT account".
 [[models]]
-name = "gpt-5-codex"
+name = "gpt-6-astra"
 provider = "chatgpt"
 context_window = 400_000
 input_per_m = 0.0
 output_per_m = 0.0
 tier = "strong"
+
+[[models]]
+name = "gpt-5.6-sol"
+provider = "chatgpt"
+context_window = 400_000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "strong"
+
+[[models]]
+name = "gpt-5.6-terra"
+provider = "chatgpt"
+context_window = 400_000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "cheap"
+
+[[models]]
+name = "gpt-5.6-luna"
+provider = "chatgpt"
+context_window = 400_000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "cheap"
 
 [[models]]
 name = "gpt-5"

@@ -447,6 +447,65 @@ pub struct App {
     pub current_model: String,
     /// The active theme name (marks /theme's menu row).
     pub current_theme: String,
+    /// A text selection in the history (drag with the mouse); Esc clears.
+    pub selection: Option<Selection>,
+    /// History-zone geometry from the last render — maps mouse rows to
+    /// history indices (start index, visible committed rows, following?,
+    /// top screen row).
+    pub hist_geom: (usize, usize, bool, u16),
+}
+
+/// An in-TUI text selection over history lines: `(history index, column)`
+/// anchor and head. Columns are char offsets into the line (the line is
+/// not wrapped — one history line renders as one row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (usize, u16),
+    pub head: (usize, u16),
+}
+
+/// The char-column window a selection covers on history row `idx`
+/// (None when the row isn't selected at all).
+fn selection_window(sel: Option<Selection>, idx: usize) -> Option<(usize, usize)> {
+    let sel = sel?;
+    let (mut a, mut b) = (sel.anchor, sel.head);
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+    if idx < a.0 || idx > b.0 {
+        return None;
+    }
+    let cs = if idx == a.0 { a.1 as usize } else { 0 };
+    let ce = if idx == b.0 { b.1 as usize } else { usize::MAX };
+    Some((cs, ce))
+}
+
+/// Rebuild a line with the `[cs, ce)` char range rendered reversed.
+/// Original span styling inside the selected range is traded for the
+/// highlight (the whole range reads as selected).
+fn highlighted(line: &Line<'static>, cs: usize, ce: usize) -> Line<'static> {
+    let mut before = String::new();
+    let mut chosen = String::new();
+    let mut after = String::new();
+    let mut col = 0usize;
+    for span in line.iter() {
+        for ch in span.content.chars() {
+            if col < cs {
+                before.push(ch);
+            } else if col < ce {
+                chosen.push(ch);
+            } else {
+                after.push(ch);
+            }
+            col += 1;
+        }
+    }
+    let reversed = Style::default().add_modifier(Modifier::REVERSED);
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(chosen, reversed),
+        Span::raw(after),
+    ])
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
@@ -675,10 +734,11 @@ impl App {
                 self.scroll_history(-page);
                 Action::None
             }
-            // Esc while idle: back to the live tail first, then clear the
-            // input on a second press.
+            // Esc while idle: drop a text selection first, then back to
+            // the live tail, then clear the input.
             KeyCode::Esc if !self.running => {
-                if self.history_offset > 0 {
+                if self.selection.take().is_some() {
+                } else if self.history_offset > 0 {
                     self.history_offset = 0;
                 } else {
                     self.input.clear();
@@ -1130,8 +1190,13 @@ impl App {
     pub fn on_click(&mut self, column: u16, row: u16) {
         let inner = self.last_input_inner;
         if inner.width == 0 || row < inner.y || row >= inner.y + inner.height {
+            // Outside the input box: start a text selection in the
+            // history (click-to-edit keeps the input box itself).
+            self.begin_selection(column, row);
             return;
         }
+        // A click inside the input abandons any selection.
+        self.selection = None;
         let chip_rows = (!self.attachment_chips.is_empty()) as u16;
         let visible_row = row - inner.y;
         if visible_row < chip_rows {
@@ -1152,6 +1217,86 @@ impl App {
         }
         // Below the text (empty rows of the box): cursor to the end.
         self.cursor = self.input.chars().count();
+    }
+
+    /// Map a screen row to a history index using the last render's
+    /// geometry; None when the row isn't a committed history line (the
+    /// scrolled-up indicator or a transient streaming tail).
+    fn history_index_at(&self, row: u16) -> Option<usize> {
+        let (start, body, following, top) = self.hist_geom;
+        let indicator = if following { 0u16 } else { 1 };
+        let rel = row.checked_sub(top + indicator)? as usize;
+        if rel >= body || rel >= self.history.len().saturating_sub(start) {
+            return None;
+        }
+        Some(start + rel)
+    }
+
+    /// Mouse press in the history zone: anchor a selection there.
+    pub fn begin_selection(&mut self, column: u16, row: u16) {
+        if let Some(idx) = self.history_index_at(row) {
+            self.selection = Some(Selection {
+                anchor: (idx, column),
+                head: (idx, column),
+            });
+        } else {
+            self.selection = None;
+        }
+    }
+
+    /// Mouse drag: extend the selection head.
+    pub fn extend_selection(&mut self, column: u16, row: u16) {
+        if let Some(idx) = self.history_index_at(row) {
+            if let Some(sel) = self.selection.as_mut() {
+                sel.head = (idx, column);
+            }
+        }
+    }
+
+    /// The selected text (partial columns on the boundary rows, whole
+    /// lines between). Empty selections yield None.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let (mut a, mut b) = (sel.anchor, sel.head);
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let mut out = String::new();
+        for i in a.0..=b.0 {
+            let text: String = self
+                .history
+                .get(i)?
+                .iter()
+                .flat_map(|span| span.content.chars())
+                .collect();
+            let total = text.chars().count();
+            let (cs, ce) = if i == a.0 && i == b.0 {
+                (a.1 as usize, b.1 as usize)
+            } else if i == a.0 {
+                (a.1 as usize, total)
+            } else if i == b.0 {
+                (0, b.1 as usize)
+            } else {
+                (0, total)
+            };
+            let row: String = text.chars().skip(cs).take(ce.saturating_sub(cs)).collect();
+            out.push_str(&row);
+            if i < b.0 {
+                out.push('\n');
+            }
+        }
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// The selected text, clearing the selection (used on mouse-up).
+    pub fn take_selected_text(&mut self) -> Option<String> {
+        let text = self.selected_text();
+        self.selection = None;
+        text
     }
 
     /// Commands matching the input for the completion popup: the input must
@@ -1221,6 +1366,7 @@ impl App {
                 self.history_offset = 0;
                 self.streaming.clear();
                 self.reasoning.clear();
+                self.selection = None;
                 Action::None
             }
             SlashCommand::Compact => {
@@ -1822,6 +1968,8 @@ impl App {
         }
         let end = self.history.len() - self.history_offset;
         let start = end.saturating_sub(body);
+        // Geometry for mouse->history mapping (selections).
+        self.hist_geom = (start, body.min(end - start), following, hist_area.y);
         let mut hist: Vec<Line> = Vec::new();
         if !following {
             let indicator = if start == 0 {
@@ -1831,7 +1979,13 @@ impl App {
             };
             hist.push(Line::from(indicator).style(Style::default().fg(th.dim)));
         }
-        hist.extend(self.history[start..end].iter().cloned());
+        for (k, line) in self.history[start..end].iter().enumerate() {
+            let idx = start + k;
+            match selection_window(self.selection, idx) {
+                Some((cs, ce)) => hist.push(highlighted(line, cs, ce)),
+                None => hist.push(line.clone()),
+            }
+        }
         hist.extend(tails);
         frame.render_widget(Paragraph::new(hist), hist_area);
 

@@ -1424,3 +1424,88 @@ fn auth_wizard_renders_manager_and_masks_the_key() {
         "input box signals the modal: {frame:?}"
     );
 }
+
+// ── Mouse text selection + copy ─────────────────────────────────────────────
+
+#[test]
+fn selection_extracts_partial_and_whole_lines() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.note("hello selection world");
+    app.note("second line here");
+    app.note("third");
+
+    // Simulate the geometry the renderer records: 3 committed rows at the
+    // top, following.
+    app.hist_geom = (0, 3, true, 0);
+
+    // Drag across the middle of rows 0 and 1 (reversed direction too):
+    // col 6 drops "hello ", col 11 on row 1 keeps "second line".
+    app.begin_selection(6, 0);
+    app.extend_selection(11, 1);
+    assert_eq!(
+        app.selected_text().as_deref(),
+        Some("selection world\nsecond line"),
+        "{:?}",
+        app.selected_text()
+    );
+    // Reversed drag selects the same text.
+    app.begin_selection(11, 1);
+    app.extend_selection(6, 0);
+    assert_eq!(
+        app.selected_text().as_deref(),
+        Some("selection world\nsecond line")
+    );
+
+    // Whole-line window.
+    app.begin_selection(0, 1);
+    app.extend_selection(99, 2);
+    assert_eq!(
+        app.selected_text().as_deref(),
+        Some("second line here\nthird")
+    );
+
+    // take returns the text and clears; a second take yields nothing.
+    assert!(app.take_selected_text().is_some());
+    assert!(app.take_selected_text().is_none(), "already taken");
+    app.begin_selection(0, 0);
+    app.extend_selection(3, 0);
+    assert!(app.selection.is_some());
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.selection.is_none());
+
+    // A click outside the history zone drops the selection.
+    app.begin_selection(0, 0);
+    app.extend_selection(3, 0);
+    app.begin_selection(0, 90); // row 90 is outside history
+    assert!(app.selection.is_none());
+}
+
+#[test]
+fn selection_renders_reversed_rows() {
+    let mut app = App::default();
+    app.note("alpha beta gamma");
+    app.hist_geom = (0, 1, true, 0);
+    app.begin_selection(6, 0);
+    app.extend_selection(10, 0);
+    // Rendered frame still contains the text (with the highlight applied).
+    let frame = render(&mut app, 80, 24);
+    assert!(frame.contains("alpha beta gamma"), "{frame:?}");
+    assert!(
+        app.selection.is_some(),
+        "render must not drop the selection"
+    );
+}
+
+#[test]
+fn selection_maps_rows_through_scrolled_geometry() {
+    let mut app = App::default();
+    for i in 0..40 {
+        app.note(format!("line-{i}"));
+    }
+    // Scrolled up one screen: indicator row on top, start at index 30.
+    app.hist_geom = (30, 9, false, 0);
+    app.begin_selection(0, 1); // first committed row = index 30
+    app.extend_selection(4, 2);
+    assert_eq!(app.selected_text().as_deref(), Some("line-30\nline"));
+}

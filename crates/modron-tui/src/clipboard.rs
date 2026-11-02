@@ -21,6 +21,36 @@ pub enum ClipboardContent {
     Empty,
 }
 
+/// Write text to the system clipboard (mouse selection copy in the TUI):
+/// `pbcopy` on macOS, `wl-copy`/`xclip` on Linux. Best-effort — returns
+/// false when no clipboard tool exists.
+pub fn copy_text(text: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let spawn = || -> std::io::Result<std::process::Child> {
+        if cfg!(target_os = "macos") {
+            Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+        } else {
+            Command::new("wl-copy")
+                .stdin(Stdio::piped())
+                .spawn()
+                .or_else(|_| {
+                    Command::new("xclip")
+                        .args(["-selection", "clipboard"])
+                        .stdin(Stdio::piped())
+                        .spawn()
+                })
+        }
+    };
+    match spawn() {
+        Ok(mut child) => match child.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(text.as_bytes()).is_ok() && child.wait().is_ok(),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
 /// Read the clipboard: image first, then text.
 pub fn harvest() -> ClipboardContent {
     if let Some(path) = harvest_image() {

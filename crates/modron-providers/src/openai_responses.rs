@@ -79,7 +79,9 @@ impl OpenAiResponsesProvider {
         req: TurnRequest,
         tx: UnboundedSender<modron_core::StreamDelta>,
     ) -> Result<TurnResponse> {
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        // BACKEND_URL is the complete endpoint — no path to append
+        // (double-appending /responses 404s with {"detail":"Not Found"}).
+        let url = self.base_url.trim_end_matches('/').to_string();
         let body = build_body(&req);
         let response = self.post(&url, &body).await?;
         let status = response.status();
