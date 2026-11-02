@@ -169,8 +169,13 @@ fn logout(provider: Option<&str>) -> anyhow::Result<()> {
 async fn chatgpt_login() -> anyhow::Result<()> {
     use modron_core::auth::oauth::chatgpt;
     let device = chatgpt::start().await?;
-    println!("1. Open {} and enter this code:", device.verification_uri);
+    modron_core::auth::open_browser(&device.verification_uri);
+    println!(
+        "1. Opening {} in your browser — enter this code there:",
+        device.verification_uri
+    );
     println!("   code: {}", device.user_code);
+    println!("   (if nothing opened: {})", device.verification_uri);
     println!("2. Waiting for the sign-in…");
     let (tokens, account) = chatgpt::finish(&device).await?;
     chatgpt::save(&chatgpt::ChatGptAuth {
@@ -189,11 +194,16 @@ async fn login() -> anyhow::Result<()> {
     let session = modron_core::auth::oauth::prepare_login()?;
 
     println!("EXPERIMENTAL: Anthropic subscription auth (ToS-gray; API keys remain first-class).");
-    println!("1. Open this URL in a browser and approve access:");
+    println!("1. Opening the approval page in your browser (or paste manually):");
     println!("{}", session.url);
     println!("2. Waiting for the localhost:{} callback …", session.port);
 
-    let code = modron_core::auth::oauth::wait_for_callback(session.port, &session.state).await?;
+    let code = modron_core::auth::oauth::wait_for_callback(
+        session.port,
+        &session.state,
+        Some(&session.url),
+    )
+    .await?;
     let tokens = modron_core::auth::oauth::exchange_code(&session, &code).await?;
     modron_core::auth::oauth::save_tokens(&tokens)?;
     println!(

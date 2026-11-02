@@ -1021,18 +1021,33 @@ fn streaming_renders_as_live_tail_in_the_history_zone() {
 }
 
 #[test]
-fn auth_slash_parks_a_pending_command_with_args() {
+fn auth_slash_bare_opens_the_manager_args_still_park() {
     let mut app = App::default();
+    // Bare /auth (and /auth add) open the interactive manager.
     app.handle_slash_test(SlashCommand::Auth(String::new()));
-    assert_eq!(
-        app.pending_command,
-        Some(PendingCommand::Auth(String::new()))
-    );
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::Picker { selected: 0 })
+    ));
+    assert_eq!(app.pending_command, None);
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth("add".into()));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::Picker { selected: 0 })
+    ));
 
+    // Arg forms still park the direct command.
+    let mut app = App::default();
     app.handle_slash_test(SlashCommand::Auth("groq gsk-abc".into()));
     assert_eq!(
         app.pending_command,
         Some(PendingCommand::Auth("groq gsk-abc".into()))
+    );
+    app.handle_slash_test(SlashCommand::Auth("status".into()));
+    assert_eq!(
+        app.pending_command,
+        Some(PendingCommand::Auth("status".into()))
     );
 
     // /login is an alias that parses to the same command, args included.
@@ -1051,22 +1066,38 @@ fn auth_slash_parks_a_pending_command_with_args() {
 fn auth_wizard_flows_picker_to_saved_key() {
     use crossterm::event::KeyCode;
     let mut app = App::default();
-    app.handle_slash_test(SlashCommand::Auth("add".into()));
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
     assert!(matches!(
         app.auth_flow,
         Some(AuthFlow::Picker { selected: 0 })
     ));
 
-    // Navigate to groq (registry order: zai, anthropic, openai-compat,
-    // google, groq at index 4) and enter key-entry.
+    // Registry order puts subscriptions first (anthropic, openai-compat,
+    // zai, google, groq): groq sits at index 4.
     for _ in 0..4 {
         app.on_key(key(KeyCode::Down));
     }
     app.on_key(key(KeyCode::Enter));
     match &app.auth_flow {
+        Some(AuthFlow::MethodChoice { info, .. }) => assert_eq!(info.provider_id, "groq"),
+        other => panic!("expected method choice, got {other:?}"),
+    }
+    // API key is the first method for key-only providers.
+    app.on_key(key(KeyCode::Enter));
+    match &app.auth_flow {
         Some(AuthFlow::KeyEntry { info, .. }) => assert_eq!(info.provider_id, "groq"),
         other => panic!("expected key entry, got {other:?}"),
     }
+
+    // Esc from key entry goes BACK to the provider list (same provider
+    // highlighted), not out of the manager.
+    app.on_key(key(KeyCode::Esc));
+    match &app.auth_flow {
+        Some(AuthFlow::Picker { selected }) => assert_eq!(*selected, 4),
+        other => panic!("esc should return to the picker, got {other:?}"),
+    }
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Enter));
 
     // Typed chars land in the wizard buffer, never the main input.
     for c in "gk-live-secret".chars() {
@@ -1094,81 +1125,139 @@ fn auth_wizard_flows_picker_to_saved_key() {
         history_text(&app)
     );
 
-    // Esc at any stage cancels without side effects.
+    // Esc at the picker closes the manager without side effects.
     let mut app2 = App::default();
-    app2.handle_slash_test(SlashCommand::Auth("add".into()));
+    app2.handle_slash_test(SlashCommand::Auth(String::new()));
     app2.on_key(key(KeyCode::Esc));
     assert!(app2.auth_flow.is_none());
     assert!(app2.pending_command.is_none());
 }
 
 #[test]
-fn auth_wizard_oauth_rows_park_the_right_flow() {
+fn auth_wizard_browser_sign_in_parks_the_right_flow() {
     use crossterm::event::KeyCode;
-    let reg = modron_core::auth::provider_registry().len();
 
-    // First OAuth row: ChatGPT device flow (url + user code arrive from
-    // the spawned task).
+    // Anthropic (index 0): method choice -> browser sign-in -> the PKCE
+    // session is prepared and parked; the listener+exchange run spawned.
     let mut app = App::default();
-    app.handle_slash_test(SlashCommand::Auth("add".into()));
-    for _ in 0..reg {
-        app.on_key(key(KeyCode::Down));
-    }
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Down));
     app.on_key(key(KeyCode::Enter));
     assert!(matches!(
         app.auth_flow,
-        Some(AuthFlow::WaitingOAuth { ref url, ref user_code }) if url.is_empty() && user_code.is_none()
+        Some(AuthFlow::WaitingOAuth { info: ref i, ref url, ref user_code })
+            if i.provider_id == "anthropic" && !url.is_empty() && user_code.is_none()
+    ));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::OAuthLogin { .. })
+    ));
+    // Esc backs out to the method screen (the manager stays open; the
+    // run loop aborts the spawned flow), and Esc again returns to the
+    // provider list.
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::MethodChoice { info: ref i, .. }) if i.provider_id == "anthropic"
+    ));
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.auth_flow, Some(AuthFlow::Picker { .. })));
+
+    // OpenAI/ChatGPT (index 1): method choice -> browser sign-in -> the
+    // device flow (URL + user code arrive from the spawned task).
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::WaitingOAuth { info: ref i, ref url, ref user_code })
+            if i.provider_id == "openai-compat" && url.is_empty() && user_code.is_none()
     ));
     assert!(matches!(
         app.pending_command,
         Some(PendingCommand::ChatGptLogin)
     ));
     app.on_key(key(KeyCode::Esc));
-    assert!(app.auth_flow.is_none());
-
-    // Second OAuth row: Claude subscription (PKCE session prepared now).
-    let mut app = App::default();
-    app.handle_slash_test(SlashCommand::Auth("add".into()));
-    for _ in 0..=reg {
-        app.on_key(key(KeyCode::Down));
-    }
-    app.on_key(key(KeyCode::Enter));
     assert!(matches!(
         app.auth_flow,
-        Some(AuthFlow::WaitingOAuth { ref url, ref user_code }) if !url.is_empty() && user_code.is_none()
+        Some(AuthFlow::MethodChoice { info: ref i, .. }) if i.provider_id == "openai-compat"
     ));
-    assert!(matches!(
-        app.pending_command,
-        Some(PendingCommand::OAuthLogin { .. })
-    ));
-    app.on_key(key(KeyCode::Esc));
-    assert!(app.auth_flow.is_none());
 }
 
 #[test]
-fn auth_wizard_renders_picker_and_masks_the_key() {
+fn auth_wizard_remove_parks_and_esc_navigates_back() {
     use crossterm::event::KeyCode;
     let mut app = App::default();
-    app.handle_slash_test(SlashCommand::Auth("add".into()));
-    let frame = render(&mut app, 90, 24);
-    assert!(frame.contains("add a provider"), "{frame:?}");
-    assert!(frame.contains("Z.ai"), "{frame:?}");
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
+    app.on_key(key(KeyCode::Enter)); // anthropic -> method choice
+                                     // Methods for oauth-capable providers: api key, browser, remove.
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    assert!(app.auth_flow.is_none());
+    match &app.pending_command {
+        Some(PendingCommand::AuthRemove {
+            name,
+            env_var,
+            provider_id,
+        }) => {
+            assert_eq!(env_var, "ANTHROPIC_API_KEY");
+            assert_eq!(provider_id, "anthropic");
+            assert!(name.contains("Anthropic"));
+        }
+        other => panic!("expected AuthRemove, got {other:?}"),
+    }
 
-    // Scrolling to the bottom brings both OAuth rows into the window.
-    for _ in 0..modron_core::auth::provider_registry().len() {
+    // Esc from method choice returns to the picker highlighting the
+    // provider we came from.
+    let mut app2 = App::default();
+    app2.handle_slash_test(SlashCommand::Auth(String::new()));
+    app2.on_key(key(KeyCode::Down)); // openai
+    app2.on_key(key(KeyCode::Enter));
+    app2.on_key(key(KeyCode::Esc));
+    match &app2.auth_flow {
+        Some(AuthFlow::Picker { selected }) => assert_eq!(*selected, 1),
+        other => panic!("esc should return to the picker, got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_wizard_renders_manager_and_masks_the_key() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
+    let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("auth —"), "manager header: {frame:?}");
+    assert!(frame.contains("Anthropic"), "subscriptions lead: {frame:?}");
+    assert!(
+        frame.contains("not configured"),
+        "rows show status: {frame:?}"
+    );
+
+    // Bottom of the list is the last registry provider (the separate
+    // OAuth rows are gone — they live inside method choice now).
+    let reg = modron_core::auth::provider_registry().len();
+    for _ in 0..(reg - 1) {
         app.on_key(key(KeyCode::Down));
     }
     let frame = render(&mut app, 90, 24);
-    assert!(frame.contains("ChatGPT (OpenAI)"), "{frame:?}");
-    app.on_key(key(KeyCode::Down));
-    let frame = render(&mut app, 90, 24);
-    assert!(frame.contains("Claude subscription"), "{frame:?}");
-    // Back to the top for the key-entry leg of the test (two OAuth rows
-    // mean reg+1 rows above the first provider).
-    for _ in 0..=modron_core::auth::provider_registry().len() {
+    assert!(frame.contains("GitHub Models"), "{frame:?}");
+
+    // Back to the top and into the method screen (api key first).
+    for _ in 0..(reg - 1) {
         app.on_key(key(KeyCode::Up));
     }
-    app.on_key(key(KeyCode::Enter)); // first provider (zai) → key entry
+    app.on_key(key(KeyCode::Enter)); // anthropic -> method choice
+    let frame = render(&mut app, 90, 24);
+    assert!(
+        frame.contains("sign in with Claude subscription"),
+        "browser sign-in offered: {frame:?}"
+    );
+    app.on_key(key(KeyCode::Enter)); // api key (first method) -> key entry
     for c in "sk-secret-value".chars() {
         app.on_key(key(KeyCode::Char(c)));
     }
@@ -1179,11 +1268,11 @@ fn auth_wizard_renders_picker_and_masks_the_key() {
         "raw key never rendered: {frame:?}"
     );
     assert!(
-        frame.contains("ZAI_API_KEY"),
+        frame.contains("ANTHROPIC_API_KEY"),
         "names the env var: {frame:?}"
     );
     assert!(
-        frame.contains("auth wizard open"),
+        frame.contains("auth manager"),
         "input box signals the modal: {frame:?}"
     );
 }

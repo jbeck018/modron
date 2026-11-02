@@ -35,13 +35,20 @@ pub struct TuiSinks {
 
 /// Spawned OAuth flows report through this: an interim update renders in
 /// the waiting modal (device flows deliver the URL + user code), Done
-/// settles the flow with a note for the scrollback.
+/// settles the flow with a note for the scrollback. Every message carries
+/// the flow's generation — a cancelled flow's late messages must not
+/// stomp a newer one's modal (seen live: a slow Claude failure wiped an
+/// open ChatGPT waiting screen).
 enum OAuthProgress {
     Interim {
+        gen: u64,
         url: String,
         user_code: Option<String>,
     },
-    Done(anyhow::Result<String>),
+    Done {
+        gen: u64,
+        result: anyhow::Result<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -198,6 +205,7 @@ pub async fn run_with(
     // URL (+ device-flow user code) in the modal, Done settles it.
     let (oauth_tx, mut oauth_rx) = tokio::sync::mpsc::unbounded_channel::<OAuthProgress>();
     let mut oauth_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut oauth_generation: u64 = 0;
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
@@ -357,12 +365,19 @@ pub async fn run_with(
             let Some(PendingCommand::OAuthLogin { session }) = app.pending_command.take() else {
                 unreachable!("matches! guard above")
             };
+            oauth_generation += 1;
+            let gen = oauth_generation;
             let tx = oauth_tx.clone();
             oauth_task = Some(tokio::spawn(async move {
                 let result: anyhow::Result<String> = async {
-                    let code =
-                        modron_core::auth::oauth::wait_for_callback(session.port, &session.state)
-                            .await?;
+                    // Binds the listener FIRST, then opens the browser, so
+                    // an instant approval can never race the socket.
+                    let code = modron_core::auth::oauth::wait_for_callback(
+                        session.port,
+                        &session.state,
+                        Some(&session.url),
+                    )
+                    .await?;
                     let tokens = modron_core::auth::oauth::exchange_code(&session, &code).await?;
                     modron_core::auth::oauth::save_tokens(&tokens)?;
                     Ok(format!(
@@ -371,15 +386,21 @@ pub async fn run_with(
                     ))
                 }
                 .await;
-                let _ = tx.send(OAuthProgress::Done(result));
+                let _ = tx.send(OAuthProgress::Done { gen, result });
             }));
         } else if matches!(app.pending_command, Some(PendingCommand::ChatGptLogin)) {
             app.pending_command = None;
+            oauth_generation += 1;
+            let gen = oauth_generation;
             let tx = oauth_tx.clone();
             oauth_task = Some(tokio::spawn(async move {
                 let result: anyhow::Result<String> = async {
                     let device = modron_core::auth::oauth::chatgpt::start().await?;
+                    // The verification page opens itself; the modal keeps
+                    // the URL as the manual fallback.
+                    modron_core::auth::open_browser(&device.verification_uri);
                     let _ = tx.send(OAuthProgress::Interim {
+                        gen,
                         url: device.verification_uri.clone(),
                         user_code: Some(device.user_code.clone()),
                     });
@@ -393,12 +414,12 @@ pub async fn run_with(
                         },
                     )?;
                     Ok(format!(
-                        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (gpt-5, gpt-5-codex, gpt-5-mini)",
+                        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (gpt-5-codex, gpt-5-mini)",
                         modron_core::auth::mask_key(&tokens.access_token)
                     ))
                 }
                 .await;
-                let _ = tx.send(OAuthProgress::Done(result));
+                let _ = tx.send(OAuthProgress::Done { gen, result });
             }));
         } else if let Some(cmd) = app.pending_command.take() {
             for line in run_pending_command(&mut engine, &mut app, cmd).await {
@@ -407,20 +428,38 @@ pub async fn run_with(
         }
 
         // 3c. OAuth progress: interim updates render in the waiting modal,
-        //     Done settles it. A cancelled modal aborts the task instead.
-        if app.auth_flow.is_none() {
+        //     Done settles it. The spawned flow is aborted whenever the
+        //     waiting screen isn't up (modal closed OR backed out to
+        //     another manager screen). Messages from an older
+        //     (cancelled/replaced) flow generation are dropped — they must
+        //     not stomp the current modal.
+        if !matches!(app.auth_flow, Some(AuthFlow::WaitingOAuth { .. })) {
             if let Some(task) = oauth_task.take() {
                 task.abort();
             }
         }
         while let Ok(progress) = oauth_rx.try_recv() {
+            let stale = match &progress {
+                OAuthProgress::Interim { gen, .. } | OAuthProgress::Done { gen, .. } => {
+                    *gen != oauth_generation
+                }
+            };
+            if stale {
+                continue;
+            }
             match progress {
-                OAuthProgress::Interim { url, user_code } => {
-                    if matches!(app.auth_flow, Some(AuthFlow::WaitingOAuth { .. })) {
-                        app.auth_flow = Some(AuthFlow::WaitingOAuth { url, user_code });
+                OAuthProgress::Interim { url, user_code, .. } => {
+                    // Replace url/user_code, keep the provider info the
+                    // modal was opened with.
+                    if let Some(AuthFlow::WaitingOAuth { info, .. }) = app.auth_flow.take() {
+                        app.auth_flow = Some(AuthFlow::WaitingOAuth {
+                            info,
+                            url,
+                            user_code,
+                        });
                     }
                 }
-                OAuthProgress::Done(result) => {
+                OAuthProgress::Done { result, .. } => {
                     oauth_task = None;
                     app.auth_flow = None;
                     match result {
@@ -535,6 +574,47 @@ async fn run_pending_command(
                 }
                 Err(e) => vec![format!("cannot save key: {e}")],
             }
+        }
+        // The interactive flow's "remove saved credentials": forget the
+        // key and any stored OAuth sign-in tokens.
+        PendingCommand::AuthRemove {
+            name,
+            env_var,
+            provider_id,
+        } => {
+            let mut lines = Vec::new();
+            match modron_core::auth::env_file()
+                .map_err(|e| e.to_string())
+                .and_then(|p| {
+                    modron_core::auth::remove_key_from_env_file(&p, &env_var)
+                        .map_err(|e| e.to_string())
+                }) {
+                Ok(true) => {
+                    std::env::remove_var(&env_var);
+                    lines.push(format!("✓ {name} key removed"));
+                }
+                Ok(false) => lines.push(format!("no saved {name} key")),
+                Err(e) => lines.push(format!("cannot remove key: {e}")),
+            }
+            if modron_core::auth::oauth_capable(&provider_id) {
+                let file = if provider_id == "anthropic" {
+                    modron_core::auth::oauth::auth_file()
+                } else {
+                    modron_core::auth::oauth::chatgpt::token_file()
+                };
+                if let Ok(path) = file {
+                    if path.exists() {
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => lines.push(format!(
+                                "✓ {name} sign-in tokens removed ({})",
+                                path.display()
+                            )),
+                            Err(e) => lines.push(format!("cannot remove sign-in tokens: {e}")),
+                        }
+                    }
+                }
+            }
+            lines
         }
         PendingCommand::Agent(name) => {
             let name = name.trim().to_string();
@@ -757,6 +837,12 @@ fn run_auth_command(arg: &str) -> Vec<String> {
         };
     }
 
+    // `/auth status` / `show`: the full text board (the interactive
+    // manager is what bare `/auth` opens).
+    if arg == "status" || arg == "show" {
+        return auth_status_lines();
+    }
+
     // `<provider> <key>` or `set <provider> <key>`.
     let payload = arg.strip_prefix("set ").map(str::trim).unwrap_or(arg);
     if !payload.is_empty() {
@@ -788,37 +874,37 @@ fn run_auth_command(arg: &str) -> Vec<String> {
         return vec![auth_usage()];
     }
 
-    // Bare /auth: the full status board.
+    // Empty/unrecognized arg (defensive; bare /auth opens the manager).
+    vec![auth_usage()]
+}
+
+/// The text status board (masked keys + sign-in markers).
+fn auth_status_lines() -> Vec<String> {
+    use modron_core::auth as store;
     let mut out = vec!["provider credentials:".to_string()];
     for info in store::provider_registry() {
         let (source, value) = store::key_source(info.env_var);
-        let shown = match source {
-            store::KeySource::EnvFile => {
-                format!("{} (saved)", store::mask_key(&value))
-            }
-            store::KeySource::ProcessEnv => {
-                format!("{} (process env)", store::mask_key(&value))
-            }
-            store::KeySource::None => "—".to_string(),
+        let mut shown = match source {
+            store::KeySource::EnvFile => format!("{} (saved)", store::mask_key(&value)),
+            store::KeySource::ProcessEnv => format!("{} (process env)", store::mask_key(&value)),
+            store::KeySource::None => String::new(),
         };
+        if store::oauth_signed_in(info.provider_id) {
+            let marker = if shown.is_empty() {
+                String::new()
+            } else {
+                " · ".to_string()
+            };
+            shown = format!("{shown}{marker}oauth signed in");
+        }
+        if shown.is_empty() {
+            shown = "—".to_string();
+        }
         out.push(format!("  {:<18} {}", info.name, shown));
     }
-    let oauth = store::env_file()
-        .ok()
-        .and_then(|_| {
-            std::env::var("HOME").ok().map(|h| {
-                std::path::PathBuf::from(h)
-                    .join(".modron")
-                    .join("auth")
-                    .join("anthropic.json")
-            })
-        })
-        .filter(|p| p.exists());
-    if oauth.is_some() {
-        out.push("  claude subscription: OAuth tokens present".to_string());
-    }
     out.push(
-        "save in-app: /auth <provider> <key> · remove: /auth remove <provider> · wizard: `modron auth add`".to_string(),
+        "manage in-app: /auth · save: /auth <provider> <key> · remove: /auth remove <provider>"
+            .to_string(),
     );
     out
 }

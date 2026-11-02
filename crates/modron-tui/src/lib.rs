@@ -115,6 +115,13 @@ pub enum PendingCommand {
         env_var: String,
         key: String,
     },
+    /// The interactive flow's "remove saved credentials": forget the
+    /// provider's key and any stored sign-in tokens.
+    AuthRemove {
+        name: String,
+        env_var: String,
+        provider_id: String,
+    },
     /// The interactive flow's Claude OAuth row: run the browser flow (the
     /// run loop spawns it; Esc on the flow cancels).
     OAuthLogin {
@@ -171,7 +178,7 @@ impl SlashCommand {
         ("goal", "stop condition for long runs"),
         ("learn", "distill this session into a SKILL.md"),
         ("theme", "switch color theme"),
-        ("auth", "show/save/remove provider keys"),
+        ("auth", "open the auth manager (view/sign-in/remove)"),
         ("login", "alias of /auth"),
     ];
 
@@ -241,24 +248,85 @@ impl SlashCommand {
     }
 }
 
-/// The interactive auth wizard (`/auth add`): a modal that owns the keys.
+/// The interactive auth manager (`/auth`): a modal that owns the keys.
 #[derive(Clone, Debug)]
 pub enum AuthFlow {
-    /// Choosing a provider: index into the registry, with one extra
-    /// final row for the Claude-subscription OAuth browser flow.
+    /// Choosing a provider: index into the registry. Each row shows the
+    /// provider's current status (masked key, oauth, not configured).
     Picker { selected: usize },
+    /// Second stage for one provider: API key vs browser sign-in vs
+    /// remove. `selected` indexes [`auth_methods`].
+    MethodChoice {
+        info: modron_core::auth::ProviderInfo,
+        selected: usize,
+    },
     /// Pasting/typing the key for the chosen provider. Append-only buffer
     /// (keys are pasted, not edited); rendered masked.
     KeyEntry {
         info: modron_core::auth::ProviderInfo,
         input: String,
     },
-    /// An OAuth flow is running (spawned in the run loop); Esc cancels.
+    /// An OAuth flow is running (spawned in the run loop); Esc backs out
+    /// to the method screen and the run loop aborts the task.
     /// `user_code` is set for device flows (the code typed at the URL).
     WaitingOAuth {
+        info: modron_core::auth::ProviderInfo,
         url: String,
         user_code: Option<String>,
     },
+}
+
+/// One action offered on the method-choice screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthMethod {
+    ApiKey,
+    BrowserSignIn,
+    Remove,
+}
+
+impl AuthMethod {
+    fn label(self, info: &modron_core::auth::ProviderInfo) -> String {
+        match self {
+            AuthMethod::ApiKey => format!("paste an API key ({})", info.env_var),
+            AuthMethod::BrowserSignIn => match info.provider_id {
+                "anthropic" => "sign in with Claude subscription (browser)".to_string(),
+                _ => "sign in with ChatGPT (browser)".to_string(),
+            },
+            AuthMethod::Remove => "remove saved credentials".to_string(),
+        }
+    }
+}
+
+/// The actions available for one provider: a key always, browser sign-in
+/// for the OAuth-capable two, remove always (it no-ops when nothing is
+/// stored).
+fn auth_methods(info: &modron_core::auth::ProviderInfo) -> Vec<AuthMethod> {
+    let mut methods = vec![AuthMethod::ApiKey];
+    if modron_core::auth::oauth_capable(info.provider_id) {
+        methods.push(AuthMethod::BrowserSignIn);
+    }
+    methods.push(AuthMethod::Remove);
+    methods
+}
+
+/// The status text shown on a picker row: masked key and/or oauth marker,
+/// or `not configured`.
+fn auth_row_status(info: &modron_core::auth::ProviderInfo) -> String {
+    use modron_core::auth::{key_source, mask_key, oauth_signed_in, KeySource};
+    let (source, value) = key_source(info.env_var);
+    let mut parts: Vec<String> = Vec::new();
+    match source {
+        KeySource::EnvFile | KeySource::ProcessEnv => parts.push(mask_key(&value)),
+        KeySource::None => {}
+    }
+    if oauth_signed_in(info.provider_id) {
+        parts.push("oauth".to_string());
+    }
+    if parts.is_empty() {
+        "not configured".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 /// A tool call awaiting the user's y/n/a decision.
@@ -588,7 +656,7 @@ impl App {
         use crossterm::event::KeyCode;
         match flow {
             AuthFlow::Picker { selected } => {
-                let len = modron_core::auth::provider_registry().len() + 2;
+                let len = modron_core::auth::provider_registry().len();
                 let selected = selected.min(len - 1);
                 match key.code {
                     KeyCode::Up => {
@@ -601,40 +669,92 @@ impl App {
                             selected: (selected + 1) % len,
                         });
                     }
-                    KeyCode::Esc => {} // cancel
+                    KeyCode::Esc => {} // close the manager
                     KeyCode::Enter | KeyCode::Tab => {
-                        let registry = modron_core::auth::provider_registry();
-                        if let Some(info) = registry.get(selected) {
-                            self.auth_flow = Some(AuthFlow::KeyEntry {
+                        if let Some(info) = modron_core::auth::provider_registry().get(selected) {
+                            self.auth_flow = Some(AuthFlow::MethodChoice {
                                 info: info.clone(),
-                                input: String::new(),
-                            });
-                        } else if selected == registry.len() {
-                            // The ChatGPT device-flow row: the URL + user
-                            // code arrive from the spawned task.
-                            self.pending_command = Some(PendingCommand::ChatGptLogin);
-                            self.auth_flow = Some(AuthFlow::WaitingOAuth {
-                                url: String::new(),
-                                user_code: None,
+                                selected: 0,
                             });
                         } else {
-                            // The Claude OAuth row: prepare now (pure), park
-                            // the session for the run loop to spawn.
-                            match modron_core::auth::oauth::prepare_login() {
-                                Ok(session) => {
-                                    let url = session.url.clone();
-                                    self.pending_command =
-                                        Some(PendingCommand::OAuthLogin { session });
-                                    self.auth_flow = Some(AuthFlow::WaitingOAuth {
-                                        url,
-                                        user_code: None,
-                                    });
-                                }
-                                Err(e) => self.note(format!("cannot start OAuth: {e}")),
-                            }
+                            self.auth_flow = None;
                         }
                     }
                     _ => self.auth_flow = Some(AuthFlow::Picker { selected }),
+                }
+            }
+            AuthFlow::MethodChoice { info, selected } => {
+                let methods = auth_methods(&info);
+                let len = methods.len();
+                let selected = selected.min(len - 1);
+                match key.code {
+                    KeyCode::Up => {
+                        self.auth_flow = Some(AuthFlow::MethodChoice {
+                            info,
+                            selected: (selected + len - 1) % len,
+                        });
+                    }
+                    KeyCode::Down => {
+                        self.auth_flow = Some(AuthFlow::MethodChoice {
+                            info,
+                            selected: (selected + 1) % len,
+                        });
+                    }
+                    KeyCode::Esc => {
+                        // Back to the provider list, highlighting the
+                        // provider we came from.
+                        let selected = modron_core::auth::provider_registry()
+                            .iter()
+                            .position(|p| p.provider_id == info.provider_id)
+                            .unwrap_or(0);
+                        self.auth_flow = Some(AuthFlow::Picker { selected });
+                    }
+                    KeyCode::Enter | KeyCode::Tab => match methods[selected] {
+                        AuthMethod::ApiKey => {
+                            self.auth_flow = Some(AuthFlow::KeyEntry {
+                                info,
+                                input: String::new(),
+                            });
+                        }
+                        AuthMethod::BrowserSignIn => {
+                            if info.provider_id == "anthropic" {
+                                // Claude: prepare the PKCE session now
+                                // (pure); the run loop spawns the listener
+                                // + token exchange.
+                                match modron_core::auth::oauth::prepare_login() {
+                                    Ok(session) => {
+                                        let url = session.url.clone();
+                                        self.pending_command =
+                                            Some(PendingCommand::OAuthLogin { session });
+                                        self.auth_flow = Some(AuthFlow::WaitingOAuth {
+                                            info,
+                                            url,
+                                            user_code: None,
+                                        });
+                                    }
+                                    Err(e) => self.note(format!("cannot start OAuth: {e}")),
+                                }
+                            } else {
+                                // ChatGPT device flow: the URL + user code
+                                // arrive from the spawned task.
+                                self.pending_command = Some(PendingCommand::ChatGptLogin);
+                                self.auth_flow = Some(AuthFlow::WaitingOAuth {
+                                    info,
+                                    url: String::new(),
+                                    user_code: None,
+                                });
+                            }
+                        }
+                        AuthMethod::Remove => {
+                            self.pending_command = Some(PendingCommand::AuthRemove {
+                                name: info.name.to_string(),
+                                env_var: info.env_var.to_string(),
+                                provider_id: info.provider_id.to_string(),
+                            });
+                            self.auth_flow = None;
+                        }
+                    },
+                    _ => self.auth_flow = Some(AuthFlow::MethodChoice { info, selected }),
                 }
             }
             AuthFlow::KeyEntry { info, mut input } => {
@@ -656,18 +776,38 @@ impl App {
                         // Flow ends either way; the saved note lands in the
                         // history masked.
                     }
-                    KeyCode::Esc => {} // cancel without saving
+                    KeyCode::Esc => {
+                        // Back to the provider list (the modal stays open).
+                        let selected = modron_core::auth::provider_registry()
+                            .iter()
+                            .position(|p| p.provider_id == info.provider_id)
+                            .unwrap_or(0);
+                        self.auth_flow = Some(AuthFlow::Picker { selected });
+                    }
                     _ => {}
                 }
                 if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                     self.auth_flow = Some(AuthFlow::KeyEntry { info, input });
                 }
             }
-            AuthFlow::WaitingOAuth { url, user_code } => match key.code {
-                // Esc cancels; the run loop aborts the spawned flow when it
-                // sees the modal gone.
-                KeyCode::Esc => {}
-                _ => self.auth_flow = Some(AuthFlow::WaitingOAuth { url, user_code }),
+            AuthFlow::WaitingOAuth {
+                info,
+                url,
+                user_code,
+            } => match key.code {
+                // Esc backs out to the method screen (the manager stays
+                // open); the run loop aborts the spawned flow when the
+                // waiting screen is gone.
+                KeyCode::Esc => {
+                    self.auth_flow = Some(AuthFlow::MethodChoice { info, selected: 0 });
+                }
+                _ => {
+                    self.auth_flow = Some(AuthFlow::WaitingOAuth {
+                        info,
+                        url,
+                        user_code,
+                    })
+                }
             },
         }
         Action::None
@@ -893,10 +1033,13 @@ impl App {
                 ))
             }
             SlashCommand::Auth(arg) => {
-                if arg.trim() == "add" {
+                let arg = arg.trim();
+                if arg.is_empty() || arg == "add" || arg == "manage" {
+                    // The interactive manager: view status, add/replace,
+                    // sign in, remove.
                     self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
                 } else {
-                    self.pending_command = Some(PendingCommand::Auth(arg));
+                    self.pending_command = Some(PendingCommand::Auth(arg.to_string()));
                 }
                 Action::None
             }
@@ -1338,12 +1481,13 @@ impl App {
         let sel = self.slash_selected.min(matches.len().saturating_sub(1));
         let popup_h = (matches.len() as u16).min(5);
 
-        // The auth wizard modal takes the same slot as the slash popup.
+        // The auth manager modal takes the same slot as the slash popup.
         let flow_h = match &self.auth_flow {
             None => 0,
             Some(AuthFlow::Picker { .. }) => {
-                (modron_core::auth::provider_registry().len() as u16 + 2 + 1).min(8)
+                (modron_core::auth::provider_registry().len() as u16 + 1).min(8)
             }
+            Some(AuthFlow::MethodChoice { info, .. }) => auth_methods(info).len() as u16 + 1,
             Some(AuthFlow::KeyEntry { .. }) => 4,
             Some(AuthFlow::WaitingOAuth { .. }) => 3,
         };
@@ -1479,26 +1623,16 @@ impl App {
             let lines: Vec<Line> = match flow {
                 AuthFlow::Picker { selected } => {
                     let registry = modron_core::auth::provider_registry();
-                    // Registry rows + the final OAuth row.
-                    let entries: Vec<(&str, &str)> = registry
-                        .iter()
-                        .map(|i| (i.name, i.note))
-                        .chain([
-                            ("ChatGPT (OpenAI)", "sign in with your ChatGPT plan"),
-                            ("Claude subscription", "OAuth in the browser"),
-                        ])
-                        .collect();
-                    let len = entries.len();
+                    let len = registry.len();
                     let sel = (*selected).min(len - 1);
-                    // Window: 8 modal rows = 1 header + up to 7 entries,
+                    // Window: 8 modal rows = 1 header + up to 7 rows,
                     // scrolled to keep the highlight visible.
                     let vis = len.min(7);
                     let start = sel.saturating_sub(vis - 1).min(len - vis);
-                    let mut lines = vec![Line::from(
-                        "  add a provider — ↑/↓ choose · enter select · esc cancel",
-                    )
-                    .style(Style::default().fg(th.dim))];
-                    for (i, (name, note)) in entries.iter().enumerate().skip(start).take(vis) {
+                    let mut lines =
+                        vec![Line::from("  auth — ↑/↓ choose · enter manage · esc close")
+                            .style(Style::default().fg(th.dim))];
+                    for (i, info) in registry.iter().enumerate().skip(start).take(vis) {
                         let selected_here = i == sel;
                         let pointer = if selected_here { "  ❯ " } else { "    " };
                         let style = if selected_here {
@@ -1508,7 +1642,34 @@ impl App {
                         };
                         lines.push(Line::from(vec![
                             Span::styled(pointer.to_string(), Style::default().fg(th.accent)),
-                            Span::styled(format!("{name:<20} {note}"), style),
+                            Span::styled(
+                                format!("{:<20} {}", info.name, auth_row_status(info)),
+                                style,
+                            ),
+                        ]));
+                    }
+                    lines
+                }
+                AuthFlow::MethodChoice { info, selected } => {
+                    let methods = auth_methods(info);
+                    let len = methods.len();
+                    let sel = (*selected).min(len - 1);
+                    let mut lines = vec![Line::from(format!(
+                        "  {} — ↑/↓ choose · enter select · esc back",
+                        info.name
+                    ))
+                    .style(Style::default().fg(th.dim))];
+                    for (i, method) in methods.iter().enumerate() {
+                        let selected_here = i == sel;
+                        let pointer = if selected_here { "  ❯ " } else { "    " };
+                        let style = if selected_here {
+                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(pointer.to_string(), Style::default().fg(th.accent)),
+                            Span::styled(method.label(info), style),
                         ]));
                     }
                     lines
@@ -1526,42 +1687,48 @@ impl App {
                             Span::styled(masked, Style::default()),
                             Span::styled("▎", Style::default().fg(th.accent)),
                         ]),
-                        Line::from("  enter save · esc cancel (ctrl+V pastes)")
+                        Line::from("  enter save · esc back (ctrl+V pastes)")
                             .style(Style::default().fg(th.dim)),
                         Line::from(""),
                     ]
                 }
-                AuthFlow::WaitingOAuth { url, user_code } => {
+                AuthFlow::WaitingOAuth {
+                    info,
+                    url,
+                    user_code,
+                } => {
                     let mut lines = Vec::new();
                     match user_code {
                         Some(code) => {
                             lines.push(
-                                Line::from("  ChatGPT sign-in — device flow")
+                                Line::from(format!("  {} — device flow", info.name))
                                     .style(Style::default().fg(th.accent)),
                             );
                             let open = if url.is_empty() {
-                                "https://chatgpt.com/activate"
+                                "https://auth.openai.com/codex/device"
                             } else {
                                 url.as_str()
                             };
                             lines.push(
-                                Line::from(format!("  code: {code}   open: {open}"))
-                                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                                Line::from(format!(
+                                    "  code: {code}   browser opening (or visit: {open})"
+                                ))
+                                .style(Style::default().add_modifier(Modifier::BOLD)),
                             );
                         }
                         None => {
                             lines.push(
-                                Line::from("  claude subscription — OAuth")
+                                Line::from(format!("  {} — browser sign-in", info.name))
                                     .style(Style::default().fg(th.accent)),
                             );
                             lines.push(
-                                Line::from(format!("  open in a browser: {url}"))
+                                Line::from(format!("  browser opening (or visit): {url}"))
                                     .style(Style::default().fg(th.dim)),
                             );
                         }
                     }
                     lines.push(
-                        Line::from("  waiting for the sign-in… esc cancels")
+                        Line::from("  waiting for the sign-in… esc backs out")
                             .style(Style::default().fg(th.dim)),
                     );
                     lines
@@ -1652,10 +1819,7 @@ impl App {
         let scroll = self.input_scroll as usize;
         if self.input.is_empty() {
             let (text, style) = if self.auth_flow.is_some() {
-                (
-                    "auth wizard open — esc to cancel",
-                    Style::default().fg(th.dim),
-                )
+                ("auth manager — esc to close", Style::default().fg(th.dim))
             } else if self.running {
                 ("", Style::default())
             } else {

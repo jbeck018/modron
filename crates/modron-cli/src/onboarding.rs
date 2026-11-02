@@ -134,14 +134,7 @@ pub fn run_onboarding() -> anyhow::Result<String> {
 
     if key.is_empty() {
         // Open the browser and prompt again.
-        let _ = std::process::Command::new("open")
-            .arg(opt.key_url)
-            .spawn()
-            .or_else(|_| {
-                std::process::Command::new("xdg-open")
-                    .arg(opt.key_url)
-                    .spawn()
-            });
+        modron_core::auth::open_browser(opt.key_url);
         writeln!(stdout, "  opened {} — paste your key here:", opt.key_url)?;
         write!(stdout, "  key: ")?;
         stdout.flush()?;

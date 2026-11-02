@@ -23,29 +23,31 @@ pub struct ProviderInfo {
 }
 
 /// The known-provider registry. Shared by first-run onboarding, the
-/// `modron auth` wizard, and the TUI `/auth` command.
+/// `modron auth` wizard, and the TUI `/auth` manager. Subscription
+/// providers (Anthropic, OpenAI/ChatGPT) lead: they offer browser
+/// sign-in, everything below them is key-only.
 pub fn provider_registry() -> Vec<ProviderInfo> {
     vec![
+        ProviderInfo {
+            name: "Anthropic (Claude)",
+            provider_id: "anthropic",
+            env_var: "ANTHROPIC_API_KEY",
+            key_url: "https://console.anthropic.com",
+            note: "API key or Claude subscription (browser)",
+        },
+        ProviderInfo {
+            name: "OpenAI / ChatGPT",
+            provider_id: "openai-compat",
+            env_var: "OPENAI_API_KEY",
+            key_url: "https://platform.openai.com/api-keys",
+            note: "API key or ChatGPT sign-in (browser)",
+        },
         ProviderInfo {
             name: "Z.ai (GLM)",
             provider_id: "zai",
             env_var: "ZAI_API_KEY",
             key_url: "https://z.ai/manage-apikey/apikey-list",
             note: "free tier available (glm-4.5-flash)",
-        },
-        ProviderInfo {
-            name: "Anthropic (Claude)",
-            provider_id: "anthropic",
-            env_var: "ANTHROPIC_API_KEY",
-            key_url: "https://console.anthropic.com",
-            note: "Claude models",
-        },
-        ProviderInfo {
-            name: "OpenAI",
-            provider_id: "openai-compat",
-            env_var: "OPENAI_API_KEY",
-            key_url: "https://platform.openai.com/api-keys",
-            note: "GPT models",
         },
         ProviderInfo {
             name: "Google Gemini",
@@ -104,6 +106,33 @@ pub fn provider_info(provider_id: &str) -> Option<ProviderInfo> {
     provider_registry()
         .into_iter()
         .find(|p| p.provider_id == provider_id)
+}
+
+/// Whether a provider offers the in-app browser sign-in (OAuth) in
+/// addition to API keys.
+pub fn oauth_capable(provider_id: &str) -> bool {
+    matches!(provider_id, "anthropic" | "openai-compat")
+}
+
+/// Whether stored sign-in tokens exist for an OAuth-capable provider
+/// (`~/.modron/auth/<provider>.json`).
+pub fn oauth_signed_in(provider_id: &str) -> bool {
+    let file = match provider_id {
+        "anthropic" => oauth::auth_file(),
+        "openai-compat" => oauth::chatgpt::token_file(),
+        _ => return false,
+    };
+    file.map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Open `url` in the user's browser. Best-effort: returns false when no
+/// opener exists (callers still render the URL as the manual fallback).
+pub fn open_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    const OPENER: &str = "open";
+    #[cfg(not(target_os = "macos"))]
+    const OPENER: &str = "xdg-open";
+    std::process::Command::new(OPENER).arg(url).spawn().is_ok()
 }
 
 /// The env file where keys are saved.
@@ -244,6 +273,22 @@ mod tests {
     }
 
     #[test]
+    fn subscription_providers_lead_the_registry() {
+        let reg = provider_registry();
+        assert_eq!(reg[0].provider_id, "anthropic");
+        assert_eq!(reg[1].provider_id, "openai-compat");
+        // Only those two offer browser sign-in.
+        for info in &reg {
+            assert_eq!(
+                oauth_capable(info.provider_id),
+                matches!(info.provider_id, "anthropic" | "openai-compat"),
+                "{}",
+                info.provider_id
+            );
+        }
+    }
+
+    #[test]
     fn env_file_set_parse_remove_roundtrip() {
         let dir = std::env::temp_dir().join(format!("modron-core-auth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -331,10 +376,19 @@ pub mod oauth {
 
     /// Wait for the one-shot OAuth callback on localhost. Returns the
     /// authorization code (state-validated); the socket answers the
-    /// browser with a plain "return to your terminal" page.
-    pub async fn wait_for_callback(port: u16, expected_state: &str) -> anyhow::Result<String> {
+    /// browser with a plain "return to your terminal" page. When
+    /// `open_url` is given the browser is opened AFTER the listener
+    /// binds, so an instant approval can never race the socket.
+    pub async fn wait_for_callback(
+        port: u16,
+        expected_state: &str,
+        open_url: Option<&str>,
+    ) -> anyhow::Result<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        if let Some(url) = open_url {
+            super::open_browser(url);
+        }
         let (mut socket, _) = listener.accept().await?;
         let mut buf = vec![0u8; 16384];
         let n = socket.read(&mut buf).await?;
@@ -352,15 +406,41 @@ pub mod oauth {
     }
 
     /// Exchange the callback code for tokens (authorization_code grant).
+    /// OAuth2 token endpoints require form encoding — the Anthropic
+    /// endpoint rejects JSON bodies with "Invalid request format".
     pub async fn exchange_code(session: &LoginSession, code: &str) -> anyhow::Result<TokenSet> {
+        exchange_code_at(TOKEN_URL, session, code).await
+    }
+
+    /// Endpoint-parameterized [`exchange_code`] (tests point it at a
+    /// mock and assert the wire format).
+    pub async fn exchange_code_at(
+        token_url: &str,
+        session: &LoginSession,
+        code: &str,
+    ) -> anyhow::Result<TokenSet> {
         let client = reqwest::Client::new();
         let response = client
-            .post(TOKEN_URL)
-            .json(&build_token_exchange(code, &session.verifier, session.port))
+            .post(token_url)
+            .form(&token_exchange_form(code, &session.verifier, session.port))
             .send()
             .await?;
         let body: Value = response.json().await?;
         parse_token_response(&body)
+    }
+
+    /// The form fields of the authorization_code exchange.
+    pub fn token_exchange_form(code: &str, verifier: &str, port: u16) -> Vec<(String, String)> {
+        vec![
+            ("grant_type".to_string(), "authorization_code".to_string()),
+            ("code".to_string(), code.to_string()),
+            (
+                "redirect_uri".to_string(),
+                format!("http://localhost:{port}/callback"),
+            ),
+            ("client_id".to_string(), CLIENT_ID.to_string()),
+            ("code_verifier".to_string(), verifier.to_string()),
+        ]
     }
 
     /// PKCE pair: (verifier, S256 challenge). Verifier is 64 chars from
@@ -453,16 +533,6 @@ pub mod oauth {
                 .get("id_token")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-        })
-    }
-
-    pub fn build_token_exchange(code: &str, verifier: &str, port: u16) -> Value {
-        json!({
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": format!("http://localhost:{port}/callback"),
-            "client_id": CLIENT_ID,
-            "code_verifier": verifier,
         })
     }
 
@@ -952,6 +1022,60 @@ pub mod oauth {
                 "s1"
             )
             .is_err());
+        }
+
+        #[tokio::test]
+        async fn token_exchange_is_form_encoded_on_the_wire() {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            // OAuth2 token endpoints reject JSON with "Invalid request
+            // format" (learned live against Anthropic's endpoint): prove
+            // the request is form-encoded with all five fields.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let token_url = format!("http://{addr}/oauth/token");
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = r#"{"access_token":"at-2","refresh_token":"rt-2"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = tx.send(request);
+            });
+            let session = LoginSession {
+                url: String::new(),
+                state: "s".into(),
+                verifier: "v".repeat(50),
+                port: 54545,
+            };
+            let tokens = exchange_code_at(&token_url, &session, "code-1")
+                .await
+                .unwrap();
+            assert_eq!(tokens.access_token, "at-2");
+            let request = rx.recv().unwrap();
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("content-type: application/x-www-form-urlencoded"),
+                "form content type: {request}"
+            );
+            assert!(
+                request.contains("grant_type=authorization_code"),
+                "{request}"
+            );
+            assert!(request.contains("code=code-1"), "{request}");
+            assert!(
+                request.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback"),
+                "{request}"
+            );
+            assert!(request.contains("code_verifier=vvvv"), "{request}");
         }
     }
 }
