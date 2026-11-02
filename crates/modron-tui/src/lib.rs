@@ -275,6 +275,16 @@ pub struct App {
     /// Highlighted row in the slash-command popup (clamped at use; typing
     /// resets it to the top).
     pub slash_selected: usize,
+    /// Cursor position in `input`, as a CHAR offset (0 = before the first
+    /// char, len = after the last). All edits happen here, so the input is
+    /// a real editable field, not just an append-only line.
+    pub cursor: usize,
+    /// First visible text row of the input box (it scrolls when the text
+    /// outgrows the box; the view keeps the cursor row in view).
+    pub input_scroll: u16,
+    /// The input box's inner area as of the last render — maps mouse
+    /// clicks to cursor positions.
+    pub last_input_inner: ratatui::layout::Rect,
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
@@ -321,7 +331,7 @@ impl App {
                 // is remapped to "\n" (the classic iTerm2 workaround). In
                 // raw mode crossterm reports it as exactly this.
                 KeyCode::Char('j') | KeyCode::Char('J') => {
-                    self.input.push('\n');
+                    self.insert_at_cursor('\n');
                     return Action::None;
                 }
                 KeyCode::Char('v') | KeyCode::Char('V') => {
@@ -395,6 +405,7 @@ impl App {
                 }
                 KeyCode::Tab => {
                     self.input = format!("/{} ", matches[sel].0);
+                    self.cursor = self.input.chars().count();
                     return Action::None;
                 }
                 _ => {}
@@ -412,7 +423,7 @@ impl App {
                 // protocol (run.rs enables it when available); option/alt+
                 // enter sends ESC+CR everywhere else, which crossterm
                 // reports as Enter with ALT.
-                self.input.push('\n');
+                self.insert_at_cursor('\n');
                 Action::None
             }
             KeyCode::Enter => {
@@ -422,9 +433,11 @@ impl App {
                 if self.input.ends_with('\\') {
                     self.input.pop();
                     self.input.push('\n');
+                    self.cursor = self.input.chars().count();
                     return Action::None;
                 }
                 let task = std::mem::take(&mut self.input);
+                self.cursor = 0;
                 if task.trim().is_empty() {
                     return Action::None;
                 }
@@ -436,21 +449,143 @@ impl App {
                 Action::Submit(task)
             }
             KeyCode::Backspace => {
-                self.input.pop();
+                if self.cursor > 0 {
+                    let byte = char_byte_idx(&self.input, self.cursor - 1);
+                    self.input.remove(byte);
+                    self.cursor -= 1;
+                }
                 self.slash_selected = 0;
+                Action::None
+            }
+            KeyCode::Delete => {
+                if self.cursor < self.input.chars().count() {
+                    let byte = char_byte_idx(&self.input, self.cursor);
+                    self.input.remove(byte);
+                }
+                self.slash_selected = 0;
+                Action::None
+            }
+            KeyCode::Left => {
+                self.cursor = self.cursor.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Right => {
+                self.cursor = (self.cursor + 1).min(self.input.chars().count());
+                Action::None
+            }
+            KeyCode::Home => {
+                self.cursor = self.cursor_line_start();
+                Action::None
+            }
+            KeyCode::End => {
+                self.cursor = self.cursor_line_end();
+                Action::None
+            }
+            // Up/Down inside a multi-line input move between lines (same
+            // column, clamped to the target line's length).
+            KeyCode::Up if self.input.contains('\n') => {
+                self.move_input_line(true);
+                Action::None
+            }
+            KeyCode::Down if self.input.contains('\n') => {
+                self.move_input_line(false);
                 Action::None
             }
             KeyCode::Esc if !self.running => {
                 self.input.clear();
+                self.cursor = 0;
                 Action::None
             }
             KeyCode::Char(c) => {
-                self.input.push(c);
+                self.insert_at_cursor(c);
                 self.slash_selected = 0;
                 Action::None
             }
             _ => Action::None,
         }
+    }
+
+    /// Insert a character at the cursor (char-offset domain).
+    fn insert_at_cursor(&mut self, c: char) {
+        let byte = char_byte_idx(&self.input, self.cursor);
+        self.input.insert(byte, c);
+        self.cursor += 1;
+    }
+
+    /// Char offset of the start of the cursor's line.
+    fn cursor_line_start(&self) -> usize {
+        self.cursor_line_layout().1
+    }
+
+    /// Char offset of the end of the cursor's line (before the newline).
+    fn cursor_line_end(&self) -> usize {
+        let (_, start, len) = self.cursor_line_layout();
+        start + len
+    }
+
+    /// (line_index, line_start_char_offset, line_len_chars) for the
+    /// cursor's line. The cursor at a line's end belongs to that line,
+    /// not the next one.
+    fn cursor_line_layout(&self) -> (usize, usize, usize) {
+        let mut start = 0;
+        let mut last = (0, 0, 0);
+        for (i, line) in self.input.split('\n').enumerate() {
+            let len = line.chars().count();
+            last = (i, start, len);
+            if self.cursor <= start + len {
+                return (i, start, len);
+            }
+            start += len + 1;
+        }
+        last // cursor at the very end of a trailing newline
+    }
+
+    /// Move the cursor one line up/down, keeping the column when the
+    /// target line is long enough (standard editor behavior).
+    fn move_input_line(&mut self, up: bool) {
+        let (li, start, _) = self.cursor_line_layout();
+        let col = self.cursor - start;
+        let target = if up { li.checked_sub(1) } else { Some(li + 1) };
+        let Some(target) = target else { return };
+        let mut t_start = 0;
+        for (i, line) in self.input.split('\n').enumerate() {
+            let t_len = line.chars().count();
+            if i == target {
+                self.cursor = t_start + col.min(t_len);
+                return;
+            }
+            t_start += t_len + 1;
+        }
+    }
+
+    /// A mouse click inside the input box positions the cursor. `column`
+    /// and `row` are terminal-wide coordinates (from crossterm); clicks
+    /// outside the input's inner area are ignored.
+    pub fn on_click(&mut self, column: u16, row: u16) {
+        let inner = self.last_input_inner;
+        if inner.width == 0 || row < inner.y || row >= inner.y + inner.height {
+            return;
+        }
+        let chip_rows = (!self.attachment_chips.is_empty()) as u16;
+        let visible_row = row - inner.y;
+        if visible_row < chip_rows {
+            // Click landed on the attachment-chips row: cursor to the end.
+            self.cursor = self.input.chars().count();
+            return;
+        }
+        let text_row = (self.input_scroll + visible_row - chip_rows) as usize;
+        let mut start = 0;
+        for (i, line) in self.input.split('\n').enumerate() {
+            let len = line.chars().count();
+            if i == text_row {
+                let col = (column.saturating_sub(inner.x + 2) as usize).min(len);
+                self.cursor = start + col;
+                return;
+            }
+            start += len + 1;
+        }
+        // Below the text (empty rows of the box): cursor to the end.
+        self.cursor = self.input.chars().count();
     }
 
     /// Commands matching the input for the completion popup: the input must
@@ -975,16 +1110,21 @@ impl App {
     /// Render the live region into `frame` (the run loop sizes the area).
     /// Claude Code-style: streaming/status zone on top, a rounded bordered
     /// input box at the bottom, color throughout (accent for activity, dim
-    /// for meta, cyan for tools, red for errors).
-    pub fn view(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    /// for meta, cyan for tools, red for errors). Takes `&mut self` to
+    /// record the input box's geometry and scroll state for mouse mapping.
+    pub fn view(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         let th = self.theme.resolved();
         use ratatui::layout::{Constraint, Layout};
         use ratatui::widgets::Paragraph;
 
-        // Split: everything above vs the bordered input box (3 rows).
-        // Input box height grows with multi-line content (3 base + 1/line).
-        let input_lines = self.input.matches('\n').count() as u16;
-        let input_height = (3 + input_lines).min(6).min(area.height.saturating_sub(2));
+        // Split: everything above vs the bordered input box. The box grows
+        // with its content (2 borders + chips row + one row per text line)
+        // up to 8 rows, then scrolls internally.
+        let chip_rows = (!self.attachment_chips.is_empty()) as u16;
+        let text_rows = self.input.matches('\n').count() as u16 + 1;
+        let input_height = (2 + chip_rows + text_rows)
+            .min(8)
+            .min(area.height.saturating_sub(2));
         let outer =
             Layout::vertical([Constraint::Min(1), Constraint::Length(input_height)]).split(area);
         let top = outer[0];
@@ -1166,65 +1306,71 @@ impl App {
             ));
         let inner = block.inner(input_area);
         frame.render_widget(block, input_area);
+        self.last_input_inner = inner;
 
-        // Pending-attachment chips ride as the first line inside the box.
-        let chips = if self.attachment_chips.is_empty() {
-            None
-        } else {
-            Some(self.attachment_chips.join(" "))
-        };
+        // Keep the cursor's row inside the visible window (the box scrolls
+        // vertically once the text outgrows it).
+        let (cursor_line, cursor_line_start, _) = self.cursor_line_layout();
+        let visible_text_rows = inner.height.saturating_sub(chip_rows);
+        if visible_text_rows > 0 {
+            let cl = cursor_line as u16;
+            if cl < self.input_scroll {
+                self.input_scroll = cl;
+            } else if cl >= self.input_scroll + visible_text_rows {
+                self.input_scroll = cl + 1 - visible_text_rows;
+            }
+        }
 
-        // Input text; cursor rendered as a block at the text end.
-        let display_input = if self.input.is_empty() && !self.running {
-            "type a task (or / for commands)…" // placeholder
-        } else {
-            &self.input
-        };
-        let input_style = if self.input.is_empty() && !self.running {
-            Style::default().fg(th.dim)
-        } else {
-            Style::default()
-        };
-        // Multi-line input: split on \n, render each as its own line with
-        // the prompt on the first.
+        // Pending-attachment chips ride as the first line inside the box,
+        // then the scrolled window of text rows (prompt on the first line
+        // of the INPUT, not of the window). An empty input shows the
+        // placeholder instead of a blank prompt row.
         let mut lines: Vec<Line> = Vec::new();
-        if let Some(chips) = chips {
+        if let Some(chips) =
+            (!self.attachment_chips.is_empty()).then(|| self.attachment_chips.join(" "))
+        {
             lines.push(Line::from(chips).style(Style::default().fg(th.accent)));
         }
-        let input_lines: Vec<Line> = if self.input.contains('\n') {
-            self.input
-                .split('\n')
-                .enumerate()
-                .map(|(i, line)| {
-                    if i == 0 {
-                        Line::from(vec![
-                            Span::styled("❯ ", Style::default().fg(th.accent)),
-                            Span::styled(line.to_string(), Style::default()),
-                        ])
-                    } else {
-                        Line::from(format!("  {line}"))
-                    }
-                })
-                .collect()
-        } else {
-            vec![Line::from(vec![
+        let scroll = self.input_scroll as usize;
+        if self.input.is_empty() {
+            let (text, style) = if self.running {
+                ("", Style::default())
+            } else {
+                (
+                    "type a task (or / for commands)…",
+                    Style::default().fg(th.dim),
+                )
+            };
+            lines.push(Line::from(vec![
                 Span::styled("❯ ", Style::default().fg(th.accent)),
-                Span::styled(display_input.to_string(), input_style),
-            ])]
-        };
-        lines.extend(input_lines);
+                Span::styled(text, style),
+            ]));
+        } else {
+            for (i, line) in self.input.split('\n').enumerate().skip(scroll) {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("❯ ", Style::default().fg(th.accent)),
+                        Span::styled(line.to_string(), Style::default()),
+                    ]));
+                } else {
+                    lines.push(Line::from(format!("  {line}")));
+                }
+            }
+        }
         frame.render_widget(Paragraph::new(lines), inner);
-        // Blinking-style cursor block after the text (only when not running
-        // and there's no placeholder shift).
+
+        // Cursor block at the cursor's (line, column) — the reason the
+        // cursor is a char offset, not "the end of the string".
         if !self.running && !self.input.is_empty() {
-            let cursor_x = inner.x + 2 + self.input.chars().count() as u16;
-            let cursor_y = inner.y;
-            if cursor_x < inner.x + inner.width {
+            let visible_line = cursor_line.saturating_sub(scroll) as u16;
+            let col = (self.cursor - cursor_line_start) as u16;
+            let cursor_x = inner.x + 2 + col.min(inner.width.saturating_sub(3));
+            let cursor_y = inner.y + chip_rows + visible_line;
+            if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
                 if let Some(cell) = frame
                     .buffer_mut()
                     .cell_mut(ratatui::layout::Position::new(cursor_x, cursor_y))
                 {
-                    let th = self.theme.resolved();
                     cell.set_symbol("▎")
                         .set_style(Style::default().fg(th.accent));
                 }
@@ -1329,6 +1475,12 @@ fn slugish(text: &str) -> String {
         }
     }
     out.trim_matches('-').chars().take(48).collect()
+}
+
+/// Byte index of the `ci`-th char of `s` (s.len() when past the end) —
+/// String::insert/remove speak bytes, the cursor speaks chars.
+fn char_byte_idx(s: &str, ci: usize) -> usize {
+    s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 fn short(s: &str, max_chars: usize) -> String {

@@ -229,7 +229,7 @@ fn streaming_tail_is_bounded_and_wraps_manually() {
     assert_eq!(tail.len(), 3);
 }
 
-fn render(app: &App, width: u16, height: u16) -> String {
+fn render(app: &mut App, width: u16, height: u16) -> String {
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
@@ -248,12 +248,13 @@ fn render(app: &App, width: u16, height: u16) -> String {
 
 #[test]
 fn idle_view_renders_prompt_and_status() {
-    let app = App {
+    let mut app = App {
         model_label: "glm-5.3".into(),
         input: "hello world".into(),
+        cursor: "hello world".chars().count(),
         ..App::default()
     };
-    let frame = render(&app, 80, 6);
+    let frame = render(&mut app, 80, 6);
     assert!(
         frame.contains("❯ hello world"),
         "input in the bordered box: {frame:?}"
@@ -265,11 +266,11 @@ fn idle_view_renders_prompt_and_status() {
 
 #[test]
 fn approval_view_renders_the_prompt_and_hint() {
-    let app = App {
+    let mut app = App {
         pending_approval: Some(pending()),
         ..App::default()
     };
-    let frame = render(&app, 80, 7);
+    let frame = render(&mut app, 80, 7);
     assert!(frame.contains("allow bash"), "approval prompt: {frame:?}");
     assert!(frame.contains("y = allow once"), "decision hint: {frame:?}");
     assert!(
@@ -287,7 +288,7 @@ fn running_view_shows_spinner_and_interrupt_hint() {
         ..App::default()
     };
     app.on_delta(StreamDelta::Text("streaming answer text".into()));
-    let frame = render(&app, 80, 8);
+    let frame = render(&mut app, 80, 8);
     assert!(frame.contains("esc interrupt"), "interrupt hint: {frame:?}");
     assert!(
         frame.contains("streaming answer text"),
@@ -694,6 +695,7 @@ fn slash_popup_filters_matches_from_the_catalog() {
     assert!(app.slash_matches().is_empty(), "no popup without a /");
 
     app.input.push('/');
+    app.cursor = 1;
     assert_eq!(
         app.slash_matches().len(),
         SlashCommand::CATALOG.len(),
@@ -745,6 +747,7 @@ fn tab_completes_and_arrows_move_the_slash_popup() {
     // /c matches clear, compact, compress, context, code-review (in order).
     let mut app2 = App::default();
     app2.input.push_str("/c");
+    app2.cursor = 2;
     assert_eq!(app2.on_key(key(KeyCode::Down)), Action::None);
     assert_eq!(app2.on_key(key(KeyCode::Down)), Action::None);
     assert_eq!(app2.on_key(key(KeyCode::Tab)), Action::None);
@@ -753,6 +756,7 @@ fn tab_completes_and_arrows_move_the_slash_popup() {
     // Up wraps around to the bottom of the list.
     let mut app3 = App::default();
     app3.input.push_str("/c");
+    app3.cursor = 2;
     assert_eq!(app3.on_key(key(KeyCode::Up)), Action::None);
     assert_eq!(app3.on_key(key(KeyCode::Tab)), Action::None);
     assert_eq!(
@@ -763,6 +767,7 @@ fn tab_completes_and_arrows_move_the_slash_popup() {
     // Typing after navigating resets the highlight to the top.
     let mut app4 = App::default();
     app4.input.push_str("/c");
+    app4.cursor = 2;
     app4.on_key(key(KeyCode::Down));
     app4.on_key(key(KeyCode::Char('l')));
     assert_eq!(app4.on_key(key(KeyCode::Tab)), Action::None);
@@ -777,11 +782,12 @@ fn tab_completes_and_arrows_move_the_slash_popup() {
 
 #[test]
 fn slash_popup_renders_above_the_input_box() {
-    let app = App {
+    let mut app = App {
         input: "/c".into(),
+        cursor: 2,
         ..App::default()
     };
-    let frame = render(&app, 80, 10);
+    let frame = render(&mut app, 80, 10);
     assert!(frame.contains("❯ /clear"), "top row highlighted: {frame:?}");
     assert!(frame.contains("/compact"), "middle rows listed: {frame:?}");
     assert!(
@@ -792,10 +798,135 @@ fn slash_popup_renders_above_the_input_box() {
     assert!(frame.contains("╭"), "input border survives: {frame:?}");
 
     // A space after the command word closes the popup.
-    let closed = App {
+    let mut closed = App {
         input: "/model glm".into(),
+        cursor: 10,
         ..App::default()
     };
-    let frame = render(&closed, 80, 10);
+    let frame = render(&mut closed, 80, 10);
     assert!(!frame.contains("/clear"), "no popup with args: {frame:?}");
+}
+
+#[test]
+fn cursor_model_edits_at_the_cursor_not_the_end() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    for c in "hello".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    assert_eq!(app.cursor, 5, "typing advances the cursor");
+
+    // Left twice, then type: insertion happens mid-text.
+    app.on_key(key(KeyCode::Left));
+    app.on_key(key(KeyCode::Left));
+    assert_eq!(app.cursor, 3);
+    app.on_key(key(KeyCode::Char('X')));
+    assert_eq!(app.input, "helXlo");
+
+    // Backspace deletes before the cursor; Delete deletes after it.
+    app.on_key(key(KeyCode::Backspace));
+    assert_eq!(app.input, "hello");
+    assert_eq!(app.cursor, 3);
+    app.on_key(key(KeyCode::Left));
+    app.on_key(key(KeyCode::Delete));
+    assert_eq!(app.input, "helo");
+
+    // Home/End move within the current line only.
+    let mut app2 = App {
+        input: "one\ntwo".into(),
+        cursor: 5, // on "two", after the 't'
+        ..App::default()
+    };
+    app2.on_key(key(KeyCode::End));
+    assert_eq!(app2.cursor, 7, "end of the second line");
+    app2.on_key(key(KeyCode::Home));
+    assert_eq!(app2.cursor, 4, "home of the second line, not of the input");
+
+    // Up/Down move between input lines, keeping the column.
+    app2.on_key(key(KeyCode::Up));
+    assert_eq!(app2.cursor, 0, "col 0 on line 1");
+    app2.on_key(key(KeyCode::End));
+    app2.on_key(key(KeyCode::Down));
+    assert_eq!(app2.cursor, 7, "col 3 clamped to line 2's end");
+
+    // Right clamps at the end.
+    let mut app3 = App {
+        input: "ab".into(),
+        ..App::default()
+    };
+    for _ in 0..5 {
+        app3.on_key(key(KeyCode::Right));
+    }
+    assert_eq!(app3.cursor, 2);
+}
+
+#[test]
+fn click_positions_the_cursor_inside_the_input_box() {
+    let mut app = App {
+        input: "one\ntwo".into(),
+        ..App::default()
+    };
+    // Simulate geometry recorded by the last render: inner at (1, 5), 50x4.
+    app.last_input_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 5,
+        width: 50,
+        height: 4,
+    };
+
+    // Click on row 6 (second text line), column 10 → "two" col 7 clamped.
+    app.on_click(10, 6);
+    assert_eq!(app.cursor, 7, "click past the line end clamps to it");
+
+    // Click on the first line, column 4 → col 1 of "one".
+    app.on_click(4, 5);
+    assert_eq!(app.cursor, 1);
+
+    // Click below the text rows → cursor to the end.
+    app.on_click(4, 8);
+    assert_eq!(app.cursor, 7);
+
+    // Click outside the box → unchanged.
+    app.on_click(4, 2);
+    assert_eq!(app.cursor, 7);
+
+    // Clicking the chips row (first inner row) puts the cursor at the end.
+    app.attachment_chips = vec!["[img x.png · 1 KiB]".into()];
+    app.on_click(4, 5);
+    assert_eq!(app.cursor, 7);
+}
+
+#[test]
+fn multiline_input_renders_the_cursor_on_the_typed_line() {
+    let mut app = App::default();
+    app.input = "first line here\nsecond line here".into();
+    app.cursor = app.input.chars().count(); // end of the second line
+    let frame = render(&mut app, 80, 10);
+    assert!(
+        frame.contains("second line here▎"),
+        "cursor sits right after the second line: {frame:?}"
+    );
+    assert!(
+        !frame.contains("first line here  ▎"),
+        "no stray cursor padding on the first line: {frame:?}"
+    );
+
+    // Cursor mid-first-line renders there instead.
+    app.cursor = 5;
+    let frame = render(&mut app, 80, 10);
+    assert!(frame.contains("first▎"), "cursor mid-line: {frame:?}");
+}
+
+#[test]
+fn long_multiline_input_scrolls_to_keep_the_cursor_visible() {
+    let mut app = App::default();
+    app.input = (1..=8)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.cursor = app.input.chars().count(); // end of "line 8"
+    let frame = render(&mut app, 80, 12);
+    assert!(frame.contains("line 8"), "last line visible: {frame:?}");
+    assert!(frame.contains("line 8▎"), "cursor on it: {frame:?}");
+    assert!(!frame.contains("line 1\n"), "first line scrolled out");
 }

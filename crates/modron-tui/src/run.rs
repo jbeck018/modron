@@ -113,8 +113,14 @@ pub async fn run_with(
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
     // Bracketed paste (ctrl+V in most terminals delivers a paste event):
-    // multi-line pastes enter the input instead of submitting.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    // multi-line pastes enter the input instead of submitting. Mouse
+    // capture: clicks position the input cursor (native text selection
+    // still works with shift held — the terminal's own escape hatch).
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
     if kitty_keyboard {
         use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
         let _ = crossterm::execute!(
@@ -247,7 +253,16 @@ pub async fn run_with(
                     // must never submit.
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
                     app.input.push_str(&text);
+                    app.cursor = app.input.chars().count();
                     continue;
+                }
+                crossterm::event::Event::Mouse(me) => {
+                    if let crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ) = me.kind
+                    {
+                        app.on_click(me.column, me.row);
+                    }
                 }
                 crossterm::event::Event::Key(key)
                     if key.kind == crossterm::event::KeyEventKind::Press =>
@@ -279,6 +294,7 @@ pub async fn run_with(
                                 crate::clipboard::ClipboardContent::Text(text) => {
                                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
                                     app.input.push_str(&text);
+                                    app.cursor = app.input.chars().count();
                                 }
                                 crate::clipboard::ClipboardContent::Empty => {
                                     app.status_note = Some("clipboard empty".into());
@@ -435,7 +451,11 @@ pub async fn run_with(
             crossterm::event::PopKeyboardEnhancementFlags
         );
     }
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture
+    );
     crossterm::terminal::disable_raw_mode()?;
     if let Some(id) = app.session_id {
         println!("session: {id} — resume with --resume {id}");
