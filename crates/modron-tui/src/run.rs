@@ -421,10 +421,11 @@ async fn run_pending_command(
     cmd: PendingCommand,
 ) -> Vec<String> {
     match cmd {
-        // /auth — provider credential status. Reads the same env file the
-        // CLI wizard writes (~/.config/modron/env); the file is the truth,
-        // so no provider registry is duplicated here.
-        PendingCommand::Auth => auth_status_lines(),
+        // /auth — provider credentials against the shared core store
+        // (`modron_core::auth`): bare = status, `<provider> <key>` =
+        // save, `remove <provider>` = forget. The key never reaches the
+        // model — slash commands are handled entirely locally.
+        PendingCommand::Auth(arg) => run_auth_command(&arg),
         PendingCommand::Agent(name) => {
             let name = name.trim().to_string();
             if name.is_empty() {
@@ -615,70 +616,109 @@ fn run_issues(engine: &Engine, arg: &str) -> Vec<String> {
     out
 }
 
-/// Compact /auth status: masked keys from the env file + the Claude OAuth
-/// token file + the pointer to the CLI wizard.
-fn auth_status_lines() -> Vec<String> {
-    let mut out = vec!["provider credentials:".to_string()];
-    let env_path = std::env::var("MODRON_CONFIG")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-                .join(".config")
-                .join("modron")
-        })
-        .join("env");
-    let mut any = false;
-    if let Ok(content) = std::fs::read_to_string(&env_path) {
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("export ") {
-                if let Some((var, value)) = rest.split_once('=') {
-                    let value = value.trim().trim_matches('"');
-                    if value.is_empty() {
-                        continue;
-                    }
-                    any = true;
-                    let n = value.chars().count();
-                    let masked = if n > 8 {
-                        let head: String = value.chars().take(3).collect();
-                        let tail: String = value.chars().skip(n - 4).collect();
-                        format!("{head}…{tail}")
-                    } else {
-                        "…".to_string()
-                    };
-                    out.push(format!("  {var} = {masked} (saved)"));
+/// `/auth` — status by default; `/auth <provider> <key>` saves;
+/// `/auth set <provider> <key>` and `/auth remove <provider>` explicit
+/// forms. Writes go to the shared env file; the new key applies to
+/// future launches (the running process also picks it up).
+fn run_auth_command(arg: &str) -> Vec<String> {
+    use modron_core::auth as store;
+    let arg = arg.trim();
+
+    if let Some(rest) = arg
+        .strip_prefix("remove ")
+        .or_else(|| arg.strip_prefix("logout "))
+    {
+        let id = rest.trim();
+        return match store::provider_info(id) {
+            Some(info) => {
+                match store::env_file().map_err(|e| e.to_string()).and_then(|p| {
+                    store::remove_key_from_env_file(&p, info.env_var).map_err(|e| e.to_string())
+                }) {
+                    Ok(true) => vec![format!("✓ {} key removed", info.name)],
+                    Ok(false) => vec![format!("no saved {} key", info.name)],
+                    Err(e) => vec![format!("cannot remove key: {e}")],
                 }
             }
-        }
+            None => vec![unknown_provider_line(id)],
+        };
     }
-    for var in ["ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() && !out.iter().any(|l| l.starts_with(&format!("  {var}"))) {
-                any = true;
-                let n = v.chars().count();
-                let tail: String = v.chars().skip(n.saturating_sub(4)).collect();
-                out.push(format!("  {var} = …{tail} (process env)"));
+
+    // `<provider> <key>` or `set <provider> <key>`.
+    let payload = arg.strip_prefix("set ").map(str::trim).unwrap_or(arg);
+    if !payload.is_empty() {
+        if let Some((id, key)) = payload.split_once(char::is_whitespace) {
+            let id = id.trim();
+            let key = key.trim();
+            if !key.is_empty() {
+                return match store::provider_info(id) {
+                    Some(info) => {
+                        match store::env_file().map_err(|e| e.to_string()).and_then(|p| {
+                            store::set_key_in_env_file(&p, info.env_var, key)
+                                .map_err(|e| e.to_string())
+                        }) {
+                            Ok(()) => {
+                                std::env::set_var(info.env_var, key);
+                                vec![format!(
+                                    "✓ {} key saved ({}) — ready; takes effect on your next launch if already running",
+                                    info.name,
+                                    store::mask_key(key)
+                                )]
+                            }
+                            Err(e) => vec![format!("cannot save key: {e}")],
+                        }
+                    }
+                    None => vec![unknown_provider_line(id)],
+                };
             }
         }
+        return vec![auth_usage()];
     }
-    if !any {
-        out.push("  (none configured)".to_string());
+
+    // Bare /auth: the full status board.
+    let mut out = vec!["provider credentials:".to_string()];
+    for info in store::provider_registry() {
+        let (source, value) = store::key_source(info.env_var);
+        let shown = match source {
+            store::KeySource::EnvFile => {
+                format!("{} (saved)", store::mask_key(&value))
+            }
+            store::KeySource::ProcessEnv => {
+                format!("{} (process env)", store::mask_key(&value))
+            }
+            store::KeySource::None => "—".to_string(),
+        };
+        out.push(format!("  {:<18} {}", info.name, shown));
     }
-    let oauth = std::env::var("HOME")
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".modron")
-                .join("auth")
-                .join("anthropic.json")
-        })
+    let oauth = store::env_file()
         .ok()
-        .and_then(|p| std::fs::metadata(&p).ok().map(|_| p));
+        .and_then(|_| {
+            std::env::var("HOME").ok().map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".modron")
+                    .join("auth")
+                    .join("anthropic.json")
+            })
+        })
+        .filter(|p| p.exists());
     if oauth.is_some() {
         out.push("  claude subscription: OAuth tokens present".to_string());
     }
     out.push(
-        "add a provider: run `modron auth add` (or `modron auth set <provider> <key>`)".to_string(),
+        "save in-app: /auth <provider> <key> · remove: /auth remove <provider> · wizard: `modron auth add`".to_string(),
     );
     out
+}
+
+fn unknown_provider_line(id: &str) -> String {
+    let known: Vec<&str> = modron_core::auth::provider_registry()
+        .iter()
+        .map(|p| p.provider_id)
+        .collect();
+    format!("unknown provider `{id}` — known: {}", known.join(", "))
+}
+
+fn auth_usage() -> String {
+    "/auth — status · /auth <provider> <key> — save · /auth remove <provider>".to_string()
 }
 
 enum DeltaOrTool {

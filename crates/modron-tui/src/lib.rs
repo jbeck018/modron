@@ -94,8 +94,9 @@ pub enum SlashCommand {
     Learn(String),
     /// Switch color theme (built-ins + ~/.config/modron/themes/*.json).
     Theme(String),
-    /// Show configured provider credentials (masked) and how to add more.
-    Auth,
+    /// Provider credentials: bare = status, `<provider> <key>` = save,
+    /// `remove <provider>` = forget.
+    Auth(String),
     /// Alias kept for muscle memory.
     Compress,
     Unknown(String),
@@ -106,8 +107,8 @@ pub enum SlashCommand {
 /// drains and executes it, then commits the result lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingCommand {
-    /// /auth — status of provider credentials (reads the auth store).
-    Auth,
+    /// /auth — credential status / set / remove against the shared store.
+    Auth(String),
     Agent(String),
     Allow(String),
     Deny(String),
@@ -155,7 +156,7 @@ impl SlashCommand {
         ("goal", "stop condition for long runs"),
         ("learn", "distill this session into a SKILL.md"),
         ("theme", "switch color theme"),
-        ("auth", "show provider keys (add: `modron auth add`)"),
+        ("auth", "show/save/remove provider keys"),
         ("login", "alias of /auth"),
     ];
 
@@ -192,7 +193,7 @@ impl SlashCommand {
             "goal" => SlashCommand::Goal(arg),
             "learn" => SlashCommand::Learn(arg),
             "theme" => SlashCommand::Theme(arg),
-            "auth" | "login" => SlashCommand::Auth,
+            "auth" | "login" => SlashCommand::Auth(arg),
             "compress" => SlashCommand::Compact,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -746,8 +747,8 @@ impl App {
                      already know — do not use tools.)"
                 ))
             }
-            SlashCommand::Auth => {
-                self.pending_command = Some(PendingCommand::Auth);
+            SlashCommand::Auth(arg) => {
+                self.pending_command = Some(PendingCommand::Auth(arg));
                 Action::None
             }
             SlashCommand::Agent(name) => {

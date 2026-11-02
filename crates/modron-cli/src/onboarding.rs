@@ -18,106 +18,30 @@ pub struct ProviderOption {
 }
 
 pub fn provider_options() -> Vec<ProviderOption> {
-    vec![
-        ProviderOption {
-            number: 1,
-            name: "Z.ai (GLM)",
-            provider_id: "zai",
-            env_var: "ZAI_API_KEY",
-            key_url: "https://z.ai/manage-apikey/apikey-list",
-            note: "free tier available (glm-4.5-flash)",
-        },
-        ProviderOption {
-            number: 2,
-            name: "Anthropic (Claude)",
-            provider_id: "anthropic",
-            env_var: "ANTHROPIC_API_KEY",
-            key_url: "https://console.anthropic.com",
-            note: "Claude models",
-        },
-        ProviderOption {
-            number: 3,
-            name: "OpenAI",
-            provider_id: "openai-compat",
-            env_var: "OPENAI_API_KEY",
-            key_url: "https://platform.openai.com/api-keys",
-            note: "GPT models",
-        },
-        ProviderOption {
-            number: 4,
-            name: "Google Gemini",
-            provider_id: "google",
-            env_var: "GEMINI_API_KEY",
-            key_url: "https://aistudio.google.com/apikey",
-            note: "free tier (2.5 Flash, 1M context)",
-        },
-        ProviderOption {
-            number: 5,
-            name: "Groq",
-            provider_id: "groq",
-            env_var: "GROQ_API_KEY",
-            key_url: "https://console.groq.com/keys",
-            note: "free tier, fastest inference",
-        },
-        ProviderOption {
-            number: 6,
-            name: "OpenRouter",
-            provider_id: "openrouter",
-            env_var: "OPENROUTER_API_KEY",
-            key_url: "https://openrouter.ai/keys",
-            note: "400+ models, some free",
-        },
-        ProviderOption {
-            number: 7,
-            name: "Mistral",
-            provider_id: "mistral",
-            env_var: "MISTRAL_API_KEY",
-            key_url: "https://console.mistral.ai",
-            note: "free experiment tier",
-        },
-        ProviderOption {
-            number: 8,
-            name: "Cerebras",
-            provider_id: "cerebras",
-            env_var: "CEREBRAS_API_KEY",
-            key_url: "https://cloud.cerebras.ai",
-            note: "free tier, fast",
-        },
-        ProviderOption {
-            number: 9,
-            name: "Nvidia NIM",
-            provider_id: "nvidia",
-            env_var: "NVIDIA_API_KEY",
-            key_url: "https://build.nvidia.com",
-            note: "free tier",
-        },
-        ProviderOption {
-            number: 10,
-            name: "GitHub Models",
-            provider_id: "github-models",
-            env_var: "GITHUB_MODELS_TOKEN",
-            key_url: "https://github.com/settings/personal-access-tokens",
-            note: "free tier with a GitHub account",
-        },
-    ]
+    modron_core::auth::provider_registry()
+        .into_iter()
+        .enumerate()
+        .map(|(i, info)| ProviderOption {
+            number: (i + 1) as u8,
+            name: info.name,
+            provider_id: info.provider_id,
+            env_var: info.env_var,
+            key_url: info.key_url,
+            note: info.note,
+        })
+        .collect()
 }
 
 /// Find a registry entry by provider id (`zai`, `anthropic`, …).
-pub fn option_for_provider(provider_id: &str) -> Option<ProviderOption> {
-    provider_options()
-        .into_iter()
-        .find(|o| o.provider_id == provider_id)
+pub fn option_for_provider(provider_id: &str) -> Option<modron_core::auth::ProviderInfo> {
+    modron_core::auth::provider_info(provider_id)
 }
 
 /// The env file where onboarding saves keys: `~/.config/modron/env`
-/// (or `<MODRON_CONFIG>/env` when that override is set, matching the
-/// theme dir convention).
+/// (or `<MODRON_CONFIG>/env` when that override is set) — shared with
+/// `modron auth` and the TUI `/auth` command via `modron_core::auth`.
 pub fn env_file() -> anyhow::Result<PathBuf> {
-    if let Ok(dir) = std::env::var("MODRON_CONFIG") {
-        return Ok(PathBuf::from(dir).join("env"));
-    }
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
-    Ok(home.join(".config").join("modron").join("env"))
+    modron_core::auth::env_file().map_err(|e| anyhow::anyhow!("cannot resolve env file: {e}"))
 }
 
 /// Check if ANY provider key is available (env vars or the saved env file).

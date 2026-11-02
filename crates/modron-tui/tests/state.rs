@@ -1021,14 +1021,28 @@ fn streaming_renders_as_live_tail_in_the_history_zone() {
 }
 
 #[test]
-fn auth_slash_parks_a_pending_command() {
+fn auth_slash_parks_a_pending_command_with_args() {
     let mut app = App::default();
-    app.handle_slash_test(SlashCommand::Auth);
-    assert_eq!(app.pending_command, Some(PendingCommand::Auth));
-    // And /login is an alias that parses to the same command.
+    app.handle_slash_test(SlashCommand::Auth(String::new()));
+    assert_eq!(
+        app.pending_command,
+        Some(PendingCommand::Auth(String::new()))
+    );
+
+    app.handle_slash_test(SlashCommand::Auth("groq gsk-abc".into()));
+    assert_eq!(
+        app.pending_command,
+        Some(PendingCommand::Auth("groq gsk-abc".into()))
+    );
+
+    // /login is an alias that parses to the same command, args included.
     assert_eq!(
         SlashCommand::parse("/login"),
-        Some(SlashCommand::Auth),
+        Some(SlashCommand::Auth(String::new())),
         "catalog advertises /login as an alias; parse must match"
+    );
+    assert_eq!(
+        SlashCommand::parse("/auth set zai sk-1"),
+        Some(SlashCommand::Auth("set zai sk-1".into()))
     );
 }

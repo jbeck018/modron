@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub mod auth;
 pub mod b64;
 pub mod budget;
 pub mod compact;
