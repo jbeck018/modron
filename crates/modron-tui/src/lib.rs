@@ -114,6 +114,44 @@ pub enum PendingCommand {
 }
 
 impl SlashCommand {
+    /// Every accepted `/name` (canonical commands and their aliases) with a
+    /// one-line description. The completion popup shown while typing `/`
+    /// filters this table; it must stay in sync with [`SlashCommand::parse`]
+    /// (a test asserts every name here parses to a real command).
+    pub const CATALOG: &[(&str, &str)] = &[
+        ("help", "show this help"),
+        ("?", "alias of /help"),
+        ("exit", "quit the TUI"),
+        ("quit", "alias of /exit"),
+        ("q", "alias of /exit"),
+        ("clear", "clear the scrollback"),
+        ("compact", "force a context compaction now"),
+        ("compress", "alias of /compact"),
+        ("model", "switch models mid-session"),
+        ("context", "show context usage breakdown"),
+        ("sessions", "list recent sessions"),
+        ("sandbox", "off | seatbelt | bubblewrap"),
+        ("reasoning", "toggle streamed-reasoning display"),
+        ("thinking", "alias of /reasoning"),
+        ("btw", "quick side question, no tools"),
+        ("agent", "list or switch personas"),
+        ("persona", "alias of /agent"),
+        ("allow", "allow a tool for the session"),
+        ("deny", "deny a tool for the session"),
+        ("mode", "approval mode: ask | yolo"),
+        ("tasks", "background delegate status"),
+        ("worktree", "list delegate worktrees"),
+        ("worktrees", "alias of /worktree"),
+        ("issues", "the project issue board"),
+        ("fork", "branch this conversation"),
+        ("plan", "plan first, no edits until approved"),
+        ("review", "review the working diff"),
+        ("code-review", "alias of /review"),
+        ("goal", "stop condition for long runs"),
+        ("learn", "distill this session into a SKILL.md"),
+        ("theme", "switch color theme"),
+    ];
+
     /// Parse `/name arg` from input; None if input doesn't start with `/`.
     pub fn parse(input: &str) -> Option<Self> {
         let trimmed = input.trim();
@@ -234,6 +272,9 @@ pub struct App {
     pub attachments: Vec<modron_core::Attachment>,
     /// Display labels for the pending attachments (rendered as chips).
     pub attachment_chips: Vec<String>,
+    /// Highlighted row in the slash-command popup (clamped at use; typing
+    /// resets it to the top).
+    pub slash_selected: usize,
 }
 
 /// Claude Code-inspired palette: a warm accent for activity, dim for meta.
@@ -336,6 +377,30 @@ impl App {
             return Action::Abort;
         }
 
+        // Slash-command popup (input is a bare `/word` prefix): arrows move
+        // the highlight, tab completes it into the input. Bound only while
+        // the popup is open so the keys stay free otherwise.
+        let matches = self.slash_matches();
+        if !matches.is_empty() {
+            let len = matches.len();
+            let sel = self.slash_selected.min(len - 1);
+            match key.code {
+                KeyCode::Up => {
+                    self.slash_selected = (sel + len - 1) % len;
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    self.slash_selected = (sel + 1) % len;
+                    return Action::None;
+                }
+                KeyCode::Tab => {
+                    self.input = format!("/{} ", matches[sel].0);
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Enter
                 if key.modifiers.intersects(
@@ -372,6 +437,7 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.input.pop();
+                self.slash_selected = 0;
                 Action::None
             }
             KeyCode::Esc if !self.running => {
@@ -380,10 +446,30 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.input.push(c);
+                self.slash_selected = 0;
                 Action::None
             }
             _ => Action::None,
         }
+    }
+
+    /// Commands matching the input for the completion popup: the input must
+    /// start with `/` and still be the command word (no whitespace typed
+    /// yet). A bare `/` matches everything; empty means "no popup".
+    pub fn slash_matches(&self) -> Vec<&'static (&'static str, &'static str)> {
+        let Some(rest) = self.input.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if rest.is_empty() {
+            return SlashCommand::CATALOG.iter().collect();
+        }
+        if rest.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        SlashCommand::CATALOG
+            .iter()
+            .filter(|(name, _)| name.starts_with(rest))
+            .collect()
     }
 
     /// Push text as one tool line per row (a committed line renders as one
@@ -904,6 +990,31 @@ impl App {
         let top = outer[0];
         let input_area = outer[1];
 
+        // Slash-command popup: the filtered catalog rows live between the
+        // status line and the input box. Capped at 5 rows and by whatever
+        // height remains in the top zone — the viewport is fixed-size, so
+        // the popup must never push the other sections out.
+        let matches = self.slash_matches();
+        let sel = self.slash_selected.min(matches.len().saturating_sub(1));
+        let popup_h = if matches.is_empty() {
+            0
+        } else {
+            let mut reserved: u16 = if self.pending_approval.is_some() {
+                2
+            } else {
+                1
+            };
+            if !self.reasoning.is_empty() {
+                reserved += 2;
+            }
+            if !self.streaming.is_empty() {
+                reserved += 1;
+            }
+            reserved += self.subagents.len() as u16;
+            let avail = top.height.saturating_sub(reserved);
+            (matches.len() as u16).min(5).min(avail)
+        };
+
         // Top zone rows: reasoning tail, streaming (fills), subagents,
         // approval/status.
         let mut rows: Vec<Constraint> = Vec::new();
@@ -920,6 +1031,9 @@ impl App {
             rows.push(Constraint::Length(2));
         } else {
             rows.push(Constraint::Length(1));
+        }
+        if popup_h > 0 {
+            rows.push(Constraint::Length(popup_h));
         }
         let chunks = Layout::vertical(rows).split(top);
 
@@ -997,6 +1111,44 @@ impl App {
             let status = self.styled_status_line();
             frame.render_widget(Paragraph::new(status), chunks[idx]);
         }
+        idx += 1;
+
+        // Slash-command popup (window around the highlight when the
+        // filtered list outgrows the space).
+        if popup_h > 0 {
+            let h = popup_h as usize;
+            let start = sel.saturating_sub(h - 1).min(matches.len() - h);
+            let name_w = matches.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            let lines: Vec<Line> = matches[start..start + h]
+                .iter()
+                .enumerate()
+                .map(|(i, (name, desc))| {
+                    let selected = start + i == sel;
+                    let pointer = if selected { "❯ " } else { "  " };
+                    let pad = " ".repeat(name_w + 1 - name.len());
+                    Line::from(vec![
+                        Span::styled(pointer, Style::default().fg(th.accent)),
+                        Span::styled(
+                            format!("/{name}"),
+                            if selected {
+                                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                        Span::styled(
+                            format!("{pad}{desc}"),
+                            if selected {
+                                Style::default()
+                            } else {
+                                Style::default().fg(th.dim)
+                            },
+                        ),
+                    ])
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), chunks[idx]);
+        }
 
         // ── Bordered input box ──
         let border_color = if self.running { th.accent } else { th.dim };
@@ -1024,7 +1176,7 @@ impl App {
 
         // Input text; cursor rendered as a block at the text end.
         let display_input = if self.input.is_empty() && !self.running {
-            "type a task…" // placeholder
+            "type a task (or / for commands)…" // placeholder
         } else {
             &self.input
         };

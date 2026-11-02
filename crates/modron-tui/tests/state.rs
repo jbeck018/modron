@@ -687,3 +687,115 @@ fn swarm_summary_empty_when_no_agents_ran() {
     let mut app = App::default();
     assert!(app.swarm_summary().is_empty());
 }
+
+#[test]
+fn slash_popup_filters_matches_from_the_catalog() {
+    let mut app = App::default();
+    assert!(app.slash_matches().is_empty(), "no popup without a /");
+
+    app.input.push('/');
+    assert_eq!(
+        app.slash_matches().len(),
+        SlashCommand::CATALOG.len(),
+        "bare / lists every command"
+    );
+
+    for c in "mod".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(c)));
+    }
+    let names: Vec<&str> = app.slash_matches().iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, vec!["model", "mode"], "prefix filter, catalog order");
+
+    app.input = "/model glm".into();
+    assert!(app.slash_matches().is_empty(), "space closes the popup");
+
+    app.input = "/zzz".into();
+    assert!(app.slash_matches().is_empty(), "no matches, no popup");
+}
+
+#[test]
+fn catalog_names_are_unique_and_all_parse() {
+    let mut names: Vec<&str> = SlashCommand::CATALOG.iter().map(|(n, _)| *n).collect();
+    let total = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), total, "duplicate catalog entry");
+
+    for (name, _) in SlashCommand::CATALOG {
+        match SlashCommand::parse(&format!("/{name}")) {
+            Some(SlashCommand::Unknown(_)) => {
+                panic!("/{name} parses as Unknown — catalog out of sync with parse()")
+            }
+            None => panic!("/{name} does not parse"),
+            Some(_) => {}
+        }
+    }
+}
+
+#[test]
+fn tab_completes_and_arrows_move_the_slash_popup() {
+    use crossterm::event::KeyCode;
+    // Unique match: tab completes it with a trailing space for arguments.
+    let mut app = App::default();
+    app.input.push_str("/mo");
+    assert_eq!(app.on_key(key(KeyCode::Tab)), Action::None);
+    assert_eq!(app.input, "/model ");
+
+    // Several matches: down moves the highlight, tab takes the selected one.
+    // /c matches clear, compact, compress, context, code-review (in order).
+    let mut app2 = App::default();
+    app2.input.push_str("/c");
+    assert_eq!(app2.on_key(key(KeyCode::Down)), Action::None);
+    assert_eq!(app2.on_key(key(KeyCode::Down)), Action::None);
+    assert_eq!(app2.on_key(key(KeyCode::Tab)), Action::None);
+    assert_eq!(app2.input, "/compress ", "two downs select the third match");
+
+    // Up wraps around to the bottom of the list.
+    let mut app3 = App::default();
+    app3.input.push_str("/c");
+    assert_eq!(app3.on_key(key(KeyCode::Up)), Action::None);
+    assert_eq!(app3.on_key(key(KeyCode::Tab)), Action::None);
+    assert_eq!(
+        app3.input, "/code-review ",
+        "up from the top wraps to the last"
+    );
+
+    // Typing after navigating resets the highlight to the top.
+    let mut app4 = App::default();
+    app4.input.push_str("/c");
+    app4.on_key(key(KeyCode::Down));
+    app4.on_key(key(KeyCode::Char('l')));
+    assert_eq!(app4.on_key(key(KeyCode::Tab)), Action::None);
+    assert_eq!(app4.input, "/clear ");
+
+    // Arrows are inert when the popup is closed.
+    let mut app5 = App::default();
+    app5.input.push_str("plain text");
+    assert_eq!(app5.on_key(key(KeyCode::Down)), Action::None);
+    assert_eq!(app5.input, "plain text");
+}
+
+#[test]
+fn slash_popup_renders_above_the_input_box() {
+    let app = App {
+        input: "/c".into(),
+        ..App::default()
+    };
+    let frame = render(&app, 80, 10);
+    assert!(frame.contains("❯ /clear"), "top row highlighted: {frame:?}");
+    assert!(frame.contains("/compact"), "middle rows listed: {frame:?}");
+    assert!(
+        frame.contains("/code-review"),
+        "all five /c rows fit: {frame:?}"
+    );
+    assert!(frame.contains("❯ /c"), "input echo survives: {frame:?}");
+    assert!(frame.contains("╭"), "input border survives: {frame:?}");
+
+    // A space after the command word closes the popup.
+    let closed = App {
+        input: "/model glm".into(),
+        ..App::default()
+    };
+    let frame = render(&closed, 80, 10);
+    assert!(!frame.contains("/clear"), "no popup with args: {frame:?}");
+}
