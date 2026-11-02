@@ -16,29 +16,41 @@ const CATALOG_TOML: &str = r#"
 # Fields: name, provider, context_window (tokens), input_per_m / output_per_m
 # (USD per 1M tokens; 0 for local models), tier ("cheap" | "strong").
 
+# Anthropic lineup, verified against the subscription's own
+# GET /v1/models + the official pricing page (2026-11-02). Claude 4.6+
+# models carry a 1M window at standard pricing (except haiku-5-5, which
+# price-tiers at the 100k prompt boundary).
 [[models]]
-name = "claude-opus-4-1"
+name = "claude-opus-5-5"
 provider = "anthropic"
-context_window = 200_000
-input_per_m = 15.0
-output_per_m = 75.0
+context_window = 1_000_000
+input_per_m = 4.0
+output_per_m = 20.0
 tier = "strong"
 
 [[models]]
-name = "claude-sonnet-4-5"
+name = "claude-sonnet-5-5"
 provider = "anthropic"
-context_window = 200_000
-input_per_m = 3.0
-output_per_m = 15.0
+context_window = 1_000_000
+input_per_m = 2.0
+output_per_m = 10.0
 tier = "strong"
 
 [[models]]
-name = "claude-haiku-4-5"
+name = "claude-haiku-5-5"
 provider = "anthropic"
 context_window = 200_000
-input_per_m = 1.0
-output_per_m = 5.0
+input_per_m = 0.10
+output_per_m = 0.50
 tier = "cheap"
+
+[[models]]
+name = "claude-fable-5-1"
+provider = "anthropic"
+context_window = 1_000_000
+input_per_m = 10.0
+output_per_m = 50.0
+tier = "strong"
 
 # ChatGPT subscription models (OAuth sign-in, plan-billed: 0/0 pricing).
 # The lineup is whatever /backend-api/codex/models returns for the signed
@@ -76,37 +88,25 @@ input_per_m = 0.0
 output_per_m = 0.0
 tier = "cheap"
 
+# OpenAI API-key lineup (2026-11): gpt-6 family on api.openai.com.
+# gpt-6-astra's name belongs to the chatgpt subscription entry above
+# (names are unique catalog-wide); with an OPENAI_API_KEY it still works
+# via `--provider openai-compat --model gpt-6-astra` (forced provider).
 [[models]]
-name = "gpt-5"
+name = "gpt-6-sol"
 provider = "openai"
 context_window = 400_000
-input_per_m = 1.25
+input_per_m = 2.0
 output_per_m = 10.0
 tier = "strong"
 
 [[models]]
-name = "gpt-5-mini"
+name = "gpt-5.6-cyber"
 provider = "openai"
 context_window = 400_000
-input_per_m = 0.25
-output_per_m = 2.0
-tier = "cheap"
-
-[[models]]
-name = "gpt-4.1"
-provider = "openai"
-context_window = 1_000_000
-input_per_m = 2.0
-output_per_m = 8.0
+input_per_m = 12.5
+output_per_m = 75.0
 tier = "strong"
-
-[[models]]
-name = "o4-mini"
-provider = "openai"
-context_window = 200_000
-input_per_m = 1.10
-output_per_m = 4.40
-tier = "cheap"
 
 [[models]]
 name = "gemini-2.5-pro"
@@ -364,10 +364,10 @@ mod tests {
 
     #[test]
     fn lookup_known_model() {
-        let m = lookup("claude-opus-4-1").expect("opus should be in catalog");
+        let m = lookup("claude-opus-5-5").expect("opus should be in catalog");
         assert_eq!(m.provider, "anthropic");
         assert_eq!(m.tier, Tier::Strong);
-        assert_eq!(m.context_window, 200_000);
+        assert_eq!(m.context_window, 1_000_000);
     }
 
     #[test]
@@ -395,9 +395,10 @@ mod tests {
 
     #[test]
     fn catalog_cost_matches_published_rate() {
-        let opus = lookup("claude-opus-4-1").expect("in catalog");
-        assert_eq!(opus.cost_usd(1_000_000, 0), 15.0);
-        assert_eq!(opus.cost_usd(0, 1_000_000), 75.0);
+        // platform.claude.com pricing page (2026-11): opus-5-5 $4/$20.
+        let opus = lookup("claude-opus-5-5").expect("in catalog");
+        assert_eq!(opus.cost_usd(1_000_000, 0), 4.0);
+        assert_eq!(opus.cost_usd(0, 1_000_000), 20.0);
     }
 
     #[test]
@@ -428,13 +429,14 @@ mod tests {
     #[test]
     fn every_required_model_is_present() {
         for name in [
-            "claude-opus-4-1",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5",
-            "gpt-5",
-            "gpt-5-mini",
-            "gpt-4.1",
-            "o4-mini",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-6-sol",
+            "gpt-5.6-cyber",
             "gemini-2.5-pro",
             "gemini-2.5-flash",
             "deepseek-chat",

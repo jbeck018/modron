@@ -48,7 +48,7 @@ fn usage_dashboard_aggregates_sessions() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("claude-sonnet-4-5"),
+        stdout.contains("claude-sonnet-5-5"),
         "per-model row: {stdout}"
     );
     assert!(stdout.contains("input"), "table present: {stdout}");

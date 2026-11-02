@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Provider id, e.g. "anthropic", "openai-compat", "mock".
     pub default_provider: Option<String>,
-    /// Model name, e.g. "claude-sonnet-4-5".
+    /// Model name, e.g. "claude-sonnet-5-5".
     pub default_model: Option<String>,
     /// Per-turn assembled-context cap (pre-flight token estimate).
     pub max_input_tokens: Option<u64>,
@@ -135,9 +135,9 @@ pub struct KevConfig {
 /// `[router]` section (Phase-3a R1).
 #[derive(Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct RouterConfig {
-    /// Cheap-tier model (default: claude-haiku-4-5).
+    /// Cheap-tier model (default: claude-haiku-5-5).
     pub cheap_model: Option<String>,
-    /// Strong-tier model (default: claude-sonnet-4-5).
+    /// Strong-tier model (default: claude-sonnet-5-5).
     pub strong_model: Option<String>,
     /// "learned" (default; corpus centroids with heuristic fallback) or
     /// "heuristic" (rules only).

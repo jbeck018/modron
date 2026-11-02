@@ -987,7 +987,7 @@ fn build_agent_with(
                 .router
                 .as_ref()
                 .and_then(|r| r.cheap_model.clone())
-                .unwrap_or_else(|| "claude-haiku-4-5".to_string());
+                .unwrap_or_else(|| "claude-haiku-5-5".to_string());
             let model = judge.model.clone().unwrap_or(cheap_default);
             Some((
                 Arc::new(modron_providers::LlmJudgeRouter::new(provider, model)),
@@ -1571,11 +1571,11 @@ fn build_selector(
     let cheap = router_cfg
         .cheap_model
         .clone()
-        .unwrap_or_else(|| "claude-haiku-4-5".into());
+        .unwrap_or_else(|| "claude-haiku-5-5".into());
     let strong = router_cfg
         .strong_model
         .clone()
-        .unwrap_or_else(|| "claude-sonnet-4-5".into());
+        .unwrap_or_else(|| "claude-sonnet-5-5".into());
     let provider_of = |model: &str| {
         modron_router::lookup(model)
             .map(|info| info.provider.clone())
@@ -2078,11 +2078,11 @@ fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
     let cheap = router_cfg
         .cheap_model
         .clone()
-        .unwrap_or_else(|| "claude-haiku-4-5".into());
+        .unwrap_or_else(|| "claude-haiku-5-5".into());
     let strong = router_cfg
         .strong_model
         .clone()
-        .unwrap_or_else(|| "claude-sonnet-4-5".into());
+        .unwrap_or_else(|| "claude-sonnet-5-5".into());
 
     let correct = cases.iter().filter(|c| c.correct()).count();
     println!(

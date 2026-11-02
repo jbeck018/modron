@@ -73,8 +73,8 @@ impl HeuristicSelector {
 impl Default for HeuristicSelector {
     fn default() -> Self {
         Self {
-            cheap: ("claude-haiku-4-5".to_string(), "anthropic".to_string()),
-            strong: ("claude-sonnet-4-5".to_string(), "anthropic".to_string()),
+            cheap: ("claude-haiku-5-5".to_string(), "anthropic".to_string()),
+            strong: ("claude-sonnet-5-5".to_string(), "anthropic".to_string()),
             overrides: HashMap::new(),
         }
     }
@@ -285,8 +285,8 @@ mod tests {
     use super::*;
     use modron_core::ActionKind;
 
-    const CHEAP: &str = "claude-haiku-4-5";
-    const STRONG: &str = "claude-sonnet-4-5";
+    const CHEAP: &str = "claude-haiku-5-5";
+    const STRONG: &str = "claude-sonnet-5-5";
 
     fn req(action: ActionKind, task: &str, context_tokens: u64) -> SelectRequest {
         SelectRequest {

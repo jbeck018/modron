@@ -805,7 +805,7 @@ impl Default for EngineConfig {
         Self {
             working_dir: PathBuf::from("."),
             system: String::new(),
-            default_model: "claude-sonnet-4-5".to_string(),
+            default_model: "claude-sonnet-5-5".to_string(),
             default_provider: "anthropic".to_string(),
             max_turns: 40,
             max_input_tokens: 180_000,
