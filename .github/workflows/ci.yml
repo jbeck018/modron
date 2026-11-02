@@ -32,16 +32,17 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           cargo build --release
-          STARTUP=$(python3 -c "
-import subprocess, time
-times = []
-for _ in range(10):
-    t0 = time.perf_counter()
-    subprocess.run(['target/release/modron', '--version'], capture_output=True)
-    times.append((time.perf_counter() - t0) * 1000)
-times.sort()
-print(f'{times[5]:.0f}')
-")
+          cat > /tmp/startup_gate.py <<'PY'
+          import subprocess, time
+          times = []
+          for _ in range(10):
+              t0 = time.perf_counter()
+              subprocess.run(['target/release/modron', '--version'], capture_output=True)
+              times.append((time.perf_counter() - t0) * 1000)
+          times.sort()
+          print(f'{times[5]:.0f}')
+          PY
+          STARTUP=$(python3 /tmp/startup_gate.py)
           echo "startup p50: ${STARTUP}ms"
           if [ "$STARTUP" -gt 50 ]; then
             echo "::error::startup regression: ${STARTUP}ms > 50ms budget"
