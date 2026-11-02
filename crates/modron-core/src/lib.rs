@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub mod b64;
 pub mod budget;
 pub mod compact;
+pub mod goal;
 pub mod context;
 pub mod engine;
 pub mod hooks;

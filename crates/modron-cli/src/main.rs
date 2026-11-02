@@ -276,6 +276,12 @@ struct Cli {
     /// memory root is derived as <this dir's parent>/memory.
     #[arg(long, global = true)]
     sessions_dir: Option<PathBuf>,
+    /// Natural-language stop condition: keep the run going (same session,
+    /// iterative submissions) until the model reports the goal met or a
+    /// cap trips. Pairs with a task argument.
+    #[arg(long, global = true)]
+    goal: Option<String>,
+
     /// Continue a session: bare --resume picks the most recent; use
     /// --resume=<id> for a specific one. (Claude Code / Codex convention.)
     #[arg(long, global = true, num_args = 0..=1, require_equals = true)]
@@ -726,13 +732,40 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .join(", ")
         );
     }
-    let summary = match resume_session_id {
-        Some(session_id) => agent.engine.run_task_resuming(session_id, &task).await?,
-        None => {
-            agent
-                .engine
-                .run_task_with_attachments(&task, attachments)
-                .await?
+    let summary = if let Some(goal) = cli.goal.clone() {
+        // Long-horizon run (Phase 14): iterate in one session until the
+        // natural-language stop condition is reported or a cap trips.
+        let max_iters = std::env::var("MODRON_GOAL_MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(modron_core::goal::DEFAULT_MAX_ITERATIONS);
+        let outcome = modron_core::goal::run_goal_loop(
+            &agent.engine,
+            resume_session_id,
+            &task,
+            &goal,
+            max_iters,
+        )
+        .await?;
+        eprintln!(
+            "goal run: {} iteration(s) — {}",
+            outcome.iterations,
+            if outcome.goal_met {
+                "goal reported complete"
+            } else {
+                "stopped before the goal was reported (cap or budget)"
+            }
+        );
+        outcome.summary
+    } else {
+        match resume_session_id {
+            Some(session_id) => agent.engine.run_task_resuming(session_id, &task).await?,
+            None => {
+                agent
+                    .engine
+                    .run_task_with_attachments(&task, attachments)
+                    .await?
+            }
         }
     };
 
