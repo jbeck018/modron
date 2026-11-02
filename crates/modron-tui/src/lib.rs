@@ -426,9 +426,20 @@ pub struct App {
     /// char, len = after the last). All edits happen here, so the input is
     /// a real editable field, not just an append-only line.
     pub cursor: usize,
-    /// First visible text row of the input box (it scrolls when the text
-    /// outgrows the box; the view keeps the cursor row in view).
+    /// First visible DISPLAY row of the input box (it scrolls when the
+    /// text outgrows the box; the view keeps the cursor row in view).
     pub input_scroll: u16,
+    /// Sent inputs, newest last — ↑/↓ recall them when the input is a
+    /// single line (shell-style history).
+    pub input_history: Vec<String>,
+    /// Position in the history recall (usize::MAX = not recalling).
+    pub input_history_pos: usize,
+    /// The live input saved when recall started (↓ past the newest
+    /// restores it).
+    pub input_draft: String,
+    /// History-zone width from the last render — committed lines wrap to
+    /// it at push time so long content stays readable.
+    pub last_hist_width: u16,
     /// The input box's inner area as of the last render — maps mouse
     /// clicks to cursor positions.
     pub last_input_inner: ratatui::layout::Rect,
@@ -462,6 +473,49 @@ pub struct App {
 pub struct Selection {
     pub anchor: (usize, u16),
     pub head: (usize, u16),
+}
+
+/// One DISPLAY row of the input box: a logical line (or a slice of one,
+/// when it wraps) with its absolute char offset.
+#[derive(Clone, Debug)]
+struct InputRow {
+    logical: usize,
+    /// Char offset of the row's first char in the whole input string.
+    start: usize,
+    text: String,
+}
+
+/// Split a styled line into display rows of at most `width` display
+/// columns (char granularity — width-1 glyphs assumed, matching the rest
+/// of the TUI). Spans are cut at the boundary; every row keeps the
+/// styles of the chars it carries.
+fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(8);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    for span in line.iter() {
+        for ch in span.content.chars() {
+            if col == width {
+                rows.push(Line::from(std::mem::take(&mut current)));
+                col = 0;
+            }
+            if let Some(last) = current.last_mut() {
+                if last.style == span.style {
+                    last.content.to_mut().push(ch);
+                    col += 1;
+                    continue;
+                }
+            }
+            current.push(Span::styled(
+                std::borrow::Cow::Owned(ch.to_string()),
+                span.style,
+            ));
+            col += 1;
+        }
+    }
+    rows.push(Line::from(current));
+    rows
 }
 
 /// The char-column window a selection covers on history row `idx`
@@ -670,8 +724,18 @@ impl App {
                 }
                 let task = std::mem::take(&mut self.input);
                 self.cursor = 0;
+                // Shell-style history: remember sent inputs for ↑/↓ recall.
+                self.input_history_pos = usize::MAX;
+                self.input_draft.clear();
                 if task.trim().is_empty() {
                     return Action::None;
+                }
+                if self.input_history.last() != Some(&task) {
+                    self.input_history.push(task.clone());
+                    let len = self.input_history.len();
+                    if len > 100 {
+                        self.input_history.drain(..len - 100);
+                    }
                 }
                 // Slash commands are handled locally (dirge pattern) —
                 // they never reach the model.
@@ -681,6 +745,7 @@ impl App {
                 Action::Submit(task)
             }
             KeyCode::Backspace => {
+                self.input_history_pos = usize::MAX;
                 if self.cursor > 0 {
                     let byte = char_byte_idx(&self.input, self.cursor - 1);
                     self.input.remove(byte);
@@ -690,6 +755,7 @@ impl App {
                 Action::None
             }
             KeyCode::Delete => {
+                self.input_history_pos = usize::MAX;
                 if self.cursor < self.input.chars().count() {
                     let byte = char_byte_idx(&self.input, self.cursor);
                     self.input.remove(byte);
@@ -714,13 +780,22 @@ impl App {
                 Action::None
             }
             // Up/Down inside a multi-line input move between lines (same
-            // column, clamped to the target line's length).
+            // column, clamped to the target line's length); on a
+            // single-line input they traverse the sent-input history.
             KeyCode::Up if self.input.contains('\n') => {
                 self.move_input_line(true);
                 Action::None
             }
             KeyCode::Down if self.input.contains('\n') => {
                 self.move_input_line(false);
+                Action::None
+            }
+            KeyCode::Up => {
+                self.recall_history(true);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.recall_history(false);
                 Action::None
             }
             // Internal scrollback paging (fullscreen mode).
@@ -1126,13 +1201,16 @@ impl App {
         if let Some(AuthFlow::KeyEntry { input, .. }) = &mut self.auth_flow {
             input.push_str(text);
         } else {
+            self.input_history_pos = usize::MAX;
             self.input.push_str(text);
             self.cursor = self.input.chars().count();
         }
     }
 
-    /// Insert a character at the cursor (char-offset domain).
+    /// Insert a character at the cursor (char-offset domain). Editing
+    /// leaves history-recall mode (the text becomes the new live input).
     fn insert_at_cursor(&mut self, c: char) {
+        self.input_history_pos = usize::MAX;
         let byte = char_byte_idx(&self.input, self.cursor);
         self.input.insert(byte, c);
         self.cursor += 1;
@@ -1164,6 +1242,93 @@ impl App {
             start += len + 1;
         }
         last // cursor at the very end of a trailing newline
+    }
+
+    /// The input's DISPLAY layout: logical lines wrapped to the box's
+    /// width, one [`InputRow`] per rendered row. Long single-line messages
+    /// overflow onto extra rows instead of clipping (the Claude Code
+    /// behavior the input needs for reading long tasks).
+    fn input_rows(&self, width: u16) -> Vec<InputRow> {
+        let usable = (width.saturating_sub(2) as usize).max(8);
+        let mut rows = Vec::new();
+        let mut offset = 0usize; // char offset into the whole input
+        for (li, line) in self.input.split('\n').enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            if chars.is_empty() {
+                rows.push(InputRow {
+                    logical: li,
+                    start: offset,
+                    text: String::new(),
+                });
+                offset += 1; // the newline
+                continue;
+            }
+            let mut chunk_start = 0usize;
+            while chunk_start < chars.len() {
+                let end = (chunk_start + usable).min(chars.len());
+                rows.push(InputRow {
+                    logical: li,
+                    start: offset + chunk_start,
+                    text: chars[chunk_start..end].iter().collect(),
+                });
+                chunk_start = end;
+            }
+            offset += chars.len() + 1; // chars + the newline
+        }
+        rows
+    }
+
+    /// The cursor's DISPLAY position: (row index into [`Self::input_rows`],
+    /// column within that row).
+    /// Public for tests.
+    pub fn cursor_display(&self, width: u16) -> (usize, u16) {
+        let rows = self.input_rows(width);
+        for (ri, row) in rows.iter().enumerate() {
+            let row_len = row.text.chars().count();
+            if self.cursor >= row.start && self.cursor <= row.start + row_len {
+                // Prefer this row when the cursor is strictly inside it, or
+                // sits at its end and the next row starts a new logical
+                // line (a real newline) — otherwise the boundary belongs
+                // to the next wrapped row's start.
+                let next_is_same_line = rows
+                    .get(ri + 1)
+                    .map(|n| n.logical == row.logical)
+                    .unwrap_or(false);
+                if self.cursor < row.start + row_len || !next_is_same_line {
+                    return (ri, (self.cursor - row.start) as u16);
+                }
+            }
+        }
+        (rows.len().saturating_sub(1), 0)
+    }
+
+    /// Recall sent inputs with ↑/↓ (single-line input only; multi-line
+    /// editing keeps the arrows for moving between lines). The live input
+    /// is preserved as a draft and restored when scrolling past newest.
+    fn recall_history(&mut self, up: bool) {
+        const LIVE: usize = usize::MAX;
+        if self.input_history.is_empty() {
+            return;
+        }
+        if self.input_history_pos == LIVE {
+            if !up {
+                return; // ↓ while typing live: nothing to do
+            }
+            self.input_draft = std::mem::take(&mut self.input);
+            self.input_history_pos = self.input_history.len() - 1;
+        } else if up {
+            self.input_history_pos = self.input_history_pos.saturating_sub(1);
+        } else if self.input_history_pos + 1 >= self.input_history.len() {
+            // ↓ past the newest: back to the live draft.
+            self.input_history_pos = LIVE;
+            self.input = std::mem::take(&mut self.input_draft);
+            self.cursor = self.input.chars().count();
+            return;
+        } else {
+            self.input_history_pos += 1;
+        }
+        self.input = self.input_history[self.input_history_pos].clone();
+        self.cursor = self.input.chars().count();
     }
 
     /// Move the cursor one line up/down, keeping the column when the
@@ -1205,18 +1370,16 @@ impl App {
             return;
         }
         let text_row = (self.input_scroll + visible_row - chip_rows) as usize;
-        let mut start = 0;
-        for (i, line) in self.input.split('\n').enumerate() {
-            let len = line.chars().count();
-            if i == text_row {
+        let rows = self.input_rows(inner.width);
+        match rows.get(text_row) {
+            Some(row) => {
+                let len = row.text.chars().count();
                 let col = (column.saturating_sub(inner.x + 2) as usize).min(len);
-                self.cursor = start + col;
-                return;
+                self.cursor = row.start + col;
             }
-            start += len + 1;
+            // Below the text (empty rows of the box): cursor to the end.
+            None => self.cursor = self.input.chars().count(),
         }
-        // Below the text (empty rows of the box): cursor to the end.
-        self.cursor = self.input.chars().count();
     }
 
     /// Map a screen row to a history index using the last render's
@@ -1319,22 +1482,44 @@ impl App {
     }
 
     /// Commit lines into the internal scrollback. When the user is
-    /// scrolled up, the view stays anchored (offset unchanged).
+    /// scrolled up, the view stays anchored (offset unchanged). Lines
+    /// wrap to the last rendered width so long content stays readable
+    /// (the history Paragraph does not reflow).
     pub fn push_history(&mut self, lines: Vec<Line<'static>>) {
-        self.history.extend(lines);
+        let width = self.hist_wrap_width();
+        for line in lines {
+            self.history.extend(wrap_line(&line, width));
+        }
     }
 
     /// A dim meta line into the scrollback (slash-command output).
     pub fn note(&mut self, text: impl Into<String>) {
         let dim = Style::default().fg(self.theme.resolved().dim);
-        self.history.push(Line::from(text.into()).style(dim));
+        for row in wrap_line(&Line::from(text.into()).style(dim), self.hist_wrap_width()) {
+            self.history.push(row);
+        }
     }
 
     /// Push multi-line text as one dim row per line.
     fn push_lines(&mut self, text: impl Into<String>) {
         let dim = Style::default().fg(self.theme.resolved().dim);
         for line in text.into().lines() {
-            self.history.push(Line::from(line.to_string()).style(dim));
+            for row in wrap_line(
+                &Line::from(line.to_string()).style(dim),
+                self.hist_wrap_width(),
+            ) {
+                self.history.push(row);
+            }
+        }
+    }
+
+    /// The width committed lines wrap to: the history zone's last rendered
+    /// width, or a sane default before the first frame.
+    fn hist_wrap_width(&self) -> usize {
+        if self.last_hist_width > 20 {
+            self.last_hist_width as usize
+        } else {
+            100
         }
     }
 
@@ -1758,13 +1943,22 @@ impl App {
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
-        // The task echoes into the scrollback as an indented block.
+        // The task echoes into the scrollback as an indented block,
+        // wrapped to the history width so long messages stay readable.
         let mut lines = task.split('\n');
         let accent = Style::default().fg(self.theme.resolved().accent);
-        self.history
-            .push(Line::from(format!("❯ {}", lines.next().unwrap_or_default())).style(accent));
+        let width = self.hist_wrap_width();
+        for row in wrap_line(
+            &Line::from(format!("❯ {}", lines.next().unwrap_or_default())).style(accent),
+            width,
+        ) {
+            self.history.push(row);
+        }
+        let plain = Style::default();
         for line in lines {
-            self.history.push(Line::from(format!("  {line}")));
+            for row in wrap_line(&Line::from(format!("  {line}")).style(plain), width) {
+                self.history.push(row);
+            }
         }
         if let Some(goal) = self.goal.clone() {
             let dim = Style::default().fg(self.theme.resolved().dim);
@@ -1881,12 +2075,12 @@ impl App {
         // Fullscreen layout, bottom-up: the bordered input box, the slash
         // popup, the status line, the subagent panel — everything above is
         // the internal scrollback. The box grows with its content (2
-        // borders + chips row + one row per text line) up to 8 rows, then
-        // scrolls internally.
+        // borders + chips row + one row per DISPLAY row — long lines wrap)
+        // up to half the screen, then scrolls internally.
         let chip_rows = (!self.attachment_chips.is_empty()) as u16;
-        let text_rows = self.input.matches('\n').count() as u16 + 1;
-        let input_height = (2 + chip_rows + text_rows)
-            .min(8)
+        let input_display_rows = self.input_rows(area.width.saturating_sub(2)).len() as u16;
+        let input_height = (2 + chip_rows + input_display_rows)
+            .min((area.height / 2).max(4))
             .min(area.height.saturating_sub(2));
 
         let matches = if self.auth_flow.is_none() && self.menu.is_none() {
@@ -1935,6 +2129,7 @@ impl App {
         // ── Internal scrollback ──
         let hist_area = chunks[0];
         self.last_history_height = hist_area.height;
+        self.last_hist_width = hist_area.width;
         self.history_offset = self
             .history_offset
             .min(self.history.len().saturating_sub(1));
@@ -2254,23 +2449,23 @@ impl App {
         frame.render_widget(block, input_area);
         self.last_input_inner = inner;
 
-        // Keep the cursor's row inside the visible window (the box scrolls
-        // vertically once the text outgrows it).
-        let (cursor_line, cursor_line_start, _) = self.cursor_line_layout();
+        // Keep the cursor's DISPLAY row inside the visible window (the box
+        // scrolls vertically once the text outgrows it).
+        let (cursor_row, cursor_col) = self.cursor_display(inner.width);
         let visible_text_rows = inner.height.saturating_sub(chip_rows);
         if visible_text_rows > 0 {
-            let cl = cursor_line as u16;
-            if cl < self.input_scroll {
-                self.input_scroll = cl;
-            } else if cl >= self.input_scroll + visible_text_rows {
-                self.input_scroll = cl + 1 - visible_text_rows;
+            let cr = cursor_row as u16;
+            if cr < self.input_scroll {
+                self.input_scroll = cr;
+            } else if cr >= self.input_scroll + visible_text_rows {
+                self.input_scroll = cr + 1 - visible_text_rows;
             }
         }
 
         // Pending-attachment chips ride as the first line inside the box,
-        // then the scrolled window of text rows (prompt on the first line
-        // of the INPUT, not of the window). An empty input shows the
-        // placeholder instead of a blank prompt row.
+        // then the scrolled window of DISPLAY rows (the prompt marks the
+        // very first row of the input, not of the window). An empty input
+        // shows the placeholder instead of a blank prompt row.
         let mut lines: Vec<Line> = Vec::new();
         if let Some(chips) =
             (!self.attachment_chips.is_empty()).then(|| self.attachment_chips.join(" "))
@@ -2296,26 +2491,29 @@ impl App {
                 Span::styled(text, style),
             ]));
         } else {
-            for (i, line) in self.input.split('\n').enumerate().skip(scroll) {
-                if i == 0 {
+            let rows = self.input_rows(inner.width);
+            let mut first = true;
+            for row in rows.iter().skip(scroll) {
+                if first {
+                    // The prompt marks the input's first row.
                     lines.push(Line::from(vec![
                         Span::styled("❯ ", Style::default().fg(th.accent)),
-                        Span::styled(line.to_string(), Style::default()),
+                        Span::styled(row.text.clone(), Style::default()),
                     ]));
+                    first = false;
                 } else {
-                    lines.push(Line::from(format!("  {line}")));
+                    lines.push(Line::from(format!("  {}", row.text)));
                 }
             }
         }
         frame.render_widget(Paragraph::new(lines), inner);
 
-        // Cursor block at the cursor's (line, column) — the reason the
-        // cursor is a char offset, not "the end of the string".
+        // Cursor block at the cursor's display (row, column) — the reason
+        // the cursor is a char offset, not "the end of the string".
         if !self.running && !self.input.is_empty() {
-            let visible_line = cursor_line.saturating_sub(scroll) as u16;
-            let col = (self.cursor - cursor_line_start) as u16;
-            let cursor_x = inner.x + 2 + col.min(inner.width.saturating_sub(3));
-            let cursor_y = inner.y + chip_rows + visible_line;
+            let visible_row = cursor_row.saturating_sub(scroll) as u16;
+            let cursor_x = inner.x + 2 + cursor_col.min(inner.width.saturating_sub(3));
+            let cursor_y = inner.y + chip_rows + visible_row;
             if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
                 if let Some(cell) = frame
                     .buffer_mut()

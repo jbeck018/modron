@@ -1509,3 +1509,109 @@ fn selection_maps_rows_through_scrolled_geometry() {
     app.extend_selection(4, 2);
     assert_eq!(app.selected_text().as_deref(), Some("line-30\nline"));
 }
+
+// ── Input overflow wrapping + sent-input history ────────────────────────────
+
+#[test]
+fn long_single_line_input_wraps_into_display_rows() {
+    // 200 chars on ONE line (no newline): must overflow onto rows, not clip.
+    let mut app = App {
+        input: "a".repeat(200),
+        cursor: 200,
+        ..App::default()
+    };
+    let frame = render(&mut app, 80, 24);
+    // The whole text renders across wrapped rows (border/status chars
+    // share the frame, so check the full-width runs exist).
+    assert!(frame.contains(&"a".repeat(76)), "full display rows present");
+    let total: usize = frame.chars().filter(|c| *c == 'a').count();
+    assert!(total >= 200, "every char rendered: {total}");
+
+    // cursor_display maps through the wrap: the inner width is 78 and the
+    // prompt/indent takes 2, so rows are 76 chars — char 150 sits on row 1
+    // at column 74 (the cursor at the very end, 200, sits on the last row).
+    app.cursor = 150;
+    let (row, col) = app.cursor_display(78);
+    assert_eq!(row, 1, "second row for char 150");
+    assert_eq!(col as usize, 150 - 76, "column within the row");
+    app.cursor = 200;
+    let (row, _) = app.cursor_display(78);
+    assert_eq!(row, 2, "last row for the end cursor");
+
+    // The box height is capped and the view still renders (scrolling box).
+    let frame = render(&mut app, 80, 10);
+    assert!(!frame.is_empty());
+
+    // Click maps through display rows: clicking row 1 col 0 puts the
+    // cursor at the start of the second display row.
+    let inner = app.last_input_inner;
+    app.on_click(inner.x + 2, inner.y + 1);
+    assert_eq!(app.cursor, 76, "click maps into wrapped rows");
+}
+
+#[test]
+fn input_history_recall_traverses_and_restores_draft() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    // Submit two tasks (Enter parks Submit actions).
+    app.input = "first task".into();
+    app.cursor = app.input.chars().count();
+    let _ = app.on_key(key(KeyCode::Enter));
+    app.input = "second task".into();
+    app.cursor = app.input.chars().count();
+    let _ = app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.input_history.len(), 2);
+
+    // Typing a draft, then Up recalls the newest; Up again the older one.
+    for c in "draft".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(app.input, "second task");
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(app.input, "first task");
+    // Down walks forward; past the newest restores the draft.
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(app.input, "second task");
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(app.input, "draft");
+    // Editing exits recall (a later Up treats the edit as the new draft).
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(app.input, "second task");
+    app.on_key(key(KeyCode::Char('!')));
+    assert_eq!(app.input, "second task!");
+    // A later Up restarts at the NEWEST entry, then walks back.
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(app.input, "second task", "edit restarted history traversal");
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(app.input, "first task");
+    // Resubmitting the NEWEST entry does not duplicate it.
+    app.input = "first task".into();
+    let _ = app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.input_history.len(), 3, "older entries may repeat");
+    app.input = "first task".into();
+    let _ = app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.input_history.len(), 3, "consecutive duplicate deduped");
+}
+
+#[test]
+fn committed_long_lines_wrap_into_history_rows() {
+    let mut app = App {
+        last_hist_width: 50,
+        ..App::default()
+    };
+    app.note("x".repeat(120));
+    // 120 chars at width 50 -> 3 rows (50 + 50 + 20).
+    assert_eq!(app.history.len(), 3, "{:?}", app.history.len());
+    let joined: String = app
+        .history
+        .iter()
+        .flat_map(|l| l.iter().flat_map(|s| s.content.chars()))
+        .collect();
+    assert_eq!(joined.chars().count(), 120);
+
+    // Task echoes wrap too (begin_task path).
+    app.history.clear();
+    app.begin_task(&"y".repeat(75));
+    assert_eq!(app.history.len(), 2, "75 chars + prompt wraps at 50");
+}

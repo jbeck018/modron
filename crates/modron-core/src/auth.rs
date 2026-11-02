@@ -360,18 +360,34 @@ pub mod oauth {
         pub port: u16,
     }
 
-    /// Prepare a login: PKCE pair + state + the authorize URL. Pure — no
-    /// sockets, no network; callers show `url` before waiting.
+    /// Prepare a login: PKCE pair + state + the authorize URL, bound to a
+    /// callback port PROBED for availability (54545..=54555). Concurrent
+    /// modron sessions must not break each other's sign-in: a fixed port
+    /// made a second session's login fail with address-in-use while the
+    /// first was still waiting on its listener.
     pub fn prepare_login() -> anyhow::Result<LoginSession> {
         let (verifier, challenge) = pkce_pair(None)?;
         let state = base64url_nopad(&rand_bytes()?);
-        let port = CALLBACK_PORT;
+        let port = probe_callback_port();
         Ok(LoginSession {
             url: authorize_url(&challenge, &state, port),
             state,
             verifier,
             port,
         })
+    }
+
+    /// First bindable port in the callback range (falls back to the base
+    /// port when all are taken — the listener bind then surfaces the
+    /// address-in-use error, which is at least honest). The probe releases
+    /// the socket; `wait_for_callback` binds it again moments later.
+    fn probe_callback_port() -> u16 {
+        for port in CALLBACK_PORT..CALLBACK_PORT + 40 {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+        CALLBACK_PORT
     }
 
     /// Wait for the one-shot OAuth callback on localhost. Returns the
