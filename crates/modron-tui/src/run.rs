@@ -399,14 +399,14 @@ pub async fn run_with(
             }
             match outcome {
                 Outcome::Done(summary) => {
-                    app.clear_subagents();
-                    let lines = app.finish_turn(
+                    let mut lines = app.swarm_summary();
+                    lines.extend(app.finish_turn(
                         summary.answer.clone(),
                         summary.usage,
                         summary.turns,
                         summary.tool_calls,
                         summary.session_id,
-                    );
+                    ));
                     blank_frame(&mut terminal)?;
                     commit_block(&mut terminal, &lines)?;
                 }

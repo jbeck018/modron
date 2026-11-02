@@ -593,3 +593,65 @@ fn theme_slash_lists_and_switches() {
         app.tool_lines
     );
 }
+
+// ── Swarm view v2 (Phase 14) ───────────────────────────────────────────────
+
+#[test]
+fn swarm_rows_track_lifecycle_and_summarize() {
+    use modron_tui::SwarmRow;
+    let mut app = App::default();
+    app.on_tool(ToolActivity::SubagentStarted {
+        id: "a1".into(),
+        label: "reviewer".into(),
+    });
+    app.on_tool(ToolActivity::SubagentProgress {
+        id: "a1".into(),
+        label: "reviewer".into(),
+        turns: 3,
+        tokens: 1200,
+        last_tool: Some("grep".into()),
+    });
+    // Wrong id is ignored.
+    app.on_tool(ToolActivity::SubagentProgress {
+        id: "zz".into(),
+        label: String::new(),
+        turns: 9,
+        tokens: 9,
+        last_tool: None,
+    });
+    app.on_tool(ToolActivity::SubagentFinished {
+        id: "a1".into(),
+        label: "reviewer".into(),
+        tokens: 1400,
+        turns: 4,
+        is_error: false,
+    });
+    let row: &SwarmRow = app.subagents.first().unwrap();
+    assert_eq!((row.turns, row.tokens, row.done), (4, 1400, Some(true)));
+    assert_eq!(row.last_tool.as_deref(), Some("grep"));
+
+    let summary = app.swarm_summary();
+    assert!(!summary.is_empty());
+    assert!(app.subagents.is_empty(), "summary clears the panel");
+    // Summary lines render as spans; join their text.
+    let text: String = summary
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("swarm: 1 agent(s)"), "{text}");
+    assert!(text.contains("[reviewer] done"), "{text}");
+    assert!(text.contains("1400 tok"), "{text}");
+    assert!(text.contains("last: grep"), "{text}");
+}
+
+#[test]
+fn swarm_summary_empty_when_no_agents_ran() {
+    let mut app = App::default();
+    assert!(app.swarm_summary().is_empty());
+}

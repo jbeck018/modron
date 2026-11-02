@@ -23,6 +23,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 use std::sync::mpsc::Sender;
 
+/// One live swarm row: a running or settled child agent.
+#[derive(Clone, Debug)]
+pub struct SwarmRow {
+    pub id: String,
+    pub label: String,
+    pub turns: u32,
+    pub tokens: u64,
+    pub last_tool: Option<String>,
+    /// When the row appeared (elapsed-time display).
+    pub started: std::time::Instant,
+    /// Settled state: Some(true) done, Some(false) failed, None running.
+    pub done: Option<bool>,
+}
+
 /// What the user's last key press asks the run loop to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -204,8 +218,8 @@ pub struct App {
     pub context_window: u64,
     /// Estimated current context usage (tokens, updated per turn).
     pub context_used: u64,
-    /// Live subagent rows (Phase 5h): id, label, turns, tokens, last_tool.
-    pub subagents: Vec<(String, String, u32, u64, Option<String>)>,
+    /// Live subagent rows (Phase 5h / 14 swarm v2).
+    pub subagents: Vec<SwarmRow>,
     /// A slash command awaiting run-loop execution (engine/store powers).
     pub pending_command: Option<PendingCommand>,
     /// Streamed model reasoning (shown when `show_reasoning`).
@@ -604,7 +618,15 @@ impl App {
                     .push(format!("● {name} — {mark} ({bytes} B)"));
             }
             ToolActivity::SubagentStarted { id, label } => {
-                self.subagents.push((id, label, 0, 0, None));
+                self.subagents.push(SwarmRow {
+                    id,
+                    label,
+                    turns: 0,
+                    tokens: 0,
+                    last_tool: None,
+                    started: std::time::Instant::now(),
+                    done: None,
+                });
             }
             ToolActivity::SubagentProgress {
                 id,
@@ -613,10 +635,10 @@ impl App {
                 last_tool,
                 ..
             } => {
-                if let Some(row) = self.subagents.iter_mut().find(|(rid, ..)| *rid == id) {
-                    row.2 = row.2.max(turns);
-                    row.3 = row.3.max(tokens);
-                    row.4 = last_tool.clone();
+                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
+                    row.turns = row.turns.max(turns);
+                    row.tokens = row.tokens.max(tokens);
+                    row.last_tool = last_tool.clone();
                 }
             }
             ToolActivity::SubagentFinished {
@@ -626,22 +648,48 @@ impl App {
                 is_error,
                 ..
             } => {
-                if let Some(row) = self.subagents.iter_mut().find(|(rid, ..)| *rid == id) {
-                    row.2 = turns;
-                    row.3 = tokens;
-                    row.4 = Some(if is_error {
-                        "failed".into()
-                    } else {
-                        "done".into()
-                    });
+                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
+                    row.turns = turns;
+                    row.tokens = tokens;
+                    row.done = Some(!is_error);
                 }
             }
         }
     }
 
-    /// Drop settled subagent rows (called when a turn finishes).
-    pub fn clear_subagents(&mut self) {
+    /// Scrollback summary of the swarm (committed at turn end), then clear.
+    /// Returns lines when any agent ran, empty otherwise.
+    pub fn swarm_summary(&mut self) -> Vec<Line<'static>> {
+        let t = self.theme.resolved();
+        if self.subagents.is_empty() {
+            return Vec::new();
+        }
+        let mut lines = vec![Line::from(format!(
+            "⎇ swarm: {} agent(s), {} tok total",
+            self.subagents.len(),
+            self.subagents.iter().map(|r| r.tokens).sum::<u64>()
+        ))
+        .style(Style::default().fg(t.accent))];
+        for row in &self.subagents {
+            let (mark, color) = match row.done {
+                Some(true) => ("done", t.success),
+                Some(false) => ("failed", t.error),
+                None => ("unfinished", t.warning),
+            };
+            lines.push(
+                Line::from(format!(
+                    "  ⏵ [{}] {} · {} turns · {} tok · last: {}",
+                    row.label,
+                    mark,
+                    row.turns,
+                    row.tokens,
+                    row.last_tool.as_deref().unwrap_or("-")
+                ))
+                .style(Style::default().fg(color)),
+            );
+        }
         self.subagents.clear();
+        lines
     }
 
     /// A turn ended: returns the lines to flush into scrollback (tool
@@ -894,27 +942,41 @@ impl App {
         }
 
         if !self.subagents.is_empty() {
-            let lines: Vec<Line> = self
-                .subagents
-                .iter()
-                .map(|(id, label, turns, tokens, last)| {
-                    let (state_str, color) = match last {
-                        Some(t) if t == "done" => (t.clone(), th.success),
-                        Some(t) if t == "failed" => (t.clone(), th.error),
-                        _ => (format!("turn {turns} · {tokens} tok"), th.accent),
-                    };
-                    let display = if label.is_empty() {
-                        id.clone()
-                    } else {
-                        label.clone()
-                    };
-                    Line::from(vec![
-                        Span::styled("  ⏵ ", Style::default().fg(th.accent)),
-                        Span::styled(format!("[{display}] "), Style::default().fg(th.dim)),
-                        Span::styled(state_str, Style::default().fg(color)),
-                    ])
-                })
-                .collect();
+            let active = self.subagents.iter().filter(|r| r.done.is_none()).count();
+            let total_tokens = self.subagents.iter().map(|r| r.tokens).sum::<u64>();
+            let mut lines = vec![Line::from(format!(
+                "⎇ {} agent(s) · {} active · {total_tokens} tok",
+                self.subagents.len(),
+                active
+            ))
+            .style(Style::default().fg(th.dim))];
+            let pulse = ["·", "•", "●", "•"];
+            for row in &self.subagents {
+                let (state_str, color) = match row.done {
+                    Some(true) => ("done".to_string(), th.success),
+                    Some(false) => ("failed".to_string(), th.error),
+                    None => (
+                        format!(
+                            "{} {} · t{} · {}s",
+                            pulse[(self.spinner_tick as usize) % pulse.len()],
+                            row.last_tool.as_deref().unwrap_or("working"),
+                            row.turns,
+                            row.started.elapsed().as_secs()
+                        ),
+                        th.accent,
+                    ),
+                };
+                let display = if row.label.is_empty() {
+                    row.id.chars().take(8).collect::<String>()
+                } else {
+                    row.label.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  ⏵ ", Style::default().fg(th.accent)),
+                    Span::styled(format!("[{display}] "), Style::default().fg(th.dim)),
+                    Span::styled(state_str, Style::default().fg(color)),
+                ]));
+            }
             frame.render_widget(Paragraph::new(lines), chunks[idx]);
             idx += 1;
         }
