@@ -45,6 +45,10 @@ async fn add_provider_wizard() -> anyhow::Result<()> {
     for opt in &options {
         writeln!(stdout, "   {:>2} {:<18} {}", opt.number, opt.name, opt.note)?;
     }
+    writeln!(
+        stdout,
+        "   g  ChatGPT (OpenAI)      sign in with your ChatGPT plan"
+    )?;
     writeln!(stdout, "   o  Claude subscription   OAuth in the browser")?;
     writeln!(stdout)?;
     write!(stdout, "  choice: ")?;
@@ -55,6 +59,9 @@ async fn add_provider_wizard() -> anyhow::Result<()> {
     let choice = line.trim();
     if choice.eq_ignore_ascii_case("o") {
         return login().await;
+    }
+    if choice.eq_ignore_ascii_case("g") {
+        return chatgpt_login().await;
     }
     let num: u8 = choice
         .parse()
@@ -155,6 +162,27 @@ fn logout(provider: Option<&str>) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Terminal ChatGPT device flow: prints the code + URL, polls until the
+/// browser sign-in completes, saves tokens.
+async fn chatgpt_login() -> anyhow::Result<()> {
+    use modron_core::auth::oauth::chatgpt;
+    let device = chatgpt::start().await?;
+    println!("1. Open {} and enter this code:", device.verification_uri);
+    println!("   code: {}", device.user_code);
+    println!("2. Waiting for the sign-in…");
+    let (tokens, account) = chatgpt::finish(&device).await?;
+    chatgpt::save(&chatgpt::ChatGptAuth {
+        access_token: tokens.access_token.clone(),
+        refresh_token: tokens.refresh_token.clone(),
+        account_id: account,
+    })?;
+    println!(
+        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (models gpt-5, gpt-5-codex, gpt-5-mini)",
+        modron_core::auth::mask_key(&tokens.access_token)
+    );
+    Ok(())
 }
 
 async fn login() -> anyhow::Result<()> {

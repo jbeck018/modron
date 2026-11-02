@@ -9,7 +9,7 @@
 //! park the engine task via `tokio::task::block_in_place` until the user
 //! decides.
 
-use crate::{App, PendingApproval, PendingCommand};
+use crate::{App, AuthFlow, PendingApproval, PendingCommand};
 use modron_core::{
     Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
     ToolActivitySink, ToolCall,
@@ -31,6 +31,17 @@ pub struct TuiSinks {
     pub on_delta: Arc<DeltaSink>,
     pub on_tool_event: Arc<ToolActivitySink>,
     pub approver: Arc<Approver>,
+}
+
+/// Spawned OAuth flows report through this: an interim update renders in
+/// the waiting modal (device flows deliver the URL + user code), Done
+/// settles the flow with a note for the scrollback.
+enum OAuthProgress {
+    Interim {
+        url: String,
+        user_code: Option<String>,
+    },
+    Done(anyhow::Result<String>),
 }
 
 #[derive(Clone)]
@@ -183,10 +194,9 @@ pub async fn run_with(
         app.push_history(welcome);
     }
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
-    // OAuth outcomes: Result<(TokenSet, url), error> from the spawned flow.
-    let (oauth_tx, mut oauth_rx) = tokio::sync::mpsc::unbounded_channel::<
-        anyhow::Result<(modron_core::auth::oauth::TokenSet, String)>,
-    >();
+    // OAuth progress from the spawned flows: the interim update shows the
+    // URL (+ device-flow user code) in the modal, Done settles it.
+    let (oauth_tx, mut oauth_rx) = tokio::sync::mpsc::unbounded_channel::<OAuthProgress>();
     let mut oauth_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
     #[allow(unused_assignments)]
@@ -349,16 +359,46 @@ pub async fn run_with(
             };
             let tx = oauth_tx.clone();
             oauth_task = Some(tokio::spawn(async move {
-                let result =
-                    match modron_core::auth::oauth::wait_for_callback(session.port, &session.state)
-                        .await
-                    {
-                        Ok(code) => modron_core::auth::oauth::exchange_code(&session, &code)
-                            .await
-                            .map(|tokens| (tokens, session.url.clone())),
-                        Err(e) => Err(e),
-                    };
-                let _ = tx.send(result);
+                let result: anyhow::Result<String> = async {
+                    let code =
+                        modron_core::auth::oauth::wait_for_callback(session.port, &session.state)
+                            .await?;
+                    let tokens = modron_core::auth::oauth::exchange_code(&session, &code).await?;
+                    modron_core::auth::oauth::save_tokens(&tokens)?;
+                    Ok(format!(
+                        "✓ claude subscription tokens saved ({}) — `modron auth status`",
+                        modron_core::auth::mask_key(&tokens.access_token)
+                    ))
+                }
+                .await;
+                let _ = tx.send(OAuthProgress::Done(result));
+            }));
+        } else if matches!(app.pending_command, Some(PendingCommand::ChatGptLogin)) {
+            app.pending_command = None;
+            let tx = oauth_tx.clone();
+            oauth_task = Some(tokio::spawn(async move {
+                let result: anyhow::Result<String> = async {
+                    let device = modron_core::auth::oauth::chatgpt::start().await?;
+                    let _ = tx.send(OAuthProgress::Interim {
+                        url: device.verification_uri.clone(),
+                        user_code: Some(device.user_code.clone()),
+                    });
+                    let (tokens, account) =
+                        modron_core::auth::oauth::chatgpt::finish(&device).await?;
+                    modron_core::auth::oauth::chatgpt::save(
+                        &modron_core::auth::oauth::chatgpt::ChatGptAuth {
+                            access_token: tokens.access_token.clone(),
+                            refresh_token: tokens.refresh_token.clone(),
+                            account_id: account,
+                        },
+                    )?;
+                    Ok(format!(
+                        "✓ chatgpt signed in ({}) — use `--provider chatgpt` (gpt-5, gpt-5-codex, gpt-5-mini)",
+                        modron_core::auth::mask_key(&tokens.access_token)
+                    ))
+                }
+                .await;
+                let _ = tx.send(OAuthProgress::Done(result));
             }));
         } else if let Some(cmd) = app.pending_command.take() {
             for line in run_pending_command(&mut engine, &mut app, cmd).await {
@@ -366,25 +406,28 @@ pub async fn run_with(
             }
         }
 
-        // 3c. OAuth outcome: save tokens (or report the error) and close
-        //     the modal. A cancelled modal aborts the task instead.
+        // 3c. OAuth progress: interim updates render in the waiting modal,
+        //     Done settles it. A cancelled modal aborts the task instead.
         if app.auth_flow.is_none() {
             if let Some(task) = oauth_task.take() {
                 task.abort();
             }
         }
-        while let Ok(result) = oauth_rx.try_recv() {
-            oauth_task = None;
-            app.auth_flow = None;
-            match result {
-                Ok((tokens, _url)) => match modron_core::auth::oauth::save_tokens(&tokens) {
-                    Ok(()) => app.note(format!(
-                        "✓ claude subscription tokens saved ({}) — use `modron auth status`",
-                        modron_core::auth::mask_key(&tokens.access_token)
-                    )),
-                    Err(e) => app.note(format!("cannot save tokens: {e}")),
-                },
-                Err(e) => app.note(format!("oauth failed: {e}")),
+        while let Ok(progress) = oauth_rx.try_recv() {
+            match progress {
+                OAuthProgress::Interim { url, user_code } => {
+                    if matches!(app.auth_flow, Some(AuthFlow::WaitingOAuth { .. })) {
+                        app.auth_flow = Some(AuthFlow::WaitingOAuth { url, user_code });
+                    }
+                }
+                OAuthProgress::Done(result) => {
+                    oauth_task = None;
+                    app.auth_flow = None;
+                    match result {
+                        Ok(note) => app.note(note),
+                        Err(e) => app.note(format!("oauth failed: {e}")),
+                    }
+                }
             }
         }
 
@@ -599,9 +642,10 @@ async fn run_pending_command(
             }
         }
         PendingCommand::Issues(arg) => run_issues(engine, &arg),
-        // OAuthLogin never reaches here — the run loop spawns it before
-        // run_pending_command is called (it waits on a browser round-trip).
-        PendingCommand::OAuthLogin { .. } => Vec::new(),
+        // OAuthLogin/ChatGptLogin never reach here — the run loop spawns
+        // them before run_pending_command is called (they wait on browser
+        // round-trips).
+        PendingCommand::OAuthLogin { .. } | PendingCommand::ChatGptLogin => Vec::new(),
         PendingCommand::Fork => match app.session_id {
             Some(id) => match engine.store.fork(id).await {
                 Ok(new) => {

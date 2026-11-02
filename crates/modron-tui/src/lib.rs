@@ -115,11 +115,15 @@ pub enum PendingCommand {
         env_var: String,
         key: String,
     },
-    /// The interactive flow's OAuth row: run the browser flow (the run
-    /// loop spawns it; Esc on the flow cancels).
+    /// The interactive flow's Claude OAuth row: run the browser flow (the
+    /// run loop spawns it; Esc on the flow cancels).
     OAuthLogin {
         session: modron_core::auth::oauth::LoginSession,
     },
+    /// The interactive flow's ChatGPT row: run the device-code flow (the
+    /// run loop spawns start→finish; the interim user code shows in the
+    /// modal; Esc cancels).
+    ChatGptLogin,
     Agent(String),
     Allow(String),
     Deny(String),
@@ -249,9 +253,12 @@ pub enum AuthFlow {
         info: modron_core::auth::ProviderInfo,
         input: String,
     },
-    /// The OAuth browser flow is running (spawned in the run loop); Esc
-    /// cancels.
-    WaitingOAuth { url: String },
+    /// An OAuth flow is running (spawned in the run loop); Esc cancels.
+    /// `user_code` is set for device flows (the code typed at the URL).
+    WaitingOAuth {
+        url: String,
+        user_code: Option<String>,
+    },
 }
 
 /// A tool call awaiting the user's y/n/a decision.
@@ -581,7 +588,7 @@ impl App {
         use crossterm::event::KeyCode;
         match flow {
             AuthFlow::Picker { selected } => {
-                let len = modron_core::auth::provider_registry().len() + 1;
+                let len = modron_core::auth::provider_registry().len() + 2;
                 let selected = selected.min(len - 1);
                 match key.code {
                     KeyCode::Up => {
@@ -602,15 +609,26 @@ impl App {
                                 info: info.clone(),
                                 input: String::new(),
                             });
+                        } else if selected == registry.len() {
+                            // The ChatGPT device-flow row: the URL + user
+                            // code arrive from the spawned task.
+                            self.pending_command = Some(PendingCommand::ChatGptLogin);
+                            self.auth_flow = Some(AuthFlow::WaitingOAuth {
+                                url: String::new(),
+                                user_code: None,
+                            });
                         } else {
-                            // The OAuth row: prepare now (pure), park the
-                            // session for the run loop to spawn.
+                            // The Claude OAuth row: prepare now (pure), park
+                            // the session for the run loop to spawn.
                             match modron_core::auth::oauth::prepare_login() {
                                 Ok(session) => {
                                     let url = session.url.clone();
                                     self.pending_command =
                                         Some(PendingCommand::OAuthLogin { session });
-                                    self.auth_flow = Some(AuthFlow::WaitingOAuth { url });
+                                    self.auth_flow = Some(AuthFlow::WaitingOAuth {
+                                        url,
+                                        user_code: None,
+                                    });
                                 }
                                 Err(e) => self.note(format!("cannot start OAuth: {e}")),
                             }
@@ -645,11 +663,11 @@ impl App {
                     self.auth_flow = Some(AuthFlow::KeyEntry { info, input });
                 }
             }
-            AuthFlow::WaitingOAuth { url } => match key.code {
+            AuthFlow::WaitingOAuth { url, user_code } => match key.code {
                 // Esc cancels; the run loop aborts the spawned flow when it
                 // sees the modal gone.
                 KeyCode::Esc => {}
-                _ => self.auth_flow = Some(AuthFlow::WaitingOAuth { url }),
+                _ => self.auth_flow = Some(AuthFlow::WaitingOAuth { url, user_code }),
             },
         }
         Action::None
@@ -1324,7 +1342,7 @@ impl App {
         let flow_h = match &self.auth_flow {
             None => 0,
             Some(AuthFlow::Picker { .. }) => {
-                (modron_core::auth::provider_registry().len() as u16 + 1 + 1).min(8)
+                (modron_core::auth::provider_registry().len() as u16 + 2 + 1).min(8)
             }
             Some(AuthFlow::KeyEntry { .. }) => 4,
             Some(AuthFlow::WaitingOAuth { .. }) => 3,
@@ -1465,10 +1483,10 @@ impl App {
                     let entries: Vec<(&str, &str)> = registry
                         .iter()
                         .map(|i| (i.name, i.note))
-                        .chain(std::iter::once((
-                            "Claude subscription",
-                            "OAuth in the browser",
-                        )))
+                        .chain([
+                            ("ChatGPT (OpenAI)", "sign in with your ChatGPT plan"),
+                            ("Claude subscription", "OAuth in the browser"),
+                        ])
                         .collect();
                     let len = entries.len();
                     let sel = (*selected).min(len - 1);
@@ -1513,14 +1531,41 @@ impl App {
                         Line::from(""),
                     ]
                 }
-                AuthFlow::WaitingOAuth { url } => vec![
-                    Line::from("  claude subscription — OAuth")
-                        .style(Style::default().fg(th.accent)),
-                    Line::from(format!("  open in a browser: {url}"))
-                        .style(Style::default().fg(th.dim)),
-                    Line::from("  waiting for the callback… esc cancels")
-                        .style(Style::default().fg(th.dim)),
-                ],
+                AuthFlow::WaitingOAuth { url, user_code } => {
+                    let mut lines = Vec::new();
+                    match user_code {
+                        Some(code) => {
+                            lines.push(
+                                Line::from("  ChatGPT sign-in — device flow")
+                                    .style(Style::default().fg(th.accent)),
+                            );
+                            let open = if url.is_empty() {
+                                "https://chatgpt.com/activate"
+                            } else {
+                                url.as_str()
+                            };
+                            lines.push(
+                                Line::from(format!("  code: {code}   open: {open}"))
+                                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                            );
+                        }
+                        None => {
+                            lines.push(
+                                Line::from("  claude subscription — OAuth")
+                                    .style(Style::default().fg(th.accent)),
+                            );
+                            lines.push(
+                                Line::from(format!("  open in a browser: {url}"))
+                                    .style(Style::default().fg(th.dim)),
+                            );
+                        }
+                    }
+                    lines.push(
+                        Line::from("  waiting for the sign-in… esc cancels")
+                            .style(Style::default().fg(th.dim)),
+                    );
+                    lines
+                }
             };
             frame.render_widget(Paragraph::new(lines), chunks[idx]);
             idx += 1;

@@ -40,6 +40,18 @@ input_per_m = 1.0
 output_per_m = 5.0
 tier = "cheap"
 
+# ChatGPT subscription models (OAuth sign-in, plan-billed: 0/0 pricing).
+# Model NAMES are unique catalog-wide, so the chatgpt provider carries the
+# codex variant; gpt-5/gpt-5-mini also work with `--provider chatgpt` (the
+# forced provider wins over the catalog's per-name provider).
+[[models]]
+name = "gpt-5-codex"
+provider = "chatgpt"
+context_window = 400_000
+input_per_m = 0.0
+output_per_m = 0.0
+tier = "strong"
+
 [[models]]
 name = "gpt-5"
 provider = "openai"
@@ -309,7 +321,7 @@ impl ModelInfo {
 mod tests {
     use super::*;
 
-    const ALLOWED_PROVIDERS: [&str; 13] = [
+    const ALLOWED_PROVIDERS: [&str; 14] = [
         "anthropic",
         "openai",
         "openai-compat",
@@ -323,6 +335,7 @@ mod tests {
         "nvidia",
         "openrouter",
         "github-models",
+        "chatgpt",
     ];
 
     #[test]

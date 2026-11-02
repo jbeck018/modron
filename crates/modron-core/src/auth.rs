@@ -431,6 +431,9 @@ pub mod oauth {
         pub access_token: String,
         pub refresh_token: Option<String>,
         pub expires_in: Option<u64>,
+        /// OIDC id token when the flow returns one (OpenAI carries the
+        /// chatgpt_account_id claim here).
+        pub id_token: Option<String>,
     }
 
     pub fn parse_token_response(body: &Value) -> anyhow::Result<TokenSet> {
@@ -446,6 +449,10 @@ pub mod oauth {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             expires_in: body.get("expires_in").and_then(|v| v.as_u64()),
+            id_token: body
+                .get("id_token")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         })
     }
 
@@ -518,6 +525,267 @@ pub mod oauth {
         code.ok_or_else(|| anyhow!("callback URL missing code"))
     }
 
+    /// ── ChatGPT (OpenAI Codex) subscription login ─────────────────────
+    ///
+    /// OpenAI's device flow (what the Codex CLI itself runs; NOT RFC
+    /// 8628): POST a JSON `{client_id}` to the usercode endpoint, the
+    /// user enters the returned code at the verification URL, polling the
+    /// token endpoint yields an `authorization_code` + `code_verifier`
+    /// pair (the server supplies the PKCE verifier), and a final
+    /// form-encoded authorization_code exchange returns the tokens.
+    /// Storage keeps the chatgpt-account-id the backend requires on
+    /// every request.
+    pub mod chatgpt {
+        use super::*;
+
+        /// The Codex CLI's public OAuth client id (codex-rs
+        /// login/src/auth/manager.rs).
+        pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+        pub const ISSUER: &str = "https://auth.openai.com";
+        /// Step 1: request a user code (JSON body `{client_id}`).
+        pub const USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+        /// Step 3: poll for the authorization code (JSON body
+        /// `{device_auth_id, user_code}`; 403/404 = not approved yet).
+        pub const POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+        /// Step 2: where the user types the code.
+        pub const VERIFY_URL: &str = "https://auth.openai.com/codex/device";
+        /// Step 4: authorization_code exchange (form-encoded).
+        pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+        /// The redirect_uri the device-flow exchange must repeat.
+        pub const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+        /// The Responses-API endpoint ChatGPT-plan traffic uses.
+        pub const BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+        /// User codes live ~15 minutes (the codex-rs poll cap).
+        const LOGIN_TIMEOUT_SECS: u64 = 900;
+
+        /// A started device login: show `user_code` + `verification_uri`
+        /// to the user, then call [`finish`].
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct DeviceLogin {
+            pub device_auth_id: String,
+            pub user_code: String,
+            pub verification_uri: String,
+            /// Poll interval the server asked for (seconds).
+            pub interval: u64,
+        }
+
+        /// Start the sign-in; returns the code the user enters at
+        /// `verification_uri`.
+        pub async fn start() -> anyhow::Result<DeviceLogin> {
+            begin_at(USERCODE_URL).await
+        }
+
+        /// Wait for the browser sign-in; returns the tokens plus the
+        /// chatgpt-account-id extracted from the id token.
+        pub async fn finish(login: &DeviceLogin) -> anyhow::Result<(TokenSet, String)> {
+            finish_at(POLL_URL, TOKEN_URL, login).await
+        }
+
+        /// Endpoint-parameterized [`start`] (tests point it at a mock).
+        pub async fn begin_at(usercode_url: &str) -> anyhow::Result<DeviceLogin> {
+            let client = reqwest::Client::new();
+            let response = client
+                .post(usercode_url)
+                .json(&json!({ "client_id": CLIENT_ID }))
+                .send()
+                .await?
+                .error_for_status()?;
+            let body: Value = response.json().await?;
+            let user_code = body
+                .get("user_code")
+                .or_else(|| body.get("usercode"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("usercode response missing user_code: {body}"))?;
+            Ok(DeviceLogin {
+                device_auth_id: body
+                    .get("device_auth_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("usercode response missing device_auth_id: {body}"))?
+                    .to_string(),
+                user_code: user_code.to_string(),
+                verification_uri: VERIFY_URL.to_string(),
+                // The server sends interval as a string; accept a number.
+                interval: body
+                    .get("interval")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                    })
+                    .unwrap_or(5),
+            })
+        }
+
+        /// Endpoint-parameterized [`finish`] (tests point it at a mock).
+        pub async fn finish_at(
+            poll_url: &str,
+            token_url: &str,
+            login: &DeviceLogin,
+        ) -> anyhow::Result<(TokenSet, String)> {
+            let client = reqwest::Client::new();
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS);
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow!("device login expired (15 min) — run it again"));
+                }
+                let response = client
+                    .post(poll_url)
+                    .json(&json!({
+                        "device_auth_id": login.device_auth_id,
+                        "user_code": login.user_code,
+                    }))
+                    .send()
+                    .await?;
+                let status = response.status();
+                // 403/404 = the user hasn't approved yet: keep polling
+                // (codex-rs device_code_auth.rs semantics).
+                if status.as_u16() == 403 || status.as_u16() == 404 {
+                    let nap = std::time::Duration::from_secs(login.interval.max(1))
+                        .min(deadline.saturating_duration_since(std::time::Instant::now()));
+                    tokio::time::sleep(nap).await;
+                    continue;
+                }
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(anyhow!("device auth failed with status {status}: {body}"));
+                }
+                let body: Value = response.json().await?;
+                let authorization_code = body
+                    .get("authorization_code")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("poll response missing authorization_code: {body}"))?;
+                let code_verifier = body
+                    .get("code_verifier")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("poll response missing code_verifier: {body}"))?;
+                let response = client
+                    .post(token_url)
+                    .form(&[
+                        ("grant_type", "authorization_code"),
+                        ("code", authorization_code),
+                        ("redirect_uri", REDIRECT_URI),
+                        ("client_id", CLIENT_ID),
+                        ("code_verifier", code_verifier),
+                    ])
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let body: Value = response.json().await?;
+                let tokens = parse_token_response(&body)?;
+                let id_token = tokens
+                    .id_token
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("token response missing id_token"))?;
+                let account = account_id(id_token)
+                    .ok_or_else(|| anyhow!("id token carries no chatgpt_account_id claim"))?;
+                return Ok((tokens, account));
+            }
+        }
+
+        /// Extract `chatgpt_account_id` from an OIDC id token (JWT payload,
+        /// signature NOT verified — the token came from the token endpoint
+        /// over TLS, and we only read our own account id from it).
+        pub fn account_id(id_token: &str) -> Option<String> {
+            let payload_b64 = id_token.split('.').nth(1)?;
+            let decoded = base64url_decode(payload_b64)?;
+            let value: Value = serde_json::from_slice(&decoded).ok()?;
+            value
+                .get("chatgpt_account_id")
+                .and_then(Value::as_str)
+                .map(String::from)
+        }
+
+        fn base64url_decode(data: &str) -> Option<Vec<u8>> {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut vals = Vec::with_capacity(data.len());
+            for ch in data.bytes() {
+                if ch == b'=' {
+                    continue;
+                }
+                vals.push(TABLE.iter().position(|&t| t == ch)? as u32);
+            }
+            let mut out = Vec::with_capacity(vals.len() * 3 / 4 + 3);
+            for chunk in vals.chunks(4) {
+                let b0 = chunk[0];
+                let b1 = *chunk.get(1).unwrap_or(&0);
+                let b2 = *chunk.get(2).unwrap_or(&0);
+                let b3 = *chunk.get(3).unwrap_or(&0);
+                let n = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
+                out.push((n >> 16) as u8);
+                if chunk.len() > 2 {
+                    out.push((n >> 8) as u8);
+                }
+                if chunk.len() > 3 {
+                    out.push(n as u8);
+                }
+            }
+            Some(out)
+        }
+
+        /// Stored ChatGPT credentials: what the Responses provider needs.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ChatGptAuth {
+            pub access_token: String,
+            pub refresh_token: Option<String>,
+            pub account_id: String,
+        }
+
+        pub fn token_file() -> anyhow::Result<PathBuf> {
+            let home = std::env::var("HOME").map_err(|_| anyhow!("no home directory"))?;
+            Ok(std::path::PathBuf::from(home)
+                .join(".modron")
+                .join("auth")
+                .join("openai.json"))
+        }
+
+        pub fn save(auth: &ChatGptAuth) -> anyhow::Result<()> {
+            let path = token_file()?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let body = json!({
+                "access_token": auth.access_token,
+                "refresh_token": auth.refresh_token,
+                "account_id": auth.account_id,
+                "saved_at": chrono::Utc::now().to_rfc3339(),
+            });
+            std::fs::write(&path, body.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        }
+
+        pub fn load() -> anyhow::Result<Option<ChatGptAuth>> {
+            let path = token_file()?;
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return Ok(None);
+            };
+            let value: Value = serde_json::from_str(&text)?;
+            let access_token = value
+                .get("access_token")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("stored openai tokens missing access_token"))?
+                .to_string();
+            let account_id = value
+                .get("account_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(Some(ChatGptAuth {
+                access_token,
+                refresh_token: value
+                    .get("refresh_token")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                account_id,
+            }))
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -559,6 +827,114 @@ pub mod oauth {
             assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
             assert_eq!(tokens.expires_in, Some(3600));
             assert!(parse_token_response(&json!({})).is_err());
+        }
+
+        #[test]
+        fn chatgpt_account_id_extracts_from_jwt() {
+            // payload {"chatgpt_account_id":"acc-123"} in base64url
+            let payload = base64url_nopad(br#"{"chatgpt_account_id":"acc-123"}"#);
+            let jwt = format!("header.{payload}.signature");
+            assert_eq!(chatgpt::account_id(&jwt).as_deref(), Some("acc-123"));
+            assert_eq!(chatgpt::account_id("not-a-jwt"), None);
+            assert_eq!(chatgpt::account_id("a.b.c"), None); // payload not JSON
+        }
+
+        #[tokio::test]
+        async fn chatgpt_device_flow_polls_until_tokens() {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            // Scripted server speaking the codex deviceauth protocol: a
+            // usercode grant, a 403 "not approved yet" poll, the approval
+            // poll (server-provided PKCE pair), the token exchange.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let usercode_url = format!("http://{addr}/deviceauth/usercode");
+            let poll_url = format!("http://{addr}/deviceauth/token");
+            let token_url = format!("http://{addr}/oauth/token");
+            let jwt = format!(
+                "h.{}.s",
+                base64url_nopad(br#"{"chatgpt_account_id":"acc-9"}"#)
+            );
+            let server = std::thread::spawn(move || {
+                let respond = |status: &str, body: String| {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf);
+                    let resp = format!(
+                        "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                };
+                respond(
+                    "HTTP/1.1 200 OK",
+                    r#"{"device_auth_id":"da-1","user_code":"ABCD-EFGH","interval":"1"}"#.into(),
+                );
+                respond("HTTP/1.1 403 Forbidden", String::new());
+                respond(
+                    "HTTP/1.1 200 OK",
+                    r#"{"authorization_code":"ac-1","code_challenge":"cc","code_verifier":"cv-1"}"#
+                        .into(),
+                );
+                respond(
+                    "HTTP/1.1 200 OK",
+                    format!(
+                        r#"{{"access_token":"at-1","refresh_token":"rt-1","id_token":"{jwt}"}}"#
+                    ),
+                );
+            });
+
+            let login = chatgpt::begin_at(&usercode_url).await.unwrap();
+            assert_eq!(login.user_code, "ABCD-EFGH");
+            assert_eq!(login.device_auth_id, "da-1");
+            assert_eq!(login.interval, 1);
+            assert_eq!(login.verification_uri, chatgpt::VERIFY_URL);
+
+            let (tokens, account) = chatgpt::finish_at(&poll_url, &token_url, &login)
+                .await
+                .unwrap();
+            assert_eq!(tokens.access_token, "at-1");
+            assert_eq!(tokens.refresh_token.as_deref(), Some("rt-1"));
+            assert_eq!(account, "acc-9");
+            server.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn chatgpt_device_flow_fatals_on_hard_errors() {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let poll_url = format!("http://{addr}/deviceauth/token");
+            std::thread::spawn(move || {
+                let respond = |status: &str, body: &str| {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf);
+                    let resp = format!(
+                        "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                };
+                // A 404 (not approved yet) then a 400 (rejected): only
+                // 403/404 keep the poll loop alive.
+                respond("HTTP/1.1 404 Not Found", "");
+                respond("HTTP/1.1 400 Bad Request", r#"{"error":"access_denied"}"#);
+            });
+            let login = chatgpt::DeviceLogin {
+                device_auth_id: "da".into(),
+                user_code: "U".into(),
+                verification_uri: chatgpt::VERIFY_URL.into(),
+                interval: 1,
+            };
+            let err = chatgpt::finish_at(&poll_url, "http://127.0.0.1:1/token", &login)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("400"), "{err}");
+            assert!(err.to_string().contains("access_denied"), "{err}");
         }
 
         #[test]

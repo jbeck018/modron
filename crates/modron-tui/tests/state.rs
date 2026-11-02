@@ -1103,21 +1103,44 @@ fn auth_wizard_flows_picker_to_saved_key() {
 }
 
 #[test]
-fn auth_wizard_oauth_row_parks_a_browser_login() {
+fn auth_wizard_oauth_rows_park_the_right_flow() {
     use crossterm::event::KeyCode;
+    let reg = modron_core::auth::provider_registry().len();
+
+    // First OAuth row: ChatGPT device flow (url + user code arrive from
+    // the spawned task).
     let mut app = App::default();
     app.handle_slash_test(SlashCommand::Auth("add".into()));
-    for _ in 0..modron_core::auth::provider_registry().len() {
+    for _ in 0..reg {
         app.on_key(key(KeyCode::Down));
     }
     app.on_key(key(KeyCode::Enter));
-    assert!(matches!(app.auth_flow, Some(AuthFlow::WaitingOAuth { .. })));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::WaitingOAuth { ref url, ref user_code }) if url.is_empty() && user_code.is_none()
+    ));
+    assert!(matches!(
+        app.pending_command,
+        Some(PendingCommand::ChatGptLogin)
+    ));
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.auth_flow.is_none());
+
+    // Second OAuth row: Claude subscription (PKCE session prepared now).
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth("add".into()));
+    for _ in 0..=reg {
+        app.on_key(key(KeyCode::Down));
+    }
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(
+        app.auth_flow,
+        Some(AuthFlow::WaitingOAuth { ref url, ref user_code }) if !url.is_empty() && user_code.is_none()
+    ));
     assert!(matches!(
         app.pending_command,
         Some(PendingCommand::OAuthLogin { .. })
     ));
-    // Esc cancels the modal; the run loop aborts the spawned flow when it
-    // sees the modal gone.
     app.on_key(key(KeyCode::Esc));
     assert!(app.auth_flow.is_none());
 }
@@ -1131,15 +1154,18 @@ fn auth_wizard_renders_picker_and_masks_the_key() {
     assert!(frame.contains("add a provider"), "{frame:?}");
     assert!(frame.contains("Z.ai"), "{frame:?}");
 
-    // Scrolling to the bottom brings the OAuth row into the window.
+    // Scrolling to the bottom brings both OAuth rows into the window.
     for _ in 0..modron_core::auth::provider_registry().len() {
         app.on_key(key(KeyCode::Down));
     }
     let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("ChatGPT (OpenAI)"), "{frame:?}");
+    app.on_key(key(KeyCode::Down));
+    let frame = render(&mut app, 90, 24);
     assert!(frame.contains("Claude subscription"), "{frame:?}");
-    // Back to the top for the key-entry leg of the test.
-    app.on_key(key(KeyCode::Up));
-    for _ in 1..modron_core::auth::provider_registry().len() {
+    // Back to the top for the key-entry leg of the test (two OAuth rows
+    // mean reg+1 rows above the first provider).
+    for _ in 0..=modron_core::auth::provider_registry().len() {
         app.on_key(key(KeyCode::Up));
     }
     app.on_key(key(KeyCode::Enter)); // first provider (zai) → key entry

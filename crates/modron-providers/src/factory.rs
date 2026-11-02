@@ -5,7 +5,7 @@
 //! lookup is a closure so unit tests never mutate process-global state; the
 //! convenience constructor reads `std::env` directly.
 
-use crate::{AnthropicProvider, OpenAiCompatProvider};
+use crate::{AnthropicProvider, OpenAiCompatProvider, OpenAiResponsesProvider};
 use modron_core::{Error, ModelProvider, Result};
 use std::sync::Arc;
 
@@ -103,6 +103,10 @@ pub fn provider_from_config(
             }
         }
         "zai" => Ok(Arc::new(zai_provider(&env)?)),
+        // ChatGPT subscription: OAuth sign-in (device flow), no env key.
+        // The provider reads the stored tokens itself so the error names
+        // the sign-in path, not an env var.
+        "chatgpt" => Ok(Arc::new(OpenAiResponsesProvider::from_stored_tokens()?)),
         // Free-tier providers (Phase 5g): all OpenAI-compatible; each is a
         // base URL + env key. See README "Free models" for rate limits.
         "groq" => openai_compat_with_key(
@@ -162,7 +166,7 @@ pub fn provider_from_config(
         )),
         other => Err(Error::Config(
             format!("unknown provider `{other}`"),
-            "supported providers: anthropic, openai-compat, zai".into(),
+            "supported providers: anthropic, openai-compat, zai, chatgpt (ChatGPT sign-in)".into(),
         )),
     }
 }

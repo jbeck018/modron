@@ -14,6 +14,7 @@
 pub mod anthropic;
 pub mod factory;
 pub mod openai_compat;
+pub mod openai_responses;
 pub mod retry;
 pub mod routers;
 pub use routers::{KevRouter, LlmJudgeRouter};
@@ -22,6 +23,7 @@ pub mod stream;
 pub use anthropic::AnthropicProvider;
 pub use factory::{provider_from_config, provider_from_env};
 pub use openai_compat::OpenAiCompatProvider;
+pub use openai_responses::OpenAiResponsesProvider;
 pub use retry::{with_retry, DelayFn, RetryConfig, RetryingProvider};
 pub use stream::{parse_sse_stream, StreamDelta};
 
