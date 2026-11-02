@@ -27,6 +27,7 @@ mod explore;
 mod memory_search;
 mod minify;
 mod glob;
+mod lsp;
 mod grep;
 mod read;
 pub mod reduce;

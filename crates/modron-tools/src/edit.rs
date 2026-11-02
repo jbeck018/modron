@@ -136,6 +136,14 @@ impl Tool for EditTool {
                 MAX_BYTES,
             ));
         }
+        // Live LSP (Phase 14): push the new content so language servers
+        // re-lint; the `diagnostics` tool collects the result.
+        let updated_owned = updated.clone();
+        let lsp_path = path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::lsp::did_write(&lsp_path, &updated_owned)
+        })
+        .await;
         // Diff rail (Phase 14, jcode pattern): the change surfaced in the
         // tool result itself, so the next turn (and the human) sees what
         // moved where without a re-read.

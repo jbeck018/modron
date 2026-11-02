@@ -74,6 +74,27 @@ impl Tool for DiagnosticsTool {
             },
         };
 
+        // Live LSP diagnostics first (Phase 14): anything a language
+        // server published for files this session wrote. Bounded wait —
+        // servers take a moment after didChange.
+        let lsp_lines: Vec<String> = tokio::task::spawn_blocking(|| {
+            crate::lsp::wait_diagnostics(2500, "")
+                .into_iter()
+                .map(|d| format!("{}:{}: [{}] {}", d.file, d.line, d.severity_label(), d.message))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let lsp_report = if lsp_lines.is_empty() {
+            String::new()
+        } else {
+            format!("live language-server diagnostics:
+{}
+
+", lsp_lines.join("
+"))
+        };
+
         let output = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&command)
@@ -95,21 +116,27 @@ impl Tool for DiagnosticsTool {
             text.push_str(&err_text);
         }
         let text = text.trim();
-        if code == 0 && text.is_empty() {
+        if code == 0 && text.is_empty() && lsp_lines.is_empty() {
             return Ok(ToolOutcome::ok(reduce_output(
                 format!("{checker}: clean — no diagnostics"),
+                REDUCE_CAP,
+            )));
+        }
+        if code == 0 && text.is_empty() {
+            return Ok(ToolOutcome::ok(reduce_output(
+                format!("{lsp_report}{checker}: project checker clean"),
                 REDUCE_CAP,
             )));
         }
         if code == 0 {
             // Exit 0 = success; any output is informational notes.
             return Ok(ToolOutcome::ok(reduce_output(
-                format!("{checker}: clean — notes:\n{text}"),
+                format!("{lsp_report}{checker}: clean — notes:\n{text}"),
                 REDUCE_CAP,
             )));
         }
         Ok(ToolOutcome::err(reduce_output(
-            format!("{checker} (exit {code}):\n{text}"),
+            format!("{lsp_report}{checker} (exit {code}):\n{text}"),
             REDUCE_CAP,
         )))
     }
