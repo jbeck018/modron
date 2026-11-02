@@ -644,8 +644,19 @@ async fn run_pending_command(
         }
         // /model: the engine's own default switches here (each submit
         // clones it, so the change lands from the next turn on).
-        PendingCommand::Model(name) => {
+        PendingCommand::Model { name, save_default } => {
+            // The PROVIDER follows the model, and the SELECTOR is pinned to
+            // the choice — the router would otherwise keep routing to its
+            // own cheap/strong tiers (the live bug: chatgpt-lineup names
+            // were sent to the anthropic endpoint).
             engine.config.default_model = name.clone();
+            if let Some(info) = modron_router::lookup(&name) {
+                engine.config.default_provider = info.provider.clone();
+            }
+            engine.selector = std::sync::Arc::new(modron_core::testing::StaticSelector::new(
+                &name,
+                engine.config.default_provider.clone(),
+            ));
             let detail = modron_router::lookup(&name).map(|m| {
                 format!(
                     " — provider {}, {}k window",
@@ -653,12 +664,22 @@ async fn run_pending_command(
                     m.context_window / 1000
                 )
             });
-            vec![match detail {
+            let mut lines = vec![match &detail {
                 Some(d) => format!("model: {name}{d} (applies from the next turn)"),
                 None => {
                     format!("model: {name} (unknown to the catalog; applies from the next turn)")
                 }
-            }]
+            }];
+            if save_default {
+                match crate::save_default_model(&name, engine.config.default_provider.as_str()) {
+                    Ok(path) => lines.push(format!(
+                        "✓ saved as default ({}); future launches start here",
+                        path.display()
+                    )),
+                    Err(e) => lines.push(format!("cannot save default: {e}")),
+                }
+            }
+            lines
         }
         // /sandbox: switch the policy for future tool calls.
         PendingCommand::Sandbox(mode) => match mode.as_str() {

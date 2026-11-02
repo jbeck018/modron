@@ -703,7 +703,7 @@ fn model_menu_lists_catalog_and_switches_the_engine_model() {
     assert!(app.menu.is_none());
     assert!(matches!(
         app.pending_command,
-        Some(PendingCommand::Model(ref n)) if n == "glm-5.3"
+        Some(PendingCommand::Model { ref name, .. }) if name == "glm-5.3"
     ));
 
     // Esc closes without side effects.
@@ -1614,4 +1614,51 @@ fn committed_long_lines_wrap_into_history_rows() {
     app.history.clear();
     app.begin_task(&"y".repeat(75));
     assert_eq!(app.history.len(), 2, "75 chars + prompt wraps at 50");
+}
+
+#[test]
+fn model_menu_s_key_saves_as_default_and_config_writer_roundtrips() {
+    use crossterm::event::KeyCode;
+    // 's' on a highlighted model parks the switch AND the save.
+    let mut app = App {
+        current_model: "glm-5.3".into(),
+        ..App::default()
+    };
+    app.handle_slash_test(SlashCommand::Model(String::new()));
+    app.on_key(key(KeyCode::Down)); // a different row
+    app.on_key(key(KeyCode::Char('s')));
+    assert!(app.menu.is_none());
+    match &app.pending_command {
+        Some(PendingCommand::Model { name, save_default }) => {
+            assert!(!name.is_empty());
+            assert!(*save_default, "s = switch + save default");
+        }
+        other => panic!("expected Model save, got {other:?}"),
+    }
+
+    // The config writer: MODRON_CONFIG temp dir, existing keys preserved.
+    let dir = std::env::temp_dir().join(format!("modron-model-default-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "router_mode = \"learned\"\ndefault_model = \"old\"\n",
+    )
+    .unwrap();
+    std::env::set_var("MODRON_CONFIG", &dir);
+    let path = modron_tui::save_default_model("gpt-5.6-sol", "chatgpt").unwrap();
+    std::env::remove_var("MODRON_CONFIG");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("default_model = \"gpt-5.6-sol\""), "{text}");
+    assert!(text.contains("default_provider = \"chatgpt\""), "{text}");
+    assert!(
+        text.contains("router_mode = \"learned\""),
+        "other keys kept: {text}"
+    );
+    assert_eq!(
+        text.matches("default_model").count(),
+        1,
+        "replaced, not duplicated: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -132,8 +132,12 @@ pub enum PendingCommand {
     /// modal; Esc cancels).
     ChatGptLogin,
     /// /model <name>: switch the engine's model for future turns (the
-    /// TUI label updates locally too).
-    Model(String),
+    /// provider follows the model). `save_default` also persists the
+    /// choice to config.toml.
+    Model {
+        name: String,
+        save_default: bool,
+    },
     /// /sandbox <mode>: switch the sandbox policy for future turns.
     Sandbox(String),
     Agent(String),
@@ -567,6 +571,40 @@ fn highlighted(line: &Line<'static>, cs: usize, ce: usize) -> Line<'static> {
 /// `App.theme` (switchable with /theme).
 pub const ACCENT: Color = Color::Rgb(255, 159, 10);
 pub const DIM: Color = Color::DarkGray;
+
+/// Persist the default model + provider to config.toml
+/// (MODRON_CONFIG or ~/.config/modron/config.toml): the /model menu's
+/// "save as default" path. Returns the path written.
+pub fn save_default_model(model: &str, provider: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::var("MODRON_CONFIG")
+        .map(|dir| std::path::PathBuf::from(dir).join("config.toml"))
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join(".config")
+                        .join("modron")
+                        .join("config.toml")
+                })
+                .unwrap_or_else(|_| ".modron-config.toml".into())
+        });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|l| {
+            let key = l.split('=').next().unwrap_or("").trim();
+            key != "default_model" && key != "default_provider"
+        })
+        .map(String::from)
+        .collect();
+    lines.insert(0, format!("default_provider = \"{provider}\""));
+    lines.insert(0, format!("default_model = \"{model}\""));
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    Ok(path)
+}
 
 /// Where user theme JSON files live (MODRON_CONFIG or ~/.config/modron/themes).
 pub fn theme_dir() -> std::path::PathBuf {
@@ -1019,6 +1057,23 @@ impl App {
                 self.menu = None;
                 return self.handle_slash(command);
             }
+            // `s` on a model row: switch AND persist as the default.
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                if let SlashCommand::Model(name) = &menu.options[menu.selected].command {
+                    let name = name.clone();
+                    self.menu = None;
+                    self.model_label = name.clone();
+                    self.current_model = name.clone();
+                    if let Some(info) = modron_router::lookup(&name) {
+                        self.context_window = info.context_window;
+                    }
+                    self.pending_command = Some(PendingCommand::Model {
+                        name: name.clone(),
+                        save_default: true,
+                    });
+                    self.note(format!("switched to {name} and saving it as the default"));
+                }
+            }
             _ => self.menu = Some(menu),
         }
         Action::None
@@ -1047,7 +1102,7 @@ impl App {
         }
         self.auth_flow = None;
         self.menu = Some(Menu {
-            title: "model — ↑/↓ choose · enter switch · esc close".to_string(),
+            title: "model — ↑/↓ · enter switch · s switch+save default · esc close".to_string(),
             options,
             selected,
         });
@@ -1573,7 +1628,10 @@ impl App {
                     }
                     // The engine itself switches in the run loop (each
                     // submit clones it) — the label alone would lie.
-                    self.pending_command = Some(PendingCommand::Model(name.clone()));
+                    self.pending_command = Some(PendingCommand::Model {
+                        name: name.clone(),
+                        save_default: false,
+                    });
                     self.note(format!(
                         "switched to {name} (takes effect on the next turn)"
                     ));

@@ -1133,6 +1133,18 @@ fn build_agent_with(
     }
     providers.insert(provider_id.clone(), main_provider);
 
+    // Register every OTHER provider that can build from the environment
+    // (API keys, saved sign-ins). /model switches the engine's provider
+    // along with the model — an unregistered provider made the switch a
+    // hard error ("no provider registered under `chatgpt`").
+    for extra_id in ["anthropic", "openai-compat", "chatgpt", "zai"] {
+        if !providers.contains_key(extra_id) {
+            if let Ok(built) = build_provider(extra_id) {
+                providers.insert(extra_id.to_string(), built);
+            }
+        }
+    }
+
     let store = Arc::new(JsonlSessionStore::new(&sessions_dir));
     let mut registry = default_registry_with_memory(&memory_root);
     if let Some(verify) = &cfg.verify {
@@ -1179,8 +1191,22 @@ fn build_agent_with(
         );
     }
     engine_config.personas = personas;
+    // Build the router FIRST even when pinning: its config errors (unknown
+    // mode, bad overrides) must surface regardless of the provider choice.
+    let router = build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()))?;
+    let selector = match &cli.provider {
+        // An explicitly chosen provider PINS every turn there — the
+        // router would otherwise override it with its own cheap/strong
+        // tiers (a `--provider mock` run was silently routed to
+        // anthropic the moment anthropic became buildable).
+        Some(choice) => Arc::new(modron_core::testing::StaticSelector::new(
+            &engine_config.default_model,
+            choice.id(),
+        )) as Arc<dyn modron_core::ModelSelector>,
+        None => router,
+    };
     let engine = Engine {
-        selector: build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()))?,
+        selector,
         providers,
         tools: Arc::new(registry),
         store: Arc::clone(&store) as Arc<dyn SessionStore>,
