@@ -31,20 +31,148 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Anthropic Messages API client.
 pub struct AnthropicProvider {
-    api_key: String,
+    auth: std::sync::RwLock<Auth>,
     base_url: String,
     http: Client,
 }
+
+/// How the provider authenticates.
+enum Auth {
+    /// Pay-per-token API key (`x-api-key`).
+    ApiKey(String),
+    /// Claude-subscription OAuth (tokens from `/auth` → Anthropic →
+    /// sign in with browser): `Authorization: Bearer` + the oauth beta
+    /// header, and the server-validated Claude Code system-prompt
+    /// prefix. Access tokens live ~8h; refresh tokens ROTATE on every
+    /// refresh (the response's new one must be persisted).
+    Subscription {
+        access_token: String,
+        refresh_token: Option<String>,
+    },
+}
+
+/// Beta flags the Messages API requires for subscription (OAuth) traffic.
+const OAUTH_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
+/// The Messages API validates that subscription requests carry a system
+/// prompt starting with this sentence.
+const CLAUDE_CODE_SYSTEM_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 impl AnthropicProvider {
     /// Create a client against the public API (`https://api.anthropic.com`).
     /// Fails only if the HTTP client cannot be built (TLS backend init).
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            api_key: api_key.into(),
+            auth: std::sync::RwLock::new(Auth::ApiKey(api_key.into())),
             base_url: DEFAULT_BASE_URL.to_string(),
             http: build_client()?,
         })
+    }
+
+    /// Create a client riding a Claude-subscription sign-in (tokens from
+    /// `/auth`; see [`Auth::Subscription`]). ToS-gray and experimental:
+    /// API keys remain the first-class path.
+    pub fn from_subscription(
+        access_token: impl Into<String>,
+        refresh_token: Option<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            auth: std::sync::RwLock::new(Auth::Subscription {
+                access_token: access_token.into(),
+                refresh_token,
+            }),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            http: build_client()?,
+        })
+    }
+
+    /// Whether the subscription (OAuth) auth mode is active.
+    fn is_subscription(&self) -> bool {
+        matches!(
+            &*self.auth.read().expect("auth lock"),
+            Auth::Subscription { .. }
+        )
+    }
+
+    /// The system-prefix requirement for this auth mode (subscription
+    /// only; empty = none).
+    fn system_prefix(&self) -> &'static str {
+        if self.is_subscription() {
+            CLAUDE_CODE_SYSTEM_PREFIX
+        } else {
+            ""
+        }
+    }
+
+    /// Send one `/v1/messages` request with the mode's headers; a 401 in
+    /// subscription mode triggers one refresh-and-retry (refresh tokens
+    /// rotate — the new pair is persisted before the retry).
+    async fn post_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+        let mut response = self.send_messages(url, body).await?;
+        if response.status().as_u16() == 401 && self.refresh_if_possible().await? {
+            response = self.send_messages(url, body).await?;
+        }
+        Ok(response)
+    }
+
+    async fn send_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+        // Header values are extracted under a scoped guard: the future
+        // must be Send, so no guard may live across the await.
+        let (bearer, api_key) = {
+            let auth = self.auth.read().expect("auth lock");
+            match &*auth {
+                Auth::ApiKey(key) => (None, Some(key.clone())),
+                Auth::Subscription { access_token, .. } => (Some(access_token.clone()), None),
+            }
+        };
+        let request = self
+            .http
+            .post(url)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(body);
+        let request = match (bearer, api_key) {
+            (Some(token), _) => request
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", OAUTH_BETA),
+            (None, Some(key)) => request.header("x-api-key", key),
+            (None, None) => unreachable!("auth is always one of the two"),
+        };
+        request
+            .send()
+            .await
+            .map_err(|err| crate::transport_error(PROVIDER_ID, err))
+    }
+
+    /// Refresh an expired subscription access token. True when the tokens
+    /// were rotated (persisted) and the caller should retry.
+    async fn refresh_if_possible(&self) -> Result<bool> {
+        use modron_core::auth::oauth;
+        let refresh_token = {
+            let auth = self.auth.read().expect("auth lock");
+            match &*auth {
+                Auth::Subscription {
+                    refresh_token: Some(token),
+                    ..
+                } => token.clone(),
+                _ => return Ok(false),
+            }
+        };
+        let tokens = oauth::refresh_tokens_at(oauth::TOKEN_URL, &refresh_token)
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.into(),
+                message: format!("subscription token refresh failed: {e}"),
+            })?;
+        // Persist BEFORE swapping in memory: rotation means a crash must
+        // never leave only the dead refresh token on disk.
+        oauth::save_tokens(&tokens).map_err(|e| Error::Provider {
+            provider: PROVIDER_ID.into(),
+            message: format!("cannot persist refreshed tokens: {e}"),
+        })?;
+        *self.auth.write().expect("auth lock") = Auth::Subscription {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+        };
+        Ok(true)
     }
 
     /// Point the client at another deployment (proxy, gateway, Bedrock-style
@@ -97,7 +225,7 @@ impl AnthropicProvider {
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<TurnResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut body = build_body(&req);
+        let mut body = build_body_with_prefix(&req, self.system_prefix());
         body["stream"] = json!(true);
         tracing::debug!(
             provider = PROVIDER_ID,
@@ -108,15 +236,7 @@ impl AnthropicProvider {
             "sending streaming turn request"
         );
 
-        let response = self
-            .http
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
+        let response = self.post_messages(&url, &body).await?;
         let status = response.status();
         if !status.is_success() {
             // Streaming failures arrive as a plain (non-SSE) error body.
@@ -360,7 +480,16 @@ impl StreamAccumulator {
     }
 }
 
-/// Build the `/v1/messages` request body from a [`TurnRequest`].
+/// Build the `/v1/messages` request body from a [`TurnRequest`] (no
+/// system prefix — see [`build_body_with_prefix`]).
+pub fn build_body(req: &TurnRequest) -> Value {
+    build_body_with_prefix(req, "")
+}
+
+/// [`build_body`] with a system-prompt prefix. Subscription (OAuth)
+/// requests MUST carry a system prompt beginning with the Claude Code
+/// sentence — the API validates it server-side; an empty prefix keeps
+/// `req.system` verbatim (and skips the clone).
 ///
 /// Mapping rules:
 /// - `system` becomes a top-level `system` array of one text block carrying
@@ -376,7 +505,20 @@ impl StreamAccumulator {
 ///   "input_schema"}`; the LAST tool also carries
 ///   `cache_control: {"type": "ephemeral"}` — prompt cache breakpoint #2,
 ///   marking the end of the cacheable tools+system prefix.
-pub fn build_body(req: &TurnRequest) -> Value {
+pub fn build_body_with_prefix(req: &TurnRequest, system_prefix: &str) -> Value {
+    if system_prefix.is_empty() {
+        return build_body_inner(req);
+    }
+    let mut req = req.clone();
+    req.system = if req.system.is_empty() {
+        system_prefix.to_string()
+    } else {
+        format!("{system_prefix}\n\n{}", req.system)
+    };
+    build_body_inner(&req)
+}
+
+fn build_body_inner(req: &TurnRequest) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     let mut last_role: Option<&'static str> = None;
 
@@ -601,7 +743,7 @@ impl ModelProvider for AnthropicProvider {
 
     async fn turn(&self, req: TurnRequest) -> Result<TurnResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let body = build_body(&req);
+        let body = build_body_with_prefix(&req, self.system_prefix());
         // Log shapes and sizes only — never the API key or full body.
         tracing::debug!(
             provider = PROVIDER_ID,
@@ -612,15 +754,7 @@ impl ModelProvider for AnthropicProvider {
             "sending turn request"
         );
 
-        let response = self
-            .http
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
+        let response = self.post_messages(&url, &body).await?;
         let status = response.status();
         let text = response
             .text()
@@ -652,6 +786,33 @@ mod tests {
     use super::*;
     use modron_core::{Message, ToolOutcome, ToolSpec};
     use serde_json::json;
+
+    #[test]
+    fn subscription_mode_carries_the_required_system_prefix() {
+        // Subscription (OAuth) requests are server-validated to carry a
+        // system prompt beginning with the Claude Code sentence.
+        let provider = AnthropicProvider::from_subscription("at-token", Some("rt".into())).unwrap();
+        assert!(provider.is_subscription());
+        let body = build_body_with_prefix(&sample_request(), provider.system_prefix());
+        let system = body["system"].as_array().unwrap();
+        let text = system[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("You are Claude Code, Anthropic's official CLI for Claude."),
+            "{text}"
+        );
+        // The original system prompt survives after the prefix.
+        assert!(text.ends_with("You are Modron."), "{text}");
+
+        // API-key mode: no prefix, verbatim system.
+        let key_provider = AnthropicProvider::new("sk").unwrap();
+        assert!(!key_provider.is_subscription());
+        assert_eq!(key_provider.system_prefix(), "");
+        let body = build_body_with_prefix(&sample_request(), key_provider.system_prefix());
+        assert_eq!(
+            body["system"][0]["text"].as_str().unwrap(),
+            "You are Modron."
+        );
+    }
 
     fn sample_request() -> TurnRequest {
         TurnRequest {

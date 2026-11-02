@@ -25,8 +25,22 @@ const ZAI_KEY_HINT: &str = "get a pay-as-you-go key at https://z.ai/manage-apike
      api/coding/paas/v4 and api/anthropic endpoints)";
 
 /// Build a provider from process environment variables. Empty variables are
-/// treated as unset.
+/// treated as unset. For `anthropic`, a saved Claude-subscription sign-in
+/// (`/auth` → Anthropic → sign in with browser) takes precedence over the
+/// API key — the user opted into the subscription explicitly.
 pub fn provider_from_env(provider_id: &str) -> Result<Arc<dyn ModelProvider>> {
+    if provider_id == "anthropic" {
+        if let Ok(Some(tokens)) = modron_core::auth::oauth::load_tokens() {
+            let mut provider =
+                AnthropicProvider::from_subscription(tokens.access_token, tokens.refresh_token)?;
+            if let Ok(base_url) = std::env::var("ANTHROPIC_BASE_URL") {
+                if !base_url.is_empty() {
+                    provider = provider.with_base_url(base_url);
+                }
+            }
+            return Ok(Arc::new(provider));
+        }
+    }
     provider_from_config(provider_id, |key| {
         std::env::var(key).ok().filter(|value| !value.is_empty())
     })
@@ -71,7 +85,8 @@ pub fn provider_from_config(
             let api_key = env("ANTHROPIC_API_KEY").ok_or_else(|| {
                 missing_key(
                     "ANTHROPIC_API_KEY",
-                    "get a key at https://console.anthropic.com",
+                    "get a key at https://console.anthropic.com — or sign in with a Claude \
+                     subscription (TUI: /auth → Anthropic → sign in with browser)",
                 )
             })?;
             let mut provider = AnthropicProvider::new(api_key)?;

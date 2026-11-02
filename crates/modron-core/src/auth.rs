@@ -450,6 +450,34 @@ pub mod oauth {
         })
     }
 
+    /// Refresh a Claude-subscription access token. Same custom-JSON
+    /// endpoint; refresh tokens ROTATE — the response carries a NEW
+    /// refresh_token and the old one dies, so callers must persist the
+    /// returned pair.
+    pub async fn refresh_tokens(refresh_token: &str) -> anyhow::Result<TokenSet> {
+        refresh_tokens_at(TOKEN_URL, refresh_token).await
+    }
+
+    /// Endpoint-parameterized [`refresh_tokens`] (tests point it at a
+    /// mock and assert the wire format).
+    pub async fn refresh_tokens_at(
+        token_url: &str,
+        refresh_token: &str,
+    ) -> anyhow::Result<TokenSet> {
+        let client = reqwest::Client::new();
+        let response = client
+            .post(token_url)
+            .json(&json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CLIENT_ID,
+            }))
+            .send()
+            .await?;
+        let body: Value = response.json().await?;
+        parse_token_response(&body)
+    }
+
     /// PKCE pair: (verifier, S256 challenge). Verifier is 64 chars from
     /// the unreserved set; challenge is base64url(SHA256(verifier)) without
     /// padding.
@@ -1106,6 +1134,44 @@ pub mod oauth {
                 "{request}"
             );
             assert!(request.contains(r#""code_verifier":"vvvv"#), "{request}");
+        }
+
+        #[tokio::test]
+        async fn token_refresh_rotates_on_the_wire() {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            // Refresh grant: JSON {grant_type: refresh_token, refresh_token,
+            // client_id}; the response carries the ROTATED pair.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let token_url = format!("http://{addr}/oauth/token");
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body =
+                    r#"{"access_token":"at-3","refresh_token":"rt-ROTATED","expires_in":28800}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = tx.send(request);
+            });
+            let tokens = refresh_tokens_at(&token_url, "rt-old").await.unwrap();
+            assert_eq!(tokens.access_token, "at-3");
+            assert_eq!(tokens.refresh_token.as_deref(), Some("rt-ROTATED"));
+            assert_eq!(tokens.expires_in, Some(28800));
+            let request = rx.recv().unwrap();
+            assert!(
+                request.contains(r#""grant_type":"refresh_token""#),
+                "{request}"
+            );
+            assert!(request.contains(r#""refresh_token":"rt-old""#), "{request}");
+            assert!(request.contains(r#""client_id":"9d1c250a"#), "{request}");
         }
     }
 }

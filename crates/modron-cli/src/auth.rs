@@ -207,7 +207,8 @@ async fn login() -> anyhow::Result<()> {
     let tokens = modron_core::auth::oauth::exchange_code(&session, &code).await?;
     modron_core::auth::oauth::save_tokens(&tokens)?;
     println!(
-        "tokens stored — use `--provider anthropic` with `[auth.anthropic] use_subscription = true` in config."
+        "tokens stored — `--provider anthropic` now rides the subscription automatically \
+         (a saved API key stays the fallback; /auth → Anthropic → remove to go back)"
     );
     Ok(())
 }
