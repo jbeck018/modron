@@ -6,10 +6,12 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-/// One provider option on the onboarding screen.
+/// One provider option on the onboarding screen (and the auth wizard).
 pub struct ProviderOption {
     pub number: u8,
     pub name: &'static str,
+    /// The `--provider` id the key unlocks.
+    pub provider_id: &'static str,
     pub env_var: &'static str,
     pub key_url: &'static str,
     pub note: &'static str,
@@ -20,6 +22,7 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 1,
             name: "Z.ai (GLM)",
+            provider_id: "zai",
             env_var: "ZAI_API_KEY",
             key_url: "https://z.ai/manage-apikey/apikey-list",
             note: "free tier available (glm-4.5-flash)",
@@ -27,6 +30,7 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 2,
             name: "Anthropic (Claude)",
+            provider_id: "anthropic",
             env_var: "ANTHROPIC_API_KEY",
             key_url: "https://console.anthropic.com",
             note: "Claude models",
@@ -34,6 +38,7 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 3,
             name: "OpenAI",
+            provider_id: "openai-compat",
             env_var: "OPENAI_API_KEY",
             key_url: "https://platform.openai.com/api-keys",
             note: "GPT models",
@@ -41,6 +46,7 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 4,
             name: "Google Gemini",
+            provider_id: "google",
             env_var: "GEMINI_API_KEY",
             key_url: "https://aistudio.google.com/apikey",
             note: "free tier (2.5 Flash, 1M context)",
@@ -48,6 +54,7 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 5,
             name: "Groq",
+            provider_id: "groq",
             env_var: "GROQ_API_KEY",
             key_url: "https://console.groq.com/keys",
             note: "free tier, fastest inference",
@@ -55,6 +62,7 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 6,
             name: "OpenRouter",
+            provider_id: "openrouter",
             env_var: "OPENROUTER_API_KEY",
             key_url: "https://openrouter.ai/keys",
             note: "400+ models, some free",
@@ -62,6 +70,7 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 7,
             name: "Mistral",
+            provider_id: "mistral",
             env_var: "MISTRAL_API_KEY",
             key_url: "https://console.mistral.ai",
             note: "free experiment tier",
@@ -69,15 +78,44 @@ pub fn provider_options() -> Vec<ProviderOption> {
         ProviderOption {
             number: 8,
             name: "Cerebras",
+            provider_id: "cerebras",
             env_var: "CEREBRAS_API_KEY",
             key_url: "https://cloud.cerebras.ai",
             note: "free tier, fast",
         },
+        ProviderOption {
+            number: 9,
+            name: "Nvidia NIM",
+            provider_id: "nvidia",
+            env_var: "NVIDIA_API_KEY",
+            key_url: "https://build.nvidia.com",
+            note: "free tier",
+        },
+        ProviderOption {
+            number: 10,
+            name: "GitHub Models",
+            provider_id: "github-models",
+            env_var: "GITHUB_MODELS_TOKEN",
+            key_url: "https://github.com/settings/personal-access-tokens",
+            note: "free tier with a GitHub account",
+        },
     ]
 }
 
-/// The env file where onboarding saves keys: `~/.config/modron/env`.
+/// Find a registry entry by provider id (`zai`, `anthropic`, …).
+pub fn option_for_provider(provider_id: &str) -> Option<ProviderOption> {
+    provider_options()
+        .into_iter()
+        .find(|o| o.provider_id == provider_id)
+}
+
+/// The env file where onboarding saves keys: `~/.config/modron/env`
+/// (or `<MODRON_CONFIG>/env` when that override is set, matching the
+/// theme dir convention).
 pub fn env_file() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("MODRON_CONFIG") {
+        return Ok(PathBuf::from(dir).join("env"));
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     Ok(home.join(".config").join("modron").join("env"))
 }
@@ -218,18 +256,7 @@ fn save_and_confirm(opt: &ProviderOption, key: &str) -> anyhow::Result<String> {
     // Set in the current process too.
     std::env::set_var(opt.env_var, key);
 
-    // Determine the provider id and default model.
-    let provider_id = match opt.env_var {
-        "ZAI_API_KEY" => "zai",
-        "ANTHROPIC_API_KEY" => "anthropic",
-        "OPENAI_API_KEY" => "openai-compat",
-        "GEMINI_API_KEY" => "google",
-        "GROQ_API_KEY" => "groq",
-        "OPENROUTER_API_KEY" => "openrouter",
-        "MISTRAL_API_KEY" => "mistral",
-        "CEREBRAS_API_KEY" => "cerebras",
-        _ => "openai-compat",
-    };
+    let provider_id = opt.provider_id;
 
     // Save the default provider to config.toml.
     let config_path = dirs::home_dir()

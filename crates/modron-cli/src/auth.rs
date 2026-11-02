@@ -174,47 +174,242 @@ pub fn parse_callback_url(url: &str, expected_state: &str) -> anyhow::Result<Str
     code.ok_or_else(|| anyhow!("callback URL missing code"))
 }
 
-/// `modron auth login|status|logout` (Phase 5d X3).
+// ── API-key store: the onboarding env file ────────────────────────────────
+//
+// Keys live as `export <VAR>="<key>"` lines in ~/.config/modron/env (0600,
+// same file first-run onboarding writes), so every launch path — TUI, one-shot,
+// daemon — sources them identically. Process env still wins over the file.
+
+/// Read every `export VAR="value"` line of an env file into pairs.
+pub fn parse_env_file(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("export ") {
+            if let Some((key, value)) = rest.split_once('=') {
+                let value = value.trim().trim_matches('"');
+                if !key.trim().is_empty() && !value.is_empty() {
+                    out.push((key.trim().to_string(), value.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Write/replace one provider key in an env file (0600 on create).
+pub fn set_key_in_env_file(path: &std::path::Path, env_var: &str, key: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|l| !l.starts_with(&format!("export {env_var}=")))
+        .map(String::from)
+        .collect();
+    lines.push(format!("export {env_var}=\"{key}\""));
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    chmod_600(path);
+    Ok(())
+}
+
+/// Remove one provider's key line. Ok(false) = nothing was stored.
+pub fn remove_key_from_env_file(path: &std::path::Path, env_var: &str) -> anyhow::Result<bool> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return Ok(false),
+    };
+    let lines: Vec<String> = existing
+        .lines()
+        .filter(|l| !l.starts_with(&format!("export {env_var}=")))
+        .map(String::from)
+        .collect();
+    if lines.len() == existing.lines().count() {
+        return Ok(false); // nothing matched
+    }
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn chmod_600(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+#[cfg(not(unix))]
+fn chmod_600(_path: &std::path::Path) {}
+
+/// Mask a key for display: `sk-…wxyz`.
+pub fn mask_key(key: &str) -> String {
+    let n = key.chars().count();
+    if n <= 8 {
+        return "…".to_string();
+    }
+    let head: String = key.chars().take(3).collect();
+    let tail: String = key.chars().skip(n - 4).collect();
+    format!("{head}…{tail}")
+}
+
+/// Where a configured key came from, for `auth status`.
+enum KeySource {
+    ProcessEnv,
+    EnvFile,
+    None,
+}
+
+fn key_source(env_var: &str) -> (KeySource, String) {
+    // The saved file wins for labeling (startup sources it into the
+    // process anyway); only shell-only exports show as process env.
+    if let Ok(path) = crate::onboarding::env_file() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for (var, value) in parse_env_file(&content) {
+                if var == env_var {
+                    return (KeySource::EnvFile, value);
+                }
+            }
+        }
+    }
+    if let Ok(v) = std::env::var(env_var) {
+        if !v.is_empty() {
+            return (KeySource::ProcessEnv, v);
+        }
+    }
+    (KeySource::None, String::new())
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────
+
+/// `modron auth` family: token/OAuth management for every provider.
 pub(super) async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
     match action {
         AuthAction::Login => login().await,
+        AuthAction::Add => add_provider_wizard().await,
+        AuthAction::Set { provider_id, key } => set_key(&provider_id, &key),
         AuthAction::Status => {
-            match load_tokens()? {
-                Some(tokens) => {
-                    println!(
-                        "anthropic subscription: tokens present (access token ends …{})",
-                        {
-                            let t = &tokens.access_token;
-                            t.chars()
-                                .rev()
-                                .take(4)
-                                .collect::<String>()
-                                .chars()
-                                .rev()
-                                .collect::<String>()
-                        }
-                    );
-                    if let Some(expires_in) = tokens.expires_in {
-                        println!("expires_in: {expires_in}s (from grant; refresh token stored)");
-                    }
+            print_status()?;
+            Ok(())
+        }
+        AuthAction::Logout { provider_id } => logout(provider_id.as_deref()),
+    }
+}
+
+/// Interactive: pick a provider (or Claude OAuth), paste a token. The
+/// first-run onboarding screen reuses the same registry.
+async fn add_provider_wizard() -> anyhow::Result<()> {
+    use std::io::Write;
+    let options = crate::onboarding::provider_options();
+    let mut stdout = std::io::stdout();
+    writeln!(stdout)?;
+    writeln!(stdout, "  add a provider")?;
+    writeln!(stdout)?;
+    for opt in &options {
+        writeln!(stdout, "   {:>2} {:<18} {}", opt.number, opt.name, opt.note)?;
+    }
+    writeln!(stdout, "   o  Claude subscription   OAuth in the browser")?;
+    writeln!(stdout)?;
+    write!(stdout, "  choice: ")?;
+    stdout.flush()?;
+
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let choice = line.trim();
+    if choice.eq_ignore_ascii_case("o") {
+        return login().await;
+    }
+    let num: u8 = choice
+        .parse()
+        .map_err(|_| anyhow!("invalid choice: {choice}"))?;
+    let opt = options
+        .iter()
+        .find(|o| o.number == num)
+        .ok_or_else(|| anyhow!("no provider {num}"))?;
+
+    writeln!(stdout)?;
+    writeln!(stdout, "  get a key at: {}", opt.key_url)?;
+    write!(stdout, "  paste {} : ", opt.env_var)?;
+    stdout.flush()?;
+    let mut key_line = String::new();
+    std::io::stdin().read_line(&mut key_line)?;
+    let key = key_line.trim();
+    if key.is_empty() {
+        anyhow::bail!("no key provided");
+    }
+    set_key(opt.provider_id, key)
+}
+
+/// Non-interactive: `modron auth set <provider> <key>`.
+fn set_key(provider: &str, key: &str) -> anyhow::Result<()> {
+    if key.trim().is_empty() {
+        anyhow::bail!("empty key");
+    }
+    let opt = crate::onboarding::option_for_provider(provider).ok_or_else(|| {
+        anyhow!("unknown provider `{provider}` — run `modron auth add` to pick one")
+    })?;
+    let path = crate::onboarding::env_file()?;
+    set_key_in_env_file(&path, opt.env_var, key)?;
+    // The current process picks it up too (matches onboarding behavior).
+    std::env::set_var(opt.env_var, key);
+    println!(
+        "✓ {} key saved to {} (0600) — provider `{}` is ready",
+        opt.name,
+        path.display(),
+        opt.provider_id
+    );
+    Ok(())
+}
+
+fn print_status() -> anyhow::Result<()> {
+    println!("provider          key");
+    for opt in crate::onboarding::provider_options() {
+        let (source, value) = key_source(opt.env_var);
+        let shown = match source {
+            KeySource::ProcessEnv => format!("{} (process env)", mask_key(&value)),
+            KeySource::EnvFile => format!("{} (saved)", mask_key(&value)),
+            KeySource::None => "—".to_string(),
+        };
+        println!("{:<17} {}", format!("{} ", opt.name), shown);
+    }
+    match load_tokens()? {
+        Some(tokens) => println!(
+            "{:<17} {} (OAuth)",
+            "Claude subscription ",
+            mask_key(&tokens.access_token)
+        ),
+        None => println!("{:<17} — (run `modron auth login`)", "Claude subscription "),
+    }
+    Ok(())
+}
+
+fn logout(provider: Option<&str>) -> anyhow::Result<()> {
+    match provider {
+        // Back-compat: bare `auth logout` clears the Claude OAuth tokens.
+        None => match auth_file() {
+            Ok(path) => match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("tokens deleted ({})", path.display());
+                    Ok(())
                 }
-                None => println!("no stored tokens — run `modron auth login`"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("no tokens stored");
+                    Ok(())
+                }
+                Err(e) => Err(anyhow!("cannot delete tokens: {e}")),
+            },
+            Err(e) => Err(e),
+        },
+        Some(provider) => {
+            let opt = crate::onboarding::option_for_provider(provider).ok_or_else(|| {
+                anyhow!("unknown provider `{provider}` — run `modron auth add` to pick one")
+            })?;
+            let path = crate::onboarding::env_file()?;
+            if remove_key_from_env_file(&path, opt.env_var)? {
+                std::env::remove_var(opt.env_var);
+                println!("✓ {} key removed", opt.name);
+            } else {
+                println!("no saved {} key", opt.name);
             }
             Ok(())
         }
-        AuthAction::Logout => match auth_file() {
-            Ok(path) => {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => println!("tokens deleted ({})", path.display()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        println!("no tokens stored")
-                    }
-                    Err(e) => return Err(anyhow!("cannot delete tokens: {e}")),
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
-        },
     }
 }
 
@@ -307,6 +502,52 @@ mod tests {
             "s1"
         )
         .is_err());
+    }
+
+    #[test]
+    fn env_file_set_parse_remove_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("modron-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("env");
+
+        set_key_in_env_file(&path, "ZAI_API_KEY", "sk-first").unwrap();
+        set_key_in_env_file(&path, "GROQ_API_KEY", "gsk_second").unwrap();
+        // Re-setting replaces, never duplicates.
+        set_key_in_env_file(&path, "ZAI_API_KEY", "sk-replaced").unwrap();
+
+        let pairs = parse_env_file(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(pairs.len(), 2, "{pairs:?}");
+        assert!(pairs.contains(&("ZAI_API_KEY".into(), "sk-replaced".into())));
+        assert!(pairs.contains(&("GROQ_API_KEY".into(), "gsk_second".into())));
+
+        assert!(remove_key_from_env_file(&path, "GROQ_API_KEY").unwrap());
+        assert!(!remove_key_from_env_file(&path, "GROQ_API_KEY").unwrap());
+        let pairs = parse_env_file(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(pairs.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keys_are_masked_for_display() {
+        assert_eq!(mask_key("sk-ant-1234567890"), "sk-…7890");
+        assert_eq!(mask_key("short"), "…");
+    }
+
+    #[test]
+    fn provider_lookup_covers_the_registry() {
+        assert_eq!(
+            crate::onboarding::option_for_provider("zai")
+                .unwrap()
+                .env_var,
+            "ZAI_API_KEY"
+        );
+        assert_eq!(
+            crate::onboarding::option_for_provider("github-models")
+                .unwrap()
+                .env_var,
+            "GITHUB_MODELS_TOKEN"
+        );
+        assert!(crate::onboarding::option_for_provider("nope").is_none());
     }
 
     #[test]

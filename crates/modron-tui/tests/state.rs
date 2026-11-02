@@ -1019,3 +1019,16 @@ fn streaming_renders_as_live_tail_in_the_history_zone() {
     );
     assert!(frame.contains("working"), "working title: {frame:?}");
 }
+
+#[test]
+fn auth_slash_parks_a_pending_command() {
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Auth);
+    assert_eq!(app.pending_command, Some(PendingCommand::Auth));
+    // And /login is an alias that parses to the same command.
+    assert_eq!(
+        SlashCommand::parse("/login"),
+        Some(SlashCommand::Auth),
+        "catalog advertises /login as an alias; parse must match"
+    );
+}

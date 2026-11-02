@@ -115,8 +115,8 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// Subscription auth (EXPERIMENTAL): manage OAuth tokens for providers
-    /// that support it (currently: claude).
+    /// Manage provider credentials: API keys for any provider, OAuth for
+    /// Claude subscriptions.
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -208,12 +208,24 @@ enum McpAction {
 
 #[derive(Subcommand, Clone)]
 enum AuthAction {
-    /// Authorize via browser (PKCE + localhost callback) and store tokens.
+    /// Add a provider interactively: pick one, paste a token (or run the
+    /// Claude OAuth flow in the browser).
+    Add,
+    /// Authorize a Claude subscription via browser (PKCE + localhost
+    /// callback) and store tokens.
     Login,
-    /// Show whether stored subscription tokens exist.
+    /// Store an API key without the wizard: `auth set <provider> <key>`.
+    /// (The field is `provider_id`, not `provider` — the root `--provider`
+    /// flag is a global arg and would collide on the arg id.)
+    Set { provider_id: String, key: String },
+    /// Show every provider's configured key (masked) and OAuth state.
     Status,
-    /// Delete stored tokens.
-    Logout,
+    /// Delete stored credentials. Bare `logout` clears Claude OAuth
+    /// tokens; `logout <provider>` removes that provider's saved key.
+    Logout {
+        /// Provider id (zai, anthropic, groq, …); omit for Claude OAuth.
+        provider_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]

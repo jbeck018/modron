@@ -94,6 +94,8 @@ pub enum SlashCommand {
     Learn(String),
     /// Switch color theme (built-ins + ~/.config/modron/themes/*.json).
     Theme(String),
+    /// Show configured provider credentials (masked) and how to add more.
+    Auth,
     /// Alias kept for muscle memory.
     Compress,
     Unknown(String),
@@ -104,6 +106,8 @@ pub enum SlashCommand {
 /// drains and executes it, then commits the result lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingCommand {
+    /// /auth — status of provider credentials (reads the auth store).
+    Auth,
     Agent(String),
     Allow(String),
     Deny(String),
@@ -151,6 +155,8 @@ impl SlashCommand {
         ("goal", "stop condition for long runs"),
         ("learn", "distill this session into a SKILL.md"),
         ("theme", "switch color theme"),
+        ("auth", "show provider keys (add: `modron auth add`)"),
+        ("login", "alias of /auth"),
     ];
 
     /// Parse `/name arg` from input; None if input doesn't start with `/`.
@@ -186,6 +192,7 @@ impl SlashCommand {
             "goal" => SlashCommand::Goal(arg),
             "learn" => SlashCommand::Learn(arg),
             "theme" => SlashCommand::Theme(arg),
+            "auth" | "login" => SlashCommand::Auth,
             "compress" => SlashCommand::Compact,
             other => SlashCommand::Unknown(other.to_string()),
         })
@@ -738,6 +745,10 @@ impl App {
                     "{question}\n\n(Quick side question: answer directly from what you \
                      already know — do not use tools.)"
                 ))
+            }
+            SlashCommand::Auth => {
+                self.pending_command = Some(PendingCommand::Auth);
+                Action::None
             }
             SlashCommand::Agent(name) => {
                 self.pending_command = Some(PendingCommand::Agent(name));

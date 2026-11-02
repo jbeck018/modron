@@ -421,6 +421,10 @@ async fn run_pending_command(
     cmd: PendingCommand,
 ) -> Vec<String> {
     match cmd {
+        // /auth — provider credential status. Reads the same env file the
+        // CLI wizard writes (~/.config/modron/env); the file is the truth,
+        // so no provider registry is duplicated here.
+        PendingCommand::Auth => auth_status_lines(),
         PendingCommand::Agent(name) => {
             let name = name.trim().to_string();
             if name.is_empty() {
@@ -608,6 +612,72 @@ fn run_issues(engine: &Engine, arg: &str) -> Vec<String> {
             if *open { "open" } else { "done" }
         ));
     }
+    out
+}
+
+/// Compact /auth status: masked keys from the env file + the Claude OAuth
+/// token file + the pointer to the CLI wizard.
+fn auth_status_lines() -> Vec<String> {
+    let mut out = vec!["provider credentials:".to_string()];
+    let env_path = std::env::var("MODRON_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                .join(".config")
+                .join("modron")
+        })
+        .join("env");
+    let mut any = false;
+    if let Ok(content) = std::fs::read_to_string(&env_path) {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("export ") {
+                if let Some((var, value)) = rest.split_once('=') {
+                    let value = value.trim().trim_matches('"');
+                    if value.is_empty() {
+                        continue;
+                    }
+                    any = true;
+                    let n = value.chars().count();
+                    let masked = if n > 8 {
+                        let head: String = value.chars().take(3).collect();
+                        let tail: String = value.chars().skip(n - 4).collect();
+                        format!("{head}…{tail}")
+                    } else {
+                        "…".to_string()
+                    };
+                    out.push(format!("  {var} = {masked} (saved)"));
+                }
+            }
+        }
+    }
+    for var in ["ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() && !out.iter().any(|l| l.starts_with(&format!("  {var}"))) {
+                any = true;
+                let n = v.chars().count();
+                let tail: String = v.chars().skip(n.saturating_sub(4)).collect();
+                out.push(format!("  {var} = …{tail} (process env)"));
+            }
+        }
+    }
+    if !any {
+        out.push("  (none configured)".to_string());
+    }
+    let oauth = std::env::var("HOME")
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".modron")
+                .join("auth")
+                .join("anthropic.json")
+        })
+        .ok()
+        .and_then(|p| std::fs::metadata(&p).ok().map(|_| p));
+    if oauth.is_some() {
+        out.push("  claude subscription: OAuth tokens present".to_string());
+    }
+    out.push(
+        "add a provider: run `modron auth add` (or `modron auth set <provider> <key>`)".to_string(),
+    );
     out
 }
 
