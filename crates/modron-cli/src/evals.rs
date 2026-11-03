@@ -200,12 +200,22 @@ pub(crate) async fn run_evals(
         anyhow::bail!("no eval tasks match the filter");
     }
     let models: Vec<String> = match models_arg {
-        Some(csv) => csv.split(',').map(str::trim).map(String::from).collect(),
+        // Empty CSV segments must not become empty-string model names that
+        // only fail later inside provider calls.
+        Some(csv) => csv
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(String::from)
+            .collect(),
         None => vec![cfg
             .default_model
             .clone()
             .unwrap_or_else(|| "glm-5.3-flash".to_string())],
     };
+    if models.is_empty() {
+        anyhow::bail!("--models parsed to an empty list");
+    }
 
     let mcp = crate::spawn_mcp_servers(cfg).await?;
     let stamp = chrono::Utc::now().to_rfc3339().replace([':', '+'], "-");

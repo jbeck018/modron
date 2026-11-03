@@ -88,13 +88,15 @@ input_per_m = 0.0
 output_per_m = 0.0
 tier = "cheap"
 
-# OpenAI API-key lineup (2026-11): gpt-6 family on api.openai.com.
-# gpt-6-astra's name belongs to the chatgpt subscription entry above
-# (names are unique catalog-wide); with an OPENAI_API_KEY it still works
-# via `--provider openai-compat --model gpt-6-astra` (forced provider).
+# OpenAI API-key lineup (2026-11): gpt-6 family on api.openai.com, reached
+# through the openai-compat provider (OPENAI_API_KEY) — no factory arm ever
+# builds a provider registered as "openai", so catalog entries must not use
+# that id. gpt-6-astra's name belongs to the chatgpt subscription entry
+# above (names are unique catalog-wide); with an OPENAI_API_KEY it still
+# works via `--provider openai-compat --model gpt-6-astra` (forced provider).
 [[models]]
 name = "gpt-6-sol"
-provider = "openai"
+provider = "openai-compat"
 context_window = 400_000
 input_per_m = 2.0
 output_per_m = 10.0
@@ -102,7 +104,7 @@ tier = "strong"
 
 [[models]]
 name = "gpt-5.6-cyber"
-provider = "openai"
+provider = "openai-compat"
 context_window = 400_000
 input_per_m = 12.5
 output_per_m = 75.0
@@ -345,9 +347,8 @@ impl ModelInfo {
 mod tests {
     use super::*;
 
-    const ALLOWED_PROVIDERS: [&str; 14] = [
+    const ALLOWED_PROVIDERS: [&str; 13] = [
         "anthropic",
-        "openai",
         "openai-compat",
         "google",
         "deepseek",

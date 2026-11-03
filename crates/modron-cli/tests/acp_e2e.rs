@@ -93,8 +93,12 @@ fn acp_initialize_session_prompt_and_streaming() {
     let (response, _) = client.read_until_response(id);
     assert_eq!(response["result"]["protocolVersion"], 1);
 
-    // session/new
-    let id = client.request("session/new", json!({"cwd": "/", "mcpServers": []}));
+    // session/new — the editor's cwd is honored (tools run there).
+    let project = tempfile::tempdir().unwrap();
+    let id = client.request(
+        "session/new",
+        json!({"cwd": project.path().to_str().unwrap(), "mcpServers": []}),
+    );
     let (response, _) = client.read_until_response(id);
     let acp_session = response["result"]["sessionId"]
         .as_str()
@@ -136,6 +140,12 @@ fn acp_initialize_session_prompt_and_streaming() {
     assert!(
         tool_calls >= 2,
         "bash start + completion surfaced: {updates:?}"
+    );
+    // The session cwd drove every tool: the mock's scripted write landed
+    // in the editor's project dir (not the process launch dir).
+    assert!(
+        project.path().join("demo-output.txt").exists(),
+        "demo-output.txt must land in the session cwd"
     );
 
     // Second prompt: same ACP session resumes the same Modron session.

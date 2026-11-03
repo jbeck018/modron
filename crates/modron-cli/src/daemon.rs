@@ -190,11 +190,27 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let session = request
+            // An unparseable session id must be an ERROR, not a silent
+            // None — None starts a brand-new session under the caller's
+            // "resume" intent.
+            let session = match request
                 .params
                 .get("session_id")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<SessionId>().ok());
+                .map(str::parse::<SessionId>)
+            {
+                None => None,
+                Some(Ok(id)) => Some(id),
+                Some(Err(e)) => {
+                    let _ = tx.send(Response {
+                        id: request.id,
+                        notification: None,
+                        result: None,
+                        error: Some(format!("invalid session_id: {e}")),
+                    });
+                    return;
+                }
+            };
             run_task(request.id, engine, Some(task), session, tx).await;
         }
         "list_sessions" => match engine.store.list().await {
@@ -386,11 +402,14 @@ pub async fn connect() -> anyhow::Result<Option<UnixStream>> {
     }
     match UnixStream::connect(&sock).await {
         Ok(stream) => Ok(Some(stream)),
-        Err(_) => {
-            // Stale socket.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            // Stale socket: nothing is listening; safe to remove.
             let _ = std::fs::remove_file(&sock);
             Ok(None)
         }
+        // Transient failures (full backlog, EMFILE) must NOT delete the
+        // socket — that would sever the live daemon permanently.
+        Err(_) => Ok(None),
     }
 }
 

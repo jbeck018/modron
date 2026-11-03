@@ -108,16 +108,36 @@ impl Tool for DiagnosticsTool {
             )
         };
 
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&ctx.working_dir)
-            .output()
-            .await
-            .map_err(|e| modron_core::Error::Tool {
+        let output = match tokio::time::timeout(
+            // A hanging checker (file-lock waits, interactive prompts) must
+            // not hang the agent; kill_on_drop makes the elapsed-timeout
+            // drop actually kill the child.
+            Duration::from_millis(TIMEOUT_MS),
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&ctx.working_dir)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| modron_core::Error::Tool {
                 tool: NAME.into(),
                 message: format!("cannot spawn `{command}`: {e}"),
-            })?;
+            })?,
+            Err(_) => {
+                return Ok(tool_err(
+                    NAME,
+                    format!(
+                        "{checker} timed out after {} s (interactive or stuck command: \
+                         `{command}`)",
+                        TIMEOUT_MS / 1000
+                    ),
+                    REDUCE_CAP,
+                ));
+            }
+        };
 
         let code = output.status.code().unwrap_or(-1);
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();

@@ -83,6 +83,7 @@ async fn run_seatbelt(command: &str, workspace: &Path) -> Result<std::process::O
     })?;
 
     let output = tokio::process::Command::new("sandbox-exec")
+        .kill_on_drop(true) // a dropped timeout future must not leak the child
         .arg("-f")
         .arg(&profile_path)
         .arg("sh")
@@ -110,6 +111,7 @@ async fn run_bubblewrap(command: &str, workspace: &Path) -> Result<std::process:
         .unwrap_or_else(|_| workspace.to_path_buf());
 
     let output = tokio::process::Command::new("bwrap")
+        .kill_on_drop(true) // a dropped timeout future must not leak the child
         .arg("--unshare-net") // deny network
         .arg("--unshare-ipc")
         .arg("--dev-bind")
@@ -117,9 +119,9 @@ async fn run_bubblewrap(command: &str, workspace: &Path) -> Result<std::process:
         .arg("/dev")
         .arg("--proc")
         .arg("/proc")
-        .arg("--bind")
+        .arg("--ro-bind")
         .arg("/usr")
-        .arg("/usr") // read-only system
+        .arg("/usr") // read-only system (--bind would be read-write)
         .arg("--ro-bind")
         .arg("/etc")
         .arg("/etc")

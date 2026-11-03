@@ -149,12 +149,9 @@ impl Tool for DelegateTool {
                 }
             }
         }
-        let child_ctx = ToolCtx {
-            working_dir: child_working_dir.clone(),
-            sandbox: ctx.sandbox,
-            engine: ctx.engine.clone(),
-        };
-        let _ = &child_ctx; // children receive it via ToolCtx.engine wiring
+        // The child runs IN the worktree (its ToolCtx working dir follows
+        // via delegate's working_dir parameter) — results are reported,
+        // never auto-merged.
 
         // Background mode (Phase 5i I2): detached child, state in the
         // engine registry, `delegate_status` reads it later.
@@ -170,6 +167,7 @@ impl Tool for DelegateTool {
             let task = task.to_string();
             let tool_filter = tool_filter.clone();
             let engine = std::sync::Arc::clone(engine);
+            let child_dir = child_working_dir.clone();
             let mut registry_guard = bg.lock().unwrap();
             registry_guard.insert(
                 id.clone(),
@@ -190,6 +188,7 @@ impl Tool for DelegateTool {
                     persona_for_task.as_ref(),
                     tool_filter.as_deref(),
                     budget,
+                    Some(&child_dir),
                 )
                 .await;
                 let mut guard = registry.lock().unwrap();
@@ -215,8 +214,15 @@ impl Tool for DelegateTool {
             )));
         }
 
-        match modron_core::subagent::delegate(engine, task, persona, tool_filter.as_deref(), budget)
-            .await
+        match modron_core::subagent::delegate(
+            engine,
+            task,
+            persona,
+            tool_filter.as_deref(),
+            budget,
+            Some(&child_working_dir),
+        )
+        .await
         {
             Ok(report) => {
                 let mut brief = report.brief;

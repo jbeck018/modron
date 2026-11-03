@@ -81,6 +81,54 @@ impl Default for HeuristicSelector {
 }
 
 impl HeuristicSelector {
+    /// Budget pressure + per-action overrides: the checks that win over any
+    /// tier decision. Shared by the direct heuristic path (`select`) and the
+    /// learned router's tier path (`select_with_tier`) — persona pins and
+    /// `[router.actions]` overrides must hold on both.
+    fn pre_tier(&self, req: &SelectRequest) -> Option<ModelChoice> {
+        // Budget pressure (Phase-3a R2): inside the last ~$0.50 of a capped
+        // run, everything downgrades — finishing the task cheaply beats
+        // failing mid-edit on an exhausted budget.
+        if let Some(remaining) = req.budget_remaining_usd {
+            if remaining < BUDGET_PRESSURE_USD {
+                let (model, provider) = self.cheap.clone();
+                let window = lookup(&model).map(|i| i.context_window);
+                return Some(ModelChoice {
+                    model,
+                    provider,
+                    reason: format!(
+                        "budget pressure: ${remaining:.2} remaining of the cap → cheap tier"
+                    ),
+                    confident: true,
+                    context_window: window,
+                });
+            }
+        }
+
+        // Per-action overrides win over tier rules. A model absent from the
+        // catalog keeps the override model but rides the provider the tier
+        // rules would have picked — an empty provider would make the engine
+        // silently discard the override model.
+        if let Some(model) = self.overrides.get(&req.action) {
+            let fallback_provider = match route_tier(req).0 {
+                Tier::Cheap => self.cheap.1.clone(),
+                Tier::Strong => self.strong.1.clone(),
+            };
+            let provider = lookup(model)
+                .map(|i| i.provider.clone())
+                .unwrap_or(fallback_provider);
+            return Some(ModelChoice {
+                model: model.clone(),
+                provider,
+                reason: format!("config override: action={:?} → {model}", req.action),
+                confident: true,
+                context_window: lookup(model).map(|i| i.context_window),
+            });
+        }
+
+        None
+    }
+
     /// Resolve a request against an already-decided tier (used by the
     /// learned router, Phase-3a R3): same overflow escalation, caller's
     /// reason (or the tier's default when empty).
@@ -90,6 +138,9 @@ impl HeuristicSelector {
         tier: Tier,
         reason: String,
     ) -> ModelChoice {
+        if let Some(choice) = self.pre_tier(req) {
+            return choice;
+        }
         let (tier, mut reason) = if reason.is_empty() {
             let (t, r) = route_tier(req);
             (t, r)
@@ -127,37 +178,8 @@ impl HeuristicSelector {
 
 impl ModelSelector for HeuristicSelector {
     fn select(&self, req: &SelectRequest) -> ModelChoice {
-        // Budget pressure (Phase-3a R2): inside the last ~$0.50 of a capped
-        // run, everything downgrades — finishing the task cheaply beats
-        // failing mid-edit on an exhausted budget.
-        if let Some(remaining) = req.budget_remaining_usd {
-            if remaining < BUDGET_PRESSURE_USD {
-                let (model, provider) = self.cheap.clone();
-                let window = lookup(&model).map(|i| i.context_window);
-                return ModelChoice {
-                    model,
-                    provider,
-                    reason: format!(
-                        "budget pressure: ${remaining:.2} remaining of the cap → cheap tier"
-                    ),
-                    confident: true,
-                    context_window: window,
-                };
-            }
-        }
-
-        // Per-action overrides win over tier rules.
-        if let Some(model) = self.overrides.get(&req.action) {
-            let provider = lookup(model)
-                .map(|i| i.provider.clone())
-                .unwrap_or_default();
-            return ModelChoice {
-                model: model.clone(),
-                provider,
-                reason: format!("config override: action={:?} → {model}", req.action),
-                confident: true,
-                context_window: lookup(model).map(|i| i.context_window),
-            };
+        if let Some(choice) = self.pre_tier(req) {
+            return choice;
         }
 
         let (tier, mut reason) = route_tier(req);

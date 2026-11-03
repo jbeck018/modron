@@ -154,7 +154,11 @@ pub fn open_browser(url: &str) -> bool {
 /// The env file where keys are saved.
 pub fn env_file() -> std::io::Result<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("MODRON_CONFIG") {
-        return Ok(std::path::PathBuf::from(dir).join("env"));
+        // Same convention as `modron-cli::config::config_path`: the
+        // variable names the config DIRECTORY. An empty value means unset.
+        if !dir.is_empty() {
+            return Ok(std::path::PathBuf::from(dir).join("env"));
+        }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     Ok(std::path::PathBuf::from(home)
@@ -195,7 +199,7 @@ pub fn set_key_in_env_file(
         .map(String::from)
         .collect();
     lines.push(format!("export {env_var}=\"{key}\""));
-    std::fs::write(path, lines.join("\n") + "\n")?;
+    write_private(path, &(lines.join("\n") + "\n"))?;
     chmod_600(path);
     Ok(())
 }
@@ -214,7 +218,7 @@ pub fn remove_key_from_env_file(path: &std::path::Path, env_var: &str) -> std::i
     if lines.len() == existing.lines().count() {
         return Ok(false); // nothing matched
     }
-    std::fs::write(path, lines.join("\n") + "\n")?;
+    write_private(path, &(lines.join("\n") + "\n"))?;
     Ok(true)
 }
 
@@ -225,6 +229,31 @@ fn chmod_600(path: &std::path::Path) {
 }
 #[cfg(not(unix))]
 fn chmod_600(_path: &std::path::Path) {}
+
+/// Overwrite a file holding credentials so it is 0600 from the moment of
+/// creation — `fs::write` + later chmod leaves a world-readable window on
+/// first create.
+pub fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        // mode() applies only on create; narrow a pre-existing wider file.
+        chmod_600(path);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
 
 /// Mask a key for display: `sk-…wxyz` (fully hidden when very short).
 pub fn mask_key(key: &str) -> String {
@@ -267,6 +296,402 @@ pub fn key_source(env_var: &str) -> (KeySource, String) {
         }
     }
     (KeySource::None, String::new())
+}
+
+/// ── Existing sign-in discovery ───────────────────────────────────
+///
+/// Other agent CLIs on this machine already hold subscription sign-ins
+/// that Modron speaks natively (Codex CLI's ChatGPT tokens; Claude
+/// Code's Anthropic tokens). Onboarding scans these stores and offers
+/// one-key reuse instead of a fresh browser round-trip.
+pub mod discovery {
+    use super::oauth::{self, chatgpt};
+    use serde_json::Value;
+    use std::path::Path;
+
+    /// A sign-in stored by another tool that Modron can import.
+    #[derive(Clone, Debug)]
+    pub struct DetectedSignin {
+        /// Modron provider id the imported tokens unlock
+        /// ("chatgpt" | "anthropic").
+        pub provider_id: &'static str,
+        /// Human label of the source store (e.g. "Codex CLI
+        /// (~/.codex/auth.json)").
+        pub source: String,
+        pub credentials: DetectedCredentials,
+    }
+
+    /// The tokens to persist on import — the two subscription flows
+    /// Modron implements end to end.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum DetectedCredentials {
+        ChatGpt {
+            access_token: String,
+            refresh_token: Option<String>,
+            account_id: String,
+        },
+        Anthropic {
+            access_token: String,
+            refresh_token: Option<String>,
+        },
+    }
+
+    impl DetectedSignin {
+        /// Friendly provider name for pickers and confirmations.
+        pub fn provider_label(&self) -> &'static str {
+            match self.provider_id {
+                "chatgpt" => "ChatGPT",
+                _ => "Claude (Anthropic)",
+            }
+        }
+
+        /// Masked access token for confirmation lines (never the value).
+        pub fn token_mask(&self) -> String {
+            let token = match &self.credentials {
+                DetectedCredentials::ChatGpt { access_token, .. }
+                | DetectedCredentials::Anthropic { access_token, .. } => access_token,
+            };
+            super::mask_key(token)
+        }
+    }
+
+    /// Scan the well-known credential stores under `home` (tests inject a
+    /// tempdir). Sign-ins Modron already stores itself are skipped — a
+    /// stored sign-in is "signed in", not "importable".
+    pub fn find_existing_signins_in(home: &Path) -> Vec<DetectedSignin> {
+        find_existing_signins_with(home, claude_code_keychain)
+    }
+
+    /// Scan under $HOME — the production entry point.
+    pub fn find_existing_signins() -> Vec<DetectedSignin> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        find_existing_signins_in(Path::new(&home))
+    }
+
+    fn find_existing_signins_with(
+        home: &Path,
+        keychain_probe: fn() -> Option<String>,
+    ) -> Vec<DetectedSignin> {
+        let mut found = Vec::new();
+
+        // Codex CLI (ChatGPT subscription): ~/.codex/auth.json, tokens
+        // nested under "tokens" (older builds stored them flat).
+        if !modron_chatgpt_stored_in(home) {
+            if let Some(text) = read_file(&home.join(".codex").join("auth.json")) {
+                if let Some(credentials) = parse_codex_auth(&text) {
+                    found.push(DetectedSignin {
+                        provider_id: "chatgpt",
+                        source: "Codex CLI (~/.codex/auth.json)".into(),
+                        credentials,
+                    });
+                }
+            }
+        }
+
+        // Claude Code: ~/.claude/.credentials.json, else the macOS
+        // keychain item (probe injectable — tests must stay hermetic).
+        // Anthropic refresh tokens ROTATE — imported copies go stale
+        // when either side refreshes (re-import fixes).
+        if !modron_anthropic_stored_in(home) {
+            let file = home.join(".claude").join(".credentials.json");
+            if let Some(text) = read_file(&file) {
+                if let Some(credentials) = parse_claude_credentials(&text) {
+                    found.push(DetectedSignin {
+                        provider_id: "anthropic",
+                        source: "Claude Code (~/.claude/.credentials.json)".into(),
+                        credentials,
+                    });
+                }
+            } else if let Some(text) = keychain_probe() {
+                if let Some(credentials) = parse_claude_credentials(&text) {
+                    found.push(DetectedSignin {
+                        provider_id: "anthropic",
+                        source: "Claude Code (macOS Keychain)".into(),
+                        credentials,
+                    });
+                }
+            }
+        }
+
+        found
+    }
+
+    /// Import: persist the tokens into Modron's own 0600 token store.
+    /// The source tool's copy is untouched.
+    pub fn import_signin(signin: &DetectedSignin) -> anyhow::Result<()> {
+        match &signin.credentials {
+            DetectedCredentials::ChatGpt {
+                access_token,
+                refresh_token,
+                account_id,
+            } => chatgpt::save(&chatgpt::ChatGptAuth {
+                access_token: access_token.clone(),
+                refresh_token: refresh_token.clone(),
+                account_id: account_id.clone(),
+            }),
+            DetectedCredentials::Anthropic {
+                access_token,
+                refresh_token,
+            } => oauth::save_tokens(&oauth::TokenSet {
+                access_token: access_token.clone(),
+                refresh_token: refresh_token.clone(),
+                expires_in: None,
+                id_token: None,
+            }),
+        }
+    }
+
+    /// Parse Codex CLI's auth.json. Requires a non-empty access token
+    /// and a derivable account id (explicit field, else the id_token's
+    /// `https://api.openai.com/auth` claim).
+    pub fn parse_codex_auth(text: &str) -> Option<DetectedCredentials> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        // Nested "tokens" object (2026 layout); fall back to flat keys.
+        let tokens = value.get("tokens").unwrap_or(&value);
+        let access_token = tokens.get("access_token")?.as_str()?;
+        if access_token.is_empty() {
+            return None;
+        }
+        let refresh_token = non_empty(tokens.get("refresh_token"));
+        let account_id = non_empty(tokens.get("account_id")).or_else(|| {
+            tokens
+                .get("id_token")
+                .and_then(Value::as_str)
+                .and_then(chatgpt::account_id)
+        })?;
+        Some(DetectedCredentials::ChatGpt {
+            access_token: access_token.to_string(),
+            refresh_token,
+            account_id,
+        })
+    }
+
+    /// Parse Claude Code's credentials JSON (file or keychain payload):
+    /// `{"claudeAiOauth": {"accessToken": …, "refreshToken": …}}`
+    /// (flat access_token/access_token-style keys accepted too).
+    pub fn parse_claude_credentials(text: &str) -> Option<DetectedCredentials> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        let oauth = value.get("claudeAiOauth").unwrap_or(&value);
+        let access_token = oauth
+            .get("accessToken")
+            .or_else(|| oauth.get("access_token"))?
+            .as_str()?;
+        if access_token.is_empty() {
+            return None;
+        }
+        let refresh_token = oauth
+            .get("refreshToken")
+            .or_else(|| oauth.get("refresh_token"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        Some(DetectedCredentials::Anthropic {
+            access_token: access_token.to_string(),
+            refresh_token,
+        })
+    }
+
+    fn non_empty(value: Option<&Value>) -> Option<String> {
+        value
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+
+    fn read_file(path: &Path) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+    }
+
+    fn modron_chatgpt_stored_in(home: &Path) -> bool {
+        home.join(".modron")
+            .join("auth")
+            .join("openai.json")
+            .exists()
+    }
+
+    fn modron_anthropic_stored_in(home: &Path) -> bool {
+        home.join(".modron")
+            .join("auth")
+            .join("anthropic.json")
+            .exists()
+    }
+
+    /// Claude Code stores its OAuth blob in the login keychain on macOS
+    /// (service "Claude Code-credentials"). Reading the user's own item
+    /// needs no prompt; a denied/locked keychain is a plain None.
+    #[cfg(target_os = "macos")]
+    fn claude_code_keychain() -> Option<String> {
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn claude_code_keychain() -> Option<String> {
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn codex_fixture(account: Option<&str>) -> String {
+            let mut tokens = serde_json::json!({
+                "access_token": "at-codex",
+                "refresh_token": "rt-codex",
+                "id_token": "ignored.jwt.here",
+            });
+            if let Some(account) = account {
+                tokens["account_id"] = serde_json::json!(account);
+            }
+            serde_json::json!({ "auth_mode": "chatgpt", "tokens": tokens }).to_string()
+        }
+
+        #[test]
+        fn codex_nested_tokens_with_account_field() {
+            let creds = parse_codex_auth(&codex_fixture(Some("acc-1"))).expect("parses");
+            assert_eq!(
+                creds,
+                DetectedCredentials::ChatGpt {
+                    access_token: "at-codex".into(),
+                    refresh_token: Some("rt-codex".into()),
+                    account_id: "acc-1".into(),
+                }
+            );
+        }
+
+        #[test]
+        fn codex_account_from_id_token_claim_when_field_missing() {
+            // JWT payload with the nested account claim (the LIVE-verified
+            // claim path from the ChatGPT sign-in work).
+            let payload = super::super::oauth::base64url_nopad(
+                br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc-claim"}}"#,
+            );
+            let id_token = format!("h.{payload}.s");
+            let text = serde_json::json!({
+                "tokens": {
+                    "access_token": "at-2",
+                    "refresh_token": "rt-2",
+                    "id_token": id_token,
+                }
+            })
+            .to_string();
+            let creds = parse_codex_auth(&text).expect("parses");
+            match creds {
+                DetectedCredentials::ChatGpt { account_id, .. } => {
+                    assert_eq!(account_id, "acc-claim");
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn codex_without_access_token_or_account_is_rejected() {
+            assert!(parse_codex_auth("{}").is_none());
+            assert!(
+                parse_codex_auth(r#"{"tokens":{"access_token":"","refresh_token":"rt"}}"#)
+                    .is_none()
+            );
+            // Access token present but no account derivable.
+            assert!(parse_codex_auth(r#"{"tokens":{"access_token":"at"}}"#).is_none());
+        }
+
+        #[test]
+        fn claude_credentials_shapes() {
+            let creds = parse_claude_credentials(
+                r#"{"claudeAiOauth":{"accessToken":"at-claude","refreshToken":"rt-claude","expiresAt":"2026"}}"#,
+            )
+            .expect("parses");
+            assert_eq!(
+                creds,
+                DetectedCredentials::Anthropic {
+                    access_token: "at-claude".into(),
+                    refresh_token: Some("rt-claude".into()),
+                }
+            );
+            // Keychain payloads can omit the refresh token.
+            let creds = parse_claude_credentials(r#"{"claudeAiOauth":{"accessToken":"at-only"}}"#)
+                .expect("parses");
+            assert!(
+                matches!(
+                    creds,
+                    DetectedCredentials::Anthropic {
+                        refresh_token: None,
+                        ..
+                    }
+                ),
+                "{creds:?}"
+            );
+            assert!(parse_claude_credentials("not json").is_none());
+        }
+
+        #[test]
+        fn finds_codex_and_claude_files_in_a_fake_home() {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+            std::fs::write(
+                home.path().join(".codex").join("auth.json"),
+                codex_fixture(Some("acc-9")),
+            )
+            .unwrap();
+            std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+            std::fs::write(
+                home.path().join(".claude").join(".credentials.json"),
+                r#"{"claudeAiOauth":{"accessToken":"at-c","refreshToken":"rt-c"}}"#,
+            )
+            .unwrap();
+
+            let found = find_existing_signins_with(home.path(), || None);
+            let ids: Vec<&str> = found.iter().map(|s| s.provider_id).collect();
+            assert_eq!(ids, vec!["chatgpt", "anthropic"], "{found:?}");
+            assert!(found[0].source.contains("Codex"));
+            assert_eq!(found[0].provider_label(), "ChatGPT");
+            assert_eq!(found[1].provider_label(), "Claude (Anthropic)");
+        }
+
+        #[test]
+        fn keychain_probe_supplies_the_claude_signin() {
+            let home = tempfile::tempdir().unwrap();
+            let found = find_existing_signins_with(home.path(), || {
+                Some(r#"{"claudeAiOauth":{"accessToken":"at-kc","refreshToken":"rt-kc"}}"#.into())
+            });
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].provider_id, "anthropic");
+            assert!(found[0].source.contains("Keychain"), "{found:?}");
+        }
+
+        #[test]
+        fn skips_stores_modron_already_owns() {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+            std::fs::write(
+                home.path().join(".codex").join("auth.json"),
+                codex_fixture(Some("acc-9")),
+            )
+            .unwrap();
+            // Modron already has a ChatGPT sign-in: the codex store is not
+            // importable, and nothing else is present.
+            std::fs::create_dir_all(home.path().join(".modron").join("auth")).unwrap();
+            std::fs::write(
+                home.path().join(".modron").join("auth").join("openai.json"),
+                "{}",
+            )
+            .unwrap();
+            assert!(find_existing_signins_with(home.path(), || None).is_empty());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +803,17 @@ pub mod oauth {
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
+    /// Bounded HTTP client for every OAuth exchange/refresh call: a stalled
+    /// token endpoint must fail with a timeout instead of hanging a sign-in
+    /// (or the 15-minute device-flow deadline) forever.
+    fn oauth_client() -> anyhow::Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| anyhow!("cannot build http client: {e}"))
+    }
+
     /// Claude Code's public OAuth client id — the documented,
     /// widely-integrated id for subscription flows.
     pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -443,9 +879,19 @@ pub mod oauth {
             super::open_browser(url);
         }
         let (mut socket, _) = listener.accept().await?;
-        let mut buf = vec![0u8; 16384];
-        let n = socket.read(&mut buf).await?;
-        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        // The request may arrive TCP-segmented (or after a non-navigation
+        // probe connection): read until the header terminator instead of
+        // trusting one read, bounded at 16KB.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while buf.len() < 16384 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let request = String::from_utf8_lossy(&buf).to_string();
         let request_line = request.lines().next().unwrap_or("");
         // "GET /callback?code=…&state=… HTTP/1.1"
         let target = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -473,7 +919,7 @@ pub mod oauth {
         session: &LoginSession,
         code: &str,
     ) -> anyhow::Result<TokenSet> {
-        let client = reqwest::Client::new();
+        let client = oauth_client()?;
         let response = client
             .post(token_url)
             .json(&token_exchange_body(
@@ -485,9 +931,16 @@ pub mod oauth {
             .send()
             .await?;
         // No error_for_status: this endpoint answers 200 with an error
-        // JSON body, and the body is the diagnostic worth surfacing.
-        let body: Value = response.json().await?;
-        parse_token_response(&body)
+        // JSON body, and the body is the diagnostic worth surfacing. The
+        // status is still folded into any failure so a non-JSON error body
+        // (proxy 502 HTML) doesn't surface as an opaque decode error.
+        let (status, text) = read_token_response(response).await?;
+        let body: Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow!("HTTP {status}: malformed token response: {e}"))?;
+        parse_token_response(&body).map_err(|e| match status.is_success() {
+            true => e,
+            false => anyhow!("HTTP {status}: {e:#}"),
+        })
     }
 
     /// The JSON body of the authorization_code exchange (mirrors Claude
@@ -517,7 +970,7 @@ pub mod oauth {
         token_url: &str,
         refresh_token: &str,
     ) -> anyhow::Result<TokenSet> {
-        let client = reqwest::Client::new();
+        let client = oauth_client()?;
         let response = client
             .post(token_url)
             .json(&json!({
@@ -527,8 +980,27 @@ pub mod oauth {
             }))
             .send()
             .await?;
-        let body: Value = response.json().await?;
-        parse_token_response(&body)
+        let (status, text) = read_token_response(response).await?;
+        let body: Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow!("HTTP {status}: malformed token response: {e}"))?;
+        parse_token_response(&body).map_err(|e| match status.is_success() {
+            true => e,
+            false => anyhow!("HTTP {status}: {e:#}"),
+        })
+    }
+
+    /// Read a token-endpoint response as (status, body text): the status
+    /// must survive into error messages — a proxy's HTML 502 would
+    /// otherwise surface as an opaque body-decode failure.
+    async fn read_token_response(
+        response: reqwest::Response,
+    ) -> anyhow::Result<(reqwest::StatusCode, String)> {
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| anyhow!("HTTP {status}: cannot read token response: {e}"))?;
+        Ok((status, text))
     }
 
     /// PKCE pair: (verifier, S256 challenge). Verifier is 64 chars from
@@ -644,7 +1116,7 @@ pub mod oauth {
             "expires_in": tokens.expires_in,
             "saved_at": chrono::Utc::now().to_rfc3339(),
         });
-        std::fs::write(&path, body.to_string())?;
+        super::write_private(&path, &body.to_string())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -662,13 +1134,16 @@ pub mod oauth {
         Ok(Some(parse_token_response(&value)?))
     }
 
-    /// Extract `code` and `state` from a callback URL query.
+    /// Extract `code` and `state` from a callback URL query. A callback
+    /// carrying no `state` at all fails validation when one was expected —
+    /// "state-validated" must not mean "validated only when present".
     pub fn parse_callback_url(url: &str, expected_state: &str) -> anyhow::Result<String> {
         let query = url
             .split('?')
             .nth(1)
             .ok_or_else(|| anyhow!("callback URL has no query"))?;
         let mut code = None;
+        let mut saw_state = false;
         for pair in query.split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
             match k {
@@ -676,9 +1151,13 @@ pub mod oauth {
                 "state" if v != expected_state => {
                     return Err(anyhow!("state mismatch — possible CSRF; aborting"));
                 }
+                "state" => saw_state = true,
                 "error" => return Err(anyhow!("authorization failed: {v}")),
                 _ => {}
             }
+        }
+        if !expected_state.is_empty() && !saw_state {
+            return Err(anyhow!("callback missing state — possible CSRF; aborting"));
         }
         code.ok_or_else(|| anyhow!("callback URL missing code"))
     }
@@ -758,7 +1237,7 @@ pub mod oauth {
             state: &str,
             port: u16,
         ) -> anyhow::Result<(String, Option<String>)> {
-            let client = reqwest::Client::new();
+            let client = oauth_client()?;
             let response = client
                 .post(token_url)
                 .json(&json!({
@@ -786,7 +1265,7 @@ pub mod oauth {
         /// Exchange the OAuth token for a business token (the biz API
         /// rejects the raw OAuth token).
         pub async fn business_login_at(url: &str, oauth_token: &str) -> anyhow::Result<String> {
-            let client = reqwest::Client::new();
+            let client = oauth_client()?;
             let response = client
                 .post(url)
                 .json(&json!({ "token": oauth_token }))
@@ -822,7 +1301,7 @@ pub mod oauth {
             biz_token: &str,
             key_name: &str,
         ) -> anyhow::Result<String> {
-            let client = reqwest::Client::new();
+            let client = oauth_client()?;
             let auth_header = format!("Bearer {biz_token}");
 
             let customer = client
@@ -991,7 +1470,7 @@ pub mod oauth {
 
         /// Endpoint-parameterized [`start`] (tests point it at a mock).
         pub async fn begin_at(usercode_url: &str) -> anyhow::Result<DeviceLogin> {
-            let client = reqwest::Client::new();
+            let client = oauth_client()?;
             let response = client
                 .post(usercode_url)
                 .json(&json!({ "client_id": CLIENT_ID }))
@@ -1029,7 +1508,7 @@ pub mod oauth {
             token_url: &str,
             login: &DeviceLogin,
         ) -> anyhow::Result<(TokenSet, String)> {
-            let client = reqwest::Client::new();
+            let client = oauth_client()?;
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(LOGIN_TIMEOUT_SECS);
             loop {
@@ -1171,7 +1650,7 @@ pub mod oauth {
                 "account_id": auth.account_id,
                 "saved_at": chrono::Utc::now().to_rfc3339(),
             });
-            std::fs::write(&path, body.to_string())?;
+            super::super::write_private(&path, &body.to_string())?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -1191,10 +1670,14 @@ pub mod oauth {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("stored openai tokens missing access_token"))?
                 .to_string();
+            // An empty account id would go out as an empty
+            // `chatgpt-account-id` header and fail every request with an
+            // opaque 401 — name the fix instead.
             let account_id = value
                 .get("account_id")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("stored openai tokens missing account_id"))?
                 .to_string();
             Ok(Some(ChatGptAuth {
                 access_token,

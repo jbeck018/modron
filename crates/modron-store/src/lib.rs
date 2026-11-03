@@ -58,8 +58,14 @@ impl JsonlSessionStore {
         let path = self.meta_path(meta.id);
         let data = serde_json::to_string_pretty(meta)
             .map_err(|e| Error::Session(format!("could not serialize meta: {e}")))?;
-        std::fs::write(&path, data)
-            .map_err(|e| Error::Session(format!("could not write {}: {e}", path.display())))
+        // Write-then-rename: a truncate-in-place write interrupted by a
+        // crash corrupts the meta file and permanently bricks every future
+        // append (read_meta fails forever after).
+        let tmp = self.root.join(format!("{}.meta.json.tmp", meta.id));
+        std::fs::write(&tmp, data)
+            .map_err(|e| Error::Session(format!("could not write {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::Session(format!("could not replace {}: {e}", path.display())))
     }
 }
 
@@ -75,10 +81,7 @@ impl SessionStore for JsonlSessionStore {
             updated_at: now,
             message_count: 0,
         };
-        let data = serde_json::to_string_pretty(&meta)
-            .map_err(|e| Error::Session(format!("could not serialize meta: {e}")))?;
-        std::fs::write(self.meta_path(meta.id), data)
-            .map_err(|e| Error::Session(format!("could not write meta: {e}")))?;
+        self.write_meta(&meta)?;
         std::fs::File::create(self.jsonl_path(meta.id))
             .map_err(|e| Error::Session(format!("could not create transcript: {e}")))?;
         Ok(meta)
@@ -116,10 +119,14 @@ impl SessionStore for JsonlSessionStore {
 
     async fn load(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
         let path = self.jsonl_path(id);
-        let data = std::fs::read_to_string(&path)
+        // Read bytes and decode per-line lossily: a torn multibyte write
+        // must not fail the whole load — the documented contract is that a
+        // partially damaged log stays loadable (bad lines warn + skip).
+        let data = std::fs::read(&path)
             .map_err(|e| Error::Session(format!("could not read {}: {e}", path.display())))?;
+        let text = String::from_utf8_lossy(&data);
         let mut events = Vec::new();
-        for (idx, line) in data.lines().enumerate() {
+        for (idx, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }

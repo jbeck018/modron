@@ -11,7 +11,9 @@ class Modron < Formula
   depends_on "rust" => :build
 
   def install
-    system "cargo", "install", "--locked", "--path", "crates/modron-cli"
+    # --root #{prefix}: without it cargo installs into $CARGO_HOME/bin and
+    # the formula's bin/modron (and the test block) never exists.
+    system "cargo", "install", "--locked", "--root", prefix, "--path", "crates/modron-cli"
   end
 
   test do

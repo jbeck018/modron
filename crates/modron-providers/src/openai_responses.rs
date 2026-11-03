@@ -31,30 +31,55 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DONE_SENTINEL: &str = "[DONE]";
 
+/// Live credentials behind a lock: a successful refresh swaps them in
+/// (persisted to disk first).
+#[derive(Clone)]
+struct StoredAuth {
+    access_token: String,
+    refresh_token: Option<String>,
+    account_id: String,
+}
+
 /// A ChatGPT-subscription provider: Responses API on the Codex backend.
 pub struct OpenAiResponsesProvider {
-    access_token: String,
-    account_id: String,
+    auth: std::sync::RwLock<StoredAuth>,
     base_url: String,
     http: Client,
+    /// Single-flight guard for refreshes — concurrent 401s must not both
+    /// POST the same single-use refresh token.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl OpenAiResponsesProvider {
     /// Build from explicitly passed credentials.
     pub fn new(access_token: impl Into<String>, account_id: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            access_token: access_token.into(),
-            account_id: account_id.into(),
+            auth: std::sync::RwLock::new(StoredAuth {
+                access_token: access_token.into(),
+                refresh_token: None,
+                account_id: account_id.into(),
+            }),
             base_url: chatgpt::BACKEND_URL.to_string(),
             http: build_client()?,
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     /// Build from the stored `/auth add` sign-in. Actionable error when no
-    /// sign-in exists.
+    /// sign-in exists. The refresh token rides along so an expired access
+    /// token can be rotated transparently instead of hard-failing.
     pub fn from_stored_tokens() -> Result<Self> {
         match chatgpt::load() {
-            Ok(Some(auth)) => Self::new(auth.access_token, auth.account_id),
+            Ok(Some(auth)) => Ok(Self {
+                auth: std::sync::RwLock::new(StoredAuth {
+                    access_token: auth.access_token,
+                    refresh_token: auth.refresh_token,
+                    account_id: auth.account_id,
+                }),
+                base_url: chatgpt::BACKEND_URL.to_string(),
+                http: build_client()?,
+                refresh_lock: tokio::sync::Mutex::new(()),
+            }),
             Ok(None) => Err(Error::Config(
                 "no ChatGPT sign-in".into(),
                 "run `/auth add` in the TUI (or `modron auth add`) and pick the ChatGPT \
@@ -114,17 +139,118 @@ impl OpenAiResponsesProvider {
         Ok(parsed)
     }
 
+    /// POST with the stored bearer; a 401 triggers one single-flight
+    /// refresh-and-retry. A failed refresh does not mask the original 401 —
+    /// the backend's diagnostic is what the caller needs to see.
     async fn post(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+        let mut response = self.send(url, body).await?;
+        if response.status().as_u16() == 401 {
+            match self.refresh_if_possible().await {
+                Ok(true) => response = self.send(url, body).await?,
+                Ok(false) => {}
+                Err(refresh_err) => {
+                    tracing::warn!("{refresh_err:#} — surfacing the original 401");
+                }
+            }
+        }
+        Ok(response)
+    }
+
+    async fn send(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+        // Credentials are cloned under a scoped guard: the future must be
+        // Send, so no guard may live across the await.
+        let (access_token, account_id) = {
+            let auth = self.auth.read().expect("auth lock");
+            (auth.access_token.clone(), auth.account_id.clone())
+        };
         self.http
             .post(url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
-            .header("chatgpt-account-id", &self.account_id)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("chatgpt-account-id", account_id)
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "modron")
             .json(body)
             .send()
             .await
             .map_err(|err| crate::transport_error(PROVIDER_ID, err))
+    }
+
+    /// Refresh an expired access token via the OpenAI refresh-token grant.
+    /// True when the tokens were rotated (persisted to disk BEFORE the
+    /// in-memory swap) and the caller should retry. Runs entirely under
+    /// [`Self::refresh_lock`]; the token is re-read inside the lock so a
+    /// concurrent winner's rotation is picked up instead of replaying the
+    /// now-dead token.
+    async fn refresh_if_possible(&self) -> Result<bool> {
+        let _guard = self.refresh_lock.lock().await;
+        let refresh_token = self.auth.read().expect("auth lock").refresh_token.clone();
+        let Some(refresh_token) = refresh_token else {
+            return Ok(false);
+        };
+        let response = self
+            .http
+            .post(chatgpt::TOKEN_URL)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", chatgpt::CLIENT_ID),
+                ("refresh_token", refresh_token.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
+        if !status.is_success() {
+            return Err(Error::Provider {
+                provider: PROVIDER_ID.into(),
+                message: format!("token refresh failed: HTTP {status}: {text}"),
+            });
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|err| Error::Provider {
+            provider: PROVIDER_ID.into(),
+            message: format!("malformed token refresh response: {err}"),
+        })?;
+        let access_token = value
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Provider {
+                provider: PROVIDER_ID.into(),
+                message: "token refresh response missing access_token".into(),
+            })?
+            .to_string();
+        // OpenAI rotates refresh tokens; keep the old one only when the
+        // response omits it.
+        let new_refresh_token = value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or(Some(refresh_token));
+        let account_id = value
+            .get("id_token")
+            .and_then(Value::as_str)
+            .and_then(chatgpt::account_id)
+            .unwrap_or_else(|| self.auth.read().expect("auth lock").account_id.clone());
+        let new_auth = StoredAuth {
+            access_token,
+            refresh_token: new_refresh_token,
+            account_id: account_id.clone(),
+        };
+        // Persist BEFORE swapping in memory: a crash must never leave only
+        // the dead refresh token on disk.
+        chatgpt::save(&chatgpt::ChatGptAuth {
+            access_token: new_auth.access_token.clone(),
+            refresh_token: new_auth.refresh_token.clone(),
+            account_id,
+        })
+        .map_err(|e| Error::Provider {
+            provider: PROVIDER_ID.into(),
+            message: format!("cannot persist refreshed tokens: {e}"),
+        })?;
+        *self.auth.write().expect("auth lock") = new_auth;
+        Ok(true)
     }
 }
 
@@ -263,22 +389,34 @@ impl ResponsesAccumulator {
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        // Empty arguments are a legal no-arg call; anything
+                        // else must parse — swallowing malformed JSON into
+                        // null would execute the call with the wrong shape.
+                        let raw_args = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let arguments = if raw_args.trim().is_empty() {
+                            json!({})
+                        } else {
+                            serde_json::from_str(raw_args).map_err(|err| Error::Provider {
+                                provider: PROVIDER_ID.into(),
+                                message: format!("malformed tool arguments for `{name}`: {err}"),
+                            })?
+                        };
                         self.tools.push(ToolCall {
                             id: item
                                 .get("call_id")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                            name: item
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            arguments: item
-                                .get("arguments")
-                                .and_then(Value::as_str)
-                                .and_then(|a| serde_json::from_str(a).ok())
-                                .unwrap_or(Value::Null),
+                            name,
+                            arguments,
                         });
                     }
                 }
@@ -294,7 +432,10 @@ impl ResponsesAccumulator {
                             .get("output_tokens")
                             .and_then(Value::as_u64)
                             .unwrap_or(0),
-                        cached_input_tokens: 0,
+                        cached_input_tokens: usage
+                            .pointer("/input_tokens_details/cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
                     });
                 }
             }

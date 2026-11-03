@@ -178,10 +178,19 @@ pub struct HooksConfig {
 /// known (the rest of the stack must treat that as "no config file").
 pub fn config_path() -> Option<PathBuf> {
     // `MODRON_CONFIG` overrides the default location — how tests and
-    // multi-project setups inject configuration.
+    // multi-project setups inject configuration. Convention: a DIRECTORY
+    // (holding config.toml and the auth `env` file — see
+    // `modron_core::auth::env_file`); a value naming a `.toml` file is
+    // honored as-is so both styles work.
     if let Ok(path) = std::env::var("MODRON_CONFIG") {
         if !path.is_empty() {
-            return Some(PathBuf::from(path));
+            let path = PathBuf::from(path);
+            let file = if path.extension().is_some_and(|e| e == "toml") || path.is_file() {
+                path
+            } else {
+                path.join("config.toml")
+            };
+            return Some(file);
         }
     }
     dirs::home_dir().map(|home| home.join(".config").join("modron").join("config.toml"))

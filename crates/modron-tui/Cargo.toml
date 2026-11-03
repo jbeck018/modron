@@ -14,6 +14,8 @@ anyhow.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+# Width-aware mouse geometry: CJK/emoji glyphs occupy 2 screen columns.
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -166,6 +166,19 @@ impl ModelProvider for RetryingProvider {
         )
         .await
     }
+
+    async fn turn_streaming(
+        &self,
+        req: TurnRequest,
+        tx: tokio::sync::mpsc::UnboundedSender<modron_core::StreamDelta>,
+    ) -> Result<TurnResponse> {
+        // Streaming delegates directly — a retry would replay a turn whose
+        // deltas were already emitted to the sink. Without this override the
+        // trait default silently degrades every streaming turn to one
+        // blocking non-streaming call (single final delta), making the
+        // providers' SSE paths unreachable through the wrapper.
+        self.inner.turn_streaming(req, tx).await
+    }
 }
 
 #[cfg(test)]

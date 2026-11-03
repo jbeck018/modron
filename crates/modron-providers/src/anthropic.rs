@@ -34,6 +34,10 @@ pub struct AnthropicProvider {
     auth: std::sync::RwLock<Auth>,
     base_url: String,
     http: Client,
+    /// Single-flight guard for subscription refreshes: refresh tokens
+    /// rotate, so two concurrent 401s must not both POST the same
+    /// single-use token (the loser's rotation kills the sign-in).
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 /// How the provider authenticates.
@@ -65,6 +69,7 @@ impl AnthropicProvider {
             auth: std::sync::RwLock::new(Auth::ApiKey(api_key.into())),
             base_url: DEFAULT_BASE_URL.to_string(),
             http: build_client()?,
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -82,6 +87,7 @@ impl AnthropicProvider {
             }),
             base_url: DEFAULT_BASE_URL.to_string(),
             http: build_client()?,
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -105,11 +111,19 @@ impl AnthropicProvider {
 
     /// Send one `/v1/messages` request with the mode's headers; a 401 in
     /// subscription mode triggers one refresh-and-retry (refresh tokens
-    /// rotate — the new pair is persisted before the retry).
+    /// rotate — the new pair is persisted before the retry). A failed
+    /// refresh does not mask the original 401: the server's diagnostic is
+    /// what the caller needs to see (revoked token, expired grant).
     async fn post_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
         let mut response = self.send_messages(url, body).await?;
-        if response.status().as_u16() == 401 && self.refresh_if_possible().await? {
-            response = self.send_messages(url, body).await?;
+        if response.status().as_u16() == 401 {
+            match self.refresh_if_possible().await {
+                Ok(true) => response = self.send_messages(url, body).await?,
+                Ok(false) => {}
+                Err(refresh_err) => {
+                    tracing::warn!("{refresh_err:#} — surfacing the original 401");
+                }
+            }
         }
         Ok(response)
     }
@@ -143,9 +157,14 @@ impl AnthropicProvider {
     }
 
     /// Refresh an expired subscription access token. True when the tokens
-    /// were rotated (persisted) and the caller should retry.
+    /// were rotated (persisted) and the caller should retry. The whole
+    /// read-token → POST → persist → swap sequence runs under
+    /// [`Self::refresh_lock`]: concurrent 401s re-read the (possibly
+    /// already-rotated) token inside the lock instead of racing the same
+    /// single-use token onto the wire twice.
     async fn refresh_if_possible(&self) -> Result<bool> {
         use modron_core::auth::oauth;
+        let _guard = self.refresh_lock.lock().await;
         let refresh_token = {
             let auth = self.auth.read().expect("auth lock");
             match &*auth {

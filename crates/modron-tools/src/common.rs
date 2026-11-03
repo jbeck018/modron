@@ -101,3 +101,12 @@ pub(crate) fn internal_tool_error(tool: &str, message: impl std::fmt::Display) -
         message: message.to_string(),
     }
 }
+
+/// Write-then-rename: rename(2) within a directory is atomic, so a crash
+/// or error mid-write can never truncate the target file (the old content
+/// survives until the rename lands).
+pub(crate) async fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("modron-tmp");
+    tokio::fs::write(&tmp, contents).await?;
+    tokio::fs::rename(&tmp, path).await
+}

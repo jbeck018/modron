@@ -1439,10 +1439,9 @@ fn selection_extracts_partial_and_whole_lines() {
     app.note("hello selection world");
     app.note("second line here");
     app.note("third");
-
     // Simulate the geometry the renderer records: 3 committed rows at the
     // top, following.
-    app.hist_geom = (0, 3, true, 0);
+    app.hist_geom = (0, 3, true, 0, 0);
 
     // Drag across the middle of rows 0 and 1 (reversed direction too):
     // col 6 drops "hello ", col 11 on row 1 keeps "second line".
@@ -1490,7 +1489,7 @@ fn selection_extracts_partial_and_whole_lines() {
 fn selection_renders_reversed_rows() {
     let mut app = App::default();
     app.note("alpha beta gamma");
-    app.hist_geom = (0, 1, true, 0);
+    app.hist_geom = (0, 1, true, 0, 0);
     app.begin_selection(6, 0);
     app.extend_selection(10, 0);
     // Rendered frame still contains the text (with the highlight applied).
@@ -1509,10 +1508,28 @@ fn selection_maps_rows_through_scrolled_geometry() {
         app.note(format!("line-{i}"));
     }
     // Scrolled up one screen: indicator row on top, start at index 30.
-    app.hist_geom = (30, 9, false, 0);
+    app.hist_geom = (30, 9, false, 0, 0);
     app.begin_selection(0, 1); // first committed row = index 30
     app.extend_selection(4, 2);
     assert_eq!(app.selected_text().as_deref(), Some("line-30\nline"));
+}
+
+#[test]
+fn selection_counts_double_width_glyphs_as_two_columns() {
+    let mut app = App::default();
+    // Two CJK glyphs (4 screen columns) then ASCII.
+    app.note("你好world");
+    app.hist_geom = (0, 3, true, 0, 0);
+    // Click at screen column 4 = after both glyphs = char offset 2;
+    // drag to column 7 = char offset 5 -> "wor".
+    app.begin_selection(4, 0);
+    app.extend_selection(7, 0);
+    assert_eq!(app.selected_text().as_deref(), Some("wor"));
+    // Clicking the SECOND glyph's start (column 2) anchors at char 1;
+    // column 5 = past 'w' (char 3) -> "好w".
+    app.begin_selection(2, 0);
+    app.extend_selection(5, 0);
+    assert_eq!(app.selected_text().as_deref(), Some("好w"));
 }
 
 // ── Input overflow wrapping + sent-input history ────────────────────────────
@@ -1739,7 +1756,7 @@ fn tool_summary_counts_and_panel_expand_flow() {
 
     // Clicking the summary line in history re-opens that turn's log.
     let (idx, _) = app.tool_log[0].clone();
-    app.hist_geom = (0, idx + 1, true, 0);
+    app.hist_geom = (0, idx + 1, true, 0, 0);
     app.begin_selection(0, idx as u16);
     assert!(app.tool_panel.is_some(), "summary click expands");
 }

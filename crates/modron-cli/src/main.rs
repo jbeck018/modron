@@ -218,10 +218,15 @@ enum AuthAction {
     /// Authorize a Claude subscription via browser (PKCE + localhost
     /// callback) and store tokens.
     Login,
-    /// Store an API key without the wizard: `auth set <provider> <key>`.
+    /// Store an API key without the wizard: `auth set <provider> [key]`.
+    /// Omit the key (or pass `-`) to read it from stdin — piped secrets
+    /// never touch shell history or `ps` output.
     /// (The field is `provider_id`, not `provider` — the root `--provider`
     /// flag is a global arg and would collide on the arg id.)
-    Set { provider_id: String, key: String },
+    Set {
+        provider_id: String,
+        key: Option<String>,
+    },
     /// Show every provider's configured key (masked) and OAuth state.
     Status,
     /// Delete stored credentials. Bare `logout` clears Claude OAuth
@@ -574,10 +579,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         let mut demo = cli.clone();
                         demo.provider = Some(ProviderChoice::Mock);
                         demo.model = None;
-                        build(&demo).expect("the mock provider always builds")
+                        // The retry can still fail for non-provider reasons
+                        // (unknown --agent, bad [router] mode) — surface the
+                        // error instead of panicking mid-startup.
+                        build(&demo)?
                     }
                 };
-                (agent.engine, agent.resume)
+                Ok((agent.engine, agent.resume))
             },
             String::new(),
             notice,
@@ -631,10 +639,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                                 let mut demo = onboarded.clone();
                                 demo.provider = Some(ProviderChoice::Mock);
                                 demo.model = None;
-                                build(&demo).expect("the mock provider always builds")
+                                build(&demo)?
                             }
                         };
-                        (agent.engine, agent.resume)
+                        Ok((agent.engine, agent.resume))
                     },
                     tui_model_label(&onboarded, &cfg),
                     notice,
@@ -677,10 +685,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                             let mut demo = effective_cli.clone();
                             demo.provider = Some(ProviderChoice::Mock);
                             demo.model = None;
-                            build(&demo).expect("the mock provider always builds")
+                            build(&demo)?
                         }
                     };
-                    (agent.engine, agent.resume)
+                    Ok((agent.engine, agent.resume))
                 },
                 tui_model_label(&cli, &cfg),
                 notice,
@@ -753,6 +761,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let summary = if let Some(goal) = cli.goal.clone() {
         // Long-horizon run (Phase 14): iterate in one session until the
         // natural-language stop condition is reported or a cap trips.
+        // Attachments are NOT plumbed through the goal loop yet — fail
+        // loudly instead of silently dropping them.
+        if !attachments.is_empty() {
+            anyhow::bail!("--attach is not supported with --goal yet — run the attachment task without --goal");
+        }
         let max_iters = std::env::var("MODRON_GOAL_MAX_ITERATIONS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -987,6 +1000,7 @@ fn build_agent_with(
                 .router
                 .as_ref()
                 .and_then(|r| r.cheap_model.clone())
+                .or_else(|| default_model_for_provider(&judge_provider_id))
                 .unwrap_or_else(|| "claude-haiku-5-5".to_string());
             let model = judge.model.clone().unwrap_or(cheap_default);
             Some((
@@ -1125,6 +1139,9 @@ fn build_agent_with(
             None => return Err(err),
         },
     };
+    // The engine's fallback target must follow the switch — a stale
+    // default_provider names a provider that never got registered.
+    engine_config.default_provider = provider_id.clone();
     let model_explicit = cli.model.is_some() || cfg.default_model.is_some();
     if !model_explicit {
         if let Some(m) = default_model_for_provider(&provider_id) {
@@ -1136,8 +1153,22 @@ fn build_agent_with(
     // Register every OTHER provider that can build from the environment
     // (API keys, saved sign-ins). /model switches the engine's provider
     // along with the model — an unregistered provider made the switch a
-    // hard error ("no provider registered under `chatgpt`").
-    for extra_id in ["anthropic", "openai-compat", "chatgpt", "zai"] {
+    // hard error ("no provider registered under `chatgpt`"). The list is
+    // every factory-buildable id except "mock": a set GEMINI_API_KEY or
+    // GROQ_API_KEY must not leave `/model gemini-2.5-pro` dead on arrival.
+    for extra_id in [
+        "anthropic",
+        "openai-compat",
+        "chatgpt",
+        "zai",
+        "google",
+        "groq",
+        "cerebras",
+        "mistral",
+        "nvidia",
+        "openrouter",
+        "github-models",
+    ] {
         if !providers.contains_key(extra_id) {
             if let Ok(built) = build_provider(extra_id) {
                 providers.insert(extra_id.to_string(), built);
@@ -1200,12 +1231,15 @@ fn build_agent_with(
         // An explicitly chosen provider PINS every turn there — the
         // router would otherwise override it with its own cheap/strong
         // tiers (a `--provider mock` run was silently routed to
-        // anthropic the moment anthropic became buildable).
-        Some(choice) => Arc::new(modron_core::testing::StaticSelector::new(
-            &engine_config.default_model,
-            choice.id(),
-        )) as Arc<dyn modron_core::ModelSelector>,
-        None => router,
+        // anthropic the moment anthropic became buildable). When the
+        // no-key fallback switched away from the requested provider, the
+        // pin must NOT keep naming the unbuildable one — the authed-tier
+        // router takes over instead.
+        Some(choice) if choice.id() == provider_id => Arc::new(
+            modron_core::testing::StaticSelector::new(&engine_config.default_model, choice.id()),
+        )
+            as Arc<dyn modron_core::ModelSelector>,
+        _ => router,
     };
     let engine = Engine {
         selector,
@@ -1236,37 +1270,43 @@ fn tty_approver() -> Option<Arc<modron_core::Approver>> {
         if rest_approved.load(Ordering::Relaxed) {
             return true;
         }
-        let Ok(mut tty) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-        else {
-            return false;
-        };
-        use std::io::Write as _;
-        let args = short(&call.arguments.to_string(), 90);
-        let _ = write!(tty, "\r\nmodron: allow {} {}? [y/N/a] ", call.name, args);
-        let _ = tty.flush();
-        let mut line = String::new();
-        let ok = std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(tty.try_clone().unwrap_or_else(|_| {
-                // A failed clone ends the read; treat as denial.
-                std::fs::File::open("/dev/null").expect("devnull")
-            })),
-            &mut line,
-        )
-        .is_ok();
-        if !ok {
-            return false;
-        }
-        match line.trim() {
-            "a" | "A" => {
-                rest_approved.store(true, Ordering::Relaxed);
-                true
+        // The whole tty round-trip is blocking I/O inside an async context:
+        // block_in_place frees the runtime to keep other workers (streaming
+        // deltas, background subagents) alive while the human decides — the
+        // same pattern the TUI approver uses.
+        tokio::task::block_in_place(|| {
+            let Ok(mut tty) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+            else {
+                return false;
+            };
+            use std::io::Write as _;
+            let args = short(&call.arguments.to_string(), 90);
+            let _ = write!(tty, "\r\nmodron: allow {} {}? [y/N/a] ", call.name, args);
+            let _ = tty.flush();
+            let mut line = String::new();
+            let ok = std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(tty.try_clone().unwrap_or_else(|_| {
+                    // A failed clone ends the read; treat as denial.
+                    std::fs::File::open("/dev/null").expect("devnull")
+                })),
+                &mut line,
+            )
+            .is_ok();
+            if !ok {
+                return false;
             }
-            "y" | "Y" | "yes" => true,
-            _ => false,
-        }
+            match line.trim() {
+                "a" | "A" => {
+                    rest_approved.store(true, Ordering::Relaxed);
+                    true
+                }
+                "y" | "Y" | "yes" => true,
+                _ => false,
+            }
+        })
     }))
 }
 
@@ -1522,10 +1562,16 @@ async fn run_daemon(action: DaemonAction, cli: &Cli, cfg: &config::Config) -> an
                 let msg = "{\"id\":1,\"method\":\"stop\",\"params\":{}}\n";
                 stream.write_all(msg.as_bytes()).await?;
             }
-            // Wait for cleanup.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            println!("daemon stopped");
-            Ok(())
+            // Bounded verification poll: report what actually happened, not
+            // an unconditional success.
+            for _ in 0..20 {
+                if !modron_daemon::is_running() {
+                    println!("daemon stopped");
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            anyhow::bail!("daemon did not stop within 2s — check `daemon status`");
         }
         DaemonAction::Start => {
             if modron_daemon::is_running() {
@@ -1608,12 +1654,21 @@ fn build_selector(
         }
     }
     let (default_cheap, default_strong) = derived.unwrap_or_else(|| {
-        // Nothing authed and cataloged: the classic anthropic defaults
-        // (mock runs pin the provider explicitly anyway).
-        (
-            "claude-haiku-5-5".to_string(),
-            "claude-sonnet-5-5".to_string(),
-        )
+        // Nothing authed and cataloged: prefer the active provider's own
+        // catalog default over the classic anthropic pair — the fallback
+        // must never name a provider that is not registered (mock runs pin
+        // the provider explicitly anyway).
+        authed_providers
+            .iter()
+            .find(|p| *p != "mock")
+            .and_then(|p| default_model_for_provider(p))
+            .map(|m| (m.clone(), m))
+            .unwrap_or_else(|| {
+                (
+                    "claude-haiku-5-5".to_string(),
+                    "claude-sonnet-5-5".to_string(),
+                )
+            })
     });
     let cheap = router_cfg.cheap_model.clone().unwrap_or(default_cheap);
     let strong = router_cfg.strong_model.clone().unwrap_or(default_strong);
@@ -1844,12 +1899,22 @@ async fn run_bench(
         return Ok(());
     }
     let models: Vec<String> = match models_arg {
-        Some(csv) => csv.split(',').map(str::trim).map(String::from).collect(),
+        // Empty CSV segments (`"a,,b"`, `","`) must not become empty-string
+        // model names that only fail later inside provider calls.
+        Some(csv) => csv
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(String::from)
+            .collect(),
         None => curated_free_models()
             .into_iter()
             .map(String::from)
             .collect(),
     };
+    if models.is_empty() {
+        anyhow::bail!("--models parsed to an empty list");
+    }
     let suite = bench_suite();
     let mcp = spawn_mcp_servers(cfg).await?;
 
@@ -1922,6 +1987,15 @@ async fn run_bench(
         let mut completed = 0usize;
         let mut tokens = 0u64;
         let mut cached = 0u64;
+        // The record's provider follows the catalog (multi-provider bench
+        // runs must not persist every row as "zai").
+        let model_provider = modron_router::lookup(model)
+            .map(|i| i.provider.clone())
+            .unwrap_or_else(|| {
+                cli.provider
+                    .map(|p| p.id().to_string())
+                    .unwrap_or_else(|| "zai".to_string())
+            });
 
         for task in &suite {
             let task_started = std::time::Instant::now();
@@ -1947,7 +2021,7 @@ async fn run_bench(
                     tokens += summary.usage.total();
                     cached += summary.usage.cached_input_tokens;
                     BenchRecord {
-                        provider: "zai".into(),
+                        provider: model_provider.clone(),
                         model: model.clone(),
                         task: task.to_string(),
                         completed: task_ok,
@@ -1961,7 +2035,7 @@ async fn run_bench(
                 Err(e) => {
                     eprintln!("✗ [{model}] {task}: {e}");
                     BenchRecord {
-                        provider: "zai".into(),
+                        provider: model_provider.clone(),
                         model: model.clone(),
                         task: task.to_string(),
                         completed: false,
@@ -2190,7 +2264,25 @@ async fn run_chat(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     if let Some(tag) = crate::upgrade::startup_update_notice() {
         println!("⬆ modron {tag} is available — run `modron upgrade`");
     }
-    let mut session_id: Option<SessionId> = None;
+    // `--resume <id>` seeds the chat instead of silently starting fresh;
+    // bare `--resume` picks up the most recent session.
+    let mut session_id: Option<SessionId> = match agent.resume {
+        Some(id) => Some(id),
+        None if cli.resume.is_some() => {
+            use modron_core::SessionStore as _;
+            agent
+                .store
+                .list()
+                .await?
+                .into_iter()
+                .next() // list() sorts by updated_at desc
+                .map(|meta| meta.id)
+        }
+        None => None,
+    };
+    if let Some(id) = session_id {
+        println!("resuming session {id}");
+    }
     let mut total = Usage::default();
     let stdin = std::io::stdin();
     loop {

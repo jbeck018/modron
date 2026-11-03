@@ -104,13 +104,56 @@ impl Tool for WriteTool {
                 }
             }
         }
-        if let Err(e) = tokio::fs::write(&path, content.as_bytes()).await {
+        if !overwrite {
+            // create_new is the race-free exists-check: a file appearing
+            // between check and write is never clobbered.
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+            {
+                Ok(mut file) => {
+                    use tokio::io::AsyncWriteExt as _;
+                    if let Err(e) = file.write_all(content.as_bytes()).await {
+                        return Ok(tool_err(
+                            NAME,
+                            format!("cannot write {}: {e}", path.display()),
+                            MAX_BYTES,
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(tool_err(
+                        NAME,
+                        format!(
+                            "{} already exists; pass overwrite: true to replace it",
+                            path.display()
+                        ),
+                        MAX_BYTES,
+                    ));
+                }
+                Err(e) => {
+                    return Ok(tool_err(
+                        NAME,
+                        format!("cannot write {}: {e}", path.display()),
+                        MAX_BYTES,
+                    ));
+                }
+            }
+        } else if let Err(e) = crate::common::write_atomic(&path, content.as_bytes()).await {
             return Ok(tool_err(
                 NAME,
                 format!("cannot write {}: {e}", path.display()),
                 MAX_BYTES,
             ));
         }
+        // Live LSP (Phase 14): full overwrites re-lint like edits — without
+        // this push, diagnostics go stale after a `write`.
+        let lsp_path = path.clone();
+        let lsp_content = content.to_string();
+        let _ = tokio::task::spawn_blocking(move || crate::lsp::did_write(&lsp_path, &lsp_content))
+            .await;
         Ok(ToolOutcome::ok(reduce_output(
             format!("wrote {} bytes to {}", content.len(), path.display()),
             MAX_BYTES,

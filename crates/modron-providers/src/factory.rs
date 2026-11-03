@@ -30,15 +30,28 @@ const ZAI_KEY_HINT: &str = "get a pay-as-you-go key at https://z.ai/manage-apike
 /// API key — the user opted into the subscription explicitly.
 pub fn provider_from_env(provider_id: &str) -> Result<Arc<dyn ModelProvider>> {
     if provider_id == "anthropic" {
-        if let Ok(Some(tokens)) = modron_core::auth::oauth::load_tokens() {
-            let mut provider =
-                AnthropicProvider::from_subscription(tokens.access_token, tokens.refresh_token)?;
-            if let Ok(base_url) = std::env::var("ANTHROPIC_BASE_URL") {
-                if !base_url.is_empty() {
-                    provider = provider.with_base_url(base_url);
-                }
+        match modron_core::auth::oauth::load_tokens() {
+            // A corrupt token file must not silently fall through to the
+            // API-key path — the user signed in; tell them to re-sign.
+            Err(e) => {
+                return Err(Error::Config(
+                    "cannot read the stored Anthropic sign-in".into(),
+                    format!("{e} — re-run the sign-in (`/auth` → Anthropic) to rewrite the file"),
+                ));
             }
-            return Ok(Arc::new(provider));
+            Ok(Some(tokens)) => {
+                let mut provider = AnthropicProvider::from_subscription(
+                    tokens.access_token,
+                    tokens.refresh_token,
+                )?;
+                if let Ok(base_url) = std::env::var("ANTHROPIC_BASE_URL") {
+                    if !base_url.is_empty() {
+                        provider = provider.with_base_url(base_url);
+                    }
+                }
+                return Ok(Arc::new(provider));
+            }
+            Ok(None) => {}
         }
     }
     provider_from_config(provider_id, |key| {

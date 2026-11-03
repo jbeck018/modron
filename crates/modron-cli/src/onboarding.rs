@@ -44,7 +44,9 @@ pub fn env_file() -> anyhow::Result<PathBuf> {
     modron_core::auth::env_file().map_err(|e| anyhow::anyhow!("cannot resolve env file: {e}"))
 }
 
-/// Check if ANY provider key is available (env vars or the saved env file).
+/// Check if ANY provider credential is available: env vars, the saved env
+/// file, or a stored subscription sign-in (a signed-in user must not be
+/// forced through onboarding on every launch).
 pub fn has_any_key() -> bool {
     // Source the saved env file first.
     source_env_file();
@@ -52,7 +54,14 @@ pub fn has_any_key() -> bool {
         std::env::var(p.env_var)
             .map(|v| !v.is_empty())
             .unwrap_or(false)
-    })
+    }) || modron_core::auth::oauth::load_tokens()
+        .ok()
+        .flatten()
+        .is_some()
+        || modron_core::auth::oauth::chatgpt::load()
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 /// Source the saved env file into the process environment (idempotent).
@@ -85,10 +94,103 @@ pub fn run_onboarding() -> anyhow::Result<String> {
     writeln!(stdout, "  │   ✦ modron — first-run setup                │")?;
     writeln!(stdout, "  ╰─────────────────────────────────────────────╯")?;
     writeln!(stdout)?;
+
+    // Reuse-first (jcode onboarding pattern): other agent CLIs on this
+    // machine may already hold sign-ins Modron speaks natively — offer
+    // them before the manual provider list.
+    let detected = modron_core::auth::discovery::find_existing_signins();
+    if !detected.is_empty() {
+        return choose_detected_signin(&stdin, &mut stdout, detected);
+    }
+
+    manual_provider_flow(&stdin, &mut stdout)
+}
+
+/// The reuse-first branch of onboarding: list the detected sign-ins, let
+/// Enter import the first one, or fall through to the manual provider
+/// list with `s`.
+fn choose_detected_signin(
+    stdin: &std::io::Stdin,
+    stdout: &mut std::io::Stdout,
+    detected: Vec<modron_core::auth::discovery::DetectedSignin>,
+) -> anyhow::Result<String> {
+    use std::io::Write as _;
+
+    writeln!(
+        stdout,
+        "  Found {} existing sign-in(s) on this machine:",
+        detected.len()
+    )?;
+    writeln!(stdout, "  Reuse one instead of signing in again:")?;
+    writeln!(stdout)?;
+    for (i, signin) in detected.iter().enumerate() {
+        writeln!(
+            stdout,
+            "   {} {:<20} {}",
+            i + 1,
+            signin.provider_label(),
+            signin.source
+        )?;
+    }
+    writeln!(stdout)?;
+    writeln!(stdout, "   s  Set up another provider manually")?;
+    writeln!(stdout, "   q  Quit")?;
+    writeln!(stdout)?;
+    write!(stdout, "  choice [1 = reuse]: ")?;
+    stdout.flush()?;
+
+    let mut line = String::new();
+    stdin.read_line(&mut line)?;
+    let choice = line.trim();
+
+    if choice.eq_ignore_ascii_case("q") {
+        std::process::exit(0);
+    }
+    if !choice.eq_ignore_ascii_case("s") {
+        let pick: usize = if choice.is_empty() {
+            1
+        } else {
+            choice
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid choice: {choice}"))?
+        };
+        let signin = detected
+            .get(pick - 1)
+            .ok_or_else(|| anyhow::anyhow!("no sign-in {pick}"))?;
+        modron_core::auth::discovery::import_signin(signin)
+            .map_err(|e| anyhow::anyhow!("cannot import from {}: {e}", signin.source))?;
+        save_default_provider(signin.provider_id)?;
+        writeln!(stdout)?;
+        writeln!(
+            stdout,
+            "  ✓ {} sign-in reused from {} ({})",
+            signin.provider_label(),
+            signin.source,
+            signin.token_mask()
+        )?;
+        writeln!(
+            stdout,
+            "    note: the source tool keeps its copy — if it refreshes the tokens first, re-run onboarding to re-import"
+        )?;
+        writeln!(stdout, "  ✓ default provider: {}", signin.provider_id)?;
+        return Ok(signin.provider_id.to_string());
+    }
+
+    // Manual setup: fall through to the classic list.
+    manual_provider_flow(stdin, stdout)
+}
+
+/// The classic provider/key flow, split out so the reuse branch can fall
+/// through to it.
+fn manual_provider_flow(
+    stdin: &std::io::Stdin,
+    stdout: &mut std::io::Stdout,
+) -> anyhow::Result<String> {
+    use std::io::Write as _;
+
     writeln!(stdout, "  No AI provider is configured yet.")?;
     writeln!(stdout, "  Pick one to get started (you can change later):")?;
     writeln!(stdout)?;
-
     let options = provider_options();
     for opt in &options {
         writeln!(stdout, "   {} {:<20} {}", opt.number, opt.name, opt.note)?;
@@ -163,7 +265,8 @@ fn save_and_confirm(opt: &ProviderOption, key: &str) -> anyhow::Result<String> {
         .map(String::from)
         .collect();
     lines.push(format!("export {}=\"{}\"", opt.env_var, key));
-    std::fs::write(&path, lines.join("\n") + "\n")?;
+    // 0600 from creation — the file holds live API keys.
+    modron_core::auth::write_private(&path, &(lines.join("\n") + "\n"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -174,11 +277,23 @@ fn save_and_confirm(opt: &ProviderOption, key: &str) -> anyhow::Result<String> {
     std::env::set_var(opt.env_var, key);
 
     let provider_id = opt.provider_id;
+    save_default_provider(provider_id)?;
 
-    // Save the default provider to config.toml.
-    let config_path = dirs::home_dir()
-        .map(|h| h.join(".config").join("modron").join("config.toml"))
-        .ok_or_else(|| anyhow::anyhow!("no home"))?;
+    writeln!(std::io::stdout())?;
+    writeln!(
+        std::io::stdout(),
+        "  ✓ key saved to {} (mode 0600)",
+        path.display()
+    )?;
+    writeln!(std::io::stdout(), "  ✓ default provider: {provider_id}\n")?;
+    Ok(provider_id.to_string())
+}
+
+/// Persist `default_provider` to config.toml — via config::config_path so
+/// MODRON_CONFIG overrides land in the file the loader actually reads.
+/// Shared by the key flow and the sign-in import path.
+fn save_default_provider(provider_id: &str) -> anyhow::Result<()> {
+    let config_path = crate::config::config_path().ok_or_else(|| anyhow::anyhow!("no home"))?;
     let existing_config = std::fs::read_to_string(&config_path).unwrap_or_default();
     // Replace or add the default_provider line.
     let mut config_lines: Vec<String> = existing_config
@@ -191,15 +306,7 @@ fn save_and_confirm(opt: &ProviderOption, key: &str) -> anyhow::Result<String> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&config_path, config_lines.join("\n") + "\n")?;
-
-    writeln!(std::io::stdout())?;
-    writeln!(
-        std::io::stdout(),
-        "  ✓ key saved to {} (mode 0600)",
-        path.display()
-    )?;
-    writeln!(std::io::stdout(), "  ✓ default provider: {provider_id}\n")?;
-    Ok(provider_id.to_string())
+    Ok(())
 }
 
 #[cfg(test)]

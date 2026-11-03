@@ -60,6 +60,42 @@ pub struct TuiConfig {
 /// Poll cadence for crossterm events (and the spinner tick).
 const TICK: Duration = Duration::from_millis(50);
 
+/// Restores the terminal on EVERY exit path — a propagated `?` or a panic
+/// past the render loop would otherwise leave the user's shell in raw mode
+/// on the alternate screen. Idempotent.
+struct TerminalRestore {
+    kitty: bool,
+    done: bool,
+}
+
+impl TerminalRestore {
+    fn restore(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        if self.kitty {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
+        }
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableMouseCapture
+        );
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 /// Shared approval slot: the engine-side approver queues a call; the render
 /// loop drains it into the App; the response channel carries the decision.
 type ApprovalSlot = Arc<Mutex<Option<(ToolCallLike, mpsc::Sender<bool>)>>>;
@@ -76,9 +112,11 @@ type ToolCallLike = String;
 
 /// Run the TUI. `build` receives the wired sinks and returns the engine plus
 /// the session to resume (if `--resume` was given). Requires a TTY on stdout;
-/// returns an actionable error otherwise.
+/// returns an actionable error otherwise. The closure is fallible so a failed
+/// engine build surfaces as an error (terminal restored by the guard) instead
+/// of a panic.
 pub async fn run_with(
-    build: impl FnOnce(TuiSinks) -> (Engine, Option<SessionId>),
+    build: impl FnOnce(TuiSinks) -> anyhow::Result<(Engine, Option<SessionId>)>,
     model_label: String,
     upgrade_notice: Option<String>,
 ) -> anyhow::Result<()> {
@@ -117,7 +155,7 @@ pub async fn run_with(
             // decision. block_in_place keeps other runtime workers alive.
             tokio::task::block_in_place(|| receiver.recv().unwrap_or(false))
         }),
-    });
+    })?;
 
     // Terminal setup: inline viewport, raw mode, hidden cursor.
     // Kitty keyboard protocol (kitty/Ghostty/WezTerm/iTerm2 3.5+): lets the
@@ -127,6 +165,12 @@ pub async fn run_with(
     let kitty_keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
+    // From here on, every exit path must restore the terminal — the guard's
+    // Drop covers error returns and panics the inline teardown cannot.
+    let mut terminal_restore = TerminalRestore {
+        kitty: kitty_keyboard,
+        done: false,
+    };
     // Bracketed paste (ctrl+V in most terminals delivers a paste event):
     // multi-line pastes enter the input instead of submitting. Mouse
     // capture: clicks position the input cursor (native text selection
@@ -148,8 +192,11 @@ pub async fn run_with(
     // moves the whole terminal session. The earlier inline-viewport design
     // (Phase 1d) traded this away for native selection; that trade is
     // reversed by user direction.
-    let _ = crossterm::terminal::Clear(crossterm::terminal::ClearType::All);
     let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    );
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
@@ -217,6 +264,15 @@ pub async fn run_with(
     let (oauth_tx, mut oauth_rx) = tokio::sync::mpsc::unbounded_channel::<OAuthProgress>();
     let mut oauth_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut oauth_generation: u64 = 0;
+    // Slow slash commands (/tasks, /fork) run OFF the render loop — same
+    // spawn + channel + generation pattern as the OAuth flows — so redraws
+    // and Esc keep working while they await tools/store I/O.
+    let (slow_tx, mut slow_rx) = tokio::sync::mpsc::unbounded_channel::<SlowCommandProgress>();
+    let mut slow_command_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut slow_command_generation: u64 = 0;
+    // Clipboard I/O (pbcopy/wl-copy/osascript subprocesses) is also async.
+    let (clip_tx, mut clip_rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardProgress>();
+    let mut harvest_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
@@ -274,15 +330,17 @@ pub async fn run_with(
                         app.extend_selection(me.column, me.row)
                     }
                     crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                        // Selection release: copy to the system clipboard.
+                        // Selection release: copy asynchronously — the
+                        // clipboard helper shells out (pbcopy/wl-copy), and
+                        // the render loop must not wait on it.
                         if let Some(text) = app.take_selected_text() {
                             let chars = text.chars().count();
-                            if crate::clipboard::copy_text(&text) {
-                                app.status_note = Some(format!("copied {chars} chars"));
-                            } else {
-                                app.status_note =
-                                    Some("selection made — no clipboard tool found".into());
-                            }
+                            app.status_note = Some(format!("copying {chars} chars…"));
+                            let tx = clip_tx.clone();
+                            tokio::spawn(async move {
+                                let ok = crate::clipboard::copy_text(&text);
+                                let _ = tx.send(ClipboardProgress::Copied { ok, chars });
+                            });
                         }
                     }
                     crossterm::event::MouseEventKind::ScrollUp => app.scroll_history(3),
@@ -296,37 +354,33 @@ pub async fn run_with(
                         crate::Action::None => {}
                         crate::Action::PasteImage => {
                             // ctrl+V: image → staged attachment; text → into
-                            // the input. Bounded so a hung clipboard service
-                            // cannot hang the TUI.
-                            let started = std::time::Instant::now();
-                            match tokio::task::spawn_blocking(crate::clipboard::harvest)
-                                .await
-                                .unwrap_or(crate::clipboard::ClipboardContent::Empty)
-                            {
-                                crate::clipboard::ClipboardContent::Image(path) => {
-                                    match app.attach_image(&path) {
-                                        Some(chip) => {
-                                            app.status_note = Some(format!(
-                                                "attached {chip} (goes with your next message)"
-                                            ))
-                                        }
-                                        None => {
-                                            app.status_note =
-                                                Some("clipboard image unreadable".into())
-                                        }
-                                    }
-                                }
-                                crate::clipboard::ClipboardContent::Text(text) => {
-                                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                                    app.paste_into_auth_or_input(&text);
-                                }
-                                crate::clipboard::ClipboardContent::Empty => {
-                                    app.status_note = Some("clipboard empty".into());
-                                }
+                            // the input. Spawned (bounded by the harvest
+                            // timeout inside) so the render loop never
+                            // waits on a clipboard service.
+                            if harvest_task.is_some() {
+                                app.status_note = Some("clipboard read already in flight".into());
+                                continue;
                             }
-                            let _ = started; // bounded by the harvest timeout itself
+                            app.status_note = Some("reading clipboard…".into());
+                            let tx = clip_tx.clone();
+                            harvest_task = Some(tokio::spawn(async move {
+                                let content =
+                                    tokio::task::spawn_blocking(crate::clipboard::harvest)
+                                        .await
+                                        .unwrap_or(crate::clipboard::ClipboardContent::Empty);
+                                let _ = tx.send(ClipboardProgress::Harvested(content));
+                            }));
                         }
                         crate::Action::Submit(task) => {
+                            // One engine task at a time: a second concurrent
+                            // spawn would overwrite the first JoinHandle
+                            // (unabortable orphan streaming into the App,
+                            // double finish_turn, clobbered approval slot).
+                            if engine_task.is_some() {
+                                app.status_note =
+                                    Some("a turn is already running — Esc aborts it".into());
+                                continue;
+                            }
                             let task = app.task_with_goal(&task);
                             app.begin_task(&task);
                             let attachments = app.take_attachments();
@@ -359,15 +413,32 @@ pub async fn run_with(
                             }));
                         }
                         crate::Action::Abort => {
-                            if let Some(task) = engine_task.take() {
-                                task.abort();
-                                // Give the runtime a beat to cancel.
-                                tokio::time::sleep(Duration::from_millis(30)).await;
+                            match (engine_task.take(), slow_command_task.take()) {
+                                (Some(task), _) => {
+                                    task.abort();
+                                    // Give the runtime a beat to cancel.
+                                    tokio::time::sleep(Duration::from_millis(30)).await;
+                                    app.finish_interrupted();
+                                }
+                                // No engine running: Esc cancels a slow
+                                // command instead. Bumping the generation
+                                // drops any Done already sitting in the
+                                // channel (an aborted /fork must not adopt
+                                // its new session id).
+                                (None, Some(task)) => {
+                                    slow_command_generation += 1;
+                                    task.abort();
+                                    app.status_note = Some("command cancelled".into());
+                                }
+                                (None, None) => {}
                             }
-                            app.finish_interrupted();
                         }
                         crate::Action::Quit => {
                             if let Some(task) = engine_task.take() {
+                                task.abort();
+                            }
+                            if let Some(task) = slow_command_task.take() {
+                                slow_command_generation += 1;
                                 task.abort();
                             }
                             result = Ok(());
@@ -483,8 +554,27 @@ pub async fn run_with(
                 .await;
                 let _ = tx.send(OAuthProgress::Done { gen, result });
             }));
+        } else if app.pending_command.as_ref().is_some_and(is_slow_command)
+            && slow_command_task.is_none()
+            && engine_task.is_none()
+        {
+            // Slow commands (/tasks runs a tool, /fork rewrites the whole
+            // session log) spawn instead of blocking the render loop.
+            let Some(cmd) = app.pending_command.take() else {
+                unreachable!("guarded by is_some_and above")
+            };
+            slow_command_generation += 1;
+            let gen = slow_command_generation;
+            let engine_for_task = engine.clone();
+            let tx = slow_tx.clone();
+            let session = app.session_id;
+            app.status_note = Some(format!("/{} running (Esc cancels)…", cmd_label(&cmd)));
+            slow_command_task = Some(tokio::spawn(async move {
+                let result = run_slow_pending_command(engine_for_task, cmd, session).await;
+                let _ = tx.send(SlowCommandProgress::Done { gen, result });
+            }));
         } else if let Some(cmd) = app.pending_command.take() {
-            for line in run_pending_command(&mut engine, &mut app, cmd).await {
+            for line in run_pending_command(&mut engine, cmd).await {
                 app.note(line);
             }
         }
@@ -512,18 +602,29 @@ pub async fn run_with(
             match progress {
                 OAuthProgress::Interim { url, user_code, .. } => {
                     // Replace url/user_code, keep the provider info the
-                    // modal was opened with.
-                    if let Some(AuthFlow::WaitingOAuth { info, .. }) = app.auth_flow.take() {
-                        app.auth_flow = Some(AuthFlow::WaitingOAuth {
-                            info,
-                            url,
-                            user_code,
-                        });
+                    // modal was opened with. NOTE: match — NOT `if let` over
+                    // `.take()`: a current-gen Interim can arrive after the
+                    // user Esc'd back to an earlier manager screen, and
+                    // dropping the taken flow would close the whole manager.
+                    match app.auth_flow.take() {
+                        Some(AuthFlow::WaitingOAuth { info, .. }) => {
+                            app.auth_flow = Some(AuthFlow::WaitingOAuth {
+                                info,
+                                url,
+                                user_code,
+                            });
+                        }
+                        other => app.auth_flow = other,
                     }
                 }
                 OAuthProgress::Done { result, .. } => {
                     oauth_task = None;
-                    app.auth_flow = None;
+                    // Only settle the modal when it is still up — a late
+                    // Done must not close a manager the user deliberately
+                    // backed out of (Esc keeps the manager open).
+                    if matches!(app.auth_flow, Some(AuthFlow::WaitingOAuth { .. })) {
+                        app.auth_flow = None;
+                    }
                     match result {
                         Ok(note) => app.note(note),
                         Err(e) => app.note(format!("oauth failed: {e}")),
@@ -532,12 +633,38 @@ pub async fn run_with(
             }
         }
 
+        // 3d. Slow-command and clipboard results land here (spawned above);
+        //     stale generations (aborted/replaced commands) are dropped.
+        while let Ok(progress) = slow_rx.try_recv() {
+            let SlowCommandProgress::Done { gen, result } = progress;
+            if gen != slow_command_generation {
+                continue;
+            }
+            slow_command_task = None;
+            for line in result.lines {
+                app.note(line);
+            }
+            if let Some(id) = result.new_session {
+                app.session_id = Some(id);
+            }
+        }
+        while let Ok(progress) = clip_rx.try_recv() {
+            if matches!(progress, ClipboardProgress::Harvested(_)) {
+                harvest_task = None;
+            }
+            apply_clipboard_progress(&mut app, progress);
+        }
+
         // 4. Approve-rest mirror: when the user pressed `a`, future approvals
-        //    short-circuit in the approver; drain any queued one just in case.
+        //    short-circuit in the approver; drain any queued one so an
+        //    approval parked BEFORE the `a` press is answered, not re-prompted.
         if app.approve_rest {
             approval
                 .rest_approved
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some((_, respond)) = approval.slot.lock().unwrap().take() {
+                let _ = respond.send(true);
+            }
         }
 
         // 5. Engine settled? (Re-drain the event channels first: deltas and
@@ -583,35 +710,29 @@ pub async fn run_with(
         terminal.draw(|frame| app.view(frame, frame.area()))?;
     }
 
-    // Teardown: restore the terminal, then print the session id into the
-    // NORMAL buffer (it scrolls away with the alt screen otherwise).
-    if kitty_keyboard {
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::PopKeyboardEnhancementFlags
-        );
+    // Teardown (guard-backed): restore the terminal from the normal path
+    // too, then print the session id into the NORMAL buffer (it scrolls
+    // away with the alt screen otherwise).
+    terminal_restore.restore();
+    // A /fork that landed during the final tick still adopts its session.
+    while let Ok(SlowCommandProgress::Done { gen, result }) = slow_rx.try_recv() {
+        if gen == slow_command_generation {
+            if let Some(id) = result.new_session {
+                app.session_id = Some(id);
+            }
+        }
     }
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture
-    );
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-    crossterm::terminal::disable_raw_mode()?;
     if let Some(id) = app.session_id {
         println!("session: {id} — resume with --resume {id}");
     }
     result
 }
 
-/// Execute a parked slash command against the engine/store. Returns the
+/// Execute a parked FAST slash command against the engine. Returns the
 /// lines to commit. Engine mutations apply to every FUTURE turn (each
-/// submit clones the engine).
-async fn run_pending_command(
-    engine: &mut Engine,
-    app: &mut App,
-    cmd: PendingCommand,
-) -> Vec<String> {
+/// submit clones the engine). Slow commands (/tasks, /fork) are spawned
+/// by the loop instead — see [`run_slow_pending_command`].
+async fn run_pending_command(engine: &mut Engine, cmd: PendingCommand) -> Vec<String> {
     match cmd {
         // /auth — provider credentials against the shared core store
         // (`modron_core::auth`): bare = status, `<provider> <key>` =
@@ -659,12 +780,15 @@ async fn run_pending_command(
                 Err(e) => lines.push(format!("cannot remove key: {e}")),
             }
             if modron_core::auth::oauth_capable(&provider_id) {
-                let file = if provider_id == "anthropic" {
-                    modron_core::auth::oauth::auth_file()
-                } else {
-                    modron_core::auth::oauth::chatgpt::token_file()
+                // Each OAuth sign-in has its own token store — removing
+                // provider X must never delete provider Y's tokens (zai's
+                // env-file key is handled above; it has no token file).
+                let token_file: Result<Option<std::path::PathBuf>, _> = match provider_id.as_str() {
+                    "anthropic" => modron_core::auth::oauth::auth_file().map(Some),
+                    "chatgpt" => modron_core::auth::oauth::chatgpt::token_file().map(Some),
+                    _ => Ok(None),
                 };
-                if let Ok(path) = file {
+                if let Ok(Some(path)) = token_file {
                     if path.exists() {
                         match std::fs::remove_file(&path) {
                             Ok(()) => lines.push(format!(
@@ -811,21 +935,6 @@ async fn run_pending_command(
             }
             other => vec![format!("usage: /mode ask|yolo (got {other:?})")],
         },
-        PendingCommand::Tasks => {
-            // Run the delegate_status tool directly through the registry.
-            let ctx = modron_core::ToolCtx {
-                sandbox: engine.config.sandbox,
-                working_dir: engine.config.working_dir.clone(),
-                engine: Some(std::sync::Arc::new(engine.clone())),
-            };
-            match engine.tools.get("delegate_status") {
-                Some(tool) => match tool.execute(serde_json::json!({}), &ctx).await {
-                    Ok(outcome) => vec![outcome.content],
-                    Err(e) => vec![format!("delegate_status failed: {e}")],
-                },
-                None => vec!["delegate_status tool not registered in this build".into()],
-            }
-        }
         PendingCommand::Worktree => {
             let dir = engine.config.working_dir.join(".modron").join("worktrees");
             match std::fs::read_dir(&dir) {
@@ -846,21 +955,121 @@ async fn run_pending_command(
         PendingCommand::Issues(arg) => run_issues(engine, &arg),
         // OAuthLogin/ChatGptLogin never reach here — the run loop spawns
         // them before run_pending_command is called (they wait on browser
-        // round-trips).
+        // round-trips). Tasks/Fork are likewise spawned (is_slow_command).
         PendingCommand::OAuthLogin { .. } | PendingCommand::ChatGptLogin => Vec::new(),
-        PendingCommand::Fork => match app.session_id {
+        PendingCommand::Tasks | PendingCommand::Fork => Vec::new(), // spawned by the loop (is_slow_command)
+    }
+}
+
+/// Whether a pending command does slow I/O (tool execution, whole-log
+/// session copies) and must run on a spawned task instead of the render
+/// loop. Exhaustive by intent: adding a slow variant must update this.
+fn is_slow_command(cmd: &PendingCommand) -> bool {
+    matches!(cmd, PendingCommand::Tasks | PendingCommand::Fork)
+}
+
+/// The /command label for status notes.
+fn cmd_label(cmd: &PendingCommand) -> &'static str {
+    match cmd {
+        PendingCommand::Tasks => "tasks",
+        PendingCommand::Fork => "fork",
+        _ => "command",
+    }
+}
+
+/// Result of a slow slash command: lines to commit, plus (for /fork) the
+/// newly active session id to adopt.
+#[derive(Default)]
+struct SlowCommandResult {
+    lines: Vec<String>,
+    new_session: Option<SessionId>,
+}
+
+enum SlowCommandProgress {
+    Done { gen: u64, result: SlowCommandResult },
+}
+
+/// The spawned bodies of the slow commands (moved verbatim from the old
+/// inline arms — the engine clone shares the live subagent registry).
+async fn run_slow_pending_command(
+    engine: Engine,
+    cmd: PendingCommand,
+    session: Option<SessionId>,
+) -> SlowCommandResult {
+    match cmd {
+        PendingCommand::Tasks => {
+            // Run the delegate_status tool directly through the registry.
+            let ctx = modron_core::ToolCtx {
+                sandbox: engine.config.sandbox,
+                working_dir: engine.config.working_dir.clone(),
+                engine: Some(std::sync::Arc::new(engine.clone())),
+            };
+            let lines = match engine.tools.get("delegate_status") {
+                Some(tool) => match tool.execute(serde_json::json!({}), &ctx).await {
+                    Ok(outcome) => vec![outcome.content],
+                    Err(e) => vec![format!("delegate_status failed: {e}")],
+                },
+                None => vec!["delegate_status tool not registered in this build".into()],
+            };
+            SlowCommandResult {
+                lines,
+                new_session: None,
+            }
+        }
+        PendingCommand::Fork => match session {
             Some(id) => match engine.store.fork(id).await {
-                Ok(new) => {
-                    app.session_id = Some(new);
-                    vec![format!(
+                Ok(new) => SlowCommandResult {
+                    lines: vec![format!(
                         "forked: new branch {new} (active now; the original is untouched — \
                              resume it with --resume {id})"
-                    )]
-                }
-                Err(e) => vec![format!("fork failed: {e}")],
+                    )],
+                    new_session: Some(new),
+                },
+                Err(e) => SlowCommandResult {
+                    lines: vec![format!("fork failed: {e}")],
+                    new_session: None,
+                },
             },
-            None => vec!["no session yet — send a task first, then /fork".into()],
+            None => SlowCommandResult {
+                lines: vec!["no session yet — send a task first, then /fork".into()],
+                new_session: None,
+            },
         },
+        // Everything else is fast-local and never routed here.
+        _ => SlowCommandResult::default(),
+    }
+}
+
+/// Clipboard results applied on the render thread (the bodies of the old
+/// inline ctrl+V / mouse-up handlers).
+enum ClipboardProgress {
+    Harvested(crate::clipboard::ClipboardContent),
+    Copied { ok: bool, chars: usize },
+}
+
+fn apply_clipboard_progress(app: &mut App, progress: ClipboardProgress) {
+    match progress {
+        ClipboardProgress::Harvested(crate::clipboard::ClipboardContent::Image(path)) => {
+            match app.attach_image(&path) {
+                Some(chip) => {
+                    app.status_note = Some(format!("attached {chip} (goes with your next message)"))
+                }
+                None => app.status_note = Some("clipboard image unreadable".into()),
+            }
+        }
+        ClipboardProgress::Harvested(crate::clipboard::ClipboardContent::Text(text)) => {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            app.paste_into_auth_or_input(&text);
+        }
+        ClipboardProgress::Harvested(crate::clipboard::ClipboardContent::Empty) => {
+            app.status_note = Some("clipboard empty".into());
+        }
+        ClipboardProgress::Copied { ok: true, chars } => {
+            app.status_note = Some(format!("copied {chars} chars"));
+        }
+        ClipboardProgress::Copied { ok: false, .. } => {
+            app.status_note = Some("selection made — no clipboard tool found".into());
+        }
     }
 }
 

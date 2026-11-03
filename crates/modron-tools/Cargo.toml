@@ -16,6 +16,8 @@ tokio.workspace = true
 regex.workspace = true
 ignore.workspace = true
 walkdir.workspace = true
+# Process-group signaling for bash-tool timeout kills (unix).
+libc = "0.2"
 
 # Code intelligence (Phase 14): exact syntax-aware skeletons. The scanner
 # fallback stays for every language without a bundled grammar.

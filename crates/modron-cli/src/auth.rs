@@ -24,12 +24,34 @@ pub(super) async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
     match action {
         AuthAction::Login => login().await,
         AuthAction::Add => add_provider_wizard().await,
-        AuthAction::Set { provider_id, key } => set_key(&provider_id, &key),
+        AuthAction::Set { provider_id, key } => {
+            let key = read_key_arg(key)?;
+            set_key(&provider_id, &key)
+        }
         AuthAction::Status => {
             print_status()?;
             Ok(())
         }
         AuthAction::Logout { provider_id } => logout(provider_id.as_deref()),
+    }
+}
+
+/// Resolve the `auth set` key argument: an explicit value wins; omitted or
+/// `-` reads one line from stdin — piped secrets never touch shell history
+/// or `ps` output.
+fn read_key_arg(key: Option<String>) -> anyhow::Result<String> {
+    match key {
+        Some(k) if k != "-" => Ok(k),
+        _ => {
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            let key = line.trim().to_string();
+            if key.is_empty() {
+                anyhow::bail!("no key provided — pass it on stdin or as the argument");
+            }
+            Ok(key)
+        }
     }
 }
 

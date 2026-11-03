@@ -428,6 +428,7 @@ impl modron_core::Tool for TestDelegateTool {
             persona,
             Some(&["write".to_string()]),
             30_000,
+            None,
         )
         .await?;
         Ok(modron_core::ToolOutcome {

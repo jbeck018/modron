@@ -7,7 +7,7 @@ use crate::common::tool_err;
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use modron_core::{Tool, ToolCtx, ToolOutcome, ToolSpec};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const NAME: &str = "skill";
 const MAX_BYTES: usize = 8 * 1024;
@@ -68,12 +68,28 @@ impl SkillTool {
 
     fn load_body(&self, name: &str) -> Option<String> {
         for root in &self.roots {
+            // Fast path: the name IS the directory name.
             let path = root.join(name).join("SKILL.md");
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let (_, body) = split_frontmatter(&text);
+                return Some(body);
+            }
+            // The index advertises FRONTMATTER names — a repo skill whose
+            // frontmatter name differs from its folder must still load by
+            // that name (and keep overriding a same-named builtin).
+            let Ok(read_dir) = std::fs::read_dir(root) else {
                 continue;
             };
-            let (_, body) = split_frontmatter(&text);
-            return Some(body);
+            for entry in read_dir.flatten() {
+                let skill_md = entry.path().join("SKILL.md");
+                let Ok(text) = std::fs::read_to_string(&skill_md) else {
+                    continue;
+                };
+                if parse_frontmatter(&text).0.as_deref() == Some(name) {
+                    let (_, body) = split_frontmatter(&text);
+                    return Some(body);
+                }
+            }
         }
         // Built-in skills ship with the binary.
         modron_core::builtin_skills::builtin_skill_body(name).map(|text| split_frontmatter(text).1)
@@ -133,7 +149,7 @@ impl Tool for SkillTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> modron_core::Result<ToolOutcome> {
         let spec = self.spec();
         if let Err(message) = validate_args(&spec, &args) {
@@ -150,7 +166,19 @@ impl Tool for SkillTool {
         if name.contains('/') || name.contains("..") {
             return Ok(tool_err(NAME, "invalid skill name", MAX_BYTES));
         }
-        match self.load_body(name) {
+        // Session-cwd roots first: the engine's system prompt advertises
+        // skills from the SESSION working dir (per-session ACP cwd), which
+        // can differ from the launch dir this tool was registered with.
+        let session_roots = [
+            ctx.working_dir.join(".modron").join("skills"),
+            ctx.working_dir.join(".claude").join("skills"),
+        ];
+        let body = session_roots
+            .iter()
+            .filter_map(|root| read_skill_body(root, name))
+            .next()
+            .or_else(|| self.load_body(name));
+        match body {
             Some(body) => Ok(ToolOutcome::ok(reduce_output(body, MAX_BYTES))),
             None => {
                 let available = self.index();
@@ -162,6 +190,14 @@ impl Tool for SkillTool {
             }
         }
     }
+}
+
+/// Read one skill body from a single root (frontmatter stripped), if the
+/// directory exists there.
+fn read_skill_body(root: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(name).join("SKILL.md")).ok()?;
+    let (_, body) = split_frontmatter(&text);
+    Some(body)
 }
 
 #[cfg(test)]
@@ -201,6 +237,34 @@ mod tests {
         assert!(
             !outcome.content.contains("description:"),
             "frontmatter stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_loads_from_the_session_working_dir() {
+        // ACP pins a per-session cwd: the tool was registered against the
+        // launch dir, but the SESSION's repo skills must still load.
+        let session = tempfile::tempdir().unwrap();
+        let skill = session.path().join(".modron").join("skills").join("local");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: local\ndescription: session-local\n---\nsession-local body\n",
+        )
+        .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let tool = SkillTool::for_working_dir(other.path());
+        let outcome = tool
+            .execute(
+                serde_json::json!({"name": "local"}),
+                &ToolCtx::new(session.path()),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.is_error);
+        assert!(
+            outcome.content.contains("session-local body"),
+            "{outcome:?}"
         );
     }
 

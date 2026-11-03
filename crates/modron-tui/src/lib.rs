@@ -500,7 +500,7 @@ pub struct App {
     /// History-zone geometry from the last render — maps mouse rows to
     /// history indices (start index, visible committed rows, following?,
     /// top screen row).
-    pub hist_geom: (usize, usize, bool, u16),
+    pub hist_geom: (usize, usize, bool, u16, u16),
 }
 
 /// An in-TUI text selection over history lines: `(history index, column)`
@@ -563,6 +563,39 @@ struct InputRow {
 /// columns (char granularity — width-1 glyphs assumed, matching the rest
 /// of the TUI). Spans are cut at the boundary; every row keeps the
 /// styles of the chars it carries.
+/// Screen column -> char offset for a rendered line: walk the spans
+/// counting each char's real glyph width (CJK/emoji are 2 columns) until
+/// the column is reached. Keeps mouse selection aligned with what the
+/// user sees when wide glyphs precede the click point.
+fn screen_col_to_char_line(line: &Line<'_>, col: usize) -> usize {
+    let mut width = 0usize;
+    let mut chars = 0usize;
+    for span in line.spans.iter() {
+        for ch in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + w > col {
+                return chars;
+            }
+            width += w;
+            chars += 1;
+        }
+    }
+    chars
+}
+
+/// `screen_col_to_char_line` for plain text (input-box rows).
+fn screen_col_to_char_str(text: &str, col: usize) -> usize {
+    let mut width = 0usize;
+    for (i, ch) in text.chars().enumerate() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + w > col {
+            return i;
+        }
+        width += w;
+    }
+    text.chars().count()
+}
+
 fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let width = width.max(8);
     let mut rows: Vec<Line<'static>> = Vec::new();
@@ -644,20 +677,28 @@ pub const DIM: Color = Color::DarkGray;
 
 /// Persist the default model + provider to config.toml
 /// (MODRON_CONFIG or ~/.config/modron/config.toml): the /model menu's
-/// "save as default" path. Returns the path written.
+/// "save as default" path. Returns the path written. MODRON_CONFIG follows
+/// the same convention as the CLI loader: a directory holding config.toml,
+/// with a value naming a `.toml` file honored as-is.
 pub fn save_default_model(model: &str, provider: &str) -> std::io::Result<std::path::PathBuf> {
-    let path = std::env::var("MODRON_CONFIG")
-        .map(|dir| std::path::PathBuf::from(dir).join("config.toml"))
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join(".config")
-                        .join("modron")
-                        .join("config.toml")
-                })
-                .unwrap_or_else(|_| ".modron-config.toml".into())
-        });
+    let path = match std::env::var("MODRON_CONFIG") {
+        Ok(dir) if !dir.is_empty() => {
+            let dir = std::path::PathBuf::from(dir);
+            if dir.extension().is_some_and(|e| e == "toml") || dir.is_file() {
+                dir
+            } else {
+                dir.join("config.toml")
+            }
+        }
+        _ => std::env::var("HOME")
+            .map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".config")
+                    .join("modron")
+                    .join("config.toml")
+            })
+            .unwrap_or_else(|_| ".modron-config.toml".into()),
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -678,14 +719,13 @@ pub fn save_default_model(model: &str, provider: &str) -> std::io::Result<std::p
 
 /// Where user theme JSON files live (MODRON_CONFIG or ~/.config/modron/themes).
 pub fn theme_dir() -> std::path::PathBuf {
-    std::env::var("MODRON_CONFIG")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".config")
-                .join("modron")
-        })
-        .join("themes")
+    match std::env::var("MODRON_CONFIG") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+            .join(".config")
+            .join("modron"),
+    }
+    .join("themes")
 }
 
 /// Mathematical spinner: rotating phase-space glyphs (quarter-circle phases,
@@ -796,12 +836,6 @@ impl App {
             }
         }
 
-        // Esc while running interrupts (type-ahead edits land in the input
-        // for the next task).
-        if self.running && key.code == KeyCode::Esc {
-            return Action::Abort;
-        }
-
         // An open menu (arg-less /model, /theme, ...) owns every key.
         if let Some(menu) = self.menu.take() {
             return self.menu_key(menu, key);
@@ -811,6 +845,14 @@ impl App {
         // (except the global ctrl+ shortcuts handled above).
         if let Some(flow) = self.auth_flow.take() {
             return self.auth_flow_key(flow, key);
+        }
+
+        // Esc while running interrupts (type-ahead edits land in the input
+        // for the next task). AFTER the modal blocks above: Esc with an
+        // open menu or auth wizard must close the modal, not abort the
+        // turn (both modals document "owns every key").
+        if self.running && key.code == KeyCode::Esc {
+            return Action::Abort;
         }
 
         // Slash-command popup (input is a bare `/word` prefix): arrows move
@@ -980,6 +1022,7 @@ impl App {
                 // Enter opens the highlighted match.
                 let matches = self.filtered_registry_indices();
                 if matches.is_empty() {
+                    let mut closed = false;
                     match key.code {
                         KeyCode::Backspace => {
                             self.list_filter.pop();
@@ -990,13 +1033,18 @@ impl App {
                         KeyCode::Esc => {
                             if self.list_filter.is_empty() {
                                 self.auth_flow = None;
+                                closed = true;
                             } else {
                                 self.list_filter.clear();
                             }
                         }
                         _ => {}
                     }
-                    self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
+                    // Esc may have CLOSED the manager above — do not
+                    // resurrect it unconditionally.
+                    if !closed {
+                        self.auth_flow = Some(AuthFlow::Picker { selected: 0 });
+                    }
                     return Action::None;
                 }
                 let len = matches.len();
@@ -1199,6 +1247,7 @@ impl App {
         let matches = self.filtered_menu_indices(&menu);
         if matches.is_empty() {
             // Nothing matches: only editing the filter or leaving helps.
+            let mut closed = false;
             match key.code {
                 KeyCode::Backspace => {
                     self.list_filter.pop();
@@ -1209,14 +1258,18 @@ impl App {
                 KeyCode::Esc => {
                     if self.list_filter.is_empty() {
                         self.menu = None;
+                        closed = true;
                     } else {
                         self.list_filter.clear();
                     }
                 }
                 _ => {}
             }
-            menu.selected = 0;
-            self.menu = Some(menu);
+            // Esc may have CLOSED the menu above — do not resurrect it.
+            if !closed {
+                menu.selected = 0;
+                self.menu = Some(menu);
+            }
             return Action::None;
         }
         let len = matches.len();
@@ -1693,8 +1746,9 @@ impl App {
         let rows = self.input_rows(inner.width);
         match rows.get(text_row) {
             Some(row) => {
-                let len = row.text.chars().count();
-                let col = (column.saturating_sub(inner.x + 2) as usize).min(len);
+                // Width-aware column conversion (double-width glyphs).
+                let col =
+                    screen_col_to_char_str(&row.text, column.saturating_sub(inner.x + 2) as usize);
                 self.cursor = row.start + col;
             }
             // Below the text (empty rows of the box): cursor to the end.
@@ -1706,7 +1760,7 @@ impl App {
     /// geometry; None when the row isn't a committed history line (the
     /// scrolled-up indicator or a transient streaming tail).
     fn history_index_at(&self, row: u16) -> Option<usize> {
-        let (start, body, following, top) = self.hist_geom;
+        let (start, body, following, top, _) = self.hist_geom;
         let indicator = if following { 0u16 } else { 1 };
         let rel = row.checked_sub(top + indicator)? as usize;
         if rel >= body || rel >= self.history.len().saturating_sub(start) {
@@ -1715,8 +1769,15 @@ impl App {
         Some(start + rel)
     }
 
+    /// The history zone's left screen column (last render).
+    fn history_x(&self) -> u16 {
+        self.hist_geom.4
+    }
+
     /// Mouse press in the history zone: anchor a selection there —
     /// unless the row is a grouped tool summary, which expands instead.
+    /// Screen columns convert to CHAR offsets (double-width glyphs count
+    /// once) so selection/copy match what the user sees highlighted.
     pub fn begin_selection(&mut self, column: u16, row: u16) {
         if let Some(idx) = self.history_index_at(row) {
             if let Some((_, events)) = self.tool_log.iter().find(|(i, _)| *i == idx) {
@@ -1725,22 +1786,34 @@ impl App {
             }
         }
         if let Some(idx) = self.history_index_at(row) {
+            let col = self.history_char_column(idx, column);
             self.selection = Some(Selection {
-                anchor: (idx, column),
-                head: (idx, column),
+                anchor: (idx, col),
+                head: (idx, col),
             });
         } else {
             self.selection = None;
         }
     }
 
-    /// Mouse drag: extend the selection head.
+    /// Mouse drag: extend the selection head (same column conversion).
     pub fn extend_selection(&mut self, column: u16, row: u16) {
         if let Some(idx) = self.history_index_at(row) {
+            let col = self.history_char_column(idx, column);
             if let Some(sel) = self.selection.as_mut() {
-                sel.head = (idx, column);
+                sel.head = (idx, col);
             }
         }
+    }
+
+    /// Screen column -> char offset on history line `idx`, walking the
+    /// line's spans with real glyph widths.
+    fn history_char_column(&self, idx: usize, column: u16) -> u16 {
+        let Some(line) = self.history.get(idx) else {
+            return 0;
+        };
+        let col = column.saturating_sub(self.history_x()) as usize;
+        screen_col_to_char_line(line, col) as u16
     }
 
     /// The selected text (partial columns on the boundary rows, whole
@@ -1879,6 +1952,9 @@ impl App {
                 self.streaming.clear();
                 self.reasoning.clear();
                 self.selection = None;
+                // Stale (index, events) pairs would match NEW history rows
+                // against the WRONG turn's tool log on the next click.
+                self.tool_log.clear();
                 Action::None
             }
             SlashCommand::Compact => {
@@ -2313,7 +2389,10 @@ impl App {
         // (click it — or ctrl+t — to expand the full log).
         self.commit_tool_summary();
 
-        // Commit into the internal scrollback (returned for tests).
+        // Commit into the internal scrollback (returned for tests). Answer
+        // lines wrap like every other commit path — the history paragraph
+        // has no wrap of its own, and unwrapped lines break the
+        // one-row-per-line selection/click geometry.
         let mut lines: Vec<Line<'static>> = Vec::new();
         if answer.is_empty() {
             lines.push(
@@ -2321,8 +2400,9 @@ impl App {
                     .style(Style::default().fg(t.warning)),
             );
         } else {
+            let width = self.hist_wrap_width();
             for line in answer.lines() {
-                lines.push(Line::from(line.to_string()));
+                lines.extend(wrap_line(&Line::from(line.to_string()), width));
             }
         }
         lines.push(
@@ -2607,7 +2687,13 @@ impl App {
         let end = self.history.len() - self.history_offset;
         let start = end.saturating_sub(body);
         // Geometry for mouse->history mapping (selections).
-        self.hist_geom = (start, body.min(end - start), following, hist_area.y);
+        self.hist_geom = (
+            start,
+            body.min(end - start),
+            following,
+            hist_area.y,
+            hist_area.x,
+        );
         let mut hist: Vec<Line> = Vec::new();
         if !following {
             let indicator = if start == 0 {

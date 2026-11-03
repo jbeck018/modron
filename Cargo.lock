@@ -1413,6 +1413,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "ignore",
+ "libc",
  "modron-core",
  "regex",
  "serde",
@@ -1443,6 +1444,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

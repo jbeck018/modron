@@ -167,6 +167,30 @@ pub fn session_new_cwd(params: &Value) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// The effective session cwd: the editor-supplied value when present and a
+/// real directory, else the launch directory. (Tested pure.)
+pub fn session_cwd(params: &Value, launch_dir: &std::path::Path) -> std::path::PathBuf {
+    match session_new_cwd(params) {
+        Some(cwd) if cwd.is_dir() => cwd,
+        _ => launch_dir.to_path_buf(),
+    }
+}
+
+/// Build the per-session Engine: a cheap clone of the base engine with
+/// `working_dir` pinned to the session cwd — every tool call (bash, edit,
+/// write, skills) then runs in the editor's project, not the launch dir.
+/// Providers, tool registry, store, and background-subagent registry are
+/// Arc-shared across sessions.
+fn session_engine(
+    base: &modron_core::Engine,
+    params: &Value,
+    launch_dir: &std::path::Path,
+) -> modron_core::Engine {
+    let mut engine = base.clone();
+    engine.config.working_dir = session_cwd(params, launch_dir);
+    engine
+}
+
 /// Extract the text of a session/prompt request (concatenated text blocks).
 pub fn prompt_text(params: &Value) -> Option<String> {
     let blocks = params.get("prompt")?.as_array()?;
@@ -322,9 +346,14 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
         },
         &mcp,
     )?);
-    // ACP session id → Modron session id (None until the first prompt ran).
-    let sessions: Arc<Mutex<HashMap<String, Option<modron_core::SessionId>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // ACP session state: the Modron resume id plus a per-session Engine
+    // clone whose working_dir follows the editor-supplied cwd (Engine is a
+    // cheap Arc-clone; providers/tools/store stay shared).
+    struct AcSession {
+        resume: Option<modron_core::SessionId>,
+        engine: modron_core::Engine,
+    }
+    let sessions: Arc<Mutex<HashMap<String, AcSession>>> = Arc::new(Mutex::new(HashMap::new()));
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<(
         String,
         Value,
@@ -378,10 +407,13 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                             Ok(parsed) => {
                                 let acp_session = uuid::Uuid::new_v4().to_string();
                                 *current_acp_session.lock().unwrap() = Some(acp_session.clone());
-                                sessions
-                                    .lock()
-                                    .unwrap()
-                                    .insert(acp_session.clone(), Some(parsed));
+                                sessions.lock().unwrap().insert(
+                                    acp_session.clone(),
+                                    AcSession {
+                                        resume: Some(parsed),
+                                        engine: session_engine(&agent.engine, &message["params"], &cli.working_dir),
+                                    },
+                                );
                                 send!(json_response(id, json!({"sessionId": acp_session})));
                             }
                             Err(_) => {
@@ -390,10 +422,15 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                         }
                     }
                     "session/new" => {
-                        let _ = session_new_cwd(&message["params"]);
                         let acp_session = uuid::Uuid::new_v4().to_string();
                         *current_acp_session.lock().unwrap() = Some(acp_session.clone());
-                        sessions.lock().unwrap().insert(acp_session.clone(), None);
+                        sessions.lock().unwrap().insert(
+                            acp_session.clone(),
+                            AcSession {
+                                resume: None,
+                                engine: session_engine(&agent.engine, &message["params"], &cli.working_dir),
+                            },
+                        );
                         send!(json_response(id, json!({"sessionId": acp_session})));
                     }
                     "session/prompt" => {
@@ -410,16 +447,25 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                             continue;
                         }
                         pending = Some((session_id.clone(), id.clone().unwrap_or(json!(null))));
-                        let agent = Arc::clone(&agent);
+                        // Label permission requests with the session that is
+                        // actually RUNNING (the pending guard serializes).
+                        *current_acp_session.lock().unwrap() = Some(session_id.clone());
+                        let base_engine = {
+                            let sessions = sessions.lock().unwrap();
+                            sessions
+                                .get(&session_id)
+                                .map(|s| s.engine.clone())
+                                .unwrap_or_else(|| agent.engine.clone())
+                        };
                         let sessions = Arc::clone(&sessions);
                         let done = done_tx.clone();
                         let sid = session_id.clone();
                         tokio::spawn(async move {
                             let modron_session =
-                                sessions.lock().unwrap().get(&sid).cloned().flatten();
+                                sessions.lock().unwrap().get(&sid).and_then(|s| s.resume);
                             let outcome = match modron_session {
-                                Some(id) => agent.engine.run_task_resuming(id, &task).await,
-                                None => agent.engine.run_task(&task).await,
+                                Some(id) => base_engine.run_task_resuming(id, &task).await,
+                                None => base_engine.run_task(&task).await,
                             };
                             let _ = done.send((sid, id.unwrap_or(json!(null)), outcome));
                         });
@@ -432,9 +478,9 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                 }
             }
             Some((session_id, request_id, outcome)) = done_rx.recv() => {
-                if let Some(map) = sessions.lock().unwrap().get_mut(&session_id) {
-                    if map.is_none() {
-                        *map = outcome.as_ref().ok().map(|s| s.session_id);
+                if let Some(entry) = sessions.lock().unwrap().get_mut(&session_id) {
+                    if entry.resume.is_none() {
+                        entry.resume = outcome.as_ref().ok().map(|s| s.session_id);
                     }
                 }
                 // Flush every update BEFORE the response: the editor must see
@@ -509,6 +555,29 @@ mod tests {
         let cwd = session_new_cwd(&json!({"cwd": "/tmp/project", "mcpServers": []}));
         assert_eq!(cwd, Some(std::path::PathBuf::from("/tmp/project")));
         assert_eq!(session_new_cwd(&json!({})), None);
+    }
+
+    #[test]
+    fn session_cwd_uses_real_param_dirs_and_falls_back() {
+        // A cwd that exists on disk wins; a missing/absent one falls back
+        // to the launch dir (never a silently broken working dir).
+        let real = tempfile::tempdir().unwrap();
+        let params = json!({"cwd": real.path().to_str().unwrap()});
+        assert_eq!(
+            session_cwd(&params, std::path::Path::new("/launch")),
+            real.path()
+        );
+        assert_eq!(
+            session_cwd(
+                &json!({"cwd": "/nonexistent"}),
+                std::path::Path::new("/launch")
+            ),
+            std::path::Path::new("/launch")
+        );
+        assert_eq!(
+            session_cwd(&json!({}), std::path::Path::new("/launch")),
+            std::path::Path::new("/launch")
+        );
     }
 
     #[test]

@@ -129,7 +129,7 @@ impl Tool for EditTool {
         } else {
             content.replacen(old, new, 1)
         };
-        if let Err(e) = tokio::fs::write(&path, updated.as_bytes()).await {
+        if let Err(e) = crate::common::write_atomic(&path, updated.as_bytes()).await {
             return Ok(tool_err(
                 NAME,
                 format!("cannot write {}: {e}", path.display()),

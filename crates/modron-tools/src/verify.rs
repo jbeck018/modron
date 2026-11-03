@@ -70,6 +70,9 @@ impl Tool for VerifyTool {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                // The verify command can write files; a dropped timeout
+                // future must kill it, not detach it to keep running.
+                .kill_on_drop(true)
                 .output(),
         )
         .await;

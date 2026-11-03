@@ -110,6 +110,7 @@ pub async fn explore(parent: &Engine, task: &str, budget_tokens: u64) -> Result<
         None,
         Some(&EXPLORE_TOOLS.map(str::to_string)),
         budget_tokens,
+        None,
     )
     .await
 }
@@ -119,13 +120,16 @@ pub async fn explore(parent: &Engine, task: &str, budget_tokens: u64) -> Result<
 /// model, approval lists) and a tool filter. Without a persona it inherits
 /// the parent's selector and full registry — the orchestrator pattern's
 /// "subtask in an isolated context". `delegate` itself is always excluded
-/// from the child registry: no recursive spawning.
+/// from the child registry: no recursive spawning. `working_dir` overrides
+/// the parent's working dir (worktree isolation passes the worktree here —
+/// without it the "isolated" child would mutate the main tree).
 pub async fn delegate(
     parent: &Engine,
     task: &str,
     persona: Option<&crate::PersonaSpec>,
     tool_filter: Option<&[String]>,
     budget_tokens: u64,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<ExploreReport> {
     if task.trim().is_empty() {
         return Err(Error::Config(
@@ -199,7 +203,9 @@ pub async fn delegate(
         });
 
     let config = EngineConfig {
-        working_dir: parent.config.working_dir.clone(),
+        working_dir: working_dir
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| parent.config.working_dir.clone()),
         system: persona.and_then(|p| p.system.clone()).unwrap_or_default(),
         default_model: String::new(),
         default_provider: String::new(),

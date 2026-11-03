@@ -70,7 +70,14 @@ impl KevRouter {
     ) -> Self {
         let _ = model; // reserved: forward the model id once servers require it
         Self {
-            http: reqwest::Client::new(),
+            // Bounded like every other client: `route` runs inside the
+            // engine's per-turn path, so a stalled endpoint must fail with
+            // a timeout, not hang the turn forever.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             endpoint: endpoint.into(),
             api_key,
             min_confidence: 0.6,

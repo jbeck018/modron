@@ -118,6 +118,10 @@ impl Tool for BashTool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Own process group: on timeout the WHOLE tree (grandchildren like
+        // `cargo`, pipelines, `cmd &`) is signaled, not just the `sh`.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd
             .spawn()
@@ -162,8 +166,7 @@ impl Tool for BashTool {
             }
             Ok(Err(e)) => Err(internal_tool_error(NAME, format!("wait failed: {e}"))),
             Err(_elapsed) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_child_tree(&mut child).await;
                 let text = merged_output(
                     join_read(NAME, out_task).await?,
                     join_read(NAME, err_task).await?,
@@ -175,6 +178,24 @@ impl Tool for BashTool {
             }
         }
     }
+}
+
+/// Kill the spawned shell AND its process group (grandchildren included),
+/// then reap. `child.kill()` alone would leave `cargo`, pipelines, and
+/// background spawns running as orphans.
+#[cfg(unix)]
+async fn kill_child_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // Negative pid = the whole group (we spawned with group 0).
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+#[cfg(not(unix))]
+async fn kill_child_tree(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 /// Phase 13 token-efficient I/O: output above this size is relayed to disk
@@ -192,7 +213,15 @@ fn relay_oversized(text: &str) -> String {
         return text.to_string();
     }
     let dir = std::env::temp_dir().join("modron-relay");
+    // 0700: the relay dir holds command output and its name is guessable —
+    // other local users must not be able to pre-create or write inside it
+    // (symlink attacks on the predictable file name).
     let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let name = format!("{}-{}.txt", chrono_now_compact(), fnv8(text.as_bytes()),);
     let path = dir.join(name);
     if std::fs::write(&path, text).is_err() {
@@ -211,7 +240,7 @@ fn relay_oversized(text: &str) -> String {
     format!(
         "{}\n… [+{} of {} lines relayed to {} — read it with the `read` tool] …\n{}",
         head.join("\n"),
-        lines.len() - head.len() - tail.len(),
+        lines.len().saturating_sub(head.len() + tail.len()),
         lines.len(),
         path.display(),
         tail.join("\n"),
@@ -238,9 +267,29 @@ fn fnv8(bytes: &[u8]) -> String {
     format!("{:08x}", hash & 0xffff_ffff)
 }
 
+/// Hard capture ceiling for one stream: the 10KB model-facing cap and the
+/// 8KB relay threshold bound what the model sees, this bounds what the
+/// agent BUFFERS — a runaway `yes` piped for the full timeout window must
+/// not OOM the process. Output past the cap is dropped (the relay file
+/// then holds at most the first 1MB).
+pub const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
 async fn read_all<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Vec<u8> {
     let mut buf = Vec::new();
-    let _ = reader.read_to_end(&mut buf).await;
+    let mut chunk = [0u8; 16384];
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if buf.len() + n > MAX_CAPTURE_BYTES {
+            let room = MAX_CAPTURE_BYTES - buf.len();
+            buf.extend_from_slice(&chunk[..room]);
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
     buf
 }
 

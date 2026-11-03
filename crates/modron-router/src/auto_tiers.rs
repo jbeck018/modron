@@ -46,6 +46,16 @@ pub fn derive_tiers(authed_providers: &[String]) -> Option<(String, String)> {
         .iter()
         .filter(|(_, m)| m.tier == Tier::Strong)
         .collect();
+    // A reachable set with no Strong-tier catalog models (single cheap
+    // provider) must not discard the whole derivation — the priciest
+    // reachable model stands in for strong rather than letting the caller
+    // fall back to unauthenticated defaults.
+    let priciest_reachable = reachable.iter().max_by(|(ia, a), (ib, b)| {
+        a.input_per_m
+            .partial_cmp(&b.input_per_m)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(ib.cmp(ia))
+    });
     let strong = strong_pool
         .iter()
         .filter(|(_, m)| m.input_per_m <= STRONG_PRICE_CEILING)
@@ -57,6 +67,7 @@ pub fn derive_tiers(authed_providers: &[String]) -> Option<(String, String)> {
                 .then(ib.cmp(ia))
         })
         .or_else(|| strong_pool.first())
+        .or(priciest_reachable.as_ref())
         .map(|(_, m)| m.name.clone())?;
 
     Some((cheap, strong))

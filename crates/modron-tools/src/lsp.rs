@@ -43,6 +43,9 @@ impl Diag {
 pub struct LspServer {
     lang: &'static str,
     stdin: Mutex<Option<std::process::ChildStdin>>,
+    /// Reaped in Drop — dropping the handle would leave the exited server
+    /// as an unreapable zombie for the life of the process.
+    child: Mutex<Option<std::process::Child>>,
     next_id: AtomicU64,
     /// Diagnostics published by the server, keyed by file URI.
     diagnostics: Arc<Mutex<HashMap<String, Vec<Diag>>>>,
@@ -55,6 +58,10 @@ impl Drop for LspServer {
         // best-effort shutdown; process exit closes pipes either way
         let _ = self.notify("shutdown", serde_json::json!({}));
         let _ = self.notify("exit", serde_json::json!({}));
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -153,6 +160,7 @@ impl LspServer {
         let server = LspServer {
             lang,
             stdin: Mutex::new(Some(stdin)),
+            child: Mutex::new(Some(child)),
             next_id: AtomicU64::new(1),
             diagnostics: Arc::clone(&diagnostics),
             opened: Mutex::new(std::collections::HashSet::new()),
@@ -315,6 +323,23 @@ fn reader_loop(stdout: std::process::ChildStdout, table: Arc<Mutex<HashMap<Strin
             }
         }
         let Some(len) = content_length else { continue };
+        // A hostile or buggy server must not OOM the agent with one
+        // oversized Content-Length header: skip absurd frames whole
+        // (draining the declared length keeps framing in sync).
+        const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+        if len == 0 || len > MAX_FRAME_BYTES {
+            let mut remaining = len;
+            let mut sink = [0u8; 65536];
+            while remaining > 0 {
+                let want = remaining.min(sink.len());
+                match reader.read_exact(&mut sink[..want]) {
+                    Ok(()) => remaining -= want,
+                    Err(_) => return,
+                }
+            }
+            tracing::warn!(len, "skipped an oversized LSP frame");
+            continue;
+        }
         let mut body = vec![0u8; len];
         if reader.read_exact(&mut body).is_err() {
             return;

@@ -82,6 +82,10 @@ fn github_token() -> Option<String> {
 fn api_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("modron-upgrade")
+        // A stalled GitHub connection must time out — `modron upgrade` runs
+        // interactively and must not hang forever on a dead network.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
 }
 

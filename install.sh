@@ -36,13 +36,17 @@ fi
 info "installing modron ($TARGET) into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-if command -v curl >/dev/null 2>&1 && curl -fsSL -o /tmp/modron.tar.gz "$URL" 2>/dev/null; then
-  tar -xzf /tmp/modron.tar.gz -C "$INSTALL_DIR" modron
-  rm -f /tmp/modron.tar.gz
+TARBALL="$(mktemp "${TMPDIR:-/tmp}/modron.tar.gz.XXXXXX")"
+trap 'rm -f "$TARBALL"' EXIT
+
+if command -v curl >/dev/null 2>&1 && curl -fsSL -o "$TARBALL" "$URL" 2>/dev/null; then
+  tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron
+  rm -f "$TARBALL"
   info "installed release binary"
 else
   info "no matching release binary — building from source (requires Rust 1.99+)"
   command -v cargo >/dev/null 2>&1 || fail "cargo not found — install rustup from https://rustup.rs"
+  command -v git >/dev/null 2>&1 || fail "git not found — install git to build from source"
   TMPDIR_BUILD="$(mktemp -d)"
   git clone --depth 1 "https://github.com/$REPO.git" "$TMPDIR_BUILD/modron"
   (cd "$TMPDIR_BUILD/modron" && cargo build --release)
