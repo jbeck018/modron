@@ -1795,3 +1795,26 @@ fn menus_and_auth_picker_filter_as_you_type() {
         other => panic!("filter should land on z.ai, got {other:?}"),
     }
 }
+
+#[test]
+fn model_menu_marks_unauthenticated_providers() {
+    let dir = std::env::temp_dir().join(format!("modron-nokey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("MODRON_CONFIG", &dir);
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Model(String::new()));
+    std::env::remove_var("MODRON_CONFIG");
+    // With no keys or sign-ins in the isolated config, every provider
+    // row carries the no-key marker; filtering still works over it.
+    assert!(app.filtered_menu_indices_count() >= 12);
+    for c in "no key".chars() {
+        app.on_key(key(crossterm::event::KeyCode::Char(c)));
+    }
+    // "no key" appears in DETAIL, which the filter matches.
+    assert!(
+        app.filtered_menu_indices_count() >= 1,
+        "detail participates in filtering"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

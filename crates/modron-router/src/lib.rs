@@ -12,9 +12,11 @@
 //!
 //! Approximate pricing, reviewed quarterly — see the catalog module docs.
 
+pub mod auto_tiers;
 pub mod catalog;
 pub mod learned;
 pub mod selector;
 
+pub use auto_tiers::derive_tiers;
 pub use catalog::{catalog, lookup, ModelInfo, Tier};
 pub use selector::HeuristicSelector;

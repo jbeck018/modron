@@ -125,6 +125,22 @@ pub fn oauth_signed_in(provider_id: &str) -> bool {
     file.map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Whether a CATALOG provider id has usable credentials: an API key
+/// (env or saved env file) or a stored OAuth sign-in. "chatgpt" rides
+/// the OpenAI sign-in tokens; "openai"/"openai-compat" share
+/// OPENAI_API_KEY.
+pub fn catalog_provider_authenticated(provider_id: &str) -> bool {
+    match provider_id {
+        "chatgpt" => oauth_signed_in("openai-compat"),
+        "anthropic" => {
+            key_source("ANTHROPIC_API_KEY").0 != KeySource::None || oauth_signed_in("anthropic")
+        }
+        other => provider_info(other)
+            .map(|info| key_source(info.env_var).0 != KeySource::None)
+            .unwrap_or(false),
+    }
+}
+
 /// Open `url` in the user's browser. Best-effort: returns false when no
 /// opener exists (callers still render the URL as the manual fallback).
 pub fn open_browser(url: &str) -> bool {
@@ -270,6 +286,27 @@ mod tests {
         vars.dedup();
         assert_eq!(vars.len(), total, "duplicate env var");
         assert!(reg.len() >= 10);
+    }
+
+    #[test]
+    fn catalog_provider_auth_maps_keys_and_signins() {
+        // chatgpt rides the OpenAI sign-in tokens, not a key.
+        assert_eq!(
+            catalog_provider_authenticated("chatgpt"),
+            oauth_signed_in("openai-compat") || false
+        );
+        // anthropic accepts either path.
+        assert_eq!(
+            catalog_provider_authenticated("anthropic"),
+            key_source("ANTHROPIC_API_KEY").0 != KeySource::None || oauth_signed_in("anthropic")
+        );
+        // Registry providers key off their env var; unknown ids are out.
+        let zai = provider_info("zai").unwrap();
+        assert_eq!(
+            catalog_provider_authenticated("zai"),
+            key_source(zai.env_var).0 != KeySource::None
+        );
+        assert!(!catalog_provider_authenticated("nope"));
     }
 
     #[test]

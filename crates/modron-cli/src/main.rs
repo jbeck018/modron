@@ -1193,7 +1193,9 @@ fn build_agent_with(
     engine_config.personas = personas;
     // Build the router FIRST even when pinning: its config errors (unknown
     // mode, bad overrides) must surface regardless of the provider choice.
-    let router = build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()))?;
+    // Tiers derive from the providers that actually built (keys/sign-ins).
+    let authed: Vec<String> = providers.keys().cloned().collect();
+    let router = build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()), &authed)?;
     let selector = match &cli.provider {
         // An explicitly chosen provider PINS every turn there — the
         // router would otherwise override it with its own cheap/strong
@@ -1591,17 +1593,30 @@ async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegist
 fn build_selector(
     cfg: &config::Config,
     persona_model: Option<String>,
+    authed_providers: &[String],
 ) -> anyhow::Result<Arc<dyn modron_core::ModelSelector>> {
     use modron_router::{learned::LearnedRouter, HeuristicSelector};
     let router_cfg = cfg.router.clone().unwrap_or_default();
-    let cheap = router_cfg
-        .cheap_model
-        .clone()
-        .unwrap_or_else(|| "claude-haiku-5-5".into());
-    let strong = router_cfg
-        .strong_model
-        .clone()
-        .unwrap_or_else(|| "claude-sonnet-5-5".into());
+    // Default tiers derive from the AUTHED models (what the user's keys
+    // and sign-ins can actually reach); explicit [router] config wins.
+    let derived = modron_router::derive_tiers(authed_providers);
+    if router_cfg.cheap_model.is_none() && router_cfg.strong_model.is_none() {
+        if let Some((cheap, strong)) = &derived {
+            eprintln!(
+                "note: auto-routing from your signed-in providers — cheap: {cheap}, strong: {strong} (override in [router])"
+            );
+        }
+    }
+    let (default_cheap, default_strong) = derived.unwrap_or_else(|| {
+        // Nothing authed and cataloged: the classic anthropic defaults
+        // (mock runs pin the provider explicitly anyway).
+        (
+            "claude-haiku-5-5".to_string(),
+            "claude-sonnet-5-5".to_string(),
+        )
+    });
+    let cheap = router_cfg.cheap_model.clone().unwrap_or(default_cheap);
+    let strong = router_cfg.strong_model.clone().unwrap_or(default_strong);
     let provider_of = |model: &str| {
         modron_router::lookup(model)
             .map(|info| info.provider.clone())
@@ -2098,17 +2113,18 @@ async fn run_bench(
 /// an always-strong baseline (synthetic 10k-in/1k-out task per example).
 fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
     use modron_router::learned::run_eval;
-    let selector = build_selector(cfg, None)?;
+    let authed: Vec<String> = ["anthropic", "openai-compat", "chatgpt", "zai", "google"]
+        .iter()
+        .filter(|id| build_provider_shim(id).is_ok())
+        .map(|id| id.to_string())
+        .collect();
+    let selector = build_selector(cfg, None, &authed)?;
     let cases = run_eval(selector.as_ref());
     let router_cfg = cfg.router.clone().unwrap_or_default();
-    let cheap = router_cfg
-        .cheap_model
-        .clone()
-        .unwrap_or_else(|| "claude-haiku-5-5".into());
-    let strong = router_cfg
-        .strong_model
-        .clone()
-        .unwrap_or_else(|| "claude-sonnet-5-5".into());
+    let defaults = modron_router::derive_tiers(&authed)
+        .unwrap_or_else(|| ("claude-haiku-5-5".into(), "claude-sonnet-5-5".into()));
+    let cheap = router_cfg.cheap_model.clone().unwrap_or(defaults.0);
+    let strong = router_cfg.strong_model.clone().unwrap_or(defaults.1);
 
     let correct = cases.iter().filter(|c| c.correct()).count();
     println!(

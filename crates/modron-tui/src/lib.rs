@@ -1310,13 +1310,20 @@ impl App {
             if is_current {
                 selected = i;
             }
+            // Unauthenticated models stay selectable (the user may be
+            // mid-setup) but visibly need credentials.
+            let authed = modron_core::auth::catalog_provider_authenticated(&m.provider);
             options.push(MenuOption {
                 label: if is_current {
                     format!("● {}", m.name)
                 } else {
                     m.name.clone()
                 },
-                detail: format!("{} · {}k", m.provider, m.context_window / 1000),
+                detail: if authed {
+                    format!("{} · {}k", m.provider, m.context_window / 1000)
+                } else {
+                    format!("{} · {}k · no key", m.provider, m.context_window / 1000)
+                },
                 command: SlashCommand::Model(m.name.clone()),
             });
         }
