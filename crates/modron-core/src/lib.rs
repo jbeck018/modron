@@ -938,4 +938,49 @@ mod tests {
         assert!(reg.get("dummy").is_some());
         assert!(reg.get("nope").is_none());
     }
+
+    #[test]
+    fn prompt_prefix_is_wire_stable_across_registries() {
+        // Cache discipline: provider prompt caches key on the byte prefix
+        // of (system + tools). Tool specs must serialize IDENTICALLY
+        // regardless of registration order — this test pins that property
+        // (a HashMap-iteration ordering regression would bust every
+        // provider's cache on every turn).
+        #[derive(Default, Clone)]
+        struct Named(&'static str);
+        #[async_trait]
+        impl Tool for Named {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.0.into(),
+                    description: format!("tool {}", self.0),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"x": {"type": "string"}}
+                    }),
+                }
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: &ToolCtx,
+            ) -> Result<ToolOutcome> {
+                Ok(ToolOutcome::ok("hi"))
+            }
+        }
+        let names = ["zeta", "alpha", "mid", "beta"];
+        let mut a = ToolRegistry::new();
+        for n in names {
+            a.register(Arc::new(Named(n)));
+        }
+        let mut b = ToolRegistry::new();
+        for n in names.iter().rev() {
+            b.register(Arc::new(Named(n)));
+        }
+        let wire_a = serde_json::to_string(&a.specs_prompt()).unwrap();
+        let wire_b = serde_json::to_string(&b.specs_prompt()).unwrap();
+        assert_eq!(wire_a, wire_b, "tool spec wire order must be deterministic");
+        let specs: Vec<String> = a.specs_prompt().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(specs, vec!["alpha", "beta", "mid", "zeta"]);
+    }
 }

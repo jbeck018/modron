@@ -2405,9 +2405,23 @@ impl App {
                 lines.extend(wrap_line(&Line::from(line.to_string()), width));
             }
         }
+        // Cache discipline: per-turn ratio plus the SESSION cumulative —
+        // a falling cache hit rate is the cheapest early warning that
+        // request prefixes went unstable (cost multiplies silently).
+        let session_cache = {
+            let all = self.cumulative.input_tokens + self.cumulative.cached_input_tokens;
+            if all > 0 {
+                format!(
+                    " (session {:.0}%)",
+                    100.0 * self.cumulative.cached_input_tokens as f64 / all as f64
+                )
+            } else {
+                String::new()
+            }
+        };
         lines.push(
             Line::from(format!(
-                "  {} tok · {} turns · {} cache",
+                "  {} tok · {} turns · {} cache{session_cache}",
                 usage.total(),
                 turns,
                 {
