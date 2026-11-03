@@ -172,20 +172,199 @@ impl ModelProvider for RetryingProvider {
         req: TurnRequest,
         tx: tokio::sync::mpsc::UnboundedSender<modron_core::StreamDelta>,
     ) -> Result<TurnResponse> {
-        // Streaming delegates directly — a retry would replay a turn whose
-        // deltas were already emitted to the sink. Without this override the
-        // trait default silently degrades every streaming turn to one
-        // blocking non-streaming call (single final delta), making the
-        // providers' SSE paths unreachable through the wrapper.
-        self.inner.turn_streaming(req, tx).await
+        // Streaming replays a turn ONLY when nothing observable was
+        // emitted: deltas already sent to the sink cannot be replayed
+        // (duplication), but a transport death BEFORE any output is safe
+        // and uses the same attempt budget + backoff as `turn` — the
+        // empty-completion safety net providers like oh-my-pi ship.
+        // (Without this override the trait default silently degrades
+        // every streaming turn to one blocking non-streaming call.)
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let attempts = self.cfg.max_attempts.max(1);
+        let mut pending = Some(req);
+        for attempt in 1..=attempts {
+            let is_last = attempt == attempts;
+            let call_req = if is_last {
+                pending.take().expect("req held until the last attempt")
+            } else {
+                // Keep the original for a possible replay; the request can
+                // be large, so the happy path (first attempt) never clones.
+                pending.as_ref().expect("req").clone()
+            };
+            let (fwd_tx, mut fwd_rx) =
+                tokio::sync::mpsc::unbounded_channel::<modron_core::StreamDelta>();
+            let emitted = std::sync::Arc::new(AtomicBool::new(false));
+            let flag = std::sync::Arc::clone(&emitted);
+            let sink = tx.clone();
+            // Live forwarding keeps the caller's stream real-time; the
+            // flag records whether anything observable was sent. Relies on
+            // the provider dropping its tx when the call returns.
+            let forwarder = tokio::spawn(async move {
+                while let Some(delta) = fwd_rx.recv().await {
+                    flag.store(true, Ordering::Relaxed);
+                    let _ = sink.send(delta);
+                }
+            });
+            let result = self.inner.turn_streaming(call_req, fwd_tx).await;
+            // fwd_tx was consumed by the call; awaiting the forwarder
+            // flushes any tail deltas before we decide on a replay.
+            let _ = forwarder.await;
+            let nothing_emitted = !emitted.load(Ordering::Relaxed);
+            match result {
+                Ok(response) => return Ok(response),
+                Err(err) if !is_last && nothing_emitted && is_transport_death(&err) => {
+                    tracing::warn!(
+                        attempt,
+                        error = %err,
+                        "provider transport died before any output — replaying"
+                    );
+                    (self.delay)(self.cfg.backoff_for(attempt - 1)).await;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("the loop returns on its final iteration")
+    }
+}
+
+/// A transport-class provider error ("connection error:", "timeout:",
+/// "request failed:"): the request or stream died at the transport layer.
+/// Used for the nothing-emitted streaming replay — semantic failures
+/// (HTTP 4xx, malformed payloads) fail fast instead.
+fn is_transport_death(err: &Error) -> bool {
+    match err {
+        Error::Provider { message, .. } => {
+            message.starts_with("connection error:")
+                || message.starts_with("timeout:")
+                || message.starts_with("request failed:")
+        }
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modron_core::{StopReason, Usage};
+    use modron_core::{Message, StopReason, StreamDelta, Usage};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A provider whose stream dies (emitting nothing) on the first call
+    /// and succeeds on the second — the empty-completion replay case.
+    struct DeadThenAliveStreamProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DeadThenAliveStreamProvider {
+        fn id(&self) -> &str {
+            "dead-then-alive"
+        }
+
+        async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+            unreachable!("streaming path under test")
+        }
+
+        async fn turn_streaming(
+            &self,
+            _req: TurnRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        ) -> Result<TurnResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Died before ANY delta: nothing reaches the sink.
+                return Err(provider_err("connection error: stream ended before [DONE]"));
+            }
+            let _ = tx.send(StreamDelta::Text("replayed".into()));
+            Ok(TurnResponse {
+                text: "replayed".into(),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: StopReason::EndTurn,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stream_death_is_replayed_once_without_duplicates() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RetryingProvider::new(Arc::new(DeadThenAliveStreamProvider {
+            calls: Arc::clone(&calls),
+        }))
+        .with_delay_fn(noop_delay());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = provider
+            .turn_streaming(
+                TurnRequest {
+                    model: "m".into(),
+                    system: String::new(),
+                    messages: vec![Message::user("hi")],
+                    tools: vec![],
+                    max_tokens: 16,
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text, "replayed");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one replay");
+        let mut texts = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            if let StreamDelta::Text(t) = delta {
+                texts.push(t);
+            }
+        }
+        assert_eq!(texts, vec!["replayed"], "no duplicated content");
+    }
+
+    #[tokio::test]
+    async fn stream_death_after_output_is_not_replayed() {
+        struct DiedMidStream;
+        #[async_trait]
+        impl ModelProvider for DiedMidStream {
+            fn id(&self) -> &str {
+                "died-mid-stream"
+            }
+            async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+                unreachable!()
+            }
+            async fn turn_streaming(
+                &self,
+                _req: TurnRequest,
+                tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+            ) -> Result<TurnResponse> {
+                let _ = tx.send(StreamDelta::Text("partial ".into()));
+                Err(provider_err("connection error: stream ended before [DONE]"))
+            }
+        }
+        let provider = RetryingProvider::new(Arc::new(DiedMidStream)).with_delay_fn(noop_delay());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = provider
+            .turn_streaming(
+                TurnRequest {
+                    model: "m".into(),
+                    system: String::new(),
+                    messages: vec![Message::user("hi")],
+                    tools: vec![],
+                    max_tokens: 16,
+                },
+                tx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stream ended"), "{err}");
+        let mut texts = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            if let StreamDelta::Text(t) = delta {
+                texts.push(t);
+            }
+        }
+        assert_eq!(
+            texts,
+            vec!["partial "],
+            "emitted content preserved, no replay"
+        );
+    }
 
     fn noop_delay() -> DelayFn {
         Arc::new(|_| Box::pin(async {}))
