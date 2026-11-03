@@ -47,6 +47,7 @@ pub fn older_transcript_text(events: &[SessionEvent], skip_last_messages: usize)
     let mut out = String::new();
     for event in older {
         match event {
+            SessionEvent::TurnTrace { .. } => {}
             SessionEvent::Task { text } => {
                 push_line(&mut out, &format!("[TASK] {text}"));
             }

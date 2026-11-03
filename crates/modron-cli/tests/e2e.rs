@@ -258,10 +258,12 @@ async fn mock_drives_real_tools_and_store_end_to_end() {
         events_after.len() > events.len(),
         "resume appends to the same session log"
     );
-    assert!(
-        matches!(events_after.last(), Some(SessionEvent::Message { message, ..
-        }) if message.content == format!("resumed: {MARKER}"))
-    );
+    // The terminal TurnTrace record follows the final message, so match
+    // on presence rather than position.
+    assert!(events_after
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Message { message, .. }
+                if message.content == format!("resumed: {MARKER}"))));
 }
 
 /// Definition of Usable #4 as a test: the real binary, `--provider mock`,

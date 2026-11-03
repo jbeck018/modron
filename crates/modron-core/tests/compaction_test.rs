@@ -276,10 +276,12 @@ async fn compaction_fires_once_shrinks_context_and_completes() {
     // (e)+(f) Exactly one Compaction event over the run, placed after the
     // last pre-compaction tool result, with its usage right behind it.
     let events = engine.store.load(summary.session_id).await.unwrap();
+    // TurnTrace observability records ride along: one per model turn
+    // (4) + the terminal stop-label record.
     assert_eq!(
         events.len(),
-        14,
-        "Task + 2×(MS,U,M,TR) + Compaction + U + (MS,U,M)"
+        18,
+        "Task + 2×(MS,U,M,TR) + 3×TurnTrace + Compaction + U + (MS,U,M) + terminal TurnTrace"
     );
     let compactions = events
         .iter()
@@ -305,10 +307,11 @@ async fn compaction_fires_once_shrinks_context_and_completes() {
         "the compaction call's usage is persisted right after the event"
     );
     assert!(
-        matches!(events.last(), Some(SessionEvent::Message { message, ..
-        })
-            if message.content == "All done: two edge cases chosen."),
-        "the final answer is the last event"
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Message { message, .. }
+            if message.content == "All done: two edge cases chosen.")),
+        "the final answer is persisted (the terminal TurnTrace follows it)"
     );
 }
 

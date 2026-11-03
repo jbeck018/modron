@@ -159,6 +159,11 @@ impl Engine {
     ) -> Result<RunSummary> {
         let tool_specs = self.tools.specs_prompt();
         let system = self.assemble_system(&tool_specs);
+        // Cache-discipline audit key: one hash over the exact wire prefix
+        // (system + tool specs) — a change across turns means prefix
+        // instability (cache busts), visible in TurnTrace records.
+        let prompt_hash = prompt_wire_hash(&system, &tool_specs);
+        let mut stop_label: &'static str = "end_turn";
         let mut governor =
             BudgetGovernor::new(self.config.max_total_tokens, self.config.max_input_tokens);
 
@@ -187,6 +192,7 @@ impl Engine {
                     max = self.config.max_turns,
                     "stopping: max_turns reached"
                 );
+                stop_label = "max_turns";
                 break;
             }
 
@@ -309,6 +315,7 @@ impl Engine {
             // configured, drive the provider through `turn_streaming` and
             // forward deltas as they arrive (providers without an SSE
             // implementation yield one Text delta via the trait default).
+            let turn_started = std::time::Instant::now();
             let response = match self.config.on_delta.clone() {
                 Some(sink) => {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
@@ -342,7 +349,25 @@ impl Engine {
             if !models_used.contains(&model) {
                 models_used.push(model.clone());
             }
-            spend_usd += self.turn_cost_usd(&model, &response.usage);
+            let turn_cost = self.turn_cost_usd(&model, &response.usage);
+            spend_usd += turn_cost;
+            self.store
+                .append(
+                    session_id,
+                    &SessionEvent::TurnTrace {
+                        turn: turns,
+                        harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                        provider: provider.id().to_string(),
+                        model: model.clone(),
+                        prompt_hash: Some(prompt_hash.clone()),
+                        latency_ms: Some(turn_started.elapsed().as_millis() as u64),
+                        cost_usd: Some(turn_cost),
+                        usage: Some(response.usage),
+                        verifier: None,
+                        failure_label: None,
+                    },
+                )
+                .await?;
 
             // USD spend cap (A3): computed from provider-reported usage and
             // the injected price lookup — an honest estimate, checked after
@@ -359,6 +384,7 @@ impl Engine {
                     )
                     .trim()
                     .to_string();
+                    stop_label = "spend_cap";
                     break;
                 }
             }
@@ -528,6 +554,7 @@ impl Engine {
                     cap = self.config.max_total_tokens,
                     "stopping: cumulative token budget exceeded"
                 );
+                stop_label = "budget_exhausted";
                 break;
             }
         }
@@ -545,6 +572,26 @@ impl Engine {
             }
         }
 
+        // Terminal trace record: the run's stop label lands in the log
+        // (replay/audit material — the minimal-trace-record contract).
+        let _ = self
+            .store
+            .append(
+                session_id,
+                &SessionEvent::TurnTrace {
+                    turn: turns,
+                    harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                    provider: String::new(),
+                    model: String::new(),
+                    prompt_hash: None,
+                    latency_ms: None,
+                    cost_usd: None,
+                    usage: None,
+                    verifier: None,
+                    failure_label: Some(stop_label.to_string()),
+                },
+            )
+            .await;
         Ok(RunSummary {
             session_id,
             answer,
@@ -1043,10 +1090,23 @@ fn is_transcript_item(event: &SessionEvent) -> bool {
 /// becomes the compact-state user message it stands for (so a verbatim tail
 /// that spans an older compaction keeps its state); accounting events are
 /// dropped.
+/// sha256 over the exact wire bytes of (system + tool specs): the
+/// prefix-stability key for cache-discipline auditing.
+fn prompt_wire_hash(system: &str, tools: &[ToolSpec]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(system.as_bytes());
+    if let Ok(wire) = serde_json::to_string(tools) {
+        hasher.update(wire.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) -> Vec<Message> {
     let mut messages = Vec::new();
     for event in events {
         match event {
+            SessionEvent::TurnTrace { .. } => {}
             SessionEvent::Task { text } => messages.push(Message::user(text.clone())),
             SessionEvent::Message { message, .. } => messages.push(message.clone()),
             SessionEvent::ToolResult { call_id, outcome } => {
@@ -1307,6 +1367,35 @@ mod tests {
             "verify ran twice (fail then pass)"
         );
         assert!(summary.turns >= 3, "the gate forced an extra model turn");
+    }
+
+    #[tokio::test]
+    async fn turn_trace_records_land_in_the_session_log() {
+        let (engine, _verify) = gate_engine(vec![text("done")]);
+        let summary = engine.run_task("hello").await.unwrap();
+        let events = engine.store.load(summary.session_id).await.unwrap();
+        let traces: Vec<(u32, Option<String>, Option<String>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::TurnTrace {
+                    turn,
+                    prompt_hash,
+                    failure_label,
+                    ..
+                } => Some((*turn, prompt_hash.clone(), failure_label.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            traces.iter().any(|(t, hash, _)| *t == 1 && hash.is_some()),
+            "per-turn record carries the prompt hash: {traces:?}"
+        );
+        assert!(
+            traces
+                .iter()
+                .any(|(_, _, label)| label.as_deref() == Some("end_turn")),
+            "terminal record carries the stop label: {traces:?}"
+        );
     }
 
     #[tokio::test]

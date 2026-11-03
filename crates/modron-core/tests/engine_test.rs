@@ -154,27 +154,38 @@ async fn full_tool_loop_end_to_end() {
         .contains("echo from /tmp/modron-engine-test"));
 
     // Session events appended as they happened.
+    // Session events appended as they happened. TurnTrace observability
+    // records ride along between the structural events — assert on the
+    // structural subsequence so the ordering intent stays readable.
     let events = engine.store.load(summary.session_id).await.unwrap();
-    assert_eq!(events.len(), 8);
+    let structural: Vec<&SessionEvent> = events
+        .iter()
+        .filter(|e| !matches!(e, SessionEvent::TurnTrace { .. }))
+        .collect();
+    assert_eq!(structural.len(), 8, "Task + 2×(MS,U,M) + TR");
     assert!(
-        matches!(events[0], SessionEvent::Task { ref text, .. } if text == "list the rust files")
+        matches!(structural[0], SessionEvent::Task { ref text, .. } if text == "list the rust files")
     );
     assert!(
-        matches!(events[1], SessionEvent::ModelSelected { ref model, .. } if model == "mock-model")
+        matches!(structural[1], SessionEvent::ModelSelected { ref model, .. } if model == "mock-model")
     );
-    assert!(matches!(events[2], SessionEvent::Usage { .. }));
-    assert!(matches!(events[3], SessionEvent::Message { ref message, ..
+    assert!(matches!(structural[2], SessionEvent::Usage { .. }));
+    assert!(
+        matches!(structural[3], SessionEvent::Message { ref message, ..
         }
-        if message.role == Role::Assistant && message.tool_calls.len() == 1));
+        if message.role == Role::Assistant && message.tool_calls.len() == 1)
+    );
     assert!(
-        matches!(events[4], SessionEvent::ToolResult { ref call_id, ref outcome }
+        matches!(structural[4], SessionEvent::ToolResult { ref call_id, ref outcome }
         if call_id == "call_1" && !outcome.is_error)
     );
-    assert!(matches!(events[5], SessionEvent::ModelSelected { .. }));
-    assert!(matches!(events[6], SessionEvent::Usage { .. }));
-    assert!(matches!(events[7], SessionEvent::Message { ref message, ..
+    assert!(matches!(structural[5], SessionEvent::ModelSelected { .. }));
+    assert!(matches!(structural[6], SessionEvent::Usage { .. }));
+    assert!(
+        matches!(structural[7], SessionEvent::Message { ref message, ..
         }
-        if message.role == Role::Assistant && message.content == "All done."));
+        if message.role == Role::Assistant && message.content == "All done.")
+    );
 
     // Session title = first line of the task.
     let listed = engine.store.list().await.unwrap();
@@ -369,20 +380,21 @@ async fn resume_reconstructs_transcript_and_continues_same_session() {
     assert_eq!(messages[4].role, Role::User);
     assert_eq!(messages[4].content, "keep going");
 
-    // Events keep accumulating in the same session log.
+    // Events keep accumulating in the same session log (+ TurnTrace
+    // records for the resumed turn and its terminal stop label).
     let events_after = engine2.store.load(summary.session_id).await.unwrap();
     assert_eq!(
         events_after.len(),
-        events_before + 4,
-        "Task + ModelSelected + Usage + Message"
+        events_before + 6,
+        "Task + ModelSelected + Usage + TurnTrace + Message + terminal TurnTrace"
     );
     assert!(
         matches!(events_after.first(), Some(SessionEvent::Task { ref text }) if text == "start work")
     );
-    assert!(
-        matches!(events_after.last(), Some(SessionEvent::Message { ref message, ..
-        }) if message.content == "second answer")
-    );
+    assert!(events_after
+        .iter()
+        .any(|e| matches!(e, SessionEvent::Message { ref message, .. }
+                if message.content == "second answer")));
 }
 
 #[tokio::test]

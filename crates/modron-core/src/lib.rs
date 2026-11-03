@@ -469,6 +469,37 @@ pub enum SessionEvent {
         summary: String,
         summarized_events: u32,
     },
+    /// Harness observability record (2026-11, additive): one per model
+    /// turn (verifier/failure_label None), one per finish-gate run
+    /// (verifier Some), and one terminal record carrying the run's stop
+    /// label. Fields follow the "minimal trace record" literature (run
+    /// id = the session, task id = the Task event, step index = turn):
+    /// versions, prompt/config hash for prefix-stability auditing
+    /// (cache discipline), latency, cost, verifier verdict, failure
+    /// label. `None`-heavy records stay small; serde defaults keep old
+    /// logs loadable.
+    TurnTrace {
+        turn: u32,
+        harness_version: String,
+        provider: String,
+        model: String,
+        /// sha256 over (system prompt bytes + tool-spec wire bytes).
+        #[serde(default)]
+        prompt_hash: Option<String>,
+        #[serde(default)]
+        latency_ms: Option<u64>,
+        #[serde(default)]
+        cost_usd: Option<f64>,
+        #[serde(default)]
+        usage: Option<Usage>,
+        /// "pass" | "fail" — the finish gate's verification verdict.
+        #[serde(default)]
+        verifier: Option<String>,
+        /// Terminal stop label for the run's final record:
+        /// "max_turns", "spend_cap", "budget_exhausted", "end_turn".
+        #[serde(default)]
+        failure_label: Option<String>,
+    },
     /// Pre-mutation file snapshot (Phase-1b C1, additive): captured before
     /// `write`/`edit` execute. `prior_content_b64: None` means the file was
     /// new (rewind deletes it) or exceeded the 256KB snapshot cap. Bash
