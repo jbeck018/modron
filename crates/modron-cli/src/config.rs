@@ -156,6 +156,9 @@ pub struct CompactionConfig {
     pub min_interval_turns: Option<u32>,
     pub tail_messages: Option<usize>,
     pub summary_max_bytes: Option<usize>,
+    /// Kill-switch for the bitmap compaction attachment (default on): set
+    /// `false` to keep summary text only.
+    pub bitmap_compaction: Option<bool>,
 }
 
 /// `[verify]` section (Phase-2a D3).
@@ -445,17 +448,33 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[compaction]\nthreshold_frac = 0.7\ntail_messages = 8\n\n[verify]\ncommand = \"cargo test --quiet\"\n",
+            "[compaction]\nthreshold_frac = 0.7\ntail_messages = 8\nbitmap_compaction = false\n\n[verify]\ncommand = \"cargo test --quiet\"\n",
         )
         .unwrap();
         let config = load_from(&path, no_env);
         let compaction = config.compaction.expect("compaction section parsed");
         assert_eq!(compaction.threshold_frac, Some(0.7));
         assert_eq!(compaction.tail_messages, Some(8));
+        assert_eq!(compaction.bitmap_compaction, Some(false));
         assert_eq!(compaction.enabled, None, "unset fields stay None");
         assert_eq!(
             config.verify.expect("verify parsed").command,
             "cargo test --quiet"
+        );
+    }
+
+    #[test]
+    fn compaction_section_without_bitmap_field_keeps_engine_default() {
+        // Old configs (pre-bitmap field) must parse; the engine default
+        // (on) applies because the section simply omits the key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[compaction]\nenabled = true\n").unwrap();
+        let config = load_from(&path, no_env);
+        assert_eq!(
+            config.compaction.unwrap().bitmap_compaction,
+            None,
+            "unset bitmap_compaction stays None (engine default wins)"
         );
     }
 }

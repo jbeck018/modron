@@ -72,6 +72,7 @@ fn compaction_config(max_input_tokens: u64, threshold_frac: f64) -> EngineConfig
             min_interval_turns: 2,
             tail_messages: 1,
             summary_max_bytes: 2048,
+            bitmap_compaction: true,
         },
         ..EngineConfig::default()
     }
@@ -82,10 +83,21 @@ fn engine(
     config: EngineConfig,
     store: Arc<InMemoryStore>,
 ) -> Engine {
+    engine_with_model(provider, config, store, "mock-model")
+}
+
+/// Same as [`engine`] but pins the selected model id — the bitmap gate keys
+/// on the model the selector hands the engine for the post-compaction turn.
+fn engine_with_model(
+    provider: Arc<dyn ModelProvider>,
+    config: EngineConfig,
+    store: Arc<InMemoryStore>,
+    model: &str,
+) -> Engine {
     let mut providers = HashMap::new();
     providers.insert("mock".to_string(), provider);
     Engine {
-        selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+        selector: Arc::new(StaticSelector::new(model, "mock")),
         providers,
         tools: registry(),
         store,
@@ -476,6 +488,7 @@ fn phase0_session_events_still_load_and_compaction_roundtrips() {
             min_interval_turns: 4,
             tail_messages: 6,
             summary_max_bytes: 2048,
+            bitmap_compaction: true,
         }
     );
 }
@@ -582,6 +595,7 @@ async fn compaction_uses_the_model_window_not_the_global_cap() {
                 min_interval_turns: 0,
                 tail_messages: 1, // the 40k message must NOT survive in the tail
                 summary_max_bytes: 2048,
+                bitmap_compaction: true,
             },
             ..modron_core::EngineConfig::default()
         },
@@ -596,5 +610,82 @@ async fn compaction_uses_the_model_window_not_the_global_cap() {
     assert_eq!(
         compactions, 1,
         "compaction fired against the 10k model window despite the 180k global cap"
+    );
+}
+
+/// Bitmap compaction gate (oh-my-pi pattern): the pruned older transcript
+/// rides the compact-state message as ONE pixel-font PNG attachment, but
+/// only when the model selected for the NEXT turn is vision-capable — a
+/// text-only model would pay image tokens for pixels it cannot read. The
+/// text summary is kept in every branch (the bitmap is additive). The
+/// kill-switch (`bitmap_compaction: false`) must also suppress it.
+#[tokio::test]
+async fn compaction_attaches_bitmap_for_vision_models_only() {
+    // (a) Vision model: exactly one image/png attachment on the compact
+    // state, with the text summary still in place.
+    let provider = scripted_provider();
+    let engine = engine_with_model(
+        provider.clone(),
+        compaction_config(4000, 0.4),
+        Arc::new(InMemoryStore::new()),
+        "claude-opus-5-5",
+    );
+    engine.run_task(TASK).await.unwrap();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4, "turn1 + turn2 + compaction call + turn3");
+    let compact = &requests[3].messages[0];
+    assert!(
+        compact
+            .content
+            .starts_with("Conversation compacted; summary of earlier work:\n"),
+        "the text summary always stays"
+    );
+    assert!(compact.content.contains(SUMMARY));
+    assert_eq!(compact.attachments.len(), 1, "vision model gets the bitmap");
+    match &compact.attachments[0] {
+        modron_core::Attachment::Image { media_type, data } => {
+            assert_eq!(media_type, "image/png");
+            let bytes = modron_core::b64::decode(data).expect("valid base64 body");
+            assert_eq!(&bytes[..4], b"\x89PNG", "body is PNG bytes");
+        }
+        other => panic!("expected an image attachment, got {other:?}"),
+    }
+
+    // (b) Non-vision model: same script, same policy — no attachment.
+    let provider = scripted_provider();
+    let engine = engine_with_model(
+        provider.clone(),
+        compaction_config(4000, 0.4),
+        Arc::new(InMemoryStore::new()),
+        "nonvision-model",
+    );
+    engine.run_task(TASK).await.unwrap();
+    let requests = provider.requests();
+    let compact = &requests[3].messages[0];
+    assert!(
+        compact.content.contains(SUMMARY),
+        "summary text is unaffected"
+    );
+    assert!(
+        compact.attachments.is_empty(),
+        "non-vision model must not receive a bitmap"
+    );
+
+    // (c) Kill-switch: `bitmap_compaction = false` suppresses the bitmap
+    // even for a vision-capable model.
+    let provider = scripted_provider();
+    let mut config = compaction_config(4000, 0.4);
+    config.compaction.bitmap_compaction = false;
+    let engine = engine_with_model(
+        provider.clone(),
+        config,
+        Arc::new(InMemoryStore::new()),
+        "claude-opus-5-5",
+    );
+    engine.run_task(TASK).await.unwrap();
+    let compact = &provider.requests()[3].messages[0];
+    assert!(
+        compact.attachments.is_empty(),
+        "the policy kill-switch must suppress the bitmap"
     );
 }

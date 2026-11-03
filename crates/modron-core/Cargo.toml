@@ -22,6 +22,10 @@ sha2.workspace = true
 # Real dependency (not dev): hooks (H1) spawn hook processes with timeouts,
 # matching the providers-crate precedent for retry backoff.
 tokio.workspace = true
+# PNG encoder for bitmap context compaction (bitmap_compact.rs): a pruned
+# transcript rendered as one pixel-font image a vision model reads in ~1-2k
+# tokens. Pure Rust, no system libpng.
+png = "0.17"
 
 [dev-dependencies]
 tokio.workspace = true
