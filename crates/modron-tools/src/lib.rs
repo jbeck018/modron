@@ -84,6 +84,42 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
     registry
 }
 
+/// Tools that stay in the model-visible schema. Harness research (2026:
+/// Harness-Bench, oh-my-pi) is unambiguous: top harnesses pin a SMALL
+/// deliberate tool surface (~14) and mount the rest on demand — every
+/// hidden schema is tokens paid on every request, and `tool_search`
+/// keeps the rest discoverable.
+pub const ESSENTIAL_TOOLS: [&str; 11] = [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "glob",
+    "tool_search",
+    "skill",
+    "memory_search",
+    "diagnostics",
+    "verify",
+];
+
+/// Demote every registered tool not in [`ESSENTIAL_TOOLS`] to on-demand
+/// (hidden from the prompt schema; still callable and discoverable via
+/// `tool_search`). Applied once, after the production registry is fully
+/// assembled — MCP tools (already on-demand) are unaffected.
+pub fn tier_default_tools(registry: &mut ToolRegistry) {
+    let hide: Vec<String> = registry
+        .specs()
+        .into_iter()
+        .filter(|s| !ESSENTIAL_TOOLS.contains(&s.name.as_str()))
+        .filter(|s| !registry.is_on_demand(&s.name))
+        .map(|s| s.name)
+        .collect();
+    for name in hide {
+        registry.mark_on_demand(&name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +134,34 @@ mod tests {
             vec!["bash", "edit", "glob", "grep", "read", "write"],
             "sorted spec names"
         );
+    }
+
+    #[test]
+    fn tiering_keeps_only_essential_tools_in_the_prompt() {
+        let mut registry = default_registry_with_memory(Path::new("/tmp/modron-test-memory"));
+        tier_default_tools(&mut registry);
+        let prompt = registry.specs_prompt();
+        let names: Vec<&str> = prompt.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"remember"),
+            "on-demand tools stay declared: {names:?}"
+        );
+        for spec in &prompt {
+            let essential = ESSENTIAL_TOOLS.contains(&spec.name.as_str());
+            assert_eq!(
+                essential,
+                !spec.description.contains("on-demand tool"),
+                "{}: essential tools keep full schemas, others get stubs",
+                spec.name
+            );
+        }
+        for hidden in ["remember", "read_minified"] {
+            assert!(
+                registry.specs().iter().any(|s| s.name == hidden),
+                "{hidden} stays registered"
+            );
+            assert!(registry.is_on_demand(hidden), "{hidden} is on-demand");
+        }
     }
 
     #[test]

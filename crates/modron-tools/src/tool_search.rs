@@ -198,14 +198,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finds_on_demand_tools_the_prompt_hides() {
+    async fn finds_on_demand_tools_the_prompt_stubs() {
         let engine = engine_with_tools();
-        // The prompt must NOT carry the on-demand tools…
+        // On-demand tools ride the prompt as STUBS (declared, minimal
+        // schema) — not full schemas…
         let prompt_specs = engine.tools.specs_prompt();
-        assert!(prompt_specs
+        let stub = prompt_specs
             .iter()
-            .all(|s| s.name != "mcp__github__create_issue"));
-        assert!(prompt_specs.iter().all(|s| s.name != "mcp__slack__post"));
+            .find(|s| s.name == "mcp__github__create_issue")
+            .expect("on-demand tools stay declared as stubs");
+        assert!(stub.description.contains("on-demand tool"), "{stub:?}");
+        assert_eq!(stub.parameters, serde_json::json!({"type": "object"}));
         // …but they stay callable…
         assert!(engine.tools.get("mcp__github__create_issue").is_some());
         // …and searchable.

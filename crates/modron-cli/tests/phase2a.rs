@@ -197,7 +197,11 @@ async fn verify_failure_is_visible_to_the_model() {
     assert!(verdict.content.contains("exit code: 1"));
     // The gate fed the failure back; with a permanently failing command
     // it exhausts its rounds and ends with the visible marker.
-    assert!(summary.answer.starts_with("fixed"), "{:?}" , summary.answer);
-    assert!(summary.answer.contains("verification still failing"), "{:?}", summary.answer);
+    assert!(summary.answer.starts_with("fixed"), "{:?}", summary.answer);
+    assert!(
+        summary.answer.contains("verification still failing"),
+        "{:?}",
+        summary.answer
+    );
     assert!(summary.turns >= 4);
 }

@@ -1191,6 +1191,10 @@ fn build_agent_with(
     registry.register(Arc::new(modron_tools::SkillTool::for_working_dir(
         &working_dir,
     )));
+    // Tool tiering: only ESSENTIAL_TOOLS stay in the prompt schema; the
+    // rest (explore, delegate_status, merge_worktree, memory pair,
+    // read_minified) are on-demand and discoverable via tool_search.
+    modron_tools::tier_default_tools(&mut registry);
     for reg in mcp {
         registry.register(Arc::new(modron_mcp::McpTool::new(
             Arc::clone(&reg.handle),

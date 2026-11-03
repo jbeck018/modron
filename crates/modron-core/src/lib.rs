@@ -319,11 +319,28 @@ impl ToolRegistry {
     }
     /// Specs for the SYSTEM PROMPT: everything except on-demand tools.
     pub fn specs_prompt(&self) -> Vec<ToolSpec> {
+        // On-demand tools ride the wire schema as STUBS: declared (so
+        // structured tool-calling providers accept calls to them) at
+        // ~10 tokens each, with the full schema discoverable via
+        // `tool_search`. Dropping them entirely would make them
+        // uncallable on strict providers; full schemas would pay their
+        // cost on every request.
         let mut v: Vec<_> = self
             .tools
             .values()
-            .map(|t| t.spec())
-            .filter(|s| !self.on_demand.contains(&s.name))
+            .map(|t| {
+                let spec = t.spec();
+                if self.on_demand.contains(&spec.name) {
+                    ToolSpec {
+                        description: "on-demand tool — call tool_search for its full                                       schema and usage"
+                            .into(),
+                        parameters: serde_json::json!({"type": "object"}),
+                        ..spec
+                    }
+                } else {
+                    spec
+                }
+            })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
