@@ -27,6 +27,11 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 /// (`read`, `glob`, `grep`, `remember`, …) is read-only and never gated.
 const MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
 
+/// Finish-gate bound: verification feedback rounds before the run may end
+/// without passing verification (StaminaBench: gains plateau after 3-5
+/// retries; 2 keeps the worst case tight).
+const MAX_VERIFY_ROUNDS: u32 = 2;
+
 /// Output-token ask for the compaction (summarizer) call — small by design
 /// (PLAN.md §4.10): a compact state is a few hundred tokens at most, and the
 /// summary is byte-capped again before it is persisted.
@@ -167,6 +172,13 @@ impl Engine {
         // back into the usefulness ledger when the run completes.
         let mut memory_hits: Vec<String> = Vec::new();
         let mut spend_usd = 0.0_f64;
+        // Finish-gate state: whether a mutating tool was dispatched this
+        // run, and how many verification rounds have been spent.
+        let mut mutated_this_run = false;
+        let mut verify_rounds: u32 = 0;
+        // Whether the most recent dispatch turn ENDED with a passing
+        // `verify` call — the model's own evidence satisfies the gate.
+        let mut last_dispatch_ended_with_passing_verify = false;
 
         loop {
             if turns >= self.config.max_turns {
@@ -372,7 +384,39 @@ impl Engine {
             answer = response.text;
 
             if response.stop_reason != StopReason::ToolUse || response.tool_calls.is_empty() {
-                break;
+                // Finish gate (harness-enforced verification): a run that
+                // dispatched mutating tools must show verify evidence
+                // before it may end — outcome-only scoring hides unverified
+                // work (AgentLens: 94.3% of lucky passes lack it). Arms
+                // only when a `verify` tool is registered (i.e. [verify]
+                // configured); failures feed the output back verbatim and
+                // continue — StaminaBench's retry-with-test-feedback loop,
+                // bounded to MAX_VERIFY_ROUNDS per run.
+                if !self
+                    .run_finish_gate(
+                        session_id,
+                        &mut transcript,
+                        &mut mutated_this_run,
+                        &mut verify_rounds,
+                        &mut answer,
+                        last_dispatch_ended_with_passing_verify,
+                    )
+                    .await?
+                {
+                    break;
+                }
+                continue;
+            }
+
+            // A requested mutating call arms the finish gate (conservative:
+            // a vetoed or failed call still counts — the model ATTEMPTED a
+            // mutation, so unverified finishes stay blocked).
+            if response
+                .tool_calls
+                .iter()
+                .any(|c| MUTATING_TOOLS.contains(&c.name.as_str()))
+            {
+                mutated_this_run = true;
             }
 
             // Dispatch tool calls; each result enters the transcript. Hooks
@@ -420,6 +464,13 @@ impl Engine {
                 }
                 outcomes
             };
+            last_dispatch_ended_with_passing_verify = response
+                .tool_calls
+                .last()
+                .map(|c| c.name == "verify")
+                .unwrap_or(false)
+                && outcomes.last().map(|o| !o.is_error).unwrap_or(false);
+
             for (call, outcome) in response.tool_calls.iter().zip(&outcomes) {
                 tracing::info!(
                     tool = %call.name,
@@ -783,6 +834,91 @@ impl Engine {
             && (context_tokens as f64) > policy.threshold_frac * (effective_cap as f64)
     }
 
+    /// Pre-flight estimate of the tokens the next provider call will see:
+    /// system prompt + tool schemas + full transcript (incl. tool-call JSON).
+    /// Run one finish-gate check at a natural end-of-run.
+    ///
+    /// Returns `true` when the run must CONTINUE (verification failed and
+    /// rounds remain — the failure output was appended to `transcript` as a
+    /// user message and persisted), `false` when the run may end. The gate
+    /// disarms (`mutated` cleared) on a passing verification, and is skipped
+    /// when the previous turn already ended with a passing `verify` call (no
+    /// duplicate suite runs). Harness-initiated: direct tool execution, no
+    /// approval prompt or hook veto; round bound is per-run (resume grants a
+    /// fresh bound).
+    async fn run_finish_gate(
+        &self,
+        session_id: SessionId,
+        transcript: &mut Vec<Message>,
+        mutated: &mut bool,
+        rounds: &mut u32,
+        answer: &mut String,
+        last_dispatch_ended_with_passing_verify: bool,
+    ) -> Result<bool> {
+        if !*mutated || *rounds >= MAX_VERIFY_ROUNDS {
+            if *mutated && *rounds >= MAX_VERIFY_ROUNDS {
+                // Bound exhausted: let the run end, but never silently.
+                *answer = format!(
+                    "{answer}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]"
+                )
+                .trim()
+                .to_string();
+            }
+            return Ok(false);
+        }
+        let Some(verify_tool) = self.tools.get("verify") else {
+            return Ok(false);
+        };
+        // Skip when the previous dispatch already ended with a passing
+        // verify (the model showed its evidence — no duplicate suite run).
+        if last_dispatch_ended_with_passing_verify {
+            *mutated = false;
+            return Ok(false);
+        }
+        *rounds += 1;
+        let ctx = ToolCtx {
+            sandbox: self.config.sandbox,
+            working_dir: self.config.working_dir.clone(),
+            engine: Some(Arc::new(self.clone())),
+        };
+        let outcome = verify_tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .unwrap_or_else(|err| ToolOutcome::err(err.to_string()));
+        tracing::info!(
+            round = *rounds,
+            passed = !outcome.is_error,
+            "finish gate verification"
+        );
+        let passed = !outcome.is_error;
+        // Persisted as a user message (not an orphan ToolResult): resume and
+        // compaction rebuild transcripts from the event log and an unpaired
+        // Role::Tool breaks provider request building.
+        let feedback = Message::user(if passed {
+            format!("Verification passed:\n{}", outcome.content)
+        } else {
+            format!(
+                "The verification command failed:\n{}\nFix the failures, then finish — the harness will re-run verification.",
+                outcome.content
+            )
+        });
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: feedback.clone(),
+                },
+            )
+            .await?;
+        transcript.push(feedback);
+        if passed {
+            *mutated = false;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// One compaction pass (X1, PLAN.md §4.10): load the session's events,
     /// render everything older than the policy tail
     /// ([`compact::older_transcript_text`]), summarize it with a routed
@@ -994,8 +1130,6 @@ fn derive_action(messages: &[Message]) -> ActionKind {
     ActionKind::Chat
 }
 
-/// Pre-flight estimate of the tokens the next provider call will see:
-/// system prompt + tool schemas + full transcript (incl. tool-call JSON).
 fn estimate_context_tokens(system: &str, tools: &[ToolSpec], messages: &[Message]) -> u64 {
     let mut tokens = estimate_tokens(system);
     if let Ok(json) = serde_json::to_string(tools) {
@@ -1015,6 +1149,8 @@ fn estimate_context_tokens(system: &str, tools: &[ToolSpec], messages: &[Message
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{EngineConfig, Tool, ToolOutcome, ToolRegistry, TurnResponse};
+    use async_trait::async_trait;
     use serde_json::json;
 
     #[test]
@@ -1061,6 +1197,173 @@ mod tests {
         assert!(
             est > 3,
             "estimate must include the tool schema cost, got {est}"
+        );
+    }
+
+    /// A write tool (records the call) and a verify tool whose first run
+    /// fails and second passes — the finish-gate scenario.
+    struct GateWriteTool;
+    #[async_trait]
+    impl Tool for GateWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "test write".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::ok("wrote"))
+        }
+    }
+    struct GateVerifyTool(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl Tool for GateVerifyTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "verify".into(),
+                description: "test verify".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(ToolOutcome::err("test run failed: 2 tests failed"))
+            } else {
+                Ok(ToolOutcome::ok("all green"))
+            }
+        }
+    }
+
+    struct AlwaysFailVerifyTool;
+    #[async_trait]
+    impl Tool for AlwaysFailVerifyTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "verify".into(),
+                description: "test verify".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::err("test run failed"))
+        }
+    }
+
+    fn gate_engine(script: Vec<TurnResponse>) -> (Engine, std::sync::Arc<GateVerifyTool>) {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let verify = std::sync::Arc::new(GateVerifyTool(std::sync::atomic::AtomicUsize::new(0)));
+        registry.register(std::sync::Arc::clone(&verify) as std::sync::Arc<dyn Tool>);
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::new(crate::testing::MockProvider::with_script(script)),
+        );
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig::default(),
+        };
+        (engine, verify)
+    }
+
+    fn call(name: &str) -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("c-{name}"),
+                name: name.into(),
+                arguments: json!({}),
+            }],
+            usage: Default::default(),
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    fn text(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_gate_feeds_verify_failures_back_until_green() {
+        // Turn 1 writes; turn 2 tries to finish (verify FAILS -> feedback);
+        // turn 3 finishes again (verify passes -> run ends).
+        let (engine, verify) = gate_engine(vec![call("write"), text("done?"), text("done")]);
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "done");
+        assert_eq!(
+            verify.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "verify ran twice (fail then pass)"
+        );
+        assert!(summary.turns >= 3, "the gate forced an extra model turn");
+    }
+
+    #[tokio::test]
+    async fn finish_gate_is_inert_without_a_registered_verify_tool() {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::new(crate::testing::MockProvider::with_script(vec![
+                call("write"),
+                text("done"),
+            ])),
+        );
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig::default(),
+        };
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.turns, 2, "no verify tool registered: no gate");
+    }
+
+    #[tokio::test]
+    async fn finish_gate_gives_up_after_max_rounds() {
+        // Verify always fails: the run ends after MAX_VERIFY_ROUNDS rounds
+        // of feedback rather than looping forever.
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        registry.register(std::sync::Arc::new(AlwaysFailVerifyTool));
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::new(crate::testing::MockProvider::with_script(vec![
+                call("write"),
+                text("attempt 1"),
+                text("attempt 2"),
+                text("attempt 3"),
+            ])),
+        );
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig::default(),
+        };
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(
+            summary.answer,
+            "attempt 3
+
+[verification still failing after 2 rounds — see transcript]"
         );
     }
 }

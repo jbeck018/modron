@@ -152,9 +152,13 @@ async fn verify_tool_runs_through_the_engine() {
 async fn verify_failure_is_visible_to_the_model() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn SessionStore> = Arc::new(JsonlSessionStore::new(dir.path().join("s")));
+    // The finish gate now also fires at end-of-run (verify is a mutating
+    // tool and its first run failed), forcing one more scripted turn.
     let provider = MockProvider::new()
         .then_response(tool_call_response("c1", "verify", json!({})))
-        .then_response(text_response("will fix"));
+        .then_response(text_response("will fix"))
+        .then_response(text_response("fixed"))
+        .then_repeat_last();
     let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
     providers.insert("mock".to_string(), Arc::new(provider));
 
@@ -191,4 +195,9 @@ async fn verify_failure_is_visible_to_the_model() {
     assert!(verdict.is_error);
     assert!(verdict.content.contains("2 tests failed"));
     assert!(verdict.content.contains("exit code: 1"));
+    // The gate fed the failure back; with a permanently failing command
+    // it exhausts its rounds and ends with the visible marker.
+    assert!(summary.answer.starts_with("fixed"), "{:?}" , summary.answer);
+    assert!(summary.answer.contains("verification still failing"), "{:?}", summary.answer);
+    assert!(summary.turns >= 4);
 }
