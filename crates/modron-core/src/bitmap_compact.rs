@@ -252,19 +252,17 @@ fn wrap_ascii(text: &str, budget: usize) -> Vec<Vec<u8>> {
 // Vision gate
 // ---------------------------------------------------------------------------
 
-/// Whether `model` is vision-capable AND its provider actually encodes
-/// message attachments on the wire (anthropic and openai-compat do; the
-/// chatgpt Responses path drops attachments today, so gpt-6/gpt-5.6 ids
-/// are excluded until it learns them — a bitmap there would be silently
-/// wasted pixels). Deliberately a small explicit list, not catalog
-/// metadata: unknown models return `false`, so a typo costs a bitmap,
-/// never a broken turn. Case-insensitive prefix match covers tier/size
-/// suffixes (`glm-5.3-air`). Known limitation: the gate checks the model
-/// at compaction time — a later routed non-vision model receives the PNG
-/// as an ordinary (ignored) attachment.
+/// Whether `model` is vision-capable AND its provider encodes message
+/// attachments on the wire (anthropic, openai-compat, and — since this
+/// follow-up — the chatgpt Responses path). Deliberately a small explicit
+/// list, not catalog metadata: unknown models return `false`, so a typo
+/// costs a bitmap, never a broken turn. Case-insensitive prefix match
+/// covers tier/size suffixes (`glm-5.3-air`). Known limitation: the gate
+/// checks the model at compaction time — a later routed non-vision model
+/// receives the PNG as an ordinary (ignored) attachment.
 pub fn vision_capable(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    ["claude-", "glm-5.3"]
+    ["claude-", "glm-5.3", "gpt-6", "gpt-5.6"]
         .iter()
         .any(|prefix| model.starts_with(prefix))
 }
@@ -393,20 +391,13 @@ mod tests {
             "glm-5.3",
             "glm-5.3-air",
             "GLM-5.3",
-        ] {
-            assert!(vision_capable(model), "{model} should be vision-capable");
-        }
-        for model in [
-            "nonvision-model",
-            "mock-model",
-            "small-window-model",
-            "",
-            // gpt-6/gpt-5.6 ride the chatgpt Responses provider, which
-            // does not encode attachments yet (doc comment above).
             "gpt-6",
             "gpt-6-mini",
             "gpt-5.6-turbo",
         ] {
+            assert!(vision_capable(model), "{model} should be vision-capable");
+        }
+        for model in ["nonvision-model", "mock-model", "small-window-model", ""] {
             assert!(!vision_capable(model), "{model} must not gate a bitmap in");
         }
     }

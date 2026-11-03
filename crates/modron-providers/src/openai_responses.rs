@@ -292,11 +292,38 @@ pub fn build_body(req: &TurnRequest) -> Value {
     let mut input: Vec<Value> = Vec::new();
     for message in &req.messages {
         match message.role {
-            Role::User => input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": message.content}],
-            })),
+            Role::User => {
+                // Multimodal: images ride as input_image data URLs (the
+                // Responses wire form of image_url parts); documents
+                // inline as text parts, mirroring the openai-compat
+                // encoding. This also unlocks bitmap-compaction payloads
+                // for gpt-6/gpt-5.6 turns.
+                let mut content = vec![json!({
+                    "type": "input_text",
+                    "text": message.content,
+                })];
+                for attachment in &message.attachments {
+                    match attachment {
+                        modron_core::Attachment::Image { media_type, data } => {
+                            content.push(json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{media_type};base64,{data}"),
+                            }));
+                        }
+                        modron_core::Attachment::Document { name, text } => {
+                            content.push(json!({
+                                "type": "input_text",
+                                "text": format!("[Attached document: {name}]\n{text}"),
+                            }));
+                        }
+                    }
+                }
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                }));
+            }
             Role::Assistant => {
                 if !message.content.is_empty() {
                     input.push(json!({
@@ -585,6 +612,39 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("usage limit"), "{err}");
+    }
+
+    #[test]
+    fn body_encodes_attachments_as_input_parts() {
+        let mut req = request();
+        // Replace the transcript with ONE user message carrying both
+        // attachment kinds.
+        req.messages = vec![Message {
+            role: Role::User,
+            content: "see this".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            attachments: vec![
+                modron_core::Attachment::Image {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                },
+                modron_core::Attachment::Document {
+                    name: "notes.txt".into(),
+                    text: "hello doc".into(),
+                },
+            ],
+        }];
+        let body = build_body(&req);
+        let content = &body["input"][0]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 3);
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,QUJD");
+        assert_eq!(content[2]["type"], "input_text");
+        assert!(content[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[Attached document: notes.txt]"));
     }
 
     #[test]

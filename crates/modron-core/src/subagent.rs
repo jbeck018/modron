@@ -150,6 +150,13 @@ pub async fn delegate(
         if allowed {
             if let Some(tool) = parent.tools.get(&spec.name) {
                 registry.register(Arc::clone(tool));
+                // Carry the parent's essential/discoverable tiering: a
+                // tool the parent stubs stays a stub in the child, so the
+                // child's prompt prefix keeps the same small-schema shape
+                // (tool_search remains available for the full schema).
+                if parent.tools.is_on_demand(&spec.name) {
+                    registry.mark_on_demand(&spec.name);
+                }
             }
         }
     }

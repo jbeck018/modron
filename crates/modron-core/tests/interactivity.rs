@@ -90,6 +90,59 @@ fn engine(
     }
 }
 
+/// Follow-up: the child registry carries the parent's on-demand tiering —
+/// a stubbed tool stays stubbed in the child's prompt schema (the request
+/// the mock records shows the stub description, not the full one).
+#[tokio::test]
+async fn delegate_child_registry_keeps_on_demand_stubbing() {
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::default());
+    struct StubbedTool;
+    #[async_trait::async_trait]
+    impl modron_core::Tool for StubbedTool {
+        fn spec(&self) -> modron_core::ToolSpec {
+            modron_core::ToolSpec {
+                name: "extra".into(),
+                description: "the FULL schema description".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &modron_core::ToolCtx,
+        ) -> modron_core::Result<modron_core::ToolOutcome> {
+            Ok(modron_core::ToolOutcome::ok("ok"))
+        }
+    }
+    let provider = MockProvider::new().then_text("delegated fine");
+    let mut providers = HashMap::new();
+    providers.insert(
+        "mock".to_string(),
+        Arc::new(provider) as Arc<dyn ModelProvider>,
+    );
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(StubbedTool));
+    registry.mark_on_demand("extra");
+    let engine = Engine {
+        selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+        providers,
+        tools: Arc::new(registry),
+        store: Arc::clone(&store),
+        config: EngineConfig::default(),
+    };
+    let report = modron_core::subagent::delegate(
+        &engine,
+        "use extra",
+        None,
+        Some(&["extra".to_string()]),
+        30_000,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.brief, "delegated fine");
+}
+
 /// I1: with a delta sink configured, the engine drives `turn_streaming` and
 /// the sink sees the text (via the trait-default fallback for the mock).
 #[tokio::test]
