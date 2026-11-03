@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub mod auth;
 pub mod b64;
+pub mod bitmap_compact;
 pub mod budget;
 pub mod builtin_skills;
 pub mod compact;
@@ -131,7 +132,7 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -381,13 +382,20 @@ pub struct TurnResponse {
 /// Deltas are strictly ordered; `Done` is final and sent only on success.
 /// Defined here so the frozen `ModelProvider` trait can carry the streaming
 /// method; `modron-providers` re-exports this type.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StreamDelta {
     /// A fragment of assistant text.
     Text(String),
     /// A fragment of extended-thinking / reasoning trace (never part of
     /// `TurnResponse`).
     Reasoning(String),
+    /// A COMPLETE tool call item emitted mid-stream, before the turn's
+    /// remaining items finish (multi-item streams complete items one at
+    /// a time). The engine uses these to speculatively execute idempotent
+    /// read tools while the rest of the turn still streams (oh-my-pi
+    /// pattern); sinks never see this variant — the engine driver
+    /// intercepts it.
+    ToolCallReady(ToolCall),
     /// The stream terminated cleanly.
     Done,
 }
@@ -646,7 +654,7 @@ pub trait AsyncRouter: Send + Sync {
 /// summarized by a routed cheap-model call (`ActionKind::Summarize`), capped
 /// at `summary_max_bytes`, while the `tail_messages` most recent transcript
 /// items stay verbatim. Compact once, not continuously.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactionPolicy {
     pub enabled: bool,
     /// Compaction trigger: estimated context > this fraction of
@@ -658,6 +666,19 @@ pub struct CompactionPolicy {
     pub tail_messages: usize,
     /// Hard byte cap on the stored summary (char-boundary truncation).
     pub summary_max_bytes: usize,
+    /// Attach the pruned transcript as a pixel-font bitmap image alongside
+    /// the summary (bitmap compaction, `bitmap_compact.rs`): vision-capable
+    /// models read the full older conversation back from one image instead
+    /// of a lossy re-summary. Kill-switch for configs that want summary
+    /// text only; serde default keeps pre-field configs loading as `true`.
+    #[serde(default = "default_bitmap_compaction")]
+    pub bitmap_compaction: bool,
+}
+
+/// Serde default for [`CompactionPolicy::bitmap_compaction`] — on by design
+/// (the bitmap is additive; the text summary is always kept either way).
+fn default_bitmap_compaction() -> bool {
+    true
 }
 
 impl Default for CompactionPolicy {
@@ -668,6 +689,7 @@ impl Default for CompactionPolicy {
             min_interval_turns: 4,
             tail_messages: 6,
             summary_max_bytes: 2048,
+            bitmap_compaction: true,
         }
     }
 }

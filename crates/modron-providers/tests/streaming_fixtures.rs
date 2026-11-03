@@ -215,13 +215,19 @@ async fn anthropic_streaming_fixture_matches_non_streaming_contract() {
     assert_eq!(recorded.body.get("stream"), Some(&json!(true)));
     assert_eq!(recorded.body["tools"][0]["name"], "glob");
 
-    // Deltas: exactly one Text fragment then Done, in order.
+    // Deltas: one Text fragment, the COMPLETE tool call emitted
+    // mid-stream (speculative-execution hook), then Done, in order.
     let deltas = drain(&mut rx);
     assert_eq!(
         deltas,
         vec![
             StreamDelta::Text("Let me check the repo.".into()),
-            StreamDelta::Done
+            StreamDelta::ToolCallReady(modron_core::ToolCall {
+                id: "toolu_01XYZ".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            }),
+            StreamDelta::Done,
         ]
     );
 

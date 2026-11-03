@@ -409,7 +409,7 @@ impl ResponsesAccumulator {
                                 message: format!("malformed tool arguments for `{name}`: {err}"),
                             })?
                         };
-                        self.tools.push(ToolCall {
+                        let call = ToolCall {
                             id: item
                                 .get("call_id")
                                 .and_then(Value::as_str)
@@ -417,7 +417,11 @@ impl ResponsesAccumulator {
                                 .to_string(),
                             name,
                             arguments,
-                        });
+                        };
+                        self.tools.push(call.clone());
+                        // Complete item mid-stream: the engine may start
+                        // speculating on it while later items stream.
+                        let _ = tx.send(modron_core::StreamDelta::ToolCallReady(call));
                     }
                 }
             }
@@ -563,6 +567,7 @@ mod tests {
             match d {
                 modron_core::StreamDelta::Text(_) => text += 1,
                 modron_core::StreamDelta::Reasoning(_) => reasoning += 1,
+                modron_core::StreamDelta::ToolCallReady(_) => {}
                 modron_core::StreamDelta::Done => {}
             }
         }

@@ -961,6 +961,9 @@ fn build_agent_with(
         if let Some(v) = section.summary_max_bytes {
             compaction.summary_max_bytes = v;
         }
+        if let Some(v) = section.bitmap_compaction {
+            compaction.bitmap_compaction = v;
+        }
     }
     if cli.no_compact {
         compaction.enabled = false;
@@ -1323,6 +1326,7 @@ fn stdout_delta_sink() -> Arc<modron_core::DeltaSink> {
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         StreamDelta::Reasoning(_) => {}
+        StreamDelta::ToolCallReady(_) => {}
         StreamDelta::Done => println!(),
     })
 }

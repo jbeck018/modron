@@ -406,7 +406,35 @@ impl StreamAccumulator {
                 }
             }
             Some("content_block_stop") => {
-                // Nothing to do: arguments are parsed once at finish().
+                // The block's arguments are COMPLETE: emit the call now so
+                // the engine can speculatively execute idempotent read
+                // tools while later blocks still stream. finish() re-parses
+                // from tool_blocks for the final TurnResponse (unchanged).
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if let Some((_, id, name, partial_json)) =
+                    self.tool_blocks.iter().find(|(i, ..)| *i == index).cloned()
+                {
+                    // Empty arguments are a legal no-arg call; malformed
+                    // JSON degrades to null exactly like finish() does.
+                    // Mirror finish(): empty partial_json is a no-arg call;
+                    // MALFORMED json is skipped here (no speculation on a
+                    // call the turn is about to fail on) — finish() errors
+                    // the whole turn for it.
+                    let raw_args = partial_json.trim();
+                    let arguments = if raw_args.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        match serde_json::from_str::<Value>(raw_args) {
+                            Ok(value) => value,
+                            Err(_) => return Ok(()),
+                        }
+                    };
+                    let _ = tx.send(StreamDelta::ToolCallReady(modron_core::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    }));
+                }
             }
             Some("message_delta") => {
                 if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {

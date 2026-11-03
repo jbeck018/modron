@@ -2172,6 +2172,7 @@ impl App {
                     self.reasoning.push_str(&t);
                 }
             }
+            StreamDelta::ToolCallReady(_) => {}
             StreamDelta::Done => {}
         }
     }

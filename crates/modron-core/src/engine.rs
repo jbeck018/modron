@@ -6,6 +6,7 @@
 //! trips. Every event is appended to the `SessionStore` as it happens, so a
 //! crashed run still leaves a usable transcript.
 
+use crate::bitmap_compact;
 use crate::budget::BudgetGovernor;
 use crate::compact;
 use crate::context;
@@ -31,6 +32,18 @@ const MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
 /// without passing verification (StaminaBench: gains plateau after 3-5
 /// retries; 2 keeps the worst case tight).
 const MAX_VERIFY_ROUNDS: u32 = 2;
+
+/// Idempotent, side-effect-free tools eligible for speculative execution
+/// (started mid-stream when the provider completes a tool-call item early,
+/// reused by the dispatch once the turn finishes — oh-my-pi pattern).
+/// bash/write/edit stay out: side effects must never run on a call the
+/// model might still revise.
+const SPECULATIVE_TOOLS: [&str; 3] = ["read", "grep", "glob"];
+
+/// Identity key for a speculative result: (tool, exact wire args).
+fn speculative_key(call: &ToolCall) -> String {
+    format!("{}:{}", call.name, call.arguments)
+}
 
 /// Output-token ask for the compaction (summarizer) call — small by design
 /// (PLAN.md §4.10): a compact state is a few hundred tokens at most, and the
@@ -224,13 +237,16 @@ impl Engine {
             // first, under context pressure and past the min-interval,
             // summarize the older transcript. Runs before the pre-flight
             // budget check so a compaction can rescue an over-cap context.
+            // The current selection is the model taking the NEXT turn —
+            // passed in so the bitmap attachment can be gated on its
+            // vision capability.
             if self.should_compact_with_cap(
                 turns,
                 turns_since_compaction,
                 context_tokens,
                 effective_cap,
             ) {
-                if let Some(outcome) = self.run_compaction(session_id, task).await? {
+                if let Some(outcome) = self.run_compaction(session_id, task, &choice.model).await? {
                     governor.feed_turn(outcome.usage);
                     spend_usd += self.turn_cost_usd(&outcome.model, &outcome.usage);
                     total.input_tokens += outcome.usage.input_tokens;
@@ -316,17 +332,107 @@ impl Engine {
             // forward deltas as they arrive (providers without an SSE
             // implementation yield one Text delta via the trait default).
             let turn_started = std::time::Instant::now();
+            // Speculative results computed during THIS turn's stream.
+            let mut speculative: std::collections::HashMap<String, ToolOutcome> =
+                std::collections::HashMap::new();
             let response = match self.config.on_delta.clone() {
                 Some(sink) => {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
-                    let forwarder = tokio::spawn(async move {
-                        while let Some(delta) = rx.recv().await {
-                            sink(delta);
+                    // Speculative driver: forwards deltas to the sink,
+                    // and when the provider completes a tool-call item
+                    // mid-stream, immediately executes idempotent reads
+                    // so the dispatch below can reuse the result instead
+                    // of re-running the tool. Gated OFF when any observer
+                    // or gate would be bypassed: pre_tool/post_tool
+                    // hooks, the on_tool_event sink, and the --deny list
+                    // all must keep seeing every execution.
+                    let speculation_safe = self.config.hooks.pre_tool.is_none()
+                        && self.config.hooks.post_tool.is_none()
+                        && self.config.on_tool_event.is_none()
+                        && !self
+                            .config
+                            .approvals
+                            .deny
+                            .iter()
+                            .any(|d| SPECULATIVE_TOOLS.contains(&d.as_str()));
+                    if speculation_safe {
+                        let spec_results: std::sync::Arc<
+                            std::sync::Mutex<std::collections::HashMap<String, ToolOutcome>>,
+                        > = std::sync::Arc::default();
+                        let engine_for_spec = Arc::new(self.clone());
+                        let driver_map = Arc::clone(&spec_results);
+                        // The driver owns the in-flight handles so every
+                        // speculation is joined before the drain below.
+                        let driver = tokio::spawn(async move {
+                            let mut in_flight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                            while let Some(delta) = rx.recv().await {
+                                match delta {
+                                    StreamDelta::ToolCallReady(call) => {
+                                        if !SPECULATIVE_TOOLS.contains(&call.name.as_str()) {
+                                            continue;
+                                        }
+                                        let key = speculative_key(&call);
+                                        // Placeholder first: duplicate
+                                        // items for the same call must
+                                        // not spawn duplicate executions.
+                                        {
+                                            let mut map = driver_map.lock().unwrap();
+                                            if map.contains_key(&key) {
+                                                continue;
+                                            }
+                                            map.insert(
+                                                key.clone(),
+                                                ToolOutcome::err(String::new()),
+                                            );
+                                        }
+                                        let engine = Arc::clone(&engine_for_spec);
+                                        let map = Arc::clone(&driver_map);
+                                        in_flight.push(tokio::spawn(async move {
+                                            let name = call.name.clone();
+                                            let ctx = ToolCtx {
+                                                sandbox: engine.config.sandbox,
+                                                working_dir: engine.config.working_dir.clone(),
+                                                engine: Some(Arc::clone(&engine)),
+                                            };
+                                            let outcome = match engine.tools.get(&name) {
+                                                Some(tool) => tool
+                                                    .execute(call.arguments.clone(), &ctx)
+                                                    .await
+                                                    .unwrap_or_else(|e| {
+                                                        ToolOutcome::err(e.to_string())
+                                                    }),
+                                                None => ToolOutcome::err("unknown tool"),
+                                            };
+                                            map.lock()
+                                                .unwrap()
+                                                .insert(speculative_key(&call), outcome);
+                                        }));
+                                    }
+                                    other => sink(other),
+                                }
+                            }
+                            in_flight
+                        });
+                        let result = provider.turn_streaming(request, tx).await;
+                        let in_flight = driver.await.unwrap_or_default();
+                        for handle in in_flight {
+                            let _ = handle.await;
                         }
-                    });
-                    let result = provider.turn_streaming(request, tx).await;
-                    let _ = forwarder.await;
-                    result?
+                        let drained: Vec<_> = spec_results.lock().unwrap().drain().collect();
+                        speculative.extend(drained);
+                        result?
+                    } else {
+                        // Plain forwarder: speculation disabled (hooks,
+                        // event sink, or deny list present).
+                        let forwarder = tokio::spawn(async move {
+                            while let Some(delta) = rx.recv().await {
+                                sink(delta);
+                            }
+                        });
+                        let result = provider.turn_streaming(request, tx).await;
+                        let _ = forwarder.await;
+                        result?
+                    }
                 }
                 None => provider.turn(request).await?,
             };
@@ -468,12 +574,8 @@ impl Engine {
                 let futures = response
                     .tool_calls
                     .iter()
-                    .map(|call| self.execute_tool_with_hooks(session_id, call, &ctx));
-                futures::future::join_all(futures)
-                    .await
-                    .into_iter()
-                    .map(|r| r.unwrap_or_else(|err| ToolOutcome::err(err.to_string())))
-                    .collect()
+                    .map(|call| self.dispatch_tool_call(session_id, call, &ctx, &speculative));
+                futures::future::join_all(futures).await
             } else {
                 let mut outcomes = Vec::with_capacity(response.tool_calls.len());
                 for call in &response.tool_calls {
@@ -483,9 +585,8 @@ impl Engine {
                         }
                     }
                     let outcome = self
-                        .execute_tool_with_hooks(session_id, call, &ctx)
-                        .await
-                        .unwrap_or_else(|err| ToolOutcome::err(err.to_string()));
+                        .dispatch_tool_call(session_id, call, &ctx, &speculative)
+                        .await;
                     outcomes.push(outcome);
                 }
                 outcomes
@@ -966,6 +1067,30 @@ impl Engine {
         Ok(true)
     }
 
+    /// Execute one model tool call, reusing a speculative result computed
+    /// mid-stream when (tool, args) match exactly. The deny list is
+    /// re-checked here: a result speculated before the dispatch must never
+    /// smuggle a denied tool's output into the transcript.
+    async fn dispatch_tool_call(
+        &self,
+        session_id: SessionId,
+        call: &ToolCall,
+        ctx: &ToolCtx,
+        speculative: &std::collections::HashMap<String, ToolOutcome>,
+    ) -> ToolOutcome {
+        if SPECULATIVE_TOOLS.contains(&call.name.as_str())
+            && !self.config.approvals.deny.iter().any(|d| d == &call.name)
+        {
+            if let Some(outcome) = speculative.get(&speculative_key(call)) {
+                tracing::info!(tool = %call.name, "speculative hit: reuse mid-stream result");
+                return outcome.clone();
+            }
+        }
+        self.execute_tool_with_hooks(session_id, call, ctx)
+            .await
+            .unwrap_or_else(|err| ToolOutcome::err(err.to_string()))
+    }
+
     /// One compaction pass (X1, PLAN.md §4.10): load the session's events,
     /// render everything older than the policy tail
     /// ([`compact::older_transcript_text`]), summarize it with a routed
@@ -974,6 +1099,13 @@ impl Engine {
     /// `Compaction` event plus its `Usage` event, and return the rebuilt
     /// transcript: `[compact state] + recent tail verbatim`.
     ///
+    /// Bitmap compaction (additive): when the policy allows it and
+    /// `next_model` — the model selected for the turn AFTER the compaction —
+    /// is vision-capable, the same older-transcript text is also rendered as
+    /// one pixel-font PNG and attached to the compact-state message, so the
+    /// model reads the full pruned history from a single image instead of
+    /// the lossy summary alone. The text summary is always kept.
+    ///
     /// `Ok(None)` means there was nothing older than the tail to summarize —
     /// no provider call, no events, no interval reset. The caller feeds the
     /// returned usage into the budget governor and run totals.
@@ -981,6 +1113,7 @@ impl Engine {
         &self,
         session_id: SessionId,
         task: &str,
+        next_model: &str,
     ) -> Result<Option<CompactionOutcome>> {
         let events = self.store.load(session_id).await?;
         let (older, tail) =
@@ -1009,7 +1142,7 @@ impl Engine {
         let request = TurnRequest {
             model: model.clone(),
             system: compact::summarizer_prompt().to_string(),
-            messages: vec![Message::user(older_text)],
+            messages: vec![Message::user(older_text.as_str())],
             tools: Vec::new(),
             max_tokens: COMPACTION_MAX_OUTPUT_TOKENS,
         };
@@ -1046,8 +1179,15 @@ impl Engine {
 
         // Rebuild the in-memory transcript: one compact-state user message
         // replaces everything summarized, then the recent tail verbatim.
+        // The bitmap (when gated in below) rides on that message only — the
+        // persisted `Compaction` event stays text-shaped, so old logs and
+        // non-vision resumes are unaffected.
+        let mut compact_message = compact_state_message(&summary);
+        if let Some(bitmap) = self.compaction_bitmap(&older_text, next_model) {
+            compact_message.attachments.push(bitmap);
+        }
         let mut transcript = Vec::with_capacity(tail.len() + 1);
-        transcript.push(compact_state_message(&summary));
+        transcript.push(compact_message);
         transcript.extend(events_to_messages(tail));
 
         // Debug-level: the CLI surfaces the user-facing `compacted: …
@@ -1059,6 +1199,23 @@ impl Engine {
             usage: response.usage,
             model,
         }))
+    }
+
+    /// The compact-state bitmap attachment, or `None` when it does not
+    /// apply: the policy kill-switch is off, the next-turn model is not
+    /// vision-capable (an unreadable image is pure token spend), or the
+    /// older transcript misses the bitmap's caps (empty/oversize). Every
+    /// refusal degrades to the text-only compact state — never an error.
+    fn compaction_bitmap(&self, older_text: &str, next_model: &str) -> Option<crate::Attachment> {
+        if !self.config.compaction.bitmap_compaction || !bitmap_compact::vision_capable(next_model)
+        {
+            tracing::debug!(
+                model = %next_model,
+                "compaction bitmap skipped (policy off or non-vision model)"
+            );
+            return None;
+        }
+        bitmap_compact::render_text_bitmap(older_text, bitmap_compact::COMPACT_BITMAP_WIDTH_PX)
     }
 }
 
@@ -1395,6 +1552,144 @@ mod tests {
                 .iter()
                 .any(|(_, _, label)| label.as_deref() == Some("end_turn")),
             "terminal record carries the stop label: {traces:?}"
+        );
+    }
+
+    /// Glob stub counting executions (speculative-execution tests).
+    struct CountingGlob(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl Tool for CountingGlob {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "glob".into(),
+                description: "counting glob".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(ToolOutcome::ok("one file"))
+        }
+    }
+
+    /// A provider that completes a read tool call MID-STREAM (emitting
+    /// ToolCallReady) and returns the same call at turn end.
+    struct SpeculativeStreamProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl ModelProvider for SpeculativeStreamProvider {
+        fn id(&self) -> &str {
+            "spec-stream"
+        }
+        async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+            unreachable!("streaming path under test")
+        }
+        async fn turn_streaming(
+            &self,
+            _req: TurnRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        ) -> Result<TurnResponse> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                // Turn 2+: finish with plain text.
+                let _ = tx.send(StreamDelta::Text("done".into()));
+                return Ok(TurnResponse {
+                    text: "done".into(),
+                    tool_calls: Vec::new(),
+                    usage: Default::default(),
+                    stop_reason: StopReason::EndTurn,
+                });
+            }
+            let read_call = ToolCall {
+                id: "s1".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            };
+            let _ = tx.send(StreamDelta::Text("checking ".into()));
+            let _ = tx.send(StreamDelta::ToolCallReady(read_call.clone()));
+            // Simulate the rest of the turn still streaming.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(TurnResponse {
+                text: String::new(),
+                tool_calls: vec![read_call],
+                usage: Default::default(),
+                stop_reason: StopReason::ToolUse,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn speculation_disabled_when_a_speculative_tool_is_denied() {
+        use std::collections::HashMap;
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(CountingGlob(Arc::clone(&executions))));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "spec-stream".into(),
+            Arc::new(SpeculativeStreamProvider {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "spec-stream")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                on_delta: Some(Arc::new(|_delta| {})),
+                approvals: crate::ApprovalPolicy {
+                    deny: vec!["glob".into()],
+                    ..crate::ApprovalPolicy::default()
+                },
+                ..EngineConfig::default()
+            },
+        };
+        // glob is denied: the dispatch blocks the call, so the run ends
+        // without any glob execution — and crucially the speculative
+        // driver must NOT have executed it either.
+        let summary = engine.run_task("list files").await.unwrap();
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a denied tool must never execute — not even speculatively"
+        );
+        // The denied call still counts as dispatched (its blocked outcome
+        // enters the transcript) — one call, zero executions is the contract.
+        assert_eq!(summary.tool_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn speculative_read_runs_once_and_is_reused_at_dispatch() {
+        use std::collections::HashMap;
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(CountingGlob(Arc::clone(&executions))));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "spec-stream".into(),
+            Arc::new(SpeculativeStreamProvider {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "spec-stream")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            // Streaming + an on_delta sink arms the speculative driver.
+            config: EngineConfig {
+                on_delta: Some(Arc::new(|_delta| {})),
+                ..EngineConfig::default()
+            },
+        };
+        let summary = engine.run_task("list files").await.unwrap();
+        assert!(summary.tool_calls >= 1, "the turn dispatched the glob call");
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "glob executed exactly once (speculated mid-stream, reused at dispatch)"
         );
     }
 
