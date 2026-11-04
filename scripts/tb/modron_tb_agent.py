@@ -143,7 +143,28 @@ class ModronTbAgent(BaseAgent):
         else:
             return AgentResult(failure_mode=FailureMode.AGENT_TIMEOUT)
 
-        # 5. Token usage: the LAST Usage event per model from the newest
+        # 5. Diagnostics into the trial's logging_dir: modron's stdout log
+        #    and its session transcript — without these a failed trial is
+        #    undissectable (the container is destroyed after the run).
+        if logging_dir is None:
+            # tb's custom-agent path passes None: fall back to a host-side
+            # scrape dir so failures stay dissectable.
+            logging_dir = Path("/tmp/modron-trial-logs") / time.strftime("%H%M%S")
+        if logging_dir is not None:
+            _copy_back(session, logging_dir, [
+                "/tmp/modron-run.log",
+                "/tmp/modron-exit",
+            ])
+            newest_out = session.container.exec_run(
+                ["sh", "-c",
+                 f"ls -t {home}/sessions/*.jsonl 2>/dev/null | head -1"],
+                user="root",
+            )
+            newest = (newest_out.output or b"").decode().strip()
+            if newest:
+                _copy_back(session, logging_dir, [newest])
+
+        # 6. Token usage: the LAST Usage event per model from the newest
         #    transcript (turn-level events repeat).
         out = session.container.exec_run(
             ["sh", "-c",
@@ -168,6 +189,25 @@ class ModronTbAgent(BaseAgent):
             failure_mode=FailureMode.NONE,
         )
 
+
+
+def _copy_back(session: TmuxSession, logging_dir: Path, remote_paths: list[str]) -> None:
+    """Copy files out of the task container into the trial log dir."""
+    import tarfile
+    from io import BytesIO
+
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    for remote in remote_paths:
+        try:
+            bits, _stat = session.container.get_archive(remote)
+        except Exception:
+            continue  # missing file (e.g. no exit marker on timeout)
+        tar = tarfile.open(fileobj=BytesIO(b"".join(bits)))
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+            out = logging_dir / Path(remote).name
+            out.write_bytes(tar.extractfile(member).read())
 
 def _summarize_usage(text: str) -> tuple[int, int]:
     last_per_model: dict[str, tuple[int, int]] = {}

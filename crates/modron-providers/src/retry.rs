@@ -40,9 +40,13 @@ pub struct RetryConfig {
 
 impl Default for RetryConfig {
     fn default() -> Self {
+        // Patient on transient bursts: provider-side overload (Z.ai 1305,
+        // 429s) routinely outlasts a 1-second budget — terminal-bench
+        // batch runs showed 2/8 trials dying to flakiness that passes on
+        // any retry. 5 attempts x 500ms base = ~13s of backoff ceiling.
         Self {
-            max_attempts: 3,
-            base_backoff: Duration::from_millis(200),
+            max_attempts: 5,
+            base_backoff: Duration::from_millis(500),
         }
     }
 }
@@ -431,7 +435,7 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "new default: 5 attempts");
     }
 
     #[test]
@@ -457,11 +461,11 @@ mod tests {
     }
 
     #[test]
-    fn backoff_schedule_is_200_then_800() {
+    fn backoff_schedule_is_500_then_2000() {
         let cfg = RetryConfig::default();
-        assert_eq!(cfg.backoff_for(0), Duration::from_millis(200));
-        assert_eq!(cfg.backoff_for(1), Duration::from_millis(800));
-        assert_eq!(cfg.backoff_for(2), Duration::from_millis(3200));
+        assert_eq!(cfg.backoff_for(0), Duration::from_millis(500));
+        assert_eq!(cfg.backoff_for(1), Duration::from_millis(2000));
+        assert_eq!(cfg.backoff_for(2), Duration::from_millis(8000));
     }
 
     /// Counting stub transport behind the [`RetryingProvider`] wrapper.
@@ -515,7 +519,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
-            "two retries after two failures"
+            "two retries after two failures (within the 5-attempt budget)"
         );
     }
 }
