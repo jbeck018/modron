@@ -41,10 +41,25 @@ POLL_SEC = 5
 MAX_RUN_SEC = 30 * 60
 
 
+def _provider_for(model: str) -> str:
+    """Provider id for the pinned run, from the model family."""
+    if model.startswith("gpt-"):
+        return "chatgpt"
+    if model.startswith("claude-"):
+        return "anthropic"
+    return "zai"
+
+
 class ModronTbAgent(BaseAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._model_name = kwargs.get("model_name", "glm-5.3")
+        # Pin provider+model together: without --provider the router picks
+        # per-turn tiers (e.g. the flash cheap tier), and a gated/overloaded
+        # flash model kills the trial even when the pinned model works.
+        self._provider = (
+            kwargs.get("provider_name") or _provider_for(self._model_name)
+        )
 
     @staticmethod
     def name() -> str:
@@ -107,7 +122,8 @@ class ModronTbAgent(BaseAgent):
             f"export HOME={home} MODRON_SESSIONS_DIR={home}/sessions "
             f"ZAI_API_KEY='{api_key}' ZAI_BASE_URL='{base_url}'; "
             f"mkdir -p {home}/sessions; rm -f /tmp/modron-exit; "
-            f"{BINARY_IN_CONTAINER} --model {self._model_name} --yolo "
+            f"{BINARY_IN_CONTAINER} --provider {self._provider} "
+            f"--model {self._model_name} --yolo "
             f"--sessions-dir {home}/sessions --max-turns 60 "
             f'"$(cat /tmp/modron-instruction.txt)" > /tmp/modron-run.log 2>&1; '
             "echo $? > /tmp/modron-exit\n"
