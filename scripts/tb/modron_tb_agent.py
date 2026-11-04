@@ -173,12 +173,14 @@ class ModronTbAgent(BaseAgent):
         except Exception:
             tracing = None  # capture is best-effort, never poison the result
 
-        # 6. Token usage: the LAST Usage event per model from the newest
-        #    transcript (turn-level events repeat).
+        # 6. Token usage: the LAST Usage event per model, parsed from the
+        #    /logs copy (guaranteed by the run command's cp) — the old
+        #    in-container grep raced the transcript flush and under-
+        #    reported several trials.
         out = session.container.exec_run(
             ["sh", "-c",
-             f"ls -t {home}/sessions/*.jsonl 2>/dev/null | head -1 | xargs "
-             f"grep -h '\"type\":\"usage\"' 2>/dev/null"],
+             "cat /logs/modron-session.jsonl 2>/dev/null; "
+             f"cat {home}/sessions/*.jsonl 2>/dev/null"],
             user="root",
         )
         input_tokens, output_tokens = _summarize_usage(
@@ -219,7 +221,11 @@ def _copy_back(session: TmuxSession, logging_dir: Path, remote_paths: list[str])
             out.write_bytes(tar.extractfile(member).read())
 
 def _summarize_usage(text: str) -> tuple[int, int]:
-    last_per_model: dict[str, tuple[int, int]] = {}
+    """Sum EVERY usage event: the engine logs per-turn deltas, not
+    cumulative totals (last-event logic under-reported long runs by ~20x).
+    Subagent spend arrives as its own events tagged "subagent (tool)" —
+    included, honest accounting."""
+    total_in = total_out = 0
     for line in text.splitlines():
         try:
             event = json.loads(line)
@@ -228,11 +234,6 @@ def _summarize_usage(text: str) -> tuple[int, int]:
         if event.get("type") != "usage":
             continue
         usage = event.get("usage", {})
-        last_per_model[event.get("model", "?")] = (
-            int(usage.get("input_tokens", 0)),
-            int(usage.get("output_tokens", 0)),
-        )
-    return (
-        sum(v[0] for v in last_per_model.values()),
-        sum(v[1] for v in last_per_model.values()),
-    )
+        total_in += int(usage.get("input_tokens", 0))
+        total_out += int(usage.get("output_tokens", 0))
+    return total_in, total_out
