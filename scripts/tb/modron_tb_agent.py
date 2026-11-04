@@ -35,7 +35,6 @@ from terminal_bench.terminal.tmux_session import TmuxSession
 DEFAULT_BINARY = (
     "target-linux-musl/x86_64-unknown-linux-musl/release/modron"
 )
-HOME_IN_CONTAINER = "/tmp/modron-home"
 BINARY_IN_CONTAINER = "/usr/local/bin/modron"
 POLL_SEC = 5
 MAX_RUN_SEC = 30 * 60
@@ -116,17 +115,24 @@ class ModronTbAgent(BaseAgent):
         #    ONE literal send ending in a newline: non-blocking sends go
         #    through verbatim (the blocking path strips and injects its
         #    own Enter machinery — two separate sends raced and merged).
-        home = HOME_IN_CONTAINER
+        home = "/tmp/modron-home"
         cmd = (
             f"chmod +x {BINARY_IN_CONTAINER}; "
-            f"export HOME={home} MODRON_SESSIONS_DIR={home}/sessions "
+            # NO HOME override: task images legitimately ship dotfiles in
+            # the home dir (aws creds, jupyter config, .ssh) and every TB
+            # trial is already a fresh container — isolation is free.
+            # Sessions still go to an explicit dir.
+            f"export MODRON_SESSIONS_DIR={home}/sessions "
             f"ZAI_API_KEY='{api_key}' ZAI_BASE_URL='{base_url}'; "
             f"mkdir -p {home}/sessions; rm -f /tmp/modron-exit; "
             f"{BINARY_IN_CONTAINER} --provider {self._provider} "
             f"--model {self._model_name} --yolo "
-            f"--sessions-dir {home}/sessions --max-turns 60 "
+            f"--sessions-dir {home}/sessions --max-turns 80 "
             f'"$(cat /tmp/modron-instruction.txt)" > /tmp/modron-run.log 2>&1; '
-            "echo $? > /tmp/modron-exit\n"
+            "echo $? > /tmp/modron-exit; "
+            "cp -f /tmp/modron-run.log /logs/modron-run.log 2>/dev/null; "
+            "cp -f $(ls -t /tmp/modron-home/sessions/*.jsonl 2>/dev/null "
+            "| head -1) /logs/modron-session.jsonl 2>/dev/null; true\n"
         )
         session.send_keys(cmd, block=False, min_timeout_sec=1.0)
 
@@ -150,19 +156,22 @@ class ModronTbAgent(BaseAgent):
             # tb's custom-agent path passes None: fall back to a host-side
             # scrape dir so failures stay dissectable.
             logging_dir = Path("/tmp/modron-trial-logs") / time.strftime("%H%M%S")
-        if logging_dir is not None:
-            _copy_back(session, logging_dir, [
-                "/tmp/modron-run.log",
-                "/tmp/modron-exit",
-            ])
-            newest_out = session.container.exec_run(
-                ["sh", "-c",
-                 f"ls -t {home}/sessions/*.jsonl 2>/dev/null | head -1"],
-                user="root",
-            )
-            newest = (newest_out.output or b"").decode().strip()
-            if newest:
-                _copy_back(session, logging_dir, [newest])
+        try:
+            if logging_dir is not None:
+                _copy_back(session, logging_dir, [
+                    "/tmp/modron-run.log",
+                    "/tmp/modron-exit",
+                ])
+                newest_out = session.container.exec_run(
+                    ["sh", "-c",
+                     f"ls -t {home}/sessions/*.jsonl 2>/dev/null | head -1"],
+                    user="root",
+                )
+                newest = (newest_out.output or b"").decode().strip()
+                if newest:
+                    _copy_back(session, logging_dir, [newest])
+        except Exception:
+            tracing = None  # capture is best-effort, never poison the result
 
         # 6. Token usage: the LAST Usage event per model from the newest
         #    transcript (turn-level events repeat).
