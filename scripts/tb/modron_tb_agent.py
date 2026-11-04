@@ -129,10 +129,12 @@ class ModronTbAgent(BaseAgent):
             f"--model {self._model_name} --yolo "
             f"--sessions-dir {home}/sessions --max-turns 80 "
             f'"$(cat /tmp/modron-instruction.txt)" > /tmp/modron-run.log 2>&1; '
-            "echo $? > /tmp/modron-exit; "
             "cp -f /tmp/modron-run.log /logs/modron-run.log 2>/dev/null; "
             "cp -f $(ls -t /tmp/modron-home/sessions/*.jsonl 2>/dev/null "
-            "| head -1) /logs/modron-session.jsonl 2>/dev/null; true\n"
+            "| head -1) /logs/modron-session.jsonl 2>/dev/null; "
+            # Marker LAST: the poller breaks on it — copying before the
+            # marker prevents the usage parse racing an empty /logs.
+            "echo $? > /tmp/modron-exit\n"
         )
         session.send_keys(cmd, block=False, min_timeout_sec=1.0)
 
