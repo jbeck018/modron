@@ -34,7 +34,10 @@ impl Tool for BashTool {
             description:
                 "Run a shell command (`sh -c`) in the working dir. Captures stdout+stderr \
                           and the exit code; output capped at 10KB. Optional timeout_ms (default \
-                          30000, max 120000); timeouts kill the process."
+                          30000, max 120000); timeouts kill the process. Long-running services \
+                          (servers, daemons) MUST be started fully detached so they survive the \
+                          call: `setsid nohup CMD >log 2>&1 </dev/null &` — attached children are \
+                          killed with the process group when the call times out."
                     .into(),
             parameters: json!({
                 "type": "object",
