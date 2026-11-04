@@ -37,7 +37,7 @@ DEFAULT_BINARY = (
 )
 BINARY_IN_CONTAINER = "/usr/local/bin/modron"
 POLL_SEC = 5
-MAX_RUN_SEC = 30 * 60
+MAX_RUN_SEC = 120 * 60  # marathons: 36-54-turn runs need >30 min; tb enforces its own task timeout upstream
 
 
 def _provider_for(model: str) -> str:
