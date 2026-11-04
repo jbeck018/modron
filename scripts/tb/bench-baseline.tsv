@@ -1,13 +1,18 @@
-# modron terminal-bench baseline (2026-11-04, glm-5.3 pinned, v0.1.1+2374f3c)
+# modron terminal-bench baseline (2026-11-04 post-ramp, glm-5.3 pinned, v0.1.1+e84a98d)
 # task	attempts	resolved	rate
 # jcode rule: never do worse than this per task
+blind-maze-explorer-5x5	1	1	100%
 broken-python	1	1	100%
+chess-best-move	2	0	0%
+conda-env-conflict-resolution	2	1	50%
 count-dataset-tokens	1	1	100%
 create-bucket	5	2	40%
 csv-to-parquet	3	2	67%
+extract-elf	1	1	100%
 extract-safely	1	1	100%
-fix-pandas-version	2	0	0%
-fix-permissions	1	1	100%
+fibonacci-server	2	0	0%
+fix-pandas-version	3	0	0%
+fix-permissions	2	2	100%
 git-multibranch	6	1	17%
 git-workflow-hack	1	1	100%
 grid-pattern-transform	1	1	100%
@@ -16,5 +21,5 @@ jupyter-notebook-server	6	0	0%
 mlflow-register	1	1	100%
 modernize-fortran-build	1	1	100%
 processing-pipeline	1	1	100%
-simple-web-scraper	1	1	100%
-TOTAL	35	16	46%
+simple-web-scraper	2	2	100%
+TOTAL	46	21	46%
