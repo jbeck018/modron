@@ -3,3 +3,5 @@
 .env
 demo-output.txt
 .DS_Store
+runs/
+__pycache__/
