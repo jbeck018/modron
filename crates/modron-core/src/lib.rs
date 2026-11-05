@@ -824,6 +824,8 @@ pub struct EngineConfig {
     /// are history, events after it stay in the append-only log but never
     /// re-enter context. `None` = full-log resume.
     pub resume_from_event: Option<u64>,
+    /// Force one self-check turn before ending when no verify tool exists.
+    pub self_check_on_finish: bool,
     /// OS sandbox applied to mutating tool subprocesses (Phase-1b A2,
     /// additive; default [`SandboxPolicy::Off`]).
     pub sandbox: SandboxPolicy,
@@ -888,6 +890,7 @@ impl Default for EngineConfig {
             price_lookup: None,
             hooks: hooks::HookConfig::default(),
             resume_from_event: None,
+            self_check_on_finish: false,
             sandbox: SandboxPolicy::Off,
             approver: None,
             on_delta: None,

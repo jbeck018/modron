@@ -194,6 +194,9 @@ impl Engine {
         // run, and how many verification rounds have been spent.
         let mut mutated_this_run = false;
         let mut verify_rounds: u32 = 0;
+        // Whether the finish gate already injected its self-check turn —
+        // a provider failure ON THAT TURN is non-fatal (keep the answer).
+        let mut self_check_sent = false;
         // Whether the most recent dispatch turn ENDED with a passing
         // `verify` call — the model's own evidence satisfies the gate.
         let mut last_dispatch_ended_with_passing_verify = false;
@@ -420,7 +423,7 @@ impl Engine {
                         }
                         let drained: Vec<_> = spec_results.lock().unwrap().drain().collect();
                         speculative.extend(drained);
-                        result?
+                        result
                     } else {
                         // Plain forwarder: speculation disabled (hooks,
                         // event sink, or deny list present).
@@ -431,10 +434,27 @@ impl Engine {
                         });
                         let result = provider.turn_streaming(request, tx).await;
                         let _ = forwarder.await;
-                        result?
+                        result
                     }
                 }
-                None => provider.turn(request).await?,
+                None => provider.turn(request).await,
+            };
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    // The self-check turn is an ENHANCEMENT: if the
+                    // provider fails on it, keep the pre-check answer and
+                    // end the run — never destroy completed work for the
+                    // bonus turn.
+                    if self_check_sent && !answer.is_empty() {
+                        tracing::warn!(
+                            error = %e,
+                            "self-check turn failed; keeping the pre-check answer"
+                        );
+                        break;
+                    }
+                    return Err(e);
+                }
             };
             turns += 1;
 
@@ -532,6 +552,7 @@ impl Engine {
                         &mut verify_rounds,
                         &mut answer,
                         last_dispatch_ended_with_passing_verify,
+                        &mut self_check_sent,
                     )
                     .await?
                 {
@@ -1002,6 +1023,7 @@ impl Engine {
         rounds: &mut u32,
         answer: &mut String,
         last_dispatch_ended_with_passing_verify: bool,
+        self_check_sent: &mut bool,
     ) -> Result<bool> {
         if !*mutated || *rounds >= MAX_VERIFY_ROUNDS {
             if *mutated && *rounds >= MAX_VERIFY_ROUNDS {
@@ -1015,7 +1037,35 @@ impl Engine {
             return Ok(false);
         }
         let Some(verify_tool) = self.tools.get("verify") else {
-            return Ok(false);
+            // No verify tool: the self-check fallback (when enabled) forces
+            // ONE requirements-checklist turn — the model re-reads the task
+            // and verifies each concrete detail against the environment
+            // before ending. Targets the lucky-pass class (config formats,
+            // exact names/passwords/ports) without needing a test command.
+            if !self.config.self_check_on_finish || *rounds >= MAX_VERIFY_ROUNDS {
+                return Ok(false);
+            }
+            *rounds += 1;
+            *self_check_sent = true;
+            let feedback = Message::user(
+                "Before finishing: re-read the ORIGINAL task instruction and list every \
+                 concrete requirement it names — file paths, exact names, passwords, \
+                 ports, config file locations and formats, expected content. Verify each \
+                 one against the actual environment with tools (read the configs you \
+                 wrote, check services are still running, confirm file contents). Fix \
+                 any mismatch you find, then finish.",
+            );
+            self.store
+                .append(
+                    session_id,
+                    &SessionEvent::Message {
+                        parent_id: None,
+                        message: feedback.clone(),
+                    },
+                )
+                .await?;
+            transcript.push(feedback);
+            return Ok(true);
         };
         // Skip when the previous dispatch already ended with a passing
         // verify (the model showed its evidence — no duplicate suite run).

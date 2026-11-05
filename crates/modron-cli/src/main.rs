@@ -1110,6 +1110,7 @@ fn build_agent_with(
             sinks.approver
         },
         async_router,
+        self_check_on_finish: true,
         on_delta: sinks.on_delta,
         on_tool_event: sinks.on_tool_event,
         personas: Default::default(),
