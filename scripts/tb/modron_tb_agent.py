@@ -179,10 +179,13 @@ class ModronTbAgent(BaseAgent):
         #    /logs copy (guaranteed by the run command's cp) — the old
         #    in-container grep raced the transcript flush and under-
         #    reported several trials.
+        # Filter INSIDE the container: cat of a multi-MB transcript
+        # truncates through exec_run (chess trials reported 0/0 with the
+        # full 211KB jsonl intact on disk); usage lines are ~100 bytes.
         out = session.container.exec_run(
             ["sh", "-c",
-             "cat /logs/modron-session.jsonl 2>/dev/null; "
-             f"cat {home}/sessions/*.jsonl 2>/dev/null"],
+             "grep -h '\"type\":\"usage\"' /logs/modron-session.jsonl "
+             f"{home}/sessions/*.jsonl 2>/dev/null"],
             user="root",
         )
         input_tokens, output_tokens = _summarize_usage(
