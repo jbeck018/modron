@@ -1015,6 +1015,7 @@ impl Engine {
     /// duplicate suite runs). Harness-initiated: direct tool execution, no
     /// approval prompt or hook veto; round bound is per-run (resume grants a
     /// fresh bound).
+    #[allow(clippy::too_many_arguments)]
     async fn run_finish_gate(
         &self,
         session_id: SessionId,

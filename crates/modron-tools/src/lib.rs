@@ -26,6 +26,7 @@ mod edit;
 mod explore;
 mod glob;
 mod grep;
+mod interact;
 mod lsp;
 mod memory_search;
 mod minify;
@@ -44,6 +45,7 @@ pub use edit::EditTool;
 pub use explore::ExploreTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use interact::InteractTool;
 pub use read::ReadTool;
 pub use reduce::reduce_output;
 pub use remember::RememberTool;
@@ -81,6 +83,7 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
     registry.register(Arc::new(crate::minify::ReadMinifiedTool));
     registry.register(Arc::new(crate::tool_search::ToolSearchTool));
     registry.register(Arc::new(crate::diagnostics::DiagnosticsTool));
+    registry.register(Arc::new(crate::interact::InteractTool::new()));
     registry
 }
 
@@ -89,7 +92,7 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
 /// deliberate tool surface (~14) and mount the rest on demand — every
 /// hidden schema is tokens paid on every request, and `tool_search`
 /// keeps the rest discoverable.
-pub const ESSENTIAL_TOOLS: [&str; 11] = [
+pub const ESSENTIAL_TOOLS: [&str; 12] = [
     "read",
     "write",
     "edit",
@@ -101,6 +104,7 @@ pub const ESSENTIAL_TOOLS: [&str; 11] = [
     "memory_search",
     "diagnostics",
     "verify",
+    "interact",
 ];
 
 /// Demote every registered tool not in [`ESSENTIAL_TOOLS`] to on-demand
@@ -177,6 +181,7 @@ mod tests {
                 "edit",
                 "glob",
                 "grep",
+                "interact",
                 "memory_search",
                 "read",
                 "read_minified",
