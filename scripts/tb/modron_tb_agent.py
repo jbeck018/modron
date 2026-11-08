@@ -102,6 +102,24 @@ class ModronTbAgent(BaseAgent):
             [binary], container_dir="/usr/local/bin", container_filename="modron"
         )
 
+        # 1b. Claude escalation support: ship modron's auth store so a
+        #     follow-up run with --provider anthropic can authenticate
+        #     (tokens imported from the host Claude Code sign-in).
+        auth_file = Path.home() / ".modron" / "auth" / "anthropic.json"
+        if auth_file.is_file():
+            try:
+                session.copy_to_container(
+                    [auth_file],
+                    container_dir=f"{home}/.modron/auth",
+                    container_filename="anthropic.json",
+                )
+                session.send_keys(
+                    f"chmod 600 {home}/.modron/auth/anthropic.json\n",
+                    block=False,
+                )
+            except Exception:
+                pass  # escalation is optional
+
         # 2. Instruction file: avoids quoting hell in the tmux command line.
         tmp = Path(tempfile.mkstemp(suffix=".txt")[1])
         tmp.write_text(instruction)
@@ -192,6 +210,31 @@ class ModronTbAgent(BaseAgent):
             (out.output or b"").decode("utf-8", "replace")
         )
         exit_code = (result.output or b"").strip().decode()
+        escalate = os.environ.get("MODRON_ESCALATE_MODEL", "")
+        if exit_code not in ("0", "") and escalate:
+            # Second-model ladder: the first pass failed; retry once with
+            # the escalation provider/model (transcript and servers from
+            # pass 1 stay in the container — pass 2 resumes the state).
+            esc_provider = "anthropic" if escalate.startswith("claude") else "zai"
+            second = (
+                f"{BINARY_IN_CONTAINER} --provider {esc_provider} "
+                f"--model {escalate} --yolo "
+                f"--sessions-dir {home}/sessions --max-turns 80 "
+                f'"$(cat /tmp/modron-instruction.txt)" >> /tmp/modron-run.log 2>&1; '
+                "echo $? > /tmp/modron-exit\n"
+            )
+            session.send_keys(second, block=False, min_timeout_sec=1.0)
+            deadline2 = time.monotonic() + MAX_RUN_SEC
+            while time.monotonic() < deadline2:
+                result = session.container.exec_run(
+                    ["cat", "/tmp/modron-exit"], user="root"
+                )
+                if result.exit_code == 0 and (result.output or b"").strip():
+                    break
+                time.sleep(POLL_SEC)
+            else:
+                return AgentResult(failure_mode=FailureMode.AGENT_TIMEOUT)
+            exit_code = (result.output or b"").strip().decode()
         if exit_code not in ("0", ""):
             # The run itself errored; record as unspecified failure.
             return AgentResult(
