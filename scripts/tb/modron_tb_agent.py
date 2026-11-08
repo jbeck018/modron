@@ -223,18 +223,26 @@ class ModronTbAgent(BaseAgent):
                 f'"$(cat /tmp/modron-instruction.txt)" >> /tmp/modron-run.log 2>&1; '
                 "echo $? > /tmp/modron-exit\n"
             )
-            session.send_keys(second, block=False, min_timeout_sec=1.0)
-            deadline2 = time.monotonic() + MAX_RUN_SEC
-            while time.monotonic() < deadline2:
-                result = session.container.exec_run(
-                    ["cat", "/tmp/modron-exit"], user="root"
+            try:
+                session.send_keys(second, block=False, min_timeout_sec=1.0)
+                deadline2 = time.monotonic() + MAX_RUN_SEC
+                while time.monotonic() < deadline2:
+                    result = session.container.exec_run(
+                        ["cat", "/tmp/modron-exit"], user="root"
+                    )
+                    if result.exit_code == 0 and (result.output or b"").strip():
+                        break
+                    time.sleep(POLL_SEC)
+                else:
+                    return AgentResult(failure_mode=FailureMode.AGENT_TIMEOUT)
+                exit_code = (result.output or b"").strip().decode()
+            except Exception as exc:
+                # The escalation is an enhancement: never let it crash the
+                # trial — report the pass-1 failure instead.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "escalation pass failed: %s", exc
                 )
-                if result.exit_code == 0 and (result.output or b"").strip():
-                    break
-                time.sleep(POLL_SEC)
-            else:
-                return AgentResult(failure_mode=FailureMode.AGENT_TIMEOUT)
-            exit_code = (result.output or b"").strip().decode()
         if exit_code not in ("0", ""):
             # The run itself errored; record as unspecified failure.
             return AgentResult(

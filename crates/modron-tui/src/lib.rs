@@ -3106,8 +3106,21 @@ impl App {
             } else if self.running {
                 ("", Style::default())
             } else {
-                (
+                // Rotating capability hints (claude-code/opencode pattern):
+                // the empty input teaches the surface organically, cycling
+                // on the spinner tick so it stays alive but quiet.
+                const HINTS: [&str; 8] = [
                     "type a task (or / for commands)…",
+                    "try /model — switch models mid-session",
+                    "try /auth — sign in or reuse existing logins",
+                    "try @file — attach a file to the task",
+                    "try !command — run shell passthrough",
+                    "try /tasks — check background subagents",
+                    "try /fork — branch the session to explore",
+                    "try ctrl+t — expand the tool activity panel",
+                ];
+                (
+                    HINTS[(self.spinner_tick.div_euclid(8) as usize) % HINTS.len()],
                     Style::default().fg(th.dim),
                 )
             };
