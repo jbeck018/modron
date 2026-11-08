@@ -11,7 +11,7 @@
 
 use crate::{App, AuthFlow, PendingApproval, PendingCommand};
 use modron_core::{
-    Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
+    ApprovalMode, Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
     ToolActivitySink, ToolCall,
 };
 use std::sync::atomic::Ordering;
@@ -218,6 +218,15 @@ pub async fn run_with(
             .collect(),
         current_model: engine.config.default_model.clone(),
         current_theme: "modron".to_string(),
+        // The status strip's mode label mirrors the engine's real state
+        // (shift+tab and /mode keep it current through PendingCommand).
+        approval_mode: match engine.config.approvals.mode {
+            ApprovalMode::Ask => "ask",
+            ApprovalMode::ApproveAll => "yolo",
+            ApprovalMode::Deny => "deny",
+        }
+        .to_string(),
+        working_dir: engine.config.working_dir.clone(),
         ..App::default()
     };
 
@@ -273,6 +282,10 @@ pub async fn run_with(
     // Clipboard I/O (pbcopy/wl-copy/osascript subprocesses) is also async.
     let (clip_tx, mut clip_rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardProgress>();
     let mut harvest_task: Option<tokio::task::JoinHandle<()>> = None;
+    // `!` shell passthrough is async too: a slow `make` must never freeze
+    // the render loop, and Esc gets to kill it (kill_on_drop).
+    let (shell_tx, mut shell_rx) = tokio::sync::mpsc::unbounded_channel::<ShellOutcome>();
+    let mut shell_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
@@ -335,7 +348,7 @@ pub async fn run_with(
                         // the render loop must not wait on it.
                         if let Some(text) = app.take_selected_text() {
                             let chars = text.chars().count();
-                            app.status_note = Some(format!("copying {chars} chars…"));
+                            app.toast(format!("copying {chars} chars…"));
                             let tx = clip_tx.clone();
                             tokio::spawn(async move {
                                 let ok = crate::clipboard::copy_text(&text);
@@ -358,10 +371,10 @@ pub async fn run_with(
                             // timeout inside) so the render loop never
                             // waits on a clipboard service.
                             if harvest_task.is_some() {
-                                app.status_note = Some("clipboard read already in flight".into());
+                                app.toast("clipboard read already in flight");
                                 continue;
                             }
-                            app.status_note = Some("reading clipboard…".into());
+                            app.toast("reading clipboard…");
                             let tx = clip_tx.clone();
                             harvest_task = Some(tokio::spawn(async move {
                                 let content =
@@ -372,13 +385,49 @@ pub async fn run_with(
                             }));
                         }
                         crate::Action::Submit(task) => {
+                            // `!` shell passthrough: the user typed it
+                            // themselves, so no approval gate — and it
+                            // never reaches the model. Echo the command in
+                            // accent, run it in the workspace (spawned; the
+                            // render loop keeps drawing), land the captured
+                            // output as dim history lines.
+                            if let Some(command) = shell_passthrough(&task) {
+                                if command.is_empty() {
+                                    app.toast("usage: !<shell command>");
+                                    continue;
+                                }
+                                if shell_task.is_some() {
+                                    app.toast("a shell command is still running — Esc cancels it");
+                                    continue;
+                                }
+                                let accent = ratatui::style::Style::default()
+                                    .fg(app.theme.resolved().accent);
+                                app.push_history(vec![ratatui::text::Line::from(format!(
+                                    "❯ !{command}"
+                                ))
+                                .style(accent)]);
+                                let tx = shell_tx.clone();
+                                let dir = engine.config.working_dir.clone();
+                                shell_task = Some(tokio::spawn(async move {
+                                    let result = tokio::process::Command::new("sh")
+                                        .arg("-c")
+                                        .arg(&command)
+                                        .current_dir(&dir)
+                                        // Esc-abort kills the child, not
+                                        // just the awaiting task.
+                                        .kill_on_drop(true)
+                                        .output()
+                                        .await;
+                                    let _ = tx.send(ShellOutcome { command, result });
+                                }));
+                                continue;
+                            }
                             // One engine task at a time: a second concurrent
                             // spawn would overwrite the first JoinHandle
                             // (unabortable orphan streaming into the App,
                             // double finish_turn, clobbered approval slot).
                             if engine_task.is_some() {
-                                app.status_note =
-                                    Some("a turn is already running — Esc aborts it".into());
+                                app.toast("a turn is already running — Esc aborts it");
                                 continue;
                             }
                             let task = app.task_with_goal(&task);
@@ -428,9 +477,15 @@ pub async fn run_with(
                                 (None, Some(task)) => {
                                     slow_command_generation += 1;
                                     task.abort();
-                                    app.status_note = Some("command cancelled".into());
+                                    app.toast("command cancelled");
                                 }
                                 (None, None) => {}
+                            }
+                            // A pending `!` shell job cancels with Esc too
+                            // (kill_on_drop kills the child process).
+                            if let Some(task) = shell_task.take() {
+                                task.abort();
+                                app.toast("shell command cancelled");
                             }
                         }
                         crate::Action::Quit => {
@@ -568,12 +623,22 @@ pub async fn run_with(
             let engine_for_task = engine.clone();
             let tx = slow_tx.clone();
             let session = app.session_id;
-            app.status_note = Some(format!("/{} running (Esc cancels)…", cmd_label(&cmd)));
+            app.toast(format!("/{} running (Esc cancels)…", cmd_label(&cmd)));
             slow_command_task = Some(tokio::spawn(async move {
                 let result = run_slow_pending_command(engine_for_task, cmd, session).await;
                 let _ = tx.send(SlowCommandProgress::Done { gen, result });
             }));
         } else if let Some(cmd) = app.pending_command.take() {
+            // Keep the strip's mode label honest with the engine's real
+            // state: /mode's arg is normalized by run_pending_command, so
+            // mirror the same acceptance (invalid args change nothing).
+            if let PendingCommand::Mode(m) = &cmd {
+                match m.trim() {
+                    "ask" => app.approval_mode = "ask".into(),
+                    "yolo" | "auto" => app.approval_mode = "yolo".into(),
+                    _ => {}
+                }
+            }
             for line in run_pending_command(&mut engine, cmd).await {
                 app.note(line);
             }
@@ -655,6 +720,32 @@ pub async fn run_with(
             apply_clipboard_progress(&mut app, progress);
         }
 
+        // 3e. `!` shell passthrough result: stdout, stderr and the exit
+        //     code land as dim lines under the accent echo, bounded like
+        //     the bash tool's capture — a runaway `cat` must not flood
+        //     the scrollback.
+        while let Ok(outcome) = shell_rx.try_recv() {
+            shell_task = None;
+            match outcome.result {
+                Ok(output) => {
+                    let stdout = cap_output(String::from_utf8_lossy(&output.stdout).trim_end());
+                    let stderr = cap_output(String::from_utf8_lossy(&output.stderr).trim_end());
+                    if !stdout.is_empty() {
+                        app.note(stdout);
+                    }
+                    if !stderr.is_empty() {
+                        app.note(stderr);
+                    }
+                    match output.status.code() {
+                        Some(0) => app.note("exit 0"),
+                        Some(code) => app.note(format!("exit {code}")),
+                        None => app.note("exit: killed by signal"),
+                    }
+                }
+                Err(e) => app.note(format!("!{}: {e}", outcome.command)),
+            }
+        }
+
         // 4. Approve-rest mirror: when the user pressed `a`, future approvals
         //    short-circuit in the approver; drain any queued one so an
         //    approval parked BEFORE the `a` press is answered, not re-prompted.
@@ -705,8 +796,8 @@ pub async fn run_with(
             break;
         }
 
-        // 6. Render the full screen; advance the spinner.
-        app.spinner_tick += 1;
+        // 6. Render the full screen; advance the spinner and age the toast.
+        app.tick();
         terminal.draw(|frame| app.view(frame, frame.area()))?;
     }
 
@@ -1051,10 +1142,8 @@ fn apply_clipboard_progress(app: &mut App, progress: ClipboardProgress) {
     match progress {
         ClipboardProgress::Harvested(crate::clipboard::ClipboardContent::Image(path)) => {
             match app.attach_image(&path) {
-                Some(chip) => {
-                    app.status_note = Some(format!("attached {chip} (goes with your next message)"))
-                }
-                None => app.status_note = Some("clipboard image unreadable".into()),
+                Some(chip) => app.toast(format!("attached {chip} (goes with your next message)")),
+                None => app.toast("clipboard image unreadable"),
             }
         }
         ClipboardProgress::Harvested(crate::clipboard::ClipboardContent::Text(text)) => {
@@ -1062,15 +1151,46 @@ fn apply_clipboard_progress(app: &mut App, progress: ClipboardProgress) {
             app.paste_into_auth_or_input(&text);
         }
         ClipboardProgress::Harvested(crate::clipboard::ClipboardContent::Empty) => {
-            app.status_note = Some("clipboard empty".into());
+            app.toast("clipboard empty");
         }
         ClipboardProgress::Copied { ok: true, chars } => {
-            app.status_note = Some(format!("copied {chars} chars"));
+            app.toast(format!("copied {chars} chars"));
         }
         ClipboardProgress::Copied { ok: false, .. } => {
-            app.status_note = Some("selection made — no clipboard tool found".into());
+            app.toast("selection made — no clipboard tool found");
         }
     }
+}
+
+/// `!command` detection for the submit path: everything after the leading
+/// `!` runs in the shell — it never reaches the model. None = a normal
+/// task; `Some("")` = bare `!` (the caller shows usage).
+#[doc(hidden)]
+pub fn shell_passthrough(input: &str) -> Option<String> {
+    input.strip_prefix('!').map(|rest| rest.trim().to_string())
+}
+
+/// Output discipline for `!` passthrough, mirroring the bash tool's
+/// MAX_BYTES: keep the TAIL (errors land at the end of a command's
+/// output), head-mark the cut, never split a UTF-8 char. Empty in, empty out.
+#[doc(hidden)]
+pub fn cap_output(text: &str) -> String {
+    const MAX: usize = 10 * 1024; // modron-tools bash MAX_BYTES
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    let mut start = text.len() - MAX;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("… (output truncated)\n{}", &text[start..])
+}
+
+/// A finished `!` passthrough: the command plus its captured output (or
+/// the spawn failure).
+struct ShellOutcome {
+    command: String,
+    result: std::io::Result<std::process::Output>,
 }
 
 /// /issues — a tiny per-project board in the workspace memory store:

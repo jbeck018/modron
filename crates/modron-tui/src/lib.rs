@@ -250,7 +250,7 @@ impl SlashCommand {
          /btw <question>  quick side question, no tools\n\
          /agent [name]    list or switch personas\n\
          /allow|/deny <tool>  session tool permissions\n\
-         /mode ask|yolo   approval mode\n\
+         /mode ask|yolo   approval mode (or flip it with shift+tab)\n\
          /tasks           background delegate status\n\
          /worktree        list delegate worktrees\n\
          /issues [add <text>]  the project issue board\n\
@@ -259,6 +259,9 @@ impl SlashCommand {
          /review          review the working diff\n\
          /goal <condition>  stop condition for long autonomous runs\n\
          /learn [title]   distill this session into a SKILL.md\n\
+         ? (bare)         shortcuts (this help)\n\
+         !command         shell passthrough — output lands here, never the model\n\
+         @path            tab-complete a workspace file into the task\n\
          (anything else is sent as a task to the agent)"
     }
 }
@@ -411,6 +414,9 @@ pub struct App {
     pub session_id: Option<modron_core::SessionId>,
     pub transcript_mode: bool,
     pub status_note: Option<String>,
+    /// Ticks left before the toast (`status_note`) auto-clears. Notes must
+    /// expire — a status line that never changes is wallpaper nobody reads.
+    pub status_note_ticks: u32,
     pub quit: bool,
     /// Braille spinner frame counter (advanced per tick).
     pub spinner_tick: u64,
@@ -442,6 +448,16 @@ pub struct App {
     /// Highlighted row in the slash-command popup (clamped at use; typing
     /// resets it to the top).
     pub slash_selected: usize,
+    /// Highlighted row in the `@file` completion popup (same grammar as
+    /// the slash popup; typing resets it to the top).
+    pub at_selected: usize,
+    /// The workspace walk feeding `@file` completion, cached on the first
+    /// live `@` token (the walk runs on the RENDER thread — once per
+    /// @-session, never per keystroke) and invalidated on submit.
+    pub file_completions: Option<Vec<String>>,
+    /// The engine's working dir — the walk root for `@file` completion
+    /// (injected by the run loop; empty = the process cwd).
+    pub working_dir: std::path::PathBuf,
     /// Cursor position in `input`, as a CHAR offset (0 = before the first
     /// char, len = after the last). All edits happen here, so the input is
     /// a real editable field, not just an append-only line.
@@ -463,6 +479,10 @@ pub struct App {
     /// This turn's tool events (grouped view: the history stays clean,
     /// one summary line lands at turn end; the panel expands on demand).
     pub turn_tools: Vec<ToolEvent>,
+    /// Approval mode label for the status strip (`ask`/`yolo`/`deny`),
+    /// mirrored from the engine config by the run loop; shift+tab and
+    /// /mode keep it current. Empty = the engine's default (ask).
+    pub approval_mode: String,
     /// Committed summary lines -> their events, newest last (capped) —
     /// clicking a summary line re-opens the panel for that turn.
     pub tool_log: Vec<(usize, Vec<ToolEvent>)>,
@@ -734,6 +754,14 @@ const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 /// Working spinner: calculus operators cycling (partial → nabla → delta →
 /// increment) — signals active computation.
 const SPINNER_WORKING: [&str; 4] = ["∂", "∇", "∆", "∇"];
+/// Toast lifetime in spinner ticks (~2s at the 50ms poll). Notices that
+/// never expire turn into wallpaper — the old `status_note` did exactly
+/// that, so every note is now a toast with a fuse.
+const TOAST_TICKS: u32 = 40;
+/// Cap on the `@file` completion walk (entries collected): the render
+/// thread pays for this once per @-session, and 200 paths already
+/// outnumbers any honest completion need.
+const FILE_COMPLETION_CAP: usize = 200;
 
 impl App {
     /// Apply a key press. Key filtering (releases vs presses) is the run
@@ -880,6 +908,31 @@ impl App {
             }
         }
 
+        // @file completion popup (a live `@token` sits in the input): the
+        // same binding grammar as the slash popup — arrows move the
+        // highlight, Tab splices the selected path into the input. Bound
+        // only while the popup is open.
+        let at_files = self.file_matches();
+        if !at_files.is_empty() {
+            let len = at_files.len();
+            let sel = self.at_selected.min(len - 1);
+            match key.code {
+                KeyCode::Up => {
+                    self.at_selected = (sel + len - 1) % len;
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    self.at_selected = (sel + 1) % len;
+                    return Action::None;
+                }
+                KeyCode::Tab => {
+                    self.complete_at(&at_files[sel]);
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Enter
                 if key.modifiers.intersects(
@@ -919,6 +972,16 @@ impl App {
                         self.input_history.drain(..len - 100);
                     }
                 }
+                // The @-completion cache dies with the submit: the task may
+                // create or delete files, and the next `@` deserves a fresh
+                // walk.
+                self.file_completions = None;
+                self.at_selected = 0;
+                // Bare `?`: the status strip's "? shortcuts" hint — same
+                // help as /help, minus the slash.
+                if task.trim() == "?" {
+                    return self.handle_slash(SlashCommand::Help);
+                }
                 // Slash commands are handled locally (dirge pattern) —
                 // they never reach the model.
                 if let Some(cmd) = SlashCommand::parse(task.trim()) {
@@ -934,6 +997,7 @@ impl App {
                     self.cursor -= 1;
                 }
                 self.slash_selected = 0;
+                self.at_selected = 0;
                 Action::None
             }
             KeyCode::Delete => {
@@ -943,6 +1007,7 @@ impl App {
                     self.input.remove(byte);
                 }
                 self.slash_selected = 0;
+                self.at_selected = 0;
                 Action::None
             }
             KeyCode::Left => {
@@ -991,6 +1056,21 @@ impl App {
                 self.scroll_history(-page);
                 Action::None
             }
+            // shift+tab: flip the approval mode (the strip's key hint).
+            // The label flips immediately; the engine mutation rides
+            // PendingCommand::Mode exactly like the /mode menu — it
+            // applies from the next submit (each submit clones the engine).
+            KeyCode::BackTab => {
+                let next = if self.approval_mode == "yolo" {
+                    "ask"
+                } else {
+                    "yolo"
+                };
+                self.approval_mode = next.to_string();
+                self.pending_command = Some(PendingCommand::Mode(next.to_string()));
+                self.toast(format!("approval mode: {next}"));
+                Action::None
+            }
             // Esc while idle: drop a text selection first, then back to
             // the live tail, then clear the input.
             KeyCode::Esc if !self.running => {
@@ -1006,6 +1086,7 @@ impl App {
             KeyCode::Char(c) => {
                 self.insert_at_cursor(c);
                 self.slash_selected = 0;
+                self.at_selected = 0;
                 Action::None
             }
             _ => Action::None,
@@ -1881,6 +1962,76 @@ impl App {
             .collect()
     }
 
+    /// The live `@` token for file completion: (char offset of the `@`,
+    /// fragment after it). The `@` must START a token (input start or after
+    /// whitespace — `a@b` is an email address, not a completion) and the
+    /// fragment must hold no whitespace (that token ended; the user is on
+    /// to the next word). Cursor-independent: Tab splices over the token
+    /// wherever the caret sits.
+    #[doc(hidden)]
+    pub fn at_token(&self) -> Option<(usize, String)> {
+        let (at, _) = self.input.char_indices().rev().find(|(_, ch)| *ch == '@')?;
+        if at > 0 && !self.input[..at].ends_with(char::is_whitespace) {
+            return None;
+        }
+        let frag: String = self.input[at + 1..]
+            .chars()
+            .take_while(|ch| !ch.is_whitespace())
+            .collect();
+        Some((at, frag))
+    }
+
+    /// The `@`-completion candidates: the cached workspace walk filtered
+    /// by the live fragment (case-insensitive substring — friendlier than
+    /// the slash popup's prefix for paths). The walk itself runs on the
+    /// render thread, so it happens ONCE per @-session ([`App::tick`] does
+    /// not touch it; the Enter submit invalidates it).
+    pub fn file_matches(&mut self) -> Vec<String> {
+        let Some((_, frag)) = self.at_token() else {
+            return Vec::new();
+        };
+        if self.file_completions.is_none() {
+            self.file_completions = Some(collect_files(self.walk_root()));
+        }
+        let files = self.file_completions.as_deref().unwrap_or_default();
+        files
+            .iter()
+            .filter(|path| list_matches(&frag, &[path]))
+            .cloned()
+            .collect()
+    }
+
+    /// Tab on an `@` completion: splice the chosen path over the live
+    /// token (`@fragment` → `@path `), leaving the rest of the input
+    /// untouched, cursor landed after the inserted space.
+    fn complete_at(&mut self, path: &str) {
+        let Some((at, frag)) = self.at_token() else {
+            return;
+        };
+        let start = char_byte_idx(&self.input, at);
+        let end = char_byte_idx(&self.input, at + 1 + frag.chars().count());
+        let mut out = String::with_capacity(self.input.len() - (end - start) + path.len() + 2);
+        out.push_str(&self.input[..start]);
+        out.push('@');
+        out.push_str(path);
+        out.push(' ');
+        out.push_str(&self.input[end..]);
+        self.input = out;
+        self.cursor = at + 1 + path.chars().count() + 1;
+        self.at_selected = 0;
+    }
+
+    /// The walk root for `@file` completion: the engine's working dir once
+    /// the run loop injects it; the process cwd before that (and for
+    /// directly-constructed App states).
+    fn walk_root(&self) -> &std::path::Path {
+        if self.working_dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            &self.working_dir
+        }
+    }
+
     /// Commit lines into the internal scrollback. When the user is
     /// scrolled up, the view stays anchored (offset unchanged). Lines
     /// wrap to the last rendered width so long content stays readable
@@ -1897,6 +2048,28 @@ impl App {
         let dim = Style::default().fg(self.theme.resolved().dim);
         for row in wrap_line(&Line::from(text.into()).style(dim), self.hist_wrap_width()) {
             self.history.push(row);
+        }
+    }
+
+    /// Raise a toast: the note renders as a one-line highlighted strip
+    /// directly above the input and auto-clears after [`TOAST_TICKS`]
+    /// (~2s at the 50ms poll). Every transient notice goes through here —
+    /// `status_note` written by hand never expires (the old bug).
+    pub fn toast(&mut self, text: impl Into<String>) {
+        self.status_note = Some(text.into());
+        self.status_note_ticks = TOAST_TICKS;
+    }
+
+    /// One render-loop tick: advance the spinner and age the toast.
+    /// A note whose fuse hit zero is cleared — fire-and-forget notices
+    /// must not outlive their usefulness.
+    pub fn tick(&mut self) {
+        self.spinner_tick += 1;
+        if self.status_note_ticks > 0 {
+            self.status_note_ticks -= 1;
+            if self.status_note_ticks == 0 {
+                self.status_note = None;
+            }
         }
     }
 
@@ -2451,8 +2624,7 @@ impl App {
         self.commit_tool_summary();
         self.streaming.clear();
         self.current_tool = None;
-        self.status_note =
-            Some("interrupted — partial work is persisted; resume with --resume".into());
+        self.toast("interrupted — partial work is persisted; resume with --resume");
         let lines = vec![
             Line::from("(interrupted — partial work is persisted; resume with --resume)")
                 .style(Style::default().fg(t.warning)),
@@ -2467,6 +2639,7 @@ impl App {
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
+        self.status_note_ticks = 0;
         self.turn_tools.clear();
         // The task echoes into the scrollback as an indented block,
         // wrapped to the history width so long messages stay readable.
@@ -2542,7 +2715,115 @@ impl App {
         }
     }
 
-    /// The one-line status: spinner/model, tool in flight, or approval prompt.
+    /// The one-line status strip: `<model> · <tok> tok · cache <pct>% ·
+    /// ctx <est%> · <mode> (shift+tab) · ? shortcuts …` — everything the
+    /// operator glances at, one dense key-hinted line (the old line
+    /// sprawled and still hid the cache rate and approval mode). Transient
+    /// notes are NOT part of it: they render as a toast above the input
+    /// and expire (see [`App::toast`]).
+    fn status_spans(&self) -> Vec<Span<'static>> {
+        let t = self.theme.resolved();
+        let dim = Style::default().fg(t.dim);
+        let spinner = if self.running {
+            SPINNER_WORKING[(self.spinner_tick as usize) % SPINNER_WORKING.len()]
+        } else {
+            SPINNER[(self.spinner_tick as usize) % SPINNER.len()]
+        };
+        let mut spans = vec![
+            Span::styled(format!("{spinner} "), Style::default().fg(t.accent)),
+            Span::styled(self.model_label.clone(), dim),
+            Span::styled(format!(" · {} tok", self.cumulative.total()), dim),
+        ];
+        // Session-cumulative cache hit rate — a falling number is the
+        // cheapest early warning that request prefixes went unstable
+        // (same arithmetic as finish_turn's summary line).
+        let cache_denom = self.cumulative.input_tokens + self.cumulative.cached_input_tokens;
+        if cache_denom > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " · cache {:.0}%",
+                    100.0 * self.cumulative.cached_input_tokens as f64 / cache_denom as f64
+                ),
+                dim,
+            ));
+        }
+        // Estimated context pressure; at the 80% compaction trigger the
+        // segment flips to the warning color and shouts `!`.
+        if self.context_window > 0 {
+            let pct = self.ctx_pct();
+            spans.push(Span::styled(
+                format!(" · ctx {pct}%{}", if pct >= 80 { "!" } else { "" }),
+                if pct >= 80 {
+                    Style::default().fg(t.warning)
+                } else {
+                    dim
+                },
+            ));
+        }
+        spans.push(Span::styled(
+            format!(" · {} (shift+tab)", self.approval_label()),
+            dim,
+        ));
+        if self.running {
+            spans.push(Span::styled(
+                format!(" · turn {}", self.turn_count + 1),
+                dim,
+            ));
+            if let Some(tool) = &self.current_tool {
+                spans.push(Span::styled(
+                    format!(" · {tool}"),
+                    Style::default().fg(t.tool),
+                ));
+            }
+            spans.push(Span::styled(" · esc interrupt", dim));
+        } else {
+            spans.push(Span::styled(" · ? shortcuts", dim));
+            spans.push(Span::styled(
+                format!(
+                    " · ctrl+o {}",
+                    if self.transcript_mode {
+                        "full"
+                    } else {
+                        "compact"
+                    }
+                ),
+                dim,
+            ));
+            spans.push(Span::styled(format!(" · {}", self.session_label()), dim));
+            if !self.input.is_empty() {
+                spans.push(Span::styled(" · esc clears", dim));
+            }
+        }
+        spans
+    }
+
+    /// Estimated context-window pressure as a whole percent.
+    fn ctx_pct(&self) -> u64 {
+        if self.context_window == 0 {
+            return 0;
+        }
+        let frac = (self.context_used as f64 / self.context_window as f64).min(1.0);
+        (frac * 100.0) as u64
+    }
+
+    /// The approval-mode label (`""` = unset = the engine's ask default).
+    fn approval_label(&self) -> &str {
+        if self.approval_mode.is_empty() {
+            "ask"
+        } else {
+            &self.approval_mode
+        }
+    }
+
+    /// The session id, shortened to its first 8 chars (or "no session").
+    fn session_label(&self) -> String {
+        self.session_id
+            .map(|id| format!("session {}", &id.to_string()[..8]))
+            .unwrap_or_else(|| "no session".into())
+    }
+
+    /// The plain-text status line: the approval prompt while one is
+    /// pending, otherwise the consolidated strip (see [`App::status_spans`]).
     pub fn status_line(&self) -> String {
         if let Some(pending) = &self.pending_approval {
             return format!(
@@ -2551,40 +2832,10 @@ impl App {
                 short(&pending.call.arguments.to_string(), 80)
             );
         }
-        let spinner = SPINNER[(self.spinner_tick as usize) % SPINNER.len()];
-        if self.running {
-            let tool = match &self.current_tool {
-                Some(t) => format!(" · {t}"),
-                None => String::new(),
-            };
-            return format!(
-                "{spinner} running (turn {} · {} tok{}){} — esc to interrupt",
-                self.turn_count + 1,
-                self.cumulative.total(),
-                tool,
-                self.status_note
-                    .as_ref()
-                    .map(|n| format!(" · {n}"))
-                    .unwrap_or_default()
-            );
-        }
-        let note = self
-            .status_note
-            .as_ref()
-            .map(|n| format!(" · {n}"))
-            .unwrap_or_default();
-        format!(
-            "{spinner} idle · {} tok ·{note} {} · ctrl+o {} · esc clears input",
-            self.cumulative.total(),
-            self.session_id
-                .map(|id| format!("session {}", &id.to_string()[..8]))
-                .unwrap_or_else(|| "no session".into()),
-            if self.transcript_mode {
-                "full"
-            } else {
-                "compact"
-            }
-        )
+        self.status_spans()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
     }
 
     /// Render the live region into `frame` (the run loop sizes the area).
@@ -2608,13 +2859,23 @@ impl App {
             .min((area.height / 2).max(4))
             .min(area.height.saturating_sub(2));
 
-        let matches = if self.auth_flow.is_none() && self.menu.is_none() {
-            self.slash_matches()
-        } else {
+        let modal_open = self.auth_flow.is_some() || self.menu.is_some();
+        let matches = if modal_open {
             Vec::new()
+        } else {
+            self.slash_matches()
+        };
+        // @file completion shares the popup slot — slash wins (the two
+        // tokens can't be live at once: a `/word` prefix has no whitespace
+        // yet, so no @ boundary).
+        let at_files = if modal_open || !matches.is_empty() {
+            Vec::new()
+        } else {
+            self.file_matches()
         };
         let sel = self.slash_selected.min(matches.len().saturating_sub(1));
-        let popup_h = (matches.len() as u16).min(5);
+        let at_sel = self.at_selected.min(at_files.len().saturating_sub(1));
+        let popup_h = (matches.len().max(at_files.len()) as u16).min(5);
 
         // The auth manager / command menus take the same slot as the
         // slash popup.
@@ -2659,6 +2920,11 @@ impl App {
         }
         if popup_h > 0 {
             rows.push(Constraint::Length(popup_h));
+        }
+        if self.status_note.is_some() {
+            // The toast strip hugs the input: transient notices sit where
+            // the eye already is, not in the status line's old slot.
+            rows.push(Constraint::Length(1));
         }
         rows.push(Constraint::Length(input_height));
         let chunks = Layout::vertical(rows).split(area);
@@ -3020,8 +3286,9 @@ impl App {
         }
 
         // Slash-command popup (window around the highlight when the
-        // filtered list outgrows the space).
-        if popup_h > 0 {
+        // filtered list outgrows the space), or the @file popup sharing
+        // the same slot and grammar.
+        if popup_h > 0 && !matches.is_empty() {
             let h = popup_h as usize;
             let start = sel.saturating_sub(h - 1).min(matches.len() - h);
             let name_w = matches.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
@@ -3054,6 +3321,46 @@ impl App {
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines), chunks[idx]);
+            idx += 1;
+        } else if popup_h > 0 {
+            let h = popup_h as usize;
+            let start = at_sel.saturating_sub(h - 1).min(at_files.len() - h);
+            let lines: Vec<Line> = at_files[start..start + h]
+                .iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    let selected = start + i == at_sel;
+                    let pointer = if selected { "❯ " } else { "  " };
+                    Line::from(vec![
+                        Span::styled(pointer, Style::default().fg(th.accent)),
+                        Span::styled(
+                            format!("@{path}"),
+                            if selected {
+                                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                    ])
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), chunks[idx]);
+            idx += 1;
+        }
+
+        // Toast strip: the transient status note, highlighted, directly
+        // above the input. Aged out by App::tick — a note that never
+        // expires is wallpaper.
+        if let Some(note) = self.status_note.as_ref() {
+            // REVERSED flips the accent into a background: a strip that
+            // reads as an overlay, not as more history.
+            let highlight = Style::default()
+                .fg(th.accent)
+                .add_modifier(Modifier::REVERSED);
+            let line = Line::from(format!(" {note} ")).style(highlight);
+            frame.render_widget(Paragraph::new(line), chunks[idx]);
+            // No idx bump — the input box (next) addresses its own chunk
+            // as the last row.
         }
 
         // ── Bordered input box ──
@@ -3179,51 +3486,10 @@ impl App {
         format!("{bar} {pct}%{marker}")
     }
 
+    /// The status line as styled spans — a thin wrapper over
+    /// [`App::status_spans`] (single source of truth for the strip).
     fn styled_status_line(&self) -> Line<'static> {
-        let t = self.theme.resolved();
-        let spinner = if self.running {
-            SPINNER_WORKING[(self.spinner_tick as usize) % SPINNER_WORKING.len()]
-        } else {
-            SPINNER[(self.spinner_tick as usize) % SPINNER.len()]
-        };
-        if self.running {
-            let tool = self
-                .current_tool
-                .as_ref()
-                .map(|t| format!(" · {t}"))
-                .unwrap_or_default();
-            Line::from(vec![
-                Span::styled(format!("{spinner} "), Style::default().fg(t.accent)),
-                Span::styled(self.model_label.clone(), Style::default().fg(t.dim)),
-                Span::styled(
-                    format!(
-                        " turn {} · {} tok{tool}",
-                        self.turn_count + 1,
-                        self.cumulative.total()
-                    ),
-                    Style::default().fg(t.dim),
-                ),
-                Span::styled("  esc interrupt", Style::default().fg(t.dim)),
-            ])
-        } else {
-            let meter = self.context_meter();
-            Line::from(vec![
-                Span::styled(format!("{spinner} "), Style::default().fg(t.accent)),
-                Span::styled(self.model_label.clone(), Style::default().fg(t.dim)),
-                Span::styled(
-                    format!(
-                        " · {} tok · {meter} ctrl+o {}",
-                        self.cumulative.total(),
-                        if self.transcript_mode {
-                            "full"
-                        } else {
-                            "compact"
-                        }
-                    ),
-                    Style::default().fg(t.dim),
-                ),
-            ])
-        }
+        Line::from(self.status_spans())
     }
 }
 
@@ -3248,6 +3514,34 @@ pub fn streaming_tail(text: &str, max_lines: usize, width: usize) -> Vec<Line<'s
         .iter()
         .map(|l| Line::from(l.clone()))
         .collect()
+}
+
+/// Walk the workspace for `@`-completion candidates: the `ignore` crate's
+/// walker (respects .gitignore, skips hidden files), with the two heavy
+/// build dirs filtered even when no .gitignore covers them. Capped hard
+/// ([`FILE_COMPLETION_CAP`]) — the render thread pays for this walk, once
+/// per @-session, and 200 sorted paths outnumber any honest completion.
+fn collect_files(root: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = ignore::WalkBuilder::new(root)
+        .require_git(false) // gitignore discipline without a .git dir
+        .filter_entry(|e| {
+            // The root passes (depth 0); below it, never descend into the
+            // trees every workspace could do without.
+            e.depth() == 0 || (e.file_name() != "target" && e.file_name() != "node_modules")
+        })
+        .build()
+        .flatten()
+        .filter_map(|entry| {
+            let rel = entry.path().strip_prefix(root).ok()?;
+            if rel.as_os_str().is_empty() {
+                return None; // the root itself
+            }
+            Some(rel.to_string_lossy().replace('\\', "/"))
+        })
+        .take(FILE_COMPLETION_CAP)
+        .collect();
+    out.sort();
+    out
 }
 
 /// Lowercase kebab slug for skill names from a title.

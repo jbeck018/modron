@@ -8,6 +8,8 @@ license.workspace = true
 modron-core = { path = "../modron-core", version = "0.1.0" }
 modron-router = { path = "../modron-router", version = "0.1.0" }
 modron-store = { path = "../modron-store", version = "0.1.0" }
+# @file completion walks the workspace: .gitignore respect for free.
+ignore.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 anyhow.workspace = true

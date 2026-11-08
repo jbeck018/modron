@@ -1835,3 +1835,216 @@ fn model_menu_marks_unauthenticated_providers() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Status strip, toasts, `!` passthrough, `@file` completion ─────────────
+
+#[test]
+fn status_strip_consolidates_the_dense_line() {
+    let mut app = App {
+        model_label: "glm-5.3".into(),
+        context_window: 200_000,
+        context_used: 60_000,
+        approval_mode: "ask".into(),
+        ..App::default()
+    };
+    app.cumulative.input_tokens = 300;
+    app.cumulative.cached_input_tokens = 100;
+    let line = app.status_line();
+    assert!(line.contains("glm-5.3"), "model first: {line}");
+    assert!(line.contains("300 tok"), "cumulative tokens: {line}");
+    assert!(line.contains("cache 25%"), "session cache hit: {line}");
+    assert!(line.contains("ctx 30%"), "estimated context: {line}");
+    assert!(line.contains("ask (shift+tab)"), "mode + key hint: {line}");
+    assert!(line.contains("? shortcuts"), "help hint: {line}");
+    assert!(line.contains("no session"), "session state kept: {line}");
+
+    // Running: turn number, in-flight tool and interrupt hint survive.
+    app.running = true;
+    app.turn_count = 3;
+    app.current_tool = Some("grep".into());
+    let line = app.status_line();
+    assert!(line.contains("turn 4"), "{line}");
+    assert!(line.contains("grep"), "{line}");
+    assert!(line.contains("esc interrupt"), "{line}");
+
+    // Context pressure flips the ctx segment to the compact warning.
+    app.context_used = 180_000;
+    assert!(
+        app.status_line().contains("ctx 90%!"),
+        "compaction warning: {}",
+        app.status_line()
+    );
+}
+
+#[test]
+fn bare_question_mark_shows_shortcuts() {
+    let mut app = App::default();
+    app.on_key(key(crossterm::event::KeyCode::Char('?')));
+    assert_eq!(
+        app.on_key(key(crossterm::event::KeyCode::Enter)),
+        Action::None,
+        "help is handled locally"
+    );
+    let text = history_text(&app).join("\n");
+    assert!(text.contains("/exit"), "help text committed: {text}");
+}
+
+#[test]
+fn shift_tab_flips_approval_mode_and_parks_the_engine_mutation() {
+    use crossterm::event::KeyCode;
+    let mut app = App {
+        approval_mode: "ask".into(),
+        ..App::default()
+    };
+    assert_eq!(app.on_key(key(KeyCode::BackTab)), Action::None);
+    assert_eq!(app.approval_mode, "yolo");
+    assert_eq!(
+        app.pending_command,
+        Some(PendingCommand::Mode("yolo".into()))
+    );
+    assert_eq!(app.on_key(key(KeyCode::BackTab)), Action::None);
+    assert_eq!(app.approval_mode, "ask");
+}
+
+#[test]
+fn toast_note_expires_after_forty_ticks() {
+    let mut app = App::default();
+    app.toast("copying 12 chars…");
+    assert_eq!(app.status_note.as_deref(), Some("copying 12 chars…"));
+    for _ in 0..39 {
+        app.tick();
+    }
+    assert!(app.status_note.is_some(), "still visible at tick 39");
+    app.tick();
+    assert!(app.status_note.is_none(), "auto-cleared at tick 40");
+}
+
+#[test]
+fn toast_renders_above_the_input_then_expires() {
+    let mut app = App {
+        model_label: "glm-5.3".into(),
+        ..App::default()
+    };
+    app.toast("attached [img shot.png]");
+    let frame = render(&mut app, 80, 8);
+    assert!(frame.contains("attached [img shot.png]"), "{frame:?}");
+    for _ in 0..40 {
+        app.tick();
+    }
+    let frame = render(&mut app, 80, 8);
+    assert!(!frame.contains("attached"), "toast aged out: {frame:?}");
+}
+
+#[test]
+fn shell_passthrough_detection_and_output_cap() {
+    use modron_tui::run::{cap_output, shell_passthrough};
+    assert_eq!(shell_passthrough("fix the bug"), None, "plain task");
+    assert_eq!(
+        shell_passthrough("!git status"),
+        Some("git status".into()),
+        "the ! prefix is stripped"
+    );
+    assert_eq!(
+        shell_passthrough("!   cargo fmt  "),
+        Some("cargo fmt".into()),
+        "surrounding whitespace trimmed"
+    );
+    assert_eq!(
+        shell_passthrough("!"),
+        Some(String::new()),
+        "bare ! = usage"
+    );
+
+    let long = "a".repeat(20_000);
+    let capped = cap_output(&long);
+    assert!(capped.len() < 11_000, "bounded: {}", capped.len());
+    assert!(capped.contains("truncated"), "the cut is marked");
+
+    // Multi-byte safety: the tail stays whole chars (a String, so a split
+    // char would have panicked the boundary walk).
+    let wide = "🦀".repeat(5_000);
+    let capped = cap_output(&wide);
+    assert!(capped.len() < 10_500, "bounded: {}", capped.len());
+    assert!(capped.ends_with("🦀"), "tail kept whole: {capped:?}");
+    assert_eq!(cap_output("short"), "short", "under the cap, verbatim");
+}
+
+#[test]
+fn at_token_is_the_last_boundary_at_with_fragment() {
+    let mut app = App::default();
+    assert!(app.at_token().is_none(), "no @, no token");
+
+    app.input = "fix @src/li".into();
+    let (at, frag) = app.at_token().unwrap();
+    assert_eq!(at, 4);
+    assert_eq!(frag, "src/li");
+
+    // An email address is not a completion token (no boundary before @).
+    app.input = "mail jacob@example.com".into();
+    assert!(app.at_token().is_none());
+
+    // Whitespace after the fragment ends the token (bare-@ semantics for
+    // the token itself; the fragment stops at the space).
+    app.input = "@src main.rs".into();
+    let (_, frag) = app.at_token().unwrap();
+    assert_eq!(frag, "src");
+}
+
+#[test]
+fn at_completion_walks_the_workspace_and_tab_completes() {
+    use crossterm::event::KeyCode;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "fn main() {}").unwrap();
+    std::fs::write(dir.path().join("README.md"), "hi").unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(dir.path().join("ignored.txt"), "").unwrap();
+    std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+    std::fs::write(dir.path().join("node_modules/x.js"), "").unwrap();
+    let mut app = App {
+        working_dir: dir.path().to_path_buf(),
+        ..App::default()
+    };
+
+    // Case-insensitive substring filter over the cached walk.
+    app.input = "read @read".into();
+    assert_eq!(app.file_matches(), vec!["README.md"]);
+    app.cursor = app.input.chars().count();
+    assert_eq!(app.on_key(key(KeyCode::Tab)), Action::None);
+    assert_eq!(app.input, "read @README.md ", "token spliced in place");
+    assert_eq!(app.cursor, "read @README.md ".chars().count());
+
+    // Submit invalidates the walk cache (the task may change the tree).
+    app.on_key(key(KeyCode::Enter));
+    assert!(
+        app.file_completions.is_none(),
+        "cache invalidated on submit"
+    );
+
+    // The next @ re-walks: gitignored entries and vendored trees never
+    // surface; directories complete too.
+    app.input = "@".into();
+    let all = app.file_matches();
+    assert!(all.contains(&"src".to_string()), "{all:?}");
+    assert!(all.contains(&"src/lib.rs".to_string()), "{all:?}");
+    assert!(
+        !all.iter()
+            .any(|f| f.ends_with("ignored.txt") || f.contains("node_modules")),
+        "gitignore + vendor filters: {all:?}"
+    );
+}
+
+#[test]
+fn at_popup_renders_in_the_popup_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hi").unwrap();
+    let mut app = App {
+        working_dir: dir.path().to_path_buf(),
+        model_label: "glm-5.3".into(),
+        ..App::default()
+    };
+    app.input = "@".into();
+    let frame = render(&mut app, 80, 12);
+    assert!(frame.contains("@README.md"), "completion popup: {frame:?}");
+    assert!(frame.contains("glm-5.3"), "status strip still present");
+}
