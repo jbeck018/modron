@@ -235,35 +235,145 @@ impl SlashCommand {
             other => SlashCommand::Unknown(other.to_string()),
         })
     }
+}
 
-    /// The help text shown by /help.
-    pub fn help_text() -> &'static str {
-        "/help            show this help\n\
-         /exit            quit the TUI\n\
-         /clear           clear the scrollback\n\
-         /compact         force a context compaction now\n\
-         /model <name>    switch models mid-session\n\
-         /context         show context usage breakdown\n\
-         /sessions        list recent sessions\n\
-         /sandbox <mode>  off | seatbelt | bubblewrap\n\
-         /reasoning       toggle streamed-reasoning display\n\
-         /btw <question>  quick side question, no tools\n\
-         /agent [name]    list or switch personas\n\
-         /allow|/deny <tool>  session tool permissions\n\
-         /mode ask|yolo   approval mode (or flip it with shift+tab)\n\
-         /tasks           background delegate status\n\
-         /worktree        list delegate worktrees\n\
-         /issues [add <text>]  the project issue board\n\
-         /fork            branch this conversation\n\
-         /plan <task>     plan first, no edits until approved\n\
-         /review          review the working diff\n\
-         /goal <condition>  stop condition for long autonomous runs\n\
-         /learn [title]   distill this session into a SKILL.md\n\
-         ? (bare)         shortcuts (this help)\n\
-         !command         shell passthrough — output lands here, never the model\n\
-         @path            tab-complete a workspace file into the task\n\
-         (anything else is sent as a task to the agent)"
+/// Which tab of the help modal is showing (Claude Code's /help pattern:
+/// an overview, the command table, the key bindings — three short pages
+/// beat one long wall of text nobody scrolls).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HelpTab {
+    #[default]
+    General,
+    Commands,
+    Shortcuts,
+}
+
+impl HelpTab {
+    /// Tab order with the labels the indicator line shows.
+    const ALL: [(HelpTab, &'static str); 3] = [
+        (HelpTab::General, "General"),
+        (HelpTab::Commands, "Commands"),
+        (HelpTab::Shortcuts, "Shortcuts"),
+    ];
+
+    /// ←/→ wrap around (a three-item ring — wrapping beats a dead key at
+    /// either end, same as the popups' arrow handling).
+    fn next(self) -> Self {
+        match self {
+            HelpTab::General => HelpTab::Commands,
+            HelpTab::Commands => HelpTab::Shortcuts,
+            HelpTab::Shortcuts => HelpTab::General,
+        }
     }
+
+    fn prev(self) -> Self {
+        match self {
+            HelpTab::General => HelpTab::Shortcuts,
+            HelpTab::Commands => HelpTab::General,
+            HelpTab::Shortcuts => HelpTab::Commands,
+        }
+    }
+}
+
+/// The General tab: what modron is and the core flow. Wrapped to 70
+/// columns here rather than trusting the Paragraph — the modal renders
+/// raw rows, and a long line would silently clip on a narrow terminal
+/// (the same manual-wrap discipline as the history).
+fn help_general_lines() -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for paragraph in [
+        "modron is a token-efficient coding agent that lives in this \
+         terminal: you type a task, the engine works it through tools \
+         (shell, file edits, search) asking y/n before anything \
+         destructive, and the answer streams into the scrollback above.",
+        "Slash commands configure the session — /model, /sandbox, \
+         /review — and never reach the model: type / to browse them all.",
+        "This help has three tabs; see Shortcuts for every key binding \
+         the TUI actually has.",
+    ] {
+        for row in wrap_line(&Line::from(format!("  {paragraph}")), 70) {
+            lines.push(row);
+        }
+        lines.push(Line::from(""));
+    }
+    lines.pop(); // no trailing blank row (the footer hint sits there)
+    lines
+}
+
+/// The Commands tab: [`SlashCommand::CATALOG`] one `/name` + description
+/// per row — the exact table the completion popup filters, so a command
+/// that parses is a command this page lists (a test holds that line).
+fn help_command_lines(t: theme::Resolved) -> Vec<Line<'static>> {
+    let name_w = SlashCommand::CATALOG
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(0);
+    SlashCommand::CATALOG
+        .iter()
+        .map(|(name, desc)| {
+            Line::from(vec![
+                Span::raw(format!("  /{name:<name_w$}")),
+                Span::styled(format!("  {desc}"), Style::default().fg(t.dim)),
+            ])
+        })
+        .collect()
+}
+
+/// The Shortcuts tab: the key grid. Hand-written NEXT to the handlers it
+/// documents — every row was verified against `on_key`/`run.rs` (the
+/// requested "double-esc clears input" died here: esc's idle behavior is
+/// a single-press cascade — selection, then jump-to-live, then input —
+/// and no double-press state exists anywhere).
+fn help_shortcut_lines(t: theme::Resolved) -> Vec<Line<'static>> {
+    const W: usize = 18; // key column; the longest binding is "shift/alt+enter"
+    let rows: [(&str, &str); 16] = [
+        ("enter", "send the task"),
+        (
+            "shift/alt+enter",
+            "newline in the input (ctrl+j works on any terminal)",
+        ),
+        (
+            "\\ + enter",
+            "line continuation — the same newline, everywhere",
+        ),
+        (
+            "esc",
+            "interrupt the running turn · close modals · clear input",
+        ),
+        (
+            "pgup/pgdn",
+            "page the session history (the mouse wheel scrolls too)",
+        ),
+        ("ctrl+t", "expand this turn's tool activity (esc closes)"),
+        ("ctrl+o", "toggle transcript detail (compact/full)"),
+        ("ctrl+c", "abort the running turn · quit when idle"),
+        ("ctrl+v", "paste: image → attachment · text → input"),
+        ("shift+tab", "flip the approval mode: ask | yolo"),
+        ("↑/↓", "recall sent inputs · move between input lines"),
+        (
+            "mouse",
+            "click positions the cursor · drag selects · release copies",
+        ),
+        ("?", "shortcuts (this modal — /help does the same)"),
+        (
+            "!command",
+            "shell passthrough — output lands here, never the model",
+        ),
+        (
+            "@path",
+            "attach a workspace file to the task (tab completes)",
+        ),
+        ("tab", "complete the highlighted /command or @path"),
+    ];
+    rows.iter()
+        .map(|(k, action)| {
+            Line::from(vec![
+                Span::styled(format!("  {:<W$}", k), Style::default().fg(t.accent)),
+                Span::styled(*action, Style::default()),
+            ])
+        })
+        .collect()
 }
 
 /// The interactive auth manager (`/auth`): a modal that owns the keys.
@@ -506,6 +616,14 @@ pub struct App {
     /// takes one (`/model`, `/theme`, ...). Mutually exclusive with the
     /// auth manager; owns all keys while open.
     pub menu: Option<Menu>,
+    /// The tabbed help modal (/help, bare `?`): General / Commands /
+    /// Shortcuts. Preempts menu/auth on open (two key owners would fight
+    /// over esc) and owns all keys while open, like the menu.
+    pub help: Option<HelpTab>,
+    /// Scroll offset of the help modal's content (the Commands tab is
+    /// taller than any honest window); reset on open and tab switch,
+    /// clamped at render.
+    pub help_scroll: usize,
     /// Persona names, injected by the run loop (feeds /agent's menu).
     pub personas: Vec<String>,
     /// Registered tool names, injected by the run loop (feeds /allow and
@@ -862,6 +980,13 @@ impl App {
                 }
                 _ => return Action::None,
             }
+        }
+
+        // The tabbed help modal (/help, bare `?`) owns every key while
+        // open — placed BEFORE the Esc-abort check so esc closes the
+        // modal instead of killing a running turn (the menu's contract).
+        if self.help.is_some() {
+            return self.help_key(key);
         }
 
         // An open menu (arg-less /model, /theme, ...) owns every key.
@@ -1433,6 +1558,45 @@ impl App {
             .collect()
     }
 
+    /// Open the help modal on its first tab. The modal slots are mutually
+    /// exclusive (help renders in the menu's chunk, and two key owners
+    /// would fight over esc), so opening help closes whatever else is up
+    /// — the same preemption /auth does to the menu.
+    fn open_help(&mut self) {
+        self.menu = None;
+        self.auth_flow = None;
+        self.help_scroll = 0;
+        self.help = Some(HelpTab::default());
+    }
+
+    /// Handle a key inside the help modal: ←/→ (or h/l) switch tabs —
+    /// wrapping, and resetting the scroll since each tab starts at its
+    /// top — ↑/↓ (pgup/pgdn) page a tab taller than the window, esc
+    /// closes. Everything else is swallowed: a modal that let keys leak
+    /// to the input underneath would type ghost text into a box the user
+    /// cannot see.
+    fn help_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
+        let tab = self.help.unwrap_or_default();
+        match key.code {
+            KeyCode::Esc => self.help = None,
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.help = Some(tab.prev());
+                self.help_scroll = 0;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.help = Some(tab.next());
+                self.help_scroll = 0;
+            }
+            KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+            KeyCode::Down => self.help_scroll += 1, // clamped at render
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.help_scroll += 10,
+            _ => {}
+        }
+        Action::None
+    }
+
     /// `/model` with no argument: the whole catalog as a picker, the
     /// current model marked and preselected.
     pub fn open_model_menu(&mut self) {
@@ -1617,8 +1781,8 @@ impl App {
     /// Route pasted text: into the auth flow's key buffer when the wizard
     /// is waiting for a key, into the normal input otherwise.
     pub fn paste_into_auth_or_input(&mut self, text: &str) {
-        if self.menu.is_some() {
-            return; // an open menu owns the keyboard; paste is ignored
+        if self.menu.is_some() || self.help.is_some() {
+            return; // an open modal owns the keyboard; paste is ignored
         }
         if let Some(AuthFlow::KeyEntry { input, .. }) = &mut self.auth_flow {
             input.push_str(text);
@@ -2116,7 +2280,11 @@ impl App {
         match cmd {
             SlashCommand::Exit => Action::Quit,
             SlashCommand::Help => {
-                self.push_lines(SlashCommand::help_text());
+                // The tabbed modal (Claude Code's pattern) replaces the old
+                // static text block — a scrollback dump can't be tabbed,
+                // filtered, or closed, and it pushed real content out of
+                // the history the user came to read.
+                self.open_help();
                 Action::None
             }
             SlashCommand::Clear => {
@@ -2859,7 +3027,7 @@ impl App {
             .min((area.height / 2).max(4))
             .min(area.height.saturating_sub(2));
 
-        let modal_open = self.auth_flow.is_some() || self.menu.is_some();
+        let modal_open = self.auth_flow.is_some() || self.menu.is_some() || self.help.is_some();
         let matches = if modal_open {
             Vec::new()
         } else {
@@ -2895,6 +3063,21 @@ impl App {
             }
         };
 
+        // The help modal: tab strip + up to half the screen of content +
+        // the footer hint (a floor of 6 keeps the tab strip readable on
+        // cramped terminals; taller tabs page through with ↑/↓).
+        let help_h = match self.help {
+            None => 0,
+            Some(tab) => {
+                let content = match tab {
+                    HelpTab::General => help_general_lines().len(),
+                    HelpTab::Commands => help_command_lines(th).len(),
+                    HelpTab::Shortcuts => help_shortcut_lines(th).len(),
+                } as u16;
+                (content + 2).min((area.height / 2).max(6))
+            }
+        };
+
         let tool_panel_rows = self.tool_panel.as_ref().map_or(0, |events| {
             (events.len() as u16 + 2).min((area.height / 2).max(4))
         });
@@ -2917,6 +3100,9 @@ impl App {
         });
         if flow_h > 0 {
             rows.push(Constraint::Length(flow_h));
+        }
+        if help_h > 0 {
+            rows.push(Constraint::Length(help_h));
         }
         if popup_h > 0 {
             rows.push(Constraint::Length(popup_h));
@@ -3285,6 +3471,43 @@ impl App {
             idx += 1;
         }
 
+        // ── Tabbed help modal (/help, bare ?) — the menu's render style
+        // (dim header row, plain content, dim hint) with a tab strip for
+        // a header: the active tab is accent+underlined, the others dim.
+        if let Some(tab) = self.help {
+            let content = match tab {
+                HelpTab::General => help_general_lines(),
+                HelpTab::Commands => help_command_lines(th),
+                HelpTab::Shortcuts => help_shortcut_lines(th),
+            };
+            let vis = (help_h as usize).saturating_sub(2).max(1);
+            self.help_scroll = self.help_scroll.min(content.len().saturating_sub(vis));
+            let mut strip: Vec<Span> = vec![Span::raw("  ")];
+            for (i, (t, label)) in HelpTab::ALL.iter().enumerate() {
+                if i > 0 {
+                    strip.push(Span::styled("   ", Style::default().fg(th.dim)));
+                }
+                let style = if *t == tab {
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                strip.push(Span::styled((*label).to_string(), style));
+            }
+            let mut lines = vec![Line::from(strip)];
+            for line in content.iter().skip(self.help_scroll).take(vis) {
+                lines.push(line.clone());
+            }
+            lines.push(
+                Line::from("  ←/→ tabs · ↑/↓ scroll · esc close")
+                    .style(Style::default().fg(th.dim)),
+            );
+            frame.render_widget(Paragraph::new(lines), chunks[idx]);
+            idx += 1;
+        }
+
         // Slash-command popup (window around the highlight when the
         // filtered list outgrows the space), or the @file popup sharing
         // the same slot and grammar.
@@ -3410,6 +3633,11 @@ impl App {
                 ("auth manager — esc to close", Style::default().fg(th.dim))
             } else if self.menu.is_some() {
                 ("menu open — esc to close", Style::default().fg(th.dim))
+            } else if self.help.is_some() {
+                (
+                    "help open — ←/→ tabs · esc close",
+                    Style::default().fg(th.dim),
+                )
             } else if self.running {
                 ("", Style::default())
             } else {

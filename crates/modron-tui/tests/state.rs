@@ -344,14 +344,19 @@ fn slash_commands_parse_and_route() {
 #[test]
 fn slash_commands_are_handled_locally() {
     let mut app = App::default();
-    // /help shows help text in the tool lines
+    // /help opens the tabbed help modal (handled locally, never submitted)
     app.on_key(key(crossterm::event::KeyCode::Char('/')));
     for c in "help".chars() {
         app.on_key(key(crossterm::event::KeyCode::Char(c)));
     }
     let action = app.on_key(key(crossterm::event::KeyCode::Enter));
     assert_eq!(action, Action::None, "help is local, not submitted");
-    assert!(history_text(&app).iter().any(|l| l.contains("/exit")));
+    assert!(app.help.is_some(), "the tabbed help modal is open");
+    assert!(
+        history_text(&app).is_empty(),
+        "the modal replaces the old scrollback dump: {:?}",
+        history_text(&app)
+    );
 
     // /exit quits
     let mut app2 = App::default();
@@ -1878,6 +1883,7 @@ fn status_strip_consolidates_the_dense_line() {
 
 #[test]
 fn bare_question_mark_shows_shortcuts() {
+    use modron_tui::HelpTab;
     let mut app = App::default();
     app.on_key(key(crossterm::event::KeyCode::Char('?')));
     assert_eq!(
@@ -1885,8 +1891,96 @@ fn bare_question_mark_shows_shortcuts() {
         Action::None,
         "help is handled locally"
     );
-    let text = history_text(&app).join("\n");
-    assert!(text.contains("/exit"), "help text committed: {text}");
+    assert!(
+        matches!(app.help, Some(HelpTab::General)),
+        "bare ? opens the same tabbed modal as /help"
+    );
+}
+
+// ── Tabbed help modal (/help) ──────────────────────────────────────────────
+
+#[test]
+fn help_modal_tabs_switch_scroll_and_esc_closes() {
+    use crossterm::event::KeyCode;
+    use modron_tui::HelpTab;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Help);
+    assert!(matches!(app.help, Some(HelpTab::General)));
+
+    // Right (and vim h/l) walk the ring, wrapping at both ends.
+    app.on_key(key(KeyCode::Right));
+    assert!(matches!(app.help, Some(HelpTab::Commands)));
+    app.on_key(key(KeyCode::Right));
+    assert!(matches!(app.help, Some(HelpTab::Shortcuts)));
+    app.on_key(key(KeyCode::Right));
+    assert!(matches!(app.help, Some(HelpTab::General)), "wraps forward");
+    app.on_key(key(KeyCode::Char('h')));
+    assert!(matches!(app.help, Some(HelpTab::Shortcuts)), "h walks back");
+    app.on_key(key(KeyCode::Left));
+    assert!(
+        matches!(app.help, Some(HelpTab::Commands)),
+        "left walks back"
+    );
+
+    // The modal owns the keyboard: typing never leaks into the input
+    // underneath, and one esc closes the modal (the input survives it).
+    app.input.push_str("leftover");
+    app.on_key(key(KeyCode::Char('x')));
+    assert_eq!(app.input, "leftover", "typing is swallowed");
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.help.is_none());
+    assert_eq!(app.input, "leftover", "esc only closes the modal");
+
+    // Esc with a turn running closes the modal instead of aborting it
+    // (the modal check sits before the Esc-abort branch).
+    let mut run = App {
+        running: true,
+        ..App::default()
+    };
+    run.handle_slash_test(SlashCommand::Help);
+    assert_eq!(run.on_key(key(KeyCode::Esc)), Action::None);
+    assert!(run.help.is_none());
+
+    // The Commands tab is taller than the window: downs clamp at the
+    // content's end on render, up walks back.
+    app.handle_slash_test(SlashCommand::Help);
+    app.on_key(key(KeyCode::Right)); // Commands
+    for _ in 0..50 {
+        app.on_key(key(KeyCode::Down));
+    }
+    let _ = render(&mut app, 90, 24); // render performs the clamp
+    assert!(app.help_scroll < 50, "scroll clamped: {}", app.help_scroll);
+    app.on_key(key(KeyCode::Up));
+    assert_eq!(app.help_scroll, 22, "one down-step back from the clamp");
+}
+
+#[test]
+fn help_modal_renders_tabs_catalog_and_shortcuts() {
+    use crossterm::event::KeyCode;
+    let mut app = App::default();
+    app.handle_slash_test(SlashCommand::Help);
+    let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("General"), "tab strip: {frame:?}");
+    assert!(frame.contains("Commands"), "every tab labelled: {frame:?}");
+    assert!(
+        frame.contains("token-efficient coding agent"),
+        "general copy: {frame:?}"
+    );
+    assert!(frame.contains("←/→ tabs"), "footer hint: {frame:?}");
+
+    // Commands tab renders straight from the catalog (so it lists
+    // exactly what parses).
+    app.on_key(key(KeyCode::Right));
+    let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("/compact"), "catalog rows: {frame:?}");
+    assert!(frame.contains("/help"), "catalog rows: {frame:?}");
+
+    // Shortcuts tab: only bindings that actually exist.
+    app.on_key(key(KeyCode::Right));
+    let frame = render(&mut app, 90, 24);
+    assert!(frame.contains("pgup/pgdn"), "shortcut grid: {frame:?}");
+    assert!(frame.contains("shift+tab"), "shortcut grid: {frame:?}");
+    assert!(frame.contains("ctrl+v"), "shortcut grid: {frame:?}");
 }
 
 #[test]
