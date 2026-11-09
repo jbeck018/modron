@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "modron-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "modron-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "modron-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "modron-providers"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "modron-router"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "modron-core",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "modron-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "modron-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "modron-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "crossterm",
