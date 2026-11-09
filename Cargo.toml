@@ -13,6 +13,7 @@ members = [
     "crates/modron-view",
     "crates/modron-server",
     "crates/modron-desktop",
+    "mobile/rust-core",
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ toml = "0.8"
 dirs = "5"
 futures = "0.3"
 tempfile = "3"
+tokio-tungstenite = "0.30"
 ratatui = "0.30"
 libc = "0.2"
 sha2 = "0.10"
