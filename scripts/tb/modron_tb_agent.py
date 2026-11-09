@@ -145,7 +145,7 @@ class ModronTbAgent(BaseAgent):
             f"mkdir -p {home}/sessions; rm -f /tmp/modron-exit; "
             f"{BINARY_IN_CONTAINER} --provider {self._provider} "
             f"--model {self._model_name} --yolo "
-            f"--sessions-dir {home}/sessions --max-turns 80 "
+            f"--sessions-dir {home}/sessions --max-turns 150 "
             f'"$(cat /tmp/modron-instruction.txt)" > /tmp/modron-run.log 2>&1; '
             "cp -f /tmp/modron-run.log /logs/modron-run.log 2>/dev/null; "
             "cp -f $(ls -t /tmp/modron-home/sessions/*.jsonl 2>/dev/null "
@@ -219,7 +219,7 @@ class ModronTbAgent(BaseAgent):
             second = (
                 f"{BINARY_IN_CONTAINER} --provider {esc_provider} "
                 f"--model {escalate} --yolo "
-                f"--sessions-dir {home}/sessions --max-turns 80 "
+                f"--sessions-dir {home}/sessions --max-turns 150 "
                 f'"$(cat /tmp/modron-instruction.txt)" >> /tmp/modron-run.log 2>&1; '
                 "echo $? > /tmp/modron-exit\n"
             )
