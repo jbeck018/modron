@@ -110,9 +110,35 @@ Evidence (all captured on this machine, 2026-11-09):
    `src/lib.rs` does `mod speech;` pointing at
    `../../nsh-platform-macos/src/speech.rs`, a path outside the published
    package, so `nsh package --target ios-simulator` (and `--target ios`)
-   fails compiling from the registry. Upstream defect, not local. Workarounds:
-   build nsh from a github checkout (`cargo build -p nsh-cli`, path-dep
-   hosts) or pin the next patch release.
+   fails compiling from the registry. **FIXED, VERIFIED 2026-11-09** (see
+   below). Upstream main has since moved speech into a shared
+   `nsh-platform-apple` crate (so the next published release should drop
+   the defect); until then run `scripts/nsh-ios-fix.sh` once per machine.
+
+   ### The workaround hunt (what works and what doesn't)
+
+   - **[patch.crates-io] in mobile/app/Cargo.toml: DOES NOT APPLY.** The
+     per-target runner manifests under `mobile/app/.nsh/rust/<target>/`
+     are what cargo builds for `nsh package`, and nsh **regenerates them
+     from templates on every run** (verified by hash: an edited runner
+     manifest reverts during the next `nsh package`), so a patch placed
+     there is wiped and one placed in the app manifest never reaches the
+     runner's independent resolution. Patching a vendored fixed copy of
+     the crate is therefore dead on arrival.
+   - **Editing the generated runner manifest: wiped every run** (same
+     regeneration fact).
+   - **Building nsh-cli from a github checkout (SPIKE's original
+     suggestion): works** but costs a full CLI source build and an
+     out-of-band toolchain swap.
+   - **THE FIX (shipped): one symlink in the cargo registry.** The failing
+     path resolves to `<registry-src>/nsh-platform-macos/src/speech.rs`;
+     `scripts/nsh-ios-fix.sh` links the unversioned name to the extracted
+     `nsh-platform-macos-0.4.0/` package (cargo does not re-verify
+     extracted packages, so the link persists across builds). Verified end
+     to end: `nsh package . --target ios-simulator` -> runner built in
+     1m1s -> `Modron Remote.app` (54MB) packaged -> installed and launched
+     on the iPhone 17 Pro simulator (iOS 26.5), process stayed alive
+     (pid confirmed via launchctl).
 2. The `#[module]` macro rewrites exported fn bodies - `?` and
    Result-returning calls inside them fail to compile in surprising ways.
    Pattern that works: exported fns stay one-line, real logic in plain
@@ -179,11 +205,11 @@ terminal affordances). Words, states, ordering, semantics: shared.
 
 ## Exact next steps for the real-device pass
 
-1. Fix the iOS runner build: either `git clone
-   https://github.com/longbridge/nsh && cargo build -p nsh-cli` (use that
-   CLI; it links nsh-platform crates by path, which contain the file the
-   registry package is missing), or wait for an nsh 0.4.x patch and
-   re-pin `NSH_VERSION`.
+1. ~~Fix the iOS runner build~~ DONE 2026-11-09, no nsh rebuild needed:
+   run `scripts/nsh-ios-fix.sh` once per machine (idempotent), then
+   `rustup target add aarch64-apple-ios-sim` (done on this machine).
+   VERIFIED: packaged + installed + launched in the installed iOS 26.5
+   simulator (`nsh package app --target ios-simulator --run`).
 2. `rustup target add aarch64-apple-ios-sim` (done on this machine), then
    `nsh package app --target ios-simulator --run` - launches in the
    installed iOS 26.5 simulator.
