@@ -5,14 +5,19 @@ how smart the agent is; the harness decides how fast, safe, and expensive that
 intelligence is to use.** Read the founding document in [PLAN.md](PLAN.md); the live
 work ledger is [LEDGER.md](LEDGER.md).
 
-Status: **v0.1.1 — self-improving memory, goal runs, LSP diagnostics, image paste** — one-shot CLI + `modron chat` REPL with
-live streaming answers, interactive approvals (Ask prompts on your terminal), agent
-engine loop, Anthropic + OpenAI-compatible + **Z.ai** providers (SSE streaming
-proven at the wire level), 6 essential tools behind an approval gate + optional
-macOS Seatbelt sandbox, lifecycle hooks (configurable in config.toml), file
-checkpoints with `modron rewind`, USD spend caps, persistent workspace memory,
-token-efficient autocompaction, JSONL session trees, heuristic model router, and a
-keyless mock-provider end-to-end path.
+Status: **v0.1.1 — sign-in reuse, tool tiering, self-check finish gate, tb harness** — one-shot CLI + `modron chat` REPL +
+`modron tui` (inline viewport, rotating capability hints, dense status strip,
+`!` shell passthrough, `@file` completion) with live streaming answers and
+interactive approvals (Ask prompts on your terminal), agent engine loop,
+Anthropic + OpenAI-compatible + **Z.ai** providers (SSE streaming proven at the
+wire level) plus Claude/ChatGPT subscription OAuth, 12 essential tools behind
+an approval gate + optional macOS Seatbelt sandbox, first-run onboarding that
+reuses existing Codex CLI / Claude Code sign-ins, lifecycle hooks (configurable
+in config.toml), file checkpoints with `modron rewind`, USD spend caps,
+persistent workspace memory, token-efficient autocompaction, TurnTrace
+session records, 5-attempt patient retries with empty-stream replay, JSONL
+session trees, heuristic model router, and a keyless mock-provider
+end-to-end path.
 
 ## Install
 
@@ -21,6 +26,26 @@ curl -fsSL https://raw.githubusercontent.com/jbeck018/modron/main/install.sh | b
 # or from source:
 cargo install --locked --git https://github.com/jbeck018/modron
 ```
+
+## First run & auth
+
+With no provider configured, the first launch opens a setup screen instead of
+erroring. Before asking for a key it checks for sign-ins other agent CLIs
+already hold on this machine and offers one-press reuse:
+
+- **Codex CLI** — ChatGPT tokens in `~/.codex/auth.json`
+- **Claude Code** — `~/.claude/.credentials.json`, else the macOS keychain
+
+Enter reuses the first detected sign-in; `s` falls through to the manual
+provider list. The source tool keeps its copy — if it refreshes its tokens
+first, re-run onboarding to re-import.
+
+`modron auth` manages credentials any time: `auth add` (interactive wizard),
+`auth login` (Claude subscription OAuth in the browser), `auth set <provider>
+[key]` — omit the key or pass `-` and it is read from stdin, so piped secrets
+never touch shell history or `ps` — `auth status` (masked), `auth logout
+[provider]`. Saved keys live in `~/.config/modron/env` (mode 0600), sourced on
+every launch; the TUI's `/auth` opens the same manager mid-session.
 
 ## Daemon (persistent sessions)
 
@@ -108,7 +133,21 @@ approval prompt) is the managed viewport. No alternate screen, no redraw churn.
 
 - **Esc** interrupts the running turn (partial work stays persisted and resumable)
 - **y/n/a** answers inline approval prompts; `a` approves for the rest of the run
+- **shift+tab** flips the approval mode (ask | yolo)
+- **ctrl+t** expands this turn's tool activity in a scrollable panel (esc closes)
 - **ctrl+o** toggles transcript detail (compact vs full tool output)
+- **ctrl+v** pastes the clipboard: an image becomes an attachment, text lands in the input
+- **`!cmd`** shell passthrough: output lands in your scrollback and never
+  reaches the model (and needs no approval gate — you typed it)
+- **`@path`** attaches a workspace file to the task; tab completes it (the
+  walk respects .gitignore and skips hidden files)
+- The status strip packs the essentials into one dense line: model / tok /
+  cache% / ctx% / approval mode (shift+tab) / ? shortcuts
+- The empty input rotates capability hints (`try /model`, `try @file`,
+  `try !command`, `try ctrl+t`, ...) cycling on the spinner tick
+- Transient notes render as toasts above the input and expire
+- **/help** (or a bare `?`) opens a tabbed modal — General / Commands /
+  Shortcuts — arrow keys move between tabs
 - **ctrl+c** aborts then quits; the status line shows tokens and the live tool
 
 ## Live usage
@@ -165,7 +204,10 @@ cargo run -p modron-cli -- "task" --provider zai --model glm-5.3
 |---|---|---|
 | `--provider` | `anthropic` \| `openai-compat` \| `zai` \| `mock` | config `default_provider`, else `anthropic` |
 | `--model` | model name sent to the provider | config `default_model`, else `claude-sonnet-4-5` |
-| `--approve-all` | let `bash`/`write`/`edit` execute (Ask mode blocks them otherwise) | off |
+| `--approve-all` | let `bash`/`write`/`edit` execute (Ask mode blocks them otherwise); `--yolo` is an alias | off |
+| `--allow <tool>` / `--deny <tool>` | per-run tool permissions, repeatable (deny wins) | — |
+| `--agent <name>` | run as a persona from `[agents.*]` (prompt, model, permissions) | — |
+| `--goal "<condition>"` | natural-language stop condition: keep iterating in the same session until the model reports the goal met or a cap trips | — |
 | `--sandbox seatbelt` | macOS sandbox: network denied, writes fenced to workspace + temp | off |
 | `--max-cost <usd>` | USD spend cap for the run (catalog-priced, per-turn enforced) | unlimited |
 | `--resume <uuid>` | continue a previous session (same session id, honors rewind points) | — |
@@ -184,6 +226,12 @@ cargo run -p modron-cli -- "task" --provider zai --model glm-5.3
 modron tui                      # inline-viewport TUI: streaming, tool lines,
                                  #   esc-to-interrupt, inline y/n/a approvals
 modron chat                     # interactive multi-turn session (streaming)
+modron auth add|login|set|status|logout
+                                # provider credentials (API keys + OAuth);
+                                #   auth set <provider> reads the key from
+                                #   stdin when the key arg is omitted or '-'
+modron acp                      # Agent Client Protocol server for editors (Zed)
+modron eval                     # mini-swe evals: verifier-scored task suite
 modron router eval                   # score the model router offline
 modron usage                    # aggregate token/cost/cache-hit dashboard
 modron sessions                   # list stored sessions with tokens + est. cost
@@ -193,6 +241,7 @@ modron sessions restart <id>      # same session id, fresh context
 modron rewind                   # undo the last checkpointed file mutation +
                                  #   mark the transcript for resume-from-truncation
 modron memory list|show|forget  # inspect/forget the workspace's persistent memory
+modron memory stats|curate      # usefulness ledger; decay/relegate useless facts
 ```
 
 ## Memory, caching, compaction
@@ -208,6 +257,35 @@ modron memory list|show|forget  # inspect/forget the workspace's persistent memo
   with the cheap model and continues from `[compact state] + recent tail`. The
   measured gate: post-compaction input ≤ 1.5× a fresh session's for the same task
   (asserted in tests). Compaction usage counts against the budget governor.
+
+## Reliability, observability, tool tiering
+
+- **Finish gate:** a run that mutated files does not just stop. With a
+  `[verify]` command configured, the engine re-runs it and feeds failures
+  back until green (bounded rounds). With no verify tool, one
+  requirements-checklist turn is forced instead: the model re-reads the
+  original task and verifies each concrete detail it names — paths, exact
+  names, ports, config formats — against the environment before ending.
+- **TurnTrace:** every model turn appends an observability record to the
+  session JSONL — harness version, provider/model, a sha256 over the prompt
+  prefix (cache-stability auditing), latency, cost, usage, the finish gate's
+  verdict, and a terminal stop label (`end_turn`, `max_turns`, `spend_cap`,
+  `budget_exhausted`).
+- **Patient retries:** provider transport errors (429, 5xx, timeouts,
+  connection errors) retry up to 5 attempts with exponential backoff
+  (500ms base, factor 4) — provider-side overload bursts routinely outlast
+  a shorter budget.
+- **Empty-stream replay:** a stream that dies before emitting anything
+  observable is replayed once; once deltas have reached the terminal there
+  is no replay, so partial output is never duplicated.
+- **Tool tiering:** 12 essential tools stay in the request schema (read,
+  write, edit, bash, grep, glob, tool_search, skill, memory_search,
+  diagnostics, verify, interact); everything else — `remember`,
+  `read_minified`, `explore`, `delegate_status`, `merge_worktree`, MCP
+  tools — stays callable but off-prompt, surfaced on demand via
+  `tool_search`.
+- **`interact` tool:** a persistent tmux session (`start` / `send` /
+  `capture`) for screen programs bash cannot hold open — vim, ssh, REPLs.
 
 ## Configuration
 
@@ -228,7 +306,8 @@ post_tool = ""                       # observes; never blocks
 threshold_frac = 0.7
 
 [verify]                             # registers the `verify` tool: the agent runs
-command = "cargo test --quiet"       #   your checks after edits and fixes failures
+command = "cargo test --quiet"       #   your checks after edits, and the finish
+                                     #   gate re-runs it before a mutating run ends
 
 # Agent personas (Kilo-style custom modes): tailored prompt, forced model,
 # tool permissions. Select with --agent debug.
@@ -315,6 +394,14 @@ per session under `~/.modron/sessions/` (override with `--sessions-dir`); a
 `{uuid}.rewind` marker stores the truncation point a rewind created. Workspace
 memory lives under `~/.modron/memory/<workspace-slug>/`.
 
+## Benchmarks
+
+`modron bench` compares the curated free-tier models on a fixed task suite,
+`modron eval` scores verifier-checked mini-swe tasks, and `scripts/tb` adapts
+Terminal-Bench: a headless in-container agent adapter, a per-task scorecard
+(`score.py`), and a baseline TSV regression gate. Setup and pilot recipe:
+[scripts/tb/README.md](scripts/tb/README.md).
+
 ## Tests
 
 ```sh
@@ -341,13 +428,17 @@ smoke is documented above but (by design) unexecuted until keys exist.
 
 ```
 crates/modron-core        traits, agent engine, budget + USD caps, approval/sandbox/hook
-                           pipeline, checkpoints + rewind, autocompaction, memory, mock provider
+                           pipeline, checkpoints + rewind, autocompaction, memory, auth
+                           (API keys, OAuth, cross-CLI sign-in discovery), mock provider
 crates/modron-providers   Anthropic Messages + OpenAI-compatible clients (SSE streaming),
-                           retry/backoff, Z.ai factory
-crates/modron-tools       read / glob / grep / bash / write / edit / remember + output
-                           reduction + registry
+                           retry/backoff with empty-stream replay, Z.ai factory
+crates/modron-tools       read / glob / grep / bash / write / edit / interact / remember /
+                           memory_search / diagnostics / skill / explore / delegate +
+                           output reduction + tiered registry
 crates/modron-store       JSONL session store (append-only, corrupt-line tolerant)
 crates/modron-router      heuristic model selector + embedded model catalog (pricing)
+crates/modron-tui         the inline-viewport terminal UI
+crates/modron-mcp         MCP client + on-demand tool bridge
 crates/modron-cli         the one-shot binary, config, subcommands
 ```
 
