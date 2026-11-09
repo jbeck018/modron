@@ -4,7 +4,28 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# GPUI + gpui-kit desktop client (Phase 4). The GUI dependencies are added
-# by the desktop tranche; the skeleton stays dep-free so the workspace
-# build never depends on gpui resolution.
+# Phase 4: the GPUI Kit remote client. Dependency note: `gpui-kit = "0.9.1"`
+# (Longbridge, https://gpui-kit.com) is an umbrella crate that pins and
+# re-exports the whole GPUI stack — the `gpui` core ships as the
+# `gpui-pre` snapshot crate (=0.3.12, snapshot of zed@d2a4fb6) plus
+# `gpui-base` 0.9.1 and `gpui-component` 0.9.1; everything resolves from
+# crates.io (no git pin needed). Exact versions are pinned by Cargo.lock.
+
+[[bin]]
+name = "modron-desktop"
+path = "src/main.rs"
+
 [dependencies]
+modron-core = { path = "../modron-core", version = "0.1.0" }
+modron-protocol = { path = "../modron-protocol", version = "0.1.0" }
+modron-view = { path = "../modron-view", version = "0.1.0" }
+modron-router = { path = "../modron-router", version = "0.1.0" }
+anyhow.workspace = true
+async-channel = "2"
+futures.workspace = true
+gpui-kit = "0.9.1"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite = "0.30"
+uuid.workspace = true

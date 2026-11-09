@@ -1,16 +1,13 @@
-//! modron-desktop — the GPUI/GPUI-Kit remote client (Phase 4).
+//! modron-desktop -- the GPUI Kit remote client (remote-control Phase 4).
 //!
-//! Skeleton crate slot; the desktop tranche adds the gpui/gpui-kit
-//! dependencies and the app (session sidebar, virtualized transcript,
-//! composer, approval strip, tool panel, model picker).
+//! Layering: [`app_state::AppState`] folds protocol frames into UI state
+//! (plain Rust, unit-tested without gpui); [`wire`] speaks the WebSocket
+//! protocol; [`demo`] is a built-in mock server for standalone runs; [`ui`]
+//! is a thin GPUI Kit renderer over the state.
 
-/// Crate slot placeholder — replaced by the Phase-4 implementation.
-pub const PENDING: &str = "phase-4";
+pub mod app_state;
+pub mod demo;
+pub mod ui;
+pub mod wire;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn skeleton_compiles() {
-        assert_eq!(super::PENDING, "phase-4");
-    }
-}
+pub use app_state::{AppState, ConnState, Row, SessionRow};
