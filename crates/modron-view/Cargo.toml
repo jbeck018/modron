@@ -1,0 +1,12 @@
+[package]
+name = "modron-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+modron-core = { path = "../modron-core", version = "0.1.0" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

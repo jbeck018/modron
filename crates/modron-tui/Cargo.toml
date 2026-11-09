@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 modron-core = { path = "../modron-core", version = "0.1.0" }
+modron-view = { path = "../modron-view", version = "0.1.0" }
 modron-router = { path = "../modron-router", version = "0.1.0" }
 modron-store = { path = "../modron-store", version = "0.1.0" }
 # @file completion walks the workspace: .gitignore respect for free.

@@ -9,6 +9,10 @@ members = [
     "crates/modron-tui",
     "crates/modron-mcp",
     "crates/modron-cli",
+    "crates/modron-protocol",
+    "crates/modron-view",
+    "crates/modron-server",
+    "crates/modron-desktop",
 ]
 
 [workspace.package]

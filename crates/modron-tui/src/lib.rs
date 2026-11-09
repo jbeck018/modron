@@ -19,6 +19,7 @@ pub use run::{run_with, TuiConfig, TuiSinks};
 pub use theme::Theme;
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
+use modron_view::{tool_summary_line, ToolEvent};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
@@ -650,42 +651,9 @@ pub struct Selection {
     pub head: (usize, u16),
 }
 
-/// One grouped tool event for the collapsed tool view.
-#[derive(Clone, Debug)]
-pub struct ToolEvent {
-    pub name: String,
-    /// Output size in bytes (filled at Done).
-    pub bytes: Option<u64>,
-    pub is_error: bool,
-    pub done: bool,
-}
-
-impl ToolEvent {
-    /// The row as shown in the expanded panel, e.g. `✓ read — 2.1 KB` or
-    /// `● bash …`.
-    pub fn summary(&self) -> String {
-        if !self.done {
-            format!("● {} …", self.name)
-        } else {
-            let mark = if self.is_error { "✗" } else { "✓" };
-            match self.bytes {
-                Some(b) => format!("{mark} {} — {}", self.name, human_bytes(b)),
-                None => format!("{mark} {}", self.name),
-            }
-        }
-    }
-}
-
-/// `2.1 KB`-style byte sizes for the tool panel.
-fn human_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
+// The grouped tool view (`ToolEvent`, `human_bytes`, `tool_summary_line`)
+// moved to modron-view so servers, the desktop app, and mobile clients
+// group identically; imported at the top of this module.
 
 /// One DISPLAY row of the input box: a logical line (or a slice of one,
 /// when it wraps) with its absolute char offset.
@@ -2640,7 +2608,7 @@ impl App {
         if self.turn_tools.is_empty() {
             return;
         }
-        let summary = self.tool_summary_line();
+        let summary = tool_summary_line(&self.turn_tools);
         let index = self.history.len();
         let t = self.theme.resolved();
         // One row only — it is the click target for the expandable panel.
@@ -2658,36 +2626,6 @@ impl App {
         if len > 20 {
             self.tool_log.drain(..len - 20);
         }
-    }
-
-    /// `⏺ 21 tools · glob ×9 · read ×8 …` — counts, biggest first.
-    fn tool_summary_line(&self) -> String {
-        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
-        for event in &self.turn_tools {
-            *counts.entry(event.name.as_str()).or_default() += 1;
-        }
-        let mut parts: Vec<(usize, &str)> = counts.into_iter().map(|(n, c)| (c, n)).collect();
-        parts.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
-        let total: usize = parts.iter().map(|(c, _)| *c).sum();
-        let shown: Vec<String> = parts
-            .iter()
-            .take(4)
-            .map(|(c, n)| {
-                if *c > 1 {
-                    format!("{n} ×{c}")
-                } else {
-                    n.to_string()
-                }
-            })
-            .collect();
-        let mut line = format!("⏺ {total} tools · {}", shown.join(" · "));
-        if parts.len() > 4 {
-            line.push_str(" · …");
-        }
-        if total == 1 {
-            line = format!("⏺ 1 tool · {}", parts[0].1);
-        }
-        line
     }
 
     /// Open the expanded panel for a set of events (current turn or a

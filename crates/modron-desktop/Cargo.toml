@@ -1,0 +1,10 @@
+[package]
+name = "modron-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# GPUI + gpui-kit desktop client (Phase 4). The GUI dependencies are added
+# by the desktop tranche; the skeleton stays dep-free so the workspace
+# build never depends on gpui resolution.
+[dependencies]

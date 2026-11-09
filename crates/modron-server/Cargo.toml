@@ -1,0 +1,10 @@
+[package]
+name = "modron-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Filled in by the Phase-2 server tranche: SessionHub fan-out, WS + Unix
+# socket listeners, approvals/interrupt/attach. Kept dep-free until then so
+# the skeleton never breaks the workspace build.
+[dependencies]

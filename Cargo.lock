@@ -1402,6 +1402,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "modron-desktop"
+version = "0.1.2"
+
+[[package]]
 name = "modron-mcp"
 version = "0.1.2"
 dependencies = [
@@ -1412,6 +1416,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "modron-protocol"
+version = "0.1.2"
+dependencies = [
+ "modron-core",
+ "modron-view",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -1444,6 +1459,10 @@ dependencies = [
  "toml",
  "tracing",
 ]
+
+[[package]]
+name = "modron-server"
+version = "0.1.2"
 
 [[package]]
 name = "modron-store"
@@ -1496,12 +1515,22 @@ dependencies = [
  "modron-core",
  "modron-router",
  "modron-store",
+ "modron-view",
  "ratatui",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "unicode-width",
+]
+
+[[package]]
+name = "modron-view"
+version = "0.1.2"
+dependencies = [
+ "modron-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
