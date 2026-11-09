@@ -28,6 +28,12 @@ pub struct Config {
     pub max_input_tokens: Option<u64>,
     /// Cumulative token budget for a whole task run.
     pub max_total_tokens: Option<u64>,
+    /// Verify-failure escalation model id (engine `escalate_on_check_failure`):
+    /// when the finish gate exhausts its feedback rounds with verification
+    /// still failing, the run gets ONE extra model turn on this model whose
+    /// answer replaces the run answer on success. Unset = never escalate.
+    #[serde(default)]
+    pub escalate_on_check_failure: Option<String>,
     /// Lifecycle hooks around tool calls (Phase-1c I4): `pre_tool` may veto
     /// (non-zero exit blocks the tool), `post_tool` observes. Shell commands
     /// receiving the `MODRON_TOOL_*` env contract.
@@ -476,5 +482,28 @@ mod tests {
             None,
             "unset bitmap_compaction stays None (engine default wins)"
         );
+    }
+
+    #[test]
+    fn escalate_on_check_failure_parses_and_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "escalate_on_check_failure = 'claude-sonnet-5-5'\ndefault_model = 'm'\n",
+        )
+        .unwrap();
+        let config = load_from(&path, no_env);
+        assert_eq!(
+            config.escalate_on_check_failure.as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+
+        // Key omitted: stays None (escalation off — the engine default).
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "default_model = 'm'\n").unwrap();
+        assert!(load_from(&empty, no_env)
+            .escalate_on_check_failure
+            .is_none());
     }
 }

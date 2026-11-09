@@ -826,6 +826,15 @@ pub struct EngineConfig {
     pub resume_from_event: Option<u64>,
     /// Force one self-check turn before ending when no verify tool exists.
     pub self_check_on_finish: bool,
+    /// Verify-failure escalation (additive, `None` by default): when the
+    /// finish gate exhausts its feedback rounds (`MAX_VERIFY_ROUNDS` in
+    /// `engine.rs` — verification still failing), the run gets ONE extra
+    /// model turn on this model id (selector provider kept, the
+    /// `resolve_provider` fallback ladder unchanged — the persona
+    /// ForcedSelector path). The escalated answer replaces the run answer on
+    /// success; any failure keeps the pre-escalation answer. Bound: one per
+    /// run (a resume grants a fresh bound, like the gate rounds).
+    pub escalate_on_check_failure: Option<String>,
     /// OS sandbox applied to mutating tool subprocesses (Phase-1b A2,
     /// additive; default [`SandboxPolicy::Off`]).
     pub sandbox: SandboxPolicy,
@@ -891,6 +900,7 @@ impl Default for EngineConfig {
             hooks: hooks::HookConfig::default(),
             resume_from_event: None,
             self_check_on_finish: false,
+            escalate_on_check_failure: None,
             sandbox: SandboxPolicy::Off,
             approver: None,
             on_delta: None,
@@ -920,6 +930,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("price_lookup", &self.price_lookup.is_some())
             .field("hooks", &self.hooks)
             .field("resume_from_event", &self.resume_from_event)
+            .field("escalate_on_check_failure", &self.escalate_on_check_failure)
             .field("sandbox", &self.sandbox)
             .field("approver", &self.approver.is_some())
             .field("on_delta", &self.on_delta.is_some())

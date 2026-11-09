@@ -33,6 +33,20 @@ const MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
 /// retries; 2 keeps the worst case tight).
 const MAX_VERIFY_ROUNDS: u32 = 2;
 
+/// System-prompt addendum for the escalation turn (verify-failure
+/// escalation): one appended block, not a rebuilt prompt, so the escalated
+/// model sees the same identity/tool contract the run used and only the
+/// mission changes. Byte-stable: tests match on it, and its presence in a
+/// captured request is what marks a turn as the escalation.
+const ESCALATION_SYSTEM_ADDENDUM: &str = "\n\nVERIFICATION ESCALATION: the \
+run's automated verification failed and the normal feedback rounds were \
+exhausted. You are the escalation reviewer: re-read the ORIGINAL task and \
+re-check EVERY concrete requirement it names (file paths, exact names, \
+passwords, ports, config file locations and formats, expected content) \
+against the evidence in this conversation. Your next message REPLACES the \
+run's final answer — correct any mismatch you find and state plainly \
+anything you cannot confirm.";
+
 /// Idempotent, side-effect-free tools eligible for speculative execution
 /// (started mid-stream when the provider completes a tool-call item early,
 /// reused by the dispatch once the turn finishes — oh-my-pi pattern).
@@ -556,6 +570,47 @@ impl Engine {
                     )
                     .await?
                 {
+                    // Escalation (ONE per run): the gate just exhausted its
+                    // feedback rounds with verification still failing (the
+                    // same two conditions its give-up note keys on) and the
+                    // config names an escalation model. The escalated turn's
+                    // answer replaces `answer` on success; any failure is
+                    // swallowed inside (warn) and the give-up note survives.
+                    // The bound needs no counter: this branch always exits
+                    // the loop below, so the site — and thus the escalation
+                    // — can fire at most once per run (a resume grants a
+                    // fresh bound, like the gate rounds). Max-turns headroom
+                    // is required: the persisted handoff message must not
+                    // promise a re-check the loop can no longer service.
+                    if mutated_this_run
+                        && verify_rounds >= MAX_VERIFY_ROUNDS
+                        && turns < self.config.max_turns
+                        && self.config.escalate_on_check_failure.is_some()
+                    {
+                        if let Err(err) = self
+                            .run_escalation_turn(
+                                session_id,
+                                task,
+                                &system,
+                                &mut transcript,
+                                &mut answer,
+                                &mut turns,
+                                &mut total,
+                                &mut models_used,
+                                &mut governor,
+                                &mut spend_usd,
+                            )
+                            .await
+                        {
+                            // Store-level failures degrade too: a completed
+                            // run with the old answer beats losing it to an
+                            // escalation bookkeeping error.
+                            tracing::warn!(
+                                error = %err,
+                                "escalation turn failed; keeping the pre-escalation answer"
+                            );
+                        }
+                    }
                     break;
                 }
                 continue;
@@ -1116,6 +1171,220 @@ impl Engine {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// ONE best-effort escalation turn after the finish gate exhausted its
+    /// feedback rounds (`escalate_on_check_failure` set): the configured
+    /// model re-checks every concrete requirement and its answer REPLACES
+    /// the run answer on success. Every failure mode degrades to "keep the
+    /// pre-escalation answer" (warned, `Ok` returned) — the gate's give-up
+    /// note in `answer` is already an honest end state, so a failed
+    /// escalation must never destroy it, let alone fail the run.
+    ///
+    /// Shape mirrors [`Self::run_compaction`]: a harness-initiated model
+    /// call outside the main loop (plain `provider.turn`, full usage
+    /// accounting by the caller's locals). Tool-less by design: a single
+    /// turn cannot service tool calls it provokes, and a persisted
+    /// assistant message with unanswered tool_calls would break provider
+    /// request building on resume (the same orphan-record concern that
+    /// keeps the gate's feedback a user message).
+    ///
+    /// Store errors propagate (infrastructure — the run is already broken);
+    /// provider/resolution failures are swallowed here.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_escalation_turn(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        system: &str,
+        transcript: &mut Vec<Message>,
+        answer: &mut String,
+        turns: &mut u32,
+        total: &mut Usage,
+        models_used: &mut Vec<String>,
+        governor: &mut BudgetGovernor,
+        spend_usd: &mut f64,
+    ) -> Result<()> {
+        let escalation_model = self
+            .config
+            .escalate_on_check_failure
+            .clone()
+            .ok_or_else(|| {
+                Error::Config(
+                    "escalation turn requested without `escalate_on_check_failure`".into(),
+                    "set `escalate_on_check_failure` in the engine config".into(),
+                )
+            })?;
+
+        // Provider resolution mirrors the persona path (subagent.rs
+        // ForcedSelector → resolve_provider): keep the selector's provider
+        // for a Chat action and swap only the model, so the registered-
+        // provider → default-provider fallback ladder applies unchanged. A
+        // model id from another provider rides the run's provider — a
+        // mismatch surfaces as a provider error and degrades below.
+        let context_tokens = estimate_context_tokens(system, &[], transcript);
+        let mut choice = self.selector.select(&SelectRequest {
+            task: task.to_string(),
+            action: ActionKind::Chat,
+            context_tokens,
+            budget_remaining_usd: self
+                .config
+                .max_cost_usd
+                .map(|cap| (cap - *spend_usd).max(0.0)),
+        });
+        choice.model = escalation_model.clone();
+        choice.reason = format!(
+            "escalation: verification failed after {MAX_VERIFY_ROUNDS} rounds → {escalation_model}"
+        );
+        choice.confident = true;
+        let (provider, model) = self.resolve_provider(&choice)?;
+        // resolve_provider's fallback swaps the MODEL when the selector's
+        // provider is unregistered — an escalation that silently runs on
+        // default_model would lie about "the escalation model re-checked
+        // this". Abort the escalation instead; the old answer survives.
+        if model != escalation_model {
+            tracing::warn!(
+                requested = %escalation_model,
+                resolved = %model,
+                "escalation model did not resolve; keeping the pre-escalation answer"
+            );
+            return Ok(());
+        }
+
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::ModelSelected {
+                    model: model.clone(),
+                    reason: choice.reason.clone(),
+                    action: Some(format!("{:?}", ActionKind::Chat)),
+                    context_tokens: Some(context_tokens),
+                },
+            )
+            .await?;
+
+        // Handoff to the escalated model, persisted as a user message (the
+        // gate's feedback pattern): resume and compaction rebuild the
+        // transcript from the event log, so the escalation's context must
+        // live in a `Message` event, not in a transient.
+        let handoff = Message::user(format!(
+            "Verification failed after {MAX_VERIFY_ROUNDS} feedback rounds. This run is \
+             escalated to `{model}` for one re-check: re-read the ORIGINAL task and verify \
+             every concrete requirement against the evidence above, then give the corrected \
+             final answer."
+        ));
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: handoff.clone(),
+                },
+            )
+            .await?;
+        transcript.push(handoff);
+
+        let request = TurnRequest {
+            model: model.clone(),
+            system: format!("{system}{ESCALATION_SYSTEM_ADDENDUM}"),
+            messages: transcript.clone(),
+            // No tools: see the doc comment — a tool call the harness
+            // cannot service must not be provoked.
+            tools: Vec::new(),
+            max_tokens: MAX_OUTPUT_TOKENS,
+        };
+        tracing::info!(
+            provider = provider.id(),
+            model = %model,
+            "escalation turn: re-checking after verification failure"
+        );
+        let turn_started = std::time::Instant::now();
+        // Best-effort by contract: a provider failure keeps the
+        // pre-escalation answer (which already carries the gate's give-up
+        // note) and ends the run — never a failed run for a bonus turn.
+        let response = match provider.turn(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "escalation turn failed; keeping the pre-escalation answer"
+                );
+                return Ok(());
+            }
+        };
+
+        // Honest accounting to the token: the escalation's usage joins the
+        // governor, the run totals, the event log and the USD spend exactly
+        // like a main-loop turn (compaction precedent).
+        *turns += 1;
+        governor.feed_turn(response.usage);
+        total.input_tokens += response.usage.input_tokens;
+        total.output_tokens += response.usage.output_tokens;
+        total.cached_input_tokens += response.usage.cached_input_tokens;
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Usage {
+                    model: model.clone(),
+                    usage: response.usage,
+                },
+            )
+            .await?;
+        if !models_used.contains(&model) {
+            models_used.push(model.clone());
+        }
+        let turn_cost = self.turn_cost_usd(&model, &response.usage);
+        *spend_usd += turn_cost;
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::TurnTrace {
+                    turn: *turns,
+                    harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                    provider: provider.id().to_string(),
+                    model: model.clone(),
+                    // No prompt hash: the one-off system addendum breaks the
+                    // stable-prefix contract the hash audits — recording a
+                    // divergent hash would read as a cache bug, not the
+                    // exceptional turn it is.
+                    prompt_hash: None,
+                    latency_ms: Some(turn_started.elapsed().as_millis() as u64),
+                    cost_usd: Some(turn_cost),
+                    usage: Some(response.usage),
+                    verifier: None,
+                    failure_label: None,
+                },
+            )
+            .await?;
+
+        // Record the escalated answer as the assistant message it stands
+        // for (transcript stays rebuildable from the log).
+        let assistant = Message {
+            role: Role::Assistant,
+            content: response.text.clone(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            attachments: Vec::new(),
+        };
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: assistant.clone(),
+                },
+            )
+            .await?;
+        transcript.push(assistant);
+
+        // An empty escalation is no replacement: models that refuse or
+        // truncate yield "" and the honest give-up note must survive it.
+        if response.text.trim().is_empty() {
+            tracing::warn!("escalation turn returned no text; keeping the pre-escalation answer");
+            return Ok(());
+        }
+        *answer = response.text;
+        Ok(())
     }
 
     /// Execute one model tool call, reusing a speculative result computed
@@ -1799,6 +2068,148 @@ mod tests {
             "attempt 3
 
 [verification still failing after 2 rounds — see transcript]"
+        );
+    }
+
+    /// Gate engine variant for the escalation tests: AlwaysFail verify (so
+    /// the bound IS exhausted) plus a handle on the mock to assert the
+    /// escalation turn's wire shape.
+    fn escalation_engine(
+        script: Vec<TurnResponse>,
+        escalate: Option<&str>,
+    ) -> (Engine, std::sync::Arc<crate::testing::MockProvider>) {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        registry.register(std::sync::Arc::new(AlwaysFailVerifyTool));
+        let mock = std::sync::Arc::new(crate::testing::MockProvider::with_script(script));
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::clone(&mock) as std::sync::Arc<dyn ModelProvider>,
+        );
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                escalate_on_check_failure: escalate.map(str::to_string),
+                ..EngineConfig::default()
+            },
+        };
+        (engine, mock)
+    }
+
+    #[tokio::test]
+    async fn escalation_fires_once_when_the_gate_exhausts_its_rounds() {
+        // Turns 1-4 drive the gate to its bound (write, then two failing
+        // verify feedback rounds); the 5th scripted response serves the
+        // escalation turn and must REPLACE the run answer.
+        let (engine, mock) = escalation_engine(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                text("attempt 2"),
+                text("attempt 3"),
+                text("ESCALATED ANSWER"),
+            ],
+            Some("claude-opus-escalated"),
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(
+            summary.answer, "ESCALATED ANSWER",
+            "the escalated answer replaces the run answer (give-up note included)"
+        );
+        assert!(
+            summary
+                .models_used
+                .contains(&"claude-opus-escalated".to_string()),
+            "the escalation model is accounted in models_used: {:?}",
+            summary.models_used
+        );
+
+        // Wire shape of the escalation turn: escalation model id, the
+        // system addendum, no tools, and the persisted handoff message as
+        // the last transcript entry (the gate's Message::user pattern).
+        let requests = mock.requests();
+        let escalated = requests.last().expect("escalation turn hit the provider");
+        assert_eq!(
+            escalated.model, "claude-opus-escalated",
+            "the escalation turn must carry the escalation model id"
+        );
+        assert!(
+            escalated.system.contains("VERIFICATION ESCALATION"),
+            "the escalated turn carries the system-prompt addendum"
+        );
+        assert!(
+            escalated.tools.is_empty(),
+            "the escalation turn is tool-less: one turn cannot service tool calls"
+        );
+        assert!(
+            matches!(escalated.messages.last(), Some(message) if message.role == Role::User
+                && message.content.contains("escalated")),
+            "the handoff rides the transcript as a user message"
+        );
+
+        // Exactly ONE extra turn: the four main-loop requests kept the
+        // selector's model; the escalation was granted once.
+        assert_eq!(requests.len(), 5);
+        assert!(requests[..4].iter().all(|r| r.model == "m"));
+        assert_eq!(summary.turns, 5);
+    }
+
+    #[tokio::test]
+    async fn escalation_does_not_fire_when_unset() {
+        // Same exhausted-gate script without `escalate_on_check_failure`:
+        // the give-up note stays the final word and no fifth turn exists.
+        let (engine, mock) = escalation_engine(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                text("attempt 2"),
+                text("attempt 3"),
+            ],
+            None,
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert!(summary
+            .answer
+            .contains("[verification still failing after 2 rounds"));
+        // write + attempt 1 + attempt 2 + attempt 3 — no escalation turn.
+        assert_eq!(mock.requests().len(), 4);
+        assert!(mock.requests().iter().all(|r| r.model == "m"));
+        assert_eq!(summary.turns, 4);
+    }
+
+    #[tokio::test]
+    async fn escalation_provider_failure_keeps_the_pre_escalation_answer() {
+        // The script covers only the main-loop turns, so the escalation
+        // turn hits the mock's exhausted-script provider error. The run
+        // must stay Ok, warn, and keep the honest give-up answer.
+        let (engine, mock) = escalation_engine(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                text("attempt 2"),
+                text("attempt 3"),
+            ],
+            Some("claude-opus-escalated"),
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(
+            summary.answer,
+            "attempt 3
+
+[verification still failing after 2 rounds — see transcript]"
+        );
+        // The attempt reached the provider under the escalation model id
+        // (recorded even though the turn errored) — once.
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests.last().map(|r| r.model.as_str()),
+            Some("claude-opus-escalated")
         );
     }
 }

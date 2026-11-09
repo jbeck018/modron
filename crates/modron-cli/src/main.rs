@@ -1111,6 +1111,9 @@ fn build_agent_with(
         },
         async_router,
         self_check_on_finish: true,
+        // config.toml top-level `escalate_on_check_failure = "<model id>"`:
+        // one verify-failure escalation turn on that model (None = off).
+        escalate_on_check_failure: cfg.escalate_on_check_failure.clone(),
         on_delta: sinks.on_delta,
         on_tool_event: sinks.on_tool_event,
         personas: Default::default(),
