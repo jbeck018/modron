@@ -15,6 +15,7 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -22,6 +23,7 @@ use gpui_kit::{
     Focusable, InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowOptions,
 };
+use modron_core::Attachment;
 use modron_protocol::{Decision, Payload};
 use modron_router::lookup;
 use modron_view::TranscriptEntry;
@@ -51,6 +53,8 @@ fn catalog_rows() -> Vec<ModelRow> {
         })
         .collect()
 }
+
+gpui_kit::actions!(modron_desktop, [NewChat]);
 
 /// Launch configuration from the CLI.
 #[derive(Clone, Debug)]
@@ -142,6 +146,9 @@ pub struct DesktopApp {
     /// `--resume` waiting for the first Sessions frame (then attaches the
     /// named session, or the newest).
     pending_resume: Option<Option<uuid::Uuid>>,
+    /// Images/documents staged for the next submit (drag-and-drop, the
+    /// + button, or clipboard). `(attachment, display label)`.
+    staged: Vec<(Attachment, String)>,
 }
 
 impl DesktopApp {
@@ -214,6 +221,7 @@ impl DesktopApp {
             panel_rows: None,
             focus: cx.focus_handle(),
             pending_resume: resume,
+            staged: Vec::new(),
         };
         app.refresh(cx);
         app
@@ -272,7 +280,7 @@ impl DesktopApp {
 
     fn submit(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
         let task = task.trim().to_string();
-        if task.is_empty() {
+        if task.is_empty() && self.staged.is_empty() {
             return;
         }
         self.composer.update(cx, |input, cx| {
@@ -281,7 +289,132 @@ impl DesktopApp {
         self.state.mark_running();
         self.state.last_note = None;
         let session_id = self.state.attached;
-        self.send(Command::Submit { session_id, task });
+        let attachments: Vec<Attachment> = std::mem::take(&mut self.staged)
+            .into_iter()
+            .map(|(attachment, _)| attachment)
+            .collect();
+        self.send(Command::Submit {
+            session_id,
+            task,
+            attachments,
+        });
+        self.refresh(cx);
+    }
+
+    // -- attachments -------------------------------------------------------
+
+    /// Stage one dropped file (image -> base64 attachment; known text
+    /// extensions -> inline document; anything else refused with a note).
+    fn stage_from_path(&mut self, path: &std::path::Path) -> Result<(), String> {
+        const MAX_BYTES: u64 = 8 * 1024 * 1024;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        let meta = std::fs::metadata(path).map_err(|e| format!("{name}: {e}"))?;
+        if meta.len() > MAX_BYTES {
+            return Err(format!(
+                "{name} is {} MB - the limit is 8 MB",
+                meta.len() / 1024 / 1024
+            ));
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let bytes = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
+        let (attachment, label) = match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "webp" | "gif" => {
+                let media_type = match ext.as_str() {
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "webp" => "image/webp",
+                    _ => "image/gif",
+                };
+                (
+                    Attachment::Image {
+                        media_type: media_type.into(),
+                        data: modron_core::b64::encode(&bytes),
+                    },
+                    format!("{name} · {} KB", meta.len() / 1024),
+                )
+            }
+            "txt" | "md" | "json" | "toml" | "csv" | "rs" | "py" | "js" | "ts" | "sh" => {
+                let text =
+                    String::from_utf8(bytes).map_err(|_| format!("{name} is not UTF-8 text"))?;
+                (
+                    Attachment::Document {
+                        name: name.clone(),
+                        text,
+                    },
+                    name,
+                )
+            }
+            other => return Err(format!("unsupported file type: .{other}")),
+        };
+        self.staged.push((attachment, label));
+        Ok(())
+    }
+
+    /// Stage whatever usable sits on the clipboard: an image, or copied
+    /// file paths (Finder copies).
+    fn stage_clipboard(&mut self, cx: &App) -> Result<(), String> {
+        let Some(item) = cx.read_from_clipboard() else {
+            return Err("the clipboard is empty".into());
+        };
+        let mut staged_any = false;
+        let mut last_error = None;
+        for entry in item.entries() {
+            match entry {
+                gpui_kit::ClipboardEntry::Image(image) => {
+                    let media_type = match image.format {
+                        gpui_kit::ImageFormat::Png => "image/png",
+                        gpui_kit::ImageFormat::Jpeg => "image/jpeg",
+                        gpui_kit::ImageFormat::Webp => "image/webp",
+                        gpui_kit::ImageFormat::Gif => "image/gif",
+                        _ => "image/png",
+                    };
+                    let kb = image.bytes.len() / 1024;
+                    self.staged.push((
+                        Attachment::Image {
+                            media_type: media_type.into(),
+                            data: modron_core::b64::encode(&image.bytes),
+                        },
+                        format!("clipboard image · {kb} KB"),
+                    ));
+                    staged_any = true;
+                }
+                gpui_kit::ClipboardEntry::ExternalPaths(paths) => {
+                    for path in paths.paths() {
+                        match self.stage_from_path(path) {
+                            Ok(()) => staged_any = true,
+                            Err(e) => last_error = Some(e),
+                        }
+                    }
+                }
+                gpui_kit::ClipboardEntry::String(_) => {}
+            }
+        }
+        match (staged_any, last_error) {
+            (true, _) => Ok(()),
+            (false, Some(e)) => Err(e),
+            (false, None) => Err("no image or files on the clipboard - drag one in instead".into()),
+        }
+    }
+
+    fn cycle_mode(&mut self, cx: &mut Context<Self>) {
+        use modron_protocol::{ApprovalModeWire, ConfigPatch};
+        let (label, wire) = match self.state.approval_mode.as_str() {
+            "ask" => ("yolo", ApprovalModeWire::ApproveAll),
+            "yolo" => ("deny", ApprovalModeWire::Deny),
+            _ => ("ask", ApprovalModeWire::Ask),
+        };
+        self.state.approval_mode = label.to_string();
+        self.send(Command::SetConfig(ConfigPatch {
+            approval_mode: Some(wire),
+            ..ConfigPatch::default()
+        }));
         self.refresh(cx);
     }
 
@@ -390,97 +523,101 @@ impl DesktopApp {
 
     // -- rendering ---------------------------------------------------------
 
+    /// `2026-11-10T09:00:00Z` -> "now" / "5m" / "2h" / "3d" / the date.
+    fn relative_time(rfc3339: &str) -> String {
+        let Ok(updated) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+            return String::new();
+        };
+        let secs = (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_seconds();
+        match secs {
+            s if s < 60 => "now".into(),
+            s if s < 3600 => format!("{}m", s / 60),
+            s if s < 86_400 => format!("{}h", s / 3600),
+            s if s < 7 * 86_400 => format!("{}d", s / 86_400),
+            _ => updated.format("%b %-d").to_string(),
+        }
+    }
+
     fn render_sidebar(&self, entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
-        let mut sidebar = div()
-            .id("sidebar")
+        let query = self.session_filter_query.to_ascii_lowercase();
+
+        // New chat: the primary action of the surface (the desktop chat
+        // grammar) - creates a server-side shell and adopts it.
+        let mut list = div()
+            .id("sidebar-list")
             .flex()
             .flex_col()
-            .w(px(264.))
-            .h_full()
-            .flex_shrink_0()
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
-            .border_r_1()
-            .border_color(theme.border)
-            .bg(theme.muted)
-            // New chat: the primary action of the surface (ChatGPT/Claude
-            // pattern) - creates a server-side shell and adopts it.
-            .child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_2()
-                    .child({
-                        let entity = entity.clone();
-                        Button::new("new-chat")
-                            .label("New chat")
-                            .primary()
-                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                entity.update(cx, |this, _cx| {
-                                    this.send(Command::NewSession { title: None });
-                                    // Refresh the list once the server notes
-                                    // the new session (the correlated Note
-                                    // adopts it).
-                                    this.send(Command::ListSessions);
-                                });
-                            })
-                    }),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .pb_2()
-                    .child(Input::new(&self.session_filter).id("session-filter")),
-            );
+            .child(div().px_3().pt_3().pb_2().child({
+                let entity = entity.clone();
+                Button::new("new-chat")
+                    .label("New chat")
+                    .primary()
+                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                        entity.update(cx, |this, _cx| {
+                            this.send(Command::NewSession { title: None });
+                            // Refresh the list once the server notes
+                            // the new session (the correlated Note
+                            // adopts it).
+                            this.send(Command::ListSessions);
+                        });
+                    })
+            }))
+            .child(div().px_3().pb_2().child(Input::new(&self.session_filter)));
 
-        let query = self.session_filter_query.to_ascii_lowercase();
         let mut shown = 0usize;
         for (ix, session) in self.state.sessions.iter().enumerate() {
-            if !query.is_empty()
-                && !session.title.to_ascii_lowercase().contains(&query)
-            {
+            if !query.is_empty() && !session.title.to_ascii_lowercase().contains(&query) {
                 continue;
             }
             shown += 1;
             let id = session.id;
             let attached = self.state.attached == Some(id);
             let title: SharedString = session.title.clone().into();
-            let meta: SharedString = format!(
-                "{} msg · {}",
-                session.message_count,
-                Self::relative_time(&session.updated_at),
-            )
-            .into();
+            let meta: SharedString = Self::relative_time(&session.updated_at).into();
             let entity = entity.clone();
+            // Single line: truncated title, relative time on the right
+            // (the desktop chat grammar - message counts and ids live in
+            // the transcript header, not the list).
             let row = div()
                 .id(("session", ix))
-                .px_3()
-                .py_2()
-                .border_l_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .mx_2()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
                 .cursor_pointer()
-                .when(attached, |row| {
-                    row.border_color(theme.accent).bg(theme.secondary)
-                })
+                .when(attached, |row| row.bg(theme.secondary))
                 .hover(|row| row.bg(theme.secondary))
                 .on_click(move |_event: &ClickEvent, _window, cx| {
                     entity.update(cx, |this, cx| this.attach(id, cx));
                 })
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.5))
                         .text_color(theme.foreground)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
                         .child(title),
                 )
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(10.5))
                         .text_color(theme.muted_foreground)
                         .child(meta),
                 );
-            sidebar = sidebar.child(row);
+            list = list.child(row);
         }
         if shown == 0 {
-            sidebar = sidebar.child(
+            list = list.child(
                 div()
                     .px_3()
                     .py_4()
@@ -493,23 +630,51 @@ impl DesktopApp {
                     })),
             );
         }
-        sidebar.into_any_element()
-    }
 
-    /// `2026-11-10T09:00:00Z` -> "now" / "5m" / "2h" / "3d" / the date.
-    fn relative_time(rfc3339: &str) -> String {
-        let Ok(updated) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
-            return String::new();
-        };
-        let secs = (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_seconds();
-        match secs {
-            s if s < 0 => "now".into(),
-            s if s < 60 => "now".into(),
-            s if s < 3600 => format!("{}m", s / 60),
-            s if s < 86_400 => format!("{}h", s / 3600),
-            s if s < 7 * 86_400 => format!("{}d", s / 86_400),
-            _ => updated.format("%b %-d").to_string(),
-        }
+        // Footer: the account row (cosmetic until settings exist), pinned
+        // under the scroll area like the desktop chat clients.
+        let footer = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .size(px(24.))
+                    .rounded_full()
+                    .bg(theme.accent)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.))
+                    .text_color(theme.accent_foreground)
+                    .child(SharedString::from("J")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(SharedString::from("Jacob Beck")),
+            );
+
+        div()
+            .id("sidebar")
+            .flex()
+            .flex_col()
+            .w(px(264.))
+            .h_full()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(theme.border)
+            .bg(theme.muted)
+            .child(list)
+            .child(footer)
+            .into_any_element()
     }
 
     /// One transcript row as an element (called from the list's
@@ -638,9 +803,7 @@ impl DesktopApp {
                     .gap_2()
                     .px_4()
                     .py_1()
-                    .child(
-                        div().flex_1().h(px(1.)).bg(theme.border),
-                    )
+                    .child(div().flex_1().h(px(1.)).bg(theme.border))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -677,9 +840,9 @@ impl DesktopApp {
             // total for hand-built rows in tests.
             Row::Entry(TranscriptEntry::Model { .. })
             | Row::Entry(TranscriptEntry::Usage { .. })
-            | Row::Entry(TranscriptEntry::Compaction { .. }) => div()
-                .id(("transcript-row", ix))
-                .into_any_element(),
+            | Row::Entry(TranscriptEntry::Compaction { .. }) => {
+                div().id(("transcript-row", ix)).into_any_element()
+            }
         }
     }
 
@@ -941,51 +1104,130 @@ impl DesktopApp {
             live = live.child(panel);
         }
 
-        // Composer: a rounded pill with the send/stop control inside —
-        // the chat-app pattern. Enter sends (the input's PressEnter);
-        // while a run is active the send becomes stop.
-        let composer = div()
-            .px_4()
-            .py_3()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
+        // Composer: a floating rounded pill — [+][mode] input [model]
+        // [send/stop] — with staged attachment chips above it. The whole
+        // pane accepts image/document drops.
+        let mut staged_row = div().flex().flex_row().flex_wrap().gap_1().px_4().pb_1();
+        for (ix, (_, label)) in self.staged.iter().enumerate() {
+            let label: SharedString = label.clone().into();
+            staged_row = staged_row.child(
                 div()
+                    .id(("staged", ix))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_1p5()
-                    .rounded_xl()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.muted)
-                    .child(div().flex_1().child(Input::new(&self.composer)))
-                    .children(if self.state.running {
-                        vec![Button::new("stop")
-                            .label("stop")
-                            .danger()
-                            .small()
-                            .on_click(cx.listener(|this, _e, _w, cx| this.interrupt(cx)))]
-                    } else {
-                        vec![Button::new("send")
-                            .label("send")
-                            .primary()
-                            .small()
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                let task = this.composer.read(cx).value().to_string();
-                                this.submit(&task, window, cx);
-                            }))]
-                    }),
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.foreground)
+                            .child(label),
+                    )
+                    .child(
+                        Button::new(("unstage", ix))
+                            .label("x")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.staged.remove(ix);
+                                this.refresh(cx);
+                            })),
+                    ),
             );
+        }
 
+        let mode_chip: SharedString = self.state.approval_mode.clone().into();
+        let model_chip: SharedString = if self.state.model.is_empty() {
+            "model".into()
+        } else {
+            self.state.model.clone().into()
+        };
+        let pill_entity = entity.clone();
+        let composer = div().px_4().pb_3().pt_1().child(staged_row).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1p5()
+                .rounded_xl()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .shadow_sm()
+                .child(
+                    Button::new("add-attachment")
+                        .label("+")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            if let Err(e) = this.stage_clipboard(cx) {
+                                this.state.last_note = Some(e);
+                            }
+                            this.refresh(cx);
+                        })),
+                )
+                .child(
+                    Button::new("mode-chip")
+                        .label(mode_chip)
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _e, _w, cx| this.cycle_mode(cx))),
+                )
+                .child(div().flex_1().child(Input::new(&self.composer)))
+                .child(
+                    Button::new("model-chip")
+                        .label(model_chip)
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _e, window, cx| {
+                            this.open_picker(window, cx);
+                        })),
+                )
+                .children(if self.state.running {
+                    vec![Button::new("stop")
+                        .label("stop")
+                        .danger()
+                        .small()
+                        .on_click(cx.listener(|this, _e, _w, cx| this.interrupt(cx)))]
+                } else {
+                    vec![Button::new("send")
+                        .label("\u{2191}")
+                        .primary()
+                        .small()
+                        .on_click(cx.listener(|this, _e, window, cx| {
+                            let task = this.composer.read(cx).value().to_string();
+                            this.submit(&task, window, cx);
+                        }))]
+                }),
+        );
+        let _ = pill_entity;
+
+        // The whole main pane is a drop target (drag images/documents in
+        // from Finder). External file drags surface as a PathBuf drag.
+        let drop_entity = entity.clone();
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .bg(theme.background)
+            .on_drop::<std::path::PathBuf>(move |path: &std::path::PathBuf, _window, cx| {
+                drop_entity.update(cx, |this, cx| {
+                    let result = this.stage_from_path(std::path::Path::new(path));
+                    if let Err(e) = result {
+                        this.state.last_note = Some(e);
+                    }
+                    this.refresh(cx);
+                });
+            })
             .child(header)
             .child(body)
             .child(live)
@@ -1014,11 +1256,7 @@ impl DesktopApp {
             .bg(theme.muted)
             .text_size(px(11.))
             .text_color(theme.muted_foreground)
-            .child(
-                div()
-                    .text_color(dot_color)
-                    .child(SharedString::from(dot)),
-            )
+            .child(div().text_color(dot_color).child(SharedString::from(dot)))
             .child(div().child(status))
             .child(div().flex_1())
             .child(div().child(session))
@@ -1212,6 +1450,9 @@ pub fn run(options: LaunchOptions) {
 
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
+        // Dark-first (the desktop chat grammar this surface follows);
+        // follows nothing else for now - deterministic look.
+        Theme::change(ThemeMode::Dark, None, cx);
         cx.bind_keys([
             KeyBinding::new("escape", PickerClose, Some("ModelPicker")),
             KeyBinding::new("up", PickerUp, Some("ModelPicker")),

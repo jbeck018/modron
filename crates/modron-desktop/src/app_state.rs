@@ -63,9 +63,15 @@ pub enum Row {
     /// folds per-turn Model/Usage notes into these chips + the status bar
     /// (a documented divergence: the TUI renders them as scrollback
     /// lines; a chat surface reads better without them between turns).
-    Divider { text: String },
-    Streaming { text: String },
-    Reasoning { text: String },
+    Divider {
+        text: String,
+    },
+    Streaming {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
 }
 
 /// The whole UI state. Every protocol frame lands here via

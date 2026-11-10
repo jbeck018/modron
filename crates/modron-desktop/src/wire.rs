@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 
 use anyhow::{anyhow, Context as _};
 use futures::{SinkExt, StreamExt};
+use modron_core::Attachment;
 use modron_protocol::{ConfigPatch, Decision, Frame, Payload, PROTOCOL_VERSION};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -209,6 +210,7 @@ pub enum Command {
     Submit {
         session_id: Option<uuid::Uuid>,
         task: String,
+        attachments: Vec<Attachment>,
     },
     Interrupt(uuid::Uuid),
     Approve {
@@ -231,10 +233,14 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
             session_id: *id,
             last_seq,
         },
-        Command::Submit { session_id, task } => Payload::Submit {
+        Command::Submit {
+            session_id,
+            task,
+            attachments,
+        } => Payload::Submit {
             session_id: *session_id,
             task: task.clone(),
-            attachments: Vec::new(),
+            attachments: attachments.clone(),
         },
         Command::Interrupt(id) => Payload::Interrupt { session_id: *id },
         Command::Approve {
@@ -575,20 +581,28 @@ mod tests {
                 last_seq: 42,
             } if session_id == session
         ));
+        let attachments = vec![modron_core::Attachment::Image {
+            media_type: "image/png".into(),
+            data: "aGk=".into(),
+        }];
         let submit = payload_for(
             &Command::Submit {
                 session_id: Some(session),
                 task: "fix it".into(),
+                attachments: attachments.clone(),
             },
             0,
         );
         assert!(matches!(
-            submit,
+            &submit,
             Payload::Submit {
                 session_id: Some(s),
                 task,
-                attachments
-            } if s == session && task == "fix it" && attachments.is_empty()
+                attachments: got
+            } if *s == session
+                && task == "fix it"
+                && got.len() == 1
+                && matches!(&got[0], Attachment::Image { media_type, .. } if media_type == "image/png")
         ));
         let cfg = payload_for(
             &Command::SetConfig(ConfigPatch {
