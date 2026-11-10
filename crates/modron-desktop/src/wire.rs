@@ -223,6 +223,15 @@ pub enum Command {
         title: Option<String>,
     },
     DeleteSession(uuid::Uuid),
+    CreateTask {
+        title: String,
+        base: Option<String>,
+    },
+    TaskStatus(uuid::Uuid),
+    MergeTask {
+        session_id: uuid::Uuid,
+        message: Option<String>,
+    },
     Ping,
 }
 
@@ -256,6 +265,18 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
         },
         Command::ListSessions => Payload::ListSessions {},
         Command::DeleteSession(id) => Payload::DeleteSession { session_id: *id },
+        Command::CreateTask { title, base } => Payload::CreateTask {
+            title: title.clone(),
+            base: base.clone(),
+        },
+        Command::TaskStatus(id) => Payload::GetTaskStatus { session_id: *id },
+        Command::MergeTask {
+            session_id,
+            message,
+        } => Payload::MergeTask {
+            session_id: *session_id,
+            message: message.clone(),
+        },
         Command::NewSession { title } => Payload::NewSession {
             title: title.clone(),
         },

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -273,6 +274,12 @@ impl SessionHandle {
     /// Whether the sticky approve-rest flag is armed.
     pub fn allow_rest_armed(&self) -> bool {
         self.allow_rest.load(Ordering::Relaxed)
+    }
+
+    /// The working dir this session's engine runs in (worktree tasks run
+    /// inside their worktree).
+    pub fn working_dir(&self) -> PathBuf {
+        lock(&self.engine).config.working_dir.clone()
     }
 
     /// The live (non-persisted) half of a snapshot.
@@ -609,6 +616,17 @@ impl SessionHub {
     /// ever resume. The per-session engine clone gets the hub's sinks and
     /// a `PinnedCreateStore` over the shared broadcasting store.
     pub fn ensure_session(&self, id: SessionId, pinned: Option<SessionId>) -> Arc<SessionHandle> {
+        self.ensure_session_in(id, pinned, None)
+    }
+
+    /// [`ensure_session`] with a working-dir override: worktree tasks run
+    /// their engine inside the task's worktree.
+    pub fn ensure_session_in(
+        &self,
+        id: SessionId,
+        pinned: Option<SessionId>,
+        working_dir: Option<PathBuf>,
+    ) -> Arc<SessionHandle> {
         let mut sessions = lock(&self.inner.sessions);
         if let Some(existing) = sessions.get(&id) {
             return existing.clone();
@@ -642,6 +660,9 @@ impl SessionHub {
                 .map(|handle| handle.approve_gate(call))
                 .unwrap_or(false)
         }));
+        if let Some(dir) = working_dir {
+            config.working_dir = dir;
+        }
         engine.config = config;
 
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);

@@ -66,6 +66,8 @@ impl Demo {
                 created_at: "2026-11-09T09:00:00Z".into(),
                 updated_at: "2026-11-09T09:14:00Z".into(),
                 message_count: 4,
+                task_branch: None,
+                task_state: None,
             },
             SessionMetaWire {
                 id: SESSION_B,
@@ -73,6 +75,8 @@ impl Demo {
                 created_at: "2026-11-09T10:00:00Z".into(),
                 updated_at: "2026-11-09T10:30:00Z".into(),
                 message_count: 2,
+                task_branch: None,
+                task_state: None,
             },
         ];
         let (attached, _) = watch::channel(None);
@@ -119,6 +123,8 @@ impl Demo {
                 created_at: "2026-11-09T11:00:00Z".into(),
                 updated_at: "2026-11-09T11:00:00Z".into(),
                 message_count: 0,
+                task_branch: None,
+                task_state: None,
             });
         id
     }

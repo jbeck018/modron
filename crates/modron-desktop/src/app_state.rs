@@ -39,12 +39,18 @@ pub struct SessionRow {
     pub title: String,
     pub updated_at: String,
     pub message_count: u32,
+    /// Set when the session is a worktree task: the task branch.
+    pub task_branch: Option<String>,
+    /// "running" | "ready" (list-time snapshot).
+    pub task_state: Option<String>,
 }
 
 impl From<&SessionMetaWire> for SessionRow {
     fn from(m: &SessionMetaWire) -> Self {
         Self {
             id: m.id,
+            task_branch: m.task_branch.clone(),
+            task_state: m.task_state.clone(),
             title: m.title.clone(),
             updated_at: m.updated_at.clone(),
             message_count: m.message_count,
@@ -229,6 +235,14 @@ impl AppState {
             }
             // The client's own delete request echoes back; ignore it.
             Payload::DeleteSession { .. } => {}
+            // Task lifecycle requests are client->server only. The
+            // TaskCreated reply adopts the fresh session: submit + status
+            // land there without an explicit attach.
+            Payload::CreateTask { .. }
+            | Payload::GetTaskStatus { .. }
+            | Payload::MergeTask { .. } => {}
+            Payload::TaskCreated { session_id, .. } => self.attached = Some(session_id),
+            Payload::TaskStatus { .. } | Payload::TaskMerged { .. } => {}
             Payload::Note { text } => {
                 self.last_note = Some(text.clone());
                 // `new_session`'s correlated reply names the fresh session
@@ -966,6 +980,8 @@ mod tests {
                         created_at: "2026-11-01T10:00:00Z".into(),
                         updated_at: "2026-11-01T10:00:00Z".into(),
                         message_count: 2,
+                        task_branch: None,
+                        task_state: None,
                     },
                     SessionMetaWire {
                         id: sid(),
@@ -973,6 +989,8 @@ mod tests {
                         created_at: "2026-11-09T10:00:00Z".into(),
                         updated_at: "2026-11-09T10:00:00Z".into(),
                         message_count: 5,
+                        task_branch: None,
+                        task_state: None,
                     },
                 ],
             },

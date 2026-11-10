@@ -75,6 +75,7 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
         hub.clone(),
     ));
     let mut template = engine;
+    let working_dir = template.config.working_dir.clone();
     template.store = Arc::clone(&broadcasting) as Arc<dyn modron_core::SessionStore>;
     hub.set_engine(template);
 
@@ -83,6 +84,8 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
         store: broadcasting,
         devices_dir: clients_dir,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        working_dir,
+        tasks: crate::tasks::TaskRegistry::new(),
     });
 
     let mut tasks = Vec::new();

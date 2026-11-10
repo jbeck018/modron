@@ -181,6 +181,16 @@ pub struct DesktopApp {
     >,
     /// A session row the user marked for deletion (two-step confirm).
     confirm_delete: Option<uuid::Uuid>,
+    /// The "New task" inline form (Conductor/Para grammar: a task spawns
+    /// an agent in its own worktree + branch).
+    new_task_open: bool,
+    new_task_title: Entity<InputState>,
+    new_task_base: Entity<InputState>,
+    /// Per-session review overlay (files +/- counts from task_status).
+    review_open: Option<uuid::Uuid>,
+    review_files: Vec<modron_protocol::TaskFileStat>,
+    review_branch: String,
+    /// Generative-UI form inputs, cached per transcript row index.
     /// Images/documents staged for the next submit: drag-and-drop, the
     /// attach button, or clipboard paste. The tuple is `(attachment,
     /// display label, thumbnail)`; the thumbnail is prebuilt so rendering
@@ -267,6 +277,15 @@ impl DesktopApp {
             window_handle: None,
             form_inputs: Default::default(),
             confirm_delete: None,
+            new_task_open: false,
+            new_task_title: cx
+                .new(|cx| InputState::new(window, cx).placeholder("what should the agent do?")),
+            new_task_base: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("base branch (default: current)")
+            }),
+            review_open: None,
+            review_files: Vec::new(),
+            review_branch: String::new(),
         };
         // Typewriter streaming: advance the visible cursor a few chars per
         // tick so chunk-granular deltas read like a per-character stream.
@@ -310,6 +329,41 @@ impl DesktopApp {
         match event {
             UiEvent::Frame(frame) => {
                 let is_sessions = matches!(frame.payload, Payload::Sessions { .. });
+                // Review-overlay updates: task_status/merged answers land in
+                // DesktopApp fields (not the transcript).
+                match &frame.payload {
+                    Payload::TaskStatus {
+                        session_id,
+                        worktree,
+                        branch,
+                        running,
+                        ahead,
+                        files,
+                    } => {
+                        if self.review_open.as_ref() == Some(session_id) {
+                            self.review_branch = format!(
+                                "{branch} · {ahead} ahead{} · {worktree}",
+                                if *running { " · running" } else { "" }
+                            );
+                            self.review_files = files.clone();
+                        }
+                    }
+                    Payload::TaskMerged {
+                        session_id,
+                        ok,
+                        summary,
+                    } => {
+                        if self.review_open.as_ref() == Some(session_id) {
+                            self.review_open = None;
+                        }
+                        self.state.last_note = Some(if *ok {
+                            summary.clone()
+                        } else {
+                            format!("merge failed: {summary}")
+                        });
+                    }
+                    _ => {}
+                }
                 self.state.apply_frame(*frame);
                 // --resume: attach as soon as the session list is known
                 // (bare = the server's newest; an id = that session).
@@ -589,6 +643,53 @@ impl DesktopApp {
         }
     }
 
+    // -- worktree tasks ----------------------------------------------------
+
+    fn create_task(&mut self, cx: &mut Context<Self>) {
+        let title = self.new_task_title.read(cx).value().trim().to_string();
+        let base_raw = self.new_task_base.read(cx).value().trim().to_string();
+        if title.is_empty() {
+            self.state.last_note = Some("give the task a description first".into());
+            self.refresh(cx);
+            return;
+        }
+        let base = if base_raw.is_empty() {
+            None
+        } else {
+            Some(base_raw)
+        };
+        self.new_task_open = false;
+        self.state.last_note = Some(format!("starting task: {title}"));
+        self.send(Command::CreateTask { title, base });
+        self.send(Command::ListSessions);
+        self.refresh(cx);
+    }
+
+    fn open_task_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_task_open = true;
+        self.new_task_title.update(cx, |input, cx| {
+            let handle = input.focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        self.refresh(cx);
+    }
+
+    fn request_task_status(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.review_open = Some(id);
+        self.review_files.clear();
+        self.review_branch.clear();
+        self.refresh(cx);
+        self.send(Command::TaskStatus(id));
+    }
+
+    fn merge_task(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.send(Command::MergeTask {
+            session_id: id,
+            message: None,
+        });
+        self.refresh(cx);
+    }
+
     fn cycle_mode(&mut self, cx: &mut Context<Self>) {
         use modron_protocol::{ApprovalModeWire, ConfigPatch};
         let (label, wire) = match self.state.approval_mode.as_str() {
@@ -737,11 +838,65 @@ impl DesktopApp {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .child(div().px_3().pt_9().pb_2().child({
+            // "New task" (Conductor/Para grammar): a task spawns an agent
+            // in its own worktree + branch. The inline form collects the
+            // description and optional base branch.
+            .child(div().px_3().pt_9().pb_2().flex().flex_col().gap_1().child({
+                let entity = entity.clone();
+                Button::new("new-task")
+                    .label(if self.new_task_open {
+                        "describe the task..."
+                    } else {
+                        "New task"
+                    })
+                    .primary()
+                    .on_click(move |_e: &ClickEvent, window, cx: &mut App| {
+                        entity.update(cx, |this, cx| this.open_task_form(window, cx));
+                    })
+            }))
+            .children(if self.new_task_open {
+                let title_entity = entity.clone();
+                let cancel_entity = entity.clone();
+                vec![
+                    div().px_3().pb_1().child(Input::new(&self.new_task_title)),
+                    div().px_3().pb_1().child(Input::new(&self.new_task_base)),
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .child(
+                            Button::new("task-create")
+                                .label("create")
+                                .primary()
+                                .small()
+                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                    title_entity.update(cx, |this, cx| this.create_task(cx));
+                                }),
+                        )
+                        .child(
+                            Button::new("task-cancel")
+                                .label("cancel")
+                                .ghost()
+                                .small()
+                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                    cancel_entity.update(cx, |this, cx| {
+                                        this.new_task_open = false;
+                                        this.refresh(cx);
+                                    });
+                                }),
+                        ),
+                ]
+            } else {
+                vec![]
+            })
+            .child(div().px_3().pb_2().flex().flex_row().gap_1().child({
                 let entity = entity.clone();
                 Button::new("new-chat")
                     .label("New chat")
-                    .primary()
+                    .ghost()
+                    .small()
                     .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                         entity.update(cx, |this, _cx| {
                             this.send(Command::NewSession { title: None });
@@ -795,54 +950,77 @@ impl DesktopApp {
                         .whitespace_nowrap()
                         .child(title),
                 )
-                .children(if self.confirm_delete == Some(id) {
-                    let entity_yes = entity.clone();
-                    let entity_no = entity.clone();
-                    vec![
-                        Button::new(("del-yes", ix))
-                            .label("delete")
-                            .danger()
-                            .xsmall()
-                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                entity_yes.update(cx, |this, cx| this.delete_session(id, cx));
-                            })
-                            .into_any_element(),
-                        Button::new(("del-no", ix))
-                            .label("keep")
-                            .ghost()
-                            .xsmall()
-                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                entity_no.update(cx, |this, cx| {
-                                    this.confirm_delete = None;
-                                    this.refresh(cx);
-                                });
-                            })
-                            .into_any_element(),
-                    ]
-                } else {
-                    let entity_del = entity.clone();
-                    vec![
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(theme.muted_foreground)
-                            .child(meta)
-                            .into_any_element(),
-                        Button::new(("del", ix))
-                            .label("x")
-                            .ghost()
-                            .xsmall()
-                            .on_click(move |_event: &ClickEvent, _w, cx: &mut App| {
-                                // The x sits inside the clickable row: stop
-                                // propagation so the attach handler does
-                                // not fire too.
-                                cx.stop_propagation();
-                                entity_del.update(cx, |this, cx| {
-                                    this.confirm_delete = Some(id);
-                                    this.refresh(cx);
-                                });
-                            })
-                            .into_any_element(),
-                    ]
+                .children({
+                    let mut trailing: Vec<gpui_kit::AnyElement> = Vec::new();
+                    if self.confirm_delete == Some(id) {
+                        let entity_yes = entity.clone();
+                        let entity_no = entity.clone();
+                        trailing.push(
+                            Button::new(("del-yes", ix))
+                                .label("delete")
+                                .danger()
+                                .xsmall()
+                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                    entity_yes.update(cx, |this, cx| this.delete_session(id, cx));
+                                })
+                                .into_any_element(),
+                        );
+                        trailing.push(
+                            Button::new(("del-no", ix))
+                                .label("keep")
+                                .ghost()
+                                .xsmall()
+                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                    entity_no.update(cx, |this, cx| {
+                                        this.confirm_delete = None;
+                                        this.refresh(cx);
+                                    });
+                                })
+                                .into_any_element(),
+                        );
+                    } else {
+                        let entity_del = entity.clone();
+                        trailing.push(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.muted_foreground)
+                                .child(meta)
+                                .into_any_element(),
+                        );
+                        // Worktree tasks carry a branch chip: the visual
+                        // mark that this session runs in its own worktree.
+                        if let Some(branch) = &session.task_branch {
+                            let chip: SharedString = branch.trim_start_matches("modron/").into();
+                            trailing.push(
+                                div()
+                                    .px_1p5()
+                                    .rounded_sm()
+                                    .bg(theme.accent)
+                                    .text_size(px(10.))
+                                    .text_color(theme.accent_foreground)
+                                    .child(chip)
+                                    .into_any_element(),
+                            );
+                        }
+                        trailing.push(
+                            Button::new(("del", ix))
+                                .label("x")
+                                .ghost()
+                                .xsmall()
+                                .on_click(move |_event: &ClickEvent, _w, cx: &mut App| {
+                                    // The x sits inside the clickable row:
+                                    // stop propagation so the attach
+                                    // handler does not fire too.
+                                    cx.stop_propagation();
+                                    entity_del.update(cx, |this, cx| {
+                                        this.confirm_delete = Some(id);
+                                        this.refresh(cx);
+                                    });
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                    trailing
                 });
             list = list.child(row);
         }
@@ -1174,6 +1352,9 @@ impl DesktopApp {
     }
 
     fn render_main(&self, entity: &Entity<Self>, cx: &mut Context<Self>) -> AnyElement {
+        // The review overlay needs &mut Context (listeners); compute it
+        // before taking the shared theme borrow.
+        let review = self.render_review(cx);
         let theme = cx.theme();
 
         // Header: what am I looking at (session title) + the model chip
@@ -1229,7 +1410,10 @@ impl DesktopApp {
                     .small()
                     .toggled(self.state.show_reasoning)
                     .on_click(cx.listener(|this, _e, _w, cx| this.toggle_reasoning(cx))),
-            );
+            )
+            // Worktree-task controls (Conductor/Para grammar): branch chip,
+            // review toggle, merge. Present only on task sessions.
+            .children(self.task_ui_for_attached(cx));
 
         // Transcript: virtualized list, follows the tail while scrolled to
         // the bottom (thousands of rows render only the visible range).
@@ -1327,6 +1511,9 @@ impl DesktopApp {
                     })
                     .child(strip),
             );
+        }
+        if let Some(review) = review {
+            live = live.child(review);
         }
         if self.tool_panel_open {
             let rows: Vec<String> = match &self.panel_rows {
@@ -1585,6 +1772,152 @@ impl DesktopApp {
             .child(live)
             .child(composer)
             .into_any_element()
+    }
+
+    /// Header controls for the attached session when it is a worktree
+    /// task: branch chip, review toggle, merge button.
+    fn task_ui_for_attached(&self, cx: &Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        use gpui_kit::component::button::{Button, ButtonVariants};
+        let Some(id) = self.state.attached else {
+            return Vec::new();
+        };
+        let Some(row) = self.state.sessions.iter().find(|s| s.id == id) else {
+            return Vec::new();
+        };
+        let Some(branch) = &row.task_branch else {
+            return Vec::new();
+        };
+        let theme = cx.theme();
+        let chip: SharedString = branch.trim_start_matches("modron/").into();
+        let review_open = self.review_open.as_ref() == Some(&id);
+        let mut out = vec![
+            // Branch chip (the mark that this session runs in a worktree).
+            div()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .bg(theme.secondary)
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground)
+                .child(chip)
+                .into_any_element(),
+        ];
+        out.push(
+            Button::new("review")
+                .label(if review_open { "hide review" } else { "review" })
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    let Some(id) = this.state.attached else {
+                        return;
+                    };
+                    if this.review_open.as_ref() == Some(&id) {
+                        this.review_open = None;
+                        this.refresh(cx);
+                    } else {
+                        this.request_task_status(id, cx);
+                    }
+                }))
+                .into_any_element(),
+        );
+        out.push(
+            Button::new("merge")
+                .label("merge")
+                .primary()
+                .small()
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    let Some(id) = this.state.attached else {
+                        return;
+                    };
+                    this.merge_task(id, cx);
+                }))
+                .into_any_element(),
+        );
+        out
+    }
+
+    /// The review overlay: per-file +/- counts for the attached task, with
+    /// merge/close controls (rendered above the live region).
+    fn render_review(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        use gpui_kit::component::button::{Button, ButtonVariants};
+        let id = self.review_open?;
+        if self.state.attached.as_ref() != Some(&id) {
+            return None;
+        }
+        let theme = cx.theme();
+        let mut panel = div()
+            .id("review-panel")
+            .key_context("ToolPanel")
+            .track_focus(&self.focus)
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.muted)
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(if self.review_branch.is_empty() {
+                                "review (loading diff...)".into()
+                            } else {
+                                self.review_branch.clone()
+                            })),
+                    )
+                    .child(
+                        Button::new("merge-review")
+                            .label("merge")
+                            .primary()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                let Some(id) = this.state.attached else {
+                                    return;
+                                };
+                                this.merge_task(id, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("close-review")
+                            .label("close")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.review_open = None;
+                                this.refresh(cx);
+                            })),
+                    ),
+            );
+        if self.review_files.is_empty() && !self.review_branch.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from("no file changes vs base")),
+            );
+        }
+        for file in &self.review_files {
+            let label: SharedString =
+                format!("{}  +{} -{}", file.path, file.added, file.deleted).into();
+            panel = panel.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(label),
+            );
+        }
+        Some(panel.into_any_element())
     }
 
     fn render_status_bar(&self, _entity: &Entity<Self>, cx: &App) -> AnyElement {

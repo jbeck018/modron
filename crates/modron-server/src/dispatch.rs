@@ -30,6 +30,10 @@ pub struct ServerState {
     pub devices_dir: PathBuf,
     /// Advertised in `welcome`.
     pub version: String,
+    /// The repo the server serves (git worktree tasks run here).
+    pub working_dir: PathBuf,
+    /// Worktree-task registry: session id -> task record.
+    pub tasks: crate::tasks::TaskRegistry,
 }
 
 /// The live frames of one subscription: the broadcast->buffer forwarder
@@ -153,12 +157,28 @@ pub async fn handle_frame(
             Ok(sessions) => {
                 let rows = sessions
                     .into_iter()
-                    .map(|meta| SessionMetaWire {
-                        id: meta.id,
-                        title: meta.title,
-                        created_at: meta.created_at.to_rfc3339(),
-                        updated_at: meta.updated_at.to_rfc3339(),
-                        message_count: meta.message_count,
+                    .map(|meta| {
+                        let task = state.tasks.get(&meta.id);
+                        let task_state = task.as_ref().map(|_| {
+                            if state
+                                .hub
+                                .handle(&meta.id)
+                                .is_some_and(|handle| handle.is_busy())
+                            {
+                                "running".to_string()
+                            } else {
+                                "ready".to_string()
+                            }
+                        });
+                        SessionMetaWire {
+                            id: meta.id,
+                            title: meta.title,
+                            created_at: meta.created_at.to_rfc3339(),
+                            updated_at: meta.updated_at.to_rfc3339(),
+                            message_count: meta.message_count,
+                            task_branch: task.as_ref().map(|r| r.branch.clone()),
+                            task_state,
+                        }
                     })
                     .collect();
                 send(
@@ -205,6 +225,91 @@ pub async fn handle_frame(
                     );
                 }
                 Err(e) => send(ctx, error(request_id, format!("delete failed: {e}"))),
+            }
+        }
+        Payload::CreateTask { title, base } => {
+            match crate::tasks::create_task(
+                state,
+                &state.hub,
+                &state.working_dir,
+                &title,
+                base.as_deref(),
+            )
+            .await
+            {
+                Ok(record) => {
+                    send(
+                        ctx,
+                        reply(
+                            request_id,
+                            Some(record.session_id),
+                            Payload::TaskCreated {
+                                session_id: record.session_id,
+                                worktree: record.worktree.display().to_string(),
+                                branch: record.branch.clone(),
+                            },
+                        ),
+                    );
+                }
+                Err(e) => send(ctx, error(request_id, e.to_string())),
+            }
+        }
+        Payload::GetTaskStatus { session_id } => {
+            match crate::tasks::task_status(state, &session_id).await {
+                Ok((record, ahead, files)) => {
+                    let running = state
+                        .hub
+                        .handle(&session_id)
+                        .is_some_and(|handle| handle.is_busy());
+                    send(
+                        ctx,
+                        reply(
+                            request_id,
+                            Some(session_id),
+                            Payload::TaskStatus {
+                                session_id,
+                                worktree: record.worktree.display().to_string(),
+                                branch: record.branch.clone(),
+                                running,
+                                ahead,
+                                files,
+                            },
+                        ),
+                    );
+                }
+                Err(e) => send(ctx, error(request_id, e.to_string())),
+            }
+        }
+        Payload::MergeTask {
+            session_id,
+            message,
+        } => {
+            match crate::tasks::merge_task(
+                state,
+                &state.working_dir,
+                &session_id,
+                message.as_deref(),
+            )
+            .await
+            {
+                Ok((record, ok, summary)) => {
+                    send(
+                        ctx,
+                        reply(
+                            request_id,
+                            Some(session_id),
+                            Payload::TaskMerged {
+                                session_id,
+                                ok,
+                                summary,
+                            },
+                        ),
+                    );
+                    // The base checkout changed on success: refresh task
+                    // state for attached clients.
+                    let _ = record;
+                }
+                Err(e) => send(ctx, error(request_id, e.to_string())),
             }
         }
         Payload::NewSession { title } => match state
@@ -536,6 +641,12 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::NewSession { .. } => "new_session",
         Payload::ListSessions {} => "list_sessions",
         Payload::DeleteSession { .. } => "delete_session",
+        Payload::CreateTask { .. } => "create_task",
+        Payload::GetTaskStatus { .. } => "get_task_status",
+        Payload::MergeTask { .. } => "merge_task",
+        Payload::TaskCreated { .. } => "task_created",
+        Payload::TaskStatus { .. } => "task_status",
+        Payload::TaskMerged { .. } => "task_merged",
         Payload::Ping {} => "ping",
     }
 }

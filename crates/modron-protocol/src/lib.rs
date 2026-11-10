@@ -130,6 +130,24 @@ pub enum Payload {
     /// Permanently delete a session (store-level). Refused while the
     /// session's run is active; answered by a correlated `note`.
     DeleteSession { session_id: Uuid },
+    /// Create a task: a new session bound to a fresh git worktree and
+    /// branch off `base` (default HEAD of the server's repo). Answered by
+    /// a correlated `task_created`.
+    CreateTask {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+    },
+    /// Diff/branch status of a task session. Answered by `task_status`.
+    GetTaskStatus { session_id: Uuid },
+    /// Merge a task's branch back into the base it branched from
+    /// (review-first: a conflicted merge aborts cleanly). Answered by
+    /// `task_merged`.
+    MergeTask {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// Liveness check (answered by `pong`).
     Ping {},
 
@@ -164,6 +182,29 @@ pub enum Payload {
     ConfigChanged { patch: ConfigPatch },
     /// Answer to `list_sessions`.
     Sessions { sessions: Vec<SessionMetaWire> },
+    /// Answer to `create_task`: the new session runs inside a dedicated
+    /// worktree on its own branch.
+    TaskCreated {
+        session_id: Uuid,
+        worktree: String,
+        branch: String,
+    },
+    /// Answer to `task_status`: per-task diff/branch state.
+    TaskStatus {
+        session_id: Uuid,
+        worktree: String,
+        branch: String,
+        running: bool,
+        ahead: u64,
+        files: Vec<TaskFileStat>,
+    },
+    /// Answer to `merge_task`: conflicted merges abort cleanly (ok=false
+    /// with the conflicting paths) and the base stays untouched.
+    TaskMerged {
+        session_id: Uuid,
+        ok: bool,
+        summary: String,
+    },
     /// A run completed.
     TurnDone { summary: WireRunSummary },
     /// A run errored.
@@ -249,6 +290,21 @@ pub struct SessionMetaWire {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: u32,
+    /// Set when the session is a worktree task: the task branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_branch: Option<String>,
+    /// Task state as the server sees it (list-time snapshot): "running"
+    /// or "ready" (has commits ahead of base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_state: Option<String>,
+}
+
+/// One changed file in a task's diff (from `git diff --numstat`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskFileStat {
+    pub path: String,
+    pub added: u64,
+    pub deleted: u64,
 }
 
 /// The live (non-persisted) half of a snapshot: what a fresh attach needs
