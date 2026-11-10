@@ -24,10 +24,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all --check
+      # modron-desktop (gpui) needs Linux GUI system libs the runner does
+      # not ship; the macOS job covers the desktop crate, Linux covers the
+      # headless workspace (server/protocol/view/TUI/mobile-core).
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            cargo clippy --workspace --exclude modron-desktop --all-targets -- -D warnings
+          else
+            cargo clippy --workspace --all-targets -- -D warnings
+          fi
       - name: Tests (offline — the mock provider is the acceptance harness)
-        run: cargo test --workspace
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            cargo test --workspace --exclude modron-desktop
+          else
+            cargo test --workspace
+          fi
       - name: Startup performance gate (the ~6ms promise — fails above 50ms)
         if: matrix.os == 'macos-latest'
         run: |
@@ -79,7 +92,7 @@ jobs:
         with:
           key: release-${{ matrix.target }}
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p modron-cli
       - name: Binary size (keep it honest — PLAN §"lightweight")
         run: ls -lh target/${{ matrix.target }}/release/modron
       - uses: actions/upload-artifact@v4
