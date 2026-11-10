@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 modron-core = { path = "../modron-core", version = "0.1.0" }
+modron-protocol = { path = "../modron-protocol", version = "0.1.0" }
 modron-view = { path = "../modron-view", version = "0.1.0" }
 modron-router = { path = "../modron-router", version = "0.1.0" }
 modron-store = { path = "../modron-store", version = "0.1.0" }
@@ -15,6 +16,11 @@ serde_json.workspace = true
 serde.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+dirs.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 # Width-aware mouse geometry: CJK/emoji glyphs occupy 2 screen columns.

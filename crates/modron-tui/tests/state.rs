@@ -2142,3 +2142,66 @@ fn at_popup_renders_in_the_popup_slot() {
     assert!(frame.contains("@README.md"), "completion popup: {frame:?}");
     assert!(frame.contains("glm-5.3"), "status strip still present");
 }
+
+#[test]
+fn backfill_transcript_rebuilds_scrollback_from_a_replay() {
+    // The late-join pipeline end to end: persisted SessionEvents ->
+    // modron_view::replay -> App::backfill_transcript, asserting the same
+    // rows the live path would have committed.
+    use modron_view::replay;
+    let mut assistant = modron_core::Message::assistant("looking at the file");
+    assistant.tool_calls = vec![ToolCall {
+        id: "call-1".into(),
+        name: "read".into(),
+        arguments: json!({"path": "a.rs"}),
+    }];
+    let events = vec![
+        modron_core::SessionEvent::Task {
+            text: "read a.rs".into(),
+        },
+        modron_core::SessionEvent::Message {
+            parent_id: None,
+            message: assistant,
+        },
+        modron_core::SessionEvent::ToolResult {
+            call_id: "call-1".into(),
+            outcome: modron_core::ToolOutcome::ok("contents"),
+        },
+        modron_core::SessionEvent::Message {
+            parent_id: None,
+            message: modron_core::Message::assistant("it says hi"),
+        },
+        modron_core::SessionEvent::Usage {
+            model: "m1".into(),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cached_input_tokens: 40,
+            },
+        },
+    ];
+
+    let mut app = App::default();
+    app.backfill_transcript(replay(&events));
+    let history = history_text(&app);
+    assert!(
+        history.iter().any(|l| l == "❯ read a.rs"),
+        "task echo: {history:?}"
+    );
+    assert!(
+        history.iter().any(|l| l == "looking at the file"),
+        "assistant text: {history:?}"
+    );
+    assert!(
+        history.iter().any(|l| l == "⏺ 1 tool · read"),
+        "grouped tool summary: {history:?}"
+    );
+    assert!(
+        history.iter().any(|l| l == "m1 · 110 tok · cache 29%"),
+        "usage note (TUI meta arithmetic): {history:?}"
+    );
+    // The tool summary's events land in tool_log so ctrl+t re-opens them.
+    assert_eq!(app.tool_log.len(), 1);
+    assert_eq!(app.tool_log[0].1.len(), 1);
+    assert_eq!(app.tool_log[0].1[0].name, "read");
+}

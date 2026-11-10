@@ -13,13 +13,14 @@
 //! The terminal loop lives in [`run`].
 
 pub mod clipboard;
+pub mod remote;
 pub mod run;
 pub mod theme;
 pub use run::{run_with, TuiConfig, TuiSinks};
 pub use theme::Theme;
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
-use modron_view::{tool_summary_line, ToolEvent};
+use modron_view::{tool_summary_line, ToolEvent, TranscriptEntry};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
@@ -2172,6 +2173,94 @@ impl App {
         let width = self.hist_wrap_width();
         for line in lines {
             self.history.extend(wrap_line(&line, width));
+        }
+    }
+
+    /// Rebuild scrollback from a replayed transcript (remote attach): the
+    /// server's store is the source of truth and modron-view did the
+    /// grouping; this renders each entry with the same styles the live
+    /// path commits (echo accent, tool color, dim meta). Tool summaries
+    /// also land in `tool_log` so ctrl+t / click re-opens their panels.
+    pub fn backfill_transcript(&mut self, entries: Vec<TranscriptEntry>) {
+        let t = self.theme.resolved();
+        for entry in entries {
+            match entry {
+                TranscriptEntry::Task { text } | TranscriptEntry::User { text } => {
+                    let mut lines = text.split('\n');
+                    let accent = Style::default().fg(t.accent);
+                    for row in wrap_line(
+                        &Line::from(format!("❯ {}", lines.next().unwrap_or_default()))
+                            .style(accent),
+                        self.hist_wrap_width(),
+                    ) {
+                        self.history.push(row);
+                    }
+                    let plain = Style::default();
+                    for line in lines {
+                        for row in wrap_line(
+                            &Line::from(format!("  {line}")).style(plain),
+                            self.hist_wrap_width(),
+                        ) {
+                            self.history.push(row);
+                        }
+                    }
+                }
+                TranscriptEntry::Assistant { text } => {
+                    let plain = Style::default();
+                    for line in text.split('\n') {
+                        for row in wrap_line(
+                            &Line::from(line.to_string()).style(plain),
+                            self.hist_wrap_width(),
+                        ) {
+                            self.history.push(row);
+                        }
+                    }
+                    self.history.push(Line::from(""));
+                }
+                TranscriptEntry::ToolSummary { line, events } => {
+                    let index = self.history.len();
+                    let tool = Style::default().fg(t.tool);
+                    for row in wrap_line(&Line::from(line).style(tool), self.hist_wrap_width()) {
+                        self.history.push(row);
+                    }
+                    self.tool_log.push((index, events));
+                }
+                TranscriptEntry::Swarm { lines } => {
+                    self.push_lines(lines.join("\n"));
+                }
+                TranscriptEntry::Model { model, reason } => {
+                    self.note(format!("model {model} ({reason})"));
+                }
+                TranscriptEntry::Usage { model, usage } => {
+                    let denom = usage.input_tokens + usage.cached_input_tokens;
+                    let cache = if denom > 0 {
+                        format!(
+                            " · cache {:.0}%",
+                            100.0 * usage.cached_input_tokens as f64 / denom as f64
+                        )
+                    } else {
+                        String::new()
+                    };
+                    self.note(format!("{} · {} tok{}", model, usage.total(), cache));
+                }
+                TranscriptEntry::Compaction {
+                    summarized_events, ..
+                } => {
+                    let warn = Style::default().fg(t.warning);
+                    for row in wrap_line(
+                        &Line::from(format!("[compacted {summarized_events} earlier events]"))
+                            .style(warn),
+                        self.hist_wrap_width(),
+                    ) {
+                        self.history.push(row);
+                    }
+                }
+            }
+        }
+        // Same cap as the live path (commit_tool_summary).
+        let len = self.tool_log.len();
+        if len > 20 {
+            self.tool_log.drain(..len - 20);
         }
     }
 
