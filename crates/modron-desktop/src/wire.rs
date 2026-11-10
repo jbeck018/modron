@@ -222,6 +222,7 @@ pub enum Command {
     NewSession {
         title: Option<String>,
     },
+    DeleteSession(uuid::Uuid),
     Ping,
 }
 
@@ -254,6 +255,7 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
             patch: patch.clone(),
         },
         Command::ListSessions => Payload::ListSessions {},
+        Command::DeleteSession(id) => Payload::DeleteSession { session_id: *id },
         Command::NewSession { title } => Payload::NewSession {
             title: title.clone(),
         },

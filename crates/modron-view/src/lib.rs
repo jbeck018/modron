@@ -15,6 +15,13 @@
 //!   complete source of truth; live-only detail arrives separately as a
 //!   protocol snapshot).
 
+pub mod gen_ui;
+
+pub use gen_ui::{
+    render_ascii, split_generative_ui, ChartKind, GenField, GenFieldKind, GenPoint, GenSegment,
+    GenUi,
+};
+
 use modron_core::{SessionEvent, ToolActivity, Usage};
 use serde::{Deserialize, Serialize};
 
@@ -276,6 +283,10 @@ pub enum TranscriptEntry {
         summary: String,
         summarized_events: u32,
     },
+    /// A generative-UI widget parsed from a ```modron-ui fenced block in
+    /// an assistant answer (table, chart, form). The GUI renders native
+    /// widgets; the TUI renders the ASCII projection.
+    GenerativeUi { ui: crate::gen_ui::GenUi },
 }
 
 /// Rebuild the display transcript from a session's persisted event log —
@@ -323,9 +334,19 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
                         call_names.insert(call.id.clone(), call.name.clone());
                     }
                     if !message.content.is_empty() {
-                        entries.push(TranscriptEntry::Assistant {
-                            text: message.content.clone(),
-                        });
+                        // Generative-UI split: ```modron-ui blocks become
+                        // native-widget entries; the surrounding prose
+                        // stays as assistant text.
+                        for segment in gen_ui::split_generative_ui(&message.content) {
+                            match segment {
+                                gen_ui::GenSegment::Text(text) => {
+                                    entries.push(TranscriptEntry::Assistant { text });
+                                }
+                                gen_ui::GenSegment::Ui(ui) => {
+                                    entries.push(TranscriptEntry::GenerativeUi { ui });
+                                }
+                            }
+                        }
                     }
                 }
                 modron_core::Role::Tool => {
@@ -580,6 +601,7 @@ mod tests {
                 TranscriptEntry::Model { .. } => "model",
                 TranscriptEntry::Usage { .. } => "usage",
                 TranscriptEntry::Compaction { .. } => "compaction",
+                TranscriptEntry::GenerativeUi { .. } => "gen_ui",
             })
             .collect();
         assert_eq!(

@@ -588,6 +588,12 @@ impl SessionHub {
     }
 
     /// The handle for a live session, if one exists.
+    /// Drop a session's live handle (deleted sessions): subscribers keep
+    /// their channels but no new frames flow.
+    pub fn remove(&self, id: &SessionId) -> Option<Arc<SessionHandle>> {
+        lock(&self.inner.sessions).remove(id)
+    }
+
     pub fn handle(&self, id: &SessionId) -> Option<Arc<SessionHandle>> {
         lock(&self.inner.sessions).get(id).cloned()
     }

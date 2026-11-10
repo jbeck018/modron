@@ -70,6 +70,11 @@ pub const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[
         "author and sharpen SKILL.md files",
         include_str!("skills/writing-skills.md"),
     ),
+    (
+        "generative-ui",
+        "emit tables, charts, and forms the clients render natively (modron-ui fenced JSON)",
+        include_str!("skills/generative-ui.md"),
+    ),
 ];
 
 /// Lookup a built-in skill's body by name.

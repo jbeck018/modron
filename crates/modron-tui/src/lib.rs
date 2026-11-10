@@ -2255,6 +2255,15 @@ impl App {
                         self.history.push(row);
                     }
                 }
+                TranscriptEntry::GenerativeUi { ui } => {
+                    let tool = Style::default().fg(t.tool);
+                    for line in modron_view::render_ascii(&ui.clone()) {
+                        for row in wrap_line(&Line::from(line).style(tool), self.hist_wrap_width())
+                        {
+                            self.history.push(row);
+                        }
+                    }
+                }
             }
         }
         // Same cap as the live path (commit_tool_summary).
@@ -2770,8 +2779,23 @@ impl App {
             );
         } else {
             let width = self.hist_wrap_width();
-            for line in answer.lines() {
-                lines.extend(wrap_line(&Line::from(line.to_string()), width));
+            // Generative-UI split: ```modron-ui fenced blocks render as
+            // aligned ASCII (tables/charts/forms); the surrounding prose
+            // keeps its usual wrapping.
+            for segment in modron_view::split_generative_ui(&answer) {
+                match segment {
+                    modron_view::GenSegment::Text(text) => {
+                        for line in text.lines() {
+                            lines.extend(wrap_line(&Line::from(line.to_string()), width));
+                        }
+                    }
+                    modron_view::GenSegment::Ui(ui) => {
+                        let tool = Style::default().fg(t.tool);
+                        for line in modron_view::render_ascii(&ui) {
+                            lines.extend(wrap_line(&Line::from(line).style(tool), width));
+                        }
+                    }
+                }
             }
         }
         // Cache discipline: per-turn ratio plus the SESSION cumulative —

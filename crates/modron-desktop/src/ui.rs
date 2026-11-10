@@ -171,6 +171,16 @@ pub struct DesktopApp {
     /// Weak self for callbacks that render-time elements carry (the
     /// composer's paste interception).
     weak_self: gpui_kit::WeakEntity<DesktopApp>,
+    /// This window's handle: deferred work (form inputs) needs the window
+    /// to construct input state.
+    window_handle: Option<gpui_kit::AnyWindowHandle>,
+    /// Generative-UI form inputs, cached per transcript row index.
+    form_inputs: std::collections::HashMap<
+        usize,
+        Vec<gpui_kit::Entity<gpui_kit::component::input::InputState>>,
+    >,
+    /// A session row the user marked for deletion (two-step confirm).
+    confirm_delete: Option<uuid::Uuid>,
     /// Images/documents staged for the next submit: drag-and-drop, the
     /// attach button, or clipboard paste. The tuple is `(attachment,
     /// display label, thumbnail)`; the thumbnail is prebuilt so rendering
@@ -254,7 +264,25 @@ impl DesktopApp {
             pending_resume: resume,
             staged: Vec::new(),
             weak_self: cx.weak_entity(),
+            window_handle: None,
+            form_inputs: Default::default(),
+            confirm_delete: None,
         };
+        // Typewriter streaming: advance the visible cursor a few chars per
+        // tick so chunk-granular deltas read like a per-character stream.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(16))
+                .await;
+            let Ok(()) = this.update(cx, |app, cx| {
+                if app.state.advance_stream() {
+                    app.refresh(cx);
+                }
+            }) else {
+                break;
+            };
+        })
+        .detach();
         // Follow OS appearance switches on this window (light <-> dark).
         window
             .observe_window_appearance(|_window, cx| {
@@ -305,6 +333,7 @@ impl DesktopApp {
             }
         }
         self.refresh(cx);
+        self.sync_form_inputs(cx);
     }
 
     // -- commands ----------------------------------------------------------
@@ -335,6 +364,118 @@ impl DesktopApp {
             session_id,
             task,
             attachments,
+        });
+        self.refresh(cx);
+    }
+
+    /// Create missing generative-UI form inputs (input state needs the
+    /// window). Called after every applied event; keyed by transcript row
+    /// index, which is stable between rebuilds of the same log.
+    fn sync_form_inputs(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window_handle else {
+            return;
+        };
+        let mut missing: Vec<(usize, Vec<String>)> = Vec::new();
+        for (ix, row) in self.display.iter().enumerate() {
+            if let Row::Entry(TranscriptEntry::GenerativeUi {
+                ui: modron_view::GenUi::Form { fields, .. },
+            }) = row
+            {
+                if self.form_inputs.contains_key(&ix) {
+                    continue;
+                }
+                let placeholders = fields
+                    .iter()
+                    .map(|field| {
+                        field
+                            .placeholder
+                            .clone()
+                            .or_else(|| field.label.clone())
+                            .unwrap_or_else(|| field.name.clone())
+                    })
+                    .collect();
+                missing.push((ix, placeholders));
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        // The handle's update yields (&mut Window, &mut App) WITHOUT
+        // borrowing this view, so input entities are created there and
+        // inserted into self afterwards (no re-entrant view borrow).
+        let created = handle.update(cx, |_root, window, cx| {
+            missing
+                .iter()
+                .map(|(_, placeholders)| {
+                    placeholders
+                        .iter()
+                        .map(|placeholder| {
+                            cx.new(|cx| {
+                                InputState::new(window, cx).placeholder(placeholder.clone())
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Ok(created) = created {
+            for ((ix, _), inputs) in missing.into_iter().zip(created) {
+                self.form_inputs.insert(ix, inputs);
+            }
+            self.refresh(cx);
+        }
+    }
+
+    /// Delete a session through the server (two-step confirm happens in
+    /// the sidebar row). Detaches first if it was attached.
+    fn delete_session(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
+        if self.state.attached == Some(id) {
+            self.state.attached = None;
+        }
+        self.send(Command::DeleteSession(id));
+        self.send(Command::ListSessions);
+        self.refresh(cx);
+    }
+
+    /// Submit the values of a generative-UI form (row `form_ix`) as the
+    /// next chat message - one `label: value` line per field.
+    fn submit_form(&mut self, form_ix: usize, cx: &mut Context<Self>) {
+        if self.state.attached.is_none() {
+            self.state.last_note = Some("attach a session before submitting a form".into());
+            self.refresh(cx);
+            return;
+        }
+        let Some(inputs) = self.form_inputs.get(&form_ix) else {
+            return;
+        };
+        let Some(Row::Entry(TranscriptEntry::GenerativeUi {
+            ui: modron_view::GenUi::Form { title, fields, .. },
+        })) = self.display.get(form_ix)
+        else {
+            return;
+        };
+        let mut lines = vec![title.clone()];
+        for (i, field) in fields.iter().enumerate() {
+            let label = field.label.clone().unwrap_or_else(|| field.name.clone());
+            let value = inputs
+                .get(i)
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default();
+            let value = if value.is_empty() {
+                field.placeholder.clone().unwrap_or_default()
+            } else {
+                value
+            };
+            lines.push(format!("{}: {}", label, value));
+        }
+        self.state.mark_running();
+        self.state.last_note = None;
+        let session_id = self.state.attached;
+        self.send(Command::Submit {
+            session_id,
+            task: lines.join("\n"),
+            attachments: Vec::new(),
         });
         self.refresh(cx);
     }
@@ -624,6 +765,7 @@ impl DesktopApp {
             let title: SharedString = session.title.clone().into();
             let meta: SharedString = Self::relative_time(&session.updated_at).into();
             let entity = entity.clone();
+            let attach_entity = entity.clone();
             // Single line: truncated title, relative time on the right
             // (the desktop chat grammar - message counts and ids live in
             // the transcript header, not the list).
@@ -641,7 +783,7 @@ impl DesktopApp {
                 .when(attached, |row| row.bg(theme.secondary))
                 .hover(|row| row.bg(theme.secondary))
                 .on_click(move |_event: &ClickEvent, _window, cx| {
-                    entity.update(cx, |this, cx| this.attach(id, cx));
+                    attach_entity.update(cx, |this, cx| this.attach(id, cx));
                 })
                 .child(
                     div()
@@ -653,12 +795,55 @@ impl DesktopApp {
                         .whitespace_nowrap()
                         .child(title),
                 )
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(theme.muted_foreground)
-                        .child(meta),
-                );
+                .children(if self.confirm_delete == Some(id) {
+                    let entity_yes = entity.clone();
+                    let entity_no = entity.clone();
+                    vec![
+                        Button::new(("del-yes", ix))
+                            .label("delete")
+                            .danger()
+                            .xsmall()
+                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                entity_yes.update(cx, |this, cx| this.delete_session(id, cx));
+                            })
+                            .into_any_element(),
+                        Button::new(("del-no", ix))
+                            .label("keep")
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                entity_no.update(cx, |this, cx| {
+                                    this.confirm_delete = None;
+                                    this.refresh(cx);
+                                });
+                            })
+                            .into_any_element(),
+                    ]
+                } else {
+                    let entity_del = entity.clone();
+                    vec![
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme.muted_foreground)
+                            .child(meta)
+                            .into_any_element(),
+                        Button::new(("del", ix))
+                            .label("x")
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_event: &ClickEvent, _w, cx: &mut App| {
+                                // The x sits inside the clickable row: stop
+                                // propagation so the attach handler does
+                                // not fire too.
+                                cx.stop_propagation();
+                                entity_del.update(cx, |this, cx| {
+                                    this.confirm_delete = Some(id);
+                                    this.refresh(cx);
+                                });
+                            })
+                            .into_any_element(),
+                    ]
+                });
             list = list.child(row);
         }
         if shown == 0 {
@@ -757,11 +942,14 @@ impl DesktopApp {
     fn transcript_row(row: &Row, ix: usize, entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
 
-        // Right-aligned user bubble.
+        // Right-aligned user bubble: the row spans the full width so
+        // justify_end actually pushes the bubble to the right edge; the
+        // machine's answer stays full-width on the left.
         let user_bubble = |text: &str| {
             let label: SharedString = text.into();
             div()
                 .id(("transcript-row", ix))
+                .w_full()
                 .flex()
                 .flex_row()
                 .justify_end()
@@ -773,9 +961,10 @@ impl DesktopApp {
                         .px_3()
                         .py_2()
                         .rounded_lg()
-                        .bg(theme.secondary)
+                        .rounded_br_sm()
+                        .bg(theme.primary)
+                        .text_color(theme.primary_foreground)
                         .text_size(px(13.))
-                        .text_color(theme.foreground)
                         .child(label),
                 )
                 .into_any_element()
@@ -906,6 +1095,28 @@ impl DesktopApp {
                     .child(label)
                     .into_any_element()
             }
+            Row::Entry(TranscriptEntry::GenerativeUi { ui }) => {
+                let theme_colors = cx.theme();
+                let inputs = entity.read(cx).form_inputs.get(&ix).cloned();
+                let attached = entity.read(cx).state.attached;
+                let row_entity = entity.clone();
+                let _ = ix;
+                div()
+                    .id(("transcript-row", ix))
+                    .px_4()
+                    .py_1()
+                    .child(crate::ui::render_gen_ui(
+                        ui,
+                        inputs.as_ref(),
+                        attached,
+                        ix,
+                        move |form_ix: usize, cx: &mut App| {
+                            row_entity.update(cx, |this, cx| this.submit_form(form_ix, cx));
+                        },
+                        theme_colors,
+                    ))
+                    .into_any_element()
+            }
             // rows() folds these into dividers; the arm keeps the match
             // total for hand-built rows in tests.
             Row::Entry(TranscriptEntry::Model { .. })
@@ -1028,24 +1239,16 @@ impl DesktopApp {
         // intrinsic height (ListSizingBehavior::Auto lays out from its own
         // style), so without size_full() the pane rendered blank no matter
         // how many rows the state held — found by the first human click.
-        let transcript = div()
-            .flex_1()
-            .min_h_0()
-            .overflow_hidden()
-            .flex()
-            .justify_center()
-            .child(
-                div().max_w(px(760.)).w_full().h_full().child(
-                    list(self.list_state.clone(), move |ix, _window, cx| {
-                        let row = display_entity.read(cx).display.get(ix).cloned();
-                        match row {
-                            Some(row) => Self::transcript_row(&row, ix, &row_entity, cx),
-                            None => div().into_any_element(),
-                        }
-                    })
-                    .size_full(),
-                ),
-            );
+        let transcript = div().flex_1().min_h_0().overflow_hidden().child(
+            list(self.list_state.clone(), move |ix, _window, cx| {
+                let row = display_entity.read(cx).display.get(ix).cloned();
+                match row {
+                    Some(row) => Self::transcript_row(&row, ix, &row_entity, cx),
+                    None => div().into_any_element(),
+                }
+            })
+            .size_full(),
+        );
         let body = if self.display.is_empty() {
             div()
                 .flex_1()
@@ -1573,6 +1776,220 @@ impl Render for DesktopApp {
     }
 }
 
+/// Render one generative-UI widget with native controls:
+/// - table: styled header + row grid;
+/// - chart: horizontal bars scaled to the max value (pie adds percent);
+/// - form: real inputs per field (state cached per transcript row via
+///   `inputs`); submit sends the answers as the next chat message.
+#[allow(clippy::too_many_arguments)]
+pub fn render_gen_ui(
+    ui: &modron_view::GenUi,
+    inputs: Option<&Vec<gpui_kit::Entity<gpui_kit::component::input::InputState>>>,
+    attached: Option<uuid::Uuid>,
+    ix: usize,
+    on_submit: impl Fn(usize, &mut App) + 'static,
+    theme: &gpui_kit::component::theme::Theme,
+) -> gpui_kit::AnyElement {
+    use gpui_kit::component::button::{Button, ButtonVariants};
+    use gpui_kit::component::input::Input;
+
+    let card = |inner: gpui_kit::AnyElement| -> gpui_kit::AnyElement {
+        div()
+            .max_w(px(640.))
+            .mx_2()
+            .my_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.muted)
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(inner)
+            .into_any_element()
+    };
+
+    match ui {
+        modron_view::GenUi::Table {
+            title,
+            columns,
+            rows,
+        } => {
+            let mut grid = div().flex().flex_col().gap_0p5();
+            if let Some(title) = title {
+                let t: SharedString = title.clone().into();
+                grid = grid.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(t),
+                );
+            }
+            let header = div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .children(columns.iter().map(|col| {
+                    let c: SharedString = col.clone().into();
+                    div()
+                        .flex_1()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(c)
+                }));
+            grid = grid.child(header).child(div().h(px(1.)).bg(theme.border));
+            for row in rows {
+                grid = grid.child(div().flex().flex_row().gap_3().children(
+                    columns.iter().enumerate().map(|(i, _)| {
+                        let cell: SharedString = row.get(i).cloned().unwrap_or_default().into();
+                        div()
+                            .flex_1()
+                            .text_size(px(12.5))
+                            .text_color(theme.foreground)
+                            .child(cell)
+                    }),
+                ));
+            }
+            card(grid.into_any_element())
+        }
+        modron_view::GenUi::Chart {
+            title,
+            kind,
+            points,
+        } => {
+            let mut inner = div().flex().flex_col().gap_1();
+            if let Some(title) = title {
+                let t: SharedString = title.clone().into();
+                inner = inner.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(t),
+                );
+            }
+            let max = points
+                .iter()
+                .map(|p| p.value.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let total: f64 = points.iter().map(|p| p.value).sum();
+            for point in points {
+                let width = px(((point.value.abs() / max) * 240.0).round().max(4.0) as f32);
+                let bar_label: SharedString = point.label.clone().into();
+                let value: SharedString = if *kind == modron_view::ChartKind::Pie {
+                    let pct = if total > 0.0 {
+                        (point.value / total) * 100.0
+                    } else {
+                        0.0
+                    };
+                    format!("{:.0}%", pct).into()
+                } else {
+                    format!("{}", point.value).into()
+                };
+                inner = inner.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(theme.muted_foreground)
+                                .child(bar_label),
+                        )
+                        .child(div().h(px(10.)).w(width).rounded_sm().bg(theme.accent))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .child(value),
+                        ),
+                );
+            }
+            card(inner.into_any_element())
+        }
+        modron_view::GenUi::Form {
+            title,
+            submit_label,
+            fields,
+        } => {
+            let mut inner = div().flex().flex_col().gap_2();
+            let t: SharedString = title.clone().into();
+            inner = inner.child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .child(t),
+            );
+            for (f, field) in fields.iter().enumerate() {
+                let label_text = field.label.clone().unwrap_or_else(|| field.name.clone());
+                let label: SharedString = label_text.clone().into();
+                let input = inputs.and_then(|v| v.get(f)).cloned();
+                let field_row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .children(match (&field.kind, input) {
+                                (_, Some(input)) => {
+                                    vec![Input::new(&input).into_any_element()]
+                                }
+                                (modron_view::GenFieldKind::Select, None) => {
+                                    let options: SharedString = field.options.join(" / ").into();
+                                    vec![div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.muted_foreground)
+                                        .child(options)
+                                        .into_any_element()]
+                                }
+                                _ => vec![div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(SharedString::from(
+                                        field.placeholder.clone().unwrap_or_else(|| {
+                                            "(input appears once the row syncs)".into()
+                                        }),
+                                    ))
+                                    .into_any_element()],
+                            }),
+                    );
+                inner = inner.child(field_row);
+            }
+            let submit_text_label: String =
+                submit_label.clone().unwrap_or_else(|| "submit".to_string());
+            let can_submit = attached.is_some() && inputs.is_some();
+            let submit_button = Button::new(("gen-form-submit", ix))
+                .label(submit_text_label)
+                .primary()
+                .small()
+                .when(can_submit, |b| {
+                    b.on_click({
+                        move |_e: &ClickEvent, _w, cx: &mut App| {
+                            on_submit(ix, cx);
+                        }
+                    })
+                });
+            inner = inner.child(div().flex().flex_row().justify_end().child(submit_button));
+            card(inner.into_any_element())
+        }
+    }
+}
+
 /// Launch the GPUI app: net thread (tokio) first, then the event loop.
 pub fn run(options: LaunchOptions) {
     let resume = options.resume;
@@ -1620,7 +2037,7 @@ pub fn run(options: LaunchOptions) {
             KeyBinding::new("down", PickerDown, Some("ModelPicker")),
             KeyBinding::new("escape", CloseToolPanel, Some("ToolPanel")),
         ]);
-        gpui_kit::open_window(
+        let (window, view) = gpui_kit::open_window(
             WindowOptions {
                 titlebar: Some(gpui_kit::TitlebarOptions {
                     title: Some("modron desktop".into()),
@@ -1638,6 +2055,11 @@ pub fn run(options: LaunchOptions) {
             },
         )
         .expect("failed to open the modron desktop window");
+        // Give the view its window handle: deferred work (form inputs)
+        // needs a &mut Window to construct input state.
+        view.update(cx, |app, _cx| {
+            app.window_handle = Some(window);
+        });
     });
 }
 

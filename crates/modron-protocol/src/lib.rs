@@ -127,6 +127,9 @@ pub enum Payload {
     },
     /// List sessions (answered by `sessions`).
     ListSessions {},
+    /// Permanently delete a session (store-level). Refused while the
+    /// session's run is active; answered by a correlated `note`.
+    DeleteSession { session_id: Uuid },
     /// Liveness check (answered by `pong`).
     Ping {},
 

@@ -168,6 +168,45 @@ pub async fn handle_frame(
             }
             Err(e) => send(ctx, error(request_id, e.to_string())),
         },
+        Payload::DeleteSession { session_id } => {
+            // A running session keeps its history until it settles.
+            if state
+                .hub
+                .handle(&session_id)
+                .is_some_and(|handle| handle.is_busy())
+            {
+                send(
+                    ctx,
+                    error(
+                        request_id,
+                        "session is running - interrupt it before deleting",
+                    ),
+                );
+                return Flow::Continue;
+            }
+            match state.store.delete(session_id).await {
+                Ok(true) => {
+                    state.hub.remove(&session_id);
+                    send(
+                        ctx,
+                        reply(
+                            request_id,
+                            Some(session_id),
+                            Payload::Note {
+                                text: format!("session deleted: {session_id}"),
+                            },
+                        ),
+                    );
+                }
+                Ok(false) => {
+                    send(
+                        ctx,
+                        error(request_id, format!("no such session {session_id}")),
+                    );
+                }
+                Err(e) => send(ctx, error(request_id, format!("delete failed: {e}"))),
+            }
+        }
         Payload::NewSession { title } => match state
             .store
             .create_session(title.as_deref().unwrap_or("remote session"))
@@ -496,6 +535,7 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Fork { .. } => "fork",
         Payload::NewSession { .. } => "new_session",
         Payload::ListSessions {} => "list_sessions",
+        Payload::DeleteSession { .. } => "delete_session",
         Payload::Ping {} => "ping",
     }
 }

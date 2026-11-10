@@ -84,6 +84,8 @@ pub struct AppState {
     pub attached: Option<uuid::Uuid>,
     /// The attached session's last seen `seq` (re-attach resume point).
     pub last_seq: u64,
+    /// Typewriter cursor into `streaming_text` (char count shown).
+    stream_cursor: usize,
 
     events: Vec<SessionEvent>,
     transcript: Vec<TranscriptEntry>,
@@ -225,6 +227,8 @@ impl AppState {
                 self.tracker.clear_turn();
                 self.pending_approval = None;
             }
+            // The client's own delete request echoes back; ignore it.
+            Payload::DeleteSession { .. } => {}
             Payload::Note { text } => {
                 self.last_note = Some(text.clone());
                 // `new_session`'s correlated reply names the fresh session
@@ -290,6 +294,7 @@ impl AppState {
 
     fn clear_buffers(&mut self) {
         self.streaming_text.clear();
+        self.stream_cursor = 0;
         self.streaming_reasoning.clear();
     }
 
@@ -345,12 +350,37 @@ impl AppState {
                 text: self.streaming_reasoning.clone(),
             });
         }
-        if !self.streaming_text.is_empty() {
+        let visible_stream = self.displayed_streaming();
+        if !visible_stream.is_empty() {
             rows.push(Row::Streaming {
-                text: self.streaming_text.clone(),
+                text: visible_stream,
             });
         }
         rows
+    }
+
+    /// The streaming text the user should SEE right now: the buffer up to
+    /// the typewriter cursor (character-level streaming - deltas land in
+    /// the buffer at chunk granularity, the display advances per char).
+    pub fn displayed_streaming(&self) -> String {
+        self.streaming_text
+            .char_indices()
+            .nth(self.stream_cursor)
+            .map(|(i, _)| self.streaming_text[..i].to_string())
+            .unwrap_or_else(|| self.streaming_text.clone())
+    }
+
+    /// Advance the typewriter cursor (adaptive: bigger steps the further
+    /// behind the display falls). Returns whether anything moved.
+    pub fn advance_stream(&mut self) -> bool {
+        let total = self.streaming_text.chars().count();
+        if self.stream_cursor >= total {
+            return false;
+        }
+        let behind = total - self.stream_cursor;
+        let step = (behind / 12).max(2);
+        self.stream_cursor = (self.stream_cursor + step).min(total);
+        true
     }
 
     /// The expandable tool panel: per-event rows ([`ToolEvent::summary`])
@@ -595,7 +625,14 @@ mod tests {
         assert!(
             matches!(&rows[3], Row::Entry(TranscriptEntry::Assistant { text }) if text == "it says hi")
         );
-        // Streaming buffer trails as the in-flight row.
+        // Streaming buffer trails as the in-flight row. The typewriter
+        // cursor gates what is visible: reveal everything, then assert.
+        for _ in 0..100 {
+            if !s.advance_stream() {
+                break;
+            }
+        }
+        let rows = s.rows();
         assert_eq!(
             rows.last(),
             Some(&Row::Streaming {
@@ -629,6 +666,11 @@ mod tests {
                 },
             },
         ));
+        for _ in 0..100 {
+            if !s.advance_stream() {
+                break;
+            }
+        }
         assert_eq!(
             s.rows().last(),
             Some(&Row::Streaming {
