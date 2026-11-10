@@ -17,6 +17,6 @@ pub mod catalog;
 pub mod learned;
 pub mod selector;
 
-pub use auto_tiers::derive_tiers;
+pub use auto_tiers::{derive_tier_candidates, derive_tiers, TierCandidates};
 pub use catalog::{catalog, lookup, ModelInfo, Tier};
 pub use selector::HeuristicSelector;

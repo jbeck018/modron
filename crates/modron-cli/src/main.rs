@@ -1113,6 +1113,7 @@ fn build_agent_with(
             .unwrap_or_default(),
         default_provider: provider_id.clone(),
         default_model: model.clone(),
+        tier_fallbacks: None,
         max_turns: cli.max_turns.unwrap_or(engine_defaults.max_turns),
         max_input_tokens: cli
             .max_input_tokens
@@ -1298,7 +1299,8 @@ fn build_agent_with(
     // mode, bad overrides) must surface regardless of the provider choice.
     // Tiers derive from the providers that actually built (keys/sign-ins).
     let authed: Vec<String> = providers.keys().cloned().collect();
-    let router = build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()), &authed)?;
+    let (router, mut tier_fallbacks) =
+        build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()), &authed)?;
     let selector = match &cli.provider {
         // An explicitly chosen provider PINS every turn there — the
         // router would otherwise override it with its own cheap/strong
@@ -1307,12 +1309,18 @@ fn build_agent_with(
         // no-key fallback switched away from the requested provider, the
         // pin must NOT keep naming the unbuildable one — the authed-tier
         // router takes over instead.
-        Some(choice) if choice.id() == provider_id => Arc::new(
-            modron_core::testing::StaticSelector::new(&engine_config.default_model, choice.id()),
-        )
-            as Arc<dyn modron_core::ModelSelector>,
+        Some(choice) if choice.id() == provider_id => {
+            // An explicit --provider pin is an explicit choice: the tier
+            // fallback must never silently swap it.
+            tier_fallbacks = None;
+            Arc::new(modron_core::testing::StaticSelector::new(
+                &engine_config.default_model,
+                choice.id(),
+            )) as Arc<dyn modron_core::ModelSelector>
+        }
         _ => router,
     };
+    engine_config.tier_fallbacks = tier_fallbacks;
     let engine = Engine {
         selector,
         providers,
@@ -1745,6 +1753,14 @@ async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegist
     Ok(out)
 }
 
+/// The selector plus the auth-fallback candidates derived alongside it
+/// (`None` whenever the tiers are explicit: `[router]` overrides, a
+/// persona's forced model, or a `--provider` pin).
+type SelectorWithFallbacks = (
+    Arc<dyn modron_core::ModelSelector>,
+    Option<Arc<modron_core::TierFallbacks>>,
+);
+
 /// Build the active selector from `[router]` config (Phase-3a R1).
 /// Default mode is `learned` (corpus centroids + heuristic fallback — the
 /// fallback preserves budget/overflow rules, so learned is a strict
@@ -1753,17 +1769,51 @@ fn build_selector(
     cfg: &config::Config,
     persona_model: Option<String>,
     authed_providers: &[String],
-) -> anyhow::Result<Arc<dyn modron_core::ModelSelector>> {
+) -> anyhow::Result<SelectorWithFallbacks> {
     use modron_router::{learned::LearnedRouter, HeuristicSelector};
     let router_cfg = cfg.router.clone().unwrap_or_default();
     // Default tiers derive from the AUTHED models (what the user's keys
     // and sign-ins can actually reach); explicit [router] config wins.
     let derived = modron_router::derive_tiers(authed_providers);
+    let mut tier_fallbacks: Option<Arc<modron_core::TierFallbacks>> = None;
     if router_cfg.cheap_model.is_none() && router_cfg.strong_model.is_none() {
-        if let Some((cheap, strong)) = &derived {
-            eprintln!(
-                "note: auto-routing from your signed-in providers — cheap: {cheap}, strong: {strong} (override in [router])"
-            );
+        // Auto-routing mode: derive the ORDERED fallback candidates too,
+        // so a dead provider token cannot take a whole tier down (the
+        // engine retries once on the next candidate from another
+        // provider). A persona's forced model is an explicit choice —
+        // never silently swapped.
+        if persona_model.is_none() {
+            if let Some(candidates) = modron_router::derive_tier_candidates(authed_providers) {
+                let pair_of = |model: &str| {
+                    modron_router::lookup(model)
+                        .map(|info| (model.to_string(), info.provider.clone()))
+                };
+                let list = |names: &[String]| -> Vec<(String, String)> {
+                    names.iter().filter_map(|n| pair_of(n)).collect()
+                };
+                let cheap = list(&candidates.cheap);
+                let strong = list(&candidates.strong);
+                if cheap.len() > 1 || strong.len() > 1 {
+                    let alt = |v: &[(String, String)]| {
+                        v.get(1)
+                            .map(|(m, p)| format!("{m} ({p})"))
+                            .unwrap_or_else(|| "-".into())
+                    };
+                    eprintln!(
+                        "note: auto-routing from your signed-in providers — cheap: {}, strong: {} (auth fallback: cheap -> {}, strong -> {}; override in [router])",
+                        cheap[0].0,
+                        strong[0].0,
+                        alt(&cheap),
+                        alt(&strong)
+                    );
+                    tier_fallbacks = Some(Arc::new(modron_core::TierFallbacks { cheap, strong }));
+                }
+                if let Some((cheap, strong)) = &derived {
+                    eprintln!(
+                        "note: auto-routing from your signed-in providers — cheap: {cheap}, strong: {strong} (override in [router])"
+                    );
+                }
+            }
         }
     }
     let (default_cheap, default_strong) = derived.unwrap_or_else(|| {
@@ -1814,8 +1864,8 @@ fn build_selector(
     .with_overrides(overrides)
     .with_forced_model(persona_model);
     match router_cfg.mode.as_deref() {
-        None | Some("learned") => Ok(Arc::new(LearnedRouter::new(heuristic))),
-        Some("heuristic") => Ok(Arc::new(heuristic)),
+        None | Some("learned") => Ok((Arc::new(LearnedRouter::new(heuristic)), tier_fallbacks)),
+        Some("heuristic") => Ok((Arc::new(heuristic), tier_fallbacks)),
         Some(other) => Err(anyhow::anyhow!(
             "unknown router mode `{other}` — use \"learned\" or \"heuristic\"",
         )),
@@ -2305,7 +2355,7 @@ fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
         .filter(|id| build_provider_shim(id).is_ok())
         .map(|id| id.to_string())
         .collect();
-    let selector = build_selector(cfg, None, &authed)?;
+    let (selector, _) = build_selector(cfg, None, &authed)?;
     let cases = run_eval(selector.as_ref());
     let router_cfg = cfg.router.clone().unwrap_or_default();
     let defaults = modron_router::derive_tiers(&authed)

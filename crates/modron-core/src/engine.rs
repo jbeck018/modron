@@ -15,7 +15,7 @@ use crate::{
     estimate_tokens, judge, ActionKind, ApprovalMode, Engine, Error, JudgeMode, Message,
     ModelChoice, ModelProvider, Result, Role, RunSummary, SelectRequest, SessionEvent, SessionId,
     StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome, ToolSpec, TurnRequest,
-    Usage,
+    TurnResponse, Usage,
 };
 use std::sync::Arc;
 
@@ -211,6 +211,11 @@ impl Engine {
         // Whether the finish gate already injected its self-check turn —
         // a provider failure ON THAT TURN is non-fatal (keep the answer).
         let mut self_check_sent = false;
+        // Tier fallback (remote-control hardening): once an auth failure
+        // promotes the run to a tier's fallback model, every later turn
+        // uses the fallback directly (the dead primary would 401 again
+        // each turn). `(primary model, fallback selection)`.
+        let mut run_tier_override: Option<(String, ModelChoice)> = None;
         // Whether the most recent dispatch turn ENDED with a passing
         // `verify` call — the model's own evidence satisfies the gate.
         let mut last_dispatch_ended_with_passing_verify = false;
@@ -317,158 +322,207 @@ impl Engine {
                     }
                 }
             }
-            let (provider, model) = self.resolve_provider(&choice)?;
-
-            self.store
-                .append(
-                    session_id,
-                    &SessionEvent::ModelSelected {
-                        model: model.clone(),
-                        reason: choice.reason.clone(),
-                        action: Some(format!("{action:?}")),
-                        context_tokens: Some(context_tokens),
-                    },
-                )
-                .await?;
-
-            let request = TurnRequest {
-                model: model.clone(),
-                system: system.clone(),
-                messages: transcript.clone(),
-                tools: tool_specs.clone(),
-                max_tokens: MAX_OUTPUT_TOKENS,
+            // Tier fallback: a run-level override (an earlier turn's auth
+            // failure promoted this model) applies immediately; otherwise
+            // the selector's choice stands. The fallback flag mirrors the
+            // override so a fresh primary failure can still be retried on
+            // a candidate.
+            let mut fallback: Option<ModelChoice> = match &run_tier_override {
+                Some((primary, fb)) if *primary == choice.model => Some(fb.clone()),
+                _ => None,
             };
-            tracing::info!(
-                turn = turns + 1,
-                provider = provider.id(),
-                model = %model,
-                "turn start"
-            );
-            // Streaming dispatch (Phase-1c I1): when a delta sink is
-            // configured, drive the provider through `turn_streaming` and
-            // forward deltas as they arrive (providers without an SSE
-            // implementation yield one Text delta via the trait default).
-            let turn_started = std::time::Instant::now();
+            let mut attempted_fallback = fallback.is_some();
+            // Loop-external turn state: None = self-check short-circuit
+            // (the outer run loop ends with the preserved answer).
+            let mut turn_outcome: Option<(TurnResponse, String, String)> = None;
+            #[allow(unused_assignments)]
+            let mut turn_started = std::time::Instant::now();
             // Speculative results computed during THIS turn's stream.
             let mut speculative: std::collections::HashMap<String, ToolOutcome> =
                 std::collections::HashMap::new();
-            let response = match self.config.on_delta.clone() {
-                Some(sink) => {
-                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
-                    // Speculative driver: forwards deltas to the sink,
-                    // and when the provider completes a tool-call item
-                    // mid-stream, immediately executes idempotent reads
-                    // so the dispatch below can reuse the result instead
-                    // of re-running the tool. Gated OFF when any observer
-                    // or gate would be bypassed: pre_tool/post_tool
-                    // hooks, the on_tool_event sink, and the --deny list
-                    // all must keep seeing every execution.
-                    let speculation_safe = self.config.hooks.pre_tool.is_none()
-                        && self.config.hooks.post_tool.is_none()
-                        && self.config.on_tool_event.is_none()
-                        && !self
-                            .config
-                            .approvals
-                            .deny
-                            .iter()
-                            .any(|d| SPECULATIVE_TOOLS.contains(&d.as_str()));
-                    if speculation_safe {
-                        let spec_results: std::sync::Arc<
-                            std::sync::Mutex<std::collections::HashMap<String, ToolOutcome>>,
-                        > = std::sync::Arc::default();
-                        let engine_for_spec = Arc::new(self.clone());
-                        let driver_map = Arc::clone(&spec_results);
-                        // The driver owns the in-flight handles so every
-                        // speculation is joined before the drain below.
-                        let driver = tokio::spawn(async move {
-                            let mut in_flight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-                            while let Some(delta) = rx.recv().await {
-                                match delta {
-                                    StreamDelta::ToolCallReady(call) => {
-                                        if !SPECULATIVE_TOOLS.contains(&call.name.as_str()) {
-                                            continue;
-                                        }
-                                        let key = speculative_key(&call);
-                                        // Placeholder first: duplicate
-                                        // items for the same call must
-                                        // not spawn duplicate executions.
-                                        {
-                                            let mut map = driver_map.lock().unwrap();
-                                            if map.contains_key(&key) {
+            loop {
+                let active = fallback.clone().unwrap_or_else(|| choice.clone());
+                let (provider, model) = self.resolve_provider(&active)?;
+
+                self.store
+                    .append(
+                        session_id,
+                        &SessionEvent::ModelSelected {
+                            model: model.clone(),
+                            reason: active.reason.clone(),
+                            action: Some(format!("{action:?}")),
+                            context_tokens: Some(context_tokens),
+                        },
+                    )
+                    .await?;
+
+                let request = TurnRequest {
+                    model: model.clone(),
+                    system: system.clone(),
+                    messages: transcript.clone(),
+                    tools: tool_specs.clone(),
+                    max_tokens: MAX_OUTPUT_TOKENS,
+                };
+                tracing::info!(
+                    turn = turns + 1,
+                    provider = provider.id(),
+                    model = %model,
+                    "turn start"
+                );
+                // Streaming dispatch (Phase-1c I1): when a delta sink is
+                // configured, drive the provider through `turn_streaming` and
+                // forward deltas as they arrive (providers without an SSE
+                // implementation yield one Text delta via the trait default).
+                turn_started = std::time::Instant::now();
+                speculative.clear();
+                let response = match self.config.on_delta.clone() {
+                    Some(sink) => {
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
+                        // Speculative driver: forwards deltas to the sink,
+                        // and when the provider completes a tool-call item
+                        // mid-stream, immediately executes idempotent reads
+                        // so the dispatch below can reuse the result instead
+                        // of re-running the tool. Gated OFF when any observer
+                        // or gate would be bypassed: pre_tool/post_tool
+                        // hooks, the on_tool_event sink, and the --deny list
+                        // all must keep seeing every execution.
+                        let speculation_safe = self.config.hooks.pre_tool.is_none()
+                            && self.config.hooks.post_tool.is_none()
+                            && self.config.on_tool_event.is_none()
+                            && !self
+                                .config
+                                .approvals
+                                .deny
+                                .iter()
+                                .any(|d| SPECULATIVE_TOOLS.contains(&d.as_str()));
+                        if speculation_safe {
+                            let spec_results: std::sync::Arc<
+                                std::sync::Mutex<std::collections::HashMap<String, ToolOutcome>>,
+                            > = std::sync::Arc::default();
+                            let engine_for_spec = Arc::new(self.clone());
+                            let driver_map = Arc::clone(&spec_results);
+                            // The driver owns the in-flight handles so every
+                            // speculation is joined before the drain below.
+                            let driver = tokio::spawn(async move {
+                                let mut in_flight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                                while let Some(delta) = rx.recv().await {
+                                    match delta {
+                                        StreamDelta::ToolCallReady(call) => {
+                                            if !SPECULATIVE_TOOLS.contains(&call.name.as_str()) {
                                                 continue;
                                             }
-                                            map.insert(
-                                                key.clone(),
-                                                ToolOutcome::err(String::new()),
-                                            );
+                                            let key = speculative_key(&call);
+                                            // Placeholder first: duplicate
+                                            // items for the same call must
+                                            // not spawn duplicate executions.
+                                            {
+                                                let mut map = driver_map.lock().unwrap();
+                                                if map.contains_key(&key) {
+                                                    continue;
+                                                }
+                                                map.insert(
+                                                    key.clone(),
+                                                    ToolOutcome::err(String::new()),
+                                                );
+                                            }
+                                            let engine = Arc::clone(&engine_for_spec);
+                                            let map = Arc::clone(&driver_map);
+                                            in_flight.push(tokio::spawn(async move {
+                                                let name = call.name.clone();
+                                                let ctx = ToolCtx {
+                                                    sandbox: engine.config.sandbox,
+                                                    working_dir: engine.config.working_dir.clone(),
+                                                    engine: Some(Arc::clone(&engine)),
+                                                };
+                                                let outcome = match engine.tools.get(&name) {
+                                                    Some(tool) => tool
+                                                        .execute(call.arguments.clone(), &ctx)
+                                                        .await
+                                                        .unwrap_or_else(|e| {
+                                                            ToolOutcome::err(e.to_string())
+                                                        }),
+                                                    None => ToolOutcome::err("unknown tool"),
+                                                };
+                                                map.lock()
+                                                    .unwrap()
+                                                    .insert(speculative_key(&call), outcome);
+                                            }));
                                         }
-                                        let engine = Arc::clone(&engine_for_spec);
-                                        let map = Arc::clone(&driver_map);
-                                        in_flight.push(tokio::spawn(async move {
-                                            let name = call.name.clone();
-                                            let ctx = ToolCtx {
-                                                sandbox: engine.config.sandbox,
-                                                working_dir: engine.config.working_dir.clone(),
-                                                engine: Some(Arc::clone(&engine)),
-                                            };
-                                            let outcome = match engine.tools.get(&name) {
-                                                Some(tool) => tool
-                                                    .execute(call.arguments.clone(), &ctx)
-                                                    .await
-                                                    .unwrap_or_else(|e| {
-                                                        ToolOutcome::err(e.to_string())
-                                                    }),
-                                                None => ToolOutcome::err("unknown tool"),
-                                            };
-                                            map.lock()
-                                                .unwrap()
-                                                .insert(speculative_key(&call), outcome);
-                                        }));
+                                        other => sink(other),
                                     }
-                                    other => sink(other),
                                 }
+                                in_flight
+                            });
+                            let result = provider.turn_streaming(request, tx).await;
+                            let in_flight = driver.await.unwrap_or_default();
+                            for handle in in_flight {
+                                let _ = handle.await;
                             }
-                            in_flight
-                        });
-                        let result = provider.turn_streaming(request, tx).await;
-                        let in_flight = driver.await.unwrap_or_default();
-                        for handle in in_flight {
-                            let _ = handle.await;
+                            let drained: Vec<_> = spec_results.lock().unwrap().drain().collect();
+                            speculative.extend(drained);
+                            result
+                        } else {
+                            // Plain forwarder: speculation disabled (hooks,
+                            // event sink, or deny list present).
+                            let forwarder = tokio::spawn(async move {
+                                while let Some(delta) = rx.recv().await {
+                                    sink(delta);
+                                }
+                            });
+                            let result = provider.turn_streaming(request, tx).await;
+                            let _ = forwarder.await;
+                            result
                         }
-                        let drained: Vec<_> = spec_results.lock().unwrap().drain().collect();
-                        speculative.extend(drained);
-                        result
-                    } else {
-                        // Plain forwarder: speculation disabled (hooks,
-                        // event sink, or deny list present).
-                        let forwarder = tokio::spawn(async move {
-                            while let Some(delta) = rx.recv().await {
-                                sink(delta);
-                            }
-                        });
-                        let result = provider.turn_streaming(request, tx).await;
-                        let _ = forwarder.await;
-                        result
                     }
-                }
-                None => provider.turn(request).await,
-            };
-            let response = match response {
-                Ok(r) => r,
-                Err(e) => {
-                    // The self-check turn is an ENHANCEMENT: if the
-                    // provider fails on it, keep the pre-check answer and
-                    // end the run — never destroy completed work for the
-                    // bonus turn.
-                    if self_check_sent && !answer.is_empty() {
-                        tracing::warn!(
-                            error = %e,
-                            "self-check turn failed; keeping the pre-check answer"
-                        );
+                    None => provider.turn(request).await,
+                };
+                match response {
+                    Ok(r) => {
+                        turn_outcome = Some((r, model, provider.id().to_string()));
                         break;
                     }
-                    return Err(e);
+                    Err(e) => {
+                        // The self-check turn is an ENHANCEMENT: if the
+                        // provider fails on it, keep the pre-check answer and
+                        // end the run — never destroy completed work for the
+                        // bonus turn.
+                        if self_check_sent && !answer.is_empty() {
+                            tracing::warn!(
+                                error = %e,
+                                "self-check turn failed; keeping the pre-check answer"
+                            );
+                            break;
+                        }
+                        // Auth-class failure on a tier's primary: retry ONCE
+                        // on the tier's fallback candidate (a dead token on
+                        // one provider must not take a tier another signed-in
+                        // provider serves). Auth failures precede streaming,
+                        // so nothing is re-emitted.
+                        if !attempted_fallback {
+                            if let Some(fb) =
+                                self.tier_fallback_after_auth_failure(&model, provider.id(), &e)
+                            {
+                                tracing::warn!(
+                                    from = %model,
+                                    to = %fb.model,
+                                    to_provider = %fb.provider,
+                                    error = %e,
+                                    "auth failure — falling back to the tier fallback model"
+                                );
+                                attempted_fallback = true;
+                                fallback = Some(fb.clone());
+                                run_tier_override = Some((model, fb));
+                                continue;
+                            }
+                        }
+                        return Err(e);
+                    }
                 }
+            }
+            let Some((response, model, provider_id)) = turn_outcome else {
+                // Self-check short-circuit: the outer run loop ends with
+                // the preserved answer.
+                break;
             };
             turns += 1;
 
@@ -497,7 +551,7 @@ impl Engine {
                     &SessionEvent::TurnTrace {
                         turn: turns,
                         harness_version: env!("CARGO_PKG_VERSION").to_string(),
-                        provider: provider.id().to_string(),
+                        provider: provider_id.clone(),
                         model: model.clone(),
                         prompt_hash: Some(prompt_hash.clone()),
                         latency_ms: Some(turn_started.elapsed().as_millis() as u64),
@@ -840,6 +894,78 @@ impl Engine {
 
     /// Resolve (provider, model) for a selector choice, falling back to the
     /// configured defaults when the selector names an unregistered provider.
+    /// Auth-class provider failure: the request never reached the model
+    /// (dead token, revoked grant, bad key), so retrying on another
+    /// provider cannot duplicate streamed output. Message-shape based —
+    /// providers format status + provider error bodies into `message`.
+    fn is_auth_failure(error: &Error) -> bool {
+        match error {
+            Error::Provider { message, .. } => {
+                let m = message.to_ascii_lowercase();
+                [
+                    "401",
+                    "403",
+                    "unauthorized",
+                    "revoked",
+                    "invalid_grant",
+                    "authentication_error",
+                    "invalid api key",
+                    "invalid_api_key",
+                ]
+                .iter()
+                .any(|needle| m.contains(needle))
+            }
+            _ => false,
+        }
+    }
+
+    /// The first same-tier fallback candidate on a different, registered
+    /// provider — only when `failed_model` is a tier's primary and the
+    /// error is auth-class.
+    fn tier_fallback_after_auth_failure(
+        &self,
+        failed_model: &str,
+        failed_provider: &str,
+        error: &Error,
+    ) -> Option<ModelChoice> {
+        if !Self::is_auth_failure(error) {
+            return None;
+        }
+        let fallbacks = self.config.tier_fallbacks.as_ref()?;
+        let tier_list = if fallbacks
+            .cheap
+            .first()
+            .is_some_and(|(m, _)| m == failed_model)
+        {
+            ("cheap", &fallbacks.cheap)
+        } else if fallbacks
+            .strong
+            .first()
+            .is_some_and(|(m, _)| m == failed_model)
+        {
+            ("strong", &fallbacks.strong)
+        } else {
+            return None;
+        };
+        tier_list
+            .1
+            .iter()
+            .skip(1)
+            .find(|(_, provider)| {
+                provider != failed_provider && self.providers.contains_key(provider)
+            })
+            .map(|(model, provider)| ModelChoice {
+                model: model.clone(),
+                provider: provider.clone(),
+                reason: format!(
+                    "tier fallback ({}): {failed_model} failed auth on {failed_provider}",
+                    tier_list.0
+                ),
+                confident: true,
+                context_window: None,
+            })
+    }
+
     fn resolve_provider(&self, choice: &ModelChoice) -> Result<(Arc<dyn ModelProvider>, String)> {
         if let Some(provider) = self.providers.get(&choice.provider) {
             return Ok((provider.clone(), choice.model.clone()));

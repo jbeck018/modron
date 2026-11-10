@@ -856,11 +856,32 @@ pub struct EngineConfig {
     /// additive). The CLI fills these from `[agents.*]` with catalog-resolved
     /// providers.
     pub personas: std::collections::BTreeMap<String, PersonaSpec>,
+    /// Ordered per-tier fallback candidates (remote-control hardening,
+    /// additive; `None` by default). Index 0 of each list is the tier's
+    /// PRIMARY model; the rest are same-tier alternates on other
+    /// providers, most-preferred first. When a turn fails with an
+    /// AUTH-class provider error on a tier's primary (dead token, revoked
+    /// grant), the engine retries the turn ONCE on the first candidate
+    /// whose provider is registered — and keeps that model for the rest
+    /// of the run. Set by the CLI from `derive_tier_candidates` in
+    /// auto-routing mode only; explicit pins (`[router]` overrides,
+    /// `--model`, `--provider`) leave it `None`, so an explicit choice is
+    /// never silently swapped.
+    pub tier_fallbacks: Option<Arc<TierFallbacks>>,
     /// Background-delegate registry (Phase 5i I2, additive): the `delegate`
     /// tool's detached children report into this map, and `delegate_status`
     /// reads it. Engine-held so it survives across chat turns.
     pub background_subagents:
         Arc<std::sync::Mutex<std::collections::HashMap<String, BackgroundDelegate>>>,
+}
+
+/// Per-tier ordered fallback candidates for [`EngineConfig::tier_fallbacks`].
+#[derive(Clone, Debug)]
+pub struct TierFallbacks {
+    /// `(model, provider)` pairs, the tier's primary first.
+    pub cheap: Vec<(String, String)>,
+    /// `(model, provider)` pairs, the tier's primary first.
+    pub strong: Vec<(String, String)>,
 }
 
 /// A detached subagent's state (Phase 5i I2).
@@ -907,6 +928,7 @@ impl Default for EngineConfig {
             on_tool_event: None,
             async_router: None,
             personas: Default::default(),
+            tier_fallbacks: None,
             background_subagents: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
@@ -937,6 +959,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("on_tool_event", &self.on_tool_event.is_some())
             .field("async_router", &self.async_router.is_some())
             .field("personas", &self.personas.keys().collect::<Vec<_>>())
+            .field("tier_fallbacks", &self.tier_fallbacks.is_some())
             .field(
                 "background_subagents",
                 &self.background_subagents.lock().unwrap().len(),
