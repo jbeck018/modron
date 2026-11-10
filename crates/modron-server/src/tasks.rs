@@ -60,16 +60,28 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        // A repo without configured identity still needs to commit merges:
+        // fall back to a deterministic identity unless the environment
+        // already provides one (the user's config wins in practice).
+        .envs([
+            ("GIT_AUTHOR_NAME", "modron"),
+            ("GIT_AUTHOR_EMAIL", "modron@localhost"),
+            ("GIT_COMMITTER_NAME", "modron"),
+            ("GIT_COMMITTER_EMAIL", "modron@localhost"),
+        ])
         .output()
         .await
         .context("git not found on the server machine")?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
+        // Merge conflict notices ride STDOUT; other failures explain on
+        // stderr. Carry both into the error.
         Err(anyhow!(
-            "git {} failed: {}",
+            "git {} failed: {}{}",
             args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
         ))
     }
 }
@@ -245,9 +257,10 @@ pub async fn merge_task(
                 out.trim()
             ),
         )),
-        Err(_) => {
-            // Conflicted: abort cleanly (the base stays untouched) and
-            // report the conflicting paths.
+        Err(merge_error) => {
+            // Conflicted (or otherwise failed): abort cleanly so the base
+            // stays untouched, then distinguish conflicts from other
+            // failures.
             let _ = git(cwd, &["merge", "--abort"]).await;
             let conflicted = git(cwd, &["diff", "--name-only", "--diff-filter=U"])
                 .await
@@ -256,6 +269,11 @@ pub async fn merge_task(
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .collect();
+            if conflicts.is_empty() {
+                return Err(anyhow!(
+                    "merge failed (aborted cleanly, base untouched): {merge_error}"
+                ));
+            }
             Err(anyhow!(
                 "merge conflicts (aborted cleanly, base untouched): {}",
                 conflicts.join(", ")

@@ -178,7 +178,14 @@ async fn merge_conflict_aborts_cleanly() {
     let err = tasks::merge_task(&state, &repo, &record.session_id, None)
         .await
         .expect_err("conflicted merge must fail");
-    assert!(err.to_string().contains("merge conflicts"), "{err}");
+    assert!(
+        err.to_string().contains("aborted cleanly"),
+        "conflict must abort cleanly: {err}"
+    );
+    assert!(
+        err.to_string().contains("CONFLICT"),
+        "the conflict notice should surface: {err}"
+    );
 
     let merged = std::fs::read_to_string(repo.join("a.txt")).unwrap();
     assert_eq!(
