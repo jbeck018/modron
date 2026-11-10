@@ -148,6 +148,14 @@ pub enum Payload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// Open a remote-control tunnel for a session through a relay bridge
+    /// (a deployed cloud/bridge worker). `bridge_url` is the relay's
+    /// base (scheme + host). Answered by `remote_control_started` with
+    /// the share URL to open on any device.
+    RemoteControl {
+        session_id: Uuid,
+        bridge_url: String,
+    },
     /// Liveness check (answered by `pong`).
     Ping {},
 
@@ -205,6 +213,9 @@ pub enum Payload {
         ok: bool,
         summary: String,
     },
+    /// Answer to `remote_control`: the tunnel is up; open `url` (web
+    /// viewer) on any device to watch and drive the session.
+    RemoteControlStarted { url: String },
     /// A run completed.
     TurnDone { summary: WireRunSummary },
     /// A run errored.

@@ -86,6 +86,11 @@ pub enum SlashCommand {
     Issues(String),
     /// Branch the conversation (fork the session log).
     Fork,
+    /// /remote-control <bridge-url>: open a remote-control tunnel for the
+    /// current session through a deployed cloud/bridge worker.
+    RemoteControl {
+        url: String,
+    },
     /// Plan-first mode: submit a task constrained to planning.
     Plan(String),
     /// Review the working diff.
@@ -156,6 +161,11 @@ pub enum PendingCommand {
     Worktree,
     Issues(String),
     Fork,
+    /// /remote-control <bridge-url>: open a remote-control tunnel for
+    /// the current session through a deployed cloud/bridge worker.
+    RemoteControl {
+        url: String,
+    },
 }
 
 impl SlashCommand {
@@ -227,6 +237,7 @@ impl SlashCommand {
             "worktree" | "worktrees" => SlashCommand::Worktree,
             "issues" => SlashCommand::Issues(arg),
             "fork" => SlashCommand::Fork,
+            "remote-control" | "rc" => SlashCommand::RemoteControl { url: arg },
             "plan" => SlashCommand::Plan(arg),
             "code-review" | "review" => SlashCommand::CodeReview,
             "goal" => SlashCommand::Goal(arg),
@@ -2492,6 +2503,10 @@ impl App {
             }
             SlashCommand::Fork => {
                 self.pending_command = Some(PendingCommand::Fork);
+                Action::None
+            }
+            SlashCommand::RemoteControl { url } => {
+                self.pending_command = Some(PendingCommand::RemoteControl { url });
                 Action::None
             }
             SlashCommand::Plan(task) => {

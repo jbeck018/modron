@@ -4104,6 +4104,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
+ "chrono",
  "futures",
  "gpui-kit",
  "modron-core",

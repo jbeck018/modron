@@ -1,0 +1,24 @@
+{
+  // modron remote-control bridge: a transport-only relay. `modron serve`
+  // connects as the agent side of a session; any browser/phone opens
+  // /s/<key> to watch and drive it. One command deploys it:
+  //   npx wrangler deploy
+  // (from this directory, after `npx wrangler login`).
+  "name": "modron-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BRIDGE",
+        "class_name": "SessionBridge"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SessionBridge"]
+    }
+  ]
+}

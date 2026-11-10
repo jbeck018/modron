@@ -27,6 +27,7 @@
 pub mod dispatch;
 pub mod hub;
 pub mod pairing;
+pub mod rc;
 pub mod serve;
 pub mod tasks;
 pub mod unix;

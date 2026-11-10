@@ -88,6 +88,9 @@ enum LoopCmd {
         decision: modron_protocol::Decision,
     },
     SetConfig(modron_protocol::ConfigPatch),
+    RemoteControl {
+        bridge_url: String,
+    },
 }
 
 /// Driver -> loop updates that do not fit the delta/approval/outcome
@@ -662,22 +665,29 @@ pub async fn run_with(
             // Connected: config slash commands become SetConfig patches;
             // anything needing the local engine is refused EXPLICITLY
             // (OAuth flows, /tasks, /fork run on the machine that owns
-            // the engine — the server).
+            // the engine — the server). /remote-control is the exception
+            // that is remote-NATIVE: it opens a tunnel through the bridge
+            // so any device can watch and drive this session.
             if let Some(cmd) = app.pending_command.take() {
-                match remote_slash_command(&cmd) {
-                    Some((patch, mode_label)) => {
-                        if let Some(label) = mode_label {
-                            app.approval_mode = label;
+                match cmd {
+                    PendingCommand::RemoteControl { url } => {
+                        if url.is_empty() {
+                            app.toast("usage: /remote-control <bridge url> (deploy cloud/bridge)");
+                        } else {
+                            let _ = loop_cmd_tx.send(LoopCmd::RemoteControl { bridge_url: url });
                         }
-                        let _ = loop_cmd_tx.send(LoopCmd::SetConfig(patch));
                     }
-                    None => {
-                        // Refused explicitly, never silently dropped: the
-                        // command is consumed (a parked-and-kept command
-                        // would re-toast every tick).
-                        app.pending_command = None;
-                        app.toast("needs the local engine — restart without --connect");
-                    }
+                    other => match remote_slash_command(&other) {
+                        Some((patch, mode_label)) => {
+                            if let Some(label) = mode_label {
+                                app.approval_mode = label;
+                            }
+                            let _ = loop_cmd_tx.send(LoopCmd::SetConfig(patch));
+                        }
+                        None => {
+                            app.toast("needs the local engine — restart without --connect");
+                        }
+                    },
                 }
             }
         } else if matches!(app.pending_command, Some(PendingCommand::OAuthLogin { .. })) {
@@ -1035,6 +1045,15 @@ pub async fn run_with(
 /// by the loop instead — see [`run_slow_pending_command`].
 async fn run_pending_command(engine: &mut Engine, cmd: PendingCommand) -> Vec<String> {
     match cmd {
+        // Remote mode intercepts /remote-control before the local
+        // dispatch; unreachable here, but the match must stay total.
+        // /remote-control only works over a serve connection: in the
+        // local path say so explicitly instead of ignoring.
+        PendingCommand::RemoteControl { .. } => {
+            vec!["needs a server session - run `modron serve`, connect with \
+             --connect, then /remote-control <bridge url>"
+                .to_string()]
+        }
         // /auth — provider credentials against the shared core store
         // (`modron_core::auth`): bare = status, `<provider> <key>` =
         // save, `remove <provider>` = forget. The key never reaches the
@@ -1632,6 +1651,9 @@ fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
         Payload::OAuthProgress {
             provider, message, ..
         } => vec![LoopInput::Note(format!("[{provider}] {message}"))],
+        Payload::RemoteControlStarted { url } => vec![LoopInput::Note(format!(
+            "remote-control live — open {url} on any device to watch and drive this session"
+        ))],
         Payload::Error { message } => vec![LoopInput::Note(format!("server error: {message}"))],
         // Welcome (handshake already done), Event (persisted frames are
         // folded into snapshots; live visibility rides deltas — re-rendering
@@ -1672,15 +1694,22 @@ fn spawn_remote_driver(
     approval: ApprovalBus,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // The adopted session id: set by the auto-attach snapshot (first
+        // submit) or by --resume; used for session-scoped commands.
+        let mut driver_session: Option<uuid::Uuid> = None;
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
                     None => break,
                     Some(LoopCmd::Submit { session, task, attachments }) => {
-                        let _ = client.send(Payload::Submit { session_id: session, task, attachments });
+                        let _ = client.send(Payload::Submit {
+                            session_id: session.or(driver_session),
+                            task,
+                            attachments,
+                        });
                     }
                     Some(LoopCmd::Interrupt { session }) => {
-                        if let Some(session_id) = session {
+                        if let Some(session_id) = session.or(driver_session) {
                             let _ = client.send(Payload::Interrupt { session_id });
                         }
                     }
@@ -1689,6 +1718,15 @@ fn spawn_remote_driver(
                     }
                     Some(LoopCmd::SetConfig(patch)) => {
                         let _ = client.send(Payload::SetConfig { patch });
+                    }
+                    Some(LoopCmd::RemoteControl { bridge_url }) => {
+                        let Some(session_id) = driver_session else {
+                            break;
+                        };
+                        let _ = client.send(Payload::RemoteControl {
+                            session_id,
+                            bridge_url,
+                        });
                     }
                 },
                 frame = client.next_frame() => match frame {
@@ -1721,6 +1759,7 @@ fn spawn_remote_driver(
                                     let _ = ui_tx.send(UiFrame::ConfigChanged(patch));
                                 }
                                 LoopInput::Snapshot(snap) => {
+                                    driver_session = Some(snap.session_id);
                                     let _ = ui_tx.send(UiFrame::Snapshot(snap));
                                 }
                                 LoopInput::Approval { request_id, call } => {

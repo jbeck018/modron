@@ -243,6 +243,10 @@ impl AppState {
             | Payload::MergeTask { .. } => {}
             Payload::TaskCreated { session_id, .. } => self.attached = Some(session_id),
             Payload::TaskStatus { .. } | Payload::TaskMerged { .. } => {}
+            // Remote-control registration is TUI-driven this tranche
+            // (divergence row in AGENTS.md); the desktop share button
+            // lands next.
+            Payload::RemoteControl { .. } | Payload::RemoteControlStarted { .. } => {}
             Payload::Note { text } => {
                 self.last_note = Some(text.clone());
                 // `new_session`'s correlated reply names the fresh session

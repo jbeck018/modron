@@ -254,6 +254,29 @@ pub async fn handle_frame(
                 Err(e) => send(ctx, error(request_id, e.to_string())),
             }
         }
+        Payload::RemoteControl {
+            session_id,
+            bridge_url,
+        } => {
+            // The tunnel is registered from the server's repo dir (task
+            // sessions run there via their worktree).
+            match crate::rc::start_remote_control(
+                state,
+                session_id,
+                &state.working_dir,
+                &bridge_url,
+            ) {
+                Ok(url) => send(
+                    ctx,
+                    reply(
+                        request_id,
+                        Some(session_id),
+                        Payload::RemoteControlStarted { url },
+                    ),
+                ),
+                Err(e) => send(ctx, error(request_id, e.to_string())),
+            }
+        }
         Payload::GetTaskStatus { session_id } => {
             match crate::tasks::task_status(state, &session_id).await {
                 Ok((record, ahead, files)) => {
@@ -643,6 +666,8 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::DeleteSession { .. } => "delete_session",
         Payload::CreateTask { .. } => "create_task",
         Payload::GetTaskStatus { .. } => "get_task_status",
+        Payload::RemoteControl { .. } => "remote_control",
+        Payload::RemoteControlStarted { .. } => "remote_control_started",
         Payload::MergeTask { .. } => "merge_task",
         Payload::TaskCreated { .. } => "task_created",
         Payload::TaskStatus { .. } => "task_status",
