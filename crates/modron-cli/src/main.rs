@@ -1794,25 +1794,33 @@ fn build_selector(
                 let cheap = list(&candidates.cheap);
                 let strong = list(&candidates.strong);
                 if cheap.len() > 1 || strong.len() > 1 {
-                    let alt = |v: &[(String, String)]| {
-                        v.get(1)
+                    // The engine skips same-provider candidates itself, so
+                    // the full chain is what an operator wants to see.
+                    let alts = |v: &[(String, String)]| -> String {
+                        v[1..]
+                            .iter()
                             .map(|(m, p)| format!("{m} ({p})"))
-                            .unwrap_or_else(|| "-".into())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     };
                     eprintln!(
-                        "note: auto-routing from your signed-in providers — cheap: {}, strong: {} (auth fallback: cheap -> {}, strong -> {}; override in [router])",
+                        "note: auto-routing from your signed-in providers — cheap: {}, strong: {} (auth fallbacks — cheap: {}; strong: {}; override in [router])",
                         cheap[0].0,
                         strong[0].0,
-                        alt(&cheap),
-                        alt(&strong)
+                        alts(&cheap),
+                        alts(&strong)
                     );
                     tier_fallbacks = Some(Arc::new(modron_core::TierFallbacks { cheap, strong }));
                 }
-                if let Some((cheap, strong)) = &derived {
-                    eprintln!(
-                        "note: auto-routing from your signed-in providers — cheap: {cheap}, strong: {strong} (override in [router])"
-                    );
-                }
+            }
+        }
+        // One note per startup: the enriched line above when fallbacks
+        // exist, the plain line otherwise.
+        if tier_fallbacks.is_none() {
+            if let Some((cheap, strong)) = &derived {
+                eprintln!(
+                    "note: auto-routing from your signed-in providers — cheap: {cheap}, strong: {strong} (override in [router])"
+                );
             }
         }
     }
