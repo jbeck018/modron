@@ -247,6 +247,30 @@ impl RemoteClient {
         self.frames.try_recv().ok()
     }
 
+    /// List sessions on the server (`--resume` bare resolves newest).
+    pub async fn list_sessions(&mut self) -> Result<Vec<modron_protocol::SessionMetaWire>> {
+        let _id = self.send(Payload::ListSessions {});
+        let deadline = tokio::time::sleep(REQUEST_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => bail!("list_sessions timeout"),
+                frame = self.frames.recv() => match frame {
+                    Some(Frame {
+                        payload: Payload::Sessions { sessions },
+                        ..
+                    }) => return Ok(sessions),
+                    Some(Frame {
+                        payload: Payload::Error { message },
+                        ..
+                    }) => bail!("list_sessions failed: {message}"),
+                    Some(_) => continue,
+                    None => bail!("connection closed while listing sessions"),
+                }
+            }
+        }
+    }
+
     /// Attach a session: send `attach {session, last_seq}` and await the
     /// `snapshot` reply (skipping unrelated interleaved frames).
     pub async fn attach(&mut self, session: Uuid, last_seq: u64) -> Result<AttachSnapshot> {

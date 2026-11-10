@@ -333,6 +333,12 @@ struct Cli {
     /// --resume=<id> for a specific one. (Claude Code / Codex convention.)
     #[arg(long, global = true, num_args = 0..=1, require_equals = true)]
     resume: Option<Option<SessionId>>,
+    /// Drive a running `modron serve` instead of an in-process engine:
+    /// "unix" (the default socket), "unix:<path>", or "ws://host:port".
+    /// Sessions live on the server and survive this TUI closing; combine
+    /// with --resume to reattach.
+    #[arg(long, global = true)]
+    connect: Option<String>,
     /// Autocompaction trigger: compact when the estimated context exceeds
     /// this fraction of --max-input-tokens (0 < t < 1; default 0.8).
     #[arg(long, global = true)]
@@ -635,6 +641,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             },
             String::new(),
             notice,
+            cli.connect.as_ref().map(|target| modron_tui::RemoteSpec {
+                target: target.clone(),
+                resume: cli.resume,
+            }),
         )
         .await
         .map_err(|err| anyhow::anyhow!("{err:#}"));
@@ -650,7 +660,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // show the friendly setup screen instead of erroring later.
             // An explicit --provider choice (especially mock) IS a
             // configuration — never intercept it with onboarding.
-            if cli.provider.is_none() && !onboarding::has_any_key() {
+            if cli.provider.is_none() && cli.connect.is_none() && !onboarding::has_any_key() {
                 let provider = onboarding::run_onboarding()?;
                 let mut onboarded = cli.clone();
                 onboarded.provider = None; // let config drive it
@@ -692,6 +702,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     },
                     tui_model_label(&onboarded, &cfg),
                     notice,
+                    None,
                 )
                 .await
                 .map_err(|err| anyhow::anyhow!("{err:#}"));
@@ -738,6 +749,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 },
                 tui_model_label(&cli, &cfg),
                 notice,
+                cli.connect.as_ref().map(|target| modron_tui::RemoteSpec {
+                    target: target.clone(),
+                    resume: cli.resume,
+                }),
             )
             .await
             .map_err(|err| anyhow::anyhow!("{err:#}"));

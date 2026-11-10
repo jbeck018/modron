@@ -14,6 +14,7 @@ use modron_core::{
     ApprovalMode, Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
     ToolActivitySink, ToolCall,
 };
+use modron_protocol::{ConfigPatch, Decision, Frame, Payload, WireRunSummary};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -57,6 +58,49 @@ pub struct TuiConfig {
     pub model_label: String,
 }
 
+/// Remote-control connection (Phase 3): when set, the run loop drives a
+/// `modron serve` process over the protocol instead of an in-process
+/// engine. Sessions live on the server and survive this TUI closing.
+#[derive(Clone, Debug)]
+pub struct RemoteSpec {
+    /// Connect target for [`crate::remote::RemoteClient`]: `"unix"`
+    /// (default socket), `"unix:<path>"`, or `"ws://host:port"`.
+    pub target: String,
+    /// `None` = fresh session on first submit; `Some(None)` = the
+    /// server's newest session (`--resume` bare); `Some(Some(id))` = that
+    /// id (`--resume <id>`).
+    pub resume: Option<Option<SessionId>>,
+}
+
+/// Loop -> driver commands (the driver owns the [`RemoteClient`]; the
+/// render loop never blocks on the wire).
+enum LoopCmd {
+    Submit {
+        session: Option<SessionId>,
+        task: String,
+        attachments: Vec<modron_core::Attachment>,
+    },
+    Interrupt {
+        session: Option<SessionId>,
+    },
+    Approve {
+        request_id: String,
+        decision: modron_protocol::Decision,
+    },
+    SetConfig(modron_protocol::ConfigPatch),
+}
+
+/// Driver -> loop updates that do not fit the delta/approval/outcome
+/// channels (drained each tick).
+enum UiFrame {
+    Note(String),
+    // Boxed: AttachSnapshot carries a full event log + LiveState (392B+)
+    // against a Note's 24B.
+    Snapshot(Box<crate::remote::AttachSnapshot>),
+    ConfigChanged(modron_protocol::ConfigPatch),
+    Disconnected,
+}
+
 /// Poll cadence for crossterm events (and the spinner tick).
 const TICK: Duration = Duration::from_millis(50);
 
@@ -96,19 +140,17 @@ impl Drop for TerminalRestore {
     }
 }
 
-/// Shared approval slot: the engine-side approver queues a call; the render
-/// loop drains it into the App; the response channel carries the decision.
-type ApprovalSlot = Arc<Mutex<Option<(ToolCallLike, mpsc::Sender<bool>)>>>;
+/// Shared approval slot: the approver queues the REAL ToolCall (local
+/// closures clone the call they were handed; the remote driver carries the
+/// wire's call verbatim); the render loop drains it into the App; the
+/// response channel carries the decision.
+type ApprovalSlot = Arc<Mutex<Option<(ToolCall, mpsc::Sender<bool>)>>>;
 
 #[derive(Clone)]
 struct ApprovalBus {
     slot: ApprovalSlot,
     rest_approved: Arc<std::sync::atomic::AtomicBool>,
 }
-
-// The slot carries the tool-call summary text, not the ToolCall itself (the
-// approver receives a &ToolCall and we only need its display form).
-type ToolCallLike = String;
 
 /// Run the TUI. `build` receives the wired sinks and returns the engine plus
 /// the session to resume (if `--resume` was given). Requires a TTY on stdout;
@@ -119,6 +161,7 @@ pub async fn run_with(
     build: impl FnOnce(TuiSinks) -> anyhow::Result<(Engine, Option<SessionId>)>,
     model_label: String,
     upgrade_notice: Option<String>,
+    remote: Option<RemoteSpec>,
 ) -> anyhow::Result<()> {
     use std::io::IsTerminal as _;
     if !std::io::stdout().is_terminal() {
@@ -133,29 +176,57 @@ pub async fn run_with(
         slot: Arc::new(Mutex::new(None)),
         rest_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
 
-    // The engine builder gets sinks that talk to THIS loop.
-    let delta_sink_tx = delta_tx.clone();
-    let tool_tx = delta_tx.clone();
-    let approval_for_builder = approval.clone();
-    let (mut engine, resume_session) = build(TuiSinks {
-        on_delta: Arc::new(move |delta| {
-            let _ = delta_sink_tx.send(DeltaOrTool::Delta(delta));
-        }),
-        on_tool_event: Arc::new(move |activity| {
-            let _ = tool_tx.send(DeltaOrTool::Tool(activity));
-        }),
-        approver: Arc::new(move |call| {
-            if approval_for_builder.rest_approved.load(Ordering::Relaxed) {
-                return true;
-            }
-            let (respond, receiver) = mpsc::channel();
-            *approval_for_builder.slot.lock().unwrap() = Some((short_call(call), respond));
-            // Park the engine task until the render loop delivers the
-            // decision. block_in_place keeps other runtime workers alive.
-            tokio::task::block_in_place(|| receiver.recv().unwrap_or(false))
-        }),
-    })?;
+    // Remote-control connect happens BEFORE the terminal goes raw: a bad
+    // target fails fast with a plain error, nothing to restore.
+    let is_remote = remote.is_some();
+    let remote_target = remote.as_ref().map(|spec| spec.target.clone());
+    let mut connected = None;
+    if let Some(spec) = remote {
+        let mut client = crate::remote::RemoteClient::connect(&spec.target).await?;
+        let session = match spec.resume {
+            None => None,
+            Some(want) => match want {
+                None => client.list_sessions().await?.first().map(|meta| meta.id),
+                Some(id) => Some(id),
+            },
+        };
+        let snapshot = match session {
+            Some(id) => Some(client.attach(id, 0).await?),
+            None => None,
+        };
+        connected = Some((client, snapshot));
+    }
+
+    // The engine builder gets sinks that talk to THIS loop. Remote mode
+    // never calls it — the engine lives on the server — and the loop's
+    // local branches hold an inert stand-in so the code stays uniform.
+    let (mut engine, resume_session) = if connected.is_some() {
+        (inert_engine(), None)
+    } else {
+        let delta_sink_tx = delta_tx.clone();
+        let tool_tx = delta_tx.clone();
+        let approval_for_builder = approval.clone();
+        build(TuiSinks {
+            on_delta: Arc::new(move |delta| {
+                let _ = delta_sink_tx.send(DeltaOrTool::Delta(delta));
+            }),
+            on_tool_event: Arc::new(move |activity| {
+                let _ = tool_tx.send(DeltaOrTool::Tool(activity));
+            }),
+            approver: Arc::new(move |call| {
+                if approval_for_builder.rest_approved.load(Ordering::Relaxed) {
+                    return true;
+                }
+                let (respond, receiver) = mpsc::channel();
+                *approval_for_builder.slot.lock().unwrap() = Some((call.clone(), respond));
+                // Park the engine task until the render loop delivers the
+                // decision. block_in_place keeps other runtime workers alive.
+                tokio::task::block_in_place(|| receiver.recv().unwrap_or(false))
+            }),
+        })?
+    };
 
     // Terminal setup: inline viewport, raw mode, hidden cursor.
     // Kitty keyboard protocol (kitty/Ghostty/WezTerm/iTerm2 3.5+): lets the
@@ -200,33 +271,57 @@ pub async fn run_with(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
+    // Remote attach state drives a few App fields the local path takes
+    // from the engine (menus degrade gracefully: no personas/tool lists
+    // remotely yet — the server does not expose them over the protocol).
+    let attached = connected.as_ref().and_then(|(_, snap)| snap.as_ref());
     let mut app = App {
         upgrade_notice,
-        session_id: resume_session,
-        model_label: model_label.clone(),
+        session_id: attached.map(|snap| snap.session_id).or(resume_session),
+        model_label: attached
+            .and_then(|snap| (!snap.live.model.is_empty()).then(|| snap.live.model.clone()))
+            .unwrap_or_else(|| model_label.clone()),
         context_window: modron_router::lookup(&model_label)
             .map(|info| info.context_window)
             .unwrap_or(0),
         // Menu inputs (personas, tool list, current model) come from the
         // engine the loop owns.
-        personas: engine.config.personas.keys().cloned().collect(),
-        tool_names: engine
-            .tools
-            .specs()
-            .iter()
-            .map(|s| s.name.clone())
-            .collect(),
-        current_model: engine.config.default_model.clone(),
+        personas: if is_remote {
+            Vec::new()
+        } else {
+            engine.config.personas.keys().cloned().collect()
+        },
+        tool_names: if is_remote {
+            Vec::new()
+        } else {
+            engine
+                .tools
+                .specs()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        },
+        current_model: attached
+            .and_then(|snap| (!snap.live.model.is_empty()).then(|| snap.live.model.clone()))
+            .unwrap_or_else(|| engine.config.default_model.clone()),
         current_theme: "modron".to_string(),
         // The status strip's mode label mirrors the engine's real state
         // (shift+tab and /mode keep it current through PendingCommand).
-        approval_mode: match engine.config.approvals.mode {
-            ApprovalMode::Ask => "ask",
-            ApprovalMode::ApproveAll => "yolo",
-            ApprovalMode::Deny => "deny",
-        }
-        .to_string(),
-        working_dir: engine.config.working_dir.clone(),
+        approval_mode: if is_remote {
+            "ask".to_string()
+        } else {
+            match engine.config.approvals.mode {
+                ApprovalMode::Ask => "ask",
+                ApprovalMode::ApproveAll => "yolo",
+                ApprovalMode::Deny => "deny",
+            }
+            .to_string()
+        },
+        working_dir: if is_remote {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        } else {
+            engine.config.working_dir.clone()
+        },
         ..App::default()
     };
 
@@ -267,6 +362,18 @@ pub async fn run_with(
         ];
         app.push_history(welcome);
     }
+    // Remote banner note + attach replay: the persisted transcript lands
+    // in scrollback (same styles as the live path) before anything runs.
+    if let Some(target) = remote_target.as_deref() {
+        app.note(format!(
+            "connected to {target} — sessions live on the server and survive this TUI"
+        ));
+    }
+    if let Some((_, Some(snap))) = connected.as_ref() {
+        if !snap.events.is_empty() {
+            app.backfill_transcript(modron_view::replay(&snap.events));
+        }
+    }
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
     // OAuth progress from the spawned flows: the interim update shows the
     // URL (+ device-flow user code) in the modal, Done settles it.
@@ -287,8 +394,28 @@ pub async fn run_with(
     let (shell_tx, mut shell_rx) = tokio::sync::mpsc::unbounded_channel::<ShellOutcome>();
     let mut shell_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
+    // Remote mode's one-at-a-time flag (no JoinHandle exists to check).
+    let mut remote_busy = false;
+    // The first snapshot with events replays the transcript; later ones
+    // (auto-attach echoes) must not duplicate history.
+    let mut backfilled = false;
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
+
+    // Remote-control driver: owns the client, translates frames into the
+    // loop's channels. The loop talks to it through loop_cmd_tx.
+    let (loop_cmd_tx, loop_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<LoopCmd>();
+    if let Some((client, _)) = connected.take() {
+        spawn_remote_driver(
+            client,
+            loop_cmd_rx,
+            loop_cmd_tx.clone(),
+            delta_tx.clone(),
+            done_tx.clone(),
+            ui_tx.clone(),
+            approval.clone(),
+        );
+    }
 
     loop {
         // 1. Drain engine deltas/tool events.
@@ -300,26 +427,12 @@ pub async fn run_with(
         }
 
         // 2. Drain the approval slot into the App (redraw happens below).
+        //     The slot carries the REAL ToolCall (remote approvals arrive
+        //     with one; the local approver clones the one it was given) —
+        //     the old summary-string reconstruction is gone.
         if app.pending_approval.is_none() {
-            if let Some((summary, respond)) = approval.slot.lock().unwrap().take() {
-                app.pending_approval = Some(PendingApproval {
-                    call: modron_core::ToolCall {
-                        id: String::new(),
-                        name: summary
-                            .split_once(' ')
-                            .map(|(n, _)| n.to_string())
-                            .unwrap_or(summary.clone()),
-                        arguments: serde_json::Value::String(
-                            summary
-                                .split_once(' ')
-                                .map(|(_, a)| a.to_string())
-                                .unwrap_or_default(),
-                        ),
-                    },
-                    respond,
-                });
-                // The display summary rides in `arguments` as a string; the
-                // status line prints name + args, so this reconstructs it.
+            if let Some((call, respond)) = approval.slot.lock().unwrap().take() {
+                app.pending_approval = Some(PendingApproval { call, respond });
             }
         }
 
@@ -407,7 +520,14 @@ pub async fn run_with(
                                 ))
                                 .style(accent)]);
                                 let tx = shell_tx.clone();
-                                let dir = engine.config.working_dir.clone();
+                                let dir = if is_remote {
+                                    // `!` runs on the client machine; the
+                                    // server's working dir is its own.
+                                    std::env::current_dir()
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                                } else {
+                                    engine.config.working_dir.clone()
+                                };
                                 shell_task = Some(tokio::spawn(async move {
                                     let result = tokio::process::Command::new("sh")
                                         .arg("-c")
@@ -426,13 +546,26 @@ pub async fn run_with(
                             // spawn would overwrite the first JoinHandle
                             // (unabortable orphan streaming into the App,
                             // double finish_turn, clobbered approval slot).
-                            if engine_task.is_some() {
+                            if engine_task.is_some() || remote_busy {
                                 app.toast("a turn is already running — Esc aborts it");
                                 continue;
                             }
                             let task = app.task_with_goal(&task);
                             app.begin_task(&task);
                             let attachments = app.take_attachments();
+                            if is_remote {
+                                // Server-authoritative: the session id
+                                // arrives on the auto-attach Snapshot
+                                // (first submit) or is already known;
+                                // TurnDone/Aborted clear the busy flag.
+                                let _ = loop_cmd_tx.send(LoopCmd::Submit {
+                                    session: app.session_id,
+                                    task,
+                                    attachments,
+                                });
+                                remote_busy = true;
+                                continue;
+                            }
                             let engine = engine.clone();
                             let done = done_tx.clone();
                             let session = app.session_id;
@@ -462,24 +595,36 @@ pub async fn run_with(
                             }));
                         }
                         crate::Action::Abort => {
-                            match (engine_task.take(), slow_command_task.take()) {
-                                (Some(task), _) => {
-                                    task.abort();
-                                    // Give the runtime a beat to cancel.
-                                    tokio::time::sleep(Duration::from_millis(30)).await;
-                                    app.finish_interrupted();
+                            if is_remote {
+                                // Server-authoritative interrupt: TurnAborted
+                                // drives finish_interrupted (a dead server
+                                // leaves the turn running rather than a fake
+                                // local abort).
+                                if remote_busy {
+                                    let _ = loop_cmd_tx.send(LoopCmd::Interrupt {
+                                        session: app.session_id,
+                                    });
                                 }
-                                // No engine running: Esc cancels a slow
-                                // command instead. Bumping the generation
-                                // drops any Done already sitting in the
-                                // channel (an aborted /fork must not adopt
-                                // its new session id).
-                                (None, Some(task)) => {
-                                    slow_command_generation += 1;
-                                    task.abort();
-                                    app.toast("command cancelled");
+                            } else {
+                                match (engine_task.take(), slow_command_task.take()) {
+                                    (Some(task), _) => {
+                                        task.abort();
+                                        // Give the runtime a beat to cancel.
+                                        tokio::time::sleep(Duration::from_millis(30)).await;
+                                        app.finish_interrupted();
+                                    }
+                                    // No engine running: Esc cancels a slow
+                                    // command instead. Bumping the generation
+                                    // drops any Done already sitting in the
+                                    // channel (an aborted /fork must not adopt
+                                    // its new session id).
+                                    (None, Some(task)) => {
+                                        slow_command_generation += 1;
+                                        task.abort();
+                                        app.toast("command cancelled");
+                                    }
+                                    (None, None) => {}
                                 }
-                                (None, None) => {}
                             }
                             // A pending `!` shell job cancels with Esc too
                             // (kill_on_drop kills the child process).
@@ -513,7 +658,29 @@ pub async fn run_with(
         //     cancels it).
         // NOTE: peek with matches! before take() — an `if let` over
         // `.take()` drops the value when the pattern fails.
-        if matches!(app.pending_command, Some(PendingCommand::OAuthLogin { .. })) {
+        if is_remote {
+            // Connected: config slash commands become SetConfig patches;
+            // anything needing the local engine is refused EXPLICITLY
+            // (OAuth flows, /tasks, /fork run on the machine that owns
+            // the engine — the server).
+            if let Some(cmd) = app.pending_command.take() {
+                match remote_slash_command(&cmd) {
+                    Some((patch, mode_label)) => {
+                        if let Some(label) = mode_label {
+                            app.approval_mode = label;
+                        }
+                        let _ = loop_cmd_tx.send(LoopCmd::SetConfig(patch));
+                    }
+                    None => {
+                        // Refused explicitly, never silently dropped: the
+                        // command is consumed (a parked-and-kept command
+                        // would re-toast every tick).
+                        app.pending_command = None;
+                        app.toast("needs the local engine — restart without --connect");
+                    }
+                }
+            }
+        } else if matches!(app.pending_command, Some(PendingCommand::OAuthLogin { .. })) {
             let Some(PendingCommand::OAuthLogin { session }) = app.pending_command.take() else {
                 unreachable!("matches! guard above")
             };
@@ -746,6 +913,44 @@ pub async fn run_with(
             }
         }
 
+        // 3f. Remote-control updates: notes (server toasts/slash output,
+        //     oauth progress), config echoes (mode/model labels), and
+        //     auto-attach snapshots (the session id arrives here on a
+        //     first submit to a fresh session).
+        while let Ok(frame) = ui_rx.try_recv() {
+            match frame {
+                UiFrame::Note(text) => app.note(text),
+                UiFrame::ConfigChanged(patch) => {
+                    if let Some(mode) = patch.approval_mode {
+                        app.approval_mode = match mode {
+                            modron_protocol::ApprovalModeWire::ApproveAll => "yolo".into(),
+                            modron_protocol::ApprovalModeWire::Deny => "deny".into(),
+                            modron_protocol::ApprovalModeWire::Ask => "ask".into(),
+                        };
+                    }
+                    if let Some(model) = patch.model {
+                        app.model_label = model.clone();
+                        app.current_model = model;
+                    }
+                }
+                UiFrame::Snapshot(snap) => {
+                    app.session_id = Some(snap.session_id);
+                    if !snap.events.is_empty() && !backfilled {
+                        backfilled = true;
+                        app.backfill_transcript(modron_view::replay(&snap.events));
+                    }
+                    if !snap.live.model.is_empty() && app.current_model != snap.live.model {
+                        app.model_label = snap.live.model.clone();
+                        app.current_model = snap.live.model.clone();
+                    }
+                }
+                UiFrame::Disconnected => {
+                    remote_busy = false;
+                    app.toast("server disconnected — restart with --connect to reattach");
+                }
+            }
+        }
+
         // 4. Approve-rest mirror: when the user pressed `a`, future approvals
         //    short-circuit in the approver; drain any queued one so an
         //    approval parked BEFORE the `a` press is answered, not re-prompted.
@@ -762,6 +967,7 @@ pub async fn run_with(
         // tool activities can queue behind the Done notification.)
         while let Ok(outcome) = done_rx.try_recv() {
             engine_task = None;
+            remote_busy = false;
             while let Ok(msg) = delta_rx.try_recv() {
                 match msg {
                     DeltaOrTool::Delta(d) => app.on_delta(d),
@@ -787,7 +993,11 @@ pub async fn run_with(
                         ratatui::text::Line::from(format!("error: {e}")).style(red)
                     ]);
                 }
-                Outcome::Aborted => {}
+                Outcome::Aborted => {
+                    // Remote interrupts land here (server-authoritative);
+                    // local aborts finish inline before any frame could.
+                    app.finish_interrupted();
+                }
             }
         }
 
@@ -1377,12 +1587,216 @@ enum DeltaOrTool {
     Tool(ToolActivity),
 }
 
-fn short_call(call: &ToolCall) -> ToolCallLike {
-    let args = call.arguments.to_string();
-    let args = if args.chars().count() > 80 {
-        format!("{}…", args.chars().take(80).collect::<String>())
-    } else {
-        args
+// ---------------------------------------------------------------------------
+// Remote-control driver (Phase 3): frames -> loop channels
+// ---------------------------------------------------------------------------
+
+/// A protocol frame translated into loop-channel inputs (pure, tested).
+enum LoopInput {
+    Delta(StreamDelta),
+    Tool(ToolActivity),
+    Approval { request_id: String, call: ToolCall },
+    Done(WireRunSummary),
+    Failed(String),
+    Aborted,
+    Note(String),
+    ConfigChanged(ConfigPatch),
+    Snapshot(Box<crate::remote::AttachSnapshot>),
+}
+
+fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
+    match frame.payload {
+        Payload::Snapshot {
+            session_id,
+            last_seq,
+            events,
+            live,
+        } => vec![LoopInput::Snapshot(Box::new(
+            crate::remote::AttachSnapshot {
+                session_id,
+                last_seq,
+                events,
+                live,
+            },
+        ))],
+        Payload::Delta { delta } => vec![LoopInput::Delta(delta.to_core())],
+        Payload::Tool { activity } => vec![LoopInput::Tool(activity.into())],
+        Payload::ApprovalRequested { request_id, call } => {
+            vec![LoopInput::Approval { request_id, call }]
+        }
+        Payload::TurnDone { summary } => vec![LoopInput::Done(summary)],
+        Payload::TurnFailed { error } => vec![LoopInput::Failed(error)],
+        Payload::TurnAborted { .. } => vec![LoopInput::Aborted],
+        Payload::Note { text } => vec![LoopInput::Note(text)],
+        Payload::ConfigChanged { patch } => vec![LoopInput::ConfigChanged(patch)],
+        Payload::OAuthProgress {
+            provider, message, ..
+        } => vec![LoopInput::Note(format!("[{provider}] {message}"))],
+        Payload::Error { message } => vec![LoopInput::Note(format!("server error: {message}"))],
+        // Welcome (handshake already done), Event (persisted frames are
+        // folded into snapshots; live visibility rides deltas — re-rendering
+        // both would duplicate every message), Sessions (server-side picker
+        // is a later tranche), Pong.
+        _ => Vec::new(),
+    }
+}
+
+/// A stand-in Engine for remote mode: never called (submits, interrupts
+/// and approvals ride the protocol), but the loop's local branches hold
+/// the engine by value, so an inert one keeps the code uniform.
+fn inert_engine() -> Engine {
+    Engine {
+        selector: Arc::new(modron_core::testing::StaticSelector::new(
+            "unused", "unused",
+        )),
+        providers: std::collections::HashMap::new(),
+        tools: Arc::new(modron_core::ToolRegistry::new()),
+        store: Arc::new(modron_store::JsonlSessionStore::new(
+            std::env::temp_dir().join("modron-tui-remote"),
+        )),
+        config: modron_core::EngineConfig::default(),
+    }
+}
+
+/// Owns the client; forwards frames into the loop's channels and loop
+/// commands into the wire. The approval waiter parks a blocking thread
+/// (spawn_blocking) — the same park-and-decide shape as the local
+/// approver, just across the wire.
+fn spawn_remote_driver(
+    mut client: crate::remote::RemoteClient,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<LoopCmd>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<LoopCmd>,
+    delta_tx: mpsc::Sender<DeltaOrTool>,
+    done_tx: tokio::sync::mpsc::UnboundedSender<Outcome>,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<UiFrame>,
+    approval: ApprovalBus,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    None => break,
+                    Some(LoopCmd::Submit { session, task, attachments }) => {
+                        let _ = client.send(Payload::Submit { session_id: session, task, attachments });
+                    }
+                    Some(LoopCmd::Interrupt { session }) => {
+                        if let Some(session_id) = session {
+                            let _ = client.send(Payload::Interrupt { session_id });
+                        }
+                    }
+                    Some(LoopCmd::Approve { request_id, decision }) => {
+                        let _ = client.send(Payload::Approve { request_id, decision });
+                    }
+                    Some(LoopCmd::SetConfig(patch)) => {
+                        let _ = client.send(Payload::SetConfig { patch });
+                    }
+                },
+                frame = client.next_frame() => match frame {
+                    None => {
+                        let _ = ui_tx.send(UiFrame::Disconnected);
+                        break;
+                    }
+                    Some(frame) => {
+                        for input in frame_to_inputs(frame) {
+                            match input {
+                                LoopInput::Delta(d) => {
+                                    let _ = delta_tx.send(DeltaOrTool::Delta(d));
+                                }
+                                LoopInput::Tool(t) => {
+                                    let _ = delta_tx.send(DeltaOrTool::Tool(t));
+                                }
+                                LoopInput::Done(summary) => {
+                                    let _ = done_tx.send(Outcome::Done(summary.into()));
+                                }
+                                LoopInput::Failed(error) => {
+                                    let _ = done_tx.send(Outcome::Failed(error));
+                                }
+                                LoopInput::Aborted => {
+                                    let _ = done_tx.send(Outcome::Aborted);
+                                }
+                                LoopInput::Note(text) => {
+                                    let _ = ui_tx.send(UiFrame::Note(text));
+                                }
+                                LoopInput::ConfigChanged(patch) => {
+                                    let _ = ui_tx.send(UiFrame::ConfigChanged(patch));
+                                }
+                                LoopInput::Snapshot(snap) => {
+                                    let _ = ui_tx.send(UiFrame::Snapshot(snap));
+                                }
+                                LoopInput::Approval { request_id, call } => {
+                                    let (respond, receiver) = mpsc::channel();
+                                    *approval.slot.lock().unwrap() = Some((call, respond));
+                                    let cmd_tx = cmd_tx.clone();
+                                    let rest = approval.rest_approved.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let allow = receiver.recv().unwrap_or(false);
+                                        let decision = if allow {
+                                            if rest.load(Ordering::Relaxed) {
+                                                Decision::AllowAll
+                                            } else {
+                                                Decision::AllowOnce
+                                            }
+                                        } else {
+                                            Decision::Deny
+                                        };
+                                        let _ = cmd_tx.send(LoopCmd::Approve { request_id, decision });
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    })
+}
+
+/// Translate a parked slash command into a server SetConfig patch while
+/// connected. `None` = no remote equivalent (the loop refuses it with an
+/// explicit toast). The optional label mirrors the local /mode arm's
+/// status-strip update.
+fn remote_slash_command(cmd: &PendingCommand) -> Option<(ConfigPatch, Option<String>)> {
+    use modron_protocol::ApprovalModeWire;
+    let patch = match cmd {
+        PendingCommand::Model { name, .. } => ConfigPatch {
+            model: Some(name.clone()),
+            ..ConfigPatch::default()
+        },
+        PendingCommand::Mode(m) => {
+            let (wire, label) = match m.trim() {
+                "yolo" | "auto" => (ApprovalModeWire::ApproveAll, "yolo"),
+                "deny" => (ApprovalModeWire::Deny, "deny"),
+                _ => (ApprovalModeWire::Ask, "ask"),
+            };
+            return Some((
+                ConfigPatch {
+                    approval_mode: Some(wire),
+                    ..ConfigPatch::default()
+                },
+                Some(label.to_string()),
+            ));
+        }
+        PendingCommand::Sandbox(s) => ConfigPatch {
+            sandbox: Some(match s.trim() {
+                "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
+                "bubblewrap" | "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
+                _ => modron_core::SandboxPolicy::Off,
+            }),
+            ..ConfigPatch::default()
+        },
+        PendingCommand::Agent(name) => ConfigPatch {
+            persona: Some(name.clone()),
+            ..ConfigPatch::default()
+        },
+        PendingCommand::Allow(tool) => ConfigPatch {
+            allow: Some(vec![tool.clone()]),
+            ..ConfigPatch::default()
+        },
+        PendingCommand::Deny(tool) => ConfigPatch {
+            deny: Some(vec![tool.clone()]),
+            ..ConfigPatch::default()
+        },
+        _ => return None,
     };
-    format!("{} {}", call.name, args)
+    Some((patch, None))
 }

@@ -16,7 +16,7 @@ pub mod clipboard;
 pub mod remote;
 pub mod run;
 pub mod theme;
-pub use run::{run_with, TuiConfig, TuiSinks};
+pub use run::{run_with, RemoteSpec, TuiConfig, TuiSinks};
 pub use theme::Theme;
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
