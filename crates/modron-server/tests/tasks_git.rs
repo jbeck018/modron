@@ -65,6 +65,8 @@ fn server_state(dir: &Path, repo: &Path) -> (Arc<ServerState>, std::sync::Arc<dy
         version: "test".into(),
         working_dir: repo.to_path_buf(),
         tasks: tasks::TaskRegistry::new(),
+        bridge_base: None,
+        rc_keys: std::sync::Mutex::new(HashMap::new()),
     });
     (state, store)
 }

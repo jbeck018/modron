@@ -148,6 +148,17 @@ pub enum Payload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// List automations (answered by `automations`).
+    AutomationsList {},
+    /// Add an automation: a prompt on an interval.
+    AutomationAdd {
+        name: String,
+        prompt: String,
+        interval_minutes: u32,
+    },
+    /// Remove an automation by name. Both mutations answer with the
+    /// refreshed `automations` list.
+    AutomationRemove { name: String },
     /// Open a remote-control tunnel for a session through a relay bridge
     /// (a deployed cloud/bridge worker). `bridge_url` is the relay's
     /// base (scheme + host). Answered by `remote_control_started` with
@@ -155,6 +166,23 @@ pub enum Payload {
     RemoteControl {
         session_id: Uuid,
         bridge_url: String,
+    },
+    /// Publish an assistant answer as a shareable web page. Answered by
+    /// `page_published` with the share URL.
+    PublishPage {
+        session_id: Uuid,
+        title: String,
+        content_md: String,
+    },
+    /// Provider auth status rows (answered by `auth_providers`).
+
+    /// Persist router defaults into the server's config.toml and apply
+    /// them to future sessions. Answered by a correlated `note`.
+    PersistRouter {
+        cheap: String,
+        strong: String,
+        cheap_fallback: Option<String>,
+        strong_fallback: Option<String>,
     },
     /// Liveness check (answered by `pong`).
     Ping {},
@@ -216,6 +244,12 @@ pub enum Payload {
     /// Answer to `remote_control`: the tunnel is up; open `url` (web
     /// viewer) on any device to watch and drive the session.
     RemoteControlStarted { url: String },
+    /// Answer to `automations_list` and both mutations.
+    Automations { rows: Vec<AutomationWire> },
+    /// Answer to `publish_page`: the share URL of the rendered page.
+    PagePublished { url: String },
+    /// Answer to `auth_providers`: one row per registry provider.
+    AuthProviders { rows: Vec<AuthProviderWire> },
     /// A run completed.
     TurnDone { summary: WireRunSummary },
     /// A run errored.
@@ -316,6 +350,26 @@ pub struct TaskFileStat {
     pub path: String,
     pub added: u64,
     pub deleted: u64,
+}
+
+/// One scheduled automation (wire row).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomationWire {
+    pub name: String,
+    pub prompt: String,
+    pub interval_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<String>,
+}
+
+/// One provider row for the onboarding/settings surfaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthProviderWire {
+    pub id: String,
+    pub label: String,
+    /// "api key" | "subscription (oauth)" | "not configured"
+    pub status: String,
+    pub oauth_capable: bool,
 }
 
 /// The live (non-persisted) half of a snapshot: what a fresh attach needs

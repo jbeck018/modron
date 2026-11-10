@@ -84,6 +84,11 @@ pub enum Row {
 /// [`AppState::apply_frame`]; renderers read the projections.
 #[derive(Debug, Default)]
 pub struct AppState {
+    /// Provider auth status rows (onboarding/settings).
+    pub auth_providers: Vec<modron_protocol::AuthProviderWire>,
+    /// Scheduled automations (wire rows).
+    pub automations: Vec<modron_protocol::AutomationWire>,
+    /// Provider auth status rows (onboarding wizard/settings).pub auth_providers: Vec<modron_protocol::AuthProviderWire>,
     pub conn: ConnState,
     pub sessions: Vec<SessionRow>,
     /// The attached session, if any.
@@ -246,7 +251,22 @@ impl AppState {
             // Remote-control registration is TUI-driven this tranche
             // (divergence row in AGENTS.md); the desktop share button
             // lands next.
-            Payload::RemoteControl { .. } | Payload::RemoteControlStarted { .. } => {}
+            Payload::RemoteControl { .. } => {}
+            Payload::RemoteControlStarted { url } => {
+                self.last_note = Some(format!("remote-control live: {url} - open on any device"));
+            }
+            Payload::PagePublished { url } => {
+                self.last_note = Some(format!("published: {url}"));
+            }
+            Payload::AuthProviders { rows } => self.auth_providers = rows.clone(),
+            Payload::Automations { rows } => self.automations = rows.clone(),
+            // Client->server lifecycle frames echo nothing; the GUI drives
+            // these itself via commands.
+            Payload::AutomationsList { .. }
+            | Payload::AutomationAdd { .. }
+            | Payload::AutomationRemove { .. }
+            | Payload::PersistRouter { .. }
+            | Payload::PublishPage { .. } => {}
             Payload::Note { text } => {
                 self.last_note = Some(text.clone());
                 // `new_session`'s correlated reply names the fresh session

@@ -139,7 +139,63 @@ pub async fn run_tunnel(
     Ok(())
 }
 
-/// Register a remote-control tunnel for `session`: validates the session,
+/// The share key minted for a session by /remote-control, if any.
+pub fn share_key_for(state: &ServerState, session: &SessionId) -> Option<String> {
+    state.rc_keys.lock().unwrap().get(session).cloned()
+}
+
+/// Publish an assistant answer as a shareable web page on the bridge.
+/// `key` authenticates the agent; the bridge stores the page and serves
+/// it at /p/<id> with no auth (public share, paradev "pages" grammar).
+pub async fn publish_page(
+    bridge_base: &str,
+    key: &str,
+    session: SessionId,
+    title: &str,
+    content_md: &str,
+) -> Result<String> {
+    let base = bridge_base.trim_end_matches('/');
+    let host = base
+        .strip_prefix("wss://")
+        .or_else(|| base.strip_prefix("ws://"))
+        .or_else(|| base.strip_prefix("https://"))
+        .or_else(|| base.strip_prefix("http://"))
+        .ok_or_else(|| anyhow!("bridge url must start with ws:// or wss://"))?;
+    let http = if base.starts_with("wss://") || base.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "title": title,
+        "session": session.to_string(),
+        "content_md": content_md,
+    });
+    let response = client
+        .post(format!("{http}://{host}/pages/{key}"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"))
+        .body(body.to_string())
+        .send()
+        .await
+        .context("posting the page to the bridge")?;
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "bridge refused the page: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+    let value: serde_json::Value = response.json().await.context("bridge page reply")?;
+    let id = value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("bridge page reply missing id"))?;
+    Ok(format!("{http}://{host}/p/{id}"))
+}
+
+/// Register a remote-control tunnel for `session`:/// Register a remote-control tunnel for `session`: validates the session,
 /// mints the share key, spawns the tunnel task. Returns the open URL.
 pub fn start_remote_control(
     state: &Arc<ServerState>,
@@ -164,6 +220,7 @@ pub fn start_remote_control(
         .ok_or_else(|| anyhow!("no live session {session} - start a task or chat first"))?;
     let key = share_key();
     let (tunnel_url, open_url) = tunnel_urls(bridge_base, &key);
+    state.rc_keys.lock().unwrap().insert(session, key.clone());
     let state = Arc::clone(state);
     let bridge = bridge_base.to_string();
     tokio::spawn(async move {

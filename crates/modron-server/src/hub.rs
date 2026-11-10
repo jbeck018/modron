@@ -590,6 +590,49 @@ impl SessionHub {
 
     /// Install the template engine. Its store must already be the hub's
     /// [`BroadcastingStore`] so every session's appends fan out.
+    /// Apply explicit router defaults (onboarding/settings): rebuild the
+    /// template selector (heuristic over the chosen tiers) and set the
+    /// tier fallbacks. Existing sessions keep their pins.
+    pub fn apply_router_defaults(
+        &self,
+        cheap: &str,
+        cheap_provider: &str,
+        strong: &str,
+        strong_provider: &str,
+        cheap_fallback: Option<&str>,
+        strong_fallback: Option<&str>,
+    ) {
+        use modron_core::TierFallbacks;
+        let Some(mut template) = lock(&self.inner.template).clone() else {
+            return;
+        };
+        template.config.default_model = strong.to_string();
+        template.config.default_provider = strong_provider.to_string();
+        template.selector = Arc::new(modron_router::HeuristicSelector::new(
+            (cheap.to_string(), cheap_provider.to_string()),
+            (strong.to_string(), strong_provider.to_string()),
+        ));
+        let mut cheap_list = vec![(cheap.to_string(), cheap_provider.to_string())];
+        let mut strong_list = vec![(strong.to_string(), strong_provider.to_string())];
+        if let Some(fb) = cheap_fallback {
+            let provider = modron_router::lookup(fb)
+                .map(|i| i.provider.clone())
+                .unwrap_or_else(|| cheap_provider.to_string());
+            cheap_list.push((fb.to_string(), provider));
+        }
+        if let Some(fb) = strong_fallback {
+            let provider = modron_router::lookup(fb)
+                .map(|i| i.provider.clone())
+                .unwrap_or_else(|| strong_provider.to_string());
+            strong_list.push((fb.to_string(), provider));
+        }
+        template.config.tier_fallbacks = Some(Arc::new(TierFallbacks {
+            cheap: cheap_list,
+            strong: strong_list,
+        }));
+        self.set_engine(template);
+    }
+
     pub fn set_engine(&self, engine: Engine) {
         *lock(&self.inner.template) = Some(engine);
     }

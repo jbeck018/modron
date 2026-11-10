@@ -190,6 +190,7 @@ pub async fn spawn_server(script: Vec<TurnResponse>, delay_ms: u64) -> TestServe
             listen: Some("127.0.0.1:0".into()),
             socket: Some(socket_dir.path().join("serve.sock")),
             clients_dir: Some(clients_dir.path().to_path_buf()),
+            bridge_base: None,
         },
     )
     .await

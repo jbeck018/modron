@@ -223,6 +223,27 @@ pub enum Command {
         title: Option<String>,
     },
     DeleteSession(uuid::Uuid),
+    AuthProviders {},
+    PersistRouter {
+        cheap: String,
+        strong: String,
+        cheap_fallback: Option<String>,
+        strong_fallback: Option<String>,
+    },
+    AutomationsList {},
+    AutomationAdd {
+        name: String,
+        prompt: String,
+        interval_minutes: u32,
+    },
+    AutomationRemove {
+        name: String,
+    },
+    PublishPage {
+        session_id: uuid::Uuid,
+        title: String,
+        content_md: String,
+    },
     CreateTask {
         title: String,
         base: Option<String>,
@@ -265,6 +286,38 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
         },
         Command::ListSessions => Payload::ListSessions {},
         Command::DeleteSession(id) => Payload::DeleteSession { session_id: *id },
+        Command::AuthProviders {} => Payload::AuthProviders { rows: Vec::new() },
+        Command::PersistRouter {
+            cheap,
+            strong,
+            cheap_fallback,
+            strong_fallback,
+        } => Payload::PersistRouter {
+            cheap: cheap.clone(),
+            strong: strong.clone(),
+            cheap_fallback: cheap_fallback.clone(),
+            strong_fallback: strong_fallback.clone(),
+        },
+        Command::AutomationsList {} => Payload::AutomationsList {},
+        Command::AutomationAdd {
+            name,
+            prompt,
+            interval_minutes,
+        } => Payload::AutomationAdd {
+            name: name.clone(),
+            prompt: prompt.clone(),
+            interval_minutes: *interval_minutes,
+        },
+        Command::AutomationRemove { name } => Payload::AutomationRemove { name: name.clone() },
+        Command::PublishPage {
+            session_id,
+            title,
+            content_md,
+        } => Payload::PublishPage {
+            session_id: *session_id,
+            title: title.clone(),
+            content_md: content_md.clone(),
+        },
         Command::CreateTask { title, base } => Payload::CreateTask {
             title: title.clone(),
             base: base.clone(),

@@ -6,6 +6,7 @@
 //! accept loops. [`run_serve`] is the foreground command: pid file,
 //! startup line, ctrl+c, cleanup.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,9 @@ pub struct ServeOptions {
     pub socket: Option<PathBuf>,
     /// Device-token directory; `None` = `~/.modron/clients`.
     pub clients_dir: Option<PathBuf>,
+    /// Remote-control bridge base (scheme + host) used by /publish; the
+    /// `/remote-control` command takes its own URL.
+    pub bridge_base: Option<String>,
 }
 
 /// The addresses a server actually bound (returned by [`bind_server`]).
@@ -86,6 +90,8 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
         version: env!("CARGO_PKG_VERSION").to_string(),
         working_dir,
         tasks: crate::tasks::TaskRegistry::new(),
+        bridge_base: options.bridge_base.clone(),
+        rc_keys: std::sync::Mutex::new(HashMap::new()),
     });
 
     let mut tasks = Vec::new();

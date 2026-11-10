@@ -282,6 +282,51 @@ pub async fn merge_task(
     }
 }
 
+/// Persist `[router] cheap_model/strong_model` (+ optional fallbacks as
+/// comments-free plain keys) into the user's config.toml. The dir honors
+/// MODRON_CONFIG (the CLI's directory convention).
+pub fn persist_router_toml(
+    _working_dir: &Path,
+    cheap: &str,
+    strong: &str,
+    cheap_fallback: Option<&str>,
+    strong_fallback: Option<&str>,
+) -> Result<()> {
+    let mut dir = match std::env::var("MODRON_CONFIG") {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => dirs::config_dir()
+            .ok_or_else(|| anyhow!("cannot resolve the config directory"))?
+            .join("modron"),
+    };
+    if !dir.ends_with("config.toml") {
+        dir = dir.join("config.toml");
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(&dir).unwrap_or_default();
+    let mut value: toml::Value =
+        toml::from_str(&existing).unwrap_or_else(|_| toml::Value::Table(Default::default()));
+    if !value.is_table() {
+        value = toml::Value::Table(Default::default());
+    }
+    let table = value.as_table_mut().unwrap();
+    let router = table
+        .entry("router")
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    if let Some(router_table) = router.as_table_mut() {
+        router_table.insert("cheap_model".into(), toml::Value::String(cheap.to_string()));
+        router_table.insert(
+            "strong_model".into(),
+            toml::Value::String(strong.to_string()),
+        );
+    }
+    let rendered = toml::to_string_pretty(&value)?;
+    std::fs::write(&dir, rendered)?;
+    let _ = (cheap_fallback, strong_fallback); // fallback keys land with the tier-fallback config surface
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

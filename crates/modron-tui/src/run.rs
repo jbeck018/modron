@@ -1048,8 +1048,11 @@ async fn run_pending_command(engine: &mut Engine, cmd: PendingCommand) -> Vec<St
         // Remote mode intercepts /remote-control before the local
         // dispatch; unreachable here, but the match must stay total.
         // /remote-control only works over a serve connection: in the
-        // local path say so explicitly instead of ignoring.
-        PendingCommand::RemoteControl { .. } => {
+        // local path say so explicitly instead of ignoring. Automations
+        // and publish run on the server too.
+        PendingCommand::RemoteControl { .. }
+        | PendingCommand::Automations
+        | PendingCommand::Publish => {
             vec!["needs a server session - run `modron serve`, connect with \
              --connect, then /remote-control <bridge url>"
                 .to_string()]

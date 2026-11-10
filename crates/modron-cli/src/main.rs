@@ -127,6 +127,9 @@ enum Command {
         /// paired device token (`modron pair`).
         #[arg(long, default_value = "127.0.0.1:7699")]
         listen: String,
+        /// Remote-control bridge base (wss://host) used by /publish.
+        #[arg(long)]
+        bridge: Option<String>,
     },
     /// Manage paired remote devices (Phase 3): mint, list, revoke the
     /// bearer tokens remote clients send in their hello frame.
@@ -540,13 +543,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // `modron serve` — the remote-control session server (Phase 2). Built
     // exactly like `daemon start`: same agent path, long-lived process.
-    if let Some(Command::Serve { listen }) = &cli.command {
+    if let Some(Command::Serve { listen, bridge }) = &cli.command {
         let mcp = spawn_mcp_servers(&cfg).await?;
         let agent = build_agent_with(&cli, &cfg, false, AgentSinks::for_mode(false, false), &mcp)?;
         return modron_server::run_serve(
             agent.engine,
             &modron_server::ServeOptions {
                 listen: Some(listen.clone()),
+                bridge_base: bridge.clone(),
                 ..modron_server::ServeOptions::default()
             },
         )

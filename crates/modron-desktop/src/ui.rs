@@ -16,6 +16,7 @@
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::component::Icon;
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -168,6 +169,8 @@ pub struct DesktopApp {
     /// `--resume` waiting for the first Sessions frame (then attaches the
     /// named session, or the newest).
     pending_resume: Option<Option<uuid::Uuid>>,
+    /// 16ms animation tick (drives the running-session shimmer).
+    anim_tick: u64,
     /// Weak self for callbacks that render-time elements carry (the
     /// composer's paste interception).
     weak_self: gpui_kit::WeakEntity<DesktopApp>,
@@ -181,6 +184,17 @@ pub struct DesktopApp {
     >,
     /// A session row the user marked for deletion (two-step confirm).
     confirm_delete: Option<uuid::Uuid>,
+    /// Settings overlay open (gear in the footer).
+    settings_open: bool,
+    /// Automations add-form fields (name/prompt/interval).
+    auto_name: Entity<InputState>,
+    auto_prompt: Entity<InputState>,
+    auto_interval: Entity<InputState>,
+    /// Onboarding wizard step (0 = providers, 1 = model wiring).
+    onboarding_step: Option<usize>,
+    onboarding_cheap: Entity<InputState>,
+    onboarding_strong: Entity<InputState>,
+    onboarding_strong_fb: Entity<InputState>,
     /// The "New task" inline form (Conductor/Para grammar: a task spawns
     /// an agent in its own worktree + branch).
     new_task_open: bool,
@@ -277,18 +291,35 @@ impl DesktopApp {
             window_handle: None,
             form_inputs: Default::default(),
             confirm_delete: None,
+            anim_tick: 0,
+            settings_open: false,
             new_task_open: false,
+            auto_name: cx.new(|cx| InputState::new(window, cx).placeholder("name")),
+            auto_prompt: cx
+                .new(|cx| InputState::new(window, cx).placeholder("prompt to run on schedule")),
+            auto_interval: cx
+                .new(|cx| InputState::new(window, cx).placeholder("interval (minutes)")),
+            onboarding_step: None,
+            onboarding_cheap: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("cheap model (e.g. gpt-5.6-terra)")
+            }),
+            onboarding_strong: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("strong model (e.g. gpt-6-astra)")
+            }),
+            onboarding_strong_fb: cx
+                .new(|cx| InputState::new(window, cx).placeholder("strong fallback (optional)")),
+            review_open: None,
             new_task_title: cx
                 .new(|cx| InputState::new(window, cx).placeholder("what should the agent do?")),
             new_task_base: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("base branch (default: current)")
             }),
-            review_open: None,
             review_files: Vec::new(),
             review_branch: String::new(),
         };
         // Typewriter streaming: advance the visible cursor a few chars per
         // tick so chunk-granular deltas read like a per-character stream.
+        // The same tick drives the sidebar shimmer on running tasks.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(16))
@@ -643,6 +674,81 @@ impl DesktopApp {
         }
     }
 
+    // -- settings / automations / onboarding -------------------------------
+
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            // Providers + automations refresh on open.
+            self.send(Command::AuthProviders {});
+            self.send(Command::AutomationsList {});
+        }
+        self.refresh(cx);
+    }
+
+    fn add_automation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.auto_name.read(cx).value().trim().to_string();
+        let prompt = self.auto_prompt.read(cx).value().trim().to_string();
+        let interval = self.auto_interval.read(cx).value().trim().to_string();
+        let Ok(minutes) = interval.parse::<u32>() else {
+            self.state.last_note = Some("interval must be a number of minutes".into());
+            self.refresh(cx);
+            return;
+        };
+        if name.is_empty() || prompt.is_empty() || minutes == 0 {
+            self.state.last_note = Some("name, prompt and interval are required".into());
+            self.refresh(cx);
+            return;
+        }
+        self.auto_name
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.auto_prompt
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.auto_interval
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.send(Command::AutomationAdd {
+            name,
+            prompt,
+            interval_minutes: minutes,
+        });
+        self.refresh(cx);
+    }
+
+    fn remove_automation(&mut self, name: String, cx: &mut Context<Self>) {
+        self.send(Command::AutomationRemove { name });
+        self.refresh(cx);
+    }
+
+    fn open_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.onboarding_step = Some(0);
+        self.settings_open = false;
+        self.send(Command::AuthProviders {});
+        self.refresh(cx);
+    }
+
+    fn onboarding_next(&mut self, cx: &mut Context<Self>) {
+        match self.onboarding_step {
+            Some(0) => {
+                self.onboarding_step = Some(1);
+            }
+            Some(1) => {
+                let cheap = self.onboarding_cheap.read(cx).value().trim().to_string();
+                let strong = self.onboarding_strong.read(cx).value().trim().to_string();
+                if !cheap.is_empty() && !strong.is_empty() {
+                    self.send(Command::PersistRouter {
+                        cheap,
+                        strong,
+                        cheap_fallback: None,
+                        strong_fallback: None,
+                    });
+                }
+                self.onboarding_step = None;
+            }
+            _ => self.onboarding_step = None,
+        }
+        self.refresh(cx);
+    }
+
     // -- worktree tasks ----------------------------------------------------
 
     fn create_task(&mut self, cx: &mut Context<Self>) {
@@ -825,6 +931,13 @@ impl DesktopApp {
         }
     }
 
+    /// Whether this sidebar row is actively working (task running or the
+    /// attached session's run in flight).
+    fn row_running(&self, session: &crate::app_state::SessionRow, id: uuid::Uuid) -> bool {
+        session.task_state.as_deref() == Some("running")
+            || (self.state.attached == Some(id) && self.state.running)
+    }
+
     fn render_sidebar(&self, entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let query = self.session_filter_query.to_ascii_lowercase();
@@ -917,6 +1030,7 @@ impl DesktopApp {
             shown += 1;
             let id = session.id;
             let attached = self.state.attached == Some(id);
+            let running = self.row_running(session, id) || (attached && self.state.running);
             let title: SharedString = session.title.clone().into();
             let meta: SharedString = Self::relative_time(&session.updated_at).into();
             let entity = entity.clone();
@@ -950,8 +1064,43 @@ impl DesktopApp {
                         .whitespace_nowrap()
                         .child(title),
                 )
+                .children(if running {
+                    // Shimmer sweep: a short accent segment slides along the
+                    // bottom edge while the task runs (16ms tick).
+                    let sweep = ((self.anim_tick as f32) * 0.02).fract();
+                    vec![div()
+                        .flex_1()
+                        .min_w_0()
+                        .relative()
+                        .h(px(2.))
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left(gpui_kit::relative((sweep * 90.0).clamp(0.0, 90.0)))
+                                .w(px(24.))
+                                .h(px(2.))
+                                .rounded_sm()
+                                .bg(theme.accent),
+                        )
+                        .into_any_element()]
+                } else {
+                    Vec::new()
+                })
                 .children({
                     let mut trailing: Vec<gpui_kit::AnyElement> = Vec::new();
+                    let running = self.row_running(session, id) || (attached && self.state.running);
+                    if running {
+                        // Working: rotating loader next to the title.
+                        let spin = (self.anim_tick as f32) * 9.0;
+                        trailing.push(
+                            gpui_kit::component::Icon::default()
+                                .path("icons/loader-circle.svg")
+                                .text_color(theme.accent)
+                                .rotate(gpui_kit::radians(spin))
+                                .into_any_element(),
+                        );
+                    }
                     if self.confirm_delete == Some(id) {
                         let entity_yes = entity.clone();
                         let entity_no = entity.clone();
@@ -1002,21 +1151,27 @@ impl DesktopApp {
                                     .into_any_element(),
                             );
                         }
+                        // Hover-only: opacity 0 until the row is hovered.
                         trailing.push(
-                            Button::new(("del", ix))
-                                .label("x")
-                                .ghost()
-                                .xsmall()
-                                .on_click(move |_event: &ClickEvent, _w, cx: &mut App| {
-                                    // The x sits inside the clickable row:
-                                    // stop propagation so the attach
-                                    // handler does not fire too.
-                                    cx.stop_propagation();
-                                    entity_del.update(cx, |this, cx| {
-                                        this.confirm_delete = Some(id);
-                                        this.refresh(cx);
-                                    });
-                                })
+                            div()
+                                .opacity(0.)
+                                .group_hover("session-row", |style| style.opacity(1.))
+                                .child(
+                                    Button::new(("del", ix))
+                                        .icon(Icon::default().path("icons/trash.svg").size_4())
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(move |_event: &ClickEvent, _w, cx: &mut App| {
+                                            // The x sits inside the clickable row:
+                                            // stop propagation so the attach
+                                            // handler does not fire too.
+                                            cx.stop_propagation();
+                                            entity_del.update(cx, |this, cx| {
+                                                this.confirm_delete = Some(id);
+                                                this.refresh(cx);
+                                            });
+                                        }),
+                                )
                                 .into_any_element(),
                         );
                     }
@@ -1069,6 +1224,16 @@ impl DesktopApp {
                     .text_color(theme.foreground)
                     .child(SharedString::from("Jacob Beck")),
             )
+            .child({
+                let entity = entity.clone();
+                Button::new("settings-gear")
+                    .icon(Icon::default().path("icons/settings.svg").size_4())
+                    .ghost()
+                    .small()
+                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                        entity.update(cx, |this, cx| this.toggle_settings(cx));
+                    })
+            })
             .child(
                 Button::new("theme-toggle")
                     .label(
@@ -1151,17 +1316,12 @@ impl DesktopApp {
         match row {
             Row::Entry(TranscriptEntry::Task { text })
             | Row::Entry(TranscriptEntry::User { text }) => user_bubble(text),
-            Row::Entry(TranscriptEntry::Assistant { text }) => {
-                let label: SharedString = text.clone().into();
-                div()
-                    .id(("transcript-row", ix))
-                    .px_4()
-                    .py_1()
-                    .text_size(px(13.5))
-                    .text_color(theme.foreground)
-                    .child(label)
-                    .into_any_element()
-            }
+            Row::Entry(TranscriptEntry::Assistant { text }) => div()
+                .id(("transcript-row", ix))
+                .px_4()
+                .py_1()
+                .child(crate::markdown::render_markdown(text, theme))
+                .into_any_element(),
             Row::Entry(TranscriptEntry::ToolSummary { line, events }) => {
                 let label: SharedString = line.clone().into();
                 let panel: Vec<String> = events.iter().map(|event| event.summary()).collect();
@@ -1920,6 +2080,250 @@ impl DesktopApp {
         Some(panel.into_any_element())
     }
 
+    /// Settings overlay: model chip, approval mode, reasoning, theme,
+    /// automations CRUD, onboarding entry. Every control drives the same
+    /// protocol commands as the chat surface (parity: the /command set).
+    fn render_settings(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants};
+        use gpui_kit::component::input::Input;
+        let theme = cx.theme();
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .bg(gpui_kit::black())
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _e, _w, cx| {
+                    this.settings_open = false;
+                    this.refresh(cx);
+                }),
+            );
+        let mut panel = div()
+            .id("settings-panel")
+            .w(px(560.))
+            .max_h(px(600.))
+            .overflow_y_scroll()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(15.))
+                            .text_color(theme.foreground)
+                            .child(SharedString::from("settings")),
+                    )
+                    .child(
+                        Button::new("settings-close")
+                            .label("close")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.settings_open = false;
+                                this.refresh(cx);
+                            })),
+                    ),
+            )
+            // Approval mode.
+            .child(
+                div().flex().flex_row().gap_2().child(
+                    Button::new("settings-mode")
+                        .label(format!("mode: {}", self.state.approval_mode))
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            let next = match this.state.approval_mode.as_str() {
+                                "ask" => "yolo",
+                                "yolo" => "deny",
+                                _ => "ask",
+                            };
+                            this.state.approval_mode = next.into();
+                            this.send(Command::SetConfig(modron_protocol::ConfigPatch {
+                                approval_mode: Some(match next {
+                                    "yolo" => modron_protocol::ApprovalModeWire::ApproveAll,
+                                    "deny" => modron_protocol::ApprovalModeWire::Deny,
+                                    _ => modron_protocol::ApprovalModeWire::Ask,
+                                }),
+                                ..Default::default()
+                            }));
+                            this.refresh(cx);
+                        })),
+                ),
+            );
+
+        // Automations section.
+        let mut autos = div().flex().flex_col().gap_1().child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from("scheduled automations")),
+        );
+        for auto in &self.state.automations {
+            let label: SharedString =
+                format!("{} - every {}m", auto.name, auto.interval_minutes).into();
+            let name = auto.name.clone();
+            autos = autos.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().text_size(px(12.5)).child(label))
+                    .child(
+                        Button::new("auto-remove")
+                            .label("remove")
+                            .danger()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.remove_automation(name.clone(), cx);
+                            })),
+                    ),
+            );
+        }
+        autos = autos
+            .child(div().flex().flex_row().gap_1().children([
+                Input::new(&self.auto_name).id("auto-name"),
+                Input::new(&self.auto_prompt).id("auto-prompt"),
+                Input::new(&self.auto_interval).id("auto-interval"),
+            ]))
+            .child(
+                div().flex().flex_row().justify_end().child(
+                    Button::new("auto-add")
+                        .label("add automation")
+                        .small()
+                        .on_click(cx.listener(|this, _e, window, cx| {
+                            this.add_automation(window, cx);
+                        })),
+                ),
+            );
+        panel = panel.child(autos);
+
+        // Onboarding entry.
+        panel = panel.child(
+            div().flex().flex_row().justify_end().child(
+                Button::new("onboarding")
+                    .label("run setup wizard")
+                    .small()
+                    .on_click(cx.listener(|this, _e, _w, cx| this.open_onboarding(cx))),
+            ),
+        );
+
+        backdrop
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_full()
+                    .child(panel),
+            )
+            .into_any_element()
+    }
+
+    /// Onboarding wizard overlay: step 0 = provider auth status (re-checks
+    /// on open), step 1 = cheap/strong model wiring persisted server-side.
+    fn render_onboarding(&self, step: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants};
+        use gpui_kit::component::input::Input;
+        let theme = cx.theme();
+        let overlay = div()
+            .absolute()
+            .inset_0()
+            .bg(gpui_kit::black())
+            .flex()
+            .items_center()
+            .justify_center();
+        let mut panel = div()
+            .w(px(560.))
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .text_color(theme.foreground)
+                    .child(SharedString::from(format!("setup wizard ({}/2)", step + 1))),
+            );
+
+        match step {
+            0 => {
+                panel = panel.child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(
+                            "sign in to providers (browser opens on the server machine)",
+                        )),
+                );
+                for row in &self.state.auth_providers {
+                    let label: SharedString = format!("{} - {}", row.label, row.status).into();
+                    panel = panel.child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(if row.status == "not configured" {
+                                theme.warning
+                            } else {
+                                theme.success
+                            })
+                            .child(label),
+                    );
+                }
+                panel = panel.child(
+                    div().flex().flex_row().justify_end().child(
+                        Button::new("ob-next")
+                            .label("next: model wiring")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _e, _w, _cx| {
+                                this.send(Command::AuthProviders {});
+                            })),
+                    ),
+                );
+            }
+            _ => {
+                panel = panel.child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(
+                            "wire the tiers (persisted in the server config)",
+                        )),
+                );
+                panel = panel.child(div().child(Input::new(&self.onboarding_cheap)));
+                panel = panel.child(div().child(Input::new(&self.onboarding_strong)));
+                panel = panel.child(div().child(Input::new(&self.onboarding_strong_fb)));
+                panel = panel.child(
+                    div().flex().flex_row().justify_end().gap_1().child(
+                        Button::new("ob-save")
+                            .label("save")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.onboarding_next(cx);
+                            })),
+                    ),
+                );
+            }
+        }
+
+        overlay.child(panel).into_any_element()
+    }
+
     fn render_status_bar(&self, _entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let status: SharedString = self.state.status_line().into();
@@ -2104,6 +2508,12 @@ impl Render for DesktopApp {
             .child(status);
         if self.picker_open {
             root = root.child(self.render_picker(&entity, cx));
+        }
+        if self.settings_open {
+            root = root.child(self.render_settings(cx));
+        }
+        if let Some(step) = self.onboarding_step {
+            root = root.child(self.render_onboarding(step, cx));
         }
         root
     }

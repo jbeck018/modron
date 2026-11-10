@@ -7,6 +7,7 @@
 
 pub mod app_state;
 pub mod demo;
+pub mod markdown;
 pub mod ui;
 pub mod wire;
 

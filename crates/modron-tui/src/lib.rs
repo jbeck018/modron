@@ -91,6 +91,10 @@ pub enum SlashCommand {
     RemoteControl {
         url: String,
     },
+    /// /automations: list scheduled prompts (settings UI on desktop).
+    Automations,
+    /// /publish: publish the last assistant answer as a shareable page.
+    Publish,
     /// Plan-first mode: submit a task constrained to planning.
     Plan(String),
     /// Review the working diff.
@@ -166,6 +170,10 @@ pub enum PendingCommand {
     RemoteControl {
         url: String,
     },
+    /// /automations: list scheduled prompts (settings UI on desktop).
+    Automations,
+    /// /publish: publish the last assistant answer as a shareable page.
+    Publish,
 }
 
 impl SlashCommand {
@@ -238,6 +246,8 @@ impl SlashCommand {
             "issues" => SlashCommand::Issues(arg),
             "fork" => SlashCommand::Fork,
             "remote-control" | "rc" => SlashCommand::RemoteControl { url: arg },
+            "automations" => SlashCommand::Automations,
+            "publish" => SlashCommand::Publish,
             "plan" => SlashCommand::Plan(arg),
             "code-review" | "review" => SlashCommand::CodeReview,
             "goal" => SlashCommand::Goal(arg),
@@ -2507,6 +2517,14 @@ impl App {
             }
             SlashCommand::RemoteControl { url } => {
                 self.pending_command = Some(PendingCommand::RemoteControl { url });
+                Action::None
+            }
+            SlashCommand::Automations => {
+                self.pending_command = Some(PendingCommand::Automations);
+                Action::None
+            }
+            SlashCommand::Publish => {
+                self.pending_command = Some(PendingCommand::Publish);
                 Action::None
             }
             SlashCommand::Plan(task) => {

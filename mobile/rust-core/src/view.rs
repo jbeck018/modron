@@ -103,9 +103,9 @@ pub fn entry_lines(entry: &TranscriptEntry) -> Vec<String> {
             summary,
             summarized_events,
         } => vec![format!("compacted {summarized_events} events: {summary}")],
+        TranscriptEntry::GenerativeUi { ui } => modron_view::render_ascii(ui),
         // Generative widgets render as ASCII on text surfaces (same
         // projection the TUI uses).
-        TranscriptEntry::GenerativeUi { ui } => modron_view::render_ascii(ui),
     }
 }
 

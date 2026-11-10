@@ -10,6 +10,7 @@
 //! duplicates (events both in the log and buffered) are dropped client-side
 //! by `seq`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -34,6 +35,11 @@ pub struct ServerState {
     pub working_dir: PathBuf,
     /// Worktree-task registry: session id -> task record.
     pub tasks: crate::tasks::TaskRegistry,
+    /// Configured remote-control bridge base (scheme + host), if any.
+    pub bridge_base: Option<String>,
+    /// Session -> share key (minted by /remote-control; used to auth
+    /// page publishes).
+    pub rc_keys: std::sync::Mutex<HashMap<SessionId, String>>,
 }
 
 /// The live frames of one subscription: the broadcast->buffer forwarder
@@ -274,6 +280,81 @@ pub async fn handle_frame(
                         Payload::RemoteControlStarted { url },
                     ),
                 ),
+                Err(e) => send(ctx, error(request_id, e.to_string())),
+            }
+        }
+        Payload::AuthProviders { .. } => {
+            use modron_core::auth::{oauth_capable, oauth_signed_in, provider_registry};
+            let rows = provider_registry()
+                .iter()
+                .map(|info| {
+                    let status = if oauth_signed_in(info.provider_id) {
+                        "subscription (oauth)".to_string()
+                    } else if std::env::var(info.env_var).is_ok() {
+                        "api key".to_string()
+                    } else {
+                        "not configured".to_string()
+                    };
+                    modron_protocol::AuthProviderWire {
+                        id: info.provider_id.to_string(),
+                        label: info.name.to_string(),
+                        status,
+                        oauth_capable: oauth_capable(info.provider_id),
+                    }
+                })
+                .collect();
+            send(
+                ctx,
+                reply(request_id, None, Payload::AuthProviders { rows }),
+            );
+        }
+        Payload::PersistRouter {
+            cheap,
+            strong,
+            cheap_fallback,
+            strong_fallback,
+        } => {
+            let cheap_provider = modron_router::lookup(&cheap)
+                .map(|i| i.provider.clone())
+                .unwrap_or_default();
+            let strong_provider = modron_router::lookup(&strong)
+                .map(|i| i.provider.clone())
+                .unwrap_or_default();
+            let result = (|| -> anyhow::Result<()> {
+                crate::tasks::persist_router_toml(
+                    &state.working_dir,
+                    &cheap,
+                    &strong,
+                    cheap_fallback.as_deref(),
+                    strong_fallback.as_deref(),
+                )?;
+                state.hub.apply_router_defaults(
+                    &cheap,
+                    &cheap_provider,
+                    &strong,
+                    &strong_provider,
+                    cheap_fallback.as_deref(),
+                    strong_fallback.as_deref(),
+                );
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    send(
+                        ctx,
+                        reply(
+                            request_id,
+                            None,
+                            Payload::Note {
+                                text: format!(
+                                "router defaults saved: cheap {cheap} ({}), strong {strong} ({})",
+                                if cheap_provider.is_empty() { "?" } else { &cheap_provider },
+                                if strong_provider.is_empty() { "?" } else { &strong_provider }
+                            ),
+                            },
+                        ),
+                    )
+                }
                 Err(e) => send(ctx, error(request_id, e.to_string())),
             }
         }
@@ -664,10 +745,18 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::NewSession { .. } => "new_session",
         Payload::ListSessions {} => "list_sessions",
         Payload::DeleteSession { .. } => "delete_session",
+        Payload::AuthProviders { .. } => "auth_providers",
+        Payload::PersistRouter { .. } => "persist_router",
         Payload::CreateTask { .. } => "create_task",
         Payload::GetTaskStatus { .. } => "get_task_status",
         Payload::RemoteControl { .. } => "remote_control",
         Payload::RemoteControlStarted { .. } => "remote_control_started",
+        Payload::AutomationsList { .. } => "automations_list",
+        Payload::AutomationAdd { .. } => "automation_add",
+        Payload::AutomationRemove { .. } => "automation_remove",
+        Payload::Automations { .. } => "automations",
+        Payload::PublishPage { .. } => "publish_page",
+        Payload::PagePublished { .. } => "page_published",
         Payload::MergeTask { .. } => "merge_task",
         Payload::TaskCreated { .. } => "task_created",
         Payload::TaskStatus { .. } => "task_status",
