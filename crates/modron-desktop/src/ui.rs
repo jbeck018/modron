@@ -125,6 +125,10 @@ pub struct DesktopApp {
     list_state: ListState,
     composer: Entity<InputState>,
     filter: Entity<InputState>,
+    /// The sidebar's type-to-filter input (sessions only; the model
+    /// picker has its own).
+    session_filter: Entity<InputState>,
+    session_filter_query: String,
     /// The picker filter text, mirrored here on every refresh so the
     /// render pass can filter without touching the input entity.
     filter_query: String,
@@ -151,6 +155,8 @@ impl DesktopApp {
         let composer =
             cx.new(|cx| InputState::new(window, cx).placeholder("Type a task; enter to send"));
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("type to filter"));
+        let session_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("filter sessions"));
 
         // Enter in the composer submits.
         cx.subscribe_in(
@@ -199,6 +205,8 @@ impl DesktopApp {
             list_state: ListState::new(0, ListAlignment::Bottom, px(256.)),
             composer,
             filter,
+            session_filter,
+            session_filter_query: String::new(),
             filter_query: String::new(),
             picker_open: false,
             picker_selected: 0,
@@ -215,6 +223,7 @@ impl DesktopApp {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.display = self.state.rows();
         self.filter_query = self.filter.read(cx).value().to_string();
+        self.session_filter_query = self.session_filter.read(cx).value().to_string();
         self.list_state.reset(self.display.len());
         cx.notify();
     }
@@ -387,29 +396,59 @@ impl DesktopApp {
             .id("sidebar")
             .flex()
             .flex_col()
-            .w(px(260.))
+            .w(px(264.))
             .h_full()
             .flex_shrink_0()
             .overflow_y_scroll()
             .border_r_1()
             .border_color(theme.border)
             .bg(theme.muted)
+            // New chat: the primary action of the surface (ChatGPT/Claude
+            // pattern) - creates a server-side shell and adopts it.
             .child(
                 div()
                     .px_3()
-                    .py_2()
-                    .text_size(px(12.))
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from("sessions")),
+                    .pt_3()
+                    .pb_2()
+                    .child({
+                        let entity = entity.clone();
+                        Button::new("new-chat")
+                            .label("New chat")
+                            .primary()
+                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                entity.update(cx, |this, _cx| {
+                                    this.send(Command::NewSession { title: None });
+                                    // Refresh the list once the server notes
+                                    // the new session (the correlated Note
+                                    // adopts it).
+                                    this.send(Command::ListSessions);
+                                });
+                            })
+                    }),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .child(Input::new(&self.session_filter).id("session-filter")),
             );
+
+        let query = self.session_filter_query.to_ascii_lowercase();
+        let mut shown = 0usize;
         for (ix, session) in self.state.sessions.iter().enumerate() {
+            if !query.is_empty()
+                && !session.title.to_ascii_lowercase().contains(&query)
+            {
+                continue;
+            }
+            shown += 1;
             let id = session.id;
             let attached = self.state.attached == Some(id);
             let title: SharedString = session.title.clone().into();
             let meta: SharedString = format!(
-                "{} messages · session {}",
+                "{} msg · {}",
                 session.message_count,
-                &id.to_string()[..8]
+                Self::relative_time(&session.updated_at),
             )
             .into();
             let entity = entity.clone();
@@ -417,9 +456,10 @@ impl DesktopApp {
                 .id(("session", ix))
                 .px_3()
                 .py_2()
+                .border_l_2()
                 .cursor_pointer()
                 .when(attached, |row| {
-                    row.bg(theme.secondary).text_color(theme.accent_foreground)
+                    row.border_color(theme.accent).bg(theme.secondary)
                 })
                 .hover(|row| row.bg(theme.secondary))
                 .on_click(move |_event: &ClickEvent, _window, cx| {
@@ -439,94 +479,313 @@ impl DesktopApp {
                 );
             sidebar = sidebar.child(row);
         }
+        if shown == 0 {
+            sidebar = sidebar.child(
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(if query.is_empty() {
+                        "no sessions yet - type a task to start one"
+                    } else {
+                        "no sessions match the filter"
+                    })),
+            );
+        }
         sidebar.into_any_element()
     }
 
+    /// `2026-11-10T09:00:00Z` -> "now" / "5m" / "2h" / "3d" / the date.
+    fn relative_time(rfc3339: &str) -> String {
+        let Ok(updated) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+            return String::new();
+        };
+        let secs = (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_seconds();
+        match secs {
+            s if s < 0 => "now".into(),
+            s if s < 60 => "now".into(),
+            s if s < 3600 => format!("{}m", s / 60),
+            s if s < 86_400 => format!("{}h", s / 3600),
+            s if s < 7 * 86_400 => format!("{}d", s / 86_400),
+            _ => updated.format("%b %-d").to_string(),
+        }
+    }
+
     /// One transcript row as an element (called from the list's
-    /// render_item; all data is read from the cached `display`).
+    /// render_item; all data is read from the cached `display`). Layout
+    /// follows the chat-app grammar: the user's task is a right-aligned
+    /// accent-tinted bubble, the assistant speaks full-width plain text,
+    /// tool summaries are collapsed chips, and routing/compaction notes
+    /// are centered divider chips (per-turn usage lives in the status
+    /// bar - see AppState::rows).
     fn transcript_row(row: &Row, ix: usize, entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
-        let mut text_el = div()
-            .id(("transcript-row", ix))
-            .px_4()
-            .py_1()
-            .text_size(px(13.));
+
+        // Right-aligned user bubble.
+        let user_bubble = |text: &str| {
+            let label: SharedString = text.into();
+            div()
+                .id(("transcript-row", ix))
+                .flex()
+                .flex_row()
+                .justify_end()
+                .px_4()
+                .py_0p5()
+                .child(
+                    div()
+                        .max_w(px(520.))
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(theme.secondary)
+                        .text_size(px(13.))
+                        .text_color(theme.foreground)
+                        .child(label),
+                )
+                .into_any_element()
+        };
 
         match row {
             Row::Entry(TranscriptEntry::Task { text })
-            | Row::Entry(TranscriptEntry::User { text }) => {
-                let label: SharedString = format!("❯ {text}").into();
-                text_el = text_el.text_color(theme.accent).child(label);
-            }
+            | Row::Entry(TranscriptEntry::User { text }) => user_bubble(text),
             Row::Entry(TranscriptEntry::Assistant { text }) => {
                 let label: SharedString = text.clone().into();
-                text_el = text_el.text_color(theme.foreground).child(label);
+                div()
+                    .id(("transcript-row", ix))
+                    .px_4()
+                    .py_1()
+                    .text_size(px(13.5))
+                    .text_color(theme.foreground)
+                    .child(label)
+                    .into_any_element()
             }
             Row::Entry(TranscriptEntry::ToolSummary { line, events }) => {
                 let label: SharedString = line.clone().into();
-                let hint: SharedString = "click to expand".into();
                 let panel: Vec<String> = events.iter().map(|event| event.summary()).collect();
                 let entity = entity.clone();
-                text_el = text_el.text_color(theme.accent).child(
-                    div()
-                        .id(("tool-summary", ix))
-                        .cursor_pointer()
-                        .hover(|row| row.text_color(theme.accent_foreground))
-                        .on_click(move |_event: &ClickEvent, _window, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.open_tool_panel(Some(panel.clone()), cx);
-                            });
-                        })
-                        .child(label)
-                        .child(
-                            div()
-                                .ml_2()
-                                .text_size(px(11.))
-                                .text_color(theme.muted_foreground)
-                                .child(hint),
-                        ),
-                );
+                div()
+                    .id(("transcript-row", ix))
+                    .px_4()
+                    .py_0p5()
+                    .child(
+                        div()
+                            .id(("tool-summary", ix))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.muted)
+                            .cursor_pointer()
+                            .hover(|row| row.border_color(theme.accent))
+                            .on_click(move |_event: &ClickEvent, _window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.open_tool_panel(Some(panel.clone()), cx);
+                                });
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(SharedString::from("expand")),
+                            ),
+                    )
+                    .into_any_element()
             }
             Row::Entry(TranscriptEntry::Swarm { lines }) => {
-                text_el = text_el.text_color(theme.muted_foreground);
+                let mut card = div()
+                    .id(("transcript-row", ix))
+                    .mx_4()
+                    .my_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.muted)
+                    .flex()
+                    .flex_col()
+                    .gap_0p5();
                 for line in lines {
                     let label: SharedString = line.clone().into();
-                    text_el = text_el.child(label);
+                    card = card.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    );
                 }
+                card.into_any_element()
             }
-            Row::Entry(TranscriptEntry::Model { model, reason }) => {
-                let label: SharedString = format!("model: {model} — {reason}").into();
-                text_el = text_el.text_color(theme.muted_foreground).child(label);
-            }
-            Row::Entry(TranscriptEntry::Usage { model, usage }) => {
-                let label: SharedString = format!("  {} tok · {model}", usage.total()).into();
-                text_el = text_el.text_color(theme.muted_foreground).child(label);
-            }
-            Row::Entry(TranscriptEntry::Compaction {
-                summary,
-                summarized_events,
-            }) => {
-                let label: SharedString =
-                    format!("{summary} ({summarized_events} events summarized)").into();
-                text_el = text_el.text_color(theme.muted_foreground).child(label);
+            // Routing/compaction notes: a centered hairline chip.
+            Row::Divider { text } => {
+                let label: SharedString = text.clone().into();
+                div()
+                    .id(("transcript-row", ix))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1()
+                    .child(
+                        div().flex_1().h(px(1.)).bg(theme.border),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    )
+                    .child(div().flex_1().h(px(1.)).bg(theme.border))
+                    .into_any_element()
             }
             Row::Streaming { text } => {
-                let label: SharedString = format!("{text} ▍").into();
-                text_el = text_el.text_color(theme.accent).child(label);
+                let label: SharedString = format!("{text} \u{258d}").into();
+                div()
+                    .id(("transcript-row", ix))
+                    .px_4()
+                    .py_1()
+                    .text_size(px(13.5))
+                    .text_color(theme.foreground)
+                    .child(label)
+                    .into_any_element()
             }
             Row::Reasoning { text } => {
                 let label: SharedString = text.clone().into();
-                text_el = text_el
+                div()
+                    .id(("transcript-row", ix))
+                    .px_4()
+                    .py_1()
+                    .text_size(px(12.5))
                     .text_color(theme.muted_foreground)
                     .italic()
-                    .child(label);
+                    .child(label)
+                    .into_any_element()
             }
+            // rows() folds these into dividers; the arm keeps the match
+            // total for hand-built rows in tests.
+            Row::Entry(TranscriptEntry::Model { .. })
+            | Row::Entry(TranscriptEntry::Usage { .. })
+            | Row::Entry(TranscriptEntry::Compaction { .. }) => div()
+                .id(("transcript-row", ix))
+                .into_any_element(),
         }
-        text_el.into_any_element()
+    }
+
+    /// The empty transcript state (no attached session, or an attached
+    /// one with nothing in it yet): the surface never opens onto a void.
+    fn render_empty_transcript(&self, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let (title, hint) = if self.state.attached.is_some() {
+            (
+                "no messages yet",
+                "type below to start - the run happens on the server and survives this window",
+            )
+        } else {
+            (
+                "no session attached",
+                "pick one on the left, hit New chat, or just start typing",
+            )
+        };
+        let title: SharedString = title.into();
+        let hint: SharedString = hint.into();
+        div()
+            .id("empty-transcript")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .size_full()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(28.))
+                    .text_color(theme.border)
+                    .child(SharedString::from("\u{2712}")),
+            )
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(theme.foreground)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(hint),
+            )
+            .into_any_element()
     }
 
     fn render_main(&self, entity: &Entity<Self>, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
+
+        // Header: what am I looking at (session title) + the model chip
+        // (opens the picker) + the reasoning toggle. The TUI carries these
+        // in its status strip; a windowed surface gets a real header.
+        let title: String = self
+            .state
+            .attached
+            .and_then(|id| {
+                self.state
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.title.clone())
+            })
+            .unwrap_or_else(|| "no session".to_string());
+        let model_chip: SharedString = if self.state.model.is_empty() {
+            "model".into()
+        } else {
+            self.state.model.clone().into()
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .h(px(44.))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .overflow_hidden()
+                    .child(title),
+            )
+            .child(
+                Button::new("model-chip")
+                    .label(model_chip)
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.open_picker(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("reasoning-chip")
+                    .label("reasoning")
+                    .ghost()
+                    .small()
+                    .toggled(self.state.show_reasoning)
+                    .on_click(cx.listener(|this, _e, _w, cx| this.toggle_reasoning(cx))),
+            );
 
         // Transcript: virtualized list, follows the tail while scrolled to
         // the bottom (thousands of rows render only the visible range).
@@ -546,6 +805,14 @@ impl DesktopApp {
             })
             .size_full(),
         );
+        let body = if self.display.is_empty() {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_empty_transcript(cx))
+        } else {
+            transcript
+        };
 
         // Live region: note toast, approval strip, activity strip, tool
         // panel - the TUI's live zone with buttons instead of keys.
@@ -674,34 +941,44 @@ impl DesktopApp {
             live = live.child(panel);
         }
 
-        // Composer: input + send/stop (the stop control replaces the
-        // TUI's esc-to-interrupt by the divergence table).
+        // Composer: a rounded pill with the send/stop control inside —
+        // the chat-app pattern. Enter sends (the input's PressEnter);
+        // while a run is active the send becomes stop.
         let composer = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
             .px_4()
-            .py_2()
+            .py_3()
             .border_t_1()
             .border_color(theme.border)
-            .child(div().flex_1().child(Input::new(&self.composer)))
-            .children(if self.state.running {
-                vec![Button::new("stop")
-                    .label("stop")
-                    .danger()
-                    .small()
-                    .on_click(cx.listener(|this, _e, _w, cx| this.interrupt(cx)))]
-            } else {
-                vec![Button::new("send")
-                    .label("send")
-                    .primary()
-                    .small()
-                    .on_click(cx.listener(|this, _e, window, cx| {
-                        let task = this.composer.read(cx).value().to_string();
-                        this.submit(&task, window, cx);
-                    }))]
-            });
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.muted)
+                    .child(div().flex_1().child(Input::new(&self.composer)))
+                    .children(if self.state.running {
+                        vec![Button::new("stop")
+                            .label("stop")
+                            .danger()
+                            .small()
+                            .on_click(cx.listener(|this, _e, _w, cx| this.interrupt(cx)))]
+                    } else {
+                        vec![Button::new("send")
+                            .label("send")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                let task = this.composer.read(cx).value().to_string();
+                                this.submit(&task, window, cx);
+                            }))]
+                    }),
+            );
 
         div()
             .flex()
@@ -709,17 +986,22 @@ impl DesktopApp {
             .flex_1()
             .min_w_0()
             .bg(theme.background)
-            .child(transcript)
+            .child(header)
+            .child(body)
             .child(live)
             .child(composer)
             .into_any_element()
     }
 
-    fn render_status_bar(&self, entity: &Entity<Self>, cx: &App) -> AnyElement {
+    fn render_status_bar(&self, _entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let status: SharedString = self.state.status_line().into();
         let session: SharedString = self.state.session_label().into();
-        let reasoning = self.state.show_reasoning;
+        let (dot, dot_color) = match &self.state.conn {
+            ConnState::Connected { .. } => ("\u{25cf}", theme.success),
+            ConnState::Connecting => ("\u{25cb}", theme.warning),
+            ConnState::Offline => ("\u{25cf}", theme.danger),
+        };
         div()
             .flex()
             .flex_row()
@@ -732,32 +1014,13 @@ impl DesktopApp {
             .bg(theme.muted)
             .text_size(px(11.))
             .text_color(theme.muted_foreground)
-            .child(div().flex_1().child(status))
             .child(
-                Button::new("model-picker")
-                    .label("model")
-                    .ghost()
-                    .xsmall()
-                    .on_click({
-                        let entity = entity.clone();
-                        move |_e: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            entity.update(cx, |this, cx| this.open_picker(window, cx));
-                        }
-                    }),
+                div()
+                    .text_color(dot_color)
+                    .child(SharedString::from(dot)),
             )
-            .child(
-                Button::new("reasoning-toggle")
-                    .label("reasoning")
-                    .ghost()
-                    .xsmall()
-                    .toggled(reasoning)
-                    .on_click({
-                        let entity = entity.clone();
-                        move |_e: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                            entity.update(cx, |this, cx| this.toggle_reasoning(cx));
-                        }
-                    }),
-            )
+            .child(div().child(status))
+            .child(div().flex_1())
             .child(div().child(session))
             .into_any_element()
     }

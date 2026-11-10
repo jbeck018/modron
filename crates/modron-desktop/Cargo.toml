@@ -19,6 +19,7 @@ path = "src/main.rs"
 modron-core = { path = "../modron-core", version = "0.1.0" }
 modron-protocol = { path = "../modron-protocol", version = "0.1.0" }
 modron-view = { path = "../modron-view", version = "0.1.0" }
+chrono.workspace = true
 modron-router = { path = "../modron-router", version = "0.1.0" }
 anyhow.workspace = true
 async-channel = "2"

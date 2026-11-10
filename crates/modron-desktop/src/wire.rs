@@ -217,6 +217,9 @@ pub enum Command {
     },
     SetConfig(ConfigPatch),
     ListSessions,
+    NewSession {
+        title: Option<String>,
+    },
     Ping,
 }
 
@@ -245,6 +248,9 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
             patch: patch.clone(),
         },
         Command::ListSessions => Payload::ListSessions {},
+        Command::NewSession { title } => Payload::NewSession {
+            title: title.clone(),
+        },
         Command::Ping => Payload::Ping {},
     }
 }

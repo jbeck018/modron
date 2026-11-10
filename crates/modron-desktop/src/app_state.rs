@@ -59,6 +59,11 @@ impl From<&SessionMetaWire> for SessionRow {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
     Entry(TranscriptEntry),
+    /// A centered separator chip (model switches, compaction). The GUI
+    /// folds per-turn Model/Usage notes into these chips + the status bar
+    /// (a documented divergence: the TUI renders them as scrollback
+    /// lines; a chat surface reads better without them between turns).
+    Divider { text: String },
     Streaming { text: String },
     Reasoning { text: String },
 }
@@ -214,7 +219,15 @@ impl AppState {
                 self.tracker.clear_turn();
                 self.pending_approval = None;
             }
-            Payload::Note { text } => self.last_note = Some(text),
+            Payload::Note { text } => {
+                self.last_note = Some(text.clone());
+                // `new_session`'s correlated reply names the fresh session
+                // in its session field: adopt it so the next submit lands
+                // there without an explicit attach.
+                if let (Some(id), true) = (frame.session, text.starts_with("session created: ")) {
+                    self.attached = Some(id);
+                }
+            }
             Payload::OAuthProgress {
                 provider,
                 stage,
@@ -295,7 +308,32 @@ impl AppState {
     /// Committed transcript plus the in-flight buffers as rows (what the
     /// virtualized list renders).
     pub fn rows(&self) -> Vec<Row> {
-        let mut rows: Vec<Row> = self.transcript.iter().cloned().map(Row::Entry).collect();
+        // Presentation fold (GUI): Model/Usage notes become a divider chip
+        // only when the model CHANGES (routing re-selections every turn
+        // would otherwise pepper the transcript with identical chips), and
+        // per-turn usage rows vanish (the status bar carries cumulative
+        // tokens + cache; the shared copy lives in the tool summaries).
+        let mut rows: Vec<Row> = Vec::new();
+        let mut last_model: Option<String> = None;
+        for entry in &self.transcript {
+            match entry {
+                TranscriptEntry::Model { model, .. } => {
+                    if last_model.as_deref() != Some(model.as_str()) {
+                        rows.push(Row::Divider {
+                            text: format!("model: {model}"),
+                        });
+                        last_model = Some(model.clone());
+                    }
+                }
+                TranscriptEntry::Usage { .. } => {}
+                TranscriptEntry::Compaction {
+                    summarized_events, ..
+                } => rows.push(Row::Divider {
+                    text: format!("compacted {summarized_events} earlier events"),
+                }),
+                other => rows.push(Row::Entry(other.clone())),
+            }
+        }
         if self.show_reasoning && !self.streaming_reasoning.is_empty() {
             rows.push(Row::Reasoning {
                 text: self.streaming_reasoning.clone(),

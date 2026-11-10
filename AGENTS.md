@@ -69,6 +69,7 @@ forked per client.
 | Theming | ANSI/ratatui palette themes | System appearance + semantic roles mapped to native colors |
 | Platform chrome | None (fullscreen terminal) | Native menus, dock, safe areas (mobile), virtual keyboard handling |
 | Layout | Single column, status line + live strip | Sidebar + panes / mobile stack |
+| Per-turn meta (model switches, usage notes) | Dim scrollback lines after each turn | Desktop: centered divider chip on model CHANGE only, per-turn usage folded into the status bar; mobile: usage notes |
 
 Divergence covers PRESENTATION and KEYS only. The words, the states, the
 ordering, and the semantics do not diverge.
