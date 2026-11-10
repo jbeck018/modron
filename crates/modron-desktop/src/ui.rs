@@ -22,7 +22,7 @@ use gpui_kit::{
     Focusable, InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowOptions,
 };
-use modron_protocol::Decision;
+use modron_protocol::{Decision, Payload};
 use modron_router::lookup;
 use modron_view::TranscriptEntry;
 
@@ -59,6 +59,10 @@ pub struct LaunchOptions {
     pub connect: Option<String>,
     /// `--demo`: run the built-in mock server and connect to it.
     pub demo: bool,
+    /// `--resume` (the server's newest session) / `--resume=<id>` (that
+    /// session): attach on connect. Parity with the TUI's `--resume`.
+    /// `None` = start detached; `Some(None)` = newest; `Some(Some(id))`.
+    pub resume: Option<Option<uuid::Uuid>>,
 }
 
 impl Default for LaunchOptions {
@@ -66,15 +70,22 @@ impl Default for LaunchOptions {
         Self {
             connect: Some(format!("ws://127.0.0.1:{}", modron_protocol::DEFAULT_PORT)),
             demo: false,
+            resume: None,
         }
     }
 }
 
 impl LaunchOptions {
-    /// Parse `--connect <url>` / `--demo` from the process args.
+    /// Parse `--connect <url>` / `--demo` / `--resume[=<id>]` from the
+    /// process args.
     pub fn from_args() -> Self {
+        Self::parse(std::env::args().skip(1))
+    }
+
+    /// Parse from an explicit arg list (testable).
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Self {
         let mut options = Self::default();
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--connect" => {
@@ -84,9 +95,18 @@ impl LaunchOptions {
                 "--demo" => {
                     options.demo = true;
                 }
+                "--resume" => {
+                    options.resume = Some(None);
+                }
+                other if other.starts_with("--resume=") => {
+                    match other["--resume=".len()..].parse::<uuid::Uuid>() {
+                        Ok(id) => options.resume = Some(Some(id)),
+                        Err(e) => eprintln!("invalid --resume id: {e}"),
+                    }
+                }
                 other => {
                     eprintln!(
-                        "unknown argument {other:?}; usage: modron-desktop [--connect <url>|--demo]"
+                        "unknown argument {other:?}; usage: modron-desktop [--connect <url>|--demo] [--resume[=<id>]]"
                     );
                 }
             }
@@ -115,6 +135,9 @@ pub struct DesktopApp {
     /// line); `None` shows the live tracker rows.
     panel_rows: Option<Vec<String>>,
     focus: FocusHandle,
+    /// `--resume` waiting for the first Sessions frame (then attaches the
+    /// named session, or the newest).
+    pending_resume: Option<Option<uuid::Uuid>>,
 }
 
 impl DesktopApp {
@@ -123,6 +146,7 @@ impl DesktopApp {
         cx: &mut Context<Self>,
         cmd_tx: async_channel::Sender<Command>,
         events: async_channel::Receiver<UiEvent>,
+        resume: Option<Option<uuid::Uuid>>,
     ) -> Self {
         let composer =
             cx.new(|cx| InputState::new(window, cx).placeholder("Type a task; enter to send"));
@@ -181,6 +205,7 @@ impl DesktopApp {
             tool_panel_open: false,
             panel_rows: None,
             focus: cx.focus_handle(),
+            pending_resume: resume,
         };
         app.refresh(cx);
         app
@@ -200,7 +225,20 @@ impl DesktopApp {
 
     fn apply_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
-            UiEvent::Frame(frame) => self.state.apply_frame(*frame),
+            UiEvent::Frame(frame) => {
+                let is_sessions = matches!(frame.payload, Payload::Sessions { .. });
+                self.state.apply_frame(*frame);
+                // --resume: attach as soon as the session list is known
+                // (bare = the server's newest; an id = that session).
+                if is_sessions {
+                    if let Some(want) = self.pending_resume.take() {
+                        let target = want.or_else(|| self.state.sessions.first().map(|s| s.id));
+                        if let Some(id) = target {
+                            self.attach(id, cx);
+                        }
+                    }
+                }
+            }
             UiEvent::Connected(server_version) => {
                 self.state.conn = ConnState::Connected { server_version };
                 self.send(Command::ListSessions);
@@ -375,32 +413,31 @@ impl DesktopApp {
             )
             .into();
             let entity = entity.clone();
-            sidebar = sidebar.child(
-                div()
-                    .id(("session", ix))
-                    .px_3()
-                    .py_2()
-                    .cursor_pointer()
-                    .when(attached, |row| {
-                        row.bg(theme.secondary).text_color(theme.accent_foreground)
-                    })
-                    .hover(|row| row.bg(theme.secondary))
-                    .on_click(move |_event: &ClickEvent, _window, cx| {
-                        entity.update(cx, |this, cx| this.attach(id, cx));
-                    })
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme.foreground)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme.muted_foreground)
-                            .child(meta),
-                    ),
-            );
+            let row = div()
+                .id(("session", ix))
+                .px_3()
+                .py_2()
+                .cursor_pointer()
+                .when(attached, |row| {
+                    row.bg(theme.secondary).text_color(theme.accent_foreground)
+                })
+                .hover(|row| row.bg(theme.secondary))
+                .on_click(move |_event: &ClickEvent, _window, cx| {
+                    entity.update(cx, |this, cx| this.attach(id, cx));
+                })
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(meta),
+                );
+            sidebar = sidebar.child(row);
         }
         sidebar.into_any_element()
     }
@@ -409,7 +446,12 @@ impl DesktopApp {
     /// render_item; all data is read from the cached `display`).
     fn transcript_row(row: &Row, ix: usize, entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
-        let mut text_el = div().px_4().py_1().text_size(px(13.));
+        let mut text_el = div()
+            .id(("transcript-row", ix))
+            .px_4()
+            .py_1()
+            .text_size(px(13.));
+
         match row {
             Row::Entry(TranscriptEntry::Task { text })
             | Row::Entry(TranscriptEntry::User { text }) => {
@@ -490,16 +532,20 @@ impl DesktopApp {
         // the bottom (thousands of rows render only the visible range).
         let display_entity = entity.clone();
         let row_entity = entity.clone();
-        let transcript = div().flex_1().min_h_0().overflow_hidden().child(list(
-            self.list_state.clone(),
-            move |ix, _window, cx| {
+        // The list MUST carry its own size: a virtualized list reports zero
+        // intrinsic height (ListSizingBehavior::Auto lays out from its own
+        // style), so without size_full() the pane rendered blank no matter
+        // how many rows the state held — found by the first human click.
+        let transcript = div().flex_1().min_h_0().overflow_hidden().child(
+            list(self.list_state.clone(), move |ix, _window, cx| {
                 let row = display_entity.read(cx).display.get(ix).cloned();
                 match row {
                     Some(row) => Self::transcript_row(&row, ix, &row_entity, cx),
                     None => div().into_any_element(),
                 }
-            },
-        ));
+            })
+            .size_full(),
+        );
 
         // Live region: note toast, approval strip, activity strip, tool
         // panel - the TUI's live zone with buttons instead of keys.
@@ -867,6 +913,7 @@ impl Render for DesktopApp {
 
 /// Launch the GPUI app: net thread (tokio) first, then the event loop.
 pub fn run(options: LaunchOptions) {
+    let resume = options.resume;
     let (cmd_tx, cmd_rx) = async_channel::unbounded::<Command>();
     let (event_tx, event_rx) = async_channel::unbounded::<UiEvent>();
 
@@ -919,9 +966,46 @@ pub fn run(options: LaunchOptions) {
             },
             cx,
             move |window, cx| {
-                cx.new(|cx| DesktopApp::new(window, cx, cmd_tx.clone(), event_rx.clone()))
+                cx.new(|cx| DesktopApp::new(window, cx, cmd_tx.clone(), event_rx.clone(), resume))
             },
         )
         .expect("failed to open the modron desktop window");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resume_flag_parses_bare_and_explicit() {
+        let none = LaunchOptions::parse(args(&["--demo"]));
+        assert!(none.resume.is_none());
+
+        let bare = LaunchOptions::parse(args(&["--demo", "--resume"]));
+        assert_eq!(bare.resume, Some(None), "bare --resume = newest session");
+
+        let id = uuid::Uuid::new_v4();
+        let explicit = LaunchOptions::parse(args(&[&format!("--resume={id}")]));
+        assert_eq!(explicit.resume, Some(Some(id)));
+
+        let bad = LaunchOptions::parse(args(&["--resume=not-a-uuid"]));
+        assert!(bad.resume.is_none(), "unparseable id stays unset");
+    }
+
+    #[test]
+    fn connect_flag_still_defaults_to_loopback() {
+        let parsed = LaunchOptions::parse(args(&[]));
+        assert_eq!(
+            parsed.connect.as_deref(),
+            Some("ws://127.0.0.1:7699"),
+            "DEFAULT_PORT loopback default"
+        );
+        let explicit = LaunchOptions::parse(args(&["--connect", "ws://10.0.0.5:7699"]));
+        assert_eq!(explicit.connect.as_deref(), Some("ws://10.0.0.5:7699"));
+    }
 }
