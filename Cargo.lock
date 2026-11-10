@@ -4258,8 +4258,11 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "crossterm",
+ "dirs",
+ "futures",
  "ignore",
  "modron-core",
+ "modron-protocol",
  "modron-router",
  "modron-store",
  "modron-view",
@@ -4268,7 +4271,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]

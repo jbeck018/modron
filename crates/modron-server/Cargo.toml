@@ -4,7 +4,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Filled in by the Phase-2 server tranche: SessionHub fan-out, WS + Unix
-# socket listeners, approvals/interrupt/attach. Kept dep-free until then so
-# the skeleton never breaks the workspace build.
+# Phase-2/3: the remote-control session server — SessionHub fan-out, WS +
+# Unix-socket listeners, approvals/interrupt/attach, device pairing.
 [dependencies]
+modron-core = { path = "../modron-core", version = "0.1.0" }
+modron-protocol = { path = "../modron-protocol", version = "0.1.0" }
+modron-view = { path = "../modron-view", version = "0.1.0" }
+modron-store = { path = "../modron-store", version = "0.1.0" }
+# Catalog lookups so `SetConfig { model }` follows the provider like the TUI.
+modron-router = { path = "../modron-router", version = "0.1.0" }
+async-trait.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+# split()/next() on the tokio-tungstenite WebSocketStream.
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -119,6 +119,24 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Run the remote-control session server: WebSocket + local Unix socket
+    /// (Phase 2). Sessions live here; clients attach from anywhere.
+    Serve {
+        /// WebSocket listen address, or "disabled" for Unix-socket only.
+        /// Loopback binds trust local clients; anything else requires a
+        /// paired device token (`modron pair`).
+        #[arg(long, default_value = "127.0.0.1:7699")]
+        listen: String,
+    },
+    /// Manage paired remote devices (Phase 3): mint, list, revoke the
+    /// bearer tokens remote clients send in their hello frame.
+    Pair {
+        /// Device name for `modron pair <name>` (mint + print a token).
+        /// Omit when using a subcommand.
+        name: Option<String>,
+        #[command(subcommand)]
+        action: Option<PairAction>,
+    },
     /// Manage provider credentials: API keys for any provider, OAuth for
     /// Claude subscriptions.
     Auth {
@@ -186,6 +204,14 @@ enum DaemonAction {
     Status,
     /// Stop the daemon.
     Stop,
+}
+
+#[derive(Subcommand, Clone)]
+enum PairAction {
+    /// List paired devices (name + when the token was minted).
+    List,
+    /// Revoke a device's token (its hello frames stop authenticating).
+    Revoke { name: String },
 }
 
 #[derive(Subcommand, Clone)]
@@ -441,6 +467,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(Command::Memory { action }) = cli.command {
         return run_memory(action, &sessions_dir, &working_dir);
     }
+    // `modron pair …` — device tokens for the remote-control server; no
+    // provider, no run.
+    if let Some(Command::Pair { name, action }) = &cli.command {
+        return run_pair(name.clone(), action.clone());
+    }
     // `modron rewind` — restore the last checkpointed file + set the
     // truncation point the next --resume of that session will honor.
     if let Some(Command::Rewind { session }) = cli.command {
@@ -499,6 +530,21 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // `modron daemon …` — background engine management (Phase 9).
     if let Some(Command::Daemon { action }) = &cli.command {
         return run_daemon(action.clone(), &cli, &cfg).await;
+    }
+
+    // `modron serve` — the remote-control session server (Phase 2). Built
+    // exactly like `daemon start`: same agent path, long-lived process.
+    if let Some(Command::Serve { listen }) = &cli.command {
+        let mcp = spawn_mcp_servers(&cfg).await?;
+        let agent = build_agent_with(&cli, &cfg, false, AgentSinks::for_mode(false, false), &mcp)?;
+        return modron_server::run_serve(
+            agent.engine,
+            &modron_server::ServeOptions {
+                listen: Some(listen.clone()),
+                ..modron_server::ServeOptions::default()
+            },
+        )
+        .await;
     }
 
     // `modron auth …` — subscription token management (Phase 5d X3).
@@ -1541,6 +1587,46 @@ fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
         println!("all critical checks passed — run: modron \"your task\"");
     } else {
         println!("some checks failed — see the ✗ lines above");
+    }
+    Ok(())
+}
+
+/// `modron pair [<name>|list|revoke <name>]` (Phase 3): mint, list, and
+/// revoke the device tokens remote clients present on `modron serve`'s
+/// non-loopback WebSocket endpoint.
+fn run_pair(name: Option<String>, action: Option<PairAction>) -> anyhow::Result<()> {
+    let dir = modron_server::default_clients_dir()?;
+    match action {
+        Some(PairAction::List) => {
+            let devices = modron_server::list(&dir)?;
+            if devices.is_empty() {
+                println!("no paired devices — mint one with `modron pair <name>`");
+                return Ok(());
+            }
+            for device in devices {
+                println!("{}  (paired {})", device.name, device.created_at);
+            }
+        }
+        Some(PairAction::Revoke { name }) => {
+            if modron_server::revoke(&dir, &name)? {
+                println!("revoked {name}");
+            } else {
+                println!("no paired device named {name}");
+            }
+        }
+        None => {
+            // Bare `modron pair [name]`: mint + print. The token is shown
+            // exactly once; the file stores it for verification.
+            let device = modron_server::grant(&dir, name.as_deref().unwrap_or("default"))?;
+            let path = dir.join(format!("{}.token", device.name));
+            println!("paired device `{}` — token:", device.name);
+            println!("{}", device.token);
+            println!("stored at {}", path.display());
+            println!(
+                "send it in the hello frame of every remote client (loopback and \
+                 unix-socket connections don't need it)"
+            );
+        }
     }
     Ok(())
 }
