@@ -56,6 +56,28 @@ fn catalog_rows() -> Vec<ModelRow> {
 
 gpui_kit::actions!(modron_desktop, [NewChat]);
 
+static NEXT_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A gpui render image from raw bytes (thumbnails for staged photos).
+fn render_image(format: gpui_kit::ImageFormat, bytes: Vec<u8>) -> std::sync::Arc<gpui_kit::Image> {
+    std::sync::Arc::new(gpui_kit::Image {
+        format,
+        bytes,
+        id: NEXT_IMAGE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    })
+}
+
+fn image_format_of(media_type: &str) -> Option<gpui_kit::ImageFormat> {
+    match media_type {
+        "image/png" => Some(gpui_kit::ImageFormat::Png),
+        "image/jpeg" => Some(gpui_kit::ImageFormat::Jpeg),
+        "image/webp" => Some(gpui_kit::ImageFormat::Webp),
+        "image/gif" => Some(gpui_kit::ImageFormat::Gif),
+        "image/bmp" => Some(gpui_kit::ImageFormat::Bmp),
+        _ => None,
+    }
+}
+
 /// Launch configuration from the CLI.
 #[derive(Clone, Debug)]
 pub struct LaunchOptions {
@@ -146,9 +168,18 @@ pub struct DesktopApp {
     /// `--resume` waiting for the first Sessions frame (then attaches the
     /// named session, or the newest).
     pending_resume: Option<Option<uuid::Uuid>>,
-    /// Images/documents staged for the next submit (drag-and-drop, the
-    /// + button, or clipboard). `(attachment, display label)`.
-    staged: Vec<(Attachment, String)>,
+    /// Weak self for callbacks that render-time elements carry (the
+    /// composer's paste interception).
+    weak_self: gpui_kit::WeakEntity<DesktopApp>,
+    /// Images/documents staged for the next submit: drag-and-drop, the
+    /// attach button, or clipboard paste. The tuple is `(attachment,
+    /// display label, thumbnail)`; the thumbnail is prebuilt so rendering
+    /// never re-encodes the bytes.
+    ///
+    /// The display label is what the chip shows; the thumbnail is the
+    /// prebuilt render image (None for text documents, which render a
+    /// page glyph instead).
+    staged: Vec<(Attachment, String, Option<std::sync::Arc<gpui_kit::Image>>)>,
 }
 
 impl DesktopApp {
@@ -222,7 +253,14 @@ impl DesktopApp {
             focus: cx.focus_handle(),
             pending_resume: resume,
             staged: Vec::new(),
+            weak_self: cx.weak_entity(),
         };
+        // Follow OS appearance switches on this window (light <-> dark).
+        window
+            .observe_window_appearance(|_window, cx| {
+                Theme::change(ThemeMode::from(cx.window_appearance()), None, cx);
+            })
+            .detach();
         app.refresh(cx);
         app
     }
@@ -291,7 +329,7 @@ impl DesktopApp {
         let session_id = self.state.attached;
         let attachments: Vec<Attachment> = std::mem::take(&mut self.staged)
             .into_iter()
-            .map(|(attachment, _)| attachment)
+            .map(|(attachment, _, _)| attachment)
             .collect();
         self.send(Command::Submit {
             session_id,
@@ -324,7 +362,7 @@ impl DesktopApp {
             .unwrap_or("")
             .to_ascii_lowercase();
         let bytes = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
-        let (attachment, label) = match ext.as_str() {
+        let (attachment, label, thumb) = match ext.as_str() {
             "png" | "jpg" | "jpeg" | "webp" | "gif" => {
                 let media_type = match ext.as_str() {
                     "png" => "image/png",
@@ -332,12 +370,16 @@ impl DesktopApp {
                     "webp" => "image/webp",
                     _ => "image/gif",
                 };
+                let format =
+                    image_format_of(media_type).expect("image extension mapped to a known format");
+                let thumb = Some(render_image(format, bytes.clone()));
                 (
                     Attachment::Image {
                         media_type: media_type.into(),
                         data: modron_core::b64::encode(&bytes),
                     },
                     format!("{name} · {} KB", meta.len() / 1024),
+                    thumb,
                 )
             }
             "txt" | "md" | "json" | "toml" | "csv" | "rs" | "py" | "js" | "ts" | "sh" => {
@@ -349,11 +391,12 @@ impl DesktopApp {
                         text,
                     },
                     name,
+                    None,
                 )
             }
             other => return Err(format!("unsupported file type: .{other}")),
         };
-        self.staged.push((attachment, label));
+        self.staged.push((attachment, label, thumb));
         Ok(())
     }
 
@@ -376,12 +419,14 @@ impl DesktopApp {
                         _ => "image/png",
                     };
                     let kb = image.bytes.len() / 1024;
+                    let thumb = Some(render_image(image.format, image.bytes.clone()));
                     self.staged.push((
                         Attachment::Image {
                             media_type: media_type.into(),
                             data: modron_core::b64::encode(&image.bytes),
                         },
                         format!("clipboard image · {kb} KB"),
+                        thumb,
                     ));
                     staged_any = true;
                 }
@@ -551,7 +596,7 @@ impl DesktopApp {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .child(div().px_3().pt_3().pb_2().child({
+            .child(div().px_3().pt_9().pb_2().child({
                 let entity = entity.clone();
                 Button::new("new-chat")
                     .label("New chat")
@@ -660,6 +705,31 @@ impl DesktopApp {
                     .text_size(px(12.))
                     .text_color(theme.foreground)
                     .child(SharedString::from("Jacob Beck")),
+            )
+            .child(
+                Button::new("theme-toggle")
+                    .label(
+                        if theme.mode == gpui_kit::component::theme::ThemeMode::Dark {
+                            "\u{2600}"
+                        } else {
+                            "\u{263e}"
+                        },
+                    )
+                    .ghost()
+                    .small()
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_e: &ClickEvent, _w, cx: &mut App| {
+                            let mode =
+                                if cx.theme().mode == gpui_kit::component::theme::ThemeMode::Dark {
+                                    gpui_kit::component::theme::ThemeMode::Light
+                                } else {
+                                    gpui_kit::component::theme::ThemeMode::Dark
+                                };
+                            Theme::change(mode, None, cx);
+                            let _ = &entity;
+                        }
+                    }),
             );
 
         div()
@@ -958,16 +1028,24 @@ impl DesktopApp {
         // intrinsic height (ListSizingBehavior::Auto lays out from its own
         // style), so without size_full() the pane rendered blank no matter
         // how many rows the state held — found by the first human click.
-        let transcript = div().flex_1().min_h_0().overflow_hidden().child(
-            list(self.list_state.clone(), move |ix, _window, cx| {
-                let row = display_entity.read(cx).display.get(ix).cloned();
-                match row {
-                    Some(row) => Self::transcript_row(&row, ix, &row_entity, cx),
-                    None => div().into_any_element(),
-                }
-            })
-            .size_full(),
-        );
+        let transcript = div()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .flex()
+            .justify_center()
+            .child(
+                div().max_w(px(760.)).w_full().h_full().child(
+                    list(self.list_state.clone(), move |ix, _window, cx| {
+                        let row = display_entity.read(cx).display.get(ix).cloned();
+                        match row {
+                            Some(row) => Self::transcript_row(&row, ix, &row_entity, cx),
+                            None => div().into_any_element(),
+                        }
+                    })
+                    .size_full(),
+                ),
+            );
         let body = if self.display.is_empty() {
             div()
                 .flex_1()
@@ -1108,8 +1186,28 @@ impl DesktopApp {
         // [send/stop] — with staged attachment chips above it. The whole
         // pane accepts image/document drops.
         let mut staged_row = div().flex().flex_row().flex_wrap().gap_1().px_4().pb_1();
-        for (ix, (_, label)) in self.staged.iter().enumerate() {
+        for (ix, (_attachment, label, thumb)) in self.staged.iter().enumerate() {
             let label: SharedString = label.clone().into();
+            // Images get a real thumbnail (the prebuilt render image);
+            // documents get a page glyph.
+            let chip: gpui_kit::AnyElement = if let Some(image) = thumb {
+                gpui_kit::img(image.clone())
+                    .size(px(32.))
+                    .rounded_sm()
+                    .into_any_element()
+            } else {
+                div()
+                    .size(px(32.))
+                    .rounded_sm()
+                    .bg(theme.secondary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(14.))
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from("\u{1f4c4}"))
+                    .into_any_element()
+            };
             staged_row = staged_row.child(
                 div()
                     .id(("staged", ix))
@@ -1117,12 +1215,13 @@ impl DesktopApp {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .px_2()
-                    .py_0p5()
+                    .p_1()
+                    .pr_2()
                     .rounded_md()
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.muted)
+                    .child(chip)
                     .child(
                         div()
                             .text_size(px(11.))
@@ -1181,7 +1280,57 @@ impl DesktopApp {
                         .small()
                         .on_click(cx.listener(|this, _e, _w, cx| this.cycle_mode(cx))),
                 )
-                .child(div().flex_1().child(Input::new(&self.composer)))
+                .child(div().flex_1().child(Input::new(&self.composer).on_paste({
+                    let weak_self = self.weak_self.clone();
+                    move |item, _window, cx| -> bool {
+                        // Images and copied files stage as attachments
+                        // (true = consumed); plain text falls through
+                        // to normal paste.
+                        let Some(app) = weak_self.upgrade() else {
+                            return false;
+                        };
+                        let mut took = false;
+                        app.update(cx, |this, cx| {
+                            for entry in item.entries() {
+                                match entry {
+                                    gpui_kit::ClipboardEntry::Image(image) => {
+                                        let media_type = match image.format {
+                                            gpui_kit::ImageFormat::Png => "image/png",
+                                            gpui_kit::ImageFormat::Jpeg => "image/jpeg",
+                                            gpui_kit::ImageFormat::Webp => "image/webp",
+                                            gpui_kit::ImageFormat::Gif => "image/gif",
+                                            _ => "image/png",
+                                        };
+                                        let kb = image.bytes.len() / 1024;
+                                        let thumb =
+                                            Some(render_image(image.format, image.bytes.clone()));
+                                        this.staged.push((
+                                            Attachment::Image {
+                                                media_type: media_type.into(),
+                                                data: modron_core::b64::encode(&image.bytes),
+                                            },
+                                            format!("pasted image · {kb} KB"),
+                                            thumb,
+                                        ));
+                                        took = true;
+                                    }
+                                    gpui_kit::ClipboardEntry::ExternalPaths(paths) => {
+                                        for path in paths.paths() {
+                                            if this.stage_from_path(path).is_ok() {
+                                                took = true;
+                                            }
+                                        }
+                                    }
+                                    gpui_kit::ClipboardEntry::String(_) => {}
+                                }
+                            }
+                            if took {
+                                this.refresh(cx);
+                            }
+                        });
+                        took
+                    }
+                })))
                 .child(
                     Button::new("model-chip")
                         .label(model_chip)
@@ -1395,6 +1544,18 @@ impl Render for DesktopApp {
             .flex_col()
             .bg(theme.background)
             .text_color(theme.foreground)
+            // Behind everything: the transparent-titlebar drag band. The
+            // system traffic lights overlay the sidebar's top padding;
+            // interactive content sits above this strip and wins clicks.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(38.))
+                    .window_control_area(gpui_kit::WindowControlArea::Drag),
+            )
             .child(
                 div()
                     .flex()
@@ -1450,9 +1611,9 @@ pub fn run(options: LaunchOptions) {
 
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
-        // Dark-first (the desktop chat grammar this surface follows);
-        // follows nothing else for now - deterministic look.
-        Theme::change(ThemeMode::Dark, None, cx);
+        // Follow the system appearance at launch; the footer's moon button
+        // flips it manually, and open windows re-follow on OS switches.
+        Theme::change(ThemeMode::from(cx.window_appearance()), None, cx);
         cx.bind_keys([
             KeyBinding::new("escape", PickerClose, Some("ModelPicker")),
             KeyBinding::new("up", PickerUp, Some("ModelPicker")),
@@ -1463,7 +1624,10 @@ pub fn run(options: LaunchOptions) {
             WindowOptions {
                 titlebar: Some(gpui_kit::TitlebarOptions {
                     title: Some("modron desktop".into()),
-                    appears_transparent: false,
+                    // Our surface paints the whole window (dark or light);
+                    // a drag strip under the content keeps the empty top
+                    // band draggable while buttons stay clickable.
+                    appears_transparent: true,
                     traffic_light_position: None,
                 }),
                 ..WindowOptions::default()
