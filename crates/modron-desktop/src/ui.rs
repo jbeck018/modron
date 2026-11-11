@@ -3480,7 +3480,6 @@ impl DesktopApp {
                     .gap_6()
                     .px_6()
                     .py_5()
-                    .max_w(px(720.))
                     .child(section(
                         "general",
                         "appearance and first-run setup",
@@ -4059,7 +4058,7 @@ pub fn run(options: LaunchOptions) {
         .expect("spawn net thread");
 
     gpui_kit::application()
-        .with_assets(gpui_kit_assets::Assets)
+        .with_assets(gpui_kit_assets::AllAssets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
             // Brand install (2026-11-11, iron-rain port): bundled DM Sans +
