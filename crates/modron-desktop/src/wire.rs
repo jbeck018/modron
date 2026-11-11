@@ -247,6 +247,7 @@ pub enum Command {
     Fork {
         session_id: uuid::Uuid,
     },
+    RouterDefaults {},
     AuthStart {
         session_id: uuid::Uuid,
         provider: String,
@@ -337,6 +338,7 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
         Command::Fork { session_id } => Payload::Fork {
             session_id: *session_id,
         },
+        Command::RouterDefaults {} => Payload::RouterDefaultsReq {},
         Command::AuthStart {
             session_id,
             provider,

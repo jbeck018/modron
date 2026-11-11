@@ -90,6 +90,8 @@ pub enum Row {
 pub struct AppState {
     /// Provider auth status rows (onboarding/settings).
     pub auth_providers: Vec<modron_protocol::AuthProviderWire>,
+    /// The router recommendation + fallbacks (settings defaults card).
+    pub router_defaults: Option<modron_protocol::RouterDefaults>,
     /// Scheduled automations (wire rows).
     pub automations: Vec<modron_protocol::AutomationWire>,
     /// Provider auth status rows (onboarding wizard/settings).pub auth_providers: Vec<modron_protocol::AuthProviderWire>,
@@ -302,7 +304,24 @@ impl AppState {
             Payload::Error { message } => self.last_note = Some(message),
             Payload::Pong {} => {}
             // Client-only payloads never arrive inbound.
-            Payload::AuthStart { .. } | Payload::AuthSetKey { .. } => {}
+            Payload::RouterDefaults {
+                authed,
+                recommended_cheap,
+                recommended_strong,
+                cheap_fallback,
+                strong_fallback,
+            } => {
+                self.router_defaults = Some(modron_protocol::RouterDefaults {
+                    authed,
+                    recommended_cheap,
+                    recommended_strong,
+                    cheap_fallback,
+                    strong_fallback,
+                });
+            }
+            Payload::RouterDefaultsReq {}
+            | Payload::AuthStart { .. }
+            | Payload::AuthSetKey { .. } => {}
             Payload::Hello { .. }
             | Payload::Attach { .. }
             | Payload::Detach {}

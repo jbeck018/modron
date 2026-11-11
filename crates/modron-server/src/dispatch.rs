@@ -567,6 +567,46 @@ pub async fn handle_frame(
                 Err(e) => send(ctx, error(request_id, format!("cannot save key: {e}"))),
             }
         }
+        Payload::RouterDefaultsReq {} => {
+            // What the settings page's defaults card prefills: the authed
+            // catalog providers, the derived recommendation (the same
+            // auto-routing the serve startup notes), and the fallback
+            // chains that follow.
+            let authed: Vec<String> = modron_core::auth::provider_registry()
+                .iter()
+                .filter(|p| modron_core::auth::catalog_provider_authenticated(p.provider_id))
+                .map(|p| p.provider_id.to_string())
+                .collect();
+            let (recommended_cheap, recommended_strong, cheap_fallback, strong_fallback) =
+                match modron_router::derive_tier_candidates(&authed) {
+                    Some(candidates) => (
+                        candidates.cheap.first().cloned(),
+                        candidates.strong.first().cloned(),
+                        candidates.cheap.iter().skip(1).cloned().collect(),
+                        candidates.strong.iter().skip(1).cloned().collect(),
+                    ),
+                    None => match modron_router::derive_tiers(&authed) {
+                        Some((cheap, strong)) => {
+                            (Some(cheap), Some(strong), Vec::new(), Vec::new())
+                        }
+                        None => (None, None, Vec::new(), Vec::new()),
+                    },
+                };
+            send(
+                ctx,
+                reply(
+                    request_id,
+                    None,
+                    Payload::RouterDefaults {
+                        authed,
+                        recommended_cheap,
+                        recommended_strong,
+                        cheap_fallback,
+                        strong_fallback,
+                    },
+                ),
+            );
+        }
         Payload::AuthProviders { .. } => {
             use modron_core::auth::{oauth_capable, oauth_signed_in, provider_registry};
             let rows = provider_registry()
@@ -1030,6 +1070,8 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::ListSessions {} => "list_sessions",
         Payload::DeleteSession { .. } => "delete_session",
         Payload::AuthStart { .. } => "auth_start",
+        Payload::RouterDefaultsReq { .. } => "router_defaults_req",
+        Payload::RouterDefaults { .. } => "router_defaults",
         Payload::AuthSetKey { .. } => "auth_set_key",
         Payload::AuthProviders { .. } => "auth_providers",
         Payload::PersistRouter { .. } => "persist_router",

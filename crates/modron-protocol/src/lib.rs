@@ -279,6 +279,18 @@ pub enum Payload {
         provider: String,
         key: String,
     },
+    /// The router's default-model picture: what is signed in, the
+    /// derived recommendation, and the active fallback chains. The
+    /// settings page prefills its defaults card from this.
+    RouterDefaultsReq {},
+    /// The reply to `router_defaults_req` (settings page, defaults card).
+    RouterDefaults {
+        authed: Vec<String>,
+        recommended_cheap: Option<String>,
+        recommended_strong: Option<String>,
+        cheap_fallback: Vec<String>,
+        strong_fallback: Vec<String>,
+    },
     /// An informational toast/scrollback note (slash-command results).
     Note { text: String },
     /// Answer to `ping`.
@@ -377,6 +389,18 @@ pub struct AutomationWire {
     pub interval_minutes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<String>,
+}
+
+/// The router defaults picture for the settings page (reply to
+/// `router_defaults_req`): authed catalog providers, the derived
+/// recommendation, and the live fallback chains.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterDefaults {
+    pub authed: Vec<String>,
+    pub recommended_cheap: Option<String>,
+    pub recommended_strong: Option<String>,
+    pub cheap_fallback: Vec<String>,
+    pub strong_fallback: Vec<String>,
 }
 
 /// One provider row for the onboarding/settings surfaces.

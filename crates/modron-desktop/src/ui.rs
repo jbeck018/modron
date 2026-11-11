@@ -765,6 +765,19 @@ impl DesktopApp {
         self.settings_open = true;
         self.send(Command::AuthProviders {});
         self.send(Command::AutomationsList {});
+        self.send(Command::RouterDefaults {});
+        // Prefill the defaults inputs from the last known recommendation
+        // (the fresh reply lands async and the card offers apply recs).
+        if let Some(rec) = &self.state.router_defaults {
+            let cheap = rec.recommended_cheap.clone().unwrap_or_default();
+            let strong = rec.recommended_strong.clone().unwrap_or_default();
+            self.cheap_model_input.update(cx, |input, cx| {
+                input.set_value(&cheap, window, cx);
+            });
+            self.strong_model_input.update(cx, |input, cx| {
+                input.set_value(&strong, window, cx);
+            });
+        }
         let goal = self.state.goal.clone();
         self.goal_input.update(cx, |input, cx| {
             input.set_value(&goal, window, cx);
@@ -3241,6 +3254,47 @@ impl DesktopApp {
         ]);
 
         // -- defaults (PersistRouter: saved to config.toml) ----------------
+        let rec = self.state.router_defaults.clone();
+        let rec_line: SharedString = match &rec {
+            Some(rec) if rec.recommended_cheap.is_some() => {
+                let mut parts = vec![format!(
+                    "recommended from your signed-in providers: {} (cheap) / {} (strong)",
+                    rec.recommended_cheap.as_deref().unwrap_or(""),
+                    rec.recommended_strong.as_deref().unwrap_or("")
+                )];
+                if !rec.cheap_fallback.is_empty() || !rec.strong_fallback.is_empty() {
+                    parts.push(format!(
+                        "fallbacks: {} / {}",
+                        rec.cheap_fallback.join(", "),
+                        rec.strong_fallback.join(", ")
+                    ));
+                }
+                parts.join(" - ").into()
+            }
+            _ => "no recommendation yet - sign in to a provider above".into(),
+        };
+        let entity_recs = entity.clone();
+        let rec_apply = rec.clone();
+        let use_rec = Button::new("use-recommended")
+            .label("use recommended")
+            .outline()
+            .small()
+            .on_click(move |_e: &ClickEvent, window, cx: &mut App| {
+                entity_recs.update(cx, |this, cx| {
+                    if let Some(rec) = &rec_apply {
+                        let cheap = rec.recommended_cheap.clone().unwrap_or_default();
+                        let strong = rec.recommended_strong.clone().unwrap_or_default();
+                        this.cheap_model_input.update(cx, |input, cx| {
+                            input.set_value(&cheap, window, cx);
+                        });
+                        this.strong_model_input.update(cx, |input, cx| {
+                            input.set_value(&strong, window, cx);
+                        });
+                        this.refresh(cx);
+                    }
+                });
+            });
+        let _ = rec_apply;
         let cheap_input = self.cheap_model_input.clone();
         let strong_input = self.strong_model_input.clone();
         let entity_save = entity.clone();
@@ -3259,6 +3313,12 @@ impl DesktopApp {
                     .p_3()
                     .child(
                         div()
+                            .text_size(px(crate::brand::text::XS))
+                            .text_color(theme.muted_foreground)
+                            .child(rec_line),
+                    )
+                    .child(
+                        div()
                             .flex()
                             .flex_row()
                             .gap_2()
@@ -3274,41 +3334,49 @@ impl DesktopApp {
                             ),
                     )
                     .child(
-                        div().flex().flex_row().justify_end().child(
-                            Button::new("save-defaults")
-                                .label("save as default")
-                                .primary()
-                                .small()
-                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                    entity_save.update(cx, |this, cx| {
-                                        let cheap = this
-                                            .cheap_model_input
-                                            .read(cx)
-                                            .value()
-                                            .trim()
-                                            .to_string();
-                                        let strong = this
-                                            .strong_model_input
-                                            .read(cx)
-                                            .value()
-                                            .trim()
-                                            .to_string();
-                                        if cheap.is_empty() || strong.is_empty() {
-                                            this.state.last_note =
-                                                Some("cheap and strong models are required".into());
-                                        } else {
-                                            this.send(Command::PersistRouter {
-                                                cheap,
-                                                strong,
-                                                cheap_fallback: None,
-                                                strong_fallback: None,
-                                            });
-                                            this.state.last_note = Some("defaults saved".into());
-                                        }
-                                        this.refresh(cx);
-                                    });
-                                }),
-                        ),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap_2()
+                            .child(use_rec)
+                            .child(
+                                Button::new("save-defaults")
+                                    .label("save as default")
+                                    .primary()
+                                    .small()
+                                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                        entity_save.update(cx, |this, cx| {
+                                            let cheap = this
+                                                .cheap_model_input
+                                                .read(cx)
+                                                .value()
+                                                .trim()
+                                                .to_string();
+                                            let strong = this
+                                                .strong_model_input
+                                                .read(cx)
+                                                .value()
+                                                .trim()
+                                                .to_string();
+                                            if cheap.is_empty() || strong.is_empty() {
+                                                this.state.last_note = Some(
+                                                    "cheap and strong models are required".into(),
+                                                );
+                                            } else {
+                                                this.send(Command::PersistRouter {
+                                                    cheap,
+                                                    strong,
+                                                    cheap_fallback: None,
+                                                    strong_fallback: None,
+                                                });
+                                                this.state.last_note =
+                                                    Some("defaults saved".into());
+                                            }
+                                            this.refresh(cx);
+                                        });
+                                    }),
+                            ),
                     ),
             );
 
