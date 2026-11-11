@@ -202,6 +202,12 @@ pub struct DesktopApp {
     grouped: bool,
     /// Settings overlay open (gear in the footer).
     settings_open: bool,
+    /// Settings-page inputs (session + defaults cards).
+    allow_input: Entity<InputState>,
+    deny_input: Entity<InputState>,
+    goal_input: Entity<InputState>,
+    cheap_model_input: Entity<InputState>,
+    strong_model_input: Entity<InputState>,
     /// Automations add/edit-form fields (name/prompt/interval).
     auto_name: Entity<InputState>,
     auto_prompt: Entity<InputState>,
@@ -251,6 +257,12 @@ impl DesktopApp {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("type to filter"));
         let session_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter sessions"));
+        let allow_input = cx.new(|cx| InputState::new(window, cx).placeholder("grep, read"));
+        let deny_input = cx.new(|cx| InputState::new(window, cx).placeholder("bash"));
+        let goal_input = cx.new(|cx| InputState::new(window, cx).placeholder("a standing goal"));
+        let cheap_model_input = cx.new(|cx| InputState::new(window, cx).placeholder("cheap model"));
+        let strong_model_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("strong model"));
 
         // Typing updates the slash-command popup: a leading "/" filters
         // the shared table (modron_view::slash); Enter-free selection via
@@ -314,6 +326,11 @@ impl DesktopApp {
             list_state: ListState::new(0, ListAlignment::Bottom, px(256.)),
             composer,
             slash_candidates: Vec::new(),
+            allow_input,
+            deny_input,
+            goal_input,
+            cheap_model_input,
+            strong_model_input,
             help_open: false,
             filter,
             session_filter,
@@ -717,8 +734,7 @@ impl DesktopApp {
                 }
             }
             "auth" | "settings" => {
-                self.settings_open = true;
-                self.refresh(cx);
+                self.open_settings(window, cx);
             }
             "help" => {
                 self.toggle_help(cx);
@@ -728,6 +744,19 @@ impl DesktopApp {
                 self.refresh(cx);
             }
         }
+    }
+
+    /// Open the settings page: refresh providers + automations and seed
+    /// the editable session fields from the live state.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        self.send(Command::AuthProviders {});
+        self.send(Command::AutomationsList {});
+        let goal = self.state.goal.clone();
+        self.goal_input.update(cx, |input, cx| {
+            input.set_value(&goal, window, cx);
+        });
+        self.refresh(cx);
     }
 
     /// The /help overlay toggle (renders the shared slash table).
@@ -1296,22 +1325,6 @@ impl DesktopApp {
                     "act-automations",
                     "Automations",
                     "icons/calendar-clock.svg",
-                    None,
-                    move |_e, _w, cx| {
-                        entity.update(cx, |this, cx| {
-                            this.settings_open = true;
-                            this.refresh(cx);
-                        });
-                    },
-                )
-            })
-            .child({
-                let entity = entity.clone();
-                action_row(
-                    theme,
-                    "act-settings",
-                    "Settings",
-                    "icons/settings.svg",
                     None,
                     move |_e, _w, cx| {
                         entity.update(cx, |this, cx| {
@@ -2889,6 +2902,11 @@ impl DesktopApp {
     /// The settings PAGE (2026-11-11: was a cramped modal): the main pane
     /// swaps to this view. shadcn-flavored - section headers, bordered
     /// cards, label-left control-right rows, ghost icon controls.
+    /// The settings PAGE: shadcn-form sections - title + description on
+    /// the left of each card, controls right. Everything here maps to a
+    /// real knob: SetConfig (approval, sandbox, allow/deny, goal),
+    /// PersistRouter (saved defaults), AuthProviders (sign-in state),
+    /// and the automations registry.
     fn render_settings_page(
         &self,
         entity: &Entity<Self>,
@@ -2900,44 +2918,84 @@ impl DesktopApp {
         let entity_back = entity.clone();
         let entity_wizard = entity.clone();
 
-        let sandbox_label = if self.state.sandbox.is_empty() {
-            "off"
-        } else {
-            self.state.sandbox.as_str()
+        // Section: a muted heading + description, then the bordered card.
+        let section = |title: &'static str,
+                       description: &'static str,
+                       card: gpui_kit::AnyElement|
+         -> gpui_kit::AnyElement {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(crate::brand::text::BASE))
+                        .text_color(theme.foreground)
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .text_size(px(crate::brand::text::XS))
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(description)),
+                )
+                .child(card)
+                .into_any_element()
         };
 
-        // One card row: label left, control right.
-        fn row<I>(theme: &Theme, label: &'static str, control: I) -> gpui_kit::AnyElement
-        where
-            I: gpui_kit::IntoElement,
-        {
+        // Card row: title + hint left, control right, hairline separators.
+        let row = |title: &'static str,
+                   hint: &'static str,
+                   control: gpui_kit::AnyElement|
+         -> gpui_kit::AnyElement {
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
+                .gap_3()
                 .px_3()
-                .py_2()
+                .py_2p5()
+                .border_b_1()
+                .border_color(theme.border)
                 .child(
                     div()
-                        .text_size(px(crate::brand::text::SM))
-                        .text_color(theme.foreground)
-                        .child(SharedString::from(label)),
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(px(crate::brand::text::SM))
+                                .text_color(theme.foreground)
+                                .child(SharedString::from(title)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(crate::brand::text::XS))
+                                .text_color(theme.muted_foreground)
+                                .child(SharedString::from(hint)),
+                        ),
                 )
-                .child(control.into_any_element())
+                .child(control)
                 .into_any_element()
-        }
+        };
 
-        let general = div()
-            .flex()
-            .flex_col()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .child(row(
-                theme,
+        let card_wrap = |rows: Vec<gpui_kit::AnyElement>| {
+            div()
+                .flex()
+                .flex_col()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .children(rows)
+        };
+
+        // -- general ------------------------------------------------------
+        let general = card_wrap(vec![
+            row(
                 "appearance",
+                "light or dark, follows the system at launch",
                 Button::new("settings-theme")
                     .icon(Icon::default().path("icons/moon.svg").size_4())
                     .ghost()
@@ -2950,75 +3008,352 @@ impl DesktopApp {
                         };
                         Theme::change(mode, None, cx);
                         this.refresh(cx);
-                    })),
-            ))
-            .child(row(
-                theme,
-                "approval mode",
-                Button::new("settings-mode")
-                    .label(self.state.approval_mode.to_string())
+                    }))
+                    .into_any_element(),
+            ),
+            row(
+                "setup wizard",
+                "sign in to providers and wire the default models",
+                Button::new("run-setup-wizard")
+                    .label("run")
                     .outline()
                     .small()
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        let next = match this.state.approval_mode.as_str() {
-                            "ask" => "yolo",
-                            "yolo" => "deny",
-                            _ => "ask",
-                        };
-                        this.state.approval_mode = next.into();
-                        this.send(Command::SetConfig(modron_protocol::ConfigPatch {
-                            approval_mode: Some(match next {
-                                "yolo" => modron_protocol::ApprovalModeWire::ApproveAll,
-                                "deny" => modron_protocol::ApprovalModeWire::Deny,
-                                _ => modron_protocol::ApprovalModeWire::Ask,
-                            }),
-                            ..Default::default()
-                        }));
-                        this.refresh(cx);
-                    })),
-            ))
-            .child(row(
-                theme,
-                "sandbox",
-                Button::new("settings-sandbox")
-                    .label(sandbox_label)
-                    .outline()
-                    .small()
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        let next = match this.state.sandbox.as_str() {
-                            "off" => "seatbelt",
-                            "seatbelt" => "bwrap",
-                            _ => "off",
-                        };
-                        let policy = match next {
-                            "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
-                            "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
-                            _ => modron_core::SandboxPolicy::Off,
-                        };
-                        this.state.sandbox = next.into();
-                        this.send(Command::SetConfig(modron_protocol::ConfigPatch {
-                            sandbox: Some(policy),
-                            ..Default::default()
-                        }));
-                        this.refresh(cx);
-                    })),
-            ));
+                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                        entity_wizard.update(cx, |this, cx| this.open_onboarding(cx));
+                    })
+                    .into_any_element(),
+            ),
+        ]);
 
-        // Automations: one row per automation, then the add form.
-        let mut auto_rows = div().flex().flex_col();
+        // -- session (SetConfig: future turns) ----------------------------
+        let apply_patch = |entity: &Entity<Self>,
+                           build: fn() -> modron_protocol::ConfigPatch|
+         -> gpui_kit::AnyElement {
+            let entity = entity.clone();
+            Button::new(SharedString::from(format!(
+                "apply-{}",
+                std::any::type_name::<fn() -> modron_protocol::ConfigPatch>()
+            )))
+            .label("apply")
+            .outline()
+            .xsmall()
+            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                entity.update(cx, |this, cx| {
+                    this.send(Command::SetConfig(build()));
+                    this.refresh(cx);
+                });
+            })
+            .into_any_element()
+        };
+        let _ = apply_patch; // (per-row closures below capture state directly)
+
+        let mode_control = Button::new("settings-mode")
+            .label(self.state.approval_mode.to_string())
+            .outline()
+            .small()
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                let next = match this.state.approval_mode.as_str() {
+                    "ask" => "yolo",
+                    "yolo" => "deny",
+                    _ => "ask",
+                };
+                this.state.approval_mode = next.into();
+                this.send(Command::SetConfig(modron_protocol::ConfigPatch {
+                    approval_mode: Some(match next {
+                        "yolo" => modron_protocol::ApprovalModeWire::ApproveAll,
+                        "deny" => modron_protocol::ApprovalModeWire::Deny,
+                        _ => modron_protocol::ApprovalModeWire::Ask,
+                    }),
+                    ..Default::default()
+                }));
+                this.refresh(cx);
+            }))
+            .into_any_element();
+
+        let sandbox_label = if self.state.sandbox.is_empty() {
+            "off"
+        } else {
+            self.state.sandbox.as_str()
+        };
+        let sandbox_control = Button::new("settings-sandbox")
+            .label(sandbox_label)
+            .outline()
+            .small()
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                let next = match this.state.sandbox.as_str() {
+                    "" | "off" => "seatbelt",
+                    "seatbelt" => "bwrap",
+                    _ => "off",
+                };
+                let policy = match next {
+                    "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
+                    "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
+                    _ => modron_core::SandboxPolicy::Off,
+                };
+                this.state.sandbox = next.into();
+                this.send(Command::SetConfig(modron_protocol::ConfigPatch {
+                    sandbox: Some(policy),
+                    ..Default::default()
+                }));
+                this.refresh(cx);
+            }))
+            .into_any_element();
+
+        // One editable row: title + hint, input, apply. The patch builder
+        // reads the input's live value inside the click handler.
+        fn editable_row<F>(
+            theme: &Theme,
+            entity: &Entity<DesktopApp>,
+            id: &'static str,
+            title: &'static str,
+            hint: &'static str,
+            input: &Entity<InputState>,
+            build: F,
+        ) -> gpui_kit::AnyElement
+        where
+            F: Fn(String) -> modron_protocol::ConfigPatch + 'static,
+        {
+            let entity_apply = entity.clone();
+            let input_apply = input.clone();
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .px_3()
+                .py_2p5()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_size(px(crate::brand::text::SM))
+                        .text_color(theme.foreground)
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .text_size(px(crate::brand::text::XS))
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(hint)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(input)))
+                        .child(Button::new(id).label("apply").outline().xsmall().on_click(
+                            move |_e: &ClickEvent, _w, cx: &mut App| {
+                                let value = input_apply.read(cx).value().to_string();
+                                let patch = build(value);
+                                entity_apply.update(cx, |this, cx| {
+                                    this.send(Command::SetConfig(patch));
+                                    this.refresh(cx);
+                                });
+                            },
+                        )),
+                )
+                .into_any_element()
+        }
+
+        let session = card_wrap(vec![
+            row(
+                "approval mode",
+                "ask prompts per run; yolo approves everything; deny blocks",
+                mode_control,
+            ),
+            row(
+                "sandbox",
+                "off, seatbelt (macOS), or bwrap (linux) for future turns",
+                sandbox_control,
+            ),
+            editable_row(
+                theme,
+                entity,
+                "apply-allow",
+                "allowed tools",
+                "comma-separated; these bypass ask mode",
+                &self.allow_input,
+                |value| {
+                    let tools: Vec<String> = value
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    modron_protocol::ConfigPatch {
+                        allow: Some(tools),
+                        ..Default::default()
+                    }
+                },
+            ),
+            editable_row(
+                theme,
+                entity,
+                "apply-deny",
+                "blocked tools",
+                "comma-separated; always denied, whatever the mode",
+                &self.deny_input,
+                |value| {
+                    let tools: Vec<String> = value
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    modron_protocol::ConfigPatch {
+                        deny: Some(tools),
+                        ..Default::default()
+                    }
+                },
+            ),
+            editable_row(
+                theme,
+                entity,
+                "apply-goal",
+                "standing goal",
+                "prepended to every task until cleared",
+                &self.goal_input,
+                |value| modron_protocol::ConfigPatch {
+                    goal: Some(value),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        // -- defaults (PersistRouter: saved to config.toml) ----------------
+        let cheap_input = self.cheap_model_input.clone();
+        let strong_input = self.strong_model_input.clone();
+        let entity_save = entity.clone();
+        let defaults_card = div()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&cheap_input).id("cheap-model")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&strong_input).id("strong-model")),
+                            ),
+                    )
+                    .child(
+                        div().flex().flex_row().justify_end().child(
+                            Button::new("save-defaults")
+                                .label("save as default")
+                                .primary()
+                                .small()
+                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                    entity_save.update(cx, |this, cx| {
+                                        let cheap = this
+                                            .cheap_model_input
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        let strong = this
+                                            .strong_model_input
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        if cheap.is_empty() || strong.is_empty() {
+                                            this.state.last_note =
+                                                Some("cheap and strong models are required".into());
+                                        } else {
+                                            this.send(Command::PersistRouter {
+                                                cheap,
+                                                strong,
+                                                cheap_fallback: None,
+                                                strong_fallback: None,
+                                            });
+                                            this.state.last_note = Some("defaults saved".into());
+                                        }
+                                        this.refresh(cx);
+                                    });
+                                }),
+                        ),
+                    ),
+            );
+
+        // -- providers -----------------------------------------------------
+        let mut provider_rows: Vec<gpui_kit::AnyElement> = Vec::new();
+        for provider in &self.state.auth_providers {
+            provider_rows.push(
+                row(
+                    Box::leak(provider.label.clone().into_boxed_str()),
+                    Box::leak(provider.status.clone().into_boxed_str()),
+                    div()
+                        .text_size(px(crate::brand::text::XS))
+                        .text_color(
+                            if provider.status.starts_with("signed in")
+                                || provider.status == "api key"
+                            {
+                                theme.foreground
+                            } else {
+                                theme.muted_foreground
+                            },
+                        )
+                        .child(SharedString::from(
+                            if provider.status.starts_with("signed in")
+                                || provider.status == "api key"
+                            {
+                                "ok"
+                            } else {
+                                "sign in via the wizard"
+                            },
+                        ))
+                        .into_any_element(),
+                )
+                .into_any_element(),
+            );
+        }
+        if provider_rows.is_empty() {
+            provider_rows.push(
+                div()
+                    .px_3()
+                    .py_2p5()
+                    .text_size(px(crate::brand::text::SM))
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from("no providers configured yet"))
+                    .into_any_element(),
+            );
+        }
+        let providers = card_wrap(provider_rows);
+
+        // -- automations ---------------------------------------------------
+        let mut auto_rows: Vec<gpui_kit::AnyElement> = Vec::new();
         for auto in &self.state.automations {
             let name: SharedString = auto.name.clone().into();
             let meta: SharedString = format!("every {}m", auto.interval_minutes).into();
             let entity_del = entity.clone();
             let del_name = auto.name.clone();
-            auto_rows = auto_rows.child(
+            let btn_id = SharedString::from(format!("automation-remove-{}", auto.name));
+            auto_rows.push(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .py_2()
+                    .py_2p5()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .child(
                         div()
                             .flex_1()
@@ -3033,8 +3368,7 @@ impl DesktopApp {
                             .text_color(theme.muted_foreground)
                             .child(meta),
                     )
-                    .child({
-                        let btn_id = SharedString::from(format!("automation-remove-{}", auto.name));
+                    .child(
                         Button::new(btn_id)
                             .icon(Icon::default().path("icons/trash.svg").size_4())
                             .ghost()
@@ -3043,88 +3377,63 @@ impl DesktopApp {
                                 entity_del.update(cx, |this, cx| {
                                     this.remove_automation(del_name.clone(), cx)
                                 });
-                            })
-                            .into_any_element()
-                    }),
+                            }),
+                    )
+                    .into_any_element(),
             );
         }
-        if self.state.automations.is_empty() {
-            auto_rows = auto_rows.child(
+        if auto_rows.is_empty() {
+            auto_rows.push(
                 div()
                     .px_3()
-                    .py_2()
+                    .py_2p5()
                     .text_size(px(crate::brand::text::SM))
                     .text_color(theme.muted_foreground)
-                    .child(SharedString::from(
-                        "no automations - add one below (a prompt the server runs on an interval)",
-                    )),
+                    .child(SharedString::from("no automations yet"))
+                    .into_any_element(),
             );
         }
-
-        let automations = div()
-            .flex()
-            .flex_col()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .child(auto_rows)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .p_3()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&self.auto_name).id("auto-name")),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&self.auto_prompt).id("auto-prompt")),
-                            )
-                            .child(
-                                div()
-                                    .w(px(120.))
-                                    .child(Input::new(&self.auto_interval).id("auto-interval")),
-                            ),
-                    )
-                    .child(
-                        div().flex().flex_row().justify_end().child(
-                            Button::new("automation-add")
-                                .label("add automation")
-                                .primary()
-                                .small()
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.add_automation(window, cx);
-                                })),
-                        ),
-                    ),
-            );
-
-        let section = |title: &'static str, card: gpui_kit::AnyElement| -> gpui_kit::AnyElement {
+        let automations = card_wrap(auto_rows).child(
             div()
                 .flex()
                 .flex_col()
-                .gap_1p5()
+                .gap_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .p_3()
                 .child(
                     div()
-                        .text_size(px(crate::brand::text::XS))
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(title)),
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.auto_name).id("auto-name")),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.auto_prompt).id("auto-prompt")),
+                        )
+                        .child(
+                            div()
+                                .w(px(110.))
+                                .child(Input::new(&self.auto_interval).id("auto-interval")),
+                        ),
                 )
-                .child(card)
-                .into_any_element()
-        };
+                .child(
+                    div().flex().flex_row().justify_end().child(
+                        Button::new("automation-add")
+                            .label("add automation")
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.add_automation(window, cx);
+                            })),
+                    ),
+                ),
+        );
 
         div()
             .flex()
@@ -3133,7 +3442,6 @@ impl DesktopApp {
             .min_w_0()
             .bg(theme.background)
             .child(
-                // Page header: back + title.
                 div()
                     .flex()
                     .flex_row()
@@ -3167,25 +3475,37 @@ impl DesktopApp {
                     .id("settings-scroll")
                     .flex_1()
                     .overflow_y_scroll()
-                    .px_6()
-                    .py_5()
                     .flex()
                     .flex_col()
-                    .gap_5()
+                    .gap_6()
+                    .px_6()
+                    .py_5()
                     .max_w(px(720.))
-                    .child(section("general", general.into_any_element()))
-                    .child(section("automations", automations.into_any_element()))
-                    .child(
-                        div().flex().flex_row().justify_end().child(
-                            Button::new("run-setup-wizard")
-                                .label("run setup wizard")
-                                .outline()
-                                .small()
-                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                    entity_wizard.update(cx, |this, cx| this.open_onboarding(cx));
-                                }),
-                        ),
-                    ),
+                    .child(section(
+                        "general",
+                        "appearance and first-run setup",
+                        general.into_any_element(),
+                    ))
+                    .child(section(
+                        "session",
+                        "applies to future turns of this session",
+                        session.into_any_element(),
+                    ))
+                    .child(section(
+                        "defaults",
+                        "cheap and strong models saved for new sessions (config.toml)",
+                        defaults_card.into_any_element(),
+                    ))
+                    .child(section(
+                        "providers",
+                        "credential status per provider",
+                        providers.into_any_element(),
+                    ))
+                    .child(section(
+                        "automations",
+                        "prompts the server runs on an interval, each in a fresh session",
+                        automations.into_any_element(),
+                    )),
             )
             .into_any_element()
     }
