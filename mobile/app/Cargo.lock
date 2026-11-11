@@ -934,6 +934,7 @@ dependencies = [
  "modron-view",
  "nsh-base",
  "nsh-core",
+ "serde",
  "serde_json",
  "uuid",
 ]

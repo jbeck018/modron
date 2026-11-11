@@ -141,6 +141,66 @@ fn do_list_sessions_json() -> Result<String, String> {
     serde_json::to_string(&client.state().sessions).map_err(|e| e.to_string())
 }
 
+fn do_add_automation(name: &str, prompt: &str, interval: u32) -> Result<(), String> {
+    let guard = lock_client()?;
+    match guard.as_ref() {
+        Some(client) => client
+            .add_automation(name, prompt, interval)
+            .map_err(err_text),
+        None => Err(not_connected()),
+    }
+}
+
+fn do_remove_automation(name: &str) -> Result<(), String> {
+    let guard = lock_client()?;
+    match guard.as_ref() {
+        Some(client) => client.remove_automation(name).map_err(err_text),
+        None => Err(not_connected()),
+    }
+}
+
+fn do_list_automations_json() -> Result<String, String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    // Fire the request; rows land in the snapshot (the poll picks them
+    // up). Return the current rows so the caller renders immediately.
+    client.list_automations().map_err(err_text)?;
+    serde_json::to_string(&client.state().automations).map_err(|e| e.to_string())
+}
+
+fn do_publish_page(title: &str, content_md: &str) -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    let Some(id) = client.state().session_id else {
+        return Err("no attached session".into());
+    };
+    client.publish_page(id, title, content_md).map_err(err_text)
+}
+
+/// The shared slash-command table (`modron_view::slash`), as JSON: the
+/// composer's autocomplete and /help render it verbatim, so a command
+/// typed on any client means the same thing.
+fn do_slash_commands_json() -> String {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    struct Row {
+        name: &'static str,
+        usage: &'static str,
+        about: &'static str,
+        scope: modron_view::slash::Scope,
+    }
+    let rows: Vec<Row> = modron_view::slash::SLASH_COMMANDS
+        .iter()
+        .map(|c| Row {
+            name: c.name,
+            usage: c.usage,
+            about: c.about,
+            scope: c.scope,
+        })
+        .collect();
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+}
+
 fn do_snapshot_json() -> String {
     let guard = match lock_client() {
         Ok(guard) => guard,
@@ -275,6 +335,36 @@ impl Remote {
     pub fn demo_snapshot_json() -> String {
         demo_snapshot()
     }
+
+    /// Add an automation (settings view); the refreshed rows land in the
+    /// snapshot.
+    pub fn add_automation(name: String, prompt: String, interval_minutes: u32) -> Result<(), String> {
+        do_add_automation(&name, &prompt, interval_minutes)
+    }
+
+    /// Remove an automation by name; the refreshed rows land in the
+    /// snapshot.
+    pub fn remove_automation(name: String) -> Result<(), String> {
+        do_remove_automation(&name)
+    }
+
+    /// Fire an automations list request; the snapshot's automations
+    /// update when the answer lands. Returns the current rows.
+    pub fn list_automations_json() -> Result<String, String> {
+        do_list_automations_json()
+    }
+
+    /// Publish the attached session's transcript as a read-only page;
+    /// the URL lands in the snapshot's last_note.
+    pub fn publish_page(title: String, content_md: String) -> Result<(), String> {
+        do_publish_page(&title, &content_md)
+    }
+
+    /// The shared slash-command table as JSON (name/usage/about/scope):
+    /// the composer's autocomplete and /help render it verbatim.
+    pub fn slash_commands_json() -> String {
+        do_slash_commands_json()
+    }
 }
 
 // The demo fixture: shared types only - the screen renders exactly what a
@@ -321,6 +411,12 @@ fn demo_snapshot() -> String {
         model: "claude-opus-5".into(),
         provider: "anthropic".into(),
         goal: String::new(),
+        automations: vec![modron_protocol::AutomationWire {
+            name: "nightly repo audit".into(),
+            prompt: "audit the repo for rot and open notes".into(),
+            interval_minutes: 1440,
+            last_run: None,
+        }],
         sessions: vec![SessionMetaWire {
             id: uuid::Uuid::nil(),
             title: "migrate the router to the new hub".into(),

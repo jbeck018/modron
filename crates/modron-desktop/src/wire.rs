@@ -244,6 +244,9 @@ pub enum Command {
         title: String,
         content_md: String,
     },
+    Fork {
+        session_id: uuid::Uuid,
+    },
     RemoteControl {
         session_id: uuid::Uuid,
         bridge_url: String,
@@ -321,6 +324,9 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
             session_id: *session_id,
             title: title.clone(),
             content_md: content_md.clone(),
+        },
+        Command::Fork { session_id } => Payload::Fork {
+            session_id: *session_id,
         },
         Command::RemoteControl {
             session_id,

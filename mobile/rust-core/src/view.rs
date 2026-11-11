@@ -210,6 +210,9 @@ pub struct SessionViewModel {
     pub approval_mode: Option<ApprovalModeWire>,
     /// Sessions list (answers to `list_sessions`).
     pub sessions: Vec<SessionMetaWire>,
+    /// Scheduled automations (answers to `list_automations`; settings
+    /// views render these).
+    pub automations: Vec<modron_protocol::AutomationWire>,
     /// Last seen server seq for this session (reconnect resumes past it).
     pub last_seq: u64,
     pub turns_completed: u32,
@@ -269,6 +272,8 @@ pub struct ViewModelSnapshot {
     pub provider: String,
     pub goal: String,
     pub sessions: Vec<SessionMetaWire>,
+    /// Scheduled automations (settings views render these).
+    pub automations: Vec<modron_protocol::AutomationWire>,
     pub last_seq: u64,
     pub last_error: Option<String>,
     pub last_note: Option<String>,
@@ -322,6 +327,7 @@ impl ViewModelSnapshot {
             provider: vm.provider.clone(),
             goal: vm.goal.clone(),
             sessions: vm.sessions.clone(),
+            automations: vm.automations.clone(),
             last_seq: vm.last_seq,
             last_error: vm.last_error.clone(),
             last_note: vm.last_note.clone(),

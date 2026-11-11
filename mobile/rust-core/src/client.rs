@@ -410,6 +410,72 @@ impl RemoteClient {
         ))
     }
 
+    /// List automations: fires the request; the rows land in
+    /// `state().automations` (settings views read them there).
+    pub fn list_automations(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AutomationsList {},
+        ))
+    }
+
+    /// Add an automation (a prompt on an interval); the refreshed rows
+    /// land in `state().automations`.
+    pub fn add_automation(
+        &self,
+        name: impl Into<String>,
+        prompt: impl Into<String>,
+        interval_minutes: u32,
+    ) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AutomationAdd {
+                name: name.into(),
+                prompt: prompt.into(),
+                interval_minutes,
+            },
+        ))
+    }
+
+    /// Remove an automation by name; the refreshed rows land in
+    /// `state().automations`.
+    pub fn remove_automation(&self, name: impl Into<String>) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AutomationRemove { name: name.into() },
+        ))
+    }
+
+    /// Publish the transcript as a read-only page on the bridge; the URL
+    /// lands in `state().last_note`.
+    pub fn publish_page(
+        &self,
+        session_id: Uuid,
+        title: impl Into<String>,
+        content_md: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::PublishPage {
+                session_id,
+                title: title.into(),
+                content_md: content_md.into(),
+            },
+        ))
+    }
+
+    /// Open a remote-control tunnel for the session; the share URL lands
+    /// in `state().last_note` (the server notes it too).
+    pub fn remote_control(&self, session_id: Uuid, bridge_url: &str) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::RemoteControl {
+                session_id,
+                bridge_url: bridge_url.into(),
+            },
+        ))
+    }
+
     /// Create an empty session without submitting a task.
     pub fn new_session(&self, title: Option<&str>) -> Result<(), ClientError> {
         self.send_frame(Frame::request(
@@ -600,6 +666,10 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         }
         Payload::ConfigChanged { patch } => apply_config(vm, &patch),
         Payload::Sessions { sessions } => vm.sessions = sessions,
+        Payload::Automations { rows } => vm.automations = rows,
+        Payload::PagePublished { url } => {
+            vm.last_note = Some(format!("published: {url}"));
+        }
         Payload::TurnDone { summary } => fold_turn_done(vm, fold, &summary),
         Payload::TurnFailed { error } => fold_turn_unfinished(vm, fold, Some(error)),
         Payload::TurnAborted {} => fold_turn_unfinished(vm, fold, None),

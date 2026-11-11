@@ -117,6 +117,9 @@ pub struct AppState {
     pub provider: String,
     /// Approval-mode label (`ask`/`yolo`/`deny`; `ask` = engine default).
     pub approval_mode: String,
+    /// The sandbox label (settings control; the last /sandbox patch this
+    /// client sent; the server keeps the wire truth).
+    pub sandbox: String,
     /// Standing goal (snapshot `live.goal`).
     pub goal: String,
 
@@ -350,6 +353,13 @@ impl AppState {
         }
         if let Some(mode) = patch.approval_mode {
             self.approval_mode = approval_mode_label(mode).to_string();
+        }
+        if let Some(policy) = patch.sandbox {
+            self.sandbox = match policy {
+                modron_core::SandboxPolicy::Seatbelt => "seatbelt".into(),
+                modron_core::SandboxPolicy::Bubblewrap => "bwrap".into(),
+                modron_core::SandboxPolicy::Off => "off".into(),
+            };
         }
         if let Some(goal) = &patch.goal {
             self.goal = goal.clone();

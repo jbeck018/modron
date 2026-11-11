@@ -14,7 +14,7 @@
 //! catalog ([`modron_router::lookup`]).
 
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::Icon;
 use gpui_kit::component::{ActiveTheme, Selectable, Sizable};
@@ -55,7 +55,7 @@ fn catalog_rows() -> Vec<ModelRow> {
         .collect()
 }
 
-gpui_kit::actions!(modron_desktop, [NewChat]);
+gpui_kit::actions!(modron_desktop, [NewChat, ComposerSubmit]);
 
 static NEXT_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -150,7 +150,11 @@ pub struct DesktopApp {
     /// The rows the transcript list renders (state.rows(), cached).
     display: Vec<Row>,
     list_state: ListState,
-    composer: Entity<InputState>,
+    composer: Entity<TextareaState>,
+    /// Live slash-command candidates (a leading "/" in the composer).
+    slash_candidates: Vec<&'static str>,
+    /// The /help overlay (the shared slash-command table).
+    help_open: bool,
     filter: Entity<InputState>,
     /// The sidebar's type-to-filter input (sessions only; the model
     /// picker has its own).
@@ -236,20 +240,39 @@ impl DesktopApp {
         events: async_channel::Receiver<UiEvent>,
         resume: Option<Option<uuid::Uuid>>,
     ) -> Self {
-        let composer =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Type a task; enter to send"));
+        let composer = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx)
+                .placeholder("type a task; cmd+enter sends, shift+enter = newline");
+            state.set_auto_grow(1, 8, cx);
+            state
+        });
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("type to filter"));
         let session_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter sessions"));
 
-        // Enter in the composer submits.
+        // Typing updates the slash-command popup: a leading "/" filters
+        // the shared table (modron_view::slash); Enter-free selection via
+        // click keeps the grammar simple (cmd+enter sends).
         cx.subscribe_in(
             &composer,
             window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { .. } = event {
-                    let task = this.composer.read(cx).value().to_string();
-                    this.submit(&task, window, cx);
+            |this, _input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                    let text = this.composer.read(cx).value().to_string();
+                    let next = if let Some(token) = text.strip_prefix('/') {
+                        let token = token.split_whitespace().next().unwrap_or("");
+                        modron_view::slash::SLASH_COMMANDS
+                            .iter()
+                            .filter(|c| c.name.starts_with(token))
+                            .map(|c| c.name)
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    if next != this.slash_candidates {
+                        this.slash_candidates = next;
+                        this.refresh(cx);
+                    }
                 }
             },
         )
@@ -288,6 +311,8 @@ impl DesktopApp {
             display: Vec::new(),
             list_state: ListState::new(0, ListAlignment::Bottom, px(256.)),
             composer,
+            slash_candidates: Vec::new(),
+            help_open: false,
             filter,
             session_filter,
             session_filter_query: String::new(),
@@ -454,6 +479,14 @@ impl DesktopApp {
         self.composer.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
+        // The shared slash system (modron_view::slash): commands typed in
+        // the composer execute client-side/server-side and never reach
+        // the model. Same names as the TUI and the web/mobile shell.
+        if let Some(command) = task.strip_prefix('/') {
+            let (name, rest) = command.split_once(' ').unwrap_or((command, ""));
+            self.execute_slash(name.trim(), rest.trim(), window, cx);
+            return;
+        }
         self.state.mark_running();
         self.state.last_note = None;
         let session_id = self.state.attached;
@@ -588,6 +621,144 @@ impl DesktopApp {
         self.refresh(cx);
     }
 
+    /// Execute one shared slash command (the client-side arm; wire
+    /// effects ride the existing Command enum).
+    fn execute_slash(
+        &mut self,
+        name: &str,
+        arg: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match name {
+            "model" => {
+                if arg.is_empty() {
+                    self.open_picker(window, cx);
+                } else {
+                    let hit = catalog_rows()
+                        .into_iter()
+                        .find(|row| row.name == arg || row.name.contains(arg));
+                    if let Some(row) = hit {
+                        let patch = crate::app_state::model_patch(&row.name);
+                        self.send(Command::SetConfig(patch));
+                        self.state.model = row.name.clone();
+                        self.state.last_note =
+                            Some(format!("model set to {} (next turn)", row.name));
+                    } else {
+                        self.state.last_note = Some(format!("no model matching '{arg}'"));
+                    }
+                    self.refresh(cx);
+                }
+            }
+            "mode" => {
+                if arg.is_empty() {
+                    self.cycle_mode(cx);
+                } else {
+                    let patch = crate::app_state::model_patch(self.state.model.as_str());
+                    let mut patch = patch;
+                    patch.approval_mode = Some(match arg {
+                        "yolo" | "auto" => modron_protocol::ApprovalModeWire::ApproveAll,
+                        "deny" => modron_protocol::ApprovalModeWire::Deny,
+                        _ => modron_protocol::ApprovalModeWire::Ask,
+                    });
+                    self.send(Command::SetConfig(patch));
+                    self.state.last_note = Some(format!("mode set to {arg} (next turn)"));
+                    self.refresh(cx);
+                }
+            }
+            "sandbox" => {
+                let policy = match arg {
+                    "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
+                    "bwrap" | "bubblewrap" => modron_core::SandboxPolicy::Bubblewrap,
+                    _ => modron_core::SandboxPolicy::Off,
+                };
+                let mut patch = crate::app_state::model_patch(self.state.model.as_str());
+                patch.sandbox = Some(policy);
+                self.send(Command::SetConfig(patch));
+                self.state.last_note = Some(format!(
+                    "sandbox set to {} (next turn)",
+                    match policy {
+                        modron_core::SandboxPolicy::Seatbelt => "seatbelt",
+                        modron_core::SandboxPolicy::Bubblewrap => "bwrap",
+                        modron_core::SandboxPolicy::Off => "off",
+                    }
+                ));
+                self.refresh(cx);
+            }
+            "new" => {
+                self.send(Command::NewSession { title: None });
+                self.send(Command::ListSessions);
+                self.refresh(cx);
+            }
+            "fork" => {
+                if let Some(id) = self.state.attached {
+                    self.send(Command::Fork { session_id: id });
+                    self.refresh(cx);
+                }
+            }
+            "tasks" => {
+                if let Some(id) = self.state.attached {
+                    self.send(Command::TaskStatus(id));
+                    self.refresh(cx);
+                }
+            }
+            "share" => {
+                self.publish_page(cx);
+            }
+            "remote-control" => {
+                if let Some(id) = self.state.attached {
+                    self.send(Command::RemoteControl {
+                        session_id: id,
+                        bridge_url: arg.to_string(),
+                    });
+                    self.refresh(cx);
+                }
+            }
+            "auth" | "settings" => {
+                self.settings_open = true;
+                self.refresh(cx);
+            }
+            "help" => {
+                self.toggle_help(cx);
+            }
+            other => {
+                self.state.last_note = Some(format!("unknown command /{other} - try /help"));
+                self.refresh(cx);
+            }
+        }
+    }
+
+    /// The /help overlay toggle (renders the shared slash table).
+    fn toggle_help(&mut self, cx: &mut Context<Self>) {
+        self.help_open = !self.help_open;
+        self.refresh(cx);
+    }
+
+    /// The "+" control: a platform file finder (files + folders), staged
+    /// as attachments. The clipboard path stays for paste.
+    fn open_file_finder(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui_kit::gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Ok(()) = this.update(cx, |this, cx| {
+                for path in paths {
+                    let _ = this.stage_from_path(&path);
+                }
+                this.refresh(cx);
+            }) else {
+                return;
+            };
+        })
+        .detach();
+    }
+
     fn delete_session(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
         self.confirm_delete = None;
         if self.state.attached == Some(id) {
@@ -699,54 +870,6 @@ impl DesktopApp {
         };
         self.staged.push((attachment, label, thumb));
         Ok(())
-    }
-
-    /// Stage whatever usable sits on the clipboard: an image, or copied
-    /// file paths (Finder copies).
-    fn stage_clipboard(&mut self, cx: &App) -> Result<(), String> {
-        let Some(item) = cx.read_from_clipboard() else {
-            return Err("the clipboard is empty".into());
-        };
-        let mut staged_any = false;
-        let mut last_error = None;
-        for entry in item.entries() {
-            match entry {
-                gpui_kit::ClipboardEntry::Image(image) => {
-                    let media_type = match image.format {
-                        gpui_kit::ImageFormat::Png => "image/png",
-                        gpui_kit::ImageFormat::Jpeg => "image/jpeg",
-                        gpui_kit::ImageFormat::Webp => "image/webp",
-                        gpui_kit::ImageFormat::Gif => "image/gif",
-                        _ => "image/png",
-                    };
-                    let kb = image.bytes.len() / 1024;
-                    let thumb = Some(render_image(image.format, image.bytes.clone()));
-                    self.staged.push((
-                        Attachment::Image {
-                            media_type: media_type.into(),
-                            data: modron_core::b64::encode(&image.bytes),
-                        },
-                        format!("clipboard image · {kb} KB"),
-                        thumb,
-                    ));
-                    staged_any = true;
-                }
-                gpui_kit::ClipboardEntry::ExternalPaths(paths) => {
-                    for path in paths.paths() {
-                        match self.stage_from_path(path) {
-                            Ok(()) => staged_any = true,
-                            Err(e) => last_error = Some(e),
-                        }
-                    }
-                }
-                gpui_kit::ClipboardEntry::String(_) => {}
-            }
-        }
-        match (staged_any, last_error) {
-            (true, _) => Ok(()),
-            (false, Some(e)) => Err(e),
-            (false, None) => Err("no image or files on the clipboard - drag one in instead".into()),
-        }
     }
 
     // -- settings / automations / onboarding -------------------------------
@@ -2215,114 +2338,216 @@ impl DesktopApp {
             self.state.model.clone().into()
         };
         let pill_entity = entity.clone();
+        // The slash popup: candidate commands for the leading "/" token,
+        // rendered above the pill; click executes.
+        let slash_focus = self.composer.read(cx).focus_handle(cx);
         let composer = div().px_4().pb_3().pt_1().child(staged_row).child(
             div()
                 .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.background)
-                .shadow_sm()
-                .child(
-                    Button::new("add-attachment")
-                        .label("+")
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            if let Err(e) = this.stage_clipboard(cx) {
-                                this.state.last_note = Some(e);
-                            }
-                            this.refresh(cx);
-                        })),
-                )
-                .child(
-                    Button::new("mode-chip")
-                        .label(mode_chip)
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _e, _w, cx| this.cycle_mode(cx))),
-                )
-                .child(div().flex_1().child(Input::new(&self.composer).on_paste({
-                    let weak_self = self.weak_self.clone();
-                    move |item, _window, cx| -> bool {
-                        // Images and copied files stage as attachments
-                        // (true = consumed); plain text falls through
-                        // to normal paste.
-                        let Some(app) = weak_self.upgrade() else {
-                            return false;
-                        };
-                        let mut took = false;
-                        app.update(cx, |this, cx| {
-                            for entry in item.entries() {
-                                match entry {
-                                    gpui_kit::ClipboardEntry::Image(image) => {
-                                        let media_type = match image.format {
-                                            gpui_kit::ImageFormat::Png => "image/png",
-                                            gpui_kit::ImageFormat::Jpeg => "image/jpeg",
-                                            gpui_kit::ImageFormat::Webp => "image/webp",
-                                            gpui_kit::ImageFormat::Gif => "image/gif",
-                                            _ => "image/png",
-                                        };
-                                        let kb = image.bytes.len() / 1024;
-                                        let thumb =
-                                            Some(render_image(image.format, image.bytes.clone()));
-                                        this.staged.push((
-                                            Attachment::Image {
-                                                media_type: media_type.into(),
-                                                data: modron_core::b64::encode(&image.bytes),
-                                            },
-                                            format!("pasted image · {kb} KB"),
-                                            thumb,
-                                        ));
-                                        took = true;
-                                    }
-                                    gpui_kit::ClipboardEntry::ExternalPaths(paths) => {
-                                        for path in paths.paths() {
-                                            if this.stage_from_path(path).is_ok() {
-                                                took = true;
-                                            }
-                                        }
-                                    }
-                                    gpui_kit::ClipboardEntry::String(_) => {}
-                                }
-                            }
-                            if took {
-                                this.refresh(cx);
-                            }
-                        });
-                        took
-                    }
-                })))
-                .child(
-                    Button::new("model-chip")
-                        .label(model_chip)
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _e, window, cx| {
-                            this.open_picker(window, cx);
-                        })),
-                )
-                .children(if self.state.running {
-                    vec![Button::new("stop")
-                        .label("stop")
-                        .danger()
-                        .small()
-                        .on_click(cx.listener(|this, _e, _w, cx| this.interrupt(cx)))]
+                .flex_col()
+                .gap_1()
+                .children(if self.slash_candidates.is_empty() {
+                    vec![]
                 } else {
-                    vec![Button::new("send")
-                        .label("\u{2191}")
-                        .primary()
-                        .small()
-                        .on_click(cx.listener(|this, _e, window, cx| {
+                    let entity_popup = cx.entity();
+                    let mut popup = div()
+                        .id("slash-popup")
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .shadow_sm()
+                        .p_1()
+                        .max_h(px(240.))
+                        .overflow_y_scroll();
+                    let query = self.composer.read(cx).value().to_string();
+                    let token = query
+                        .strip_prefix('/')
+                        .and_then(|t| t.split_whitespace().next())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    for spec in modron_view::slash::SLASH_COMMANDS {
+                        if !spec.name.starts_with(&token) {
+                            continue;
+                        }
+                        let entity_click = entity_popup.clone();
+                        let name = spec.name;
+                        popup = popup.child(
+                            div()
+                                .id(SharedString::from(format!("slash-{name}")))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme.secondary.opacity(0.5)))
+                                .on_click(move |_e, window, cx: &mut App| {
+                                    entity_click.update(cx, |this, cx| {
+                                        // The command executes; any typed
+                                        // token clears with the submit path.
+                                        this.composer.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                        });
+                                        this.slash_candidates.clear();
+                                        let arg = "";
+                                        this.execute_slash(name, arg, window, cx);
+                                    });
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(crate::brand::text::SM))
+                                        .text_color(theme.accent_foreground)
+                                        .child(SharedString::from(format!("/{}", spec.name))),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(crate::brand::text::XS))
+                                        .text_color(theme.muted_foreground)
+                                        .child(SharedString::from(spec.about)),
+                                ),
+                        );
+                    }
+                    vec![popup]
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .shadow_sm()
+                        .key_context("Composer")
+                        .track_focus(&slash_focus)
+                        .on_action(cx.listener(|this, _action: &ComposerSubmit, window, cx| {
                             let task = this.composer.read(cx).value().to_string();
                             this.submit(&task, window, cx);
-                        }))]
-                }),
+                        }))
+                        .child(
+                            Button::new("add-attachment")
+                                .icon(Icon::default().path("icons/plus.svg").size_4())
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    // The finder (files) is the "+" grammar;
+                                    // clipboard staging stays on paste.
+                                    this.open_file_finder(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("mode-chip")
+                                .label(mode_chip)
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _e, _w, cx| this.cycle_mode(cx))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Textarea::new(&self.composer).on_paste({
+                                    let weak_self = self.weak_self.clone();
+                                    move |item, _window, cx| -> bool {
+                                        // Images and copied files stage as attachments
+                                        // (true = consumed); plain text falls through
+                                        // to normal paste.
+                                        let Some(app) = weak_self.upgrade() else {
+                                            return false;
+                                        };
+                                        let mut took = false;
+                                        app.update(cx, |this, cx| {
+                                            for entry in item.entries() {
+                                                match entry {
+                                                    gpui_kit::ClipboardEntry::Image(image) => {
+                                                        let media_type = match image.format {
+                                                            gpui_kit::ImageFormat::Png => {
+                                                                "image/png"
+                                                            }
+                                                            gpui_kit::ImageFormat::Jpeg => {
+                                                                "image/jpeg"
+                                                            }
+                                                            gpui_kit::ImageFormat::Webp => {
+                                                                "image/webp"
+                                                            }
+                                                            gpui_kit::ImageFormat::Gif => {
+                                                                "image/gif"
+                                                            }
+                                                            _ => "image/png",
+                                                        };
+                                                        let kb = image.bytes.len() / 1024;
+                                                        let thumb = Some(render_image(
+                                                            image.format,
+                                                            image.bytes.clone(),
+                                                        ));
+                                                        this.staged.push((
+                                                            Attachment::Image {
+                                                                media_type: media_type.into(),
+                                                                data: modron_core::b64::encode(
+                                                                    &image.bytes,
+                                                                ),
+                                                            },
+                                                            format!("pasted image · {kb} KB"),
+                                                            thumb,
+                                                        ));
+                                                        took = true;
+                                                    }
+                                                    gpui_kit::ClipboardEntry::ExternalPaths(
+                                                        paths,
+                                                    ) => {
+                                                        for path in paths.paths() {
+                                                            if this.stage_from_path(path).is_ok() {
+                                                                took = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    gpui_kit::ClipboardEntry::String(_) => {}
+                                                }
+                                            }
+                                            if took {
+                                                this.refresh(cx);
+                                            }
+                                        });
+                                        took
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new("model-chip")
+                                .label(model_chip)
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.open_picker(window, cx);
+                                })),
+                        )
+                        .children(if self.state.running {
+                            vec![Button::new("stop")
+                                .label("stop")
+                                .danger()
+                                .small()
+                                .on_click(cx.listener(|this, _e, _w, cx| this.interrupt(cx)))]
+                        } else {
+                            vec![Button::new("send")
+                                .label("\u{2191}")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    let task = this.composer.read(cx).value().to_string();
+                                    this.submit(&task, window, cx);
+                                }))]
+                        }),
+                ),
         );
         let _ = pill_entity;
 
@@ -2500,6 +2725,90 @@ impl DesktopApp {
     /// Settings overlay: model chip, approval mode, reasoning, theme,
     /// automations CRUD, onboarding entry. Every control drives the same
     /// protocol commands as the chat surface (parity: the /command set).
+    /// The /help overlay: the shared slash-command table
+    /// (modron_view::slash), rendered verbatim - the same copy the TUI's
+    /// help and the web/mobile shells show.
+    fn render_help(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants};
+        let theme = cx.theme();
+        let mut rows = div().flex().flex_col().gap_1();
+        for spec in modron_view::slash::SLASH_COMMANDS {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(150.))
+                            .truncate()
+                            .text_size(px(crate::brand::text::SM))
+                            .text_color(theme.accent_foreground)
+                            .child(SharedString::from(spec.usage)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(crate::brand::text::SM))
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(spec.about)),
+                    ),
+            );
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .bg(gpui_kit::black())
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _e, _w, cx| {
+                    this.help_open = false;
+                    this.refresh(cx);
+                }),
+            )
+            .child(
+                div()
+                    .id("help-panel")
+                    .w(px(560.))
+                    .max_h(px(520.))
+                    .overflow_y_scroll()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(crate::brand::text::XL))
+                                    .text_color(theme.foreground)
+                                    .child(SharedString::from("slash commands")),
+                            )
+                            .child(
+                                Button::new("help-close")
+                                    .label("close")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.help_open = false;
+                                        this.refresh(cx);
+                                    })),
+                            ),
+                    )
+                    .child(rows),
+            )
+            .into_any_element()
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::component::button::{Button, ButtonVariants};
         use gpui_kit::component::input::Input;
@@ -2551,9 +2860,10 @@ impl DesktopApp {
                             })),
                     ),
             )
-            // Approval mode.
+            // Approval mode + sandbox policy (TUI /mode and /sandbox
+            // parity; the settings surface is the GUI's /settings).
             .child(
-                div().flex().flex_row().gap_2().child(
+                div().flex().flex_row().gap_2().children([
                     Button::new("settings-mode")
                         .label(format!("mode: {}", self.state.approval_mode))
                         .ghost()
@@ -2575,7 +2885,29 @@ impl DesktopApp {
                             }));
                             this.refresh(cx);
                         })),
-                ),
+                    Button::new("settings-sandbox")
+                        .label(format!("sandbox: {}", self.state.sandbox))
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            let next = match this.state.sandbox.as_str() {
+                                "off" => "seatbelt",
+                                "seatbelt" => "bwrap",
+                                _ => "off",
+                            };
+                            let policy = match next {
+                                "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
+                                "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
+                                _ => modron_core::SandboxPolicy::Off,
+                            };
+                            this.state.sandbox = next.into();
+                            this.send(Command::SetConfig(modron_protocol::ConfigPatch {
+                                sandbox: Some(policy),
+                                ..Default::default()
+                            }));
+                            this.refresh(cx);
+                        })),
+                ]),
             );
 
         // Automations section.
@@ -2953,6 +3285,9 @@ impl Render for DesktopApp {
         if self.settings_open {
             root = root.child(self.render_settings(cx));
         }
+        if self.help_open {
+            root = root.child(self.render_help(cx));
+        }
         if let Some(step) = self.onboarding_step {
             root = root.child(self.render_onboarding(step, cx));
         }
@@ -3225,6 +3560,8 @@ pub fn run(options: LaunchOptions) {
             // The sidebar's "New chat" row advertises this hint; the
             // action is handled on the window root.
             KeyBinding::new("cmd-n", NewChat, None),
+            // The composer's send (textarea Enter = newline).
+            KeyBinding::new("cmd-enter", ComposerSubmit, Some("Composer")),
         ]);
         let (window, view) = gpui_kit::open_window(
             WindowOptions {

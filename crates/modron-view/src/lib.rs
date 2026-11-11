@@ -16,6 +16,7 @@
 //!   protocol snapshot).
 
 pub mod gen_ui;
+pub mod slash;
 
 pub use gen_ui::{
     render_ascii, split_generative_ui, ChartKind, GenField, GenFieldKind, GenPoint, GenSegment,
