@@ -40,6 +40,22 @@ interface SessionMeta {
   message_count: number;
 }
 
+interface AutomationRow {
+  name: string;
+  prompt: string;
+  interval_minutes: number;
+  last_run: string | null;
+}
+
+// One row of the shared slash-command table (modron-view::slash), served
+// by Remote.slashCommandsJson() as name/usage/about/scope.
+interface SlashCommand {
+  name: string;
+  usage: string;
+  about: string;
+  scope: string;
+}
+
 interface Snapshot {
   connection_label: string;
   session_id: string | null;
@@ -62,6 +78,7 @@ interface Snapshot {
   provider: string;
   goal: string;
   sessions: SessionMeta[];
+  automations: AutomationRow[];
   last_seq: number;
   last_error: string | null;
   last_note: string | null;
@@ -81,6 +98,21 @@ const url = signal(Remote.defaultUrl());
 const draft = signal("");
 const connectError = signal<string | null>(null);
 const busy = signal(false);
+// The /help note (and unknown-command hint), rendered above the composer.
+const helpNote = signal<string | null>(null);
+// The automation add-form fields (settings view).
+const autoName = signal("");
+const autoPrompt = signal("");
+const autoInterval = signal("");
+
+// The shared slash-command table is compile-time (modron-view::slash): fetch
+// it once at startup for the composer's suggestions and the /help body.
+const slashCommands = signal<SlashCommand[]>([]);
+try {
+  slashCommands.set(JSON.parse(Remote.slashCommandsJson()) as SlashCommand[]);
+} catch {
+  // The table lives in the binary; an empty list only hides suggestions.
+}
 
 const POLL_MS = 250;
 const poll = setInterval(() => {
@@ -95,7 +127,7 @@ const poll = setInterval(() => {
   }
 }, POLL_MS);
 
-const stack = createNavStack<"sessions" | "chat">(["sessions"]);
+const stack = createNavStack<"sessions" | "chat" | "settings">(["sessions"]);
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -161,6 +193,14 @@ async function decide(option: DecisionOption): Promise<void> {
 function submitDraft(): void {
   const task = draft().trim();
   if (task.length === 0) return;
+  if (task.startsWith("/")) {
+    // Slash commands run client-side (AGENTS.md parity: only what this
+    // surface can execute; the rest answers "unknown").
+    runSlash(task);
+    draft.set("");
+    return;
+  }
+  helpNote.set(null);
   if (demo()) {
     draft.set("");
     return;
@@ -168,6 +208,119 @@ function submitDraft(): void {
   try {
     Remote.submit(snap().session_id, task);
     draft.set("");
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
+// Only what this shell can execute - no invented exports. Everything
+// else in the shared table answers "unknown command" here.
+const EXECUTABLE_SLASH = new Set(["new", "share", "settings", "help", "model"]);
+
+// The suggestions above the composer: the executable slice of the shared
+// table, filtered by the word being typed (hidden once args start).
+function slashSuggestions(): SlashCommand[] {
+  const text = draft();
+  if (!text.startsWith("/") || text.includes(" ")) return [];
+  const token = text.slice(1).toLowerCase();
+  return slashCommands().filter(
+    (command) =>
+      EXECUTABLE_SLASH.has(command.name) && command.name.startsWith(token),
+  );
+}
+
+// Publish the attached session's transcript as a read-only page; the URL
+// lands in last_note, which the poll already renders.
+function publishTranscript(): void {
+  const title =
+    snap().sessions.find((s) => s.id === snap().session_id)?.title ??
+    "modron transcript";
+  const content = snap().history
+    .map((row) => row.lines.join("\n"))
+    .join("\n\n");
+  try {
+    Remote.publishPage(title, content);
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
+// Open the settings view; ask the server for automations once so the rows
+// are fresh (the demo snapshot already carries its own).
+function enterSettings(): void {
+  try {
+    Remote.listAutomationsJson();
+  } catch {
+    // Demo or between connections: render what the snapshot has.
+  }
+  stack.push("settings");
+}
+
+function runSlash(raw: string): void {
+  const spaceAt = raw.indexOf(" ");
+  const name = (
+    spaceAt === -1 ? raw.slice(1) : raw.slice(1, spaceAt)
+  ).toLowerCase();
+  const args = spaceAt === -1 ? "" : raw.slice(spaceAt + 1).trim();
+  switch (name) {
+    case "new":
+      try {
+        Remote.newSession(null);
+        Remote.listSessionsJson();
+      } catch (e) {
+        connectError.set(e instanceof Error ? e.message : String(e));
+      }
+      break;
+    case "share":
+      publishTranscript();
+      break;
+    case "settings":
+      enterSettings();
+      break;
+    case "help": {
+      // The /help body renders the shared copy, executable rows only.
+      const lines = slashCommands()
+        .filter((command) => EXECUTABLE_SLASH.has(command.name))
+        .map((command) => `${command.usage} - ${command.about}`);
+      helpNote.set(["slash commands:", ...lines].join("\n"));
+      break;
+    }
+    case "model":
+      if (args.length === 0) {
+        helpNote.set("use /model <name>");
+        break;
+      }
+      try {
+        Remote.selectModel(args, snap().provider);
+      } catch (e) {
+        connectError.set(e instanceof Error ? e.message : String(e));
+      }
+      break;
+    default:
+      helpNote.set("unknown command - try /help");
+  }
+}
+
+function addAutomationFromForm(): void {
+  const name = autoName().trim();
+  const prompt = autoPrompt().trim();
+  const minutes = Number.parseInt(autoInterval(), 10);
+  if (name.length === 0 || prompt.length === 0) return;
+  try {
+    Remote.addAutomation(name, prompt, Number.isNaN(minutes) ? 60 : minutes);
+    Remote.listAutomationsJson();
+    autoName.set("");
+    autoPrompt.set("");
+    autoInterval.set("");
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
+function removeAutomation(name: string): void {
+  try {
+    Remote.removeAutomation(name);
+    Remote.listAutomationsJson();
   } catch (e) {
     connectError.set(e instanceof Error ? e.message : String(e));
   }
@@ -314,14 +467,40 @@ function ChatScreen() {
         ) : null}
       </Scroll>
       <ApprovalSheet />
+      {helpNote() ? (
+        <View class="mx-3 mb-1 rounded-xl border border-border bg-card p-3">
+          <Text class="text-muted-foreground text-xs">{helpNote()}</Text>
+        </View>
+      ) : null}
+      {slashSuggestions().length > 0 ? (
+        <View class="mx-3 mb-1 gap-1">
+          {slashSuggestions().map((command) => (
+            <View
+              key={command.name}
+              role="button"
+              class="flex-row items-center gap-2 rounded-(--radius) border border-border bg-card px-3 py-2 active:opacity-80"
+              onPress={() => {
+                runSlash("/" + command.name);
+                draft.set("");
+              }}
+            >
+              <Text class="text-accent text-sm font-medium">{command.usage}</Text>
+              <Text class="flex-1 text-muted-foreground text-xs">
+                {command.about}
+              </Text>
+            </View>
+          ))}
+        </View>
+      ) : null}
       <View
         class="flex-row gap-2 px-3 pb-[env(safe-area-inset-bottom)] pt-2 border-t border-border bg-background items-center"
       >
         <Input
           class="flex-1 rounded-(--radius) border border-border bg-card px-3 py-2 text-foreground"
           value={draft()}
-          placeholder={demo() ? "demo mode - connect to type" : "task..."}
+          placeholder={demo() ? "demo mode - connect to type" : "task... /help"}
           returnKeyType="send"
+          multiline
           submitBehavior="submit"
           onChange={(e) => draft.set(e.value)}
           onSubmit={() => submitDraft()}
@@ -361,6 +540,13 @@ function SessionsScreen() {
             <Text class="text-secondary-foreground text-sm">
               {demo() ? "demo on" : "demo off"}
             </Text>
+          </View>
+          <View
+            role="button"
+            class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+            onPress={() => enterSettings()}
+          >
+            <Text class="text-secondary-foreground text-sm">settings</Text>
           </View>
         </View>
         <View class="flex-row gap-2 items-center">
@@ -427,12 +613,171 @@ function SessionsScreen() {
   );
 }
 
+function SettingsScreen() {
+  return (
+    <View class="flex-1 bg-background">
+      <View class="flex-row items-center gap-2 px-4 pt-[env(safe-area-inset-top)] pb-3 border-b border-border">
+        <View
+          role="button"
+          class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+          onPress={() => stack.pop()}
+        >
+          <Text class="text-secondary-foreground text-sm">back</Text>
+        </View>
+        <Text class="text-foreground font-semibold text-xl">settings</Text>
+      </View>
+      <Scroll class="flex-1 px-4 pt-3 gap-3 pb-[env(safe-area-inset-bottom)]">
+        {/* Connection: the same affordance the sessions screen has. */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-2">
+          <Text class="text-muted-foreground text-xs">connection</Text>
+          <View class="flex-row gap-2 items-center">
+            <Input
+              class="flex-1 rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+              value={url()}
+              placeholder="ws://127.0.0.1:7699"
+              keyboardType="url"
+              autoCorrect={false}
+              autoCapitalize="none"
+              onChange={(e) => url.set(e.value)}
+              onSubmit={() => void connectAndOpen()}
+            />
+            <View
+              role="button"
+              class="rounded-(--radius) bg-primary px-4 py-2 active:opacity-80"
+              onPress={() => void connectAndOpen()}
+            >
+              <Text class="text-primary-foreground">
+                {busy() ? "..." : "connect"}
+              </Text>
+            </View>
+          </View>
+          <Text class="text-muted-foreground text-xs">
+            {snap().connection_label}
+          </Text>
+          {connectError() ? (
+            <Text class="text-destructive text-xs">{connectError()}</Text>
+          ) : null}
+        </View>
+        {/* Session facts: read-only for now (the bridge has no set-config
+            export, so the mode cannot be cycled from here yet). */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-1">
+          <Text class="text-muted-foreground text-xs">session</Text>
+          <Text class="text-foreground text-sm">model: {snap().model}</Text>
+          <Text class="text-foreground text-sm">provider: {snap().provider}</Text>
+          <Text class="text-foreground text-sm">
+            approval mode: {snap().approval_mode_label}
+          </Text>
+          <Text class="text-foreground text-sm">
+            server: {snap().server_version}
+          </Text>
+          <Text class="text-foreground text-sm">seq: {snap().last_seq}</Text>
+        </View>
+        {/* Automations: the snapshot's rows, removable; the add form
+            refreshes the list through the bridge. */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-2">
+          <Text class="text-muted-foreground text-xs">automations</Text>
+          {snap().automations.map((automation) => (
+            <View
+              key={automation.name}
+              class="flex-row items-center gap-2"
+            >
+              <View class="flex-1 gap-1">
+                <Text class="text-foreground text-sm">{automation.name}</Text>
+                <Text class="text-muted-foreground text-xs">
+                  every {automation.interval_minutes}m
+                </Text>
+              </View>
+              <View
+                role="button"
+                class="rounded-(--radius) bg-destructive px-3 py-1 active:opacity-80"
+                onPress={() => removeAutomation(automation.name)}
+              >
+                <Text class="text-background text-sm">remove</Text>
+              </View>
+            </View>
+          ))}
+          {snap().automations.length === 0 ? (
+            <Text class="text-muted-foreground text-xs">none yet</Text>
+          ) : null}
+          <View class="gap-1">
+            <Input
+              class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+              value={autoName()}
+              placeholder="name"
+              autoCorrect={false}
+              autoCapitalize="none"
+              onChange={(e) => autoName.set(e.value)}
+            />
+            <Input
+              class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+              value={autoPrompt()}
+              placeholder="prompt"
+              onChange={(e) => autoPrompt.set(e.value)}
+            />
+            <View class="flex-row gap-2 items-center">
+              <Input
+                class="w-20 rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+                value={autoInterval()}
+                placeholder="60"
+                keyboardType="number-pad"
+                autoCorrect={false}
+                onChange={(e) => autoInterval.set(e.value)}
+              />
+              <View
+                role="button"
+                class="rounded-(--radius) bg-primary px-4 py-2 active:opacity-80"
+                onPress={() => addAutomationFromForm()}
+              >
+                <Text class="text-primary-foreground">add</Text>
+              </View>
+              <Text class="flex-1 text-muted-foreground text-xs">
+                minutes between runs
+              </Text>
+            </View>
+          </View>
+        </View>
+        {/* Share: publishes the transcript; the URL lands in last_note. */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-2">
+          <Text class="text-muted-foreground text-xs">share</Text>
+          <View
+            role="button"
+            class="rounded-(--radius) bg-primary px-4 py-2 items-center active:opacity-80"
+            onPress={() => publishTranscript()}
+          >
+            <Text class="text-primary-foreground">publish page</Text>
+          </View>
+          <Text class="text-muted-foreground text-xs">
+            publishes this transcript as a read-only web page
+          </Text>
+        </View>
+        {/* About. */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-1">
+          <Text class="text-muted-foreground text-xs">about</Text>
+          <Text class="text-foreground font-semibold text-lg">modron</Text>
+          <Text class="text-muted-foreground text-xs">
+            one shared shell over the modron server - web, iOS, desktop, TUI
+          </Text>
+          <Text class="text-muted-foreground text-xs">
+            server {snap().server_version}
+          </Text>
+        </View>
+      </Scroll>
+    </View>
+  );
+}
+
 function App() {
   return (
     <NavStack state={stack}>
       {(route) => (
         <View class="flex-1">
-          {route === "sessions" ? <SessionsScreen /> : <ChatScreen />}
+          {route === "sessions" ? (
+            <SessionsScreen />
+          ) : route === "chat" ? (
+            <ChatScreen />
+          ) : (
+            <SettingsScreen />
+          )}
         </View>
       )}
     </NavStack>
