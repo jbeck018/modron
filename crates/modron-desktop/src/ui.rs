@@ -186,10 +186,12 @@ pub struct DesktopApp {
     confirm_delete: Option<uuid::Uuid>,
     /// Settings overlay open (gear in the footer).
     settings_open: bool,
-    /// Automations add-form fields (name/prompt/interval).
+    /// Automations add/edit-form fields (name/prompt/interval).
     auto_name: Entity<InputState>,
     auto_prompt: Entity<InputState>,
     auto_interval: Entity<InputState>,
+    /// The automation being edited (remove+add flow on save).
+    editing_automation: Option<String>,
     /// Onboarding wizard step (0 = providers, 1 = model wiring).
     onboarding_step: Option<usize>,
     onboarding_cheap: Entity<InputState>,
@@ -299,6 +301,7 @@ impl DesktopApp {
                 .new(|cx| InputState::new(window, cx).placeholder("prompt to run on schedule")),
             auto_interval: cx
                 .new(|cx| InputState::new(window, cx).placeholder("interval (minutes)")),
+            editing_automation: None,
             onboarding_step: None,
             onboarding_cheap: cx.new(|cx| {
                 InputState::new(window, cx).placeholder("cheap model (e.g. gpt-5.6-terra)")
@@ -687,6 +690,11 @@ impl DesktopApp {
     }
 
     fn add_automation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // If editing an existing automation, remove the old one first
+        // (the new add replaces it).
+        if let Some(old_name) = self.editing_automation.take() {
+            self.send(Command::AutomationRemove { name: old_name });
+        }
         let name = self.auto_name.read(cx).value().trim().to_string();
         let prompt = self.auto_prompt.read(cx).value().trim().to_string();
         let interval = self.auto_interval.read(cx).value().trim().to_string();
@@ -716,6 +724,29 @@ impl DesktopApp {
 
     fn remove_automation(&mut self, name: String, cx: &mut Context<Self>) {
         self.send(Command::AutomationRemove { name });
+        self.refresh(cx);
+    }
+
+    /// Populate the automation form from an existing automation for
+    /// editing. The old is removed on save (remove + add replaces).
+    fn start_edit_automation(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(auto) = self
+            .state
+            .automations
+            .iter()
+            .find(|a| a.name == *name)
+            .cloned()
+        else {
+            return;
+        };
+        self.editing_automation = Some(name.to_string());
+        self.auto_name
+            .update(cx, |input, cx| input.set_value(&auto.name, window, cx));
+        self.auto_prompt
+            .update(cx, |input, cx| input.set_value(&auto.prompt, window, cx));
+        self.auto_interval.update(cx, |input, cx| {
+            input.set_value(auto.interval_minutes.to_string(), window, cx)
+        });
         self.refresh(cx);
     }
 
@@ -1563,6 +1594,26 @@ impl DesktopApp {
                         this.open_picker(window, cx);
                     })),
             )
+            // Share: opens a remote-control tunnel via the server's bridge.
+            .children(if self.state.attached.is_some() {
+                vec![Button::new("share-remote")
+                    .label("share")
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        let Some(id) = this.state.attached else {
+                            return;
+                        };
+                        this.send(Command::RemoteControl {
+                            session_id: id,
+                            bridge_url: String::new(),
+                        });
+                        this.refresh(cx);
+                    }))
+                    .into_any_element()]
+            } else {
+                vec![]
+            })
             .child(
                 Button::new("reasoning-chip")
                     .label("reasoning")
@@ -2168,7 +2219,7 @@ impl DesktopApp {
                 .text_color(theme.muted_foreground)
                 .child(SharedString::from("scheduled automations")),
         );
-        for auto in &self.state.automations {
+        for (ix, auto) in self.state.automations.iter().enumerate() {
             let label: SharedString =
                 format!("{} - every {}m", auto.name, auto.interval_minutes).into();
             let name = auto.name.clone();
@@ -2180,7 +2231,19 @@ impl DesktopApp {
                     .gap_2()
                     .child(div().flex_1().text_size(px(12.5)).child(label))
                     .child(
-                        Button::new("auto-remove")
+                        Button::new(("auto-edit", ix))
+                            .label("edit")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener({
+                                let name = name.clone();
+                                move |this, _e: &ClickEvent, window: &mut Window, cx| {
+                                    this.start_edit_automation(&name, window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new(("auto-remove", ix))
                             .label("remove")
                             .danger()
                             .xsmall()

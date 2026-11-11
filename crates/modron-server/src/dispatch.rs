@@ -264,14 +264,23 @@ pub async fn handle_frame(
             session_id,
             bridge_url,
         } => {
-            // The tunnel is registered from the server's repo dir (task
-            // sessions run there via their worktree).
-            match crate::rc::start_remote_control(
-                state,
-                session_id,
-                &state.working_dir,
-                &bridge_url,
-            ) {
+            // Empty bridge_url = use the server's --bridge config.
+            let bridge = if bridge_url.is_empty() {
+                state.bridge_base.clone()
+            } else {
+                Some(bridge_url.clone())
+            };
+            let Some(bridge) = bridge else {
+                send(
+                    ctx,
+                    error(
+                        request_id,
+                        "no bridge configured - serve with --bridge <url> first",
+                    ),
+                );
+                return Flow::Continue;
+            };
+            match crate::rc::start_remote_control(state, session_id, &state.working_dir, &bridge) {
                 Ok(url) => send(
                     ctx,
                     reply(

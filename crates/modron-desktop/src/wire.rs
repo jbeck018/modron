@@ -244,6 +244,10 @@ pub enum Command {
         title: String,
         content_md: String,
     },
+    RemoteControl {
+        session_id: uuid::Uuid,
+        bridge_url: String,
+    },
     CreateTask {
         title: String,
         base: Option<String>,
@@ -317,6 +321,13 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
             session_id: *session_id,
             title: title.clone(),
             content_md: content_md.clone(),
+        },
+        Command::RemoteControl {
+            session_id,
+            bridge_url,
+        } => Payload::RemoteControl {
+            session_id: *session_id,
+            bridge_url: bridge_url.clone(),
         },
         Command::CreateTask { title, base } => Payload::CreateTask {
             title: title.clone(),
