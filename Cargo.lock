@@ -4203,11 +4203,13 @@ dependencies = [
  "modron-router",
  "modron-store",
  "modron-view",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]
