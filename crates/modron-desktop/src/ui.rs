@@ -24,10 +24,12 @@ use gpui_kit::{
     Focusable, InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowOptions,
 };
+use gpui_kit::{Animation, AnimationExt};
 use modron_core::Attachment;
 use modron_protocol::{Decision, Payload};
 use modron_router::lookup;
 use modron_view::TranscriptEntry;
+use std::time::Duration;
 
 use crate::app_state::{decision_label, model_patch, AppState, ConnState, Row};
 use crate::wire::{Command, UiEvent};
@@ -922,29 +924,6 @@ impl DesktopApp {
         self.refresh(cx);
     }
 
-    /// Populate the automation form from an existing automation for
-    /// editing. The old is removed on save (remove + add replaces).
-    fn start_edit_automation(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(auto) = self
-            .state
-            .automations
-            .iter()
-            .find(|a| a.name == *name)
-            .cloned()
-        else {
-            return;
-        };
-        self.editing_automation = Some(name.to_string());
-        self.auto_name
-            .update(cx, |input, cx| input.set_value(&auto.name, window, cx));
-        self.auto_prompt
-            .update(cx, |input, cx| input.set_value(&auto.prompt, window, cx));
-        self.auto_interval.update(cx, |input, cx| {
-            input.set_value(auto.interval_minutes.to_string(), window, cx)
-        });
-        self.refresh(cx);
-    }
-
     fn open_onboarding(&mut self, cx: &mut Context<Self>) {
         self.onboarding_step = Some(0);
         self.settings_open = false;
@@ -1200,8 +1179,8 @@ impl DesktopApp {
     /// One-line group header: the folder path itself when it fits, else
     /// its last component.
     fn group_label(dir: &str) -> String {
-        if dir.is_empty() {
-            return "no folder".into();
+        if dir.is_empty() || dir == "." {
+            return "this folder".into();
         }
         if dir.chars().count() <= 20 {
             return dir.to_string();
@@ -1226,7 +1205,9 @@ impl DesktopApp {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            // Clear the transparent-titlebar drag band + traffic lights.
+            .pt_10();
 
         // Iconed action rows (the reference UI's grammar): icon + label,
         // full-width, generous hit area. New chat is cmd+n.
@@ -1384,7 +1365,7 @@ impl DesktopApp {
         // Section header: the list's name plus its two controls - the
         // magnifier expands the search input (closing clears it), the
         // filter toggles folder grouping.
-        let header_row = div()
+        let mut header_row = div()
             .flex()
             .flex_row()
             .items_center()
@@ -1392,52 +1373,86 @@ impl DesktopApp {
             .px_2()
             .pt_2()
             .pb_1()
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(px(crate::brand::text::SM))
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from("Sessions")),
-            )
-            .child({
-                let entity = entity.clone();
-                Button::new("search-toggle")
-                    .icon(Icon::default().path("icons/search.svg").size_4())
-                    .ghost()
-                    .xsmall()
-                    .selected(self.search_open)
-                    .on_click(move |_e, window, cx: &mut App| {
-                        entity.update(cx, |this, cx| {
-                            this.search_open = !this.search_open;
-                            if this.search_open {
-                                this.session_filter.update(cx, |input, cx| {
-                                    let handle = input.focus_handle(cx);
-                                    window.focus(&handle, cx);
-                                });
-                            } else {
-                                // Esc grammar: closing the search clears it.
+            .h(px(28.));
+        if self.search_open {
+            // Expanded: the input takes the title's place in the same row
+            // (fades in; the x collapses back to the label).
+            let entity_close = entity.clone();
+            header_row = header_row
+                .child(
+                    div()
+                        .flex_1()
+                        .with_animation(
+                            "search-expand",
+                            Animation::new(Duration::from_millis(160)),
+                            |style, progress| style.opacity(progress),
+                        )
+                        .child(Input::new(&self.session_filter)),
+                )
+                .child(
+                    Button::new("search-close")
+                        .icon(Icon::default().path("icons/x.svg").size_4())
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_e, window, cx: &mut App| {
+                            entity_close.update(cx, |this, cx| {
+                                this.search_open = false;
                                 this.session_filter_query.clear();
                                 this.session_filter
                                     .update(cx, |input, cx| input.set_value("", window, cx));
-                            }
-                            this.refresh(cx);
-                        });
-                    })
-            })
-            .child({
-                let entity = entity.clone();
-                Button::new("group-toggle")
-                    .icon(Icon::default().path("icons/list-filter.svg").size_4())
-                    .ghost()
-                    .xsmall()
-                    .selected(self.grouped)
-                    .on_click(move |_e, _w, cx: &mut App| {
-                        entity.update(cx, |this, cx| {
-                            this.grouped = !this.grouped;
-                            this.refresh(cx);
-                        });
-                    })
-            });
+                                this.refresh(cx);
+                            });
+                        }),
+                );
+        } else {
+            header_row = header_row
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(crate::brand::text::SM))
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from("Sessions")),
+                )
+                .child({
+                    let entity = entity.clone();
+                    Button::new("search-toggle")
+                        .icon(Icon::default().path("icons/search.svg").size_4())
+                        .ghost()
+                        .xsmall()
+                        .selected(self.search_open)
+                        .on_click(move |_e, window, cx: &mut App| {
+                            entity.update(cx, |this, cx| {
+                                this.search_open = !this.search_open;
+                                if this.search_open {
+                                    this.session_filter.update(cx, |input, cx| {
+                                        let handle = input.focus_handle(cx);
+                                        window.focus(&handle, cx);
+                                    });
+                                } else {
+                                    // Esc grammar: closing the search clears it.
+                                    this.session_filter_query.clear();
+                                    this.session_filter
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                }
+                                this.refresh(cx);
+                            });
+                        })
+                })
+                .child({
+                    let entity = entity.clone();
+                    Button::new("group-toggle")
+                        .icon(Icon::default().path("icons/list-filter.svg").size_4())
+                        .ghost()
+                        .xsmall()
+                        .selected(self.grouped)
+                        .on_click(move |_e, _w, cx: &mut App| {
+                            entity.update(cx, |this, cx| {
+                                this.grouped = !this.grouped;
+                                this.refresh(cx);
+                            });
+                        })
+                });
+        }
         let mut list = list.child(header_row).children(if self.search_open {
             vec![div().px_3().pb_1().child(Input::new(&self.session_filter))]
         } else {
@@ -1474,9 +1489,8 @@ impl DesktopApp {
                 let header: SharedString = Self::group_label(&dir).into();
                 list = list.child(
                     div()
-                        .mt_1()
                         .mx_2()
-                        .pt_1()
+                        .pt_2()
                         .border_t_1()
                         .border_color(theme.border)
                         .child(
@@ -1528,6 +1542,11 @@ impl DesktopApp {
                                 } else {
                                     was
                                 };
+                                // Leaving the row cancels a pending delete.
+                                if !hovered && this.confirm_delete == Some(id) {
+                                    this.confirm_delete = None;
+                                    this.refresh(cx);
+                                }
                                 if was != this.hovered_row {
                                     this.refresh(cx);
                                 }
@@ -1595,30 +1614,29 @@ impl DesktopApp {
                             );
                         }
                         if self.confirm_delete == Some(id) {
+                            // Two-click grammar: the trash becomes a
+                            // destructive check; the second click removes.
+                            // Hovering out resets (the on_hover arm).
                             let entity_yes = entity.clone();
-                            let entity_no = entity.clone();
                             trailing.push(
-                                Button::new(("del-yes", ix))
-                                    .label("delete")
-                                    .danger()
-                                    .xsmall()
-                                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                        entity_yes
-                                            .update(cx, |this, cx| this.delete_session(id, cx));
-                                    })
-                                    .into_any_element(),
-                            );
-                            trailing.push(
-                                Button::new(("del-no", ix))
-                                    .label("keep")
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                        entity_no.update(cx, |this, cx| {
-                                            this.confirm_delete = None;
-                                            this.refresh(cx);
-                                        });
-                                    })
+                                div()
+                                    .flex_shrink_0()
+                                    .child(
+                                        Button::new(("del-check", ix))
+                                            .icon(
+                                                Icon::default()
+                                                    .path("icons/check.svg")
+                                                    .size_4()
+                                                    .text_color(theme.danger),
+                                            )
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                                entity_yes.update(cx, |this, cx| {
+                                                    this.delete_session(id, cx)
+                                                });
+                                            }),
+                                    )
                                     .into_any_element(),
                             );
                         } else {
@@ -2868,195 +2886,310 @@ impl DesktopApp {
             .into_any_element()
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    /// The settings PAGE (2026-11-11: was a cramped modal): the main pane
+    /// swaps to this view. shadcn-flavored - section headers, bordered
+    /// cards, label-left control-right rows, ghost icon controls.
+    fn render_settings_page(
+        &self,
+        entity: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         use gpui_kit::component::button::{Button, ButtonVariants};
         use gpui_kit::component::input::Input;
         let theme = cx.theme();
-        let backdrop = div()
-            .absolute()
-            .inset_0()
-            .bg(gpui_kit::black())
-            .on_mouse_down(
-                gpui_kit::MouseButton::Left,
-                cx.listener(|this, _e, _w, cx| {
-                    this.settings_open = false;
-                    this.refresh(cx);
-                }),
-            );
-        let mut panel = div()
-            .id("settings-panel")
-            .w(px(560.))
-            .max_h(px(600.))
-            .overflow_y_scroll()
+        let entity_back = entity.clone();
+        let entity_wizard = entity.clone();
+
+        let sandbox_label = if self.state.sandbox.is_empty() {
+            "off"
+        } else {
+            self.state.sandbox.as_str()
+        };
+
+        // One card row: label left, control right.
+        fn row<I>(theme: &Theme, label: &'static str, control: I) -> gpui_kit::AnyElement
+        where
+            I: gpui_kit::IntoElement,
+        {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .child(
+                    div()
+                        .text_size(px(crate::brand::text::SM))
+                        .text_color(theme.foreground)
+                        .child(SharedString::from(label)),
+                )
+                .child(control.into_any_element())
+                .into_any_element()
+        }
+
+        let general = div()
+            .flex()
+            .flex_col()
             .rounded_lg()
             .border_1()
             .border_color(theme.border)
             .bg(theme.background)
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(crate::brand::text::XL))
-                            .text_color(theme.foreground)
-                            .child(SharedString::from("settings")),
-                    )
-                    .child(
-                        Button::new("settings-close")
-                            .label("close")
-                            .ghost()
-                            .small()
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.settings_open = false;
-                                this.refresh(cx);
-                            })),
-                    ),
-            )
-            // Approval mode + sandbox policy (TUI /mode and /sandbox
-            // parity; the settings surface is the GUI's /settings).
-            .child(
-                div().flex().flex_row().gap_2().children([
-                    Button::new("settings-mode")
-                        .label(format!("mode: {}", self.state.approval_mode))
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            let next = match this.state.approval_mode.as_str() {
-                                "ask" => "yolo",
-                                "yolo" => "deny",
-                                _ => "ask",
-                            };
-                            this.state.approval_mode = next.into();
-                            this.send(Command::SetConfig(modron_protocol::ConfigPatch {
-                                approval_mode: Some(match next {
-                                    "yolo" => modron_protocol::ApprovalModeWire::ApproveAll,
-                                    "deny" => modron_protocol::ApprovalModeWire::Deny,
-                                    _ => modron_protocol::ApprovalModeWire::Ask,
-                                }),
-                                ..Default::default()
-                            }));
-                            this.refresh(cx);
-                        })),
-                    Button::new("settings-sandbox")
-                        .label(format!("sandbox: {}", self.state.sandbox))
-                        .ghost()
-                        .small()
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            let next = match this.state.sandbox.as_str() {
-                                "off" => "seatbelt",
-                                "seatbelt" => "bwrap",
-                                _ => "off",
-                            };
-                            let policy = match next {
-                                "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
-                                "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
-                                _ => modron_core::SandboxPolicy::Off,
-                            };
-                            this.state.sandbox = next.into();
-                            this.send(Command::SetConfig(modron_protocol::ConfigPatch {
-                                sandbox: Some(policy),
-                                ..Default::default()
-                            }));
-                            this.refresh(cx);
-                        })),
-                ]),
-            );
+            .child(row(
+                theme,
+                "appearance",
+                Button::new("settings-theme")
+                    .icon(Icon::default().path("icons/moon.svg").size_4())
+                    .ghost()
+                    .small()
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        let mode = if cx.theme().mode == ThemeMode::Dark {
+                            ThemeMode::Light
+                        } else {
+                            ThemeMode::Dark
+                        };
+                        Theme::change(mode, None, cx);
+                        this.refresh(cx);
+                    })),
+            ))
+            .child(row(
+                theme,
+                "approval mode",
+                Button::new("settings-mode")
+                    .label(self.state.approval_mode.to_string())
+                    .outline()
+                    .small()
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        let next = match this.state.approval_mode.as_str() {
+                            "ask" => "yolo",
+                            "yolo" => "deny",
+                            _ => "ask",
+                        };
+                        this.state.approval_mode = next.into();
+                        this.send(Command::SetConfig(modron_protocol::ConfigPatch {
+                            approval_mode: Some(match next {
+                                "yolo" => modron_protocol::ApprovalModeWire::ApproveAll,
+                                "deny" => modron_protocol::ApprovalModeWire::Deny,
+                                _ => modron_protocol::ApprovalModeWire::Ask,
+                            }),
+                            ..Default::default()
+                        }));
+                        this.refresh(cx);
+                    })),
+            ))
+            .child(row(
+                theme,
+                "sandbox",
+                Button::new("settings-sandbox")
+                    .label(sandbox_label)
+                    .outline()
+                    .small()
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        let next = match this.state.sandbox.as_str() {
+                            "off" => "seatbelt",
+                            "seatbelt" => "bwrap",
+                            _ => "off",
+                        };
+                        let policy = match next {
+                            "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
+                            "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
+                            _ => modron_core::SandboxPolicy::Off,
+                        };
+                        this.state.sandbox = next.into();
+                        this.send(Command::SetConfig(modron_protocol::ConfigPatch {
+                            sandbox: Some(policy),
+                            ..Default::default()
+                        }));
+                        this.refresh(cx);
+                    })),
+            ));
 
-        // Automations section.
-        let mut autos = div().flex().flex_col().gap_1().child(
-            div()
-                .text_size(px(crate::brand::text::SM))
-                .text_color(theme.muted_foreground)
-                .child(SharedString::from("scheduled automations")),
-        );
-        for (ix, auto) in self.state.automations.iter().enumerate() {
-            let label: SharedString =
-                format!("{} - every {}m", auto.name, auto.interval_minutes).into();
-            let name = auto.name.clone();
-            autos = autos.child(
+        // Automations: one row per automation, then the add form.
+        let mut auto_rows = div().flex().flex_col();
+        for auto in &self.state.automations {
+            let name: SharedString = auto.name.clone().into();
+            let meta: SharedString = format!("every {}m", auto.interval_minutes).into();
+            let entity_del = entity.clone();
+            let del_name = auto.name.clone();
+            auto_rows = auto_rows.child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .px_3()
+                    .py_2()
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(crate::brand::text::BASE))
-                            .child(label),
+                            .truncate()
+                            .text_size(px(crate::brand::text::SM))
+                            .text_color(theme.foreground)
+                            .child(name),
                     )
                     .child(
-                        Button::new(("auto-edit", ix))
-                            .label("edit")
+                        div()
+                            .text_size(px(crate::brand::text::XS))
+                            .text_color(theme.muted_foreground)
+                            .child(meta),
+                    )
+                    .child({
+                        let btn_id = SharedString::from(format!("automation-remove-{}", auto.name));
+                        Button::new(btn_id)
+                            .icon(Icon::default().path("icons/trash.svg").size_4())
                             .ghost()
                             .xsmall()
-                            .on_click(cx.listener({
-                                let name = name.clone();
-                                move |this, _e: &ClickEvent, window: &mut Window, cx| {
-                                    this.start_edit_automation(&name, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new(("auto-remove", ix))
-                            .label("remove")
-                            .danger()
-                            .xsmall()
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.remove_automation(name.clone(), cx);
-                            })),
-                    ),
+                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                entity_del.update(cx, |this, cx| {
+                                    this.remove_automation(del_name.clone(), cx)
+                                });
+                            })
+                            .into_any_element()
+                    }),
             );
         }
-        autos = autos
-            .child(div().flex().flex_row().gap_1().children([
-                Input::new(&self.auto_name).id("auto-name"),
-                Input::new(&self.auto_prompt).id("auto-prompt"),
-                Input::new(&self.auto_interval).id("auto-interval"),
-            ]))
-            .child(
-                div().flex().flex_row().justify_end().child(
-                    Button::new("auto-add")
-                        .label("add automation")
-                        .small()
-                        .on_click(cx.listener(|this, _e, window, cx| {
-                            this.add_automation(window, cx);
-                        })),
-                ),
+        if self.state.automations.is_empty() {
+            auto_rows = auto_rows.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(crate::brand::text::SM))
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(
+                        "no automations - add one below (a prompt the server runs on an interval)",
+                    )),
             );
-        panel = panel.child(autos);
+        }
 
-        // Onboarding entry.
-        panel = panel.child(
-            div().flex().flex_row().justify_end().child(
-                Button::new("onboarding")
-                    .label("run setup wizard")
-                    .small()
-                    .on_click(cx.listener(|this, _e, _w, cx| this.open_onboarding(cx))),
-            ),
-        );
-
-        backdrop
+        let automations = div()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(auto_rows)
             .child(
                 div()
                     .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .p_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&self.auto_name).id("auto-name")),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&self.auto_prompt).id("auto-prompt")),
+                            )
+                            .child(
+                                div()
+                                    .w(px(120.))
+                                    .child(Input::new(&self.auto_interval).id("auto-interval")),
+                            ),
+                    )
+                    .child(
+                        div().flex().flex_row().justify_end().child(
+                            Button::new("automation-add")
+                                .label("add automation")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.add_automation(window, cx);
+                                })),
+                        ),
+                    ),
+            );
+
+        let section = |title: &'static str, card: gpui_kit::AnyElement| -> gpui_kit::AnyElement {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_size(px(crate::brand::text::XS))
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(title)),
+                )
+                .child(card)
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .bg(theme.background)
+            .child(
+                // Page header: back + title.
+                div()
+                    .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_center()
-                    .size_full()
-                    .child(panel),
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new("settings-back")
+                            .icon(Icon::default().path("icons/arrow-left.svg").size_4())
+                            .ghost()
+                            .small()
+                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                entity_back.update(cx, |this, cx| {
+                                    this.settings_open = false;
+                                    this.refresh(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(crate::brand::text::XL))
+                            .text_color(theme.foreground)
+                            .child(SharedString::from("Settings")),
+                    ),
+            )
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px_6()
+                    .py_5()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .max_w(px(720.))
+                    .child(section("general", general.into_any_element()))
+                    .child(section("automations", automations.into_any_element()))
+                    .child(
+                        div().flex().flex_row().justify_end().child(
+                            Button::new("run-setup-wizard")
+                                .label("run setup wizard")
+                                .outline()
+                                .small()
+                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                    entity_wizard.update(cx, |this, cx| this.open_onboarding(cx));
+                                }),
+                        ),
+                    ),
             )
             .into_any_element()
     }
 
-    /// Onboarding wizard overlay: step 0 = provider auth status (re-checks
-    /// on open), step 1 = cheap/strong model wiring persisted server-side.
     fn render_onboarding(&self, step: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::component::button::{Button, ButtonVariants};
         use gpui_kit::component::input::Input;
@@ -3335,14 +3468,15 @@ impl Render for DesktopApp {
                     .flex_1()
                     .min_h_0()
                     .child(sidebar)
-                    .child(self.render_main(&entity, cx)),
+                    .child(if self.settings_open {
+                        self.render_settings_page(&entity, cx)
+                    } else {
+                        self.render_main(&entity, cx)
+                    }),
             )
             .child(status);
         if self.picker_open {
             root = root.child(self.render_picker(&entity, cx));
-        }
-        if self.settings_open {
-            root = root.child(self.render_settings(cx));
         }
         if self.help_open {
             root = root.child(self.render_help(cx));
@@ -3604,48 +3738,52 @@ pub fn run(options: LaunchOptions) {
         })
         .expect("spawn net thread");
 
-    gpui_kit::application().run(move |cx: &mut App| {
-        gpui_kit::init(cx);
-        // Brand install (2026-11-11, iron-rain port): bundled DM Sans +
-        // Instrument Serif, the Oculus gold-on-black palette for both
-        // schemes, and the base font size. Later Theme::change calls
-        // (mode toggle, OS switch) reload from these configs.
-        crate::brand::install(cx);
-        cx.bind_keys([
-            KeyBinding::new("escape", PickerClose, Some("ModelPicker")),
-            KeyBinding::new("up", PickerUp, Some("ModelPicker")),
-            KeyBinding::new("down", PickerDown, Some("ModelPicker")),
-            KeyBinding::new("escape", CloseToolPanel, Some("ToolPanel")),
-            // The sidebar's "New chat" row advertises this hint; the
-            // action is handled on the window root.
-            KeyBinding::new("cmd-n", NewChat, None),
-            // The composer's send (textarea Enter = newline).
-            KeyBinding::new("cmd-enter", ComposerSubmit, Some("Composer")),
-        ]);
-        let (window, view) = gpui_kit::open_window(
-            WindowOptions {
-                titlebar: Some(gpui_kit::TitlebarOptions {
-                    title: Some("modron desktop".into()),
-                    // Our surface paints the whole window (dark or light);
-                    // a drag strip under the content keeps the empty top
-                    // band draggable while buttons stay clickable.
-                    appears_transparent: true,
-                    traffic_light_position: None,
-                }),
-                ..WindowOptions::default()
-            },
-            cx,
-            move |window, cx| {
-                cx.new(|cx| DesktopApp::new(window, cx, cmd_tx.clone(), event_rx.clone(), resume))
-            },
-        )
-        .expect("failed to open the modron desktop window");
-        // Give the view its window handle: deferred work (form inputs)
-        // needs a &mut Window to construct input state.
-        view.update(cx, |app, _cx| {
-            app.window_handle = Some(window);
+    gpui_kit::application()
+        .with_assets(gpui_kit_assets::Assets)
+        .run(move |cx: &mut App| {
+            gpui_kit::init(cx);
+            // Brand install (2026-11-11, iron-rain port): bundled DM Sans +
+            // Instrument Serif, the Oculus gold-on-black palette for both
+            // schemes, and the base font size. Later Theme::change calls
+            // (mode toggle, OS switch) reload from these configs.
+            crate::brand::install(cx);
+            cx.bind_keys([
+                KeyBinding::new("escape", PickerClose, Some("ModelPicker")),
+                KeyBinding::new("up", PickerUp, Some("ModelPicker")),
+                KeyBinding::new("down", PickerDown, Some("ModelPicker")),
+                KeyBinding::new("escape", CloseToolPanel, Some("ToolPanel")),
+                // The sidebar's "New chat" row advertises this hint; the
+                // action is handled on the window root.
+                KeyBinding::new("cmd-n", NewChat, None),
+                // The composer's send (textarea Enter = newline).
+                KeyBinding::new("cmd-enter", ComposerSubmit, Some("Composer")),
+            ]);
+            let (window, view) = gpui_kit::open_window(
+                WindowOptions {
+                    titlebar: Some(gpui_kit::TitlebarOptions {
+                        title: Some("modron desktop".into()),
+                        // Our surface paints the whole window (dark or light);
+                        // a drag strip under the content keeps the empty top
+                        // band draggable while buttons stay clickable.
+                        appears_transparent: true,
+                        traffic_light_position: None,
+                    }),
+                    ..WindowOptions::default()
+                },
+                cx,
+                move |window, cx| {
+                    cx.new(|cx| {
+                        DesktopApp::new(window, cx, cmd_tx.clone(), event_rx.clone(), resume)
+                    })
+                },
+            )
+            .expect("failed to open the modron desktop window");
+            // Give the view its window handle: deferred work (form inputs)
+            // needs a &mut Window to construct input state.
+            view.update(cx, |app, _cx| {
+                app.window_handle = Some(window);
+            });
         });
-    });
 }
 
 #[cfg(test)]
@@ -3736,7 +3874,8 @@ mod tests {
 
     #[test]
     fn group_labels_shorten_long_paths() {
-        assert_eq!(DesktopApp::group_label(""), "no folder");
+        assert_eq!(DesktopApp::group_label(""), "this folder");
+        assert_eq!(DesktopApp::group_label("."), "this folder");
         assert_eq!(DesktopApp::group_label("/a/b"), "/a/b");
         assert_eq!(DesktopApp::group_label("/Users/jacob/dev/modron"), "modron");
     }

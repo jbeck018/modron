@@ -4114,6 +4114,7 @@ dependencies = [
  "chrono",
  "futures",
  "gpui-kit",
+ "gpui-kit-assets",
  "modron-core",
  "modron-protocol",
  "modron-router",
