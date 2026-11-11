@@ -1,42 +1,41 @@
-//! `RemoteClient` — the mobile remote-control client: a WebSocket to the
-//! modron server, one background task folding every inbound [`Frame`] into
-//! a [`SessionViewModel`] behind a std mutex, and a polling API for
+//! `RemoteClient` — the mobile remote-control client: one WebSocket to
+//! the modron server, one background task folding every inbound [`Frame`]
+//! into a [`SessionViewModel`] behind a std mutex, and a polling API for
 //! UI shells (`state()` / `take_new_entries()` / `take_pending_approval()`
-//! plus one method per client command). No callbacks: a native shell ticks
-//! the snapshot on its render loop.
+//! plus one method per client command). No callbacks: a shell ticks the
+//! snapshot on its render loop.
 //!
 //! ```ignore
-//! let client = RemoteClient::connect(&url, None).await?;
-//! client.attach(session_id, 0).await?;          // awaits the Snapshot fold
-//! // render loop:
+//! let client = RemoteClient::connect(&url, None)?; // fire-and-forget
+//! // render loop polls:
 //! let snap = client.state();                     // cheap clone, serde-ready
 //! for entry in client.take_new_entries() { ... } // incremental rows
 //! client.submit(Some(session_id), "fix the bug")?;
 //! ```
 //!
-//! Reconnect is explicit (`reconnect`), resuming from the last seen
-//! per-session `seq` so the server replays exactly the missed events.
+//! `connect` never blocks the caller: it flips the state to `Connecting`
+//! and completes the handshake + run loop on a background task (tokio on
+//! native, `spawn_local` on wasm — a browser main thread cannot block).
+//! Errors land in `state().last_error`. Reconnect is explicit
+//! (`reconnect`), resuming from the last seen per-session `seq` so the
+//! server replays exactly the missed events.
 
 use crate::error::ClientError;
+use crate::transport;
 use crate::view::{
     fold_snapshot, fold_turn_done, fold_turn_unfinished, FoldState, OAuthProgressView,
     PendingApprovalView, SessionViewModel, ViewModelSnapshot,
 };
-use futures_util::{SinkExt, StreamExt};
-use modron_core::ToolActivity;
 use modron_protocol::{
-    ConfigPatch, Decision, Frame, Payload, SessionMetaWire, WireDelta, DEFAULT_PORT,
-    PROTOCOL_VERSION,
+    ConfigPatch, Decision, Frame, Payload, WireDelta, DEFAULT_PORT, PROTOCOL_VERSION,
 };
+use modron_types::ToolActivity;
 use modron_view::TranscriptEntry;
-use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 /// The `client` string sent in the hello frame.
@@ -49,20 +48,123 @@ pub fn default_url() -> String {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
-type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
-type WsSink = futures_util::stream::SplitSink<WsStream, WsMessage>;
-type WsRead = futures_util::stream::SplitStream<WsStream>;
+/// Inbound events after the handshake; the transport-specific shapes
+/// (tungstenite messages / browser events) normalize to these.
+#[allow(dead_code)] // `Open` is wasm-only (browser onopen)
+pub(crate) enum In {
+    /// Browser sockets only: `onopen` fired (the handshake uses it).
+    Open,
+    /// A text frame (the wire speaks JSON).
+    Text(String),
+    /// The socket closed (cleanly or not).
+    Closed,
+}
+
+/// Reject URLs a browser `WebSocket` constructor would throw on
+/// (a JS exception inside wasm aborts the whole module — validate first).
+fn validate_ws_url(url: &str) -> Result<(), ClientError> {
+    let after_scheme = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"))
+        .ok_or_else(|| ClientError::Connect("url must start with ws:// or wss://".into()))?;
+    let host = after_scheme.split(['/', '?']).next().unwrap_or("");
+    if host.is_empty() {
+        return Err(ClientError::Connect("url has no host".into()));
+    }
+    Ok(())
+}
+
+/// Runtime-agnostic deadline wrapper. Native: futures-timer polls a
+/// deadline against `Instant`. Wasm: `Instant` is unimplemented on
+/// wasm32-unknown-unknown (panics), so the delay is a browser `setTimeout`
+/// resolving a oneshot; the waiter races it with `select`.
+pub(crate) async fn with_timeout<F: Future>(dur: Duration, fut: F) -> Option<F::Output> {
+    use futures_util::future::{select, Either};
+    let mut fut = Box::pin(fut);
+    let mut delay = Box::pin(delay(dur));
+    match select(&mut fut, &mut delay).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(_) => None,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn delay(dur: Duration) {
+    futures_timer::Delay::new(dur).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn delay(dur: Duration) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let cb = wasm_bindgen::closure::Closure::once(move || {
+        let _ = tx.send(());
+    });
+    let window = web_sys::window().expect("browser window");
+    window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            dur.as_millis() as i32,
+        )
+        .expect("setTimeout");
+    // `Closure::once` releases itself when the timer fires; a never-fired
+    // timer (page unload) leaks the box, which is fine at that point.
+    std::mem::forget(cb);
+    let _ = rx.await;
+}
+pub(crate) fn handshake_timeout() -> Duration {
+    HANDSHAKE_TIMEOUT
+}
+
+/// The uncorrelated hello frame (id 0 is reserved for it).
+pub(crate) fn hello_frame(token: Option<&str>) -> Frame {
+    Frame::request(
+        0,
+        Payload::Hello {
+            client: CLIENT_NAME.into(),
+            protocol: PROTOCOL_VERSION,
+            token: token.map(Into::into),
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Background task driver
+//
+// Native: the client owns its runtime (the shell's thread has no tokio
+// context). Wasm: `spawn_local` runs the task on the JS microtask queue,
+// woken by socket callbacks and channel sends.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+static RT: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime for the remote client")
+});
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn spawn_task(fut: impl Future<Output = ()> + Send + 'static) {
+    RT.spawn(fut);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn_task(fut: impl Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(fut);
+}
 
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// Everything the recv loop and the UI-facing methods share.
+/// Everything the run loop and the UI-facing methods share.
 struct Shared {
-    /// View model + fold bookkeeping + correlated-request waiters.
+    /// View model + fold bookkeeping.
     state: Mutex<CoreState>,
     /// Current connection's outgoing frame channel; `None` when down.
     cmd: Mutex<Option<mpsc::UnboundedSender<Frame>>>,
@@ -81,10 +183,6 @@ struct Shared {
 struct CoreState {
     vm: SessionViewModel,
     fold: FoldState,
-    /// In-flight correlated requests: id -> waiter.
-    requests: HashMap<u64, oneshot::Sender<Result<Payload, ClientError>>>,
-    /// Tasks waiting for the next Snapshot fold (`attach`).
-    snapshots: Vec<oneshot::Sender<Result<(), ClientError>>>,
 }
 
 impl Shared {
@@ -98,6 +196,10 @@ impl Shared {
             gen: AtomicU64::new(0),
             next_id: AtomicU64::new(0),
         }
+    }
+
+    fn next_request_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
@@ -124,60 +226,53 @@ impl std::fmt::Debug for RemoteClient {
 }
 
 impl RemoteClient {
-    /// Connect and run the hello/welcome handshake. Fails on socket
-    /// errors, timeouts, and protocol-version mismatches.
-    pub async fn connect(url: &str, token: Option<&str>) -> Result<Self, ClientError> {
+    /// Validate the URL, mark `Connecting`, and start the handshake +
+    /// run loop on a background task. Errors land in `state().last_error`
+    /// (and `connection` goes `Disconnected`); only a malformed URL
+    /// fails synchronously.
+    pub fn connect(url: &str, token: Option<&str>) -> Result<Self, ClientError> {
+        validate_ws_url(url)?;
         let client = Self {
             shared: Arc::new(Shared::new()),
         };
-        client.spin_up(url, token).await?;
+        client.spin_up(url, token, None);
         Ok(client)
     }
 
     /// Reconnect and re-`attach` from the last seen seq: the server
-    /// replays every event the client missed while offline.
-    pub async fn reconnect(
+    /// replays every event the client missed while offline. The attach
+    /// goes out right after the welcome (inside the same background
+    /// task), so the caller just watches the state.
+    pub fn reconnect(
         &self,
         url: &str,
         session_id: Uuid,
         token: Option<&str>,
     ) -> Result<(), ClientError> {
+        validate_ws_url(url)?;
         let last_seq = {
             let st = self.shared.state.lock().unwrap();
             st.vm.last_seq
         };
-        self.spin_up(url, token).await?;
-        self.attach(session_id, last_seq).await
+        self.spin_up(url, token, Some((session_id, last_seq)));
+        Ok(())
     }
 
-    /// Mark connecting, run the handshake, spawn the run loop. Bumps the
-    /// generation so a still-draining old loop cannot clobber state.
-    async fn spin_up(&self, url: &str, token: Option<&str>) -> Result<(), ClientError> {
+    /// Mark connecting, clear stale state, and spawn the establish task.
+    /// Bumps the generation so a still-draining old loop cannot clobber
+    /// state. `resume` is the reconnect's post-handshake attach.
+    fn spin_up(&self, url: &str, token: Option<&str>, resume: Option<(Uuid, u64)>) {
         {
             let mut st = self.shared.state.lock().unwrap();
             st.vm.connection = crate::view::ConnectionState::Connecting;
             st.vm.last_error = None;
+            st.vm.sessions.clear();
         }
         let gen = self.shared.gen.fetch_add(1, Ordering::SeqCst) + 1;
-        match handshake(url, token).await {
-            Ok((sink, stream, server_version)) => {
-                {
-                    let mut st = self.shared.state.lock().unwrap();
-                    st.vm.connection = crate::view::ConnectionState::Connected;
-                    st.vm.server_version = server_version;
-                }
-                let (tx, rx) = mpsc::unbounded_channel();
-                *self.shared.cmd.lock().unwrap() = Some(tx);
-                spawn_loop(self.shared.clone(), gen, sink, stream, rx);
-                Ok(())
-            }
-            Err(e) => {
-                let mut st = self.shared.state.lock().unwrap();
-                st.vm.connection = crate::view::ConnectionState::Disconnected;
-                st.vm.last_error = Some(e.to_string());
-                Err(e)
-            }
-        }
+        let shared = self.shared.clone();
+        let url = url.to_string();
+        let token = token.map(str::to_string);
+        spawn_task(establish(shared, gen, url, token, resume));
     }
 
     // -- polling API ------------------------------------------------------
@@ -224,30 +319,17 @@ impl RemoteClient {
 
     // -- commands ---------------------------------------------------------
 
-    /// Subscribe to a session's events; resolves once the `Snapshot` has
-    /// folded. `last_seq = 0` asks for the full replay.
-    pub async fn attach(&self, session_id: Uuid, last_seq: u64) -> Result<(), ClientError> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut st = self.shared.state.lock().unwrap();
-            st.snapshots.push(tx);
-        }
+    /// Subscribe to a session's events; the `Snapshot` folds into the
+    /// view in the background (poll `state()` / `take_new_entries()`).
+    /// `last_seq = 0` asks for the full replay.
+    pub fn attach(&self, session_id: Uuid, last_seq: u64) -> Result<(), ClientError> {
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Attach {
                 session_id,
                 last_seq,
             },
-        ))?;
-        let reply = timeout(SNAPSHOT_TIMEOUT, rx)
-            .await
-            .map_err(|_| ClientError::Timeout);
-        match reply {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => Err(ClientError::Closed),
-            Err(e) => Err(e),
-        }
+        ))
     }
 
     /// Stop receiving the session's events (the session keeps running).
@@ -319,15 +401,13 @@ impl RemoteClient {
         })
     }
 
-    /// List sessions (correlated request; the answer also lands in
-    /// `state().sessions`).
-    pub async fn list_sessions(&self) -> Result<Vec<SessionMetaWire>, ClientError> {
-        match self.request(Payload::ListSessions {}).await? {
-            Payload::Sessions { sessions } => Ok(sessions),
-            other => Err(ClientError::Request(format!(
-                "unexpected list_sessions reply: {other:?}"
-            ))),
-        }
+    /// List sessions: fires the request; the rows land in
+    /// `state().sessions` (polling UIs read them there).
+    pub fn list_sessions(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::ListSessions {},
+        ))
     }
 
     /// Create an empty session without submitting a task.
@@ -349,7 +429,7 @@ impl RemoteClient {
     // -- internals --------------------------------------------------------
 
     fn next_request_id(&self) -> u64 {
-        self.shared.next_id.fetch_add(1, Ordering::SeqCst) + 1
+        self.shared.next_request_id()
     }
 
     fn send_frame(&self, frame: Frame) -> Result<(), ClientError> {
@@ -359,128 +439,99 @@ impl RemoteClient {
             None => Err(ClientError::Closed),
         }
     }
-
-    /// Fire one correlated request and await its answer.
-    async fn request(&self, payload: Payload) -> Result<Payload, ClientError> {
-        let id = self.next_request_id();
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut st = self.shared.state.lock().unwrap();
-            st.requests.insert(id, tx);
-        }
-        self.send_frame(Frame::request(id, payload))?;
-        match timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(_)) => Err(ClientError::Closed),
-            Err(_) => Err(ClientError::Timeout),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Handshake + run loop
+// Establish + run loop
 // ---------------------------------------------------------------------------
 
-async fn handshake(
-    url: &str,
-    token: Option<&str>,
-) -> Result<(WsSink, WsRead, String), ClientError> {
-    let (ws, _) = connect_async(url)
-        .await
-        .map_err(|e| ClientError::Connect(e.to_string()))?;
-    let (mut sink, mut stream) = ws.split();
-    let hello = Frame::request(
-        0,
-        Payload::Hello {
-            client: CLIENT_NAME.into(),
-            protocol: PROTOCOL_VERSION,
-            token: token.map(Into::into),
-        },
-    );
-    let json = serde_json::to_string(&hello).map_err(|e| ClientError::Json(e.to_string()))?;
-    sink.send(WsMessage::Text(json.into()))
-        .await
-        .map_err(|e| ClientError::Handshake(e.to_string()))?;
-    let msg = timeout(HANDSHAKE_TIMEOUT, stream.next())
-        .await
-        .map_err(|_| ClientError::Timeout)?;
-    let frame = match msg {
-        Some(Ok(WsMessage::Text(json))) => {
-            serde_json::from_str::<Frame>(&json).map_err(|e| ClientError::Json(e.to_string()))?
-        }
-        Some(Ok(_)) => return Err(ClientError::Handshake("expected a welcome frame".into())),
-        Some(Err(e)) => return Err(ClientError::Handshake(e.to_string())),
-        None => return Err(ClientError::Handshake("closed during handshake".into())),
-    };
-    match frame.payload {
-        Payload::Welcome {
-            server_version,
-            protocol,
-        } if protocol == PROTOCOL_VERSION => Ok((sink, stream, server_version)),
-        Payload::Welcome { protocol, .. } => Err(ClientError::ProtocolMismatch {
-            server: protocol,
-            client: PROTOCOL_VERSION,
-        }),
-        other => Err(ClientError::Handshake(format!(
-            "expected welcome, got {other:?}"
-        ))),
-    }
-}
-
-fn spawn_loop(
+/// The background connection task: handshake, wire the command channel,
+/// optionally send the reconnect attach, then run the loop to completion.
+async fn establish(
     shared: Arc<Shared>,
     gen: u64,
-    sink: WsSink,
-    stream: WsRead,
-    mut rx: mpsc::UnboundedReceiver<Frame>,
+    url: String,
+    token: Option<String>,
+    resume: Option<(Uuid, u64)>,
 ) {
-    tokio::spawn(async move {
-        let mut sink = sink;
-        let mut stream = stream;
-        let reason: Option<String> = loop {
-            tokio::select! {
-                cmd = rx.recv() => match cmd {
-                    Some(frame) => {
-                        let json = match serde_json::to_string(&frame) {
-                            Ok(json) => json,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "outgoing frame encode failed");
-                                continue;
-                            }
-                        };
-                        if let Err(e) = sink.send(WsMessage::Text(json.into())).await {
-                            break Some(format!("send failed: {e}"));
-                        }
-                    }
-                    None => {
-                        let _ = sink.send(WsMessage::Close(None)).await;
-                        break None;
-                    }
-                },
-                msg = stream.next() => match msg {
-                    Some(Ok(WsMessage::Text(json))) => match serde_json::from_str::<Frame>(&json) {
-                        Ok(frame) => fold_frame(&shared, frame),
-                        Err(e) => tracing::warn!(error = %e, "inbound frame decode failed"),
-                    },
-                    Some(Ok(WsMessage::Ping(data))) => {
-                        let _ = sink.send(WsMessage::Pong(data)).await;
-                    }
-                    Some(Ok(WsMessage::Close(_))) | None => {
-                        break Some("server closed the connection".into());
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => break Some(e.to_string()),
-                },
+    match transport::handshake(&url, token.as_deref()).await {
+        Ok((mut conn, server_version)) => {
+            {
+                let mut st = shared.state.lock().unwrap();
+                st.vm.connection = crate::view::ConnectionState::Connected;
+                st.vm.server_version = server_version;
             }
-        };
-        shutdown(&shared, gen, reason);
-    });
+            let (tx, rx) = mpsc::unbounded_channel();
+            *shared.cmd.lock().unwrap() = Some(tx.clone());
+            if let Some((session_id, last_seq)) = resume {
+                let _ = tx.send(Frame::request(
+                    shared.next_request_id(),
+                    Payload::Attach {
+                        session_id,
+                        last_seq,
+                    },
+                ));
+            }
+            run_loop(&mut conn, shared, gen, rx).await;
+        }
+        Err(e) => {
+            // A stale establish task (reconnect superseded it) must not
+            // clobber the newer connection's state.
+            if shared.gen.load(Ordering::SeqCst) == gen {
+                let mut st = shared.state.lock().unwrap();
+                st.vm.connection = crate::view::ConnectionState::Disconnected;
+                st.vm.last_error = Some(e.to_string());
+            }
+        }
+    }
 }
 
-/// Mark the connection down, fail in-flight waiters, and release the
-/// command channel. Guarded by generation so a stale loop (reconnect in
-/// progress) leaves the newer connection's state alone. `None` = clean
-/// close (no error surface); `Some` = the cause string.
+async fn run_loop(
+    conn: &mut transport::Conn,
+    shared: Arc<Shared>,
+    gen: u64,
+    mut rx: mpsc::UnboundedReceiver<Frame>,
+) {
+    let reason: Option<String> = loop {
+        tokio::select! {
+            cmd = rx.recv() => match cmd {
+                Some(frame) => {
+                    let json = match serde_json::to_string(&frame) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "outgoing frame encode failed");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = conn.send_text(&json).await {
+                        break Some(format!("send failed: {e}"));
+                    }
+                }
+                None => {
+                    conn.close().await;
+                    break None;
+                }
+            },
+            msg = conn.next_in() => match msg {
+                Some(Ok(In::Text(json))) => match serde_json::from_str::<Frame>(&json) {
+                    Ok(frame) => fold_frame(&shared, frame),
+                    Err(e) => tracing::warn!(error = %e, "inbound frame decode failed"),
+                },
+                Some(Ok(In::Open)) => {}
+                Some(Ok(In::Closed)) | None => {
+                    break Some("server closed the connection".into());
+                }
+                Some(Err(e)) => break Some(e.to_string()),
+            },
+        }
+    };
+    shutdown(&shared, gen, reason);
+}
+
+/// Mark the connection down and release the command channel. Guarded by
+/// generation so a stale loop (reconnect in progress) leaves the newer
+/// connection's state alone. `None` = clean close (no error surface);
+/// `Some` = the cause string.
 fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
     if shared.gen.load(Ordering::SeqCst) != gen {
         return;
@@ -489,13 +540,6 @@ fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
         let mut st = shared.state.lock().unwrap();
         st.vm.connection = crate::view::ConnectionState::Disconnected;
         st.vm.last_error = reason.clone();
-        let closed = ClientError::Closed;
-        for (_, waiter) in st.requests.drain() {
-            let _ = waiter.send(Err(closed.clone()));
-        }
-        for waiter in st.snapshots.drain(..) {
-            let _ = waiter.send(Err(ClientError::Closed));
-        }
     }
     *shared.cmd.lock().unwrap() = None;
     let _ = shared.closed_tx.send(true);
@@ -507,19 +551,8 @@ fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
 
 fn fold_frame(shared: &Shared, frame: Frame) {
     let mut st = shared.state.lock().unwrap();
-    let CoreState {
-        vm,
-        fold,
-        requests,
-        snapshots,
-    } = &mut *st;
+    let CoreState { vm, fold } = &mut *st;
 
-    // Correlated replies resolve their waiter first (and still fold).
-    if let Some(id) = frame.id {
-        if let Some(waiter) = requests.remove(&id) {
-            let _ = waiter.send(Ok(frame.payload.clone()));
-        }
-    }
     // Any session-scoped sequenced frame advances the resume cursor.
     if frame.session.is_some() && frame.seq > vm.last_seq {
         vm.last_seq = frame.seq;
@@ -542,9 +575,6 @@ fn fold_frame(shared: &Shared, frame: Frame) {
             live,
         } => {
             fold_snapshot(vm, fold, session_id, last_seq, &events, &live);
-            for waiter in snapshots.drain(..) {
-                let _ = waiter.send(Ok(()));
-            }
         }
         Payload::Event { event } => fold.fold_event(vm, event),
         Payload::Delta { delta } => match delta {
@@ -591,9 +621,6 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         }
         Payload::Error { message } => {
             vm.last_error = Some(message.clone());
-            for waiter in snapshots.drain(..) {
-                let _ = waiter.send(Err(ClientError::Request(message.clone())));
-            }
         }
         Payload::Pong {} => {}
         // Client->server payloads never arrive inbound; ignore defensively.
@@ -630,5 +657,14 @@ mod tests {
     #[test]
     fn client_name_is_set() {
         assert_eq!(CLIENT_NAME, "modron-mobile");
+    }
+
+    #[test]
+    fn url_validation() {
+        assert!(validate_ws_url("ws://127.0.0.1:7699").is_ok());
+        assert!(validate_ws_url("wss://modron.example.com").is_ok());
+        assert!(validate_ws_url("http://127.0.0.1:7699").is_err());
+        assert!(validate_ws_url("ws://").is_err());
+        assert!(validate_ws_url("ws:///path").is_err());
     }
 }

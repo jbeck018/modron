@@ -15,7 +15,7 @@
 //! Display-shaped payloads reuse [`modron_view`] types (`ToolEvent`) so
 //! every client groups identically.
 
-use modron_core::{
+use modron_types::{
     Attachment, RunSummary, SandboxPolicy, SessionEvent, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_view::ToolEvent;
@@ -618,7 +618,7 @@ pub struct WireSwarmRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modron_core::Message;
+    use modron_types::Message;
 
     fn roundtrip(frame: &Frame) -> Frame {
         let json = serde_json::to_string(frame).expect("serialize");

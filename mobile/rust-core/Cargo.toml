@@ -5,19 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-modron-core = { path = "../../crates/modron-core", version = "0.1.0" }
+modron-types = { path = "../../crates/modron-types", version = "0.1.0" }
 modron-protocol = { path = "../../crates/modron-protocol", version = "0.1.0" }
 modron-view = { path = "../../crates/modron-view", version = "0.1.0" }
+# sync + macros only: channels, select! — no runtime needed on either
+# target (native spawns onto the owned RT below, wasm onto spawn_local).
 tokio = { version = "1", default-features = false, features = [
-    "rt-multi-thread",
     "macros",
     "sync",
-    "net",
-    "time",
 ] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = [
-    "sink",
     "std",
 ] }
 serde = { version = "1", features = ["derive"] }
@@ -26,4 +23,29 @@ thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Handshake deadline: tokio::time would pull the native time driver into
+# the shared code, so the wrapper uses futures-timer here and browser
+# setTimeout on wasm (std Instant panics on wasm32-unknown-unknown).
+futures-timer = "3"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+uuid = { version = "1", features = ["js"] }
+web-sys = { version = "0.3", features = [
+    "WebSocket",
+    "MessageEvent",
+    "ErrorEvent",
+    "CloseEvent",
+    "BinaryType",
+    "Window",
+] }
+
 [dev-dependencies]
+# Tests run native-only: the scripted server needs TCP + timers.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }

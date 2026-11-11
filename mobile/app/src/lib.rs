@@ -3,33 +3,29 @@
 //! `.nsh/types/modron-remote/native.d.ts`.
 //!
 //! This module is the bridge to `modron-mobile-core` (the shared remote
-//! client core): one `RemoteClient` in a background tokio runtime, the
-//! folded `ViewModelSnapshot` handed to TSX as JSON so the shell renders
-//! the shared copy verbatim (AGENTS.md parity contract - no formatting in
-//! TSX).
+//! client core): one `RemoteClient`, the folded `ViewModelSnapshot`
+//! handed to TSX as JSON so the shell renders the shared copy verbatim
+//! (AGENTS.md parity contract - no formatting in TSX).
+//!
+//! Every export is synchronous and non-blocking: `connect` starts the
+//! background handshake (tokio on native, spawn_local on web) and the
+//! shell watches `snapshot_json` for the connection state; `attach` and
+//! `list_sessions` fire wire requests whose answers fold into the
+//! snapshot. The TSX screen already polls the snapshot every frame, so
+//! results simply arrive.
 //!
 //! Exported fns stay thin: the `#[module]` macro rewrites their bodies,
 //! so all real work happens in the plain helpers below.
 
 use modron_mobile_core::{ClientError, RemoteClient};
 use nsh_core::prelude::*;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 /// The crate's UI set (`nsh.json` `"rust"`).
 #[native_module("modron-remote/native")]
 fn native(registry: &mut Registry) {
     registry.module::<Remote>();
 }
-
-/// A dedicated tokio runtime on its own thread: `RemoteClient` runs its
-/// connection loop as tokio tasks, independent of the nsh host runtime.
-static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-});
 
 static CLIENT: Mutex<Option<RemoteClient>> = Mutex::new(None);
 
@@ -65,9 +61,7 @@ fn parse_decision(decision: &str) -> Result<modron_protocol::Decision, String> {
 // ---------------------------------------------------------------------------
 
 fn do_connect(url: &str, token: Option<&str>) -> Result<(), String> {
-    let client = RUNTIME
-        .block_on(RemoteClient::connect(url, token))
-        .map_err(err_text)?;
+    let client = RemoteClient::connect(url, token).map_err(err_text)?;
     let mut guard = lock_client()?;
     *guard = Some(client);
     Ok(())
@@ -77,9 +71,7 @@ fn do_attach(session_id: &str, last_seq: u64) -> Result<(), String> {
     let session = parse_session(session_id)?;
     let guard = lock_client()?;
     match guard.as_ref() {
-        Some(client) => RUNTIME
-            .block_on(async { client.attach(session, last_seq).await })
-            .map_err(err_text),
+        Some(client) => client.attach(session, last_seq).map_err(err_text),
         None => Err(not_connected()),
     }
 }
@@ -88,9 +80,7 @@ fn do_reconnect(url: &str, session_id: &str, token: Option<&str>) -> Result<(), 
     let session = parse_session(session_id)?;
     let guard = lock_client()?;
     match guard.as_ref() {
-        Some(client) => RUNTIME
-            .block_on(client.reconnect(url, session, token))
-            .map_err(err_text),
+        Some(client) => client.reconnect(url, session, token).map_err(err_text),
         None => Err(not_connected()),
     }
 }
@@ -144,10 +134,11 @@ fn do_new_session(title: Option<&str>) -> Result<(), String> {
 fn do_list_sessions_json() -> Result<String, String> {
     let guard = lock_client()?;
     let client = guard.as_ref().ok_or_else(not_connected)?;
-    let sessions = RUNTIME
-        .block_on(async { client.list_sessions().await })
-        .map_err(err_text)?;
-    serde_json::to_string(&sessions).map_err(|e| e.to_string())
+    // Fire the request; the rows land in the snapshot's sessions (the
+    // TSX poll picks them up). Return the current rows so the caller can
+    // render immediately.
+    client.list_sessions().map_err(err_text)?;
+    serde_json::to_string(&client.state().sessions).map_err(|e| e.to_string())
 }
 
 fn do_snapshot_json() -> String {
@@ -289,7 +280,7 @@ impl Remote {
 // The demo fixture: shared types only - the screen renders exactly what a
 // live session would hand it.
 fn demo_snapshot() -> String {
-    use modron_core::{ToolCall, Usage};
+    use modron_types::{ToolCall, Usage};
     use modron_mobile_core::{ConnectionState, PendingApprovalView, ViewModelSnapshot};
     use modron_protocol::{ApprovalModeWire, SessionMetaWire};
 

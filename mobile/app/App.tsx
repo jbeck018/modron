@@ -73,6 +73,9 @@ interface Snapshot {
 // Demo mode renders the scripted snapshot with no server; toggle off to
 // talk to a real one (ws://127.0.0.1:7699 by default).
 const demo = signal(true);
+// Once a connect starts, real server state must flow into the snapshot
+// even while demo is technically still on (it flips off on success).
+const live = signal(false);
 const snap = signal<Snapshot>(JSON.parse(Remote.demoSnapshotJson()) as Snapshot);
 const url = signal(Remote.defaultUrl());
 const draft = signal("");
@@ -81,7 +84,7 @@ const busy = signal(false);
 
 const POLL_MS = 250;
 const poll = setInterval(() => {
-  if (demo()) return;
+  if (!live()) return;
   try {
     // Drain incremental rows too (kept for large transcripts; the full
     // history re-render below is fine at chat scale).
@@ -94,13 +97,41 @@ const poll = setInterval(() => {
 
 const stack = createNavStack<"sessions" | "chat">(["sessions"]);
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// The handshake + session list run in the background (the Rust client is
+// fire-and-forget so the UI thread never blocks, web included): poll the
+// snapshot until connected, fire the list, poll for rows, attach the
+// first one. Errors surface through last_error.
 async function connectAndOpen(): Promise<void> {
   connectError.set(null);
   busy.set(true);
+  live.set(true);
   try {
     Remote.connect(url(), null);
-    const sessions = JSON.parse(Remote.listSessionsJson()) as SessionMeta[];
+    let connected = false;
+    for (let i = 0; i < 40; i++) {
+      const s = JSON.parse(Remote.snapshotJson()) as Snapshot;
+      if (s.connection_label === "connected") {
+        connected = true;
+        break;
+      }
+      if (s.last_error) throw new Error(s.last_error);
+      await sleep(250);
+    }
+    if (!connected) throw new Error("connect timed out");
+
+    Remote.listSessionsJson();
+    let sessions: SessionMeta[] = [];
+    for (let i = 0; i < 20; i++) {
+      const s = JSON.parse(Remote.snapshotJson()) as Snapshot;
+      sessions = s.sessions;
+      if (sessions.length > 0) break;
+      if (s.last_error) throw new Error(s.last_error);
+      await sleep(250);
+    }
     if (sessions.length === 0) throw new Error("no sessions on the server yet");
+
     Remote.attach(sessions[0].id, 0);
     demo.set(false);
     snap.set(JSON.parse(Remote.snapshotJson()) as Snapshot);

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/modron-core",
+    "crates/modron-types",
     "crates/modron-providers",
     "crates/modron-tools",
     "crates/modron-store",

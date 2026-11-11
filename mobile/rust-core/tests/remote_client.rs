@@ -98,7 +98,7 @@ fn text_delta(text: &str, seq: u64, session: Uuid) -> Frame {
 fn snapshot_frame(
     session: Uuid,
     last_seq: u64,
-    events: Vec<modron_core::SessionEvent>,
+    events: Vec<modron_types::SessionEvent>,
     live: LiveState,
 ) -> Frame {
     Frame::event(
@@ -122,6 +122,41 @@ fn entry_texts(client: &RemoteClient) -> Vec<String> {
         .collect()
 }
 
+async fn wait_for(
+    client: &RemoteClient,
+    cond: impl Fn(&modron_mobile_core::ViewModelSnapshot) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let snap = client.state();
+        if cond(&snap) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting; last error: {:?}",
+            snap.last_error
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Connect is fire-and-forget: wait for the background handshake.
+async fn wait_connected(client: &RemoteClient) {
+    wait_for(client, |snap| snap.connection_label == "connected").await;
+}
+
+/// Attach is fire-and-forget: wait for the snapshot fold to land.
+async fn wait_attached(client: &RemoteClient, session: Uuid) {
+    wait_for(client, |snap| snap.session_id == Some(session)).await;
+}
+
+async fn connect_client(url: &str) -> RemoteClient {
+    let client = RemoteClient::connect(url, None).expect("connect accepted");
+    wait_connected(&client).await;
+    client
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -131,7 +166,7 @@ async fn handshake_attach_snapshot_folds_the_full_state() {
     let listener = bind_server().await;
     let url = url_of(&listener).await;
     let session = session_id();
-    let events = vec![modron_core::SessionEvent::Task {
+    let events = vec![modron_types::SessionEvent::Task {
         text: "read a.rs".into(),
     }];
 
@@ -170,9 +205,10 @@ async fn handshake_attach_snapshot_folds_the_full_state() {
         let _ = ws.next().await;
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
+    let client = connect_client(&url).await;
     assert!(client.is_connected());
-    client.attach(session, 0).await.expect("attach");
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
 
     let snap = client.state();
     assert_eq!(snap.session_id, Some(session));
@@ -225,7 +261,7 @@ async fn live_streaming_commits_on_turn_done() {
                 Some(session),
                 1,
                 Payload::Event {
-                    event: modron_core::SessionEvent::Task {
+                    event: modron_types::SessionEvent::Task {
                         text: "count the files".into(),
                     },
                 },
@@ -268,9 +304,9 @@ async fn live_streaming_commits_on_turn_done() {
                 Some(session),
                 6,
                 Payload::Event {
-                    event: modron_core::SessionEvent::Usage {
+                    event: modron_types::SessionEvent::Usage {
                         model: "m".into(),
-                        usage: modron_core::Usage {
+                        usage: modron_types::Usage {
                             input_tokens: 75,
                             output_tokens: 25,
                             cached_input_tokens: 50,
@@ -294,7 +330,7 @@ async fn live_streaming_commits_on_turn_done() {
                         answer: "There are 42 files.".into(),
                         turns: 1,
                         tool_calls: 1,
-                        usage: modron_core::Usage::default(),
+                        usage: modron_types::Usage::default(),
                         models_used: vec!["m".into()],
                     },
                 },
@@ -304,8 +340,9 @@ async fn live_streaming_commits_on_turn_done() {
         let _ = ws.next().await;
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
-    client.attach(session, 0).await.expect("attach");
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
     client.take_new_entries(); // drain the empty snapshot
 
     // Mid-run, fully deterministic: the task row committed, the tool is
@@ -385,7 +422,7 @@ async fn approval_pending_then_resolved() {
                 1,
                 Payload::ApprovalRequested {
                     request_id: "req-9".into(),
-                    call: modron_core::ToolCall {
+                    call: modron_types::ToolCall {
                         id: "c1".into(),
                         name: "edit".into(),
                         arguments: serde_json::json!({"path": "a.rs", "change": "fix"}),
@@ -420,8 +457,9 @@ async fn approval_pending_then_resolved() {
         let _ = ws.next().await;
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
-    client.attach(session, 0).await.expect("attach");
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
 
     // The approval surfaces with the shared labels and a one-line summary.
     loop {
@@ -495,8 +533,9 @@ async fn interrupt_aborts_and_discards_the_buffer() {
         let _ = ws.next().await;
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
-    client.attach(session, 0).await.expect("attach");
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
     assert!(client.state().running);
 
     loop {
@@ -531,12 +570,12 @@ async fn disconnect_then_reconnect_resumes_from_last_seq() {
     let url = url_of(&listener).await;
     let session = session_id();
     let persisted = vec![
-        modron_core::SessionEvent::Task {
+        modron_types::SessionEvent::Task {
             text: "deploy the thing".into(),
         },
-        modron_core::SessionEvent::Usage {
+        modron_types::SessionEvent::Usage {
             model: "m".into(),
-            usage: modron_core::Usage {
+            usage: modron_types::Usage {
                 input_tokens: 1000,
                 output_tokens: 100,
                 cached_input_tokens: 500,
@@ -556,7 +595,7 @@ async fn disconnect_then_reconnect_resumes_from_last_seq() {
                 2,
                 persisted.clone(),
                 LiveState {
-                    cumulative_usage: modron_core::Usage {
+                    cumulative_usage: modron_types::Usage {
                         input_tokens: 1000,
                         output_tokens: 100,
                         cached_input_tokens: 500,
@@ -581,9 +620,9 @@ async fn disconnect_then_reconnect_resumes_from_last_seq() {
             other => panic!("expected attach, got {other:?}"),
         }
         let mut full_log = persisted;
-        full_log.push(modron_core::SessionEvent::Usage {
+        full_log.push(modron_types::SessionEvent::Usage {
             model: "m".into(),
-            usage: modron_core::Usage {
+            usage: modron_types::Usage {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
@@ -596,7 +635,7 @@ async fn disconnect_then_reconnect_resumes_from_last_seq() {
                 5,
                 full_log,
                 LiveState {
-                    cumulative_usage: modron_core::Usage {
+                    cumulative_usage: modron_types::Usage {
                         input_tokens: 1010,
                         output_tokens: 105,
                         cached_input_tokens: 500,
@@ -609,8 +648,9 @@ async fn disconnect_then_reconnect_resumes_from_last_seq() {
         let _ = ws.next().await;
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
-    client.attach(session, 0).await.expect("first attach");
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("first attach");
+    wait_attached(&client, session).await;
     assert_eq!(client.state().cumulative_tokens, 1100);
     assert_eq!(client.take_new_entries().len(), 2, "task + usage rows");
 
@@ -620,10 +660,9 @@ async fn disconnect_then_reconnect_resumes_from_last_seq() {
     assert_eq!(snap.connection_label, "disconnected");
     assert_eq!(snap.last_seq, 2, "seq advanced past the snapshot");
 
-    client
-        .reconnect(&url, session, None)
-        .await
-        .expect("reconnect");
+    client.reconnect(&url, session, None).expect("reconnect");
+    wait_connected(&client).await;
+    wait_attached(&client, session).await;
     assert_eq!(client.state().connection_label, "connected");
     assert_eq!(client.state().cumulative_tokens, 1115, "no double count");
     let texts = entry_texts(&client);
@@ -659,11 +698,23 @@ async fn protocol_mismatch_fails_the_handshake() {
         let _ = ws.next().await;
     });
 
-    let err = RemoteClient::connect(&url, None)
-        .await
-        .expect_err("must fail");
-    assert!(matches!(err, ClientError::ProtocolMismatch { .. }), "{err}");
-    assert_eq!(err.to_string(), "protocol mismatch: server v2, client v1");
+    // The mismatch surfaces asynchronously now: the background handshake
+    // fails into the state instead of the connect call.
+    let client = RemoteClient::connect(&url, None).expect("connect accepted");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let snap = client.state();
+        if let Some(err) = &snap.last_error {
+            assert!(err.contains("protocol mismatch"), "{err}");
+            assert!(err.contains("server v2, client v1"), "{err}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the mismatch"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     server.abort();
 }
 
@@ -734,17 +785,15 @@ async fn config_changed_updates_labels_and_list_sessions_folds() {
         let _ = ws.next().await;
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
-    client.attach(session, 0).await.expect("attach");
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
 
-    let sessions = client.list_sessions().await.expect("list");
+    client.list_sessions().expect("send list");
+    wait_for(&client, |snap| !snap.sessions.is_empty()).await;
+    let sessions = client.state().sessions;
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].title, "deploy the thing");
-    assert_eq!(
-        client.state().sessions.len(),
-        1,
-        "also folded into the view"
-    );
 
     client
         .select_model("claude-opus-5", "anthropic")
@@ -771,10 +820,13 @@ async fn commands_after_disconnect_fail_with_closed() {
     let server = tokio::spawn(async move {
         let mut ws = accept_ws(&listener).await;
         greet(&mut ws).await;
-        drop(ws); // close immediately: the run loop sees the close
+        // Let the client finish its background handshake before the drop:
+        // an instant RST can otherwise outrun the welcome read.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(ws); // close abruptly: the run loop sees the reset
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
+    let client = connect_client(&url).await;
     client.wait_closed().await;
     let err = client.submit(Some(session), "hi").expect_err("closed");
     assert!(matches!(err, ClientError::Closed), "{err}");
@@ -825,8 +877,9 @@ async fn snapshot_seeds_live_tools_and_subagents() {
         let _ = ws.next().await;
     });
 
-    let client = RemoteClient::connect(&url, None).await.expect("connect");
-    client.attach(session, 0).await.expect("attach");
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
     let snap = client.state();
     assert_eq!(snap.tool_lines, vec!["✓ read — 64 B"]);
     assert_eq!(

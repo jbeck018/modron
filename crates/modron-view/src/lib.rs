@@ -22,7 +22,7 @@ pub use gen_ui::{
     GenUi,
 };
 
-use modron_core::{SessionEvent, ToolActivity, Usage};
+use modron_types::{SessionEvent, ToolActivity, Usage};
 use serde::{Deserialize, Serialize};
 
 /// One grouped tool event for the collapsed tool view (lifted from the
@@ -322,13 +322,13 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
                 entries.push(TranscriptEntry::Task { text: text.clone() });
             }
             SessionEvent::Message { message, .. } => match message.role {
-                modron_core::Role::User => {
+                modron_types::Role::User => {
                     flush_tools(&mut entries, &mut turn_tools);
                     entries.push(TranscriptEntry::User {
                         text: message.content.clone(),
                     });
                 }
-                modron_core::Role::Assistant => {
+                modron_types::Role::Assistant => {
                     flush_tools(&mut entries, &mut turn_tools);
                     for call in &message.tool_calls {
                         call_names.insert(call.id.clone(), call.name.clone());
@@ -349,7 +349,7 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
                         }
                     }
                 }
-                modron_core::Role::Tool => {
+                modron_types::Role::Tool => {
                     // Tool results ride the tool summary via their
                     // companion ToolResult events, not as rows.
                 }
@@ -414,7 +414,7 @@ pub fn usage_totals(events: &[SessionEvent]) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modron_core::{Message, ToolCall, ToolOutcome};
+    use modron_types::{Message, ToolCall, ToolOutcome};
 
     fn done(name: &str, bytes: u64, is_error: bool) -> ToolActivity {
         ToolActivity::Done {

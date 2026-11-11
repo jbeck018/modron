@@ -23,10 +23,10 @@
 //! attach, so a reconnect never double-counts. `TurnDone` summaries do
 //! not add usage (the server's `Usage` events already covered the turn).
 
-use modron_core::{Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_protocol::{
     ApprovalModeWire, Decision, LiveState, PendingApproval, SessionMetaWire, WireRunSummary,
 };
+use modron_types::{Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_view::{replay, ActivityTracker, SwarmRow, ToolEvent, TranscriptEntry};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -597,7 +597,7 @@ pub(crate) fn fold_turn_unfinished(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use modron_core::{Message, ToolOutcome};
+    use modron_types::{Message, ToolOutcome};
 
     fn assistant_with_calls(content: &str, call_id: &str) -> SessionEvent {
         let mut message = Message::assistant(content);
