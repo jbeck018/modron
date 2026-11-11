@@ -969,6 +969,56 @@ impl DesktopApp {
             || (self.state.attached == Some(id) && self.state.running)
     }
 
+    /// Sidebar grouping: sessions cluster under the folder they were
+    /// started in (the empty key = "no folder", for servers predating the
+    /// wire field). `sessions` arrives newest-first, so groups come out
+    /// ordered by their newest session and rows stay newest-first within
+    /// each group. Carries each row's position in `state.sessions` so
+    /// element ids stay stable across renders; `query` (already lowercase)
+    /// matches the title or the folder label.
+    fn sidebar_groups<'a>(
+        sessions: &'a [crate::app_state::SessionRow],
+        query: &str,
+    ) -> Vec<(String, Vec<(usize, &'a crate::app_state::SessionRow)>)> {
+        let mut groups: Vec<(String, Vec<(usize, &crate::app_state::SessionRow)>)> = Vec::new();
+        for (ix, session) in sessions.iter().enumerate() {
+            if !query.is_empty()
+                && !session.title.to_ascii_lowercase().contains(query)
+                && !session
+                    .working_dir
+                    .as_deref()
+                    .unwrap_or("no folder")
+                    .to_ascii_lowercase()
+                    .contains(query)
+            {
+                continue;
+            }
+            let key = session.working_dir.clone().unwrap_or_default();
+            match groups.iter_mut().find(|(dir, _)| *dir == key) {
+                Some(group) => group.1.push((ix, session)),
+                None => groups.push((key, vec![(ix, session)])),
+            }
+        }
+        groups
+    }
+
+    /// One-line group header: the folder path itself when it fits, else
+    /// its last component.
+    fn group_label(dir: &str) -> String {
+        if dir.is_empty() {
+            return "no folder".into();
+        }
+        if dir.chars().count() <= 20 {
+            return dir.to_string();
+        }
+        dir.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|last| !last.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| dir.to_string())
+    }
+
     fn render_sidebar(&self, entity: &Entity<Self>, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let query = self.session_filter_query.to_ascii_lowercase();
@@ -1054,161 +1104,197 @@ impl DesktopApp {
             .child(div().px_3().pb_2().child(Input::new(&self.session_filter)));
 
         let mut shown = 0usize;
-        for (ix, session) in self.state.sessions.iter().enumerate() {
-            if !query.is_empty() && !session.title.to_ascii_lowercase().contains(&query) {
-                continue;
-            }
-            shown += 1;
-            let id = session.id;
-            let attached = self.state.attached == Some(id);
-            let running = self.row_running(session, id) || (attached && self.state.running);
-            let title: SharedString = session.title.clone().into();
-            let meta: SharedString = Self::relative_time(&session.updated_at).into();
-            let entity = entity.clone();
-            let attach_entity = entity.clone();
-            // Single line: truncated title, relative time on the right
-            // (the desktop chat grammar - message counts and ids live in
-            // the transcript header, not the list).
-            let row = div()
-                .id(("session", ix))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .mx_2()
-                .px_2()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .when(attached, |row| row.bg(theme.secondary))
-                .hover(|row| row.bg(theme.secondary))
-                .on_click(move |_event: &ClickEvent, _window, cx| {
-                    attach_entity.update(cx, |this, cx| this.attach(id, cx));
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(px(12.5))
-                        .text_color(theme.foreground)
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(title),
-                )
-                .children(if running {
-                    // Shimmer sweep: a short accent segment slides along the
-                    // bottom edge while the task runs (16ms tick).
-                    let sweep = ((self.anim_tick as f32) * 0.02).fract();
-                    vec![div()
-                        .flex_1()
-                        .min_w_0()
-                        .relative()
-                        .h(px(2.))
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left(gpui_kit::relative((sweep * 90.0).clamp(0.0, 90.0)))
-                                .w(px(24.))
-                                .h(px(2.))
-                                .rounded_sm()
-                                .bg(theme.accent),
-                        )
-                        .into_any_element()]
+        for (dir, group) in Self::sidebar_groups(&self.state.sessions, &query) {
+            shown += group.len();
+            // Group divider + header: a thin hairline above the cluster,
+            // then the folder as a muted one-line label (truncated).
+            let header: SharedString = Self::group_label(&dir).into();
+            list = list.child(
+                div()
+                    .mt_1()
+                    .mx_2()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(theme.muted_foreground)
+                            .child(header),
+                    ),
+            );
+            for (ix, session) in group {
+                let id = session.id;
+                let attached = self.state.attached == Some(id);
+                let running = self.row_running(session, id) || (attached && self.state.running);
+                let title: SharedString = session.title.clone().into();
+                let meta: SharedString = Self::relative_time(&session.updated_at).into();
+                let entity = entity.clone();
+                let attach_entity = entity.clone();
+                // Hover reads subtler than selection (half-strength
+                // secondary), so the attached row stays clearly distinct.
+                let hover_bg = if attached {
+                    theme.secondary
                 } else {
-                    Vec::new()
-                })
-                .children({
-                    let mut trailing: Vec<gpui_kit::AnyElement> = Vec::new();
-                    let running = self.row_running(session, id) || (attached && self.state.running);
-                    if running {
-                        // Working: rotating loader next to the title.
-                        let spin = (self.anim_tick as f32) * 9.0;
-                        trailing.push(
-                            gpui_kit::component::Icon::default()
-                                .path("icons/loader-circle.svg")
-                                .text_color(theme.accent)
-                                .rotate(gpui_kit::radians(spin))
-                                .into_any_element(),
-                        );
-                    }
-                    if self.confirm_delete == Some(id) {
-                        let entity_yes = entity.clone();
-                        let entity_no = entity.clone();
-                        trailing.push(
-                            Button::new(("del-yes", ix))
-                                .label("delete")
-                                .danger()
-                                .xsmall()
-                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                    entity_yes.update(cx, |this, cx| this.delete_session(id, cx));
-                                })
-                                .into_any_element(),
-                        );
-                        trailing.push(
-                            Button::new(("del-no", ix))
-                                .label("keep")
-                                .ghost()
-                                .xsmall()
-                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                    entity_no.update(cx, |this, cx| {
-                                        this.confirm_delete = None;
-                                        this.refresh(cx);
-                                    });
-                                })
-                                .into_any_element(),
-                        );
-                    } else {
-                        let entity_del = entity.clone();
-                        trailing.push(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(theme.muted_foreground)
-                                .child(meta)
-                                .into_any_element(),
-                        );
-                        // Worktree tasks carry a branch chip: the visual
-                        // mark that this session runs in its own worktree.
-                        if let Some(branch) = &session.task_branch {
-                            let chip: SharedString = branch.trim_start_matches("modron/").into();
-                            trailing.push(
+                    theme.secondary.opacity(0.5)
+                };
+                // Single line: truncated title, relative time on the right
+                // (the desktop chat grammar - message counts and ids live in
+                // the transcript header, not the list). Fixed row height so
+                // hover-revealed controls never reflow the list.
+                let row = div()
+                    .id(("session", ix))
+                    // Names this row as the hover group its delete button
+                    // listens to (group_hover below reveals it per row).
+                    .group("session-row")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .mx_2()
+                    .px_2()
+                    .py_1()
+                    .min_h(px(32.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(attached, |row| row.bg(theme.secondary))
+                    .hover(move |row| row.bg(hover_bg))
+                    .on_click(move |_event: &ClickEvent, _window, cx| {
+                        attach_entity.update(cx, |this, cx| this.attach(id, cx));
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(theme.foreground)
+                            .child(title),
+                    )
+                    .children(if running {
+                        // Shimmer sweep: a short accent segment slides along the
+                        // bottom edge while the task runs (16ms tick).
+                        let sweep = ((self.anim_tick as f32) * 0.02).fract();
+                        vec![div()
+                            .flex_1()
+                            .min_w_0()
+                            .relative()
+                            .h(px(2.))
+                            .child(
                                 div()
-                                    .px_1p5()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left(gpui_kit::relative((sweep * 90.0).clamp(0.0, 90.0)))
+                                    .w(px(24.))
+                                    .h(px(2.))
                                     .rounded_sm()
-                                    .bg(theme.accent)
-                                    .text_size(px(10.))
-                                    .text_color(theme.accent_foreground)
-                                    .child(chip)
+                                    .bg(theme.accent),
+                            )
+                            .into_any_element()]
+                    } else {
+                        Vec::new()
+                    })
+                    .children({
+                        let mut trailing: Vec<gpui_kit::AnyElement> = Vec::new();
+                        if running {
+                            // Working: rotating loader next to the title.
+                            let spin = (self.anim_tick as f32) * 9.0;
+                            trailing.push(
+                                gpui_kit::component::Icon::default()
+                                    .path("icons/loader-circle.svg")
+                                    .text_color(theme.accent)
+                                    .rotate(gpui_kit::radians(spin))
                                     .into_any_element(),
                             );
                         }
-                        // Hover-only: opacity 0 until the row is hovered.
-                        trailing.push(
-                            div()
-                                .opacity(0.)
-                                .group_hover("session-row", |style| style.opacity(1.))
-                                .child(
-                                    Button::new(("del", ix))
-                                        .icon(Icon::default().path("icons/trash.svg").size_4())
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(move |_event: &ClickEvent, _w, cx: &mut App| {
-                                            // The x sits inside the clickable row:
-                                            // stop propagation so the attach
-                                            // handler does not fire too.
-                                            cx.stop_propagation();
-                                            entity_del.update(cx, |this, cx| {
-                                                this.confirm_delete = Some(id);
-                                                this.refresh(cx);
-                                            });
-                                        }),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                    trailing
-                });
-            list = list.child(row);
+                        if self.confirm_delete == Some(id) {
+                            let entity_yes = entity.clone();
+                            let entity_no = entity.clone();
+                            trailing.push(
+                                Button::new(("del-yes", ix))
+                                    .label("delete")
+                                    .danger()
+                                    .xsmall()
+                                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                        entity_yes
+                                            .update(cx, |this, cx| this.delete_session(id, cx));
+                                    })
+                                    .into_any_element(),
+                            );
+                            trailing.push(
+                                Button::new(("del-no", ix))
+                                    .label("keep")
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                        entity_no.update(cx, |this, cx| {
+                                            this.confirm_delete = None;
+                                            this.refresh(cx);
+                                        });
+                                    })
+                                    .into_any_element(),
+                            );
+                        } else {
+                            let entity_del = entity.clone();
+                            trailing.push(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.muted_foreground)
+                                    .child(meta)
+                                    .into_any_element(),
+                            );
+                            // Worktree tasks carry a branch chip: the visual
+                            // mark that this session runs in its own worktree.
+                            if let Some(branch) = &session.task_branch {
+                                let chip: SharedString =
+                                    branch.trim_start_matches("modron/").into();
+                                trailing.push(
+                                    div()
+                                        .px_1p5()
+                                        .rounded_sm()
+                                        .bg(theme.accent)
+                                        .text_size(px(10.))
+                                        .text_color(theme.accent_foreground)
+                                        .child(chip)
+                                        .into_any_element(),
+                                );
+                            }
+                            // Hover-only: opacity 0 until the row (its
+                            // "session-row" group) is hovered.
+                            trailing.push(
+                                div()
+                                    .flex_shrink_0()
+                                    .opacity(0.)
+                                    .group_hover("session-row", |style| style.opacity(1.))
+                                    .child(
+                                        Button::new(("del", ix))
+                                            .icon(Icon::default().path("icons/trash.svg").size_4())
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click(
+                                                move |_event: &ClickEvent, _w, cx: &mut App| {
+                                                    // The x sits inside the clickable row:
+                                                    // stop propagation so the attach
+                                                    // handler does not fire too.
+                                                    cx.stop_propagation();
+                                                    entity_del.update(cx, |this, cx| {
+                                                        this.confirm_delete = Some(id);
+                                                        this.refresh(cx);
+                                                    });
+                                                },
+                                            ),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        trailing
+                    });
+                list = list.child(row);
+            }
         }
         if shown == 0 {
             list = list.child(
@@ -2903,5 +2989,62 @@ mod tests {
         );
         let explicit = LaunchOptions::parse(args(&["--connect", "ws://10.0.0.5:7699"]));
         assert_eq!(explicit.connect.as_deref(), Some("ws://10.0.0.5:7699"));
+    }
+
+    fn sidebar_row(
+        title: &str,
+        updated_at: &str,
+        working_dir: Option<&str>,
+    ) -> crate::app_state::SessionRow {
+        crate::app_state::SessionRow {
+            id: uuid::Uuid::new_v4(),
+            title: title.into(),
+            updated_at: updated_at.into(),
+            message_count: 0,
+            task_branch: None,
+            task_state: None,
+            working_dir: working_dir.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn sidebar_groups_by_folder_newest_first() {
+        // state.sessions arrives newest-first (AppState sorts on apply);
+        // groups order by their newest member, rows keep that order too.
+        let sessions = vec![
+            sidebar_row("a", "2026-11-09T12:00:00Z", Some("/home/j/dev/bridge")),
+            sidebar_row("b", "2026-11-09T11:00:00Z", None),
+            sidebar_row("c", "2026-11-09T10:00:00Z", Some("/home/j/dev/bridge")),
+            sidebar_row("d", "2026-11-09T09:00:00Z", Some("/home/j/dev/modron")),
+        ];
+        let groups = DesktopApp::sidebar_groups(&sessions, "");
+        assert_eq!(groups.len(), 3, "three folders: {groups:?}");
+        assert_eq!(groups[0].0, "/home/j/dev/bridge", "newest group first");
+        assert_eq!(groups[1].0, "", "no-folder sessions share a group");
+        assert_eq!(groups[2].0, "/home/j/dev/modron");
+        assert_eq!(
+            groups[0].1.iter().map(|(ix, _)| *ix).collect::<Vec<_>>(),
+            vec![0, 2],
+            "row positions preserved for stable element ids"
+        );
+    }
+
+    #[test]
+    fn sidebar_filter_matches_title_or_folder() {
+        let sessions = vec![sidebar_row(
+            "deploy",
+            "2026-11-09T12:00:00Z",
+            Some("/home/j/dev/bridge"),
+        )];
+        assert_eq!(DesktopApp::sidebar_groups(&sessions, "deploy").len(), 1);
+        assert_eq!(DesktopApp::sidebar_groups(&sessions, "bridge").len(), 1);
+        assert_eq!(DesktopApp::sidebar_groups(&sessions, "zzz").len(), 0);
+    }
+
+    #[test]
+    fn group_labels_shorten_long_paths() {
+        assert_eq!(DesktopApp::group_label(""), "no folder");
+        assert_eq!(DesktopApp::group_label("/a/b"), "/a/b");
+        assert_eq!(DesktopApp::group_label("/Users/jacob/dev/modron"), "modron");
     }
 }

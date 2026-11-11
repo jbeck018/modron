@@ -68,6 +68,7 @@ impl Demo {
                 message_count: 4,
                 task_branch: None,
                 task_state: None,
+                working_dir: Some("/Users/jacob/dev/modron".into()),
             },
             SessionMetaWire {
                 id: SESSION_B,
@@ -77,6 +78,7 @@ impl Demo {
                 message_count: 2,
                 task_branch: None,
                 task_state: None,
+                working_dir: Some("/Users/jacob/dev/bridge".into()),
             },
         ];
         let (attached, _) = watch::channel(None);
@@ -125,6 +127,7 @@ impl Demo {
                 message_count: 0,
                 task_branch: None,
                 task_state: None,
+                working_dir: Some("/Users/jacob/dev/modron".into()),
             });
         id
     }

@@ -176,6 +176,18 @@ pub async fn handle_frame(
                                 "ready".to_string()
                             }
                         });
+                        // The folder the session runs in: the hub handle
+                        // holds the engine's resolved working dir (a
+                        // worktree task runs in its worktree); a session
+                        // with no live handle ran in the served repo or
+                        // its worktree from an earlier run.
+                        let working_dir = match state.hub.handle(&meta.id) {
+                            Some(handle) => Some(handle.working_dir().display().to_string()),
+                            None => task
+                                .as_ref()
+                                .map(|record| record.worktree.display().to_string())
+                                .or_else(|| Some(state.working_dir.display().to_string())),
+                        };
                         SessionMetaWire {
                             id: meta.id,
                             title: meta.title,
@@ -184,6 +196,7 @@ pub async fn handle_frame(
                             message_count: meta.message_count,
                             task_branch: task.as_ref().map(|r| r.branch.clone()),
                             task_state,
+                            working_dir,
                         }
                     })
                     .collect();

@@ -329,6 +329,7 @@ fn demo_snapshot() -> String {
             message_count: 8,
             task_branch: None,
             task_state: None,
+            working_dir: None,
         }],
         last_seq: 42,
         last_error: None,

@@ -747,6 +747,7 @@ async fn config_changed_updates_labels_and_list_sessions_folds() {
                     sessions: vec![modron_protocol::SessionMetaWire {
                         task_branch: None,
                         task_state: None,
+                        working_dir: None,
                         id: session,
                         title: "deploy the thing".into(),
                         created_at: "2026-11-09T00:00:00Z".into(),

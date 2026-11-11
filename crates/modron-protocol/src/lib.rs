@@ -342,6 +342,11 @@ pub struct SessionMetaWire {
     /// or "ready" (has commits ahead of base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_state: Option<String>,
+    /// The folder the session runs in (the server's working dir, or a
+    /// task's worktree). Clients group the session list by it; absent on
+    /// older servers (pre-grouping wire snapshots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 /// One changed file in a task's diff (from `git diff --numstat`).

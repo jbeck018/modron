@@ -43,6 +43,9 @@ pub struct SessionRow {
     pub task_branch: Option<String>,
     /// "running" | "ready" (list-time snapshot).
     pub task_state: Option<String>,
+    /// The folder the session runs in (sidebar grouping key; `None` on
+    /// servers predating the field).
+    pub working_dir: Option<String>,
 }
 
 impl From<&SessionMetaWire> for SessionRow {
@@ -51,6 +54,7 @@ impl From<&SessionMetaWire> for SessionRow {
             id: m.id,
             task_branch: m.task_branch.clone(),
             task_state: m.task_state.clone(),
+            working_dir: m.working_dir.clone(),
             title: m.title.clone(),
             updated_at: m.updated_at.clone(),
             message_count: m.message_count,
@@ -1006,6 +1010,7 @@ mod tests {
                         message_count: 2,
                         task_branch: None,
                         task_state: None,
+                        working_dir: None,
                     },
                     SessionMetaWire {
                         id: sid(),
@@ -1015,6 +1020,7 @@ mod tests {
                         message_count: 5,
                         task_branch: None,
                         task_state: None,
+                        working_dir: None,
                     },
                 ],
             },
