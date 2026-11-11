@@ -218,6 +218,7 @@ mod tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.to_path_buf(),
+            session_id: None,
         };
         EditTool.execute(args, &ctx).await.expect("execute")
     }
@@ -315,6 +316,7 @@ mod rail_tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.path().to_path_buf(),
+            session_id: None,
         };
         crate::ReadTool
             .execute(json!({"path": "f.txt"}), &read_ctx)
@@ -325,6 +327,7 @@ mod rail_tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.path().to_path_buf(),
+            session_id: None,
         };
         let out = EditTool
             .execute(

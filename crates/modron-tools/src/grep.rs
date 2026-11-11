@@ -150,6 +150,7 @@ mod tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.path().to_path_buf(),
+            session_id: None,
         };
         let mut args = json!({"pattern": pattern});
         if let Some(p) = path {

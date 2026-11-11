@@ -51,6 +51,19 @@ pub fn older_transcript_text(events: &[SessionEvent], skip_last_messages: usize)
             SessionEvent::Task { text } => {
                 push_line(&mut out, &format!("[TASK] {text}"));
             }
+            SessionEvent::Plan { items } => {
+                // The latest plan survives compaction as its status table
+                // (the run's tracked state must not vanish mid-goal).
+                for item in items {
+                    push_line(
+                        &mut out,
+                        &format!(
+                            "[PLAN] {} {} - {}",
+                            item.status, item.text, item.done_criteria
+                        ),
+                    );
+                }
+            }
             SessionEvent::Message { message, .. } => {
                 if !message.content.trim().is_empty() {
                     let tag = match message.role {

@@ -208,6 +208,7 @@ mod tests {
             engine: None,
             sandbox: SandboxPolicy::Off,
             working_dir: work.to_path_buf(),
+            session_id: None,
         };
         MemorySearchTool::new(root)
             .execute(args, &ctx)

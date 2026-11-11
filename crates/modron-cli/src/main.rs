@@ -1264,6 +1264,9 @@ fn build_agent_with(
     // (oh-my-pi pattern): background subagents via `delegate_status`,
     // isolated worktrees via `merge_worktree`.
     registry.register(Arc::new(modron_tools::DelegateTool));
+    // The standing plan (2026-11-11): measurable subtasks + statuses,
+    // re-injected every turn so long goals stay on track.
+    registry.register(Arc::new(modron_tools::PlanTool));
     registry.register(Arc::new(modron_tools::DelegateStatusTool));
     registry.register(Arc::new(modron_tools::MergeWorktreeTool));
     // Built-in methodology skills ship with the binary, so the tool is

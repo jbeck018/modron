@@ -57,8 +57,8 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 pub use modron_types::{
-    Attachment, Message, Role, RunSummary, SandboxPolicy, SessionEvent, SessionId, SessionMeta,
-    StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec, Usage,
+    Attachment, Message, PlanItem, Role, RunSummary, SandboxPolicy, SessionEvent, SessionId,
+    SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec, Usage,
 };
 
 /// Context handed to a tool execution.
@@ -71,6 +71,9 @@ pub struct ToolCtx {
     /// Handle to the running engine (Phase 4): read-only subagent tools
     /// (`explore`) use it to spawn child agents. `None` in unit tests.
     pub engine: Option<Arc<Engine>>,
+    /// The session the run executes in (2026-11-11): session-aware tools
+    /// (`plan`) append events to the run's log. `None` in unit tests.
+    pub session_id: Option<SessionId>,
 }
 
 impl ToolCtx {
@@ -80,6 +83,7 @@ impl ToolCtx {
             working_dir: working_dir.into(),
             sandbox: SandboxPolicy::Off,
             engine: None,
+            session_id: None,
         }
     }
 }

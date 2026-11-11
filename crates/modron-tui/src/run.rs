@@ -1326,6 +1326,7 @@ async fn run_slow_pending_command(
                 sandbox: engine.config.sandbox,
                 working_dir: engine.config.working_dir.clone(),
                 engine: Some(std::sync::Arc::new(engine.clone())),
+                session_id: session,
             };
             let lines = match engine.tools.get("delegate_status") {
                 Some(tool) => match tool.execute(serde_json::json!({}), &ctx).await {

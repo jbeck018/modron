@@ -392,6 +392,7 @@ mod tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.to_path_buf(),
+            session_id: None,
         };
         ReadMinifiedTool.execute(args, &ctx).await.expect("execute")
     }

@@ -389,6 +389,11 @@ impl AppState {
                     }
                 }
                 TranscriptEntry::Usage { .. } => {}
+                TranscriptEntry::Plan { items } => {
+                    rows.push(Row::Entry(TranscriptEntry::Plan {
+                        items: items.clone(),
+                    }));
+                }
                 TranscriptEntry::Compaction {
                     summarized_events, ..
                 } => rows.push(Row::Divider {

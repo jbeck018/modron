@@ -193,6 +193,7 @@ mod tests {
             engine: Some(Arc::new(engine.clone())),
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: std::env::temp_dir(),
+            session_id: None,
         };
         ToolSearchTool.execute(args, &ctx).await.expect("execute")
     }

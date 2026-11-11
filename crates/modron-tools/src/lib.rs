@@ -30,6 +30,7 @@ mod interact;
 mod lsp;
 mod memory_search;
 mod minify;
+mod plan;
 mod read;
 pub mod reduce;
 mod remember;
@@ -46,6 +47,7 @@ pub use explore::ExploreTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use interact::InteractTool;
+pub use plan::PlanTool;
 pub use read::ReadTool;
 pub use reduce::reduce_output;
 pub use remember::RememberTool;
@@ -94,7 +96,7 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
 /// keeps the rest discoverable. `delegate` is essential (2026-11-11):
 /// the model must see it to auto-delegate — the oh-my-pi pattern of
 /// spinning off background/isolated subtasks unprompted.
-pub const ESSENTIAL_TOOLS: [&str; 13] = [
+pub const ESSENTIAL_TOOLS: [&str; 14] = [
     "read",
     "write",
     "edit",
@@ -108,6 +110,7 @@ pub const ESSENTIAL_TOOLS: [&str; 13] = [
     "verify",
     "interact",
     "delegate",
+    "plan",
 ];
 
 /// Demote every registered tool not in [`ESSENTIAL_TOOLS`] to on-demand
@@ -206,6 +209,7 @@ mod tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.path().to_path_buf(),
+            session_id: None,
         };
         let tool = registry.get("read").expect("read tool registered");
         let outcome = tool

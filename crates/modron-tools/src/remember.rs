@@ -190,6 +190,7 @@ mod tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: work.to_path_buf(),
+            session_id: None,
         };
         RememberTool::new(root)
             .execute(args, &ctx)

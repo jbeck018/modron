@@ -1814,6 +1814,65 @@ impl DesktopApp {
         };
 
         match row {
+            Row::Entry(TranscriptEntry::Plan { items }) => {
+                // The standing plan: a bordered card of checkbox rows
+                // (the shared modron_view::plan_lines copy).
+                let mut card = div().id(("transcript-row", ix)).px_4().py_1().child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.muted),
+                );
+                let mut card_body = div().flex().flex_col().gap_0p5();
+                card_body = card_body.child(
+                    div()
+                        .text_size(px(crate::brand::text::XS))
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from("plan")),
+                );
+                for line in modron_view::plan_lines(items) {
+                    let mark_char = line.chars().next().unwrap_or('o');
+                    let mark = mark_char.to_string();
+                    let rest: SharedString = line.chars().skip(1).collect::<String>().trim().into();
+                    let color = match mark_char {
+                        '\u{2713}' => theme.foreground,
+                        '\u{25b8}' => theme.accent_foreground,
+                        _ => theme.muted_foreground,
+                    };
+                    let done = mark_char == '\u{2713}';
+                    card_body = card_body.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(crate::brand::text::SM))
+                                    .text_color(color)
+                                    .child(SharedString::from(mark)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(crate::brand::text::SM))
+                                    .text_color(if done {
+                                        theme.muted_foreground
+                                    } else {
+                                        theme.foreground
+                                    })
+                                    .child(rest),
+                            ),
+                    );
+                }
+                card = card.child(card_body);
+                card.into_any_element()
+            }
             Row::Entry(TranscriptEntry::Task { text })
             | Row::Entry(TranscriptEntry::User { text }) => user_bubble(text),
             Row::Entry(TranscriptEntry::Assistant { text }) => div()

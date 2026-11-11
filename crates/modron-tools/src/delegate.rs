@@ -370,6 +370,7 @@ mod tests {
                     working_dir: dir.path().to_path_buf(),
                     sandbox: Default::default(),
                     engine: Some(std::sync::Arc::new(engine)),
+                    session_id: None,
                 },
             )
             .await
@@ -414,6 +415,7 @@ mod phase5i_tests {
             working_dir: dir.to_path_buf(),
             sandbox: Default::default(),
             engine: Some(Arc::clone(engine)),
+            session_id: None,
         }
     }
 

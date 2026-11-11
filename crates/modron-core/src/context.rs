@@ -25,6 +25,7 @@ Rules:
 - Keep tool outputs small: narrow read ranges, capped result counts, targeted queries.
 - Batch independent tool calls in one turn; sequence calls that depend on earlier results.
 - After editing, verify (re-read the diff, run the tests) before claiming success.
+- Multi-step goals: maintain the standing plan with the `plan` tool — `set` it first (subtasks with measurable done criteria), then `update` statuses as you go. The plan is re-shown to you every turn; keep it truthful.
 - Be concise: findings first, `file:line` references, no filler, no restating the task.
 - If you cannot complete the task, say so plainly and stop.";
 

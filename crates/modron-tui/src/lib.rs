@@ -2226,6 +2226,22 @@ impl App {
                         }
                     }
                 }
+                TranscriptEntry::Plan { items } => {
+                    let dim = Style::default().fg(t.tool);
+                    for row in wrap_line(&Line::from("plan").style(dim), self.hist_wrap_width()) {
+                        self.history.push(row);
+                    }
+                    let plain = Style::default();
+                    for line in modron_view::plan_lines(&items) {
+                        for row in wrap_line(
+                            &Line::from(format!("  {line}")).style(plain),
+                            self.hist_wrap_width(),
+                        ) {
+                            self.history.push(row);
+                        }
+                    }
+                    self.history.push(Line::from(""));
+                }
                 TranscriptEntry::Assistant { text } => {
                     let plain = Style::default();
                     for line in text.split('\n') {

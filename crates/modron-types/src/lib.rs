@@ -286,6 +286,15 @@ pub enum SessionEvent {
         #[serde(default)]
         failure_label: Option<String>,
     },
+    /// The standing plan (2026-11-11, the measurable-subtask primitive):
+    /// the model decomposes a goal into subtasks with measurable done
+    /// criteria via the `plan` tool; each write replaces the whole plan.
+    /// Every turn's context re-injects the latest plan so the run stays
+    /// on track; the finish gate and UIs read it too. Additive variant:
+    /// older logs load unchanged.
+    Plan {
+        items: Vec<PlanItem>,
+    },
     /// Pre-mutation file snapshot (Phase-1b C1, additive): captured before
     /// `write`/`edit` execute. `prior_content_b64: None` means the file was
     /// new (rewind deletes it) or exceeded the 256KB snapshot cap. Bash
@@ -295,6 +304,22 @@ pub enum SessionEvent {
         prior_content_b64: Option<String>,
         event_index: u64,
     },
+}
+
+/// One measurable subtask of the standing plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanItem {
+    /// The subtask in one line (imperative).
+    pub text: String,
+    /// The measurable done criterion ("tests X pass", "curl returns 200").
+    pub done_criteria: String,
+    /// "pending" | "active" | "done" | "blocked".
+    #[serde(default = "default_plan_status")]
+    pub status: String,
+}
+
+fn default_plan_status() -> String {
+    "pending".to_string()
 }
 
 /// Tool-activity notification (Phase-1d T0, additive): fired around every

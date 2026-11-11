@@ -18,6 +18,27 @@
 pub mod gen_ui;
 pub mod slash;
 
+/// The checkbox rows for a standing plan (shared copy: the TUI backfill,
+/// the mobile shell, and the GUI render these verbatim).
+pub fn plan_lines(items: &[modron_types::PlanItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| {
+            let mark = match item.status.as_str() {
+                "done" => "\u{2713}",
+                "active" => "\u{25b8}",
+                "blocked" => "\u{2717}",
+                _ => "\u{25cb}",
+            };
+            if item.done_criteria.is_empty() {
+                format!("{mark} {}", item.text)
+            } else {
+                format!("{mark} {} - {}", item.text, item.done_criteria)
+            }
+        })
+        .collect()
+}
+
 pub use gen_ui::{
     render_ascii, split_generative_ui, ChartKind, GenField, GenFieldKind, GenPoint, GenSegment,
     GenUi,
@@ -284,6 +305,10 @@ pub enum TranscriptEntry {
         summary: String,
         summarized_events: u32,
     },
+    /// The standing plan (measurable subtasks; every write replaces the
+    /// whole plan). UIs render checkbox rows; the latest plan is the
+    /// run's tracked state.
+    Plan { items: Vec<modron_types::PlanItem> },
     /// A generative-UI widget parsed from a ```modron-ui fenced block in
     /// an assistant answer (table, chart, form). The GUI renders native
     /// widgets; the TUI renders the ASCII projection.
@@ -321,6 +346,12 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
             SessionEvent::Task { text } => {
                 flush_tools(&mut entries, &mut turn_tools);
                 entries.push(TranscriptEntry::Task { text: text.clone() });
+            }
+            SessionEvent::Plan { items } => {
+                flush_tools(&mut entries, &mut turn_tools);
+                entries.push(TranscriptEntry::Plan {
+                    items: items.clone(),
+                });
             }
             SessionEvent::Message { message, .. } => match message.role {
                 modron_types::Role::User => {
@@ -603,6 +634,7 @@ mod tests {
                 TranscriptEntry::Usage { .. } => "usage",
                 TranscriptEntry::Compaction { .. } => "compaction",
                 TranscriptEntry::GenerativeUi { .. } => "gen_ui",
+                TranscriptEntry::Plan { .. } => "plan",
             })
             .collect();
         assert_eq!(

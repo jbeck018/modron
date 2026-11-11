@@ -112,6 +112,7 @@ mod tests {
             engine: None,
             sandbox: modron_core::SandboxPolicy::Off,
             working_dir: dir.path().to_path_buf(),
+            session_id: None,
         };
         GlobTool
             .execute(json!({"pattern": pattern}), &ctx)

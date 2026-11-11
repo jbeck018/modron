@@ -433,6 +433,7 @@ impl Engine {
                                                     sandbox: engine.config.sandbox,
                                                     working_dir: engine.config.working_dir.clone(),
                                                     engine: Some(Arc::clone(&engine)),
+                                                    session_id: Some(session_id),
                                                 };
                                                 let outcome = match engine.tools.get(&name) {
                                                     Some(tool) => tool
@@ -513,6 +514,20 @@ impl Engine {
                                 fallback = Some(fb.clone());
                                 run_tier_override = Some((model, fb));
                                 continue;
+                            }
+                        }
+                        // Phase 13 completion (2026-11-11): a FAILED run
+                        // is a failure signal for the memories it surfaced
+                        // — the ledger learns from both outcomes, not just
+                        // successes.
+                        if !memory_hits.is_empty() {
+                            if let Some(root) = &self.config.memory_root {
+                                if let Ok(store) = crate::memory::MemoryStore::for_workspace(
+                                    root,
+                                    &self.config.working_dir,
+                                ) {
+                                    store.record_outcome(&memory_hits, false);
+                                }
                             }
                         }
                         return Err(e);
@@ -691,6 +706,7 @@ impl Engine {
                 sandbox: self.config.sandbox,
                 working_dir: self.config.working_dir.clone(),
                 engine: Some(Arc::new(self.clone())),
+                session_id: Some(session_id),
             };
             // Phase 4: when every call in the turn is read-only, they run
             // concurrently (order-preserving — the transcript is identical to
@@ -1260,6 +1276,7 @@ impl Engine {
             sandbox: self.config.sandbox,
             working_dir: self.config.working_dir.clone(),
             engine: Some(Arc::new(self.clone())),
+            session_id: None,
         };
         let outcome = verify_tool
             .execute(serde_json::json!({}), &ctx)
@@ -1721,6 +1738,10 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
             | SessionEvent::Usage { .. } => {}
+            // The plan is not a conversation message: the context builder
+            // re-injects the latest plan every turn (the stays-on-track
+            // mechanism), so raw plan writes stay out of the transcript.
+            SessionEvent::Plan { .. } => {}
         }
     }
     messages
@@ -1744,15 +1765,44 @@ fn reconstruct_transcript(events: &[SessionEvent], tail_messages: usize) -> Vec<
             SessionEvent::Compaction { summary, .. } => Some((idx, summary)),
             _ => None,
         });
-    let Some((idx, summary)) = last_compaction else {
-        return events_to_messages(events);
+    let mut messages = match last_compaction {
+        None => events_to_messages(events),
+        Some((idx, summary)) => {
+            let mut messages = vec![compact_state_message(summary)];
+            let (_, tail) = compact::split_older_tail(&events[..idx], tail_messages);
+            messages.extend(events_to_messages(tail));
+            messages.extend(events_to_messages(&events[idx + 1..]));
+            messages
+        }
     };
-
-    let mut messages = vec![compact_state_message(summary)];
-    let (_, tail) = compact::split_older_tail(&events[..idx], tail_messages);
-    messages.extend(events_to_messages(tail));
-    messages.extend(events_to_messages(&events[idx + 1..]));
+    // The standing plan rides at the end of every turn (the
+    // stays-on-track mechanism): the model re-reads its own commitments
+    // before responding. One message; no plan writes to the transcript.
+    if let Some(items) = latest_plan(events) {
+        if !items.is_empty() {
+            let mut body =
+                String::from("[standing plan - keep statuses current via the plan tool]\n");
+            for (ix, item) in items.iter().enumerate() {
+                body.push_str(&format!(
+                    "{}. [{}] {} - {}\n",
+                    ix + 1,
+                    item.status,
+                    item.text,
+                    item.done_criteria
+                ));
+            }
+            messages.push(Message::user(body));
+        }
+    }
     messages
+}
+
+/// The most recent plan in the log, if any.
+fn latest_plan(events: &[SessionEvent]) -> Option<Vec<modron_types::PlanItem>> {
+    events.iter().rev().find_map(|event| match event {
+        SessionEvent::Plan { items } => Some(items.clone()),
+        _ => None,
+    })
 }
 
 /// First line of the task, trimmed to ~[`TITLE_MAX_CHARS`] characters.

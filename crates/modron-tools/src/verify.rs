@@ -129,6 +129,7 @@ mod tests {
                     engine: None,
                     working_dir: dir.to_path_buf(),
                     sandbox: Default::default(),
+                    session_id: None,
                 },
             )
             .await
@@ -185,6 +186,7 @@ mod tests {
                     engine: None,
                     working_dir: dir.path().to_path_buf(),
                     sandbox: Default::default(),
+                    session_id: None,
                 },
             )
             .await
