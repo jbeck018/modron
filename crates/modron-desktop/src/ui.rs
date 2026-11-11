@@ -2955,7 +2955,6 @@ impl DesktopApp {
                 .gap_3()
                 .px_3()
                 .py_2p5()
-                .border_b_1()
                 .border_color(theme.border)
                 .child(
                     div()
@@ -2981,6 +2980,15 @@ impl DesktopApp {
         };
 
         let card_wrap = |rows: Vec<gpui_kit::AnyElement>| {
+            // shadcn divide-y: hairlines BETWEEN rows, never on the last
+            // one (the card border is the bottom edge).
+            let mut wrapped: Vec<gpui_kit::AnyElement> = Vec::new();
+            for (ix, child) in rows.into_iter().enumerate() {
+                if ix > 0 {
+                    wrapped.push(div().w_full().h(px(1.)).bg(theme.border).into_any_element());
+                }
+                wrapped.push(child);
+            }
             div()
                 .flex()
                 .flex_col()
@@ -2988,7 +2996,8 @@ impl DesktopApp {
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.background)
-                .children(rows)
+                .overflow_hidden()
+                .children(wrapped)
         };
 
         // -- general ------------------------------------------------------
@@ -3121,7 +3130,6 @@ impl DesktopApp {
                 .gap_1p5()
                 .px_3()
                 .py_2p5()
-                .border_b_1()
                 .border_color(theme.border)
                 .child(
                     div()
@@ -3352,7 +3360,6 @@ impl DesktopApp {
                     .gap_2()
                     .px_3()
                     .py_2p5()
-                    .border_b_1()
                     .border_color(theme.border)
                     .child(
                         div()
