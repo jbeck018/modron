@@ -17,7 +17,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::Icon;
-use gpui_kit::component::{ActiveTheme, Sizable};
+use gpui_kit::component::{ActiveTheme, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     actions, div, list, px, AnyElement, App, AppContext, ClickEvent, Context, Entity, FocusHandle,
@@ -184,6 +184,16 @@ pub struct DesktopApp {
     >,
     /// A session row the user marked for deletion (two-step confirm).
     confirm_delete: Option<uuid::Uuid>,
+    /// The sidebar search input is expanded (the header's magnifier
+    /// toggles it; closing clears the query).
+    search_open: bool,
+    /// The session row the pointer is over, driving the hover-revealed
+    /// controls (state-driven: gpui group_hover proved unreliable inside
+    /// the scroll list).
+    hovered_row: Option<uuid::Uuid>,
+    /// Cluster sessions by their folder (the list-filter toggle; off
+    /// renders one flat newest-first list).
+    grouped: bool,
     /// Settings overlay open (gear in the footer).
     settings_open: bool,
     /// Automations add/edit-form fields (name/prompt/interval).
@@ -293,6 +303,9 @@ impl DesktopApp {
             window_handle: None,
             form_inputs: Default::default(),
             confirm_delete: None,
+            search_open: false,
+            hovered_row: None,
+            grouped: true,
             anim_tick: 0,
             settings_open: false,
             new_task_open: false,
@@ -516,6 +529,65 @@ impl DesktopApp {
 
     /// Delete a session through the server (two-step confirm happens in
     /// the sidebar row). Detaches first if it was attached.
+    /// Publish the attached session's transcript as a read-only page on
+    /// the bridge (the server answers `page_published`; the URL lands as
+    /// a note in the transcript). 2026-11-11 audit: the wire path existed
+    /// end to end (protocol, server, bridge) but nothing sent it.
+    fn publish_page(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.attached else {
+            return;
+        };
+        let title = self
+            .state
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| "modron transcript".to_string());
+        let mut md = String::from("# modron transcript\n\n");
+        for row in &self.state.rows() {
+            match row {
+                crate::app_state::Row::Entry(entry) => match entry {
+                    modron_view::TranscriptEntry::Task { text }
+                    | modron_view::TranscriptEntry::User { text } => {
+                        md.push_str(&format!("**{text}**\n\n"));
+                    }
+                    modron_view::TranscriptEntry::Assistant { text } => {
+                        md.push_str(text);
+                        md.push_str("\n\n");
+                    }
+                    modron_view::TranscriptEntry::ToolSummary { line, .. } => {
+                        md.push_str(&format!("- {line}\n"));
+                    }
+                    modron_view::TranscriptEntry::Swarm { lines } => {
+                        for line in lines {
+                            md.push_str(&format!("- {line}\n"));
+                        }
+                    }
+                    modron_view::TranscriptEntry::Model { model, reason } => {
+                        md.push_str(&format!("> model: {model} ({reason})\n\n"));
+                    }
+                    modron_view::TranscriptEntry::Usage { .. } => {}
+                    _ => {}
+                },
+                crate::app_state::Row::Divider { text } => {
+                    md.push_str(&format!("\n---\n\n{text}\n\n"));
+                }
+                crate::app_state::Row::Streaming { text } => {
+                    md.push_str(text);
+                    md.push_str("\n\n");
+                }
+                crate::app_state::Row::Reasoning { .. } => {}
+            }
+        }
+        self.send(Command::PublishPage {
+            session_id: id,
+            title,
+            content_md: md,
+        });
+        self.refresh(cx);
+    }
+
     fn delete_session(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
         self.confirm_delete = None;
         if self.state.attached == Some(id) {
@@ -1031,101 +1103,270 @@ impl DesktopApp {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            // "New task" (Conductor/Para grammar): a task spawns an agent
-            // in its own worktree + branch. The inline form collects the
-            // description and optional base branch.
-            .child(div().px_3().pt_9().pb_2().flex().flex_col().gap_1().child({
-                let entity = entity.clone();
-                Button::new("new-task")
-                    .label(if self.new_task_open {
-                        "describe the task..."
-                    } else {
-                        "New task"
-                    })
-                    .primary()
-                    .on_click(move |_e: &ClickEvent, window, cx: &mut App| {
-                        entity.update(cx, |this, cx| this.open_task_form(window, cx));
-                    })
-            }))
-            .children(if self.new_task_open {
-                let title_entity = entity.clone();
-                let cancel_entity = entity.clone();
-                vec![
-                    div().px_3().pb_1().child(Input::new(&self.new_task_title)),
-                    div().px_3().pb_1().child(Input::new(&self.new_task_base)),
+            .overflow_y_scroll();
+
+        // Iconed action rows (the reference UI's grammar): icon + label,
+        // full-width, generous hit area. New chat is cmd+n.
+        fn action_row<F>(
+            theme: &Theme,
+            id: &'static str,
+            label: &'static str,
+            icon: &'static str,
+            hint: Option<&'static str>,
+            on_click: F,
+        ) -> gpui_kit::AnyElement
+        where
+            F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        {
+            let hint = hint.map(SharedString::from);
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .mx_2()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.secondary.opacity(0.5)))
+                .on_click(move |e, w, cx| on_click(e, w, cx))
+                .child(
+                    Icon::default()
+                        .path(icon)
+                        .size_4()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
                     div()
-                        .px_3()
-                        .pb_2()
-                        .flex()
-                        .flex_row()
-                        .gap_1()
-                        .child(
-                            Button::new("task-create")
-                                .label("create")
-                                .primary()
-                                .small()
-                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                    title_entity.update(cx, |this, cx| this.create_task(cx));
-                                }),
-                        )
-                        .child(
-                            Button::new("task-cancel")
-                                .label("cancel")
-                                .ghost()
-                                .small()
-                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                    cancel_entity.update(cx, |this, cx| {
-                                        this.new_task_open = false;
-                                        this.refresh(cx);
-                                    });
-                                }),
-                        ),
-                ]
-            } else {
-                vec![]
-            })
-            .child(div().px_3().pb_2().flex().flex_row().gap_1().child({
+                        .flex_1()
+                        .text_size(px(crate::brand::text::BASE))
+                        .text_color(theme.foreground)
+                        .child(SharedString::from(label)),
+                )
+                .children(hint.map(|h| {
+                    div()
+                        .text_size(px(crate::brand::text::XS))
+                        .text_color(theme.muted_foreground)
+                        .child(h)
+                }))
+                .into_any_element()
+        }
+        list = list
+            .child({
                 let entity = entity.clone();
-                Button::new("new-chat")
-                    .label("New chat")
-                    .ghost()
-                    .small()
-                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                action_row(
+                    theme,
+                    "act-new-chat",
+                    "New chat",
+                    "icons/plus.svg",
+                    Some("\u{2318}N"),
+                    move |_e, _w, cx| {
                         entity.update(cx, |this, _cx| {
                             this.send(Command::NewSession { title: None });
-                            // Refresh the list once the server notes
-                            // the new session (the correlated Note
-                            // adopts it).
+                            // Refresh the list once the server notes the
+                            // new session (the correlated Note adopts it).
                             this.send(Command::ListSessions);
                         });
-                    })
-            }))
-            .child(div().px_3().pb_2().child(Input::new(&self.session_filter)));
+                    },
+                )
+            })
+            .child({
+                let entity = entity.clone();
+                action_row(
+                    theme,
+                    "act-new-task",
+                    "New task",
+                    "icons/square-pen.svg",
+                    None,
+                    move |_e, window, cx| {
+                        entity.update(cx, |this, cx| this.open_task_form(window, cx));
+                    },
+                )
+            })
+            .child({
+                let entity = entity.clone();
+                action_row(
+                    theme,
+                    "act-automations",
+                    "Automations",
+                    "icons/calendar-clock.svg",
+                    None,
+                    move |_e, _w, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.settings_open = true;
+                            this.refresh(cx);
+                        });
+                    },
+                )
+            })
+            .child({
+                let entity = entity.clone();
+                action_row(
+                    theme,
+                    "act-settings",
+                    "Settings",
+                    "icons/settings.svg",
+                    None,
+                    move |_e, _w, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.settings_open = true;
+                            this.refresh(cx);
+                        });
+                    },
+                )
+            });
 
+        // The new-task form (opened from its row): description + optional
+        // base branch, then create/cancel.
+        let list = list.children(if self.new_task_open {
+            let title_entity = entity.clone();
+            let cancel_entity = entity.clone();
+            vec![
+                div().px_3().pb_1().child(Input::new(&self.new_task_title)),
+                div().px_3().pb_1().child(Input::new(&self.new_task_base)),
+                div()
+                    .px_3()
+                    .pb_2()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .child(
+                        Button::new("task-create")
+                            .label("create")
+                            .primary()
+                            .small()
+                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                title_entity.update(cx, |this, cx| this.create_task(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("task-cancel")
+                            .label("cancel")
+                            .ghost()
+                            .small()
+                            .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                cancel_entity.update(cx, |this, cx| {
+                                    this.new_task_open = false;
+                                    this.refresh(cx);
+                                });
+                            }),
+                    ),
+            ]
+        } else {
+            vec![]
+        });
+
+        // Section header: the list's name plus its two controls - the
+        // magnifier expands the search input (closing clears it), the
+        // filter toggles folder grouping.
+        let header_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .mx_2()
+            .px_2()
+            .pt_2()
+            .pb_1()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(crate::brand::text::SM))
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from("Sessions")),
+            )
+            .child({
+                let entity = entity.clone();
+                Button::new("search-toggle")
+                    .icon(Icon::default().path("icons/search.svg").size_4())
+                    .ghost()
+                    .xsmall()
+                    .selected(self.search_open)
+                    .on_click(move |_e, window, cx: &mut App| {
+                        entity.update(cx, |this, cx| {
+                            this.search_open = !this.search_open;
+                            if this.search_open {
+                                this.session_filter.update(cx, |input, cx| {
+                                    let handle = input.focus_handle(cx);
+                                    window.focus(&handle, cx);
+                                });
+                            } else {
+                                // Esc grammar: closing the search clears it.
+                                this.session_filter_query.clear();
+                                this.session_filter
+                                    .update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                            this.refresh(cx);
+                        });
+                    })
+            })
+            .child({
+                let entity = entity.clone();
+                Button::new("group-toggle")
+                    .icon(Icon::default().path("icons/list-filter.svg").size_4())
+                    .ghost()
+                    .xsmall()
+                    .selected(self.grouped)
+                    .on_click(move |_e, _w, cx: &mut App| {
+                        entity.update(cx, |this, cx| {
+                            this.grouped = !this.grouped;
+                            this.refresh(cx);
+                        });
+                    })
+            });
+        let mut list = list.child(header_row).children(if self.search_open {
+            vec![div().px_3().pb_1().child(Input::new(&self.session_filter))]
+        } else {
+            vec![]
+        });
+
+        let rows: Vec<(String, Vec<(usize, &crate::app_state::SessionRow)>)> = if self.grouped {
+            Self::sidebar_groups(&self.state.sessions, &query)
+        } else {
+            let flat: Vec<(usize, &crate::app_state::SessionRow)> = self
+                .state
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, session)| {
+                    query.is_empty()
+                        || session.title.to_ascii_lowercase().contains(&query)
+                        || session
+                            .working_dir
+                            .as_deref()
+                            .unwrap_or("no folder")
+                            .to_ascii_lowercase()
+                            .contains(&query)
+                })
+                .collect();
+            vec![(String::new(), flat)]
+        };
         let mut shown = 0usize;
-        for (dir, group) in Self::sidebar_groups(&self.state.sessions, &query) {
+        for (dir, group) in rows {
             shown += group.len();
             // Group divider + header: a thin hairline above the cluster,
             // then the folder as a muted one-line label (truncated).
-            let header: SharedString = Self::group_label(&dir).into();
-            list = list.child(
-                div()
-                    .mt_1()
-                    .mx_2()
-                    .pt_1()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .px_2()
-                            .pb_1()
-                            .truncate()
-                            .text_size(px(crate::brand::text::XS))
-                            .text_color(theme.muted_foreground)
-                            .child(header),
-                    ),
-            );
+            if self.grouped {
+                let header: SharedString = Self::group_label(&dir).into();
+                list = list.child(
+                    div()
+                        .mt_1()
+                        .mx_2()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .px_2()
+                                .pb_1()
+                                .truncate()
+                                .text_size(px(crate::brand::text::XS))
+                                .text_color(theme.muted_foreground)
+                                .child(header),
+                        ),
+                );
+            }
             for (ix, session) in group {
                 let id = session.id;
                 let attached = self.state.attached == Some(id);
@@ -1145,11 +1386,31 @@ impl DesktopApp {
                 // (the desktop chat grammar - message counts and ids live in
                 // the transcript header, not the list). Fixed row height so
                 // hover-revealed controls never reflow the list.
+                let hovered = self.hovered_row == Some(id);
                 let row = div()
                     .id(("session", ix))
-                    // Names this row as the hover group its delete button
-                    // listens to (group_hover below reveals it per row).
-                    .group("session-row")
+                    // Hover is state-driven (the trash button reads
+                    // self.hovered_row): gpui's group_hover was unreliable
+                    // inside the scroll list, so the row reports enter/
+                    // leave explicitly.
+                    .on_hover({
+                        let entity = entity.clone();
+                        move |hovered: &bool, _w, cx: &mut App| {
+                            entity.update(cx, |this, cx| {
+                                let was = this.hovered_row;
+                                this.hovered_row = if *hovered {
+                                    Some(id)
+                                } else if was == Some(id) {
+                                    None
+                                } else {
+                                    was
+                                };
+                                if was != this.hovered_row {
+                                    this.refresh(cx);
+                                }
+                            });
+                        }
+                    })
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1263,13 +1524,12 @@ impl DesktopApp {
                                         .into_any_element(),
                                 );
                             }
-                            // Hover-only: opacity 0 until the row (its
-                            // "session-row" group) is hovered.
+                            // Hover-only: hidden until the row reports
+                            // hover (state-driven, see on_hover above).
                             trailing.push(
                                 div()
                                     .flex_shrink_0()
-                                    .opacity(0.)
-                                    .group_hover("session-row", |style| style.opacity(1.))
+                                    .opacity(if hovered { 1. } else { 0. })
                                     .child(
                                         Button::new(("del", ix))
                                             .icon(Icon::default().path("icons/trash.svg").size_4())
@@ -1682,23 +1942,36 @@ impl DesktopApp {
                         this.open_picker(window, cx);
                     })),
             )
-            // Share: opens a remote-control tunnel via the server's bridge.
+            // Share: opens a remote-control tunnel via the server's
+            // bridge; page publishes the transcript as a read-only web
+            // page on the same bridge (paradev "pages" grammar). Both
+            // need a --bridge'd server; the URL lands as a note.
             .children(if self.state.attached.is_some() {
-                vec![Button::new("share-remote")
-                    .label("share")
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        let Some(id) = this.state.attached else {
-                            return;
-                        };
-                        this.send(Command::RemoteControl {
-                            session_id: id,
-                            bridge_url: String::new(),
-                        });
-                        this.refresh(cx);
-                    }))
-                    .into_any_element()]
+                vec![
+                    Button::new("share-remote")
+                        .label("share")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            let Some(id) = this.state.attached else {
+                                return;
+                            };
+                            this.send(Command::RemoteControl {
+                                session_id: id,
+                                bridge_url: String::new(),
+                            });
+                            this.refresh(cx);
+                        }))
+                        .into_any_element(),
+                    Button::new("publish-page")
+                        .label("page")
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.publish_page(cx);
+                        }))
+                        .into_any_element(),
+                ]
             } else {
                 vec![]
             })
@@ -2645,6 +2918,13 @@ impl Render for DesktopApp {
             .flex_col()
             .bg(theme.background)
             .text_color(theme.foreground)
+            // cmd+n (the sidebar row's hint) creates a new chat anywhere
+            // in the window.
+            .on_action(cx.listener(|this, _action: &NewChat, _window, cx| {
+                this.send(Command::NewSession { title: None });
+                this.send(Command::ListSessions);
+                this.refresh(cx);
+            }))
             // Behind everything: the transparent-titlebar drag band. The
             // system traffic lights overlay the sidebar's top padding;
             // interactive content sits above this strip and wins clicks.
@@ -2942,6 +3222,9 @@ pub fn run(options: LaunchOptions) {
             KeyBinding::new("up", PickerUp, Some("ModelPicker")),
             KeyBinding::new("down", PickerDown, Some("ModelPicker")),
             KeyBinding::new("escape", CloseToolPanel, Some("ToolPanel")),
+            // The sidebar's "New chat" row advertises this hint; the
+            // action is handled on the window root.
+            KeyBinding::new("cmd-n", NewChat, None),
         ]);
         let (window, view) = gpui_kit::open_window(
             WindowOptions {

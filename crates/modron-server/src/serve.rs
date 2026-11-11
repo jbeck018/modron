@@ -96,6 +96,12 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
 
     let mut tasks = Vec::new();
 
+    // The automations scheduler (2026-11-11 audit fix): the CRUD path
+    // (add/remove/list frames) worked, but this loop - the thing that
+    // actually FIRES due automations into fresh sessions - was never
+    // spawned, so scheduled automations sat stored and inert.
+    crate::automations::spawn_scheduler(Arc::clone(&state));
+
     // WebSocket listener (optional).
     let ws_addr = match options.listen.as_deref() {
         Some("disabled") => None,

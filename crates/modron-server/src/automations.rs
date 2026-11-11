@@ -6,15 +6,13 @@
 //! Registry persists at `<working_dir>/.modron/automations.json`; the
 //! scheduler wakes every 30 seconds and fires anything due.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use rand::Rng;
+use modron_core::SessionEvent;
+use modron_protocol::AutomationWire;
 use serde::{Deserialize, Serialize};
-use modron_core::{SessionEvent, SessionStore};
-use modron_protocol::{AutomationWire, Payload};
-use tokio::sync::mpsc;
 
 use crate::dispatch::ServerState;
 
@@ -133,11 +131,9 @@ async fn fire(state: &Arc<ServerState>, automation: &Automation) -> Result<()> {
         )
         .await?;
     let handle = state.hub.ensure_session(meta.id, Some(meta.id));
-    let engine = handle.engine.lock().clone();
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let _ = tx; // scheduler runs need no frame sinks; results persist in store
+    let engine = handle.engine_cell().clone();
+    // Scheduler runs carry no frame sinks; results persist in the store.
     let run: crate::hub::RunFuture = {
-        let engine = engine.clone();
         let task = automation.prompt.clone();
         Box::pin(async move { engine.run_task_with_attachments(&task, Vec::new()).await })
     };
@@ -146,11 +142,8 @@ async fn fire(state: &Arc<ServerState>, automation: &Automation) -> Result<()> {
     }
 
     // Update the registry: last_run stamp + next due.
-    let mut all = load(&state);
-    if let Some(entry) = all
-        .iter_mut()
-        .find(|a| a.name == automation.name)
-    {
+    let mut all = load(state);
+    if let Some(entry) = all.iter_mut().find(|a| a.name == automation.name) {
         entry.last_run = chrono::Utc::now().to_rfc3339();
         entry.next_due_epoch = Some(
             std::time::SystemTime::now()
@@ -158,7 +151,7 @@ async fn fire(state: &Arc<ServerState>, automation: &Automation) -> Result<()> {
                 .map(|d| d.as_secs() + (automation.interval_minutes as u64) * 60)
                 .unwrap_or(u64::MAX),
         );
-        let _ = save(&state, &all);
+        let _ = save(state, &all);
     }
     Ok(())
 }
@@ -174,8 +167,7 @@ pub fn normalize(state: &ServerState) {
     let mut changed = false;
     for automation in &mut all {
         if automation.next_due_epoch.is_none() {
-            automation.next_due_epoch =
-                Some(now + (automation.interval_minutes as u64) * 60);
+            automation.next_due_epoch = Some(now + (automation.interval_minutes as u64) * 60);
             changed = true;
         }
     }
@@ -183,4 +175,3 @@ pub fn normalize(state: &ServerState) {
         let _ = save(state, &all);
     }
 }
-

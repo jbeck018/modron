@@ -24,6 +24,7 @@
 //!   foreground lifecycle;
 //! - [`pairing`]: device tokens and the auth gate.
 
+pub mod automations;
 pub mod dispatch;
 pub mod hub;
 pub mod pairing;

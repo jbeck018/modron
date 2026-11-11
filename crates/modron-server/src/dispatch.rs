@@ -305,6 +305,79 @@ pub async fn handle_frame(
                 Err(e) => send(ctx, error(request_id, e.to_string())),
             }
         }
+        Payload::AutomationsList { .. } => {
+            // 2026-11-11 audit: these three frames (plus publish_page)
+            // fell through the catch-all - the desktop's automations UI
+            // talked to a wall. CRUD answers with the refreshed list.
+            let rows = crate::automations::list(state).await;
+            send(ctx, reply(request_id, None, Payload::Automations { rows }));
+        }
+        Payload::AutomationAdd {
+            name,
+            prompt,
+            interval_minutes,
+        } => {
+            let result = crate::automations::add(
+                state,
+                crate::automations::Automation {
+                    name: name.clone(),
+                    prompt,
+                    interval_minutes,
+                    last_run: String::new(),
+                    next_due_epoch: None,
+                },
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    let rows = crate::automations::list(state).await;
+                    send(ctx, reply(request_id, None, Payload::Automations { rows }));
+                }
+                Err(e) => send(ctx, error(request_id, e.to_string())),
+            }
+        }
+        Payload::AutomationRemove { name } => {
+            let _ = crate::automations::remove(state, &name).await;
+            let rows = crate::automations::list(state).await;
+            send(ctx, reply(request_id, None, Payload::Automations { rows }));
+        }
+        Payload::PublishPage {
+            session_id,
+            title,
+            content_md,
+        } => {
+            let Some(bridge) = state.bridge_base.clone() else {
+                send(
+                    ctx,
+                    error(
+                        request_id,
+                        "no bridge configured - serve with --bridge <url> first",
+                    ),
+                );
+                return Flow::Continue;
+            };
+            let key = match crate::rc::share_key_for(state, &session_id) {
+                Some(key) => key,
+                None => {
+                    // Mint a share key the same way remote-control does;
+                    // the bridge authenticates agent posts by it.
+                    let key = crate::rc::share_key();
+                    state
+                        .rc_keys
+                        .lock()
+                        .unwrap()
+                        .insert(session_id, key.clone());
+                    key
+                }
+            };
+            match crate::rc::publish_page(&bridge, &key, session_id, &title, &content_md).await {
+                Ok(url) => send(
+                    ctx,
+                    reply(request_id, Some(session_id), Payload::PagePublished { url }),
+                ),
+                Err(e) => send(ctx, error(request_id, e.to_string())),
+            }
+        }
         Payload::AuthProviders { .. } => {
             use modron_core::auth::{oauth_capable, oauth_signed_in, provider_registry};
             let rows = provider_registry()
