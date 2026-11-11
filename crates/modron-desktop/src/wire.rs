@@ -247,6 +247,15 @@ pub enum Command {
     Fork {
         session_id: uuid::Uuid,
     },
+    AuthStart {
+        session_id: uuid::Uuid,
+        provider: String,
+    },
+    AuthSetKey {
+        session_id: uuid::Uuid,
+        provider: String,
+        key: String,
+    },
     RemoteControl {
         session_id: uuid::Uuid,
         bridge_url: String,
@@ -327,6 +336,22 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
         },
         Command::Fork { session_id } => Payload::Fork {
             session_id: *session_id,
+        },
+        Command::AuthStart {
+            session_id,
+            provider,
+        } => Payload::AuthStart {
+            session_id: *session_id,
+            provider: provider.clone(),
+        },
+        Command::AuthSetKey {
+            session_id,
+            provider,
+            key,
+        } => Payload::AuthSetKey {
+            session_id: *session_id,
+            provider: provider.clone(),
+            key: key.clone(),
         },
         Command::RemoteControl {
             session_id,

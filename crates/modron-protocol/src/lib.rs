@@ -267,6 +267,18 @@ pub enum Payload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_code: Option<String>,
     },
+    /// Start a provider's sign-in flow on the SERVER (the browser opens
+    /// there); progress streams to `session_id` as `oauth_progress`
+    /// frames and completion lands as a `note`. OAuth-capable providers
+    /// only (anthropic, openai-compat, zai).
+    AuthStart { session_id: Uuid, provider: String },
+    /// Save an API key for a provider (the non-oauth path); answers with
+    /// a `note`.
+    AuthSetKey {
+        session_id: Uuid,
+        provider: String,
+        key: String,
+    },
     /// An informational toast/scrollback note (slash-command results).
     Note { text: String },
     /// Answer to `ping`.

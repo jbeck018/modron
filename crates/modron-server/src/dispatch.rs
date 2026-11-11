@@ -378,6 +378,195 @@ pub async fn handle_frame(
                 Err(e) => send(ctx, error(request_id, e.to_string())),
             }
         }
+        Payload::AuthStart {
+            session_id,
+            provider,
+        } => {
+            // The provider's sign-in flow runs HERE (the browser opens on
+            // the server machine); progress streams to the session as
+            // oauth_progress frames and the outcome lands as a note.
+            if !modron_core::auth::oauth_capable(&provider) {
+                send(
+                    ctx,
+                    error(
+                        request_id,
+                        format!("{provider} uses an api key - set it below"),
+                    ),
+                );
+                return Flow::Continue;
+            }
+            let Some(handle) = state.hub.handle(&session_id) else {
+                send(ctx, error(request_id, "attach a session first"));
+                return Flow::Continue;
+            };
+            let publish = move |payload: Payload| handle.publish(payload);
+            let provider_kind = provider.clone();
+            tokio::spawn(async move {
+                let progress =
+                    |stage: &str, message: &str, url: Option<String>, user_code: Option<String>| {
+                        publish(Payload::OAuthProgress {
+                            provider: provider_kind.clone(),
+                            stage: stage.to_string(),
+                            message: message.to_string(),
+                            url,
+                            user_code,
+                        });
+                    };
+                let result: anyhow::Result<String> = async {
+                    match provider_kind.as_str() {
+                        "anthropic" => {
+                            let session = modron_core::auth::oauth::prepare_login()?;
+                            progress(
+                                "waiting",
+                                "approve in the browser window",
+                                Some(session.url.clone()),
+                                None,
+                            );
+                            let code = modron_core::auth::oauth::wait_for_callback(
+                                session.port,
+                                &session.state,
+                                Some(&session.url),
+                            )
+                            .await?;
+                            let tokens =
+                                modron_core::auth::oauth::exchange_code(&session, &code).await?;
+                            modron_core::auth::oauth::save_tokens(&tokens)?;
+                            Ok(format!(
+                                "claude signed in ({})",
+                                modron_core::auth::mask_key(&tokens.access_token)
+                            ))
+                        }
+                        "zai" => {
+                            let session = modron_core::auth::oauth::zai::prepare_login()?;
+                            progress(
+                                "waiting",
+                                "approve in the browser window",
+                                Some(session.url.clone()),
+                                None,
+                            );
+                            let code = modron_core::auth::oauth::wait_for_callback(
+                                session.port,
+                                &session.state,
+                                Some(&session.url),
+                            )
+                            .await?;
+                            let (key, email) = modron_core::auth::oauth::zai::finish(
+                                &code,
+                                &session.state,
+                                session.port,
+                            )
+                            .await?;
+                            let path = modron_core::auth::env_file()
+                                .map_err(|e| anyhow::anyhow!("cannot resolve env file: {e}"))?;
+                            modron_core::auth::set_key_in_env_file(&path, "ZAI_API_KEY", &key)
+                                .map_err(|e| anyhow::anyhow!("cannot save key: {e}"))?;
+                            std::env::set_var("ZAI_API_KEY", &key);
+                            Ok(format!(
+                                "z.ai signed in{} - GLM coding plan key saved",
+                                email.map(|e| format!(" ({e})")).unwrap_or_default()
+                            ))
+                        }
+                        _ => {
+                            // The ChatGPT device flow (openai-compat).
+                            let device = modron_core::auth::oauth::chatgpt::start().await?;
+                            modron_core::auth::open_browser(&device.verification_uri);
+                            progress(
+                                "waiting",
+                                "enter the code in the browser window",
+                                Some(device.verification_uri.clone()),
+                                Some(device.user_code.clone()),
+                            );
+                            let (tokens, account) =
+                                modron_core::auth::oauth::chatgpt::finish(&device).await?;
+                            modron_core::auth::oauth::chatgpt::save(
+                                &modron_core::auth::oauth::chatgpt::ChatGptAuth {
+                                    access_token: tokens.access_token.clone(),
+                                    refresh_token: tokens.refresh_token.clone(),
+                                    account_id: account,
+                                },
+                            )?;
+                            Ok(format!(
+                                "chatgpt signed in ({})",
+                                modron_core::auth::mask_key(&tokens.access_token)
+                            ))
+                        }
+                    }
+                }
+                .await;
+                match result {
+                    Ok(text) => {
+                        progress("done", &text, None, None);
+                        publish(Payload::Note {
+                            text: format!("{provider_kind}: {text}"),
+                        });
+                    }
+                    Err(e) => {
+                        progress("failed", &e.to_string(), None, None);
+                        publish(Payload::Note {
+                            text: format!("{provider_kind} sign-in failed: {e}"),
+                        });
+                    }
+                }
+                // Providers statuses changed; the settings page re-reads
+                // them on the next AuthProviders round trip. Nudge by
+                // noting completion (clients refresh on the done stage).
+            });
+            send(
+                ctx,
+                reply(
+                    request_id,
+                    Some(session_id),
+                    Payload::Note {
+                        text: format!(
+                            "{provider}: sign-in started - watch the session for the code"
+                        ),
+                    },
+                ),
+            );
+        }
+        Payload::AuthSetKey {
+            session_id,
+            provider,
+            key,
+        } => {
+            let info = modron_core::auth::provider_registry()
+                .into_iter()
+                .find(|p| p.provider_id == provider);
+            let Some(info) = info else {
+                send(
+                    ctx,
+                    error(request_id, format!("unknown provider {provider}")),
+                );
+                return Flow::Continue;
+            };
+            let path = match modron_core::auth::env_file() {
+                Ok(path) => path,
+                Err(e) => {
+                    send(
+                        ctx,
+                        error(request_id, format!("cannot resolve env file: {e}")),
+                    );
+                    return Flow::Continue;
+                }
+            };
+            match modron_core::auth::set_key_in_env_file(&path, info.env_var, &key) {
+                Ok(()) => {
+                    std::env::set_var(info.env_var, &key);
+                    let _ = session_id;
+                    send(
+                        ctx,
+                        reply(
+                            request_id,
+                            None,
+                            Payload::Note {
+                                text: format!("{}: api key saved", info.name),
+                            },
+                        ),
+                    );
+                }
+                Err(e) => send(ctx, error(request_id, format!("cannot save key: {e}"))),
+            }
+        }
         Payload::AuthProviders { .. } => {
             use modron_core::auth::{oauth_capable, oauth_signed_in, provider_registry};
             let rows = provider_registry()
@@ -840,6 +1029,8 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::NewSession { .. } => "new_session",
         Payload::ListSessions {} => "list_sessions",
         Payload::DeleteSession { .. } => "delete_session",
+        Payload::AuthStart { .. } => "auth_start",
+        Payload::AuthSetKey { .. } => "auth_set_key",
         Payload::AuthProviders { .. } => "auth_providers",
         Payload::PersistRouter { .. } => "persist_router",
         Payload::CreateTask { .. } => "create_task",

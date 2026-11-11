@@ -203,6 +203,8 @@ pub struct DesktopApp {
     /// Settings overlay open (gear in the footer).
     settings_open: bool,
     /// Settings-page inputs (session + defaults cards).
+    provider_key_input: Entity<InputState>,
+    key_target: Option<String>,
     allow_input: Entity<InputState>,
     deny_input: Entity<InputState>,
     goal_input: Entity<InputState>,
@@ -257,6 +259,8 @@ impl DesktopApp {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("type to filter"));
         let session_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter sessions"));
+        let provider_key_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("paste an api key"));
         let allow_input = cx.new(|cx| InputState::new(window, cx).placeholder("grep, read"));
         let deny_input = cx.new(|cx| InputState::new(window, cx).placeholder("bash"));
         let goal_input = cx.new(|cx| InputState::new(window, cx).placeholder("a standing goal"));
@@ -326,6 +330,8 @@ impl DesktopApp {
             list_state: ListState::new(0, ListAlignment::Bottom, px(256.)),
             composer,
             slash_candidates: Vec::new(),
+            provider_key_input,
+            key_target: None,
             allow_input,
             deny_input,
             goal_input,
@@ -419,6 +425,13 @@ impl DesktopApp {
     fn apply_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
             UiEvent::Frame(frame) => {
+                // A finished sign-in changes credential statuses; refresh
+                // the providers card without a manual reload.
+                if let Payload::OAuthProgress { stage, .. } = &frame.payload {
+                    if stage == "done" {
+                        self.send(Command::AuthProviders {});
+                    }
+                }
                 let is_sessions = matches!(frame.payload, Payload::Sessions { .. });
                 // Review-overlay updates: task_status/merged answers land in
                 // DesktopApp fields (not the transcript).
@@ -3300,35 +3313,99 @@ impl DesktopApp {
             );
 
         // -- providers -----------------------------------------------------
+        // OAuth providers get a real sign-in button (the flow runs on the
+        // server; progress lands in the session's note strip). API-key
+        // providers get set-key buttons targeting the scratch input at
+        // the bottom of the card.
         let mut provider_rows: Vec<gpui_kit::AnyElement> = Vec::new();
+        let mut key_provider: Option<String> = None;
         for provider in &self.state.auth_providers {
+            let name: SharedString = provider.label.clone().into();
+            let status: SharedString = provider.status.clone().into();
+            let signed_in =
+                provider.status.starts_with("signed in") || provider.status == "api key";
+            let control = if signed_in {
+                div()
+                    .text_size(px(crate::brand::text::XS))
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from("ok"))
+                    .into_any_element()
+            } else if provider.oauth_capable {
+                let entity_sign = entity.clone();
+                let id = provider.id.clone();
+                let session = self.state.attached;
+                Button::new(SharedString::from(format!("sign-in-{id}")))
+                    .label("sign in")
+                    .outline()
+                    .small()
+                    .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                        entity_sign.update(cx, |this, cx| {
+                            let Some(session) = session else {
+                                this.state.last_note =
+                                    Some("attach a session first (progress lands there)".into());
+                                this.refresh(cx);
+                                return;
+                            };
+                            this.send(Command::AuthStart {
+                                session_id: session,
+                                provider: id.clone(),
+                            });
+                            this.refresh(cx);
+                        });
+                    })
+                    .into_any_element()
+            } else {
+                let entity_target = entity.clone();
+                let id = provider.id.clone();
+                if key_provider.is_none() {
+                    key_provider = Some(id.clone());
+                }
+                let is_target = self.key_target.as_deref() == Some(id.as_str());
+                Button::new(SharedString::from(format!("set-key-{id}")))
+                    .label(if is_target { "key below" } else { "set key" })
+                    .ghost()
+                    .small()
+                    .on_click(move |_e: &ClickEvent, window, cx: &mut App| {
+                        entity_target.update(cx, |this, cx| {
+                            this.key_target = Some(id.clone());
+                            this.provider_key_input.update(cx, |input, cx| {
+                                let handle = input.focus_handle(cx);
+                                window.focus(&handle, cx);
+                            });
+                            this.refresh(cx);
+                        });
+                    })
+                    .into_any_element()
+            };
             provider_rows.push(
-                row(
-                    Box::leak(provider.label.clone().into_boxed_str()),
-                    Box::leak(provider.status.clone().into_boxed_str()),
-                    div()
-                        .text_size(px(crate::brand::text::XS))
-                        .text_color(
-                            if provider.status.starts_with("signed in")
-                                || provider.status == "api key"
-                            {
-                                theme.foreground
-                            } else {
-                                theme.muted_foreground
-                            },
-                        )
-                        .child(SharedString::from(
-                            if provider.status.starts_with("signed in")
-                                || provider.status == "api key"
-                            {
-                                "ok"
-                            } else {
-                                "sign in via the wizard"
-                            },
-                        ))
-                        .into_any_element(),
-                )
-                .into_any_element(),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2p5()
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_size(px(crate::brand::text::SM))
+                                    .text_color(theme.foreground)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(crate::brand::text::XS))
+                                    .text_color(theme.muted_foreground)
+                                    .child(status),
+                            ),
+                    )
+                    .child(control)
+                    .into_any_element(),
             );
         }
         if provider_rows.is_empty() {
@@ -3342,7 +3419,65 @@ impl DesktopApp {
                     .into_any_element(),
             );
         }
-        let providers = card_wrap(provider_rows);
+        // The api-key scratch row: targeted by a row's set-key button.
+        let target = self.key_target.clone();
+        let key_label: SharedString = match &target {
+            Some(id) => format!("api key for {id}").into(),
+            None => "api key - press set key on a provider".into(),
+        };
+        let key_save_enabled = target.is_some();
+        let mut key_save = Button::new("save-provider-key")
+            .label("save")
+            .outline()
+            .xsmall();
+        if key_save_enabled {
+            let entity_save = entity.clone();
+            let target = target.clone().unwrap_or_default();
+            key_save = key_save.on_click(move |_e: &ClickEvent, window, cx: &mut App| {
+                entity_save.update(cx, |this, cx| {
+                    let key = this.provider_key_input.read(cx).value().trim().to_string();
+                    if key.is_empty() {
+                        this.state.last_note = Some("paste the key first".into());
+                    } else {
+                        let session = this.state.attached;
+                        this.send(Command::AuthSetKey {
+                            session_id: session.unwrap_or(uuid::Uuid::nil()),
+                            provider: target.clone(),
+                            key,
+                        });
+                        this.provider_key_input.update(cx, |input, cx| {
+                            input.set_value("", window, cx);
+                        });
+                        this.key_target = None;
+                    }
+                    this.refresh(cx);
+                });
+            });
+        }
+        let _ = key_label;
+        let providers = card_wrap(provider_rows).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .p_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(crate::brand::text::XS))
+                        .text_color(theme.muted_foreground)
+                        .child(key_label),
+                )
+                .child(
+                    div()
+                        .w(px(240.))
+                        .child(Input::new(&self.provider_key_input)),
+                )
+                .child(key_save),
+        );
 
         // -- automations ---------------------------------------------------
         let mut auto_rows: Vec<gpui_kit::AnyElement> = Vec::new();

@@ -302,6 +302,7 @@ impl AppState {
             Payload::Error { message } => self.last_note = Some(message),
             Payload::Pong {} => {}
             // Client-only payloads never arrive inbound.
+            Payload::AuthStart { .. } | Payload::AuthSetKey { .. } => {}
             Payload::Hello { .. }
             | Payload::Attach { .. }
             | Payload::Detach {}
