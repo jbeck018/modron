@@ -197,9 +197,6 @@ pub struct DesktopApp {
     /// controls (state-driven: gpui group_hover proved unreliable inside
     /// the scroll list).
     hovered_row: Option<uuid::Uuid>,
-    /// Cluster sessions by their folder (the list-filter toggle; off
-    /// renders one flat newest-first list).
-    grouped: bool,
     /// Settings overlay open (gear in the footer).
     settings_open: bool,
     /// Settings-page inputs (session + defaults cards).
@@ -355,7 +352,6 @@ impl DesktopApp {
             confirm_delete: None,
             search_open: false,
             hovered_row: None,
-            grouped: true,
             anim_tick: 0,
             settings_open: false,
             new_task_open: false,
@@ -1476,55 +1472,18 @@ impl DesktopApp {
                                 this.refresh(cx);
                             });
                         })
-                })
-                .child({
-                    let entity = entity.clone();
-                    Button::new("group-toggle")
-                        .icon(Icon::default().path("icons/list-filter.svg").size_4())
-                        .ghost()
-                        .xsmall()
-                        .selected(self.grouped)
-                        .on_click(move |_e, _w, cx: &mut App| {
-                            entity.update(cx, |this, cx| {
-                                this.grouped = !this.grouped;
-                                this.refresh(cx);
-                            });
-                        })
                 });
         }
-        let mut list = list.child(header_row).children(if self.search_open {
-            vec![div().px_3().pb_1().child(Input::new(&self.session_filter))]
-        } else {
-            vec![]
-        });
+        let mut list = list.child(header_row);
 
-        let rows: Vec<(String, Vec<(usize, &crate::app_state::SessionRow)>)> = if self.grouped {
-            Self::sidebar_groups(&self.state.sessions, &query)
-        } else {
-            let flat: Vec<(usize, &crate::app_state::SessionRow)> = self
-                .state
-                .sessions
-                .iter()
-                .enumerate()
-                .filter(|(_, session)| {
-                    query.is_empty()
-                        || session.title.to_ascii_lowercase().contains(&query)
-                        || session
-                            .working_dir
-                            .as_deref()
-                            .unwrap_or("no folder")
-                            .to_ascii_lowercase()
-                            .contains(&query)
-                })
-                .collect();
-            vec![(String::new(), flat)]
-        };
+        let rows: Vec<(String, Vec<(usize, &crate::app_state::SessionRow)>)> =
+            Self::sidebar_groups(&self.state.sessions, &query);
         let mut shown = 0usize;
         for (dir, group) in rows {
             shown += group.len();
             // Group divider + header: a thin hairline above the cluster,
             // then the folder as a muted one-line label (truncated).
-            if self.grouped {
+            {
                 let header: SharedString = Self::group_label(&dir).into();
                 list = list.child(
                     div()
