@@ -1121,7 +1121,7 @@ impl DesktopApp {
                             .px_2()
                             .pb_1()
                             .truncate()
-                            .text_size(px(10.5))
+                            .text_size(px(crate::brand::text::XS))
                             .text_color(theme.muted_foreground)
                             .child(header),
                     ),
@@ -1170,7 +1170,7 @@ impl DesktopApp {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.5))
+                            .text_size(px(crate::brand::text::BASE))
                             .text_color(theme.foreground)
                             .child(title),
                     )
@@ -1242,7 +1242,7 @@ impl DesktopApp {
                             trailing.push(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(10.5))
+                                    .text_size(px(crate::brand::text::XS))
                                     .text_color(theme.muted_foreground)
                                     .child(meta)
                                     .into_any_element(),
@@ -1257,7 +1257,7 @@ impl DesktopApp {
                                         .px_1p5()
                                         .rounded_sm()
                                         .bg(theme.accent)
-                                        .text_size(px(10.))
+                                        .text_size(px(crate::brand::text::XS))
                                         .text_color(theme.accent_foreground)
                                         .child(chip)
                                         .into_any_element(),
@@ -1301,7 +1301,7 @@ impl DesktopApp {
                 div()
                     .px_3()
                     .py_4()
-                    .text_size(px(12.))
+                    .text_size(px(crate::brand::text::SM))
                     .text_color(theme.muted_foreground)
                     .child(SharedString::from(if query.is_empty() {
                         "no sessions yet - type a task to start one"
@@ -1330,14 +1330,14 @@ impl DesktopApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(11.))
+                    .text_size(px(crate::brand::text::XS))
                     .text_color(theme.accent_foreground)
                     .child(SharedString::from("J")),
             )
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(12.))
+                    .text_size(px(crate::brand::text::SM))
                     .text_color(theme.foreground)
                     .child(SharedString::from("Jacob Beck")),
             )
@@ -1424,7 +1424,7 @@ impl DesktopApp {
                         .rounded_br_sm()
                         .bg(theme.primary)
                         .text_color(theme.primary_foreground)
-                        .text_size(px(13.))
+                        .text_size(px(crate::brand::text::BASE))
                         .child(label),
                 )
                 .into_any_element()
@@ -1469,13 +1469,13 @@ impl DesktopApp {
                             })
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(px(crate::brand::text::SM))
                                     .text_color(theme.foreground)
                                     .child(label),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(px(crate::brand::text::XS))
                                     .text_color(theme.muted_foreground)
                                     .child(SharedString::from("expand")),
                             ),
@@ -1499,7 +1499,7 @@ impl DesktopApp {
                     let label: SharedString = line.clone().into();
                     card = card.child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(crate::brand::text::SM))
                             .text_color(theme.muted_foreground)
                             .child(label),
                     );
@@ -1520,7 +1520,7 @@ impl DesktopApp {
                     .child(div().flex_1().h(px(1.)).bg(theme.border))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(crate::brand::text::XS))
                             .text_color(theme.muted_foreground)
                             .child(label),
                     )
@@ -1533,7 +1533,7 @@ impl DesktopApp {
                     .id(("transcript-row", ix))
                     .px_4()
                     .py_1()
-                    .text_size(px(13.5))
+                    .text_size(px(crate::brand::text::BASE))
                     .text_color(theme.foreground)
                     .child(label)
                     .into_any_element()
@@ -1544,7 +1544,7 @@ impl DesktopApp {
                     .id(("transcript-row", ix))
                     .px_4()
                     .py_1()
-                    .text_size(px(12.5))
+                    .text_size(px(crate::brand::text::BASE))
                     .text_color(theme.muted_foreground)
                     .italic()
                     .child(label)
@@ -1609,19 +1609,21 @@ impl DesktopApp {
             .gap_2()
             .child(
                 div()
-                    .text_size(px(28.))
+                    .font_family(crate::brand::DISPLAY_FONT)
+                    .text_size(px(crate::brand::text::DISPLAY))
                     .text_color(theme.border)
                     .child(SharedString::from("\u{2712}")),
             )
             .child(
                 div()
-                    .text_size(px(14.))
+                    .font_family(crate::brand::DISPLAY_FONT)
+                    .text_size(px(crate::brand::text::LG))
                     .text_color(theme.foreground)
                     .child(title),
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(crate::brand::text::SM))
                     .text_color(theme.muted_foreground)
                     .child(hint),
             )
@@ -1666,7 +1668,7 @@ impl DesktopApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(13.))
+                    .text_size(px(crate::brand::text::BASE))
                     .text_color(theme.foreground)
                     .overflow_hidden()
                     .child(title),
@@ -1746,7 +1748,7 @@ impl DesktopApp {
             let label: SharedString = note.clone().into();
             live = live.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(crate::brand::text::SM))
                     .text_color(theme.muted_foreground)
                     .child(label),
             );
@@ -1764,7 +1766,12 @@ impl DesktopApp {
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.muted)
-                    .child(div().flex_1().text_size(px(13.)).child(prompt))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(crate::brand::text::BASE))
+                            .child(prompt),
+                    )
                     .child(
                         Button::new("allow-once")
                             .label(decision_label(Decision::AllowOnce))
@@ -1801,7 +1808,7 @@ impl DesktopApp {
                 div()
                     .id("tool-strip")
                     .cursor_pointer()
-                    .text_size(px(12.))
+                    .text_size(px(crate::brand::text::SM))
                     .text_color(theme.accent)
                     .on_click(move |_e: &ClickEvent, _w, cx| {
                         strip_entity.update(cx, |this, cx| this.open_tool_panel(None, cx));
@@ -1843,7 +1850,7 @@ impl DesktopApp {
                         .child(
                             div()
                                 .flex_1()
-                                .text_size(px(11.))
+                                .text_size(px(crate::brand::text::XS))
                                 .text_color(theme.muted_foreground)
                                 .child(SharedString::from("tool activity (esc closes)")),
                         )
@@ -1861,7 +1868,7 @@ impl DesktopApp {
                 let label: SharedString = row.into();
                 panel = panel.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(crate::brand::text::SM))
                         .text_color(theme.foreground)
                         .child(label),
                 );
@@ -1890,7 +1897,7 @@ impl DesktopApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(14.))
+                    .text_size(px(crate::brand::text::LG))
                     .text_color(theme.muted_foreground)
                     .child(SharedString::from("\u{1f4c4}"))
                     .into_any_element()
@@ -1911,7 +1918,7 @@ impl DesktopApp {
                     .child(chip)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(crate::brand::text::XS))
                             .text_color(theme.foreground)
                             .child(label),
                     )
@@ -2094,7 +2101,7 @@ impl DesktopApp {
                 .py_0p5()
                 .rounded_sm()
                 .bg(theme.secondary)
-                .text_size(px(11.))
+                .text_size(px(crate::brand::text::XS))
                 .text_color(theme.muted_foreground)
                 .child(chip)
                 .into_any_element(),
@@ -2165,7 +2172,7 @@ impl DesktopApp {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(11.))
+                            .text_size(px(crate::brand::text::XS))
                             .text_color(theme.muted_foreground)
                             .child(SharedString::from(if self.review_branch.is_empty() {
                                 "review (loading diff...)".into()
@@ -2199,7 +2206,7 @@ impl DesktopApp {
         if self.review_files.is_empty() && !self.review_branch.is_empty() {
             panel = panel.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(crate::brand::text::SM))
                     .text_color(theme.muted_foreground)
                     .child(SharedString::from("no file changes vs base")),
             );
@@ -2209,7 +2216,7 @@ impl DesktopApp {
                 format!("{}  +{} -{}", file.path, file.added, file.deleted).into();
             panel = panel.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(crate::brand::text::SM))
                     .text_color(theme.foreground)
                     .child(label),
             );
@@ -2256,7 +2263,7 @@ impl DesktopApp {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(15.))
+                            .text_size(px(crate::brand::text::XL))
                             .text_color(theme.foreground)
                             .child(SharedString::from("settings")),
                     )
@@ -2301,7 +2308,7 @@ impl DesktopApp {
         // Automations section.
         let mut autos = div().flex().flex_col().gap_1().child(
             div()
-                .text_size(px(12.))
+                .text_size(px(crate::brand::text::SM))
                 .text_color(theme.muted_foreground)
                 .child(SharedString::from("scheduled automations")),
         );
@@ -2315,7 +2322,12 @@ impl DesktopApp {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().text_size(px(12.5)).child(label))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(crate::brand::text::BASE))
+                            .child(label),
+                    )
                     .child(
                         Button::new(("auto-edit", ix))
                             .label("edit")
@@ -2404,7 +2416,7 @@ impl DesktopApp {
             .gap_3()
             .child(
                 div()
-                    .text_size(px(15.))
+                    .text_size(px(crate::brand::text::XL))
                     .text_color(theme.foreground)
                     .child(SharedString::from(format!("setup wizard ({}/2)", step + 1))),
             );
@@ -2413,7 +2425,7 @@ impl DesktopApp {
             0 => {
                 panel = panel.child(
                     div()
-                        .text_size(px(12.5))
+                        .text_size(px(crate::brand::text::BASE))
                         .text_color(theme.muted_foreground)
                         .child(SharedString::from(
                             "sign in to providers (browser opens on the server machine)",
@@ -2423,7 +2435,7 @@ impl DesktopApp {
                     let label: SharedString = format!("{} - {}", row.label, row.status).into();
                     panel = panel.child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(px(crate::brand::text::BASE))
                             .text_color(if row.status == "not configured" {
                                 theme.warning
                             } else {
@@ -2447,7 +2459,7 @@ impl DesktopApp {
             _ => {
                 panel = panel.child(
                     div()
-                        .text_size(px(12.5))
+                        .text_size(px(crate::brand::text::BASE))
                         .text_color(theme.muted_foreground)
                         .child(SharedString::from(
                             "wire the tiers (persisted in the server config)",
@@ -2492,7 +2504,7 @@ impl DesktopApp {
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.muted)
-            .text_size(px(11.))
+            .text_size(px(crate::brand::text::XS))
             .text_color(theme.muted_foreground)
             .child(div().text_color(dot_color).child(SharedString::from(dot)))
             .child(div().child(status))
@@ -2537,10 +2549,10 @@ impl DesktopApp {
                             this.confirm_picker(cx);
                         });
                     })
-                    .child(div().text_size(px(13.)).child(name))
+                    .child(div().text_size(px(crate::brand::text::BASE)).child(name))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(crate::brand::text::XS))
                             .text_color(theme.muted_foreground)
                             .child(meta),
                     ),
@@ -2595,7 +2607,7 @@ impl DesktopApp {
                     })
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(crate::brand::text::SM))
                             .text_color(theme.muted_foreground)
                             .child(SharedString::from(
                             "model \u{2014} type to filter \u{b7} enter switch \u{b7} esc close",
@@ -2713,7 +2725,7 @@ pub fn render_gen_ui(
                 let t: SharedString = title.clone().into();
                 grid = grid.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(crate::brand::text::SM))
                         .text_color(theme.muted_foreground)
                         .child(t),
                 );
@@ -2726,7 +2738,7 @@ pub fn render_gen_ui(
                     let c: SharedString = col.clone().into();
                     div()
                         .flex_1()
-                        .text_size(px(11.))
+                        .text_size(px(crate::brand::text::XS))
                         .text_color(theme.muted_foreground)
                         .child(c)
                 }));
@@ -2737,7 +2749,7 @@ pub fn render_gen_ui(
                         let cell: SharedString = row.get(i).cloned().unwrap_or_default().into();
                         div()
                             .flex_1()
-                            .text_size(px(12.5))
+                            .text_size(px(crate::brand::text::BASE))
                             .text_color(theme.foreground)
                             .child(cell)
                     }),
@@ -2755,7 +2767,7 @@ pub fn render_gen_ui(
                 let t: SharedString = title.clone().into();
                 inner = inner.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(crate::brand::text::SM))
                         .text_color(theme.muted_foreground)
                         .child(t),
                 );
@@ -2789,14 +2801,14 @@ pub fn render_gen_ui(
                             div()
                                 .w(px(88.))
                                 .truncate()
-                                .text_size(px(11.))
+                                .text_size(px(crate::brand::text::XS))
                                 .text_color(theme.muted_foreground)
                                 .child(bar_label),
                         )
                         .child(div().h(px(10.)).w(width).rounded_sm().bg(theme.accent))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(crate::brand::text::XS))
                                 .text_color(theme.foreground)
                                 .child(value),
                         ),
@@ -2813,7 +2825,7 @@ pub fn render_gen_ui(
             let t: SharedString = title.clone().into();
             inner = inner.child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(crate::brand::text::BASE))
                     .text_color(theme.foreground)
                     .child(t),
             );
@@ -2829,7 +2841,7 @@ pub fn render_gen_ui(
                     .child(
                         div()
                             .w(px(120.))
-                            .text_size(px(12.))
+                            .text_size(px(crate::brand::text::SM))
                             .text_color(theme.muted_foreground)
                             .child(label),
                     )
@@ -2844,13 +2856,13 @@ pub fn render_gen_ui(
                                 (modron_view::GenFieldKind::Select, None) => {
                                     let options: SharedString = field.options.join(" / ").into();
                                     vec![div()
-                                        .text_size(px(12.))
+                                        .text_size(px(crate::brand::text::SM))
                                         .text_color(theme.muted_foreground)
                                         .child(options)
                                         .into_any_element()]
                                 }
                                 _ => vec![div()
-                                    .text_size(px(12.))
+                                    .text_size(px(crate::brand::text::SM))
                                     .text_color(theme.muted_foreground)
                                     .child(SharedString::from(
                                         field.placeholder.clone().unwrap_or_else(|| {
@@ -2920,9 +2932,11 @@ pub fn run(options: LaunchOptions) {
 
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
-        // Follow the system appearance at launch; the footer's moon button
-        // flips it manually, and open windows re-follow on OS switches.
-        Theme::change(ThemeMode::from(cx.window_appearance()), None, cx);
+        // Brand install (2026-11-11, iron-rain port): bundled DM Sans +
+        // Instrument Serif, the Oculus gold-on-black palette for both
+        // schemes, and the base font size. Later Theme::change calls
+        // (mode toggle, OS switch) reload from these configs.
+        crate::brand::install(cx);
         cx.bind_keys([
             KeyBinding::new("escape", PickerClose, Some("ModelPicker")),
             KeyBinding::new("up", PickerUp, Some("ModelPicker")),

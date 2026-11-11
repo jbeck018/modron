@@ -281,7 +281,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> gpui_kit::AnyElement {
                     panel = panel.child(
                         div()
                             .font_family(MONO)
-                            .text_size(px(12.))
+                            .text_size(px(crate::brand::text::SM))
                             .text_color(theme.foreground)
                             .child(label),
                     );
@@ -302,7 +302,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> gpui_kit::AnyElement {
                         .px_4()
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(px(crate::brand::text::BASE))
                                 .text_color(theme.muted_foreground)
                                 .child(marker_label),
                         )

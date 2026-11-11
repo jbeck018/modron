@@ -39,7 +39,8 @@ pub struct Resolved {
 
 impl Theme {
     /// The shipped themes (dirge-style: a warm default, a cool dark, a
-    /// grayscale for terminals that hate color).
+    /// grayscale for terminals that hate color, plus the iron-rain
+    /// brand: gold on black).
     pub fn builtin(name: &str) -> Theme {
         match name {
             "midnight" => Theme {
@@ -60,6 +61,17 @@ impl Theme {
                 error: "#ffffff".into(),
                 success: "#aaaaaa".into(),
             },
+            // The iron-rain (Oculus) palette: brand gold on black, with
+            // its semantic status colors.
+            "oculus" => Theme {
+                name: "oculus".into(),
+                accent: "#d9a520".into(),
+                dim: "#adadad".into(),
+                tool: "#58a6ff".into(),
+                warning: "#e0912a".into(),
+                error: "#e5484d".into(),
+                success: "#3fb950".into(),
+            },
             _ => Theme {
                 name: "modron".into(),
                 accent: "#ff9f0a".into(),
@@ -73,7 +85,7 @@ impl Theme {
     }
 
     pub fn builtin_names() -> Vec<&'static str> {
-        vec!["modron", "midnight", "mono"]
+        vec!["modron", "oculus", "midnight", "mono"]
     }
 
     /// Resolve to ratatui colors; invalid hex falls back to the default

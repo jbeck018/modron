@@ -6,6 +6,7 @@
 //! is a thin GPUI Kit renderer over the state.
 
 pub mod app_state;
+pub mod brand;
 pub mod demo;
 pub mod markdown;
 pub mod ui;
