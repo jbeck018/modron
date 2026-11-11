@@ -1257,6 +1257,13 @@ fn build_agent_with(
     // Phase 4: read-only subagent for repo-wide questions; skills load
     // on demand — the tool only registers when the repo HAS skills.
     registry.register(Arc::new(modron_tools::ExploreTool));
+    // Phase 5c A2: the delegate tool itself (2026-11-11: it was never
+    // registered — only its sidekicks below were, leaving the model
+    // unable to spawn subagents and answering "no" when asked). Essential
+    // tier so the model sees it in the schema and auto-delegates
+    // (oh-my-pi pattern): background subagents via `delegate_status`,
+    // isolated worktrees via `merge_worktree`.
+    registry.register(Arc::new(modron_tools::DelegateTool));
     registry.register(Arc::new(modron_tools::DelegateStatusTool));
     registry.register(Arc::new(modron_tools::MergeWorktreeTool));
     // Built-in methodology skills ship with the binary, so the tool is

@@ -91,8 +91,10 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
 /// Harness-Bench, oh-my-pi) is unambiguous: top harnesses pin a SMALL
 /// deliberate tool surface (~14) and mount the rest on demand — every
 /// hidden schema is tokens paid on every request, and `tool_search`
-/// keeps the rest discoverable.
-pub const ESSENTIAL_TOOLS: [&str; 12] = [
+/// keeps the rest discoverable. `delegate` is essential (2026-11-11):
+/// the model must see it to auto-delegate — the oh-my-pi pattern of
+/// spinning off background/isolated subtasks unprompted.
+pub const ESSENTIAL_TOOLS: [&str; 13] = [
     "read",
     "write",
     "edit",
@@ -105,6 +107,7 @@ pub const ESSENTIAL_TOOLS: [&str; 12] = [
     "diagnostics",
     "verify",
     "interact",
+    "delegate",
 ];
 
 /// Demote every registered tool not in [`ESSENTIAL_TOOLS`] to on-demand
