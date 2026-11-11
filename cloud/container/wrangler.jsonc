@@ -1,0 +1,23 @@
+{
+  // modron cloud container: runs modron serve inside a Cloudflare
+  // Container against a cloned repo. Requires CF Containers (beta).
+  "name": "modron-container",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-01",
+  "containers": [
+    {
+      "name": "modron-agent",
+      "image": "./Dockerfile",
+      "max_instances": 5,
+      "instance_type": "standard"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "BRIDGE", "class_name": "SessionBridge" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SessionBridge"] }
+  ]
+}
