@@ -42,7 +42,9 @@ fn not_connected() -> String {
 }
 
 fn lock_client() -> Result<std::sync::MutexGuard<'static, Option<RemoteClient>>, String> {
-    CLIENT.lock().map_err(|_| "client mutex poisoned".to_string())
+    CLIENT
+        .lock()
+        .map_err(|_| "client mutex poisoned".to_string())
 }
 
 fn parse_session(id: &str) -> Result<uuid::Uuid, String> {
@@ -302,7 +304,9 @@ fn demo_snapshot() -> String {
         streaming_text: "Migrating the router now; ".into(),
         streaming_reasoning: String::new(),
         tool_lines: vec!["\u{25cf} bash \u{2026}".into()],
-        turn_summary_line: Some("\u{23fa} 4 tools \u{b7} read \u{d7}2 \u{b7} glob \u{b7} bash".into()),
+        turn_summary_line: Some(
+            "\u{23fa} 4 tools \u{b7} read \u{d7}2 \u{b7} glob \u{b7} bash".into(),
+        ),
         subagent_rows: Vec::new(),
         pending_approval: Some(PendingApprovalView::new(
             "demo-req-1".into(),
@@ -332,6 +336,8 @@ fn demo_snapshot() -> String {
             created_at: "2026-11-09T09:00:00Z".into(),
             updated_at: "2026-11-09T12:30:00Z".into(),
             message_count: 8,
+            task_branch: None,
+            task_state: None,
         }],
         last_seq: 42,
         last_error: None,
