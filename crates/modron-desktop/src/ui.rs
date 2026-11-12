@@ -298,6 +298,22 @@ impl DesktopApp {
         )
         .detach();
 
+        // Search blur: text keeps the expanded state (just unfocuses);
+        // empty collapses back to the idle header.
+        cx.subscribe_in(
+            &session_filter,
+            window,
+            |this, _input, event: &InputEvent, _window, cx| {
+                if let InputEvent::Blur = event {
+                    if this.session_filter.read(cx).value().trim().is_empty() {
+                        this.search_open = false;
+                        this.refresh(cx);
+                    }
+                }
+            },
+        )
+        .detach();
+
         // Enter in the picker filter confirms the highlighted model.
         cx.subscribe_in(
             &filter,
