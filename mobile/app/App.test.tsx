@@ -58,3 +58,34 @@ test("composer and stop control exist on the chat screen", async () => {
   const texts = app.texts();
   expect(texts).toContain("send");
 });
+
+// Two-tap delete (parity with the desktop's trash -> check flow): the
+// first tap arms the row, the second removes it from the demo snapshot.
+test("sessions screen arms and confirms a delete", async () => {
+  const app = await open("./App.tsx");
+  await app.press("delete >> nth=0");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("confirm?");
+  await app.press("confirm?");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).not.toContain("migrate the router to the new hub");
+  expect(app.texts()).toContain("audit the tools crate");
+});
+
+// Bulk mode: edit toggles selection markers, the action bar deletes the
+// selected ids.
+test("edit mode selects and bulk deletes", async () => {
+  const app = await open("./App.tsx");
+  await app.press("edit");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("sessions - tap to select");
+  await app.press("audit the tools crate");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("[x]");
+  expect(app.texts()).toContain("1 selected");
+  await app.press("delete selected");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).not.toContain("audit the tools crate");
+  expect(app.texts()).toContain("migrate the router to the new hub");
+});
+

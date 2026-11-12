@@ -476,6 +476,16 @@ impl RemoteClient {
         ))
     }
 
+    /// Delete a session on the server. The server replies with a note
+    /// (or an error when the session is running); refresh the list with
+    /// [`Self::list_sessions`] after the delete settles.
+    pub fn delete_session(&self, session_id: Uuid) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::DeleteSession { session_id },
+        ))
+    }
+
     /// Create an empty session without submitting a task.
     pub fn new_session(&self, title: Option<&str>) -> Result<(), ClientError> {
         self.send_frame(Frame::request(

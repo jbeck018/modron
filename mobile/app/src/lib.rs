@@ -272,7 +272,7 @@ impl Remote {
         match guard.as_ref() {
             Some(client) => {
                 // The send result is irrelevant once the channel drops.
-                let _ = client.disconnect();
+                client.disconnect();
                 Ok(())
             }
             None => Err(not_connected()),
@@ -304,6 +304,18 @@ impl Remote {
     /// Create an empty session without submitting a task.
     pub fn new_session(title: Option<String>) -> Result<(), String> {
         do_new_session(title.as_deref())
+    }
+
+    /// Delete a session on the server; refresh the list afterwards with
+    /// `list_sessions_json` (the server notes the outcome instead of
+    /// replaying the list).
+    pub fn delete_session(session_id: String) -> Result<(), String> {
+        let id = parse_session(&session_id)?;
+        let guard = lock_client()?;
+        match guard.as_ref() {
+            Some(client) => client.delete_session(id).map_err(err_text),
+            None => Err(not_connected()),
+        }
     }
 
     /// List sessions; the JSON rows also land in the snapshot.
@@ -417,16 +429,28 @@ fn demo_snapshot() -> String {
             interval_minutes: 1440,
             last_run: None,
         }],
-        sessions: vec![SessionMetaWire {
-            id: uuid::Uuid::nil(),
-            title: "migrate the router to the new hub".into(),
-            created_at: "2026-11-09T09:00:00Z".into(),
-            updated_at: "2026-11-09T12:30:00Z".into(),
-            message_count: 8,
-            task_branch: None,
-            task_state: None,
-            working_dir: None,
-        }],
+        sessions: vec![
+            SessionMetaWire {
+                id: uuid::Uuid::nil(),
+                title: "migrate the router to the new hub".into(),
+                created_at: "2026-11-09T09:00:00Z".into(),
+                updated_at: "2026-11-09T12:30:00Z".into(),
+                message_count: 8,
+                task_branch: None,
+                task_state: None,
+                working_dir: None,
+            },
+            SessionMetaWire {
+                id: uuid::Uuid::from_u128(1),
+                title: "audit the tools crate".into(),
+                created_at: "2026-11-08T15:00:00Z".into(),
+                updated_at: "2026-11-08T17:10:00Z".into(),
+                message_count: 5,
+                task_branch: None,
+                task_state: None,
+                working_dir: None,
+            },
+        ],
         last_seq: 42,
         last_error: None,
         last_note: Some("switched to claude-opus-5 (takes effect on the next turn)".into()),

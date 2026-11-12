@@ -104,6 +104,12 @@ const helpNote = signal<string | null>(null);
 const autoName = signal("");
 const autoPrompt = signal("");
 const autoInterval = signal("");
+// Sessions-screen delete state: bulk-select mode, the selected ids, and
+// the row id whose delete control is armed (two-tap confirm, matching
+// the desktop's trash -> check flow).
+const editMode = signal(false);
+const selectedIds = signal<string[]>([]);
+const confirmingId = signal<string | null>(null);
 
 // The shared slash-command table is compile-time (modron-view::slash): fetch
 // it once at startup for the composer's suggestions and the /help body.
@@ -254,6 +260,34 @@ function enterSettings(): void {
     // Demo or between connections: render what the snapshot has.
   }
   stack.push("settings");
+}
+
+// Delete one session (two-tap confirm lands here) or every selected id
+// from bulk mode. Demo filters the local snapshot; a live server notes
+// the outcome and the refreshed list is the truth.
+function deleteSessions(ids: string[]): void {
+  for (const id of ids) {
+    if (demo()) {
+      snap.set({
+        ...snap(),
+        sessions: snap().sessions.filter((s) => s.id !== id),
+      });
+      continue;
+    }
+    try {
+      Remote.deleteSession(id);
+    } catch (e) {
+      connectError.set(e instanceof Error ? e.message : String(e));
+    }
+  }
+  try {
+    if (!demo()) Remote.listSessionsJson();
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+  confirmingId.set(null);
+  selectedIds.set([]);
+  editMode.set(false);
 }
 
 function runSlash(raw: string): void {
@@ -528,6 +562,19 @@ function SessionsScreen() {
             role="button"
             class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
             onPress={() => {
+              editMode.update((e) => !e);
+              selectedIds.set([]);
+              confirmingId.set(null);
+            }}
+          >
+            <Text class="text-secondary-foreground text-sm">
+              {editMode() ? "done" : "edit"}
+            </Text>
+          </View>
+          <View
+            role="button"
+            class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+            onPress={() => {
               demo.update((d) => !d);
               if (demo()) {
                 snap.set(JSON.parse(Remote.demoSnapshotJson()) as Snapshot);
@@ -570,37 +617,135 @@ function SessionsScreen() {
             </Text>
           </View>
         </View>
+        {editMode() ? (
+          <View class="flex-row items-center gap-2">
+            <Text class="text-muted-foreground text-xs">
+              {selectedIds().length} selected
+            </Text>
+            <View class="flex-1" />
+            <View
+              role="button"
+              class={
+                "rounded-(--radius) px-3 py-1 active:opacity-80 " +
+                (selectedIds().length
+                  ? "bg-destructive"
+                  : "bg-secondary opacity-50")
+              }
+              onPress={() => {
+                if (selectedIds().length) deleteSessions(selectedIds());
+              }}
+            >
+              <Text
+                class={
+                  selectedIds().length
+                    ? "text-background text-sm"
+                    : "text-secondary-foreground text-sm"
+                }
+              >
+                delete selected
+              </Text>
+            </View>
+            <View
+              role="button"
+              class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+              onPress={() => {
+                editMode.set(false);
+                selectedIds.set([]);
+              }}
+            >
+              <Text class="text-secondary-foreground text-sm">cancel</Text>
+            </View>
+          </View>
+        ) : null}
         {connectError() ? (
           <Text class="text-destructive text-xs">{connectError()}</Text>
         ) : null}
       </View>
       <Scroll class="flex-1 px-4 pt-2 gap-2">
         <Text class="text-muted-foreground text-xs">
-          sessions - tap one to attach
+          {editMode()
+            ? "sessions - tap to select"
+            : "sessions - tap one to attach"}
         </Text>
-        {snap().sessions.map((session) => (
-          <View
-            role="button"
-            class="rounded-xl border border-border bg-card px-3 py-3 gap-1 active:opacity-80"
-            onPress={() => {
-              if (demo()) {
-                stack.push("chat");
-                return;
-              }
-              try {
-                Remote.attach(session.id, 0);
-                stack.push("chat");
-              } catch (e) {
-                connectError.set(e instanceof Error ? e.message : String(e));
-              }
-            }}
-          >
-            <Text class="text-foreground font-medium">{session.title}</Text>
-            <Text class="text-muted-foreground text-xs">
-              {session.message_count} messages - {session.updated_at}
-            </Text>
-          </View>
-        ))}
+        {snap().sessions.map((session) => {
+          const selected = selectedIds().includes(session.id);
+          const armed = confirmingId() === session.id;
+          return (
+            <View class="flex-row items-stretch gap-2">
+              <View
+                role="button"
+                class={
+                  "flex-1 rounded-xl border bg-card px-3 py-3 gap-1 active:opacity-80 " +
+                  (selected && editMode() ? "border-accent" : "border-border")
+                }
+                onPress={() => {
+                  confirmingId.set(null);
+                  if (editMode()) {
+                    selectedIds.update((ids) =>
+                      selected
+                        ? ids.filter((id) => id !== session.id)
+                        : [...ids, session.id],
+                    );
+                    return;
+                  }
+                  if (demo()) {
+                    stack.push("chat");
+                    return;
+                  }
+                  try {
+                    Remote.attach(session.id, 0);
+                    stack.push("chat");
+                  } catch (e) {
+                    connectError.set(e instanceof Error ? e.message : String(e));
+                  }
+                }}
+              >
+                <View class="flex-row items-center gap-2">
+                  {editMode() ? (
+                    <Text class="text-accent">{selected ? "[x]" : "[ ]"}</Text>
+                  ) : null}
+                  <Text class="text-foreground font-medium">
+                    {session.title}
+                  </Text>
+                </View>
+                <Text class="text-muted-foreground text-xs">
+                  {session.message_count} messages - {session.updated_at}
+                </Text>
+              </View>
+              {!editMode() ? (
+                <View
+                  role="button"
+                  class="justify-center px-1 active:opacity-80"
+                  onPress={() => {
+                    if (armed) {
+                      deleteSessions([session.id]);
+                    } else {
+                      confirmingId.set(session.id);
+                    }
+                  }}
+                >
+                  <View
+                    class={
+                      armed
+                        ? "rounded-(--radius) bg-destructive px-3 py-1"
+                        : "rounded-(--radius) bg-secondary px-3 py-1"
+                    }
+                  >
+                    <Text
+                      class={
+                        armed
+                          ? "text-background text-sm"
+                          : "text-secondary-foreground text-sm"
+                      }
+                    >
+                      {armed ? "confirm?" : "delete"}
+                    </Text>
+                  </View>
+                </View>
+              ) : null}
+            </View>
+          );
+        })}
         {snap().sessions.length === 0 ? (
           <Text class="text-muted-foreground text-sm">
             {demo()
