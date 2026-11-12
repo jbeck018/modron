@@ -1474,7 +1474,7 @@ impl DesktopApp {
                     Button::new("search-close")
                         .icon(Icon::default().path("icons/x.svg").size_4())
                         .ghost()
-                        .xsmall()
+                        .small()
                         .on_click(move |_e, window, cx: &mut App| {
                             entity_close.update(cx, |this, cx| {
                                 this.search_open = false;
@@ -1512,7 +1512,7 @@ impl DesktopApp {
                     Button::new("select-all")
                         .label("select all")
                         .ghost()
-                        .xsmall()
+                        .small()
                         .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                             entity.update(cx, |this, cx| {
                                 for s in &this.state.sessions {
@@ -1527,7 +1527,7 @@ impl DesktopApp {
                         .icon(Icon::default().path("icons/trash.svg").size_4())
                         .label(format!("{count}"))
                         .disabled(count == 0)
-                        .xsmall();
+                        .small();
                     if count > 0 {
                         if confirm {
                             delete = delete.danger().label("confirm").on_click(
@@ -1560,7 +1560,7 @@ impl DesktopApp {
                     Button::new("select-cancel")
                         .icon(Icon::default().path("icons/x.svg").size_4())
                         .ghost()
-                        .xsmall()
+                        .small()
                         .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                             entity_cancel.update(cx, |this, cx| {
                                 this.select_mode = false;
@@ -1576,7 +1576,7 @@ impl DesktopApp {
                 Button::new("search-toggle")
                     .icon(Icon::default().path("icons/search.svg").size_4())
                     .ghost()
-                    .xsmall()
+                    .small()
                     .selected(self.search_open)
                     .on_click(move |_e, window, cx: &mut App| {
                         entity.update(cx, |this, cx| {
@@ -1784,7 +1784,7 @@ impl DesktopApp {
                                                     .text_color(theme.danger),
                                             )
                                             .ghost()
-                                            .xsmall()
+                                            .small()
                                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                                 entity_yes.update(cx, |this, cx| {
                                                     this.delete_session(id, cx)
@@ -1831,7 +1831,7 @@ impl DesktopApp {
                                         Button::new(("del", ix))
                                             .icon(Icon::default().path("icons/trash.svg").size_4())
                                             .ghost()
-                                            .xsmall()
+                                            .small()
                                             .on_click(
                                                 move |_event: &ClickEvent, _w, cx: &mut App| {
                                                     // The x sits inside the clickable row:
@@ -2487,7 +2487,7 @@ impl DesktopApp {
                             Button::new("close-panel")
                                 .label("close")
                                 .ghost()
-                                .xsmall()
+                                .small()
                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                     this.close_tool_panel(cx);
                                 })),
@@ -2555,7 +2555,7 @@ impl DesktopApp {
                         Button::new(("unstage", ix))
                             .label("x")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.staged.remove(ix);
                                 this.refresh(cx);
@@ -2915,7 +2915,7 @@ impl DesktopApp {
                         Button::new("merge-review")
                             .label("merge")
                             .primary()
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 let Some(id) = this.state.attached else {
                                     return;
@@ -2927,7 +2927,7 @@ impl DesktopApp {
                         Button::new("close-review")
                             .label("close")
                             .ghost()
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.review_open = None;
                                 this.refresh(cx);
@@ -3188,7 +3188,7 @@ impl DesktopApp {
             )))
             .label("apply")
             .outline()
-            .xsmall()
+            .small()
             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                 entity.update(cx, |this, cx| {
                     this.send(Command::SetConfig(build()));
@@ -3293,7 +3293,7 @@ impl DesktopApp {
                         .items_center()
                         .gap_2()
                         .child(div().flex_1().child(Input::new(input)))
-                        .child(Button::new(id).label("apply").outline().xsmall().on_click(
+                        .child(Button::new(id).label("apply").outline().small().on_click(
                             move |_e: &ClickEvent, _w, cx: &mut App| {
                                 let value = input_apply.read(cx).value().to_string();
                                 let patch = build(value);
@@ -3614,7 +3614,7 @@ impl DesktopApp {
         let mut key_save = Button::new("save-provider-key")
             .label("save")
             .outline()
-            .xsmall();
+            .small();
         if key_save_enabled {
             let entity_save = entity.clone();
             let target = target.clone().unwrap_or_default();
@@ -3699,7 +3699,7 @@ impl DesktopApp {
                         Button::new(btn_id)
                             .icon(Icon::default().path("icons/trash.svg").size_4())
                             .ghost()
-                            .xsmall()
+                            .small()
                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                 entity_del.update(cx, |this, cx| {
                                     this.remove_automation(del_name.clone(), cx)

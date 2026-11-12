@@ -11,7 +11,7 @@
       "font.family": "DM Sans",
       "font.size": 13,
       "mono_font.size": 12.5,
-      "radius": 8,
+      "radius": 4,
       "radius.lg": 12,
       "colors": {
         "background": "#000000",
@@ -67,7 +67,7 @@
       "font.family": "DM Sans",
       "font.size": 13,
       "mono_font.size": 12.5,
-      "radius": 8,
+      "radius": 4,
       "radius.lg": 12,
       "colors": {
         "background": "#FFFFFF",
