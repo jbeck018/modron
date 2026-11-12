@@ -216,6 +216,53 @@ fn do_set_config_json(patch: &str) -> Result<(), String> {
     client.set_config(patch).map_err(err_text)
 }
 
+fn do_fork_session() -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    let id = attached_session_id(client)?;
+    client.fork_session(id).map_err(err_text)
+}
+
+fn do_create_task(title: &str, base: Option<&str>) -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    client.create_task(title, base).map_err(err_text)
+}
+
+fn do_task_status() -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    let id = attached_session_id(client)?;
+    client.task_status(id).map_err(err_text)
+}
+
+fn do_merge_task(message: Option<&str>) -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    let id = attached_session_id(client)?;
+    client.merge_task(id, message).map_err(err_text)
+}
+
+fn do_router_defaults_json() -> Result<String, String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    client.router_defaults().map_err(err_text)?;
+    serde_json::to_string(&client.state().router_defaults).map_err(|e| e.to_string())
+}
+
+fn do_persist_router(
+    cheap: &str,
+    strong: &str,
+    cheap_fallback: Option<&str>,
+    strong_fallback: Option<&str>,
+) -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    client
+        .persist_router(cheap, strong, cheap_fallback, strong_fallback)
+        .map_err(err_text)
+}
+
 /// The shared slash-command table (`modron_view::slash`), as JSON: the
 /// composer's autocomplete and /help render it verbatim, so a command
 /// typed on any client means the same thing.
@@ -386,6 +433,47 @@ impl Remote {
         do_set_config_json(&patch)
     }
 
+    /// Fork the attached session; the note names the new id.
+    pub fn fork_session() -> Result<(), String> {
+        do_fork_session()
+    }
+
+    /// Create a task session in its own worktree/branch; the reply
+    /// adopts the new session (submits land there).
+    pub fn create_task(title: String, base: Option<String>) -> Result<(), String> {
+        do_create_task(&title, base.as_deref())
+    }
+
+    /// The attached session's task status (lands as a note).
+    pub fn task_status() -> Result<(), String> {
+        do_task_status()
+    }
+
+    /// Merge the attached task's branch into its base (lands as a note).
+    pub fn merge_task(message: Option<String>) -> Result<(), String> {
+        do_merge_task(message.as_deref())
+    }
+
+    /// The router's default-model picture; also lands in the snapshot.
+    pub fn router_defaults_json() -> Result<String, String> {
+        do_router_defaults_json()
+    }
+
+    /// Persist cheap/strong router defaults (fallbacks optional).
+    pub fn persist_router(
+        cheap: String,
+        strong: String,
+        cheap_fallback: Option<String>,
+        strong_fallback: Option<String>,
+    ) -> Result<(), String> {
+        do_persist_router(
+            &cheap,
+            &strong,
+            cheap_fallback.as_deref(),
+            strong_fallback.as_deref(),
+        )
+    }
+
     /// The folded view state plus every pre-rendered string, as JSON
     /// (`{}` before the first connect).
     pub fn snapshot_json() -> String {
@@ -547,6 +635,13 @@ fn demo_snapshot() -> String {
         last_error: None,
         last_note: Some("switched to claude-opus-5 (takes effect on the next turn)".into()),
         oauth: None,
+        router_defaults: Some(modron_protocol::RouterDefaults {
+            authed: vec!["anthropic".into(), "openai-compat".into()],
+            recommended_cheap: Some("gpt-5.6-terra".into()),
+            recommended_strong: Some("claude-opus-5-5".into()),
+            cheap_fallback: vec!["glm-5.3".into()],
+            strong_fallback: vec!["gpt-6-astra".into()],
+        }),
         history: vec![
             row(modron_view::TranscriptEntry::Task {
                 text: "migrate the router to the new hub".into(),

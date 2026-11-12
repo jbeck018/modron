@@ -535,6 +535,77 @@ impl RemoteClient {
         ))
     }
 
+    /// Fork a session: the server copies its log under a fresh id and
+    /// both sessions get a note.
+    pub fn fork_session(&self, session_id: Uuid) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Fork { session_id },
+        ))
+    }
+
+    /// Create a task: a new session in a dedicated worktree/branch off
+    /// `base` (the reply adopts the new session).
+    pub fn create_task(&self, title: &str, base: Option<&str>) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::CreateTask {
+                title: title.into(),
+                base: base.map(Into::into),
+            },
+        ))
+    }
+
+    /// Request a task's diff/branch status; the answer lands in
+    /// `state().last_note`.
+    pub fn task_status(&self, session_id: Uuid) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::GetTaskStatus { session_id },
+        ))
+    }
+
+    /// Merge a task's branch back into its base; the answer (ok or the
+    /// abort summary) lands in `state().last_note`.
+    pub fn merge_task(&self, session_id: Uuid, message: Option<&str>) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::MergeTask {
+                session_id,
+                message: message.map(Into::into),
+            },
+        ))
+    }
+
+    /// Request the router's default-model picture; the answer lands in
+    /// `state().router_defaults`.
+    pub fn router_defaults(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::RouterDefaultsReq {},
+        ))
+    }
+
+    /// Persist router defaults into the server's config; the outcome
+    /// lands as a note.
+    pub fn persist_router(
+        &self,
+        cheap: &str,
+        strong: &str,
+        cheap_fallback: Option<&str>,
+        strong_fallback: Option<&str>,
+    ) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::PersistRouter {
+                cheap: cheap.into(),
+                strong: strong.into(),
+                cheap_fallback: cheap_fallback.map(Into::into),
+                strong_fallback: strong_fallback.map(Into::into),
+            },
+        ))
+    }
+
     /// Close the connection (the run loop drains, sends a close frame,
     /// and marks the state disconnected).
     pub fn disconnect(&self) {
@@ -717,6 +788,56 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         Payload::Sessions { sessions } => vm.sessions = sessions,
         Payload::Automations { rows } => vm.automations = rows,
         Payload::AuthProviders { rows } => vm.providers = rows,
+        Payload::RouterDefaults {
+            authed,
+            recommended_cheap,
+            recommended_strong,
+            cheap_fallback,
+            strong_fallback,
+        } => {
+            vm.router_defaults = Some(modron_protocol::RouterDefaults {
+                authed,
+                recommended_cheap,
+                recommended_strong,
+                cheap_fallback,
+                strong_fallback,
+            });
+        }
+        // A task creation adopts the fresh session (the desktop does the
+        // same); status and merge answers land as scrollback notes.
+        Payload::TaskCreated {
+            session_id,
+            worktree,
+            branch,
+        } => {
+            vm.session_id = Some(session_id);
+            vm.last_note = Some(format!("task created: {branch} in {worktree}"));
+        }
+        Payload::TaskStatus {
+            session_id,
+            branch,
+            running,
+            ahead,
+            files,
+            ..
+        } => {
+            vm.last_note = Some(format!(
+                "task {session_id}: {branch}, {ahead} ahead, {} files, {}",
+                files.len(),
+                if running { "running" } else { "idle" }
+            ));
+        }
+        Payload::TaskMerged {
+            session_id,
+            ok,
+            summary,
+        } => {
+            vm.last_note = Some(if ok {
+                format!("merged task {session_id}: {summary}")
+            } else {
+                format!("merge aborted: {summary}")
+            });
+        }
         Payload::PagePublished { url } => {
             vm.last_note = Some(format!("published: {url}"));
         }

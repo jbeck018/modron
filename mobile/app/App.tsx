@@ -64,6 +64,16 @@ interface OAuthState {
   user_code: string | null;
 }
 
+// The router's default-model picture (what is signed in and the
+// derived recommendation).
+interface RouterDefaultsWire {
+  authed: string[];
+  recommended_cheap: string | null;
+  recommended_strong: string | null;
+  cheap_fallback: string[];
+  strong_fallback: string[];
+}
+
 // One row of the shared slash-command table (modron-view::slash), served
 // by Remote.slashCommandsJson() as name/usage/about/scope.
 interface SlashCommand {
@@ -101,6 +111,7 @@ interface Snapshot {
   automations: AutomationRow[];
   providers: ProviderRow[];
   oauth: OAuthState | null;
+  router_defaults: RouterDefaultsWire | null;
   last_seq: number;
   last_error: string | null;
   last_note: string | null;
@@ -133,6 +144,11 @@ const keyDrafts = signal<Record<string, string>>({});
 const allowDraft = signal("");
 const denyDraft = signal("");
 const goalDraft = signal("");
+// Router defaults card drafts (cheap/strong model ids).
+const cheapDraft = signal("");
+const strongDraft = signal("");
+// New-task title (settings tasks card).
+const taskTitle = signal("");
 // Sessions-screen delete state: bulk-select mode, the selected ids, and
 // the row id whose delete control is armed (two-tap confirm, matching
 // the desktop's trash -> check flow).
@@ -286,6 +302,7 @@ function enterSettings(): void {
   try {
     Remote.listAutomationsJson();
     Remote.authProvidersJson();
+    Remote.routerDefaultsJson();
   } catch {
     // Demo or between connections: render what the snapshot has.
   }
@@ -390,6 +407,77 @@ function saveGoal(): void {
   const goal = (goalDraft() || snap().goal).trim();
   setConfig({ goal });
   goalDraft.set("");
+}
+
+// Demo gates: fork/tasks/router writes need a live server; the demo
+// snapshot carries the display data only.
+function needsServer(action: string): boolean {
+  if (!demo()) return true;
+  connectError.set(`${action} needs a live server`);
+  return false;
+}
+
+function tryRemote(action: string, f: () => void): void {
+  if (!needsServer(action)) return;
+  try {
+    f();
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
+function forkSession(): void {
+  tryRemote("fork", () => Remote.forkSession());
+}
+
+function requestTaskStatus(): void {
+  tryRemote("task status", () => Remote.taskStatus());
+}
+
+function mergeTask(): void {
+  tryRemote("merge task", () => Remote.mergeTask(null));
+}
+
+function createTask(): void {
+  const title = taskTitle().trim();
+  if (!title) return;
+  tryRemote("create task", () => Remote.createTask(title, null));
+  taskTitle.set("");
+  try {
+    if (!demo()) Remote.listSessionsJson();
+  } catch {
+    // The refreshed list lands with the next poll anyway.
+  }
+  if (demo()) {
+    stack.push("chat");
+  }
+}
+
+function useRecommended(): void {
+  const rec = snap().router_defaults;
+  if (!rec) return;
+  cheapDraft.set(rec.recommended_cheap ?? "");
+  strongDraft.set(rec.recommended_strong ?? "");
+}
+
+function saveDefaults(): void {
+  const cheap = (cheapDraft() || snap().model).trim();
+  const strong = (strongDraft() || snap().model).trim();
+  if (!cheap || !strong) return;
+  if (demo()) {
+    snap.set({
+      ...snap(),
+      last_note: `router defaults saved: ${cheap} / ${strong}`,
+    });
+    return;
+  }
+  try {
+    Remote.persistRouter(cheap, strong, null, null);
+    cheapDraft.set("");
+    strongDraft.set("");
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
 }
 
 // Delete one session (two-tap confirm lands here) or every selected id
@@ -552,6 +640,36 @@ function StatusHeader() {
         {snap().turns_completed} turns - {snap().tool_calls_total} tools - seq{" "}
         {snap().last_seq}
       </Text>
+      <View class="flex-row items-center gap-2 pt-1">
+        <View
+          role="button"
+          class="rounded-(--radius) bg-secondary px-2 py-1 active:opacity-80"
+          onPress={() => publishTranscript()}
+        >
+          <Text class="text-secondary-foreground text-xs">share</Text>
+        </View>
+        <View
+          role="button"
+          class="rounded-(--radius) bg-secondary px-2 py-1 active:opacity-80"
+          onPress={() => forkSession()}
+        >
+          <Text class="text-secondary-foreground text-xs">fork</Text>
+        </View>
+        <View
+          role="button"
+          class="rounded-(--radius) bg-secondary px-2 py-1 active:opacity-80"
+          onPress={() => requestTaskStatus()}
+        >
+          <Text class="text-secondary-foreground text-xs">task status</Text>
+        </View>
+        <View
+          role="button"
+          class="rounded-(--radius) bg-secondary px-2 py-1 active:opacity-80"
+          onPress={() => mergeTask()}
+        >
+          <Text class="text-secondary-foreground text-xs">merge task</Text>
+        </View>
+      </View>
     </View>
   );
 }
@@ -1011,6 +1129,87 @@ function SettingsScreen() {
             server: {snap().server_version}
           </Text>
           <Text class="text-foreground text-sm">seq: {snap().last_seq}</Text>
+        </View>
+        {/* Router defaults: the same recommendation + save flow the
+            desktop settings page has (shared microcopy). */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-2">
+          <Text class="text-muted-foreground text-xs">router defaults</Text>
+          {snap().router_defaults ? (
+            <View class="gap-1">
+              <Text class="text-muted-foreground text-xs">
+                signed in:{" "}
+                {snap().router_defaults!.authed.join(", ") || "none"}
+              </Text>
+              <Text class="text-accent text-xs">
+                recommended:{" "}
+                {snap().router_defaults!.recommended_cheap ?? "?"} (cheap) /{" "}
+                {snap().router_defaults!.recommended_strong ?? "?"} (strong)
+              </Text>
+            </View>
+          ) : (
+            <Text class="text-muted-foreground text-xs">
+              connect to a server for recommendations
+            </Text>
+          )}
+          <Input
+            class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+            value={cheapDraft()}
+            placeholder={`cheap model (default: ${snap().model})`}
+            autoCorrect={false}
+            autoCapitalize="none"
+            onChange={(e) => cheapDraft.set(e.value)}
+          />
+          <Input
+            class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+            value={strongDraft()}
+            placeholder={`strong model (default: ${snap().model})`}
+            autoCorrect={false}
+            autoCapitalize="none"
+            onChange={(e) => strongDraft.set(e.value)}
+          />
+          <View class="flex-row gap-2 items-center justify-end">
+            <View
+              role="button"
+              class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+              onPress={() => useRecommended()}
+            >
+              <Text class="text-secondary-foreground text-sm">
+                use recommended
+              </Text>
+            </View>
+            <View
+              role="button"
+              class="rounded-(--radius) bg-primary px-3 py-1 active:opacity-80"
+              onPress={() => saveDefaults()}
+            >
+              <Text class="text-primary-foreground text-sm">
+                save as default
+              </Text>
+            </View>
+          </View>
+        </View>
+        {/* Tasks: create a session bound to its own worktree/branch;
+            status and merge live in the chat header. */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-2">
+          <Text class="text-muted-foreground text-xs">tasks</Text>
+          <View class="flex-row gap-2 items-center">
+            <Input
+              class="flex-1 rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+              value={taskTitle()}
+              placeholder="new task title"
+              autoCorrect={false}
+              autoCapitalize="none"
+              onChange={(e) => taskTitle.set(e.value)}
+              onSubmit={() => createTask()}
+            />
+            <View
+              role="button"
+              class="rounded-(--radius) bg-primary px-3 py-2 active:opacity-80"
+              onPress={() => createTask()}
+            >
+              <Text class="text-primary-foreground text-sm">create</Text>
+            </View>
+          </View>
         </View>
         {/* Providers: auth status per registry row; oauth rows get a
             sign-in button (server-side flow, progress streams below),

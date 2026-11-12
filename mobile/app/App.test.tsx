@@ -120,5 +120,31 @@ test("settings cycles approval mode and sandbox", async () => {
   expect(app.texts()).toContain("save goal");
 });
 
+// Router defaults + tasks cards (parity P4): the desktop's microcopy
+// verbatim, recommendations from the snapshot.
+test("settings shows router defaults and tasks cards", async () => {
+  const app = await open("./App.tsx");
+  await app.press("settings");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("router defaults");
+  expect(app.texts()).toContain(
+    "recommended: gpt-5.6-terra (cheap) / claude-opus-5-5 (strong)",
+  );
+  expect(app.texts()).toContain("use recommended");
+  expect(app.texts()).toContain("save as default");
+  expect(app.texts()).toContain("tasks");
+});
+
+// Chat header carries the fork/task controls (parity P4).
+test("chat header has share, fork and task controls", async () => {
+  const app = await openDemoChat();
+  const texts = app.texts();
+  expect(texts).toContain("share");
+  expect(texts).toContain("fork");
+  expect(texts).toContain("task status");
+  expect(texts).toContain("merge task");
+});
+
+
 
 
