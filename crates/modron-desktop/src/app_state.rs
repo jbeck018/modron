@@ -639,6 +639,7 @@ fn swarm_row_from_wire(w: &WireSwarmRow) -> SwarmRow {
         tokens: w.tokens,
         last_tool: w.last_tool.clone(),
         done: w.done,
+        started_ms: None,
     }
 }
 

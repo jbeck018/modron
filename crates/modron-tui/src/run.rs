@@ -91,6 +91,27 @@ enum LoopCmd {
     RemoteControl {
         bridge_url: String,
     },
+    /// /fork in remote mode: the driver fills the session id.
+    Fork {
+        session: Option<SessionId>,
+    },
+    /// /tasks in remote mode: the server's worktree-task status.
+    Tasks {
+        session: Option<SessionId>,
+    },
+    /// /share in remote mode: publish the captured answer through the bridge.
+    Publish {
+        session: Option<SessionId>,
+        title: String,
+        content_md: String,
+    },
+    /// /automations in remote mode: the server's scheduled prompts.
+    ListAutomations,
+    /// /new in remote mode: a fresh server session (the driver adopts it
+    /// and re-attaches, resetting the transcript).
+    NewSession {
+        title: Option<String>,
+    },
 }
 
 /// Driver -> loop updates that do not fit the delta/approval/outcome
@@ -101,6 +122,9 @@ enum UiFrame {
     // against a Note's 24B.
     Snapshot(Box<crate::remote::AttachSnapshot>),
     ConfigChanged(modron_protocol::ConfigPatch),
+    /// New transcript entries folded from a live persisted Event frame
+    /// (the driver's ReplayFolder; parity with a fresh attach replay).
+    Entries(Vec<modron_view::TranscriptEntry>),
     Disconnected,
 }
 
@@ -365,6 +389,9 @@ pub async fn run_with(
         ];
         app.push_history(welcome);
     }
+    // Which session's log the scrollback currently mirrors; a different
+    // session's snapshot (e.g. after /new) resets it first.
+    let mut backfill_session: Option<SessionId> = None;
     // Remote banner note + attach replay: the persisted transcript lands
     // in scrollback (same styles as the live path) before anything runs.
     if let Some(target) = remote_target.as_deref() {
@@ -373,7 +400,9 @@ pub async fn run_with(
         ));
     }
     if let Some((_, Some(snap))) = connected.as_ref() {
+        backfill_session = Some(snap.session_id);
         if !snap.events.is_empty() {
+            app.reset_transcript();
             app.backfill_transcript(modron_view::replay(&snap.events));
         }
     }
@@ -401,7 +430,8 @@ pub async fn run_with(
     let mut remote_busy = false;
     // The first snapshot with events replays the transcript; later ones
     // (auto-attach echoes) must not duplicate history.
-    let mut backfilled = false;
+    // Which session's log the scrollback currently mirrors; a different
+    // session's snapshot (e.g. after /new) resets it first.
     #[allow(unused_assignments)]
     let mut result: anyhow::Result<()> = Ok(());
 
@@ -677,6 +707,25 @@ pub async fn run_with(
                             let _ = loop_cmd_tx.send(LoopCmd::RemoteControl { bridge_url: url });
                         }
                     }
+                    PendingCommand::Fork => {
+                        let _ = loop_cmd_tx.send(LoopCmd::Fork { session: None });
+                    }
+                    PendingCommand::Tasks => {
+                        let _ = loop_cmd_tx.send(LoopCmd::Tasks { session: None });
+                    }
+                    PendingCommand::Publish { title, content_md } => {
+                        let _ = loop_cmd_tx.send(LoopCmd::Publish {
+                            session: None,
+                            title,
+                            content_md,
+                        });
+                    }
+                    PendingCommand::Automations => {
+                        let _ = loop_cmd_tx.send(LoopCmd::ListAutomations);
+                    }
+                    PendingCommand::NewSession => {
+                        let _ = loop_cmd_tx.send(LoopCmd::NewSession { title: None });
+                    }
                     other => match remote_slash_command(&other) {
                         Some((patch, mode_label)) => {
                             if let Some(label) = mode_label {
@@ -685,7 +734,9 @@ pub async fn run_with(
                             let _ = loop_cmd_tx.send(LoopCmd::SetConfig(patch));
                         }
                         None => {
-                            app.toast("needs the local engine — restart without --connect");
+                            app.toast(
+                                "needs the machine that owns the engine — run it there                                  (restart without --connect)",
+                            );
                         }
                     },
                 }
@@ -945,14 +996,20 @@ pub async fn run_with(
                 }
                 UiFrame::Snapshot(snap) => {
                     app.session_id = Some(snap.session_id);
-                    if !snap.events.is_empty() && !backfilled {
-                        backfilled = true;
+                    if backfill_session != Some(snap.session_id) {
+                        backfill_session = Some(snap.session_id);
+                        app.reset_transcript();
+                    }
+                    if !snap.events.is_empty() {
                         app.backfill_transcript(modron_view::replay(&snap.events));
                     }
                     if !snap.live.model.is_empty() && app.current_model != snap.live.model {
                         app.model_label = snap.live.model.clone();
                         app.current_model = snap.live.model.clone();
                     }
+                }
+                UiFrame::Entries(entries) => {
+                    app.backfill_transcript(entries);
                 }
                 UiFrame::Disconnected => {
                     remote_busy = false;
@@ -1050,12 +1107,28 @@ async fn run_pending_command(engine: &mut Engine, cmd: PendingCommand) -> Vec<St
         // /remote-control only works over a serve connection: in the
         // local path say so explicitly instead of ignoring. Automations
         // and publish run on the server too.
-        PendingCommand::RemoteControl { .. }
-        | PendingCommand::Automations
-        | PendingCommand::Publish => {
+        PendingCommand::RemoteControl { .. } | PendingCommand::Automations => {
             vec!["needs a server session - run `modron serve`, connect with \
              --connect, then /remote-control <bridge url>"
                 .to_string()]
+        }
+        // The content rides the wire from the connected session; without a
+        // connection there is nothing to publish.
+        PendingCommand::Publish { .. } => {
+            vec![
+                "publishing runs on the server - run `modron serve`, connect with \
+             --connect (the server also needs --bridge <url>)"
+                    .to_string(),
+            ]
+        }
+        // Local TUI IS the session: a fresh one means a fresh process (or
+        // /fork to branch this one).
+        PendingCommand::NewSession => {
+            vec![
+                "the TUI is the session here - quit and relaunch for a fresh \
+             one, or /fork to branch this conversation"
+                    .to_string(),
+            ]
         }
         // /auth — provider credentials against the shared core store
         // (`modron_core::auth`): bare = status, `<provider> <key>` =
@@ -1659,10 +1732,60 @@ fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
             "remote-control live — open {url} on any device to watch and drive this session"
         ))],
         Payload::Error { message } => vec![LoopInput::Note(format!("server error: {message}"))],
-        // Welcome (handshake already done), Event (persisted frames are
-        // folded into snapshots; live visibility rides deltas — re-rendering
-        // both would duplicate every message), Sessions (server-side picker
-        // is a later tranche), Pong.
+        // Worktree-task status as a compact text block (the desktop shows
+        // a review overlay; the TUI reads).
+        Payload::TaskStatus {
+            worktree,
+            branch,
+            running,
+            ahead,
+            files,
+            ..
+        } => {
+            let mut lines = vec![format!(
+                "task {branch}: {ahead} ahead{} · {worktree}",
+                if running { " · running" } else { "" }
+            )];
+            if files.is_empty() {
+                lines.push("  (no changes vs base)".to_string());
+            } else {
+                for f in &files {
+                    lines.push(format!("  {} (+{} -{})", f.path, f.added, f.deleted));
+                }
+            }
+            lines.into_iter().map(LoopInput::Note).collect()
+        }
+        Payload::PagePublished { url } => vec![LoopInput::Note(format!(
+            "published: {url} - open on any device"
+        ))],
+        Payload::Automations { rows } => {
+            if rows.is_empty() {
+                vec![LoopInput::Note("no automations configured".into())]
+            } else {
+                rows.iter()
+                    .map(|a| {
+                        LoopInput::Note(format!(
+                            "  {} · every {}m · {}{}",
+                            a.name,
+                            a.interval_minutes,
+                            a.prompt,
+                            match &a.last_run {
+                                None => String::new(),
+                                Some(run) if run.is_empty() => String::new(),
+                                Some(run) => format!(" (last run {run})"),
+                            }
+                        ))
+                    })
+                    .chain(std::iter::once(LoopInput::Note(format!(
+                        "{} automation(s)",
+                        rows.len()
+                    ))))
+                    .collect()
+            }
+        }
+        // Welcome (handshake already done), Event (the driver folds it
+        // into the running transcript), Sessions (server-side picker is a
+        // later tranche), Pong.
         _ => Vec::new(),
     }
 }
@@ -1701,6 +1824,11 @@ fn spawn_remote_driver(
         // The adopted session id: set by the auto-attach snapshot (first
         // submit) or by --resume; used for session-scoped commands.
         let mut driver_session: Option<uuid::Uuid> = None;
+        // Live fold of persisted events (2026-11-12 audit fix): plan /
+        // model / tool-summary events now render live instead of only on
+        // the next attach; the folder matches a fresh replay exactly.
+        let mut folder = modron_view::ReplayFolder::new();
+        let mut folder_session: Option<uuid::Uuid> = None;
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
@@ -1732,6 +1860,47 @@ fn spawn_remote_driver(
                             bridge_url,
                         });
                     }
+                    Some(LoopCmd::Fork { session }) => {
+                        if let Some(session_id) = session.or(driver_session) {
+                            let _ = client.send(Payload::Fork { session_id });
+                        } else {
+                            let _ = ui_tx.send(UiFrame::Note(
+                                "no session yet - send a task first, then /fork".into(),
+                            ));
+                        }
+                    }
+                    Some(LoopCmd::Tasks { session }) => {
+                        if let Some(session_id) = session.or(driver_session) {
+                            let _ = client.send(Payload::GetTaskStatus { session_id });
+                        } else {
+                            let _ = ui_tx.send(UiFrame::Note(
+                                "no session yet - send a task first, then /tasks".into(),
+                            ));
+                        }
+                    }
+                    Some(LoopCmd::Publish {
+                        session,
+                        title,
+                        content_md,
+                    }) => {
+                        if let Some(session_id) = session.or(driver_session) {
+                            let _ = client.send(Payload::PublishPage {
+                                session_id,
+                                title,
+                                content_md,
+                            });
+                        } else {
+                            let _ = ui_tx.send(UiFrame::Note(
+                                "no session yet - send a task first, then /share".into(),
+                            ));
+                        }
+                    }
+                    Some(LoopCmd::ListAutomations) => {
+                        let _ = client.send(Payload::AutomationsList {});
+                    }
+                    Some(LoopCmd::NewSession { title }) => {
+                        let _ = client.send(Payload::NewSession { title });
+                    }
                 },
                 frame = client.next_frame() => match frame {
                     None => {
@@ -1739,6 +1908,29 @@ fn spawn_remote_driver(
                         break;
                     }
                     Some(frame) => {
+                        // /new adoption (stateful): the correlated reply
+                        // names the fresh session; attach so its snapshot
+                        // and live fold take over.
+                        if let (Some(id), Payload::Note { text }) =
+                            (frame.session, &frame.payload)
+                        {
+                            if text.starts_with("session created: ") {
+                                driver_session = Some(id);
+                                folder_session = Some(id);
+                                folder = modron_view::ReplayFolder::new();
+                                let _ = client
+                                    .send(Payload::Attach { session_id: id, last_seq: 0 });
+                            }
+                        }
+                        // Live persisted event: fold incrementally (parity
+                        // with a fresh attach replay) and surface the new
+                        // rows immediately.
+                        if let Payload::Event { event } = &frame.payload {
+                            let new = folder.push(event).to_vec();
+                            if !new.is_empty() {
+                                let _ = ui_tx.send(UiFrame::Entries(new));
+                            }
+                        }
                         for input in frame_to_inputs(frame) {
                             match input {
                                 LoopInput::Delta(d) => {
@@ -1764,6 +1956,13 @@ fn spawn_remote_driver(
                                 }
                                 LoopInput::Snapshot(snap) => {
                                     driver_session = Some(snap.session_id);
+                                    if folder_session != Some(snap.session_id) {
+                                        folder_session = Some(snap.session_id);
+                                        folder = modron_view::ReplayFolder::new();
+                                        for event in &snap.events {
+                                            folder.push(event);
+                                        }
+                                    }
                                     let _ = ui_tx.send(UiFrame::Snapshot(snap));
                                 }
                                 LoopInput::Approval { request_id, call } => {

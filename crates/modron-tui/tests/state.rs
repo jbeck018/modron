@@ -188,10 +188,10 @@ fn tool_lines_render_start_and_done() {
     });
     // Grouped view: events accumulate; the scrollback stays clean.
     assert!(history_text(&app).is_empty(), "no per-tool history lines");
-    assert_eq!(app.turn_tools.len(), 1);
-    assert!(app.turn_tools[0].done);
-    assert!(app.turn_tools[0].summary().contains("bash"));
-    assert!(app.turn_tools[0].summary().contains("42 B"));
+    assert_eq!(app.tracker.turn_tools.len(), 1);
+    assert!(app.tracker.turn_tools[0].done);
+    assert!(app.tracker.turn_tools[0].summary().contains("bash"));
+    assert!(app.tracker.turn_tools[0].summary().contains("42 B"));
     assert!(app.current_tool.is_none());
 }
 
@@ -225,7 +225,10 @@ fn finish_turn_flushes_tools_and_answer_and_updates_totals() {
         history_text(&app)
     );
     assert_eq!(app.tool_log.len(), 1, "logged for the expandable panel");
-    assert!(app.turn_tools.is_empty(), "cleared for the next turn");
+    assert!(
+        app.tracker.turn_tools.is_empty(),
+        "cleared for the next turn"
+    );
     assert!(lines.iter().any(|l| line_text(l) == "the full answer"));
     assert!(
         history_text(&app).iter().any(|l| l == "the full answer"),
@@ -838,13 +841,13 @@ fn swarm_rows_track_lifecycle_and_summarize() {
         turns: 4,
         is_error: false,
     });
-    let row: &SwarmRow = app.subagents.first().unwrap();
+    let row: &SwarmRow = app.tracker.subagents.first().unwrap();
     assert_eq!((row.turns, row.tokens, row.done), (4, 1400, Some(true)));
     assert_eq!(row.last_tool.as_deref(), Some("grep"));
 
     let summary = app.swarm_summary();
     assert!(!summary.is_empty());
-    assert!(app.subagents.is_empty(), "summary clears the panel");
+    assert!(app.tracker.subagents.is_empty(), "summary clears the panel");
     // Summary lines render as spans; join their text.
     let text: String = summary
         .iter()
@@ -910,6 +913,79 @@ fn catalog_names_are_unique_and_all_parse() {
             None => panic!("/{name} does not parse"),
             Some(_) => {}
         }
+    }
+}
+
+#[test]
+fn every_parsed_command_is_listed_in_the_catalog() {
+    // The reverse of catalog_names_are_unique_and_all_parse (and the test
+    // the CATALOG doc comment always promised): a command that parses must
+    // be discoverable in the completion popup / /help table. Aliases parse
+    // to the canonical variant; every accepted NAME must have a CATALOG row.
+    // (name, accepted-variant marker): compare by variant discriminant.
+    let accepted: &[(&str, &str)] = &[
+        ("help", "Help"),
+        ("?", "Help"),
+        ("exit", "Exit"),
+        ("quit", "Exit"),
+        ("q", "Exit"),
+        ("clear", "Clear"),
+        ("compact", "Compact"),
+        ("compress", "Compact"),
+        ("model", "Model"),
+        ("context", "Context"),
+        ("sessions", "Sessions"),
+        ("sandbox", "Sandbox"),
+        ("reasoning", "Reasoning"),
+        ("thinking", "Reasoning"),
+        ("btw", "Btw"),
+        ("agent", "Agent"),
+        ("persona", "Agent"),
+        ("allow", "Allow"),
+        ("deny", "Deny"),
+        ("mode", "Mode"),
+        ("tasks", "Tasks"),
+        ("worktree", "Worktree"),
+        ("worktrees", "Worktree"),
+        ("issues", "Issues"),
+        ("fork", "Fork"),
+        ("plan", "Plan"),
+        ("review", "CodeReview"),
+        ("code-review", "CodeReview"),
+        ("goal", "Goal"),
+        ("learn", "Learn"),
+        ("theme", "Theme"),
+        ("auth", "Auth"),
+        ("login", "Auth"),
+        ("settings", "Auth"),
+        ("share", "Publish"),
+        ("publish", "Publish"),
+        ("new", "New"),
+        ("remote-control", "RemoteControl"),
+        ("rc", "RemoteControl"),
+        ("automations", "Automations"),
+    ];
+    for (name, _) in SlashCommand::CATALOG {
+        assert!(
+            accepted.iter().any(|(n, _)| n == name),
+            "/{name} is in the CATALOG but the accepted-names table above does not know it"
+        );
+    }
+    for (name, variant) in accepted {
+        let parsed = SlashCommand::parse(&format!("/{name}"));
+        assert!(
+            !matches!(parsed, None | Some(SlashCommand::Unknown(_))),
+            "/{name} must parse"
+        );
+        let got = format!("{:?}", parsed.expect("parses"));
+        assert!(
+            got.starts_with(variant),
+            "/{name} was expected to parse to {variant}, got {got}"
+        );
+        assert!(
+            SlashCommand::CATALOG.iter().any(|(n, _)| n == name),
+            "/{name} parses but is MISSING from the CATALOG (undiscoverable in /help + popup)"
+        );
     }
 }
 
@@ -1950,8 +2026,13 @@ fn help_modal_tabs_switch_scroll_and_esc_closes() {
     }
     let _ = render(&mut app, 90, 24); // render performs the clamp
     assert!(app.help_scroll < 50, "scroll clamped: {}", app.help_scroll);
+    let clamped = app.help_scroll;
     app.on_key(key(KeyCode::Up));
-    assert_eq!(app.help_scroll, 22, "one down-step back from the clamp");
+    assert_eq!(
+        app.help_scroll,
+        clamped - 1,
+        "one down-step back from the clamp"
+    );
 }
 
 #[test]

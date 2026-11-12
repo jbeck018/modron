@@ -497,6 +497,7 @@ impl FoldState {
                     tokens: row.tokens,
                     last_tool: row.last_tool.clone(),
                     done: row.done,
+                    started_ms: None,
                 })
                 .collect(),
         };

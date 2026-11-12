@@ -16,29 +16,16 @@ pub mod clipboard;
 pub mod remote;
 pub mod run;
 pub mod theme;
+pub use modron_view::SwarmRow;
 pub use run::{run_with, RemoteSpec, TuiConfig, TuiSinks};
 pub use theme::Theme;
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
-use modron_view::{tool_summary_line, ToolEvent, TranscriptEntry};
+use modron_view::{tool_summary_line, ActivityTracker, ToolEvent, TranscriptEntry};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 use std::sync::mpsc::Sender;
-
-/// One live swarm row: a running or settled child agent.
-#[derive(Clone, Debug)]
-pub struct SwarmRow {
-    pub id: String,
-    pub label: String,
-    pub turns: u32,
-    pub tokens: u64,
-    pub last_tool: Option<String>,
-    /// When the row appeared (elapsed-time display).
-    pub started: std::time::Instant,
-    /// Settled state: Some(true) done, Some(false) failed, None running.
-    pub done: Option<bool>,
-}
 
 /// What the user's last key press asks the run loop to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +80,8 @@ pub enum SlashCommand {
     },
     /// /automations: list scheduled prompts (settings UI on desktop).
     Automations,
-    /// /publish: publish the last assistant answer as a shareable page.
+    /// /share (alias /publish): publish the last assistant answer as a
+    /// shareable page.
     Publish,
     /// Plan-first mode: submit a task constrained to planning.
     Plan(String),
@@ -111,6 +99,8 @@ pub enum SlashCommand {
     /// Alias kept for muscle memory.
     Compress,
     Unknown(String),
+    /// /new: start a fresh session (remote: server-side; local: restart).
+    New,
 }
 
 /// A slash command that needs the run loop's powers (engine mutation, tool
@@ -172,8 +162,18 @@ pub enum PendingCommand {
     },
     /// /automations: list scheduled prompts (settings UI on desktop).
     Automations,
-    /// /publish: publish the last assistant answer as a shareable page.
-    Publish,
+    /// /share: publish the last assistant answer as a shareable page
+    /// (server-side; the bridge URL comes back as a note).
+    /// /share (alias /publish): publish the last assistant answer as a
+    /// /share: publish the last assistant answer as a shareable page
+    /// (server-side; the bridge URL comes back as a note).
+    Publish {
+        title: String,
+        content_md: String,
+    },
+    /// /new: a fresh server session (remote). Local mode answers with
+    /// restart guidance instead.
+    NewSession,
 }
 
 impl SlashCommand {
@@ -215,6 +215,16 @@ impl SlashCommand {
         ("theme", "switch color theme (picker)"),
         ("auth", "open the auth manager (view/sign-in/remove)"),
         ("login", "alias of /auth"),
+        (
+            "settings",
+            "open the settings manager (auth; /help for the rest)",
+        ),
+        ("new", "start a fresh session"),
+        ("share", "publish the last answer as a shareable page"),
+        ("publish", "alias of /share"),
+        ("remote-control", "share this session through the bridge"),
+        ("rc", "alias of /remote-control"),
+        ("automations", "list scheduled automations"),
     ];
 
     /// Parse `/name arg` from input; None if input doesn't start with `/`.
@@ -247,7 +257,9 @@ impl SlashCommand {
             "fork" => SlashCommand::Fork,
             "remote-control" | "rc" => SlashCommand::RemoteControl { url: arg },
             "automations" => SlashCommand::Automations,
-            "publish" => SlashCommand::Publish,
+            "share" | "publish" => SlashCommand::Publish,
+            "new" => SlashCommand::New,
+            "settings" => SlashCommand::Auth(arg),
             "plan" => SlashCommand::Plan(arg),
             "code-review" | "review" => SlashCommand::CodeReview,
             "goal" => SlashCommand::Goal(arg),
@@ -545,6 +557,9 @@ pub struct App {
     pub cumulative: Usage,
     pub turn_count: u32,
     pub session_id: Option<modron_core::SessionId>,
+    /// The last non-empty turn answer (/share publishes this; desktop
+    /// parity: it publishes the last assistant answer too).
+    pub last_answer: Option<String>,
     pub transcript_mode: bool,
     pub status_note: Option<String>,
     /// Ticks left before the toast (`status_note`) auto-clears. Notes must
@@ -563,7 +578,10 @@ pub struct App {
     /// Estimated current context usage (tokens, updated per turn).
     pub context_used: u64,
     /// Live subagent rows (Phase 5h / 14 swarm v2).
-    pub subagents: Vec<SwarmRow>,
+    /// Canonical tool-activity grouping (modron_view::ActivityTracker;
+    /// the desktop and mobile fold the same events with the same code -
+    /// the TUI's ~80-line copy was deleted in the 2026-11-12 audit).
+    pub tracker: ActivityTracker,
     /// A slash command awaiting run-loop execution (engine/store powers).
     pub pending_command: Option<PendingCommand>,
     /// Streamed model reasoning (shown when `show_reasoning`).
@@ -611,7 +629,6 @@ pub struct App {
     pub last_hist_width: u16,
     /// This turn's tool events (grouped view: the history stays clean,
     /// one summary line lands at turn end; the panel expands on demand).
-    pub turn_tools: Vec<ToolEvent>,
     /// Approval mode label for the status strip (`ask`/`yolo`/`deny`),
     /// mirrored from the engine config by the run loop; shift+tab and
     /// /mode keep it current. Empty = the engine's default (ask).
@@ -1955,7 +1972,7 @@ impl App {
         // The live tool strip opens the panel.
         let strip = self.last_tool_strip;
         if strip.height > 0 && row >= strip.y && row < strip.y + strip.height {
-            let events = self.turn_tools.clone();
+            let events = self.tracker.turn_tools.clone();
             if !events.is_empty() {
                 self.open_tool_panel(events);
             }
@@ -2202,6 +2219,20 @@ impl App {
     /// grouping; this renders each entry with the same styles the live
     /// path commits (echo accent, tool color, dim meta). Tool summaries
     /// also land in `tool_log` so ctrl+t / click re-opens their panels.
+    /// Clear the scrollback mirrors of a session (remote /new switched to
+    /// a different server session): the next backfill starts clean. The
+    /// engine-side state (model, usage, approvals) is NOT touched - the
+    /// server carries it per session and the next snapshot restores it.
+    pub fn reset_transcript(&mut self) {
+        self.history.clear();
+        self.history_offset = 0;
+        self.streaming.clear();
+        self.reasoning.clear();
+        self.selection = None;
+        self.tool_log.clear();
+        self.last_answer = None;
+    }
+
     pub fn backfill_transcript(&mut self, entries: Vec<TranscriptEntry>) {
         let t = self.theme.resolved();
         for entry in entries {
@@ -2396,6 +2427,7 @@ impl App {
                 self.streaming.clear();
                 self.reasoning.clear();
                 self.selection = None;
+                self.last_answer = None;
                 // Stale (index, events) pairs would match NEW history rows
                 // against the WRONG turn's tool log on the next click.
                 self.tool_log.clear();
@@ -2540,7 +2572,19 @@ impl App {
                 Action::None
             }
             SlashCommand::Publish => {
-                self.pending_command = Some(PendingCommand::Publish);
+                match self.last_answer.clone() {
+                    Some(answer) => {
+                        self.pending_command = Some(PendingCommand::Publish {
+                            title: "shared page".into(),
+                            content_md: answer,
+                        });
+                    }
+                    None => self.note("nothing to publish yet - send a task first"),
+                }
+                Action::None
+            }
+            SlashCommand::New => {
+                self.pending_command = Some(PendingCommand::NewSession);
                 Action::None
             }
             SlashCommand::Plan(task) => {
@@ -2635,97 +2679,31 @@ impl App {
 
     /// Apply a tool-activity event (live `●` lines).
     pub fn on_tool(&mut self, activity: ToolActivity) {
-        match activity {
-            ToolActivity::Start { name } => {
-                self.current_tool = Some(name.clone());
-                // Grouped view: tools never hit the scrollback one by one
-                // (the wall of `● glob` lines made sessions unreadable);
-                // the live strip shows the latest, the panel expands.
-                self.turn_tools.push(ToolEvent {
-                    name,
-                    bytes: None,
-                    is_error: false,
-                    done: false,
-                });
-            }
-            ToolActivity::Done {
-                name,
-                is_error,
-                bytes,
-            } => {
-                self.current_tool = None;
-                if let Some(event) = self
-                    .turn_tools
-                    .iter_mut()
-                    .rev()
-                    .find(|e| e.name == name && !e.done)
-                {
-                    event.done = true;
-                    event.is_error = is_error;
-                    event.bytes = Some(bytes as u64);
-                } else {
-                    self.turn_tools.push(ToolEvent {
-                        name,
-                        bytes: Some(bytes as u64),
-                        is_error,
-                        done: true,
-                    });
-                }
-            }
-            ToolActivity::SubagentStarted { id, label } => {
-                self.subagents.push(SwarmRow {
-                    id,
-                    label,
-                    turns: 0,
-                    tokens: 0,
-                    last_tool: None,
-                    started: std::time::Instant::now(),
-                    done: None,
-                });
-            }
-            ToolActivity::SubagentProgress {
-                id,
-                turns,
-                tokens,
-                last_tool,
-                ..
-            } => {
-                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
-                    row.turns = row.turns.max(turns);
-                    row.tokens = row.tokens.max(tokens);
-                    row.last_tool = last_tool.clone();
-                }
-            }
-            ToolActivity::SubagentFinished {
-                id,
-                tokens,
-                turns,
-                is_error,
-                ..
-            } => {
-                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == id) {
-                    row.turns = turns;
-                    row.tokens = tokens;
-                    row.done = Some(!is_error);
-                }
-            }
+        // The in-flight tool name for the status strip is TUI-only; the
+        // grouping itself is the shared tracker (desktop/mobile parity).
+        if let ToolActivity::Start { name } = &activity {
+            self.current_tool = Some(name.clone());
         }
+        if matches!(activity, ToolActivity::Done { .. }) {
+            self.current_tool = None;
+        }
+        self.tracker.on_tool(&activity);
     }
 
     /// Scrollback summary of the swarm (committed at turn end), then clear.
     /// Returns lines when any agent ran, empty otherwise.
     pub fn swarm_summary(&mut self) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
-        if self.subagents.is_empty() {
+        if self.tracker.subagents.is_empty() {
             return Vec::new();
         }
         let mut lines = vec![Line::from(format!(
             "⎇ swarm: {} agent(s), {} tok total",
-            self.subagents.len(),
-            self.subagents.iter().map(|r| r.tokens).sum::<u64>()
+            self.tracker.subagents.len(),
+            self.tracker.subagents.iter().map(|r| r.tokens).sum::<u64>()
         ))
         .style(Style::default().fg(t.accent))];
-        for row in &self.subagents {
+        for row in &self.tracker.subagents {
             let (mark, color) = match row.done {
                 Some(true) => ("done", t.success),
                 Some(false) => ("failed", t.error),
@@ -2743,7 +2721,7 @@ impl App {
                 .style(Style::default().fg(color)),
             );
         }
-        self.subagents.clear();
+        self.tracker.subagents.clear();
         lines
     }
 
@@ -2752,10 +2730,10 @@ impl App {
     /// Commit this turn's tool events as one grouped summary line and
     /// remember them for the expandable panel (capped at 20 turns).
     fn commit_tool_summary(&mut self) {
-        if self.turn_tools.is_empty() {
+        if self.tracker.turn_tools.is_empty() {
             return;
         }
-        let summary = tool_summary_line(&self.turn_tools);
+        let summary = tool_summary_line(&self.tracker.turn_tools);
         let index = self.history.len();
         let t = self.theme.resolved();
         // One row only — it is the click target for the expandable panel.
@@ -2768,7 +2746,7 @@ impl App {
         .unwrap_or_default();
         self.history.push(row);
         self.tool_log
-            .push((index, std::mem::take(&mut self.turn_tools)));
+            .push((index, std::mem::take(&mut self.tracker.turn_tools)));
         let len = self.tool_log.len();
         if len > 20 {
             self.tool_log.drain(..len - 20);
@@ -2784,8 +2762,8 @@ impl App {
 
     /// The current-turn events, or the newest logged turn's.
     fn latest_tool_events(&self) -> Vec<ToolEvent> {
-        if !self.turn_tools.is_empty() {
-            return self.turn_tools.clone();
+        if !self.tracker.turn_tools.is_empty() {
+            return self.tracker.turn_tools.clone();
         }
         self.tool_log
             .last()
@@ -2803,6 +2781,10 @@ impl App {
     ) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
         self.running = false;
+        // The /share source (desktop parity: the last assistant answer).
+        if !answer.is_empty() {
+            self.last_answer = Some(answer.clone());
+        }
         self.streaming.clear();
         self.reasoning.clear();
         self.current_tool = None;
@@ -2908,7 +2890,7 @@ impl App {
         self.streaming.clear();
         self.status_note = None;
         self.status_note_ticks = 0;
-        self.turn_tools.clear();
+        self.tracker.turn_tools.clear();
         // The task echoes into the scrollback as an indented block,
         // wrapped to the history width so long messages stay readable.
         let mut lines = task.split('\n');
@@ -3181,11 +3163,12 @@ impl App {
         let tool_panel_rows = self.tool_panel.as_ref().map_or(0, |events| {
             (events.len() as u16 + 2).min((area.height / 2).max(4))
         });
-        let tool_strip_rows =
-            (self.running && !self.turn_tools.is_empty() && self.tool_panel.is_none()) as u16;
+        let tool_strip_rows = (self.running
+            && !self.tracker.turn_tools.is_empty()
+            && self.tool_panel.is_none()) as u16;
         let mut rows: Vec<Constraint> = vec![Constraint::Min(1)]; // scrollback
-        if !self.subagents.is_empty() {
-            rows.push(Constraint::Length(self.subagents.len() as u16 + 1));
+        if !self.tracker.subagents.is_empty() {
+            rows.push(Constraint::Length(self.tracker.subagents.len() as u16 + 1));
         }
         if tool_panel_rows > 0 {
             rows.push(Constraint::Length(tool_panel_rows));
@@ -3282,30 +3265,43 @@ impl App {
 
         let mut idx = 1;
 
-        if !self.subagents.is_empty() {
-            let active = self.subagents.iter().filter(|r| r.done.is_none()).count();
-            let total_tokens = self.subagents.iter().map(|r| r.tokens).sum::<u64>();
+        if !self.tracker.subagents.is_empty() {
+            let active = self
+                .tracker
+                .subagents
+                .iter()
+                .filter(|r| r.done.is_none())
+                .count();
+            let total_tokens = self.tracker.subagents.iter().map(|r| r.tokens).sum::<u64>();
             let mut lines = vec![Line::from(format!(
                 "⎇ {} agent(s) · {} active · {total_tokens} tok",
-                self.subagents.len(),
+                self.tracker.subagents.len(),
                 active
             ))
             .style(Style::default().fg(th.dim))];
             let pulse = ["·", "•", "●", "•"];
-            for row in &self.subagents {
+            for row in &self.tracker.subagents {
                 let (state_str, color) = match row.done {
                     Some(true) => ("done".to_string(), th.success),
                     Some(false) => ("failed".to_string(), th.error),
-                    None => (
-                        format!(
-                            "{} {} · t{} · {}s",
-                            pulse[(self.spinner_tick as usize) % pulse.len()],
-                            row.last_tool.as_deref().unwrap_or("working"),
-                            row.turns,
-                            row.started.elapsed().as_secs()
-                        ),
-                        th.accent,
-                    ),
+                    None => {
+                        let elapsed = row
+                            .started_ms
+                            .and_then(|ms| {
+                                modron_view::now_epoch_ms().map(|now| now.saturating_sub(ms) / 1000)
+                            })
+                            .unwrap_or(0);
+                        (
+                            format!(
+                                "{} {} · t{} · {}s",
+                                pulse[(self.spinner_tick as usize) % pulse.len()],
+                                row.last_tool.as_deref().unwrap_or("working"),
+                                row.turns,
+                                elapsed
+                            ),
+                            th.accent,
+                        )
+                    }
                 };
                 let display = if row.label.is_empty() {
                     row.id.chars().take(8).collect::<String>()
@@ -3354,13 +3350,14 @@ impl App {
         // ── Live tool strip: the LATEST tool + count (grouped view) ──
         if tool_strip_rows > 0 {
             let latest = self
+                .tracker
                 .turn_tools
                 .last()
                 .map(|e| e.summary())
                 .unwrap_or_default();
             let line = Line::from(format!(
                 "  {latest} · {} tools this turn — ctrl+t to expand",
-                self.turn_tools.len()
+                self.tracker.turn_tools.len()
             ))
             .style(Style::default().fg(th.tool));
             frame.render_widget(Paragraph::new(vec![line]), chunks[idx]);
@@ -3371,7 +3368,7 @@ impl App {
         }
 
         if self.pending_approval.is_some() {
-            let hint = "y = allow once · a = allow for this run · n/Esc = deny";
+            let hint = "y = allow once · a = allow all · n/Esc = deny";
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(self.status_line())

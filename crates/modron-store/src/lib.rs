@@ -112,7 +112,7 @@ impl Inner {
         // Reuse the cached handle; opening fresh only on the first append
         // (or after a delete). NotFound maps to the documented
         // unknown-session error.
-        if !caches.handles.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = caches.handles.entry(id) {
             let file = OpenOptions::new()
                 .append(true)
                 .open(self.jsonl_path(id))
@@ -129,7 +129,7 @@ impl Inner {
                         ))
                     }
                 })?;
-            caches.handles.insert(id, file);
+            entry.insert(file);
         }
         let file = caches.handles.get_mut(&id).expect("handle inserted above");
         writeln!(file, "{line}").map_err(|e| {

@@ -85,8 +85,8 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// One subagent row of the swarm view (serde-safe: no `Instant`; the TUI
-/// keeps its richer local row for elapsed-time rendering).
+/// One subagent row of the swarm view (serde-safe: epoch millis instead
+/// of `Instant`, so every client renders the same elapsed clock).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmRow {
     pub id: String,
@@ -96,6 +96,19 @@ pub struct SwarmRow {
     pub last_tool: Option<String>,
     /// `None` = still running.
     pub done: Option<bool>,
+    /// When the row appeared (epoch ms; elapsed-time rendering). Absent on
+    /// rows rebuilt from the wire snapshot (the clock restarts there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
+}
+
+/// Wall-clock epoch milliseconds (elapsed-time rendering without
+/// `Instant`, which is not serde-safe).
+pub fn now_epoch_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
 }
 
 impl SwarmRow {
@@ -176,6 +189,7 @@ impl ActivityTracker {
                     tokens: 0,
                     last_tool: None,
                     done: None,
+                    started_ms: now_epoch_ms(),
                 });
             }
             ToolActivity::SubagentProgress {
