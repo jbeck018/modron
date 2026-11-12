@@ -266,6 +266,14 @@ pub trait SessionStore: Send + Sync {
         }
         Ok(new)
     }
+    /// Number of parsed events in a session, cheaply. Default: a full
+    /// `load` (correct everywhere). Stores with an on-disk log override
+    /// this when callers ask repeatedly — the engine's checkpoint path
+    /// asks once per mutating tool call, and a full parse there taxes
+    /// every write-heavy turn (2026-11-12 audit perf fix).
+    async fn event_count(&self, id: SessionId) -> Result<u64> {
+        Ok(self.load(id).await?.len() as u64)
+    }
 }
 
 // ---------------------------------------------------------------------------

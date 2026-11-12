@@ -1049,7 +1049,10 @@ impl Engine {
             }
         };
         let _ = warned;
-        let event_index = (self.store.load(session_id).await?.len() + 1) as u64;
+        // event_count, not load: this runs per mutating tool call in
+        // ApproveAll mode, and a full log parse per call compounds over a
+        // write-heavy run (2026-11-12 audit perf fix).
+        let event_index = self.store.event_count(session_id).await? + 1;
         Ok(Some(SessionEvent::Checkpoint {
             path: path.to_string(),
             prior_content_b64: prior,

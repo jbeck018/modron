@@ -801,7 +801,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     let usage_baseline = match resume_session_id {
-        Some(session_id) => agent.store.load(session_id).await?.len(),
+        Some(session_id) => agent.store.event_count(session_id).await? as usize,
         None => 0,
     };
 

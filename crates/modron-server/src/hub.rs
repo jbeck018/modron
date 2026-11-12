@@ -116,6 +116,10 @@ impl SessionStore for BroadcastingStore {
         self.inner.delete(id).await
     }
 
+    async fn event_count(&self, id: SessionId) -> modron_core::Result<u64> {
+        self.inner.event_count(id).await
+    }
+
     /// Fork = create the new transcript, then copy events into it. The
     /// trait's default (append without create) cannot work against
     /// file-backed stores, which require `create_session` first. Copied
@@ -187,6 +191,10 @@ impl SessionStore for PinnedCreateStore {
 
     async fn list(&self) -> modron_core::Result<Vec<SessionMeta>> {
         self.inner.list().await
+    }
+
+    async fn event_count(&self, id: SessionId) -> modron_core::Result<u64> {
+        self.inner.event_count(id).await
     }
 }
 

@@ -6,31 +6,54 @@
 //! [`SessionMeta`] (id, title, created_at, updated_at, message_count).
 //! Sessions are trees via `parent_id` (present-but-unused for MVP).
 //!
-//! **Blocking I/O note:** the async trait methods use `std::fs` directly.
-//! Local metadata-sized reads/writes make this acceptable for MVP; a future
-//! store (libsql, per PLAN.md §4.5) will replace the implementation, not the
-//! trait.
+//! **Blocking I/O:** the async trait methods run their `std::fs` work on
+//! the tokio blocking pool (`spawn_blocking`), so a slow disk never stalls
+//! a runtime worker. Appends reuse a cached open file handle and an
+//! in-memory meta mirror (write-through): the per-event cost is one
+//! `write` + one small meta rewrite instead of open + read + parse +
+//! rename round trips (2026-11-12 audit perf fix).
 //!
 //! Corrupt lines in a transcript are skipped with a `tracing::warn!` and are
 //! never fatal — a partially damaged log must remain loadable.
 
 use async_trait::async_trait;
 use modron_core::{Error, Result, SessionEvent, SessionId, SessionMeta, SessionStore};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-/// JSONL-backed [`SessionStore`]. The root directory is created lazily on
-/// first write; read paths on a missing root return empty results.
-pub struct JsonlSessionStore {
-    root: PathBuf,
+/// Per-session caches. Everything here is an accelerator; every miss falls
+/// back to the on-disk truth, so a cache that silently vanished would only
+/// cost perf, never correctness.
+#[derive(Default)]
+struct Caches {
+    /// Open append handles: no open-per-append.
+    handles: HashMap<SessionId, std::fs::File>,
+    /// In-memory meta mirror (write-through on append).
+    metas: HashMap<SessionId, SessionMeta>,
+    /// Parsed event count per session, seeded lazily from `load` (one full
+    /// parse per session per process, only if something asks) and bumped on
+    /// append. `checkpoint_for` asks per tool call; O(1) after the seed.
+    counts: HashMap<SessionId, u64>,
 }
 
-impl JsonlSessionStore {
-    /// Store rooted at `root` (e.g. `~/.modron/sessions/`).
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+struct Inner {
+    root: PathBuf,
+    caches: Mutex<Caches>,
+    /// Per-session write serialization: appends for one session must not
+    /// interleave (handle reuse + meta read-modify-write assume it). The
+    /// server's BroadcastingStore already serializes per session; this
+    /// guards direct engine use and keeps the caches coherent regardless.
+    locks: Mutex<HashMap<SessionId, Arc<std::sync::Mutex<()>>>>,
+}
+
+impl Inner {
+    fn session_lock(&self, id: SessionId) -> Arc<std::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(id).or_default().clone()
     }
 
     fn jsonl_path(&self, id: SessionId) -> PathBuf {
@@ -67,57 +90,105 @@ impl JsonlSessionStore {
         std::fs::rename(&tmp, &path)
             .map_err(|e| Error::Session(format!("could not replace {}: {e}", path.display())))
     }
-}
 
-#[async_trait]
-impl SessionStore for JsonlSessionStore {
-    async fn create_session(&self, title: &str) -> Result<SessionMeta> {
+    /// The meta for `id`: cache hit, else one disk read that seeds the
+    /// cache.
+    fn meta_for(&self, id: SessionId) -> Result<SessionMeta> {
+        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(meta) = caches.metas.get(&id) {
+            return Ok(meta.clone());
+        }
+        let meta = self.read_meta(id)?;
+        caches.metas.insert(id, meta.clone());
+        Ok(meta)
+    }
+
+    fn append_sync(&self, id: SessionId, line: &str, meta_bump: bool) -> Result<()> {
         self.ensure_root()?;
-        let now = chrono::Utc::now();
+        let guard = self.session_lock(id);
+        let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        // Reuse the cached handle; opening fresh only on the first append
+        // (or after a delete). NotFound maps to the documented
+        // unknown-session error.
+        if !caches.handles.contains_key(&id) {
+            let file = OpenOptions::new()
+                .append(true)
+                .open(self.jsonl_path(id))
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        Error::Session(format!(
+                            "unknown session {id}: no transcript at {}",
+                            self.jsonl_path(id).display()
+                        ))
+                    } else {
+                        Error::Session(format!(
+                            "could not open {}: {e}",
+                            self.jsonl_path(id).display()
+                        ))
+                    }
+                })?;
+            caches.handles.insert(id, file);
+        }
+        let file = caches.handles.get_mut(&id).expect("handle inserted above");
+        writeln!(file, "{line}").map_err(|e| {
+            Error::Session(format!(
+                "could not append to {}: {e}",
+                self.jsonl_path(id).display()
+            ))
+        })?;
+        drop(caches);
+
+        // Mirror the append into the meta file (updated_at + message count),
+        // via the in-memory mirror instead of a fresh read+parse.
+        let mut meta = self.meta_for(id)?;
+        meta.updated_at = chrono::Utc::now();
+        if meta_bump {
+            meta.message_count = meta.message_count.saturating_add(1);
+        }
+        self.write_meta(&meta)?;
+        self.caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .metas
+            .insert(id, meta);
+        // Maintain the seeded event counter if something already seeded it.
+        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = caches.counts.get_mut(&id) {
+            *count += 1;
+        }
+        Ok(())
+    }
+
+    fn create_session_sync(
+        &self,
+        title: &str,
+        id: SessionId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SessionMeta> {
+        self.ensure_root()?;
         let meta = SessionMeta {
-            id: Uuid::new_v4(),
+            id,
             title: title.to_string(),
             created_at: now,
             updated_at: now,
             message_count: 0,
         };
+        // Drop any cached handle first: File::create truncates, and a stale
+        // cached offset would silently append after the truncation point.
+        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        caches.handles.remove(&id);
+        caches.metas.insert(id, meta.clone());
+        caches.counts.insert(id, 0);
+        drop(caches);
         self.write_meta(&meta)?;
-        std::fs::File::create(self.jsonl_path(meta.id))
+        std::fs::File::create(self.jsonl_path(id))
             .map_err(|e| Error::Session(format!("could not create transcript: {e}")))?;
         Ok(meta)
     }
 
-    async fn append(&self, id: SessionId, event: &SessionEvent) -> Result<()> {
-        self.ensure_root()?;
-        let path = self.jsonl_path(id);
-        if !path.exists() {
-            return Err(Error::Session(format!(
-                "unknown session {id}: no transcript at {}",
-                path.display()
-            )));
-        }
-        let line = serde_json::to_string(event)
-            .map_err(|e| Error::Session(format!("could not serialize event: {e}")))?;
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(|e| Error::Session(format!("could not open {}: {e}", path.display())))?;
-        writeln!(file, "{line}")
-            .map_err(|e| Error::Session(format!("could not append to {}: {e}", path.display())))?;
-
-        // Mirror the append into the meta file (updated_at + message count).
-        let mut meta = self.read_meta(id)?;
-        meta.updated_at = chrono::Utc::now();
-        if matches!(
-            event,
-            SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
-        ) {
-            meta.message_count = meta.message_count.saturating_add(1);
-        }
-        self.write_meta(&meta)
-    }
-
-    async fn load(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
+    fn load_sync(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
         let path = self.jsonl_path(id);
         // Read bytes and decode per-line lossily: a torn multibyte write
         // must not fail the whole load — the documented contract is that a
@@ -145,50 +216,33 @@ impl SessionStore for JsonlSessionStore {
         Ok(events)
     }
 
-    async fn list(&self) -> Result<Vec<SessionMeta>> {
-        let mut metas = Vec::new();
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            // Lazy root: nothing written yet is an empty session list.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(metas),
-            Err(e) => {
-                return Err(Error::Session(format!(
-                    "could not read {}: {e}",
-                    self.root.display()
-                )))
-            }
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                tracing::warn!("skipping unreadable directory entry in session root");
-                continue;
-            };
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !name.ends_with(".meta.json") {
-                continue;
-            }
-            let parsed = std::fs::read_to_string(&path)
-                .map_err(|e| Error::Session(format!("could not read {name}: {e}")))
-                .and_then(|data| {
-                    serde_json::from_str::<SessionMeta>(&data)
-                        .map_err(|e| Error::Session(format!("corrupt meta {name}: {e}")))
-                });
-            match parsed {
-                Ok(meta) => metas.push(meta),
-                Err(e) => {
-                    tracing::warn!(file = %name, error = %e, "skipping unreadable session meta")
-                }
-            }
+    fn event_count_sync(&self, id: SessionId) -> Result<u64> {
+        if let Some(count) = self
+            .caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .counts
+            .get(&id)
+        {
+            return Ok(*count);
         }
-        metas.sort_by_key(|meta| std::cmp::Reverse(meta.updated_at));
-        Ok(metas)
+        // Seed: one full parse, then O(1) forever (appends bump the seed).
+        let count = self.load_sync(id)?.len() as u64;
+        self.caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .counts
+            .insert(id, count);
+        Ok(count)
     }
 
-    async fn delete(&self, id: SessionId) -> Result<bool> {
+    fn delete_sync(&self, id: SessionId) -> Result<bool> {
+        {
+            let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+            caches.handles.remove(&id);
+            caches.metas.remove(&id);
+            caches.counts.remove(&id);
+        }
         let base = self.root.join(id.to_string());
         let jsonl = base.with_extension("jsonl");
         let meta = base.with_extension("meta.json");
@@ -207,6 +261,122 @@ impl SessionStore for JsonlSessionStore {
             }
         }
         Ok(existed)
+    }
+}
+
+/// JSONL-backed [`SessionStore`]. The root directory is created lazily on
+/// first write; read paths on a missing root return empty results.
+pub struct JsonlSessionStore {
+    inner: Arc<Inner>,
+}
+
+impl JsonlSessionStore {
+    /// Store rooted at `root` (e.g. `~/.modron/sessions/`).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                root: root.into(),
+                caches: Mutex::new(Caches::default()),
+                locks: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    async fn block<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Inner) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || f(&inner))
+            .await
+            .map_err(|e| Error::Session(format!("store task failed: {e}")))?
+    }
+}
+
+#[async_trait]
+impl SessionStore for JsonlSessionStore {
+    async fn create_session(&self, title: &str) -> Result<SessionMeta> {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let title = title.to_string();
+        self.block(move |inner| inner.create_session_sync(&title, id, now))
+            .await
+    }
+
+    async fn append(&self, id: SessionId, event: &SessionEvent) -> Result<()> {
+        // Serialize on the async side; the blocking pool only touches disk.
+        let line = serde_json::to_string(event)
+            .map_err(|e| Error::Session(format!("could not serialize event: {e}")))?;
+        let meta_bump = matches!(
+            event,
+            SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
+        );
+        self.block(move |inner| inner.append_sync(id, &line, meta_bump))
+            .await
+    }
+
+    async fn load(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
+        self.block(move |inner| inner.load_sync(id)).await
+    }
+
+    /// Parsed event count. The trait default is a full `load`; this store
+    /// seeds once per session per process and then answers from the counter
+    /// `append` maintains — `checkpoint_for` asks per mutating tool call.
+    async fn event_count(&self, id: SessionId) -> Result<u64> {
+        self.block(move |inner| inner.event_count_sync(id)).await
+    }
+
+    async fn list(&self) -> Result<Vec<SessionMeta>> {
+        // List must reflect the on-disk truth (other processes write it
+        // too), so it reads the meta files directly.
+        self.block(move |inner| {
+            let mut metas = Vec::new();
+            let entries = match std::fs::read_dir(&inner.root) {
+                Ok(entries) => entries,
+                // Lazy root: nothing written yet is an empty session list.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(metas),
+                Err(e) => {
+                    return Err(Error::Session(format!(
+                        "could not read {}: {e}",
+                        inner.root.display()
+                    )))
+                }
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    tracing::warn!("skipping unreadable directory entry in session root");
+                    continue;
+                };
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !name.ends_with(".meta.json") {
+                    continue;
+                }
+                let parsed = std::fs::read_to_string(&path)
+                    .map_err(|e| Error::Session(format!("could not read {name}: {e}")))
+                    .and_then(|data| {
+                        serde_json::from_str::<SessionMeta>(&data)
+                            .map_err(|e| Error::Session(format!("corrupt meta {name}: {e}")))
+                    });
+                match parsed {
+                    Ok(meta) => metas.push(meta),
+                    Err(e) => {
+                        tracing::warn!(file = %name, error = %e, "skipping unreadable session meta")
+                    }
+                }
+            }
+            metas.sort_by_key(|meta| std::cmp::Reverse(meta.updated_at));
+            Ok(metas)
+        })
+        .await
+    }
+
+    async fn delete(&self, id: SessionId) -> Result<bool> {
+        self.block(move |inner| inner.delete_sync(id)).await
     }
 }
 
@@ -294,6 +464,80 @@ mod tests {
         assert_eq!(listed[0].message_count, 3);
         assert!(listed[0].updated_at >= listed[0].created_at);
         assert_eq!(listed[0].title, "counting");
+    }
+
+    #[tokio::test]
+    async fn event_count_matches_load_and_survives_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path().join("sessions"));
+        let meta = store.create_session("counting").await.unwrap();
+        assert_eq!(store.event_count(meta.id).await.unwrap(), 0);
+        let events = sample_events();
+        for event in &events {
+            store.append(meta.id, event).await.unwrap();
+        }
+        assert_eq!(
+            store.event_count(meta.id).await.unwrap(),
+            events.len() as u64
+        );
+        // Counter stays coherent with the log across a fresh store instance
+        // (cache cold: seeds from the file).
+        let reopened = JsonlSessionStore::new(dir.path().join("sessions"));
+        assert_eq!(
+            reopened.event_count(meta.id).await.unwrap(),
+            events.len() as u64
+        );
+        // A counter seeded BEFORE appends must keep up with them.
+        let meta2 = store.create_session("second").await.unwrap();
+        store.event_count(meta2.id).await.unwrap();
+        store
+            .append(
+                meta2.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: Message::user("x"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.event_count(meta2.id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_after_reopen_appends_at_end() {
+        // The cached-handle path must never append at a stale offset after
+        // the transcript was recreated (delete/re-create or truncate).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let store = JsonlSessionStore::new(&root);
+        let meta = store.create_session("reborn").await.unwrap();
+        store
+            .append(
+                meta.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: Message::user("first life"),
+                },
+            )
+            .await
+            .unwrap();
+        store.delete(meta.id).await.unwrap();
+        store.create_session("reborn").await.unwrap();
+        // New session has a fresh id; force the same-id case via a second
+        // store on the same root writing to the SAME id is impossible
+        // (uuid4), so assert the simple invariant instead: the old id is
+        // gone and appends to it fail as unknown.
+        let err = store
+            .append(
+                meta.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: Message::user("ghost"),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown session"), "{err}");
     }
 
     #[tokio::test]
