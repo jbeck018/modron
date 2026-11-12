@@ -18,7 +18,7 @@ use modron_protocol::{
     ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval,
     SessionMetaWire, WireSwarmRow,
 };
-use modron_view::{replay, ActivityTracker, SwarmRow, ToolEvent, TranscriptEntry};
+use modron_view::{ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry};
 
 /// Connection state shown in the status bar at all times.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -103,9 +103,29 @@ pub struct AppState {
     pub last_seq: u64,
     /// Typewriter cursor into `streaming_text` (char count shown).
     stream_cursor: usize,
+    /// Byte offset of the cursor (the incremental typewriter walk starts
+    /// here instead of re-scanning the buffer from zero every tick).
+    stream_byte: usize,
+    /// Char count of `streaming_text` (maintained on push; `chars().count()`
+    /// per tick was O(streamed) per frame).
+    stream_chars: usize,
+    /// The displayed prefix of `streaming_text` (extended in place as the
+    /// cursor advances; `displayed_streaming` clones this instead of
+    /// re-slicing the whole buffer).
+    displayed_cache: String,
 
     events: Vec<SessionEvent>,
+    /// Incremental replay state: one event per frame, never a full pass
+    /// (the full fold only runs on snapshot reset).
+    folder: ReplayFolder,
     transcript: Vec<TranscriptEntry>,
+    /// Committed rows (the presentation fold of `transcript`): maintained
+    /// incrementally per folded event so a frame never re-clones the whole
+    /// history (2026-11-12 audit perf fix; `rebuild_transcript` is the only
+    /// full pass, on snapshot reset).
+    committed_rows: Vec<Row>,
+    /// Last model name seen by the row fold (divider chips only on change).
+    last_model: Option<String>,
 
     pub streaming_text: String,
     pub streaming_reasoning: String,
@@ -185,11 +205,21 @@ impl AppState {
                 self.reset_from_snapshot(last_seq, events, live);
             }
             Payload::Event { event } => {
+                // Incremental: fold the single new event into the replay
+                // folder and the committed rows instead of replaying the
+                // whole log (2026-11-12 audit perf fix).
+                let new_entries = self.folder.push(&event).to_vec();
                 self.events.push(event);
-                self.rebuild_transcript();
+                self.transcript.extend(new_entries.iter().cloned());
+                for entry in &new_entries {
+                    self.push_entry_row(entry);
+                }
             }
             Payload::Delta { delta } => match delta {
-                modron_protocol::WireDelta::Text { text } => self.streaming_text.push_str(&text),
+                modron_protocol::WireDelta::Text { text } => {
+                    self.streaming_text.push_str(&text);
+                    self.stream_chars += text.chars().count();
+                }
                 modron_protocol::WireDelta::Reasoning { text } => {
                     self.streaming_reasoning.push_str(&text)
                 }
@@ -228,8 +258,9 @@ impl AppState {
                 self.clear_buffers();
                 let swarm = self.tracker.take_swarm_summary();
                 if !swarm.is_empty() {
-                    self.transcript
-                        .push(TranscriptEntry::Swarm { lines: swarm });
+                    let entry = TranscriptEntry::Swarm { lines: swarm };
+                    self.push_entry_row(&entry);
+                    self.transcript.push(entry);
                 }
                 self.tracker.clear_turn();
             }
@@ -351,15 +382,68 @@ impl AppState {
         self.provider = live.provider;
         self.goal = live.goal;
         self.running = live.running;
+        self.resync_stream_cache();
     }
 
     fn rebuild_transcript(&mut self) {
-        self.transcript = replay(&self.events);
+        self.folder = ReplayFolder::new();
+        for event in &self.events {
+            self.folder.push(event);
+        }
+        self.transcript = self.folder.entries().to_vec();
+        // One full fold pass; afterwards every frame extends incrementally.
+        self.committed_rows.clear();
+        self.last_model = None;
+        let entries = std::mem::take(&mut self.transcript);
+        for entry in &entries {
+            self.push_entry_row(entry);
+        }
+        self.transcript = entries;
+    }
+
+    /// The presentation fold for ONE committed entry (the exact per-entry
+    /// logic of the former whole-transcript `rows()` walk; parity test
+    /// `incremental_rows_match_full_fold` pins them together).
+    fn push_entry_row(&mut self, entry: &TranscriptEntry) {
+        match entry {
+            TranscriptEntry::Model { model, .. } => {
+                if self.last_model.as_deref() != Some(model.as_str()) {
+                    self.committed_rows.push(Row::Divider {
+                        text: format!("model: {model}"),
+                    });
+                    self.last_model = Some(model.clone());
+                }
+            }
+            TranscriptEntry::Usage { .. } => {}
+            TranscriptEntry::Plan { items } => {
+                self.committed_rows.push(Row::Entry(TranscriptEntry::Plan {
+                    items: items.clone(),
+                }));
+            }
+            TranscriptEntry::Compaction {
+                summarized_events, ..
+            } => self.committed_rows.push(Row::Divider {
+                text: format!("compacted {summarized_events} earlier events"),
+            }),
+            other => self.committed_rows.push(Row::Entry(other.clone())),
+        }
+    }
+
+    /// Recompute the typewriter caches from the raw buffer (snapshot reset
+    /// and commit paths; the buffer arrived whole, cursor resets to 0).
+    fn resync_stream_cache(&mut self) {
+        self.stream_chars = self.streaming_text.chars().count();
+        self.stream_cursor = self.stream_chars;
+        self.stream_byte = self.streaming_text.len();
+        self.displayed_cache = self.streaming_text.clone();
     }
 
     fn clear_buffers(&mut self) {
         self.streaming_text.clear();
         self.stream_cursor = 0;
+        self.stream_byte = 0;
+        self.stream_chars = 0;
+        self.displayed_cache.clear();
         self.streaming_reasoning.clear();
     }
 
@@ -388,40 +472,17 @@ impl AppState {
 
     // -- projections -------------------------------------------------------
 
-    /// Committed transcript plus the in-flight buffers as rows (what the
-    /// virtualized list renders).
-    pub fn rows(&self) -> Vec<Row> {
-        // Presentation fold (GUI): Model/Usage notes become a divider chip
-        // only when the model CHANGES (routing re-selections every turn
-        // would otherwise pepper the transcript with identical chips), and
-        // per-turn usage rows vanish (the status bar carries cumulative
-        // tokens + cache; the shared copy lives in the tool summaries).
-        let mut rows: Vec<Row> = Vec::new();
-        let mut last_model: Option<String> = None;
-        for entry in &self.transcript {
-            match entry {
-                TranscriptEntry::Model { model, .. } => {
-                    if last_model.as_deref() != Some(model.as_str()) {
-                        rows.push(Row::Divider {
-                            text: format!("model: {model}"),
-                        });
-                        last_model = Some(model.clone());
-                    }
-                }
-                TranscriptEntry::Usage { .. } => {}
-                TranscriptEntry::Plan { items } => {
-                    rows.push(Row::Entry(TranscriptEntry::Plan {
-                        items: items.clone(),
-                    }));
-                }
-                TranscriptEntry::Compaction {
-                    summarized_events, ..
-                } => rows.push(Row::Divider {
-                    text: format!("compacted {summarized_events} earlier events"),
-                }),
-                other => rows.push(Row::Entry(other.clone())),
-            }
-        }
+    /// The committed rows (presentation fold of the transcript): owned by
+    /// the state and maintained incrementally, so the renderer can borrow
+    /// them instead of re-cloning the history per frame.
+    pub fn committed_rows(&self) -> &[Row] {
+        &self.committed_rows
+    }
+
+    /// The live tail rows (opted-in reasoning + the typewriter streaming
+    /// buffer): small, built per call.
+    pub fn tail_rows(&self) -> Vec<Row> {
+        let mut rows = Vec::with_capacity(2);
         if self.show_reasoning && !self.streaming_reasoning.is_empty() {
             rows.push(Row::Reasoning {
                 text: self.streaming_reasoning.clone(),
@@ -436,27 +497,46 @@ impl AppState {
         rows
     }
 
+    /// Committed transcript plus the in-flight buffers as rows (what the
+    /// virtualized list renders). The renderer hot path uses
+    /// [`Self::committed_rows`] + [`Self::tail_rows`]; this remains for
+    /// tests and one-shot callers.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows = self.committed_rows.clone();
+        rows.extend(self.tail_rows());
+        rows
+    }
+
     /// The streaming text the user should SEE right now: the buffer up to
     /// the typewriter cursor (character-level streaming - deltas land in
     /// the buffer at chunk granularity, the display advances per char).
+    /// Maintained incrementally by [`Self::advance_stream`].
     pub fn displayed_streaming(&self) -> String {
-        self.streaming_text
-            .char_indices()
-            .nth(self.stream_cursor)
-            .map(|(i, _)| self.streaming_text[..i].to_string())
-            .unwrap_or_else(|| self.streaming_text.clone())
+        self.displayed_cache.clone()
     }
 
     /// Advance the typewriter cursor (adaptive: bigger steps the further
     /// behind the display falls). Returns whether anything moved.
     pub fn advance_stream(&mut self) -> bool {
-        let total = self.streaming_text.chars().count();
-        if self.stream_cursor >= total {
+        if self.stream_cursor >= self.stream_chars {
             return false;
         }
-        let behind = total - self.stream_cursor;
+        let behind = self.stream_chars - self.stream_cursor;
         let step = (behind / 12).max(2);
-        self.stream_cursor = (self.stream_cursor + step).min(total);
+        let new_cursor = (self.stream_cursor + step).min(self.stream_chars);
+        // Walk `new_cursor - stream_cursor` chars forward from the cached
+        // byte offset and extend the displayed prefix in place - O(step),
+        // not O(streamed).
+        let old_byte = self.stream_byte;
+        let steps = new_cursor - self.stream_cursor;
+        let mut new_byte = old_byte;
+        for (i, b) in self.streaming_text[old_byte..].char_indices().take(steps) {
+            new_byte = old_byte + i + b.len_utf8();
+        }
+        self.displayed_cache
+            .push_str(&self.streaming_text[old_byte..new_byte]);
+        self.stream_cursor = new_cursor;
+        self.stream_byte = new_byte;
         true
     }
 
@@ -646,6 +726,117 @@ mod tests {
                 },
             },
         ]
+    }
+
+    #[test]
+    fn incremental_rows_match_full_replay_fold() {
+        // The Event frame path folds one event at a time through the
+        // ReplayFolder; a snapshot replay folds everything at once. The
+        // committed rows must be identical, including the multi-tool-run
+        // merge into ONE summary row.
+        let events = vec![
+            SessionEvent::Task {
+                text: "fix it".into(),
+            },
+            SessionEvent::Message {
+                parent_id: None,
+                message: assistant_with_tool_call("c1", "read", ""),
+            },
+            SessionEvent::ToolResult {
+                call_id: "c1".into(),
+                outcome: ToolOutcome::ok("a"),
+            },
+            SessionEvent::Message {
+                parent_id: None,
+                message: assistant_with_tool_call("c2", "grep", ""),
+            },
+            SessionEvent::ToolResult {
+                call_id: "c2".into(),
+                outcome: ToolOutcome::err("b"),
+            },
+            SessionEvent::Message {
+                parent_id: None,
+                message: Message::assistant("done"),
+            },
+            SessionEvent::ModelSelected {
+                model: "m2".into(),
+                reason: "r".into(),
+                action: None,
+                context_tokens: None,
+            },
+            SessionEvent::ModelSelected {
+                model: "m2".into(),
+                reason: "r".into(),
+                action: None,
+                context_tokens: None,
+            },
+            SessionEvent::ModelSelected {
+                model: "m3".into(),
+                reason: "r".into(),
+                action: None,
+                context_tokens: None,
+            },
+        ];
+        let mut incremental = AppState::new();
+        for (i, event) in events.iter().enumerate() {
+            incremental.apply_frame(event_frame(
+                i as u64 + 1,
+                Payload::Event {
+                    event: event.clone(),
+                },
+            ));
+        }
+        let mut bulk = AppState::new();
+        bulk.apply_frame(snapshot_frame(events.clone(), LiveState::default()));
+        assert_eq!(
+            incremental.rows(),
+            bulk.rows(),
+            "folded incrementally == folded from a snapshot"
+        );
+        // Two tool runs (each assistant message closes the run - replay
+        // law, pinned identically by both folds above), then divider chips
+        // only on model CHANGE.
+        let rows = incremental.rows();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, Row::Entry(TranscriptEntry::ToolSummary { .. })))
+                .count(),
+            2,
+            "one summary per tool run"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, Row::Divider { .. }))
+                .count(),
+            2,
+            "m2 m2 m3 folds to two chips (m2 once, m3 once)"
+        );
+    }
+
+    #[test]
+    fn typewriter_advances_multibyte_text_exactly() {
+        let mut s = AppState::new();
+        s.apply_frame(event_frame(
+            1,
+            Payload::Delta {
+                delta: WireDelta::Text {
+                    text: "h\u{e9}llo w\u{f6}rld \u{1f40d}".into(),
+                },
+            },
+        ));
+        // Reveal everything one step at a time; the prefix must always be
+        // valid char boundaries and end at the whole text.
+        let mut last = String::new();
+        loop {
+            if !s.advance_stream() {
+                break;
+            }
+            let shown = s.displayed_streaming();
+            assert!(s.streaming_text.starts_with(&shown), "prefix invariant");
+            last = shown;
+        }
+        assert_eq!(last, s.streaming_text);
+        assert!(!s.advance_stream(), "exhausted cursor stays put");
     }
 
     #[test]

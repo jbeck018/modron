@@ -162,9 +162,14 @@ impl LaunchOptions {
 pub struct DesktopApp {
     state: AppState,
     cmd_tx: async_channel::Sender<Command>,
-    /// The rows the transcript list renders (state.rows(), cached).
+    /// The rows the transcript list renders (committed rows + live tail,
+    /// maintained incrementally - see refresh/refresh_tail).
     display: Vec<Row>,
     list_state: ListState,
+    /// Parsed markdown per assistant text (hash-keyed). Completed messages
+    /// never change; without this every visible answer re-parsed every
+    /// frame (16ms while streaming). Cleared wholesale when large.
+    md_cache: std::cell::RefCell<std::collections::HashMap<u64, Vec<crate::markdown::MdBlock>>>,
     composer: Entity<TextareaState>,
     /// Live slash-command candidates (a leading "/" in the composer).
     slash_candidates: Vec<&'static str>,
@@ -417,17 +422,19 @@ impl DesktopApp {
             }),
             review_files: Vec::new(),
             review_branch: String::new(),
+            md_cache: Default::default(),
         };
         // Typewriter streaming: advance the visible cursor a few chars per
         // tick so chunk-granular deltas read like a per-character stream.
         // The same tick drives the sidebar shimmer on running tasks.
+        // Tail-only refresh: the committed history never changes on a tick.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(16))
                 .await;
             let Ok(()) = this.update(cx, |app, cx| {
                 if app.state.advance_stream() {
-                    app.refresh(cx);
+                    app.refresh_tail(cx);
                 }
             }) else {
                 break;
@@ -444,13 +451,38 @@ impl DesktopApp {
         app
     }
 
-    /// Recompute the renderer-visible projections and redraw.
+    /// Recompute the renderer-visible projections and redraw. FULL path:
+    /// rebuilds `display` from the state's committed rows. Frames that
+    /// change only the streaming tail use [`Self::refresh_tail`] instead
+    /// (2026-11-12 audit perf fix: a delta must not re-clone history).
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.display = self.state.rows();
-        self.filter_query = self.filter.read(cx).value().to_string();
-        self.session_filter_query = self.session_filter.read(cx).value().to_string();
+        self.rebuild_display();
+        self.sync_filters(cx);
         self.list_state.reset(self.display.len());
         cx.notify();
+    }
+
+    /// TAIL path: the committed rows are untouched; re-derive only the
+    /// live tail (streaming buffer / reasoning).
+    fn refresh_tail(&mut self, cx: &mut Context<Self>) {
+        self.extend_tail();
+        cx.notify();
+    }
+
+    fn rebuild_display(&mut self) {
+        self.display = self.state.committed_rows().to_vec();
+        self.display.extend(self.state.tail_rows());
+    }
+
+    fn extend_tail(&mut self) {
+        let committed = self.state.committed_rows().len();
+        self.display.truncate(committed);
+        self.display.extend(self.state.tail_rows());
+    }
+
+    fn sync_filters(&mut self, cx: &mut Context<Self>) {
+        self.filter_query = self.filter.read(cx).value().to_string();
+        self.session_filter_query = self.session_filter.read(cx).value().to_string();
     }
 
     fn send(&self, command: Command) {
@@ -458,6 +490,15 @@ impl DesktopApp {
     }
 
     fn apply_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
+        // What kind of display work does this frame need? Full = the
+        // committed rows changed (rebuild display); Tail = only the live
+        // streaming tail (cheap truncate+extend); None = the display is
+        // unaffected (the renderer still redraws panels from state).
+        enum RowImpact {
+            Full,
+            Tail,
+            None,
+        }
         match event {
             UiEvent::Frame(frame) => {
                 // A finished sign-in changes credential statuses; refresh
@@ -468,6 +509,15 @@ impl DesktopApp {
                     }
                 }
                 let is_sessions = matches!(frame.payload, Payload::Sessions { .. });
+                let impact = match frame.payload {
+                    Payload::Snapshot { .. }
+                    | Payload::Event { .. }
+                    | Payload::TurnDone { .. }
+                    | Payload::TurnFailed { .. }
+                    | Payload::TurnAborted { .. } => RowImpact::Full,
+                    Payload::Delta { .. } => RowImpact::Tail,
+                    _ => RowImpact::None,
+                };
                 // Review-overlay updates: task_status/merged answers land in
                 // DesktopApp fields (not the transcript).
                 match &frame.payload {
@@ -514,18 +564,27 @@ impl DesktopApp {
                         }
                     }
                 }
+                match impact {
+                    RowImpact::Full => self.refresh(cx),
+                    RowImpact::Tail => self.refresh_tail(cx),
+                    RowImpact::None => {
+                        self.sync_filters(cx);
+                        cx.notify();
+                    }
+                }
             }
             UiEvent::Connected(server_version) => {
                 self.state.conn = ConnState::Connected { server_version };
                 self.send(Command::ListSessions);
+                self.refresh(cx);
             }
             UiEvent::Disconnected(reason) => {
                 self.state.conn = ConnState::Offline;
                 self.state.running = false;
                 self.state.last_note = Some(reason);
+                self.refresh(cx);
             }
         }
-        self.refresh(cx);
         self.sync_form_inputs(cx);
     }
 
@@ -2054,12 +2113,26 @@ impl DesktopApp {
             }
             Row::Entry(TranscriptEntry::Task { text })
             | Row::Entry(TranscriptEntry::User { text }) => user_bubble(text),
-            Row::Entry(TranscriptEntry::Assistant { text }) => div()
-                .id(("transcript-row", ix))
-                .px_4()
-                .py_1()
-                .child(crate::markdown::render_markdown(text, theme))
-                .into_any_element(),
+            Row::Entry(TranscriptEntry::Assistant { text }) => {
+                let app = entity.read(cx);
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::hash::DefaultHasher::new();
+                text.hash(&mut hasher);
+                let key = hasher.finish();
+                let mut cache = app.md_cache.borrow_mut();
+                if cache.len() > 512 {
+                    cache.clear();
+                }
+                let blocks = cache
+                    .entry(key)
+                    .or_insert_with(|| crate::markdown::parse_blocks(text));
+                div()
+                    .id(("transcript-row", ix))
+                    .px_4()
+                    .py_1()
+                    .child(crate::markdown::render_blocks(blocks, theme))
+                    .into_any_element()
+            }
             Row::Entry(TranscriptEntry::ToolSummary { line, events }) => {
                 let label: SharedString = line.clone().into();
                 let panel: Vec<String> = events.iter().map(|event| event.summary()).collect();

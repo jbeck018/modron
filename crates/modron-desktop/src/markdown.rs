@@ -240,9 +240,16 @@ fn find_delim(chars: &[char], from: usize, delim: &str) -> Option<usize> {
 
 /// Render an assistant answer as styled markdown elements.
 pub fn render_markdown(text: &str, theme: &Theme) -> gpui_kit::AnyElement {
+    render_blocks(&parse_blocks(text), theme)
+}
+
+/// Render pre-parsed blocks. Split from [`render_markdown`] so callers can
+/// cache the parse (completed messages never change; re-parsing them per
+/// render frame was pure waste) and rebuild only the elements.
+pub fn render_blocks(blocks: &[MdBlock], theme: &Theme) -> gpui_kit::AnyElement {
     let mut root = div().flex().flex_col().gap_1().w_full();
 
-    for block in parse_blocks(text) {
+    for block in blocks {
         match block {
             MdBlock::Heading { level, text } => {
                 let size = match level {
@@ -251,7 +258,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> gpui_kit::AnyElement {
                     3 => 14.5,
                     _ => 13.5,
                 };
-                let label: SharedString = text.into();
+                let label: SharedString = text.clone().into();
                 root = root.child(
                     div()
                         .pt_1()
@@ -261,7 +268,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> gpui_kit::AnyElement {
                 );
             }
             MdBlock::Paragraph { spans } => {
-                root = root.child(render_spans(spans, theme, 13.5));
+                root = root.child(render_spans(spans.clone(), theme, 13.5));
             }
             MdBlock::CodeBlock { code } => {
                 let mut panel = div()
@@ -276,7 +283,7 @@ pub fn render_markdown(text: &str, theme: &Theme) -> gpui_kit::AnyElement {
                     let label: SharedString = if line.is_empty() {
                         " ".into()
                     } else {
-                        line.into()
+                        line.to_owned().into()
                     };
                     panel = panel.child(
                         div()
@@ -306,11 +313,11 @@ pub fn render_markdown(text: &str, theme: &Theme) -> gpui_kit::AnyElement {
                                 .text_color(theme.muted_foreground)
                                 .child(marker_label),
                         )
-                        .child(render_spans(spans, theme, 13.)),
+                        .child(render_spans(spans.clone(), theme, 13.)),
                 );
             }
             MdBlock::Quote { text } => {
-                let label: SharedString = text.into();
+                let label: SharedString = text.clone().into();
                 root = root.child(
                     div()
                         .border_l_2()

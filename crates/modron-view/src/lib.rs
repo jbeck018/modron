@@ -324,46 +324,67 @@ pub enum TranscriptEntry {
 /// `tool_calls` (`ToolResult` events carry only `call_id`); unrecoverable
 /// calls render as `tool`. `TurnTrace`/`Checkpoint` are observability and
 /// produce no display rows, matching the TUI.
-pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
-    let mut entries: Vec<TranscriptEntry> = Vec::new();
+/// Incremental replay: the exact fold of [`replay`], one event at a time.
+/// GUI clients hold one of these and feed it live events so a streamed
+/// frame never re-replays the whole log (the desktop pins folder == full
+/// replay with a parity test).
+#[derive(Debug, Default)]
+pub struct ReplayFolder {
+    entries: Vec<TranscriptEntry>,
     // call_id -> tool name from the most recent assistant message.
-    let mut call_names: std::collections::HashMap<String, String> = Default::default();
-    let mut turn_tools: Vec<ToolEvent> = Vec::new();
+    call_names: std::collections::HashMap<String, String>,
+    turn_tools: Vec<ToolEvent>,
+}
 
-    let flush_tools = |entries: &mut Vec<TranscriptEntry>, tools: &mut Vec<ToolEvent>| {
-        if tools.is_empty() {
-            return;
-        }
-        let line = tool_summary_line(tools);
-        entries.push(TranscriptEntry::ToolSummary {
-            line,
-            events: std::mem::take(tools),
-        });
-    };
+impl ReplayFolder {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    for event in events {
+    /// Drop all folded state (snapshot resets, session switches).
+    pub fn reset(&mut self) {
+        self.entries.clear();
+        self.call_names.clear();
+        self.turn_tools.clear();
+    }
+
+    /// Fold one event; returns the entries it produced (zero or more).
+    /// A run of `ToolResult` events accumulates and only lands as ONE
+    /// `ToolSummary` row when a boundary event arrives (or on
+    /// `into_entries`) - exactly like full-log `replay`, so a live fold
+    /// and a re-attach replay always agree.
+    pub fn push(&mut self, event: &SessionEvent) -> &[TranscriptEntry] {
+        let start = self.entries.len();
+        self.fold_event(event);
+        &self.entries[start..]
+    }
+
+    /// Fold one event into the accumulator, then flush any tools the event
+    /// boundary closes. `push` returns exactly what this appended.
+    fn fold_event(&mut self, event: &SessionEvent) {
         match event {
             SessionEvent::Task { text } => {
-                flush_tools(&mut entries, &mut turn_tools);
-                entries.push(TranscriptEntry::Task { text: text.clone() });
+                self.flush_tools();
+                self.entries
+                    .push(TranscriptEntry::Task { text: text.clone() });
             }
             SessionEvent::Plan { items } => {
-                flush_tools(&mut entries, &mut turn_tools);
-                entries.push(TranscriptEntry::Plan {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Plan {
                     items: items.clone(),
                 });
             }
             SessionEvent::Message { message, .. } => match message.role {
                 modron_types::Role::User => {
-                    flush_tools(&mut entries, &mut turn_tools);
-                    entries.push(TranscriptEntry::User {
+                    self.flush_tools();
+                    self.entries.push(TranscriptEntry::User {
                         text: message.content.clone(),
                     });
                 }
                 modron_types::Role::Assistant => {
-                    flush_tools(&mut entries, &mut turn_tools);
+                    self.flush_tools();
                     for call in &message.tool_calls {
-                        call_names.insert(call.id.clone(), call.name.clone());
+                        self.call_names.insert(call.id.clone(), call.name.clone());
                     }
                     if !message.content.is_empty() {
                         // Generative-UI split: ```modron-ui blocks become
@@ -372,10 +393,10 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
                         for segment in gen_ui::split_generative_ui(&message.content) {
                             match segment {
                                 gen_ui::GenSegment::Text(text) => {
-                                    entries.push(TranscriptEntry::Assistant { text });
+                                    self.entries.push(TranscriptEntry::Assistant { text });
                                 }
                                 gen_ui::GenSegment::Ui(ui) => {
-                                    entries.push(TranscriptEntry::GenerativeUi { ui });
+                                    self.entries.push(TranscriptEntry::GenerativeUi { ui });
                                 }
                             }
                         }
@@ -387,11 +408,12 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
                 }
             },
             SessionEvent::ToolResult { call_id, outcome } => {
-                let name = call_names
+                let name = self
+                    .call_names
                     .get(call_id)
                     .cloned()
                     .unwrap_or_else(|| "tool".to_string());
-                turn_tools.push(ToolEvent {
+                self.turn_tools.push(ToolEvent {
                     name,
                     bytes: Some(outcome.content.len() as u64),
                     is_error: outcome.is_error,
@@ -399,15 +421,15 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
                 });
             }
             SessionEvent::ModelSelected { model, reason, .. } => {
-                flush_tools(&mut entries, &mut turn_tools);
-                entries.push(TranscriptEntry::Model {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Model {
                     model: model.clone(),
                     reason: reason.clone(),
                 });
             }
             SessionEvent::Usage { model, usage } => {
-                flush_tools(&mut entries, &mut turn_tools);
-                entries.push(TranscriptEntry::Usage {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Usage {
                     model: model.clone(),
                     usage: *usage,
                 });
@@ -416,8 +438,8 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
                 summary,
                 summarized_events,
             } => {
-                flush_tools(&mut entries, &mut turn_tools);
-                entries.push(TranscriptEntry::Compaction {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Compaction {
                     summary: summary.clone(),
                     summarized_events: *summarized_events,
                 });
@@ -425,8 +447,46 @@ pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
             SessionEvent::TurnTrace { .. } | SessionEvent::Checkpoint { .. } => {}
         }
     }
-    flush_tools(&mut entries, &mut turn_tools);
-    entries
+
+    /// Flush accumulated tool events into one summary row when the event
+    /// boundary closes the run of tool activity.
+    fn flush_tools(&mut self) {
+        if self.turn_tools.is_empty() {
+            return;
+        }
+        let line = tool_summary_line(&self.turn_tools);
+        self.entries.push(TranscriptEntry::ToolSummary {
+            line,
+            events: std::mem::take(&mut self.turn_tools),
+        });
+    }
+
+    pub fn entries(&self) -> &[TranscriptEntry] {
+        &self.entries
+    }
+
+    pub fn into_entries(mut self) -> Vec<TranscriptEntry> {
+        // Same terminal flush as replay's final line.
+        if !self.turn_tools.is_empty() {
+            self.flush_tools();
+        }
+        self.entries
+    }
+}
+
+/// Full-log replay into display entries. This is the ONLY place the
+/// display-level transcript fold lives (repo law): grouping (tool runs ->
+/// one summary row), assistant-message generative-UI splitting, and the
+/// `TranscriptEntry` shapes all come from here, and every client replays
+/// the same way.
+///
+/// (moved doc: see [`ReplayFolder`] for the incremental form)
+pub fn replay(events: &[SessionEvent]) -> Vec<TranscriptEntry> {
+    let mut folder = ReplayFolder::new();
+    for event in events {
+        folder.push(event);
+    }
+    folder.into_entries()
 }
 
 /// Sum every `Usage` event in a log (the cumulative token total a resumed
