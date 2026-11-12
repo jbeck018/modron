@@ -24,7 +24,7 @@ use gpui_kit::{
     Focusable, InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowOptions,
 };
-use gpui_kit::{Animation, AnimationExt};
+use gpui_kit::{canvas, Animation, AnimationExt};
 use modron_core::Attachment;
 use modron_protocol::{Decision, Payload};
 use modron_router::lookup;
@@ -1412,7 +1412,6 @@ impl DesktopApp {
                             .label("create")
                             .primary()
                             .small()
-                            .px_3()
                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                 title_entity.update(cx, |this, cx| this.create_task(cx));
                             }),
@@ -1422,7 +1421,6 @@ impl DesktopApp {
                             .label("cancel")
                             .ghost()
                             .small()
-                            .px_3()
                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                 cancel_entity.update(cx, |this, cx| {
                                     this.new_task_open = false;
@@ -1477,7 +1475,6 @@ impl DesktopApp {
                         .icon(Icon::default().path("icons/x.svg").size_4())
                         .ghost()
                         .small()
-                        .px_3()
                         .on_click(move |_e, window, cx: &mut App| {
                             entity_close.update(cx, |this, cx| {
                                 this.search_open = false;
@@ -1516,7 +1513,6 @@ impl DesktopApp {
                         .label("select all")
                         .ghost()
                         .small()
-                        .px_3()
                         .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                             entity.update(cx, |this, cx| {
                                 for s in &this.state.sessions {
@@ -1531,8 +1527,7 @@ impl DesktopApp {
                         .icon(Icon::default().path("icons/trash.svg").size_4())
                         .label(format!("{count}"))
                         .disabled(count == 0)
-                        .small()
-                        .px_3();
+                        .small();
                     if count > 0 {
                         if confirm {
                             delete = delete.danger().label("confirm").on_click(
@@ -1566,7 +1561,6 @@ impl DesktopApp {
                         .icon(Icon::default().path("icons/x.svg").size_4())
                         .ghost()
                         .small()
-                        .px_3()
                         .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                             entity_cancel.update(cx, |this, cx| {
                                 this.select_mode = false;
@@ -1583,7 +1577,6 @@ impl DesktopApp {
                     .icon(Icon::default().path("icons/search.svg").size_4())
                     .ghost()
                     .small()
-                    .px_3()
                     .selected(self.search_open)
                     .on_click(move |_e, window, cx: &mut App| {
                         entity.update(cx, |this, cx| {
@@ -1792,7 +1785,6 @@ impl DesktopApp {
                                             )
                                             .ghost()
                                             .small()
-                                            .px_3()
                                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                                 entity_yes.update(cx, |this, cx| {
                                                     this.delete_session(id, cx)
@@ -1840,7 +1832,6 @@ impl DesktopApp {
                                             .icon(Icon::default().path("icons/trash.svg").size_4())
                                             .ghost()
                                             .small()
-                                            .px_3()
                                             .on_click(
                                                 move |_event: &ClickEvent, _w, cx: &mut App| {
                                                     // The x sits inside the clickable row:
@@ -1913,7 +1904,6 @@ impl DesktopApp {
                     .icon(Icon::default().path("icons/settings.svg").size_4())
                     .ghost()
                     .small()
-                    .px_3()
                     .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                         entity.update(cx, |this, cx| this.toggle_settings(cx));
                     })
@@ -1929,7 +1919,6 @@ impl DesktopApp {
                     )
                     .ghost()
                     .small()
-                    .px_3()
                     .on_click({
                         let entity = entity.clone();
                         move |_e: &ClickEvent, _w, cx: &mut App| {
@@ -2305,7 +2294,6 @@ impl DesktopApp {
                     .label(model_chip)
                     .ghost()
                     .small()
-                    .px_3()
                     .on_click(cx.listener(|this, _e, window, cx| {
                         this.open_picker(window, cx);
                     })),
@@ -2320,7 +2308,6 @@ impl DesktopApp {
                         .label("share")
                         .ghost()
                         .small()
-                        .px_3()
                         .on_click(cx.listener(|this, _e, _w, cx| {
                             let Some(id) = this.state.attached else {
                                 return;
@@ -2336,7 +2323,6 @@ impl DesktopApp {
                         .label("page")
                         .ghost()
                         .small()
-                        .px_3()
                         .on_click(cx.listener(|this, _e, _w, cx| {
                             this.publish_page(cx);
                         }))
@@ -2350,7 +2336,6 @@ impl DesktopApp {
                     .label("reasoning")
                     .ghost()
                     .small()
-                    .px_3()
                     .toggled(self.state.show_reasoning)
                     .on_click(cx.listener(|this, _e, _w, cx| this.toggle_reasoning(cx))),
             )
@@ -2420,7 +2405,6 @@ impl DesktopApp {
                         Button::new("allow-once")
                             .label(decision_label(Decision::AllowOnce))
                             .small()
-                            .px_3()
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.approve(Decision::AllowOnce, cx)
                             })),
@@ -2429,7 +2413,6 @@ impl DesktopApp {
                         Button::new("allow-all")
                             .label(decision_label(Decision::AllowAll))
                             .small()
-                            .px_3()
                             .on_click(
                                 cx.listener(|this, _e, _w, cx| {
                                     this.approve(Decision::AllowAll, cx)
@@ -2441,7 +2424,6 @@ impl DesktopApp {
                             .label(decision_label(Decision::Deny))
                             .danger()
                             .small()
-                            .px_3()
                             .on_click(
                                 cx.listener(|this, _e, _w, cx| this.approve(Decision::Deny, cx)),
                             ),
@@ -2506,7 +2488,6 @@ impl DesktopApp {
                                 .label("close")
                                 .ghost()
                                 .small()
-                                .px_3()
                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                     this.close_tool_panel(cx);
                                 })),
@@ -2575,7 +2556,6 @@ impl DesktopApp {
                             .label("x")
                             .ghost()
                             .small()
-                            .px_3()
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.staged.remove(ix);
                                 this.refresh(cx);
@@ -2693,7 +2673,6 @@ impl DesktopApp {
                                 .icon(Icon::default().path("icons/plus.svg").size_4())
                                 .ghost()
                                 .small()
-                                .px_3()
                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                     // The finder (files) is the "+" grammar;
                                     // clipboard staging stays on paste.
@@ -2705,7 +2684,6 @@ impl DesktopApp {
                                 .label(mode_chip)
                                 .ghost()
                                 .small()
-                                .px_3()
                                 .on_click(cx.listener(|this, _e, _w, cx| this.cycle_mode(cx))),
                         )
                         .child(
@@ -2782,7 +2760,6 @@ impl DesktopApp {
                                 .label(model_chip)
                                 .ghost()
                                 .small()
-                                .px_3()
                                 .on_click(cx.listener(|this, _e, window, cx| {
                                     this.open_picker(window, cx);
                                 })),
@@ -2792,14 +2769,12 @@ impl DesktopApp {
                                 .label("stop")
                                 .danger()
                                 .small()
-                                .px_3()
                                 .on_click(cx.listener(|this, _e, _w, cx| this.interrupt(cx)))]
                         } else {
                             vec![Button::new("send")
                                 .label("\u{2191}")
                                 .primary()
                                 .small()
-                                .px_3()
                                 .on_click(cx.listener(|this, _e, window, cx| {
                                     let task = this.composer.read(cx).value().to_string();
                                     this.submit(&task, window, cx);
@@ -2867,7 +2842,6 @@ impl DesktopApp {
                 .label(if review_open { "hide review" } else { "review" })
                 .ghost()
                 .small()
-                .px_3()
                 .on_click(cx.listener(|this, _e, _w, cx| {
                     let Some(id) = this.state.attached else {
                         return;
@@ -2886,7 +2860,6 @@ impl DesktopApp {
                 .label("merge")
                 .primary()
                 .small()
-                .px_3()
                 .on_click(cx.listener(|this, _e, _w, cx| {
                     let Some(id) = this.state.attached else {
                         return;
@@ -2943,7 +2916,6 @@ impl DesktopApp {
                             .label("merge")
                             .primary()
                             .small()
-                            .px_3()
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 let Some(id) = this.state.attached else {
                                     return;
@@ -2956,7 +2928,6 @@ impl DesktopApp {
                             .label("close")
                             .ghost()
                             .small()
-                            .px_3()
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.review_open = None;
                                 this.refresh(cx);
@@ -3060,7 +3031,6 @@ impl DesktopApp {
                                     .label("close")
                                     .ghost()
                                     .small()
-                                    .px_3()
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.help_open = false;
                                         this.refresh(cx);
@@ -3182,7 +3152,6 @@ impl DesktopApp {
                     .icon(Icon::default().path("icons/moon.svg").size_4())
                     .ghost()
                     .small()
-                    .px_3()
                     .on_click(cx.listener(|this, _e, _w, cx| {
                         let mode = if cx.theme().mode == ThemeMode::Dark {
                             ThemeMode::Light
@@ -3201,7 +3170,6 @@ impl DesktopApp {
                     .label("run")
                     .outline()
                     .small()
-                    .px_3()
                     .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                         entity_wizard.update(cx, |this, cx| this.open_onboarding(cx));
                     })
@@ -3221,7 +3189,6 @@ impl DesktopApp {
             .label("apply")
             .outline()
             .small()
-            .px_3()
             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                 entity.update(cx, |this, cx| {
                     this.send(Command::SetConfig(build()));
@@ -3236,7 +3203,6 @@ impl DesktopApp {
             .label(self.state.approval_mode.to_string())
             .outline()
             .small()
-            .px_3()
             .on_click(cx.listener(|this, _e, _w, cx| {
                 let next = match this.state.approval_mode.as_str() {
                     "ask" => "yolo",
@@ -3265,7 +3231,6 @@ impl DesktopApp {
             .label(sandbox_label)
             .outline()
             .small()
-            .px_3()
             .on_click(cx.listener(|this, _e, _w, cx| {
                 let next = match this.state.sandbox.as_str() {
                     "" | "off" => "seatbelt",
@@ -3328,21 +3293,16 @@ impl DesktopApp {
                         .items_center()
                         .gap_2()
                         .child(div().flex_1().child(Input::new(input)))
-                        .child(
-                            Button::new(id)
-                                .label("apply")
-                                .outline()
-                                .small()
-                                .px_3()
-                                .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                                    let value = input_apply.read(cx).value().to_string();
-                                    let patch = build(value);
-                                    entity_apply.update(cx, |this, cx| {
-                                        this.send(Command::SetConfig(patch));
-                                        this.refresh(cx);
-                                    });
-                                }),
-                        ),
+                        .child(Button::new(id).label("apply").outline().small().on_click(
+                            move |_e: &ClickEvent, _w, cx: &mut App| {
+                                let value = input_apply.read(cx).value().to_string();
+                                let patch = build(value);
+                                entity_apply.update(cx, |this, cx| {
+                                    this.send(Command::SetConfig(patch));
+                                    this.refresh(cx);
+                                });
+                            },
+                        )),
                 )
                 .into_any_element()
         }
@@ -3436,7 +3396,6 @@ impl DesktopApp {
             .label("use recommended")
             .outline()
             .small()
-            .px_3()
             .on_click(move |_e: &ClickEvent, window, cx: &mut App| {
                 entity_recs.update(cx, |this, cx| {
                     if let Some(rec) = &rec_apply {
@@ -3503,7 +3462,6 @@ impl DesktopApp {
                                     .label("save as default")
                                     .primary()
                                     .small()
-                                    .px_3()
                                     .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                         entity_save.update(cx, |this, cx| {
                                             let cheap = this
@@ -3565,7 +3523,6 @@ impl DesktopApp {
                     .label("sign in")
                     .outline()
                     .small()
-                    .px_3()
                     .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                         entity_sign.update(cx, |this, cx| {
                             let Some(session) = session else {
@@ -3593,7 +3550,6 @@ impl DesktopApp {
                     .label(if is_target { "key below" } else { "set key" })
                     .ghost()
                     .small()
-                    .px_3()
                     .on_click(move |_e: &ClickEvent, window, cx: &mut App| {
                         entity_target.update(cx, |this, cx| {
                             this.key_target = Some(id.clone());
@@ -3658,8 +3614,7 @@ impl DesktopApp {
         let mut key_save = Button::new("save-provider-key")
             .label("save")
             .outline()
-            .small()
-            .px_3();
+            .small();
         if key_save_enabled {
             let entity_save = entity.clone();
             let target = target.clone().unwrap_or_default();
@@ -3745,7 +3700,6 @@ impl DesktopApp {
                             .icon(Icon::default().path("icons/trash.svg").size_4())
                             .ghost()
                             .small()
-                            .px_3()
                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                 entity_del.update(cx, |this, cx| {
                                     this.remove_automation(del_name.clone(), cx)
@@ -3801,7 +3755,6 @@ impl DesktopApp {
                             .label("add automation")
                             .primary()
                             .small()
-                            .px_3()
                             .on_click(cx.listener(|this, _e, window, cx| {
                                 this.add_automation(window, cx);
                             })),
@@ -3830,7 +3783,6 @@ impl DesktopApp {
                             .icon(Icon::default().path("icons/arrow-left.svg").size_4())
                             .ghost()
                             .small()
-                            .px_3()
                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                 entity_back.update(cx, |this, cx| {
                                     this.settings_open = false;
@@ -3941,7 +3893,6 @@ impl DesktopApp {
                             .label("next: model wiring")
                             .primary()
                             .small()
-                            .px_3()
                             .on_click(cx.listener(|this, _e, _w, _cx| {
                                 this.send(Command::AuthProviders {});
                             })),
@@ -3966,7 +3917,6 @@ impl DesktopApp {
                             .label("save")
                             .primary()
                             .small()
-                            .px_3()
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.onboarding_next(cx);
                             })),
@@ -4126,47 +4076,9 @@ impl Focusable for DesktopApp {
 }
 
 impl Render for DesktopApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let entity = cx.entity();
-        // App-wide click-outside unfocus: a capture-phase press moves
-        // focus to the window root, so any focused input blurs when the
-        // click lands outside it (inputs re-focus themselves on their own
-        // mousedown, so in-input clicks are unaffected). The model
-        // picker's keyboard flow needs the filter focused, so it is
-        // exempt; the sidebar search additionally collapses when empty.
-        if !self.picker_open {
-            window.on_mouse_event(move |_: &gpui_kit::MouseDownEvent, phase, window, cx| {
-                if phase == gpui_kit::DispatchPhase::Capture {
-                    window.blur(cx);
-                }
-            });
-        }
-        if self.search_open {
-            let entity_outside = entity.clone();
-            window.on_mouse_event(
-                move |event: &gpui_kit::MouseDownEvent, phase, _window, cx| {
-                    if phase != gpui_kit::DispatchPhase::Capture {
-                        return;
-                    }
-                    let inside = SEARCH_BOUNDS
-                        .with(|slot| slot.get())
-                        .is_some_and(|b| b.contains(&event.position));
-                    if inside {
-                        return;
-                    }
-                    entity_outside.update(cx, |this, cx| {
-                        if this.search_open
-                            && this.session_filter.read(cx).value().trim().is_empty()
-                        {
-                            this.search_open = false;
-                            this.session_filter_query.clear();
-                            this.refresh(cx);
-                        }
-                    });
-                },
-            );
-        }
         let sidebar = self.render_sidebar(&entity, cx);
         let status = self.render_status_bar(&entity, cx);
         let mut root = div()
@@ -4209,8 +4121,52 @@ impl Render for DesktopApp {
                     }),
             )
             .child(status);
+        let entity_a = entity.clone();
+        let entity_b = entity.clone();
+        let outside_listeners = canvas(
+            |_, _, _| {},
+            move |_, _, window, _cx| {
+                // App-wide click-outside unfocus (capture-phase press
+                // blurs the focused input; inputs re-focus themselves on
+                // their own mousedown). The model picker is exempt: its
+                // arrow/enter flow needs the filter focused.
+                window.on_mouse_event(move |_: &gpui_kit::MouseDownEvent, phase, window, cx| {
+                    if phase != gpui_kit::DispatchPhase::Capture {
+                        return;
+                    }
+                    if !entity_a.read(cx).picker_open {
+                        window.blur(cx);
+                    }
+                });
+                // Sidebar search: collapse an EMPTY expanded input on any
+                // press outside its bounds.
+                window.on_mouse_event(
+                    move |event: &gpui_kit::MouseDownEvent, phase, _window, cx| {
+                        if phase != gpui_kit::DispatchPhase::Capture {
+                            return;
+                        }
+                        let inside = SEARCH_BOUNDS
+                            .with(|slot| slot.get())
+                            .is_some_and(|b| b.contains(&event.position));
+                        if inside {
+                            return;
+                        }
+                        entity.update(cx, |this, cx| {
+                            if this.search_open
+                                && this.session_filter.read(cx).value().trim().is_empty()
+                            {
+                                this.search_open = false;
+                                this.session_filter_query.clear();
+                                this.refresh(cx);
+                            }
+                        });
+                    },
+                );
+            },
+        );
+        root = root.child(outside_listeners);
         if self.picker_open {
-            root = root.child(self.render_picker(&entity, cx));
+            root = root.child(self.render_picker(&entity_b, cx));
         }
         if self.help_open {
             root = root.child(self.render_help(cx));
@@ -4423,7 +4379,6 @@ pub fn render_gen_ui(
                 .label(submit_text_label)
                 .primary()
                 .small()
-                .px_3()
                 .when(can_submit, |b| {
                     b.on_click({
                         move |_e: &ClickEvent, _w, cx: &mut App| {
