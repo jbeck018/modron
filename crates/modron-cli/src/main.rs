@@ -1166,10 +1166,19 @@ fn build_agent_with(
                 post_tool: h.post_tool,
             })
             .unwrap_or_default(),
-        sandbox: cli
-            .sandbox
-            .map(|choice| choice.policy())
-            .unwrap_or_default(),
+        sandbox: {
+            let policy = cli
+                .sandbox
+                .map(|choice| choice.policy())
+                .unwrap_or_default();
+            if !modron_core::sandbox::is_supported(policy) {
+                anyhow::bail!(
+                    "sandbox policy {policy:?} is not supported on this platform; \
+                     run with --sandbox off (or omit the flag)"
+                );
+            }
+            policy
+        },
         approver: if cli.approve_all || cli.yolo {
             None
         } else {

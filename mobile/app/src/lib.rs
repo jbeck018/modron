@@ -115,10 +115,11 @@ fn do_approve(request_id: String, decision: &str) -> Result<(), String> {
     }
 }
 
-fn do_select_model(model: String, provider: String) -> Result<(), String> {
+fn do_select_model(model: String) -> Result<(), String> {
     let guard = lock_client()?;
     match guard.as_ref() {
-        Some(client) => client.select_model(model, provider).map_err(err_text),
+        // Model only: the server follows the provider via the catalog.
+        Some(client) => client.select_model(model).map_err(err_text),
         None => Err(not_connected()),
     }
 }
@@ -388,10 +389,10 @@ impl Remote {
         do_approve(request_id, &decision)
     }
 
-    /// Model switch: pins the model AND follows the provider (TUI /model
-    /// parity).
-    pub fn select_model(model: String, provider: String) -> Result<(), String> {
-        do_select_model(model, provider)
+    /// Model switch: sends the model only; the server follows the provider
+    /// through the catalog (TUI /model parity).
+    pub fn select_model(model: String) -> Result<(), String> {
+        do_select_model(model)
     }
 
     /// Create an empty session without submitting a task.

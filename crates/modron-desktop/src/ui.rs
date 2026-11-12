@@ -196,9 +196,12 @@ pub struct DesktopApp {
     /// This window's handle: deferred work (form inputs) needs the window
     /// to construct input state.
     window_handle: Option<gpui_kit::AnyWindowHandle>,
-    /// Generative-UI form inputs, cached per transcript row index.
+    /// Generative-UI form inputs, cached per (session id, transcript row
+    /// index). Session-keyed: row indexes only mean something within one
+    /// session's display, so a switch must never reuse another session's
+    /// typed-in values (2026-11-12 audit fix).
     form_inputs: std::collections::HashMap<
-        usize,
+        (uuid::Uuid, usize),
         Vec<gpui_kit::Entity<gpui_kit::component::input::InputState>>,
     >,
     /// A session row the user marked for deletion (two-step confirm).
@@ -567,9 +570,13 @@ impl DesktopApp {
     }
 
     /// Create missing generative-UI form inputs (input state needs the
-    /// window). Called after every applied event; keyed by transcript row
-    /// index, which is stable between rebuilds of the same log.
+    /// window). Called after every applied event; keyed by (session id,
+    /// transcript row index), which is stable between rebuilds of the same
+    /// log and never collides across sessions.
     fn sync_form_inputs(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.state.attached else {
+            return;
+        };
         let Some(handle) = self.window_handle else {
             return;
         };
@@ -579,7 +586,7 @@ impl DesktopApp {
                 ui: modron_view::GenUi::Form { fields, .. },
             }) = row
             {
-                if self.form_inputs.contains_key(&ix) {
+                if self.form_inputs.contains_key(&(session, ix)) {
                     continue;
                 }
                 let placeholders = fields
@@ -618,7 +625,7 @@ impl DesktopApp {
         });
         if let Ok(created) = created {
             for ((ix, _), inputs) in missing.into_iter().zip(created) {
-                self.form_inputs.insert(ix, inputs);
+                self.form_inputs.insert((session, ix), inputs);
             }
             self.refresh(cx);
         }
@@ -861,12 +868,12 @@ impl DesktopApp {
     /// Submit the values of a generative-UI form (row `form_ix`) as the
     /// next chat message - one `label: value` line per field.
     fn submit_form(&mut self, form_ix: usize, cx: &mut Context<Self>) {
-        if self.state.attached.is_none() {
+        let Some(session) = self.state.attached else {
             self.state.last_note = Some("attach a session before submitting a form".into());
             self.refresh(cx);
             return;
-        }
-        let Some(inputs) = self.form_inputs.get(&form_ix) else {
+        };
+        let Some(inputs) = self.form_inputs.get(&(session, form_ix)) else {
             return;
         };
         let Some(Row::Entry(TranscriptEntry::GenerativeUi {
@@ -2165,8 +2172,9 @@ impl DesktopApp {
             }
             Row::Entry(TranscriptEntry::GenerativeUi { ui }) => {
                 let theme_colors = cx.theme();
-                let inputs = entity.read(cx).form_inputs.get(&ix).cloned();
                 let attached = entity.read(cx).state.attached;
+                let inputs = attached
+                    .and_then(|session| entity.read(cx).form_inputs.get(&(session, ix)).cloned());
                 let row_entity = entity.clone();
                 let _ = ix;
                 div()

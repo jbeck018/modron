@@ -67,16 +67,19 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(1, MAX_TIMEOUT_MS);
 
-        // Sandbox routing (A2): under Seatbelt the whole shell runs inside
-        // `sandbox-exec` (network denied, writes fenced to the workspace +
-        // temp dirs). The sandboxed path cannot stream-pipe the same way, so
-        // it uses one buffered capture; caps and exit-code reporting are
-        // identical. Timeout handling is shared below.
-        if ctx.sandbox == modron_core::SandboxPolicy::Seatbelt {
+        // Sandbox routing (A2): under Seatbelt (macOS) or Bubblewrap (Linux)
+        // the whole shell runs inside the OS sandbox (network denied, writes
+        // fenced to the workspace + temp dirs). The sandboxed path cannot
+        // stream-pipe the same way, so it uses one buffered capture; caps and
+        // exit-code reporting are identical. Timeout handling is shared below.
+        if matches!(
+            ctx.sandbox,
+            modron_core::SandboxPolicy::Seatbelt | modron_core::SandboxPolicy::Bubblewrap
+        ) {
             let started = std::time::Instant::now();
             return match tokio::time::timeout(
                 Duration::from_millis(timeout_ms),
-                modron_core::sandbox::run_sandboxed(command, &ctx.working_dir),
+                modron_core::sandbox::run_sandboxed(ctx.sandbox, command, &ctx.working_dir),
             )
             .await
             {

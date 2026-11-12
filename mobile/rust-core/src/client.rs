@@ -387,16 +387,13 @@ impl RemoteClient {
         ))
     }
 
-    /// Model switch, TUI /model parity: pins the model AND follows the
-    /// provider in one full patch.
-    pub fn select_model(
-        &self,
-        model: impl Into<String>,
-        provider: impl Into<String>,
-    ) -> Result<(), ClientError> {
+    /// Model switch: send the model only. The server follows the provider
+    /// through the catalog (hub.apply_config); pinning the CURRENT provider
+    /// here would cross-pin a foreign model to the old provider
+    /// (2026-11-12 audit fix - desktop parity via modron_router::lookup).
+    pub fn select_model(&self, model: impl Into<String>) -> Result<(), ClientError> {
         self.set_config(ConfigPatch {
             model: Some(model.into()),
-            provider: Some(provider.into()),
             ..ConfigPatch::default()
         })
     }

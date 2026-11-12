@@ -489,6 +489,11 @@ impl SessionHandle {
             *lock(&self.provider) = provider.clone();
         }
         if let Some(sandbox) = patch.sandbox {
+            if !modron_core::sandbox::is_supported(sandbox) {
+                anyhow::bail!(
+                    "sandbox policy {sandbox:?} is not supported on the server's platform"
+                );
+            }
             config.sandbox = sandbox;
         }
         if let Some(mode) = patch.approval_mode {

@@ -758,12 +758,16 @@ async fn config_changed_updates_labels_and_list_sessions_folds() {
             ),
         )
         .await;
-        // Model switch parity: the patch pins the model AND the provider.
+        // Model switch parity: the patch sends the model only; the server
+        // follows the provider through the catalog (2026-11-12 audit fix).
         let set_config = read_frame(&mut ws).await;
         match set_config.payload {
             Payload::SetConfig { patch } => {
                 assert_eq!(patch.model.as_deref(), Some("claude-opus-5"));
-                assert_eq!(patch.provider.as_deref(), Some("anthropic"));
+                assert_eq!(
+                    patch.provider, None,
+                    "the client must not pin the stale provider"
+                );
             }
             other => panic!("expected set_config, got {other:?}"),
         }
@@ -797,7 +801,7 @@ async fn config_changed_updates_labels_and_list_sessions_folds() {
     assert_eq!(sessions[0].title, "deploy the thing");
 
     client
-        .select_model("claude-opus-5", "anthropic")
+        .select_model("claude-opus-5")
         .expect("send select_model");
     loop {
         if client.state().model == "claude-opus-5" {

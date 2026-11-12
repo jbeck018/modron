@@ -45,19 +45,24 @@ pub fn seatbelt_profile(workspace: &Path) -> String {
     out
 }
 
-/// Run `command` via `sh -c` under the Seatbelt profile. The profile is
-/// materialized to a temp file (proven `-f` path rather than the deprecated
-/// `-p` inline form). Only `SandboxPolicy::Seatbelt` reaches this; callers
-/// on other platforms get an actionable error instead of a silent fallback.
-pub async fn run_sandboxed(command: &str, workspace: &Path) -> Result<std::process::Output> {
-    // Route to the platform executor.
-    match std::env::consts::OS {
-        "macos" => run_seatbelt(command, workspace).await,
-        "linux" => run_bubblewrap(command, workspace).await,
-        other => Err(Error::Config(
+/// Run `command` via `sh -c` under the selected sandbox policy. Seatbelt on
+/// macOS, bubblewrap on Linux; the profile is materialized to a temp file
+/// (proven `-f` path rather than the deprecated `-p` inline form). A
+/// policy/platform mismatch is an actionable error, never a silent fallback
+/// to a different mechanism.
+pub async fn run_sandboxed(
+    policy: SandboxPolicy,
+    command: &str,
+    workspace: &Path,
+) -> Result<std::process::Output> {
+    // Route to the platform executor for the policy that was asked for.
+    match (policy, std::env::consts::OS) {
+        (SandboxPolicy::Seatbelt, "macos") => run_seatbelt(command, workspace).await,
+        (SandboxPolicy::Bubblewrap, "linux") => run_bubblewrap(command, workspace).await,
+        (policy, os) => Err(Error::Config(
             "sandbox".into(),
             format!(
-                "no sandbox implementation for {other} — run with --sandbox off \
+                "sandbox policy {policy:?} is not supported on {os} — run with --sandbox off \
                  (and an approval mode you trust) on this platform"
             ),
         )),
@@ -209,6 +214,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Network: denied (curl cannot resolve/connect).
         let net = run_sandboxed(
+            SandboxPolicy::Seatbelt,
             "curl -m 3 -s https://example.com >/dev/null 2>&1; echo $?",
             dir.path(),
         )
@@ -217,12 +223,17 @@ mod tests {
         let code = String::from_utf8_lossy(&net.stdout).trim().to_string();
         assert_ne!(code, "0", "network must be denied under Seatbelt");
         // Workspace write: allowed.
-        let write = run_sandboxed("echo hi > ok.txt && cat ok.txt", dir.path())
-            .await
-            .unwrap();
+        let write = run_sandboxed(
+            SandboxPolicy::Seatbelt,
+            "echo hi > ok.txt && cat ok.txt",
+            dir.path(),
+        )
+        .await
+        .unwrap();
         assert_eq!(String::from_utf8_lossy(&write.stdout).trim(), "hi");
         // Outside write: denied.
         let out = run_sandboxed(
+            SandboxPolicy::Seatbelt,
             "echo x > /usr/local/modron-sbx-test 2>/dev/null; echo $?",
             dir.path(),
         )

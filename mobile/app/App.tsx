@@ -555,7 +555,9 @@ function runSlash(raw: string): void {
         break;
       }
       try {
-        Remote.selectModel(args, snap().provider);
+        // Model only: the server follows the provider via the catalog
+        // (pinning the current provider here cross-pins foreign models).
+        Remote.selectModel(args);
       } catch (e) {
         connectError.set(e instanceof Error ? e.message : String(e));
       }

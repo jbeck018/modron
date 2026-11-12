@@ -100,6 +100,10 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
     // (add/remove/list frames) worked, but this loop - the thing that
     // actually FIRES due automations into fresh sessions - was never
     // spawned, so scheduled automations sat stored and inert.
+    // normalize() first (2026-11-12 audit fix): a registry without
+    // next-due stamps (pre-field version, hand-edited) would otherwise
+    // mass-fire every automation the moment the scheduler wakes.
+    crate::automations::normalize(&state);
     crate::automations::spawn_scheduler(Arc::clone(&state));
 
     // WebSocket listener (optional).

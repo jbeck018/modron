@@ -25,8 +25,9 @@ pub struct Automation {
     /// RFC3339 timestamp of the last fired run (empty = never).
     #[serde(default)]
     pub last_run: String,
-    /// Internal: next due epoch seconds (not persisted across restarts;
-    /// recomputed as `now + interval` when the registry loads without it).
+    /// Internal: next due epoch seconds. Persisted when set; a registry
+    /// that lacks the stamp (older version, hand-edited) is normalized to
+    /// `now + interval` at serve start so nothing mass-fires on restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_due_epoch: Option<u64>,
 }
@@ -159,7 +160,14 @@ async fn fire(state: &Arc<ServerState>, automation: &Automation) -> Result<()> {
 /// Re-compute next-due stamps on registry load so a fresh serve doesn't
 /// re-fire everything immediately.
 pub fn normalize(state: &ServerState) {
-    let mut all = load(state);
+    normalize_registry(&registry_path(state));
+}
+
+fn normalize_registry(path: &std::path::Path) {
+    let mut all: Vec<Automation> = match std::fs::read(path) {
+        Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+        Err(_) => return,
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -172,6 +180,46 @@ pub fn normalize(state: &ServerState) {
         }
     }
     if changed {
-        let _ = save(state, &all);
+        let _ = std::fs::write(path, serde_json::to_string_pretty(&all).unwrap_or_default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_stamps_unstamped_entries_and_keeps_stamped_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        std::fs::write(
+            &path,
+            r#"[
+            {"name":"stale","prompt":"p","interval_minutes":10},
+            {"name":"fresh","prompt":"p","interval_minutes":10,"next_due_epoch":99999999999}
+        ]"#,
+        )
+        .unwrap();
+        normalize_registry(&path);
+        let all: Vec<Automation> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let stale = all.iter().find(|a| a.name == "stale").unwrap();
+        let fresh = all.iter().find(|a| a.name == "fresh").unwrap();
+        assert!(
+            stale.next_due_epoch.is_some(),
+            "unstamped entry must gain a stamp"
+        );
+        assert_eq!(
+            fresh.next_due_epoch,
+            Some(99999999999),
+            "stamped entry must be left alone"
+        );
+    }
+
+    #[test]
+    fn normalize_ignores_missing_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.json");
+        normalize_registry(&path);
+        assert!(!path.exists(), "no registry file must be created");
     }
 }
