@@ -89,3 +89,17 @@ test("edit mode selects and bulk deletes", async () => {
   expect(app.texts()).toContain("migrate the router to the new hub");
 });
 
+// Settings providers card (parity P2): registry rows with auth status,
+// sign-in for oauth-capable providers, key entry for the rest.
+test("settings renders the providers card", async () => {
+  const app = await open("./App.tsx");
+  await app.press("settings");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("providers");
+  expect(app.texts()).toContain("Anthropic (Claude)");
+  expect(app.texts()).toContain("subscription (oauth)");
+  expect(app.texts()).toContain("sign in");
+  expect(app.texts()).toContain("save");
+});
+
+

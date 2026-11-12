@@ -486,6 +486,45 @@ impl RemoteClient {
         ))
     }
 
+    /// Request the provider auth rows; the reply lands in
+    /// `state().providers` (the same payload doubles as request with
+    /// empty rows and reply, matching the desktop client).
+    pub fn auth_providers(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AuthProviders { rows: Vec::new() },
+        ))
+    }
+
+    /// Start a provider's sign-in flow on the server; progress streams
+    /// into `state().oauth` and the outcome arrives as a note.
+    pub fn auth_start(&self, session_id: Uuid, provider: &str) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AuthStart {
+                session_id,
+                provider: provider.into(),
+            },
+        ))
+    }
+
+    /// Save an API key for a provider; the outcome arrives as a note.
+    pub fn auth_set_key(
+        &self,
+        session_id: Uuid,
+        provider: &str,
+        key: &str,
+    ) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AuthSetKey {
+                session_id,
+                provider: provider.into(),
+                key: key.into(),
+            },
+        ))
+    }
+
     /// Create an empty session without submitting a task.
     pub fn new_session(&self, title: Option<&str>) -> Result<(), ClientError> {
         self.send_frame(Frame::request(
@@ -677,6 +716,7 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         Payload::ConfigChanged { patch } => apply_config(vm, &patch),
         Payload::Sessions { sessions } => vm.sessions = sessions,
         Payload::Automations { rows } => vm.automations = rows,
+        Payload::AuthProviders { rows } => vm.providers = rows,
         Payload::PagePublished { url } => {
             vm.last_note = Some(format!("published: {url}"));
         }

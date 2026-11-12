@@ -214,6 +214,9 @@ pub struct SessionViewModel {
     /// Scheduled automations (answers to `list_automations`; settings
     /// views render these).
     pub automations: Vec<modron_protocol::AutomationWire>,
+    /// Provider auth rows (answers to `auth_providers`; the settings
+    /// providers card renders these).
+    pub providers: Vec<modron_protocol::AuthProviderWire>,
     /// Last seen server seq for this session (reconnect resumes past it).
     pub last_seq: u64,
     pub turns_completed: u32,
@@ -275,6 +278,8 @@ pub struct ViewModelSnapshot {
     pub sessions: Vec<SessionMetaWire>,
     /// Scheduled automations (settings views render these).
     pub automations: Vec<modron_protocol::AutomationWire>,
+    /// Provider auth rows (the settings providers card renders these).
+    pub providers: Vec<modron_protocol::AuthProviderWire>,
     pub last_seq: u64,
     pub last_error: Option<String>,
     pub last_note: Option<String>,
@@ -329,6 +334,7 @@ impl ViewModelSnapshot {
             goal: vm.goal.clone(),
             sessions: vm.sessions.clone(),
             automations: vm.automations.clone(),
+            providers: vm.providers.clone(),
             last_seq: vm.last_seq,
             last_error: vm.last_error.clone(),
             last_note: vm.last_note.clone(),

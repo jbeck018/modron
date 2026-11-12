@@ -177,6 +177,37 @@ fn do_publish_page(title: &str, content_md: &str) -> Result<(), String> {
     client.publish_page(id, title, content_md).map_err(err_text)
 }
 
+fn do_auth_providers_json() -> Result<String, String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    // Fire the request; rows land in the snapshot (the poll picks them
+    // up). Return the current rows so the caller renders immediately.
+    client.auth_providers().map_err(err_text)?;
+    serde_json::to_string(&client.state().providers).map_err(|e| e.to_string())
+}
+
+// Auth flows run against the attached session (progress streams on it).
+fn attached_session_id(client: &RemoteClient) -> Result<uuid::Uuid, String> {
+    client
+        .state()
+        .session_id
+        .ok_or_else(|| "no attached session".to_string())
+}
+
+fn do_auth_start(provider: &str) -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    let id = attached_session_id(client)?;
+    client.auth_start(id, provider).map_err(err_text)
+}
+
+fn do_auth_set_key(provider: &str, key: &str) -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    let id = attached_session_id(client)?;
+    client.auth_set_key(id, provider, key).map_err(err_text)
+}
+
 /// The shared slash-command table (`modron_view::slash`), as JSON: the
 /// composer's autocomplete and /help render it verbatim, so a command
 /// typed on any client means the same thing.
@@ -323,6 +354,23 @@ impl Remote {
         do_list_sessions_json()
     }
 
+    /// Provider auth rows (label, status, oauth capability); the rows
+    /// also land in the snapshot.
+    pub fn auth_providers_json() -> Result<String, String> {
+        do_auth_providers_json()
+    }
+
+    /// Start a provider's server-side sign-in flow; progress streams
+    /// into the snapshot's `oauth` field until the note arrives.
+    pub fn auth_start(provider: String) -> Result<(), String> {
+        do_auth_start(&provider)
+    }
+
+    /// Save an API key for a provider (the non-oauth path).
+    pub fn auth_set_key(provider: String, key: String) -> Result<(), String> {
+        do_auth_set_key(&provider, &key)
+    }
+
     /// The folded view state plus every pre-rendered string, as JSON
     /// (`{}` before the first connect).
     pub fn snapshot_json() -> String {
@@ -429,6 +477,32 @@ fn demo_snapshot() -> String {
             interval_minutes: 1440,
             last_run: None,
         }],
+        providers: vec![
+            modron_protocol::AuthProviderWire {
+                id: "anthropic".into(),
+                label: "Anthropic (Claude)".into(),
+                status: "subscription (oauth)".into(),
+                oauth_capable: true,
+            },
+            modron_protocol::AuthProviderWire {
+                id: "openai-compat".into(),
+                label: "OpenAI / ChatGPT".into(),
+                status: "api key".into(),
+                oauth_capable: true,
+            },
+            modron_protocol::AuthProviderWire {
+                id: "zai".into(),
+                label: "Z.ai (GLM)".into(),
+                status: "not configured".into(),
+                oauth_capable: true,
+            },
+            modron_protocol::AuthProviderWire {
+                id: "openrouter".into(),
+                label: "OpenRouter".into(),
+                status: "not configured".into(),
+                oauth_capable: false,
+            },
+        ],
         sessions: vec![
             SessionMetaWire {
                 id: uuid::Uuid::nil(),

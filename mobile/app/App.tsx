@@ -47,6 +47,23 @@ interface AutomationRow {
   last_run: string | null;
 }
 
+// One row of the server's provider registry (auth status included).
+interface ProviderRow {
+  id: string;
+  label: string;
+  status: string;
+  oauth_capable: boolean;
+}
+
+// Server-side sign-in progress streamed while an oauth flow runs.
+interface OAuthState {
+  provider: string;
+  stage: string;
+  message: string;
+  url: string | null;
+  user_code: string | null;
+}
+
 // One row of the shared slash-command table (modron-view::slash), served
 // by Remote.slashCommandsJson() as name/usage/about/scope.
 interface SlashCommand {
@@ -79,6 +96,8 @@ interface Snapshot {
   goal: string;
   sessions: SessionMeta[];
   automations: AutomationRow[];
+  providers: ProviderRow[];
+  oauth: OAuthState | null;
   last_seq: number;
   last_error: string | null;
   last_note: string | null;
@@ -104,6 +123,8 @@ const helpNote = signal<string | null>(null);
 const autoName = signal("");
 const autoPrompt = signal("");
 const autoInterval = signal("");
+// API-key drafts per provider id (settings providers card).
+const keyDrafts = signal<Record<string, string>>({});
 // Sessions-screen delete state: bulk-select mode, the selected ids, and
 // the row id whose delete control is armed (two-tap confirm, matching
 // the desktop's trash -> check flow).
@@ -256,10 +277,42 @@ function publishTranscript(): void {
 function enterSettings(): void {
   try {
     Remote.listAutomationsJson();
+    Remote.authProvidersJson();
   } catch {
     // Demo or between connections: render what the snapshot has.
   }
   stack.push("settings");
+}
+
+// Start a provider's server-side sign-in; progress streams into the
+// snapshot's oauth field (the browser opens on the server machine).
+function signIn(provider: string): void {
+  if (demo()) {
+    connectError.set("sign in needs a live server");
+    return;
+  }
+  try {
+    Remote.authStart(provider);
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
+// Save an API key for a non-oauth provider, then refresh the rows.
+function saveKey(provider: string): void {
+  const key = (keyDrafts()[provider] ?? "").trim();
+  if (!key) return;
+  if (demo()) {
+    connectError.set("saving keys needs a live server");
+    return;
+  }
+  try {
+    Remote.authSetKey(provider, key);
+    Remote.authProvidersJson();
+    keyDrafts.set({ ...keyDrafts(), [provider]: "" });
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
 }
 
 // Delete one session (two-tap confirm lands here) or every selected id
@@ -816,6 +869,79 @@ function SettingsScreen() {
             server: {snap().server_version}
           </Text>
           <Text class="text-foreground text-sm">seq: {snap().last_seq}</Text>
+        </View>
+        {/* Providers: auth status per registry row; oauth rows get a
+            sign-in button (server-side flow, progress streams below),
+            api-key rows get a key input. */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-2">
+          <Text class="text-muted-foreground text-xs">providers</Text>
+          {snap().oauth ? (
+            <View class="gap-1">
+              <Text class="text-accent text-sm">
+                {snap().oauth.provider} sign-in: {snap().oauth.stage}
+              </Text>
+              <Text class="text-muted-foreground text-xs">
+                {snap().oauth.message}
+              </Text>
+              {snap().oauth.user_code ? (
+                <Text class="text-foreground text-sm">
+                  code: {snap().oauth.user_code}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
+          {snap().providers.map((provider) => (
+            <View class="gap-1">
+              <View class="flex-row items-center gap-2">
+                <Text class="text-foreground text-sm flex-1">
+                  {provider.label}
+                </Text>
+                <Text class="text-muted-foreground text-xs">
+                  {provider.status}
+                </Text>
+              </View>
+              {provider.oauth_capable ? (
+                <View
+                  role="button"
+                  class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+                  onPress={() => signIn(provider.id)}
+                >
+                  <Text class="text-secondary-foreground text-sm">
+                    sign in
+                  </Text>
+                </View>
+              ) : (
+                <View class="flex-row gap-2 items-center">
+                  <Input
+                    class="flex-1 rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+                    value={keyDrafts()[provider.id] ?? ""}
+                    placeholder={`${provider.label} api key`}
+                    autoCorrect={false}
+                    autoCapitalize="none"
+                    onChange={(e) =>
+                      keyDrafts.set({
+                        ...keyDrafts(),
+                        [provider.id]: e.value,
+                      })
+                    }
+                    onSubmit={() => saveKey(provider.id)}
+                  />
+                  <View
+                    role="button"
+                    class="rounded-(--radius) bg-primary px-3 py-2 active:opacity-80"
+                    onPress={() => saveKey(provider.id)}
+                  >
+                    <Text class="text-primary-foreground text-sm">save</Text>
+                  </View>
+                </View>
+              )}
+            </View>
+          ))}
+          {snap().providers.length === 0 ? (
+            <Text class="text-muted-foreground text-xs">
+              connect to a server to load providers
+            </Text>
+          ) : null}
         </View>
         {/* Automations: the snapshot's rows, removable; the add form
             refreshes the list through the bridge. */}
