@@ -18,7 +18,6 @@ use modron_core::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Anthropic provider id ([`ModelProvider::id`]).
@@ -26,8 +25,7 @@ pub const PROVIDER_ID: &str = "anthropic";
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::http::build_client;
 
 /// Anthropic Messages API client.
 pub struct AnthropicProvider {
@@ -291,14 +289,6 @@ impl AnthropicProvider {
         let _ = tx.send(StreamDelta::Done);
         Ok(parsed)
     }
-}
-
-fn build_client() -> Result<Client> {
-    Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|err| Error::Other(anyhow::anyhow!("failed to build HTTP client: {err}")))
 }
 
 /// Incremental state for one streaming turn. Reconstructs exactly what

@@ -563,7 +563,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // exactly like `daemon start`: same agent path, long-lived process.
     if let Some(Command::Serve { listen, bridge }) = &cli.command {
         let mcp = spawn_mcp_servers(&cfg).await?;
-        let agent = build_agent_with(&cli, &cfg, false, AgentSinks::for_mode(false, false), &mcp)?;
+        let agent = build_agent_with(
+            &cli,
+            &cfg,
+            false,
+            AgentSinks::for_mode(RunMode::HEADLESS),
+            &mcp,
+        )?;
         return modron_server::run_serve(
             agent.engine,
             &modron_server::ServeOptions {
@@ -795,7 +801,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         &cli,
         &cfg,
         interactive,
-        AgentSinks::for_mode(interactive, false),
+        AgentSinks::for_mode(if interactive {
+            RunMode::INTERACTIVE
+        } else {
+            RunMode::HEADLESS
+        }),
         &mcp,
     )?;
     let compaction_tail_messages = agent.engine.config.compaction.tail_messages;
@@ -931,10 +941,14 @@ struct AgentSinks {
 }
 
 impl AgentSinks {
-    fn for_mode(interactive: bool, stream: bool) -> Self {
+    fn for_mode(mode: RunMode) -> Self {
         Self {
-            approver: if interactive { tty_approver() } else { None },
-            on_delta: if stream {
+            approver: if mode.interactive {
+                tty_approver()
+            } else {
+                None
+            },
+            on_delta: if mode.stream {
                 Some(stdout_delta_sink())
             } else {
                 None
@@ -1066,17 +1080,9 @@ fn build_agent_with(
     // the engine's system-prompt section.
     let memory_root = memory_root_for(&sessions_dir);
 
-    let build_provider = |pid: &str| -> anyhow::Result<Arc<dyn ModelProvider>> {
-        Ok(match pid {
-            "mock" => Arc::new(modron_core::testing::rich_demo_provider()),
-            other => Arc::new(RetryingProvider::new(provider_from_env(other).map_err(
-                |err| {
-                    anyhow::anyhow!(err.to_string())
-                        .context(format!("cannot start provider `{other}`"))
-                },
-            )?)),
-        })
-    };
+    // Same construction as bench's build_provider_shim - one body, not two.
+    let build_provider =
+        |pid: &str| -> anyhow::Result<Arc<dyn ModelProvider>> { build_provider_shim(pid) };
 
     // Async decision model (Phase-3b M3): [judge] or [kev] — [judge] wins
     // with a warning if both are set.
@@ -1464,6 +1470,37 @@ pub(crate) fn build_provider_shim(pid: &str) -> anyhow::Result<Arc<dyn ModelProv
     })
 }
 
+/// Which surfaces a run drives (replaces the two-bool `for_mode(bool, bool)`
+/// whose six of eight call sites passed equal bools - the 2026-11-12 audit).
+#[derive(Clone, Copy)]
+pub(crate) struct RunMode {
+    interactive: bool,
+    stream: bool,
+}
+
+impl RunMode {
+    /// The TUI/ACP path: no stdout stream (the UI renders), tty approver.
+    pub(crate) const INTERACTIVE: Self = Self {
+        interactive: true,
+        stream: false,
+    };
+    /// Headless one-shots: no approver, no stream.
+    pub(crate) const HEADLESS: Self = Self {
+        interactive: false,
+        stream: false,
+    };
+    /// Headless WITH streaming (serve/daemon/direct runs print deltas).
+    pub(crate) const STREAM: Self = Self {
+        interactive: false,
+        stream: true,
+    };
+    /// The eval/bench path: tty approver AND stream.
+    pub(crate) const INTERACTIVE_STREAM: Self = Self {
+        interactive: true,
+        stream: true,
+    };
+}
+
 /// Load one attached file as an [`Attachment`] (Phase 7): images
 /// base64-encoded by extension; text files inlined; PDFs via `pdftotext`
 /// when installed (skipped with an actionable error otherwise).
@@ -1748,8 +1785,13 @@ async fn run_daemon(action: DaemonAction, cli: &Cli, cfg: &config::Config) -> an
             }
             // Build the engine with the current config.
             let mcp = spawn_mcp_servers(cfg).await?;
-            let agent =
-                build_agent_with(cli, cfg, false, AgentSinks::for_mode(false, false), &mcp)?;
+            let agent = build_agent_with(
+                cli,
+                cfg,
+                false,
+                AgentSinks::for_mode(RunMode::HEADLESS),
+                &mcp,
+            )?;
             let daemon = modron_daemon::Daemon::new(agent.engine);
             println!("starting daemon (ctrl+c to stop)…");
             daemon.run().await?;
@@ -2347,7 +2389,7 @@ async fn run_bench(
                 &model_cli,
                 cfg,
                 false,
-                AgentSinks::for_mode(false, false),
+                AgentSinks::for_mode(RunMode::HEADLESS),
                 &mcp,
             )?;
             // Re-wire the engine onto the multi-provider map (the builder
@@ -2603,7 +2645,13 @@ fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
 async fn run_chat(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     use std::io::Write as _;
     let mcp = spawn_mcp_servers(cfg).await?;
-    let agent = build_agent_with(cli, cfg, true, AgentSinks::for_mode(true, true), &mcp)?;
+    let agent = build_agent_with(
+        cli,
+        cfg,
+        true,
+        AgentSinks::for_mode(RunMode::INTERACTIVE_STREAM),
+        &mcp,
+    )?;
     println!("modron chat — one session, streaming answers. /exit or Ctrl-D to quit.");
     if let Some(tag) = crate::upgrade::startup_update_notice() {
         println!("⬆ modron {tag} is available — run `modron upgrade`");

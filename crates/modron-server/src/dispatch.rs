@@ -238,47 +238,7 @@ pub async fn handle_frame(
             Err(e) => send(ctx, error(request_id, e.to_string())),
         },
         Payload::DeleteSession { session_id } => {
-            // A running session keeps its history until it settles.
-            if state
-                .hub
-                .handle(&session_id)
-                .is_some_and(|handle| handle.is_busy())
-            {
-                send(
-                    ctx,
-                    error(
-                        request_id,
-                        "session is running - interrupt it before deleting",
-                    ),
-                );
-                return Flow::Continue;
-            }
-            match state.store.delete(session_id).await {
-                Ok(true) => {
-                    state.hub.remove(&session_id);
-                    send(
-                        ctx,
-                        reply(
-                            request_id,
-                            Some(session_id),
-                            Payload::Note {
-                                text: format!("session deleted: {session_id}"),
-                            },
-                        ),
-                    );
-                }
-                Ok(false) => {
-                    send(
-                        ctx,
-                        error_kind(
-                            request_id,
-                            format!("no such session {session_id}"),
-                            modron_protocol::ErrorKind::NotFound,
-                        ),
-                    );
-                }
-                Err(e) => send(ctx, error(request_id, format!("delete failed: {e}"))),
-            }
+            handle_delete_session(state, ctx, request_id, session_id).await;
         }
         Payload::CreateTask { title, base } => {
             match crate::tasks::create_task(
@@ -380,270 +340,23 @@ pub async fn handle_frame(
             title,
             content_md,
         } => {
-            let Some(bridge) = state.bridge_base.clone() else {
-                send(
-                    ctx,
-                    error(
-                        request_id,
-                        "no bridge configured - serve with --bridge <url> first",
-                    ),
-                );
-                return Flow::Continue;
-            };
-            let key = match crate::rc::share_key_for(state, &session_id) {
-                Some(key) => key,
-                None => {
-                    // Mint a share key the same way remote-control does;
-                    // the bridge authenticates agent posts by it.
-                    let key = crate::rc::share_key();
-                    state
-                        .rc_keys
-                        .lock()
-                        .unwrap()
-                        .insert(session_id, key.clone());
-                    key
-                }
-            };
-            match crate::rc::publish_page(&bridge, &key, session_id, &title, &content_md).await {
-                Ok(url) => send(
-                    ctx,
-                    reply(request_id, Some(session_id), Payload::PagePublished { url }),
-                ),
-                Err(e) => send(ctx, error(request_id, e.to_string())),
-            }
+            handle_publish_page(state, ctx, request_id, session_id, title, content_md).await;
         }
         Payload::AuthStart {
             session_id,
             provider,
         } => {
-            // The provider's sign-in flow runs HERE (the browser opens on
-            // the server machine); progress streams to the session as
-            // oauth_progress frames and the outcome lands as a note.
-            if !modron_core::auth::oauth_capable(&provider) {
-                send(
-                    ctx,
-                    error(
-                        request_id,
-                        format!("{provider} uses an api key - set it below"),
-                    ),
-                );
-                return Flow::Continue;
-            }
-            let Some(handle) = state.hub.handle(&session_id) else {
-                send(ctx, error(request_id, "attach a session first"));
-                return Flow::Continue;
-            };
-            let publish = move |payload: Payload| handle.publish(payload);
-            let provider_kind = provider.clone();
-            tokio::spawn(async move {
-                let progress =
-                    |stage: &str, message: &str, url: Option<String>, user_code: Option<String>| {
-                        publish(Payload::OAuthProgress {
-                            provider: provider_kind.clone(),
-                            stage: stage.to_string(),
-                            message: message.to_string(),
-                            url,
-                            user_code,
-                        });
-                    };
-                let result: anyhow::Result<String> = async {
-                    match provider_kind.as_str() {
-                        "anthropic" => {
-                            let session = modron_core::auth::oauth::prepare_login()?;
-                            progress(
-                                "waiting",
-                                "approve in the browser window",
-                                Some(session.url.clone()),
-                                None,
-                            );
-                            let code = modron_core::auth::oauth::wait_for_callback(
-                                session.port,
-                                &session.state,
-                                Some(&session.url),
-                            )
-                            .await?;
-                            let tokens =
-                                modron_core::auth::oauth::exchange_code(&session, &code).await?;
-                            modron_core::auth::oauth::save_tokens(&tokens)?;
-                            Ok(format!(
-                                "claude signed in ({})",
-                                modron_core::auth::mask_key(&tokens.access_token)
-                            ))
-                        }
-                        "zai" => {
-                            let session = modron_core::auth::oauth::zai::prepare_login()?;
-                            progress(
-                                "waiting",
-                                "approve in the browser window",
-                                Some(session.url.clone()),
-                                None,
-                            );
-                            let code = modron_core::auth::oauth::wait_for_callback(
-                                session.port,
-                                &session.state,
-                                Some(&session.url),
-                            )
-                            .await?;
-                            let (key, email) = modron_core::auth::oauth::zai::finish(
-                                &code,
-                                &session.state,
-                                session.port,
-                            )
-                            .await?;
-                            let path = modron_core::auth::env_file()
-                                .map_err(|e| anyhow::anyhow!("cannot resolve env file: {e}"))?;
-                            modron_core::auth::set_key_in_env_file(&path, "ZAI_API_KEY", &key)
-                                .map_err(|e| anyhow::anyhow!("cannot save key: {e}"))?;
-                            std::env::set_var("ZAI_API_KEY", &key);
-                            Ok(format!(
-                                "z.ai signed in{} - GLM coding plan key saved",
-                                email.map(|e| format!(" ({e})")).unwrap_or_default()
-                            ))
-                        }
-                        _ => {
-                            // The ChatGPT device flow (openai-compat).
-                            let device = modron_core::auth::oauth::chatgpt::start().await?;
-                            modron_core::auth::open_browser(&device.verification_uri);
-                            progress(
-                                "waiting",
-                                "enter the code in the browser window",
-                                Some(device.verification_uri.clone()),
-                                Some(device.user_code.clone()),
-                            );
-                            let (tokens, account) =
-                                modron_core::auth::oauth::chatgpt::finish(&device).await?;
-                            modron_core::auth::oauth::chatgpt::save(
-                                &modron_core::auth::oauth::chatgpt::ChatGptAuth {
-                                    access_token: tokens.access_token.clone(),
-                                    refresh_token: tokens.refresh_token.clone(),
-                                    account_id: account,
-                                },
-                            )?;
-                            Ok(format!(
-                                "chatgpt signed in ({})",
-                                modron_core::auth::mask_key(&tokens.access_token)
-                            ))
-                        }
-                    }
-                }
-                .await;
-                match result {
-                    Ok(text) => {
-                        progress("done", &text, None, None);
-                        publish(Payload::Note {
-                            text: format!("{provider_kind}: {text}"),
-                        });
-                    }
-                    Err(e) => {
-                        progress("failed", &e.to_string(), None, None);
-                        publish(Payload::Note {
-                            text: format!("{provider_kind} sign-in failed: {e}"),
-                        });
-                    }
-                }
-                // Providers statuses changed; the settings page re-reads
-                // them on the next AuthProviders round trip. Nudge by
-                // noting completion (clients refresh on the done stage).
-            });
-            send(
-                ctx,
-                reply(
-                    request_id,
-                    Some(session_id),
-                    Payload::Note {
-                        text: format!(
-                            "{provider}: sign-in started - watch the session for the code"
-                        ),
-                    },
-                ),
-            );
+            handle_auth_start(state, ctx, request_id, session_id, provider).await;
         }
         Payload::AuthSetKey {
             session_id,
             provider,
             key,
         } => {
-            let info = modron_core::auth::provider_registry()
-                .into_iter()
-                .find(|p| p.provider_id == provider);
-            let Some(info) = info else {
-                send(
-                    ctx,
-                    error_kind(
-                        request_id,
-                        format!("unknown provider {provider}"),
-                        modron_protocol::ErrorKind::NotFound,
-                    ),
-                );
-                return Flow::Continue;
-            };
-            let path = match modron_core::auth::env_file() {
-                Ok(path) => path,
-                Err(e) => {
-                    send(
-                        ctx,
-                        error(request_id, format!("cannot resolve env file: {e}")),
-                    );
-                    return Flow::Continue;
-                }
-            };
-            match modron_core::auth::set_key_in_env_file(&path, info.env_var, &key) {
-                Ok(()) => {
-                    std::env::set_var(info.env_var, &key);
-                    let _ = session_id;
-                    send(
-                        ctx,
-                        reply(
-                            request_id,
-                            None,
-                            Payload::Note {
-                                text: format!("{}: api key saved", info.name),
-                            },
-                        ),
-                    );
-                }
-                Err(e) => send(ctx, error(request_id, format!("cannot save key: {e}"))),
-            }
+            handle_auth_set_key(state, ctx, request_id, session_id, provider, key).await;
         }
         Payload::RouterDefaultsReq {} => {
-            // What the settings page's defaults card prefills: the authed
-            // catalog providers, the derived recommendation (the same
-            // auto-routing the serve startup notes), and the fallback
-            // chains that follow.
-            let authed: Vec<String> = modron_core::auth::provider_registry()
-                .iter()
-                .filter(|p| modron_core::auth::catalog_provider_authenticated(p.provider_id))
-                .map(|p| p.provider_id.to_string())
-                .collect();
-            let (recommended_cheap, recommended_strong, cheap_fallback, strong_fallback) =
-                match modron_router::derive_tier_candidates(&authed) {
-                    Some(candidates) => (
-                        candidates.cheap.first().cloned(),
-                        candidates.strong.first().cloned(),
-                        candidates.cheap.iter().skip(1).cloned().collect(),
-                        candidates.strong.iter().skip(1).cloned().collect(),
-                    ),
-                    None => match modron_router::derive_tiers(&authed) {
-                        Some((cheap, strong)) => {
-                            (Some(cheap), Some(strong), Vec::new(), Vec::new())
-                        }
-                        None => (None, None, Vec::new(), Vec::new()),
-                    },
-                };
-            send(
-                ctx,
-                reply(
-                    request_id,
-                    None,
-                    Payload::RouterDefaults {
-                        authed,
-                        recommended_cheap,
-                        recommended_strong,
-                        cheap_fallback,
-                        strong_fallback,
-                    },
-                ),
-            );
+            handle_router_defaults_req(state, ctx, request_id).await;
         }
         Payload::AuthProvidersReq {} | Payload::AuthProviders { .. } => {
             // AuthProvidersReq is the documented request shape; the
@@ -660,49 +373,16 @@ pub async fn handle_frame(
             cheap_fallback,
             strong_fallback,
         } => {
-            let cheap_provider = modron_router::lookup(&cheap)
-                .map(|i| i.provider.clone())
-                .unwrap_or_default();
-            let strong_provider = modron_router::lookup(&strong)
-                .map(|i| i.provider.clone())
-                .unwrap_or_default();
-            let result = (|| -> anyhow::Result<()> {
-                crate::tasks::persist_router_toml(
-                    &state.working_dir,
-                    &cheap,
-                    &strong,
-                    cheap_fallback.as_deref(),
-                    strong_fallback.as_deref(),
-                )?;
-                state.hub.apply_router_defaults(
-                    &cheap,
-                    &cheap_provider,
-                    &strong,
-                    &strong_provider,
-                    cheap_fallback.as_deref(),
-                    strong_fallback.as_deref(),
-                );
-                Ok(())
-            })();
-            match result {
-                Ok(()) => {
-                    send(
-                        ctx,
-                        reply(
-                            request_id,
-                            None,
-                            Payload::Note {
-                                text: format!(
-                                "router defaults saved: cheap {cheap} ({}), strong {strong} ({})",
-                                if cheap_provider.is_empty() { "?" } else { &cheap_provider },
-                                if strong_provider.is_empty() { "?" } else { &strong_provider }
-                            ),
-                            },
-                        ),
-                    )
-                }
-                Err(e) => send(ctx, error(request_id, e.to_string())),
-            }
+            handle_persist_router(
+                state,
+                ctx,
+                request_id,
+                cheap,
+                strong,
+                cheap_fallback,
+                strong_fallback,
+            )
+            .await;
         }
         Payload::GetTaskStatus { session_id } => {
             match crate::tasks::task_status(state, &session_id).await {
@@ -834,36 +514,7 @@ pub async fn handle_frame(
             }
         }
         Payload::Fork { session_id } => {
-            // Validate the source first: an unknown id must be an error,
-            // not a silently empty fork.
-            match state.store.load(session_id).await {
-                Ok(events) if events.is_empty() => {
-                    send(
-                        ctx,
-                        error(
-                            request_id,
-                            format!("session {session_id} has no events to fork"),
-                        ),
-                    );
-                }
-                Ok(_) => match state.store.fork(session_id).await {
-                    Ok(new_id) => {
-                        state.hub.ensure_session(new_id, None);
-                        let note = Payload::Note {
-                            text: format!("forked {session_id} -> {new_id}"),
-                        };
-                        // Both channels: the source session's clients see
-                        // the fork happen, and the requester gets the new
-                        // id even when not attached.
-                        if let Some(handle) = state.hub.handle(&session_id) {
-                            handle.publish(note.clone());
-                        }
-                        send(ctx, reply(request_id, Some(session_id), note));
-                    }
-                    Err(e) => send(ctx, error(request_id, e.to_string())),
-                },
-                Err(e) => send(ctx, error(request_id, e.to_string())),
-            }
+            handle_fork(state, ctx, request_id, session_id).await;
         }
         Payload::Attach { session_id, .. } => {
             attach(state, ctx, request_id, session_id).await;
@@ -889,6 +540,432 @@ pub async fn handle_frame(
         }
     }
     Flow::Continue
+}
+
+async fn handle_router_defaults_req(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+) {
+    // What the settings page's defaults card prefills: the authed
+    // catalog providers, the derived recommendation (the same
+    // auto-routing the serve startup notes), and the fallback
+    // chains that follow.
+    let authed: Vec<String> = modron_core::auth::provider_registry()
+        .iter()
+        .filter(|p| modron_core::auth::catalog_provider_authenticated(p.provider_id))
+        .map(|p| p.provider_id.to_string())
+        .collect();
+    let (recommended_cheap, recommended_strong, cheap_fallback, strong_fallback) =
+        match modron_router::derive_tier_candidates(&authed) {
+            Some(candidates) => (
+                candidates.cheap.first().cloned(),
+                candidates.strong.first().cloned(),
+                candidates.cheap.iter().skip(1).cloned().collect(),
+                candidates.strong.iter().skip(1).cloned().collect(),
+            ),
+            None => match modron_router::derive_tiers(&authed) {
+                Some((cheap, strong)) => (Some(cheap), Some(strong), Vec::new(), Vec::new()),
+                None => (None, None, Vec::new(), Vec::new()),
+            },
+        };
+    send(
+        ctx,
+        reply(
+            request_id,
+            None,
+            Payload::RouterDefaults {
+                authed,
+                recommended_cheap,
+                recommended_strong,
+                cheap_fallback,
+                strong_fallback,
+            },
+        ),
+    );
+}
+
+async fn handle_fork(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    session_id: SessionId,
+) {
+    // Validate the source first: an unknown id must be an error,
+    // not a silently empty fork.
+    match state.store.load(session_id).await {
+        Ok(events) if events.is_empty() => {
+            send(
+                ctx,
+                error(
+                    request_id,
+                    format!("session {session_id} has no events to fork"),
+                ),
+            );
+        }
+        Ok(_) => match state.store.fork(session_id).await {
+            Ok(new_id) => {
+                state.hub.ensure_session(new_id, None);
+                let note = Payload::Note {
+                    text: format!("forked {session_id} -> {new_id}"),
+                };
+                // Both channels: the source session's clients see
+                // the fork happen, and the requester gets the new
+                // id even when not attached.
+                if let Some(handle) = state.hub.handle(&session_id) {
+                    handle.publish(note.clone());
+                }
+                send(ctx, reply(request_id, Some(session_id), note));
+            }
+            Err(e) => send(ctx, error(request_id, e.to_string())),
+        },
+        Err(e) => send(ctx, error(request_id, e.to_string())),
+    }
+}
+
+async fn handle_delete_session(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    session_id: SessionId,
+) {
+    // A running session keeps its history until it settles.
+    if state
+        .hub
+        .handle(&session_id)
+        .is_some_and(|handle| handle.is_busy())
+    {
+        send(
+            ctx,
+            error(
+                request_id,
+                "session is running - interrupt it before deleting",
+            ),
+        );
+        return;
+    }
+    match state.store.delete(session_id).await {
+        Ok(true) => {
+            state.hub.remove(&session_id);
+            send(
+                ctx,
+                reply(
+                    request_id,
+                    Some(session_id),
+                    Payload::Note {
+                        text: format!("session deleted: {session_id}"),
+                    },
+                ),
+            );
+        }
+        Ok(false) => {
+            send(
+                ctx,
+                error_kind(
+                    request_id,
+                    format!("no such session {session_id}"),
+                    modron_protocol::ErrorKind::NotFound,
+                ),
+            );
+        }
+        Err(e) => send(ctx, error(request_id, format!("delete failed: {e}"))),
+    }
+}
+
+async fn handle_publish_page(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    session_id: SessionId,
+    title: String,
+    content_md: String,
+) {
+    let Some(bridge) = state.bridge_base.clone() else {
+        send(
+            ctx,
+            error(
+                request_id,
+                "no bridge configured - serve with --bridge <url> first",
+            ),
+        );
+        return;
+    };
+    let key = match crate::rc::share_key_for(state, &session_id) {
+        Some(key) => key,
+        None => {
+            // Mint a share key the same way remote-control does;
+            // the bridge authenticates agent posts by it.
+            let key = crate::rc::share_key();
+            state
+                .rc_keys
+                .lock()
+                .unwrap()
+                .insert(session_id, key.clone());
+            key
+        }
+    };
+    match crate::rc::publish_page(&bridge, &key, session_id, &title, &content_md).await {
+        Ok(url) => send(
+            ctx,
+            reply(request_id, Some(session_id), Payload::PagePublished { url }),
+        ),
+        Err(e) => send(ctx, error(request_id, e.to_string())),
+    }
+}
+
+async fn handle_auth_start(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    session_id: SessionId,
+    provider: String,
+) {
+    // The provider's sign-in flow runs HERE (the browser opens on
+    // the server machine); progress streams to the session as
+    // oauth_progress frames and the outcome lands as a note.
+    if !modron_core::auth::oauth_capable(&provider) {
+        send(
+            ctx,
+            error(
+                request_id,
+                format!("{provider} uses an api key - set it below"),
+            ),
+        );
+        return;
+    }
+    let Some(handle) = state.hub.handle(&session_id) else {
+        send(ctx, error(request_id, "attach a session first"));
+        return;
+    };
+    let publish = move |payload: Payload| handle.publish(payload);
+    let provider_kind = provider.clone();
+    tokio::spawn(async move {
+        let progress =
+            |stage: &str, message: &str, url: Option<String>, user_code: Option<String>| {
+                publish(Payload::OAuthProgress {
+                    provider: provider_kind.clone(),
+                    stage: stage.to_string(),
+                    message: message.to_string(),
+                    url,
+                    user_code,
+                });
+            };
+        let result: anyhow::Result<String> = async {
+            match provider_kind.as_str() {
+                "anthropic" => {
+                    let session = modron_core::auth::oauth::prepare_login()?;
+                    progress(
+                        "waiting",
+                        "approve in the browser window",
+                        Some(session.url.clone()),
+                        None,
+                    );
+                    let code = modron_core::auth::oauth::wait_for_callback(
+                        session.port,
+                        &session.state,
+                        Some(&session.url),
+                    )
+                    .await?;
+                    let tokens = modron_core::auth::oauth::exchange_code(&session, &code).await?;
+                    modron_core::auth::oauth::save_tokens(&tokens)?;
+                    Ok(format!(
+                        "claude signed in ({})",
+                        modron_core::auth::mask_key(&tokens.access_token)
+                    ))
+                }
+                "zai" => {
+                    let session = modron_core::auth::oauth::zai::prepare_login()?;
+                    progress(
+                        "waiting",
+                        "approve in the browser window",
+                        Some(session.url.clone()),
+                        None,
+                    );
+                    let code = modron_core::auth::oauth::wait_for_callback(
+                        session.port,
+                        &session.state,
+                        Some(&session.url),
+                    )
+                    .await?;
+                    let (key, email) =
+                        modron_core::auth::oauth::zai::finish(&code, &session.state, session.port)
+                            .await?;
+                    let path = modron_core::auth::env_file()
+                        .map_err(|e| anyhow::anyhow!("cannot resolve env file: {e}"))?;
+                    modron_core::auth::set_key_in_env_file(&path, "ZAI_API_KEY", &key)
+                        .map_err(|e| anyhow::anyhow!("cannot save key: {e}"))?;
+                    std::env::set_var("ZAI_API_KEY", &key);
+                    Ok(format!(
+                        "z.ai signed in{} - GLM coding plan key saved",
+                        email.map(|e| format!(" ({e})")).unwrap_or_default()
+                    ))
+                }
+                _ => {
+                    // The ChatGPT device flow (openai-compat).
+                    let device = modron_core::auth::oauth::chatgpt::start().await?;
+                    modron_core::auth::open_browser(&device.verification_uri);
+                    progress(
+                        "waiting",
+                        "enter the code in the browser window",
+                        Some(device.verification_uri.clone()),
+                        Some(device.user_code.clone()),
+                    );
+                    let (tokens, account) =
+                        modron_core::auth::oauth::chatgpt::finish(&device).await?;
+                    modron_core::auth::oauth::chatgpt::save(
+                        &modron_core::auth::oauth::chatgpt::ChatGptAuth {
+                            access_token: tokens.access_token.clone(),
+                            refresh_token: tokens.refresh_token.clone(),
+                            account_id: account,
+                        },
+                    )?;
+                    Ok(format!(
+                        "chatgpt signed in ({})",
+                        modron_core::auth::mask_key(&tokens.access_token)
+                    ))
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok(text) => {
+                progress("done", &text, None, None);
+                publish(Payload::Note {
+                    text: format!("{provider_kind}: {text}"),
+                });
+            }
+            Err(e) => {
+                progress("failed", &e.to_string(), None, None);
+                publish(Payload::Note {
+                    text: format!("{provider_kind} sign-in failed: {e}"),
+                });
+            }
+        }
+        // Providers statuses changed; the settings page re-reads
+        // them on the next AuthProviders round trip. Nudge by
+        // noting completion (clients refresh on the done stage).
+    });
+    send(
+        ctx,
+        reply(
+            request_id,
+            Some(session_id),
+            Payload::Note {
+                text: format!("{provider}: sign-in started - watch the session for the code"),
+            },
+        ),
+    );
+}
+
+async fn handle_auth_set_key(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    session_id: SessionId,
+    provider: String,
+    key: String,
+) {
+    let info = modron_core::auth::provider_registry()
+        .into_iter()
+        .find(|p| p.provider_id == provider);
+    let Some(info) = info else {
+        send(
+            ctx,
+            error_kind(
+                request_id,
+                format!("unknown provider {provider}"),
+                modron_protocol::ErrorKind::NotFound,
+            ),
+        );
+        return;
+    };
+    let path = match modron_core::auth::env_file() {
+        Ok(path) => path,
+        Err(e) => {
+            send(
+                ctx,
+                error(request_id, format!("cannot resolve env file: {e}")),
+            );
+            return;
+        }
+    };
+    match modron_core::auth::set_key_in_env_file(&path, info.env_var, &key) {
+        Ok(()) => {
+            std::env::set_var(info.env_var, &key);
+            let _ = session_id;
+            send(
+                ctx,
+                reply(
+                    request_id,
+                    None,
+                    Payload::Note {
+                        text: format!("{}: api key saved", info.name),
+                    },
+                ),
+            );
+        }
+        Err(e) => send(ctx, error(request_id, format!("cannot save key: {e}"))),
+    }
+}
+
+async fn handle_persist_router(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    cheap: String,
+    strong: String,
+    cheap_fallback: Option<String>,
+    strong_fallback: Option<String>,
+) {
+    let cheap_provider = modron_router::lookup(&cheap)
+        .map(|i| i.provider.clone())
+        .unwrap_or_default();
+    let strong_provider = modron_router::lookup(&strong)
+        .map(|i| i.provider.clone())
+        .unwrap_or_default();
+    let result = (|| -> anyhow::Result<()> {
+        crate::tasks::persist_router_toml(
+            &state.working_dir,
+            &cheap,
+            &strong,
+            cheap_fallback.as_deref(),
+            strong_fallback.as_deref(),
+        )?;
+        state.hub.apply_router_defaults(
+            &cheap,
+            &cheap_provider,
+            &strong,
+            &strong_provider,
+            cheap_fallback.as_deref(),
+            strong_fallback.as_deref(),
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => send(
+            ctx,
+            reply(
+                request_id,
+                None,
+                Payload::Note {
+                    text: format!(
+                        "router defaults saved: cheap {cheap} ({}), strong {strong} ({})",
+                        if cheap_provider.is_empty() {
+                            "?"
+                        } else {
+                            &cheap_provider
+                        },
+                        if strong_provider.is_empty() {
+                            "?"
+                        } else {
+                            &strong_provider
+                        }
+                    ),
+                },
+            ),
+        ),
+        Err(e) => send(ctx, error(request_id, e.to_string())),
+    }
 }
 
 /// Submit a task. `session_id: None` reserves a fresh session (the id

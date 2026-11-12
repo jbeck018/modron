@@ -13,6 +13,7 @@
 
 pub mod anthropic;
 pub mod factory;
+pub mod http;
 pub mod openai_compat;
 pub mod openai_responses;
 pub mod retry;

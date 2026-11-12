@@ -235,7 +235,7 @@ pub(crate) async fn run_evals(
                 &model_cli,
                 cfg,
                 false,
-                AgentSinks::for_mode(false, false),
+                AgentSinks::for_mode(crate::RunMode::HEADLESS),
                 &mcp,
             )?;
             let mut task = task.clone();

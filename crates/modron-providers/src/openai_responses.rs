@@ -21,14 +21,12 @@ use modron_core::{
 };
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// ChatGPT (subscription) provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "chatgpt";
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::http::build_client;
 const DONE_SENTINEL: &str = "[DONE]";
 
 /// Live credentials behind a lock: a successful refresh swaps them in
@@ -272,17 +270,6 @@ impl ModelProvider for OpenAiResponsesProvider {
     ) -> Result<TurnResponse> {
         self.turn_streaming_inner(req, tx).await
     }
-}
-
-fn build_client() -> Result<Client> {
-    Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|err| Error::Provider {
-            provider: PROVIDER_ID.into(),
-            message: format!("cannot build http client: {err}"),
-        })
 }
 
 /// Map a [`TurnRequest`] to the Responses API body shape: `instructions`

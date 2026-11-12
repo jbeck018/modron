@@ -19,15 +19,13 @@ use modron_core::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// OpenAI-compat provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "openai-compat";
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::http::build_client;
 
 /// Any OpenAI-compatible chat-completions endpoint.
 pub struct OpenAiCompatProvider {
@@ -295,14 +293,6 @@ impl OaiStreamAccumulator {
             stop_reason: map_stop_reason(self.finish_reason.as_deref()),
         })
     }
-}
-
-fn build_client() -> Result<Client> {
-    Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|err| Error::Other(anyhow::anyhow!("failed to build HTTP client: {err}")))
 }
 
 /// Build the `/chat/completions` request body from a [`TurnRequest`].
