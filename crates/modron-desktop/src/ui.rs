@@ -1320,7 +1320,6 @@ impl DesktopApp {
                 .px_2()
                 .py_1p5()
                 .rounded_md()
-                .cursor_pointer()
                 .hover(|style| style.bg(theme.secondary.opacity(0.5)))
                 .on_click(move |e, w, cx| on_click(e, w, cx))
                 .child(
@@ -1685,7 +1684,6 @@ impl DesktopApp {
                     .py_1()
                     .min_h(px(32.))
                     .rounded_md()
-                    .cursor_pointer()
                     .when(checked_row, |row| row.bg(theme.accent))
                     .when(attached && !checked_row, |row| row.bg(theme.secondary))
                     .hover(move |row| row.bg(hover_bg))
@@ -2076,7 +2074,6 @@ impl DesktopApp {
                             .border_1()
                             .border_color(theme.border)
                             .bg(theme.muted)
-                            .cursor_pointer()
                             .hover(|row| row.border_color(theme.accent))
                             .on_click(move |_event: &ClickEvent, _window, cx| {
                                 entity.update(cx, |this, cx| {
@@ -2436,7 +2433,6 @@ impl DesktopApp {
             live = live.child(
                 div()
                     .id("tool-strip")
-                    .cursor_pointer()
                     .text_size(px(crate::brand::text::SM))
                     .text_color(theme.accent)
                     .on_click(move |_e: &ClickEvent, _w, cx| {
@@ -2617,7 +2613,6 @@ impl DesktopApp {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .cursor_pointer()
                                 .hover(|style| style.bg(theme.secondary.opacity(0.5)))
                                 .on_click(move |_e, window, cx: &mut App| {
                                     entity_click.update(cx, |this, cx| {
@@ -3977,7 +3972,6 @@ impl DesktopApp {
                     .px_2()
                     .py_1()
                     .rounded_sm()
-                    .cursor_pointer()
                     .flex()
                     .flex_row()
                     .items_center()
