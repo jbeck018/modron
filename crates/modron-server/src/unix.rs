@@ -63,6 +63,7 @@ async fn serve_unix_connection(stream: UnixStream, state: Arc<ServerState>) -> a
                         seq: 0,
                         payload: modron_protocol::Payload::Error {
                             message: format!("unparseable frame: {e}"),
+                            kind: None,
                         },
                     },
                 );

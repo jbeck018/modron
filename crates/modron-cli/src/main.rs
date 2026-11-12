@@ -190,6 +190,13 @@ enum Command {
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
+    /// Per-turn harness trace rows for one session (model, latency, cost,
+    /// prompt hash, verifier verdict, stop label) - the TurnTrace reader
+    /// (the events were persisted since the AHE pass; nothing read them).
+    Traces {
+        /// The session id (`modron sessions list` prints them).
+        session: String,
+    },
     /// Aggregate token/cost dashboard across sessions (provider-reported
     /// usage, catalog-priced costs, cache-hit rates).
     Usage {
@@ -237,6 +244,14 @@ enum SessionsAction {
 enum McpAction {
     /// Inspect one configured server by name.
     Info { name: String },
+    /// Read one resource from a configured server (the `read_resource`
+    /// capability was unreachable before the 2026-11-12 audit).
+    Read {
+        /// The configured server name (`modron mcp info <name>` lists URIs).
+        name: String,
+        /// The resource URI to read.
+        uri: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -503,6 +518,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
     }
+    if let Some(Command::Traces { session }) = &cli.command {
+        return run_traces(&sessions_dir, session).await;
+    }
     // `modron usage` — the aggregate dashboard (Phase-2a D1).
     if let Some(Command::Usage { last }) = cli.command {
         return run_usage(&sessions_dir, last).await;
@@ -563,6 +581,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     // `modron mcp info …` — server inspection (Phase 5e).
+    if let Some(Command::Mcp {
+        action: McpAction::Read { name, uri },
+    }) = &cli.command
+    {
+        return run_mcp_read(&cfg, name.clone(), uri.clone()).await;
+    }
     if let Some(Command::Mcp {
         action: McpAction::Info { name },
     }) = cli.command
@@ -2022,6 +2046,132 @@ async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> 
         _ => println!("prompts: none"),
     }
     Ok(())
+}
+
+/// `modron mcp read <server> <uri>`: read one resource's contents
+/// (2026-11-12 audit: `read_resource` existed and was tested, but no
+/// surface could reach it).
+async fn run_mcp_read(cfg: &config::Config, name: String, uri: String) -> anyhow::Result<()> {
+    let handle = mcp_handle(cfg, &name).await?;
+    let mut handle = handle.lock().await;
+    let text = handle.read_resource(&uri).await?;
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// Shared MCP plumbing: validate the configured server and spawn it.
+async fn mcp_handle(
+    cfg: &config::Config,
+    name: &str,
+) -> anyhow::Result<Arc<tokio::sync::Mutex<modron_mcp::McpServerHandle>>> {
+    let Some(mcp) = &cfg.mcp else {
+        anyhow::bail!("no [mcp.servers] configured");
+    };
+    let Some(server) = mcp.servers.get(name) else {
+        let available: Vec<&str> = mcp.servers.keys().map(|s| s.as_str()).collect();
+        anyhow::bail!(
+            "unknown MCP server `{name}` — configured: {}",
+            if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available.join(", ")
+            }
+        );
+    };
+    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
+    let args = server.args.clone().unwrap_or_default();
+    let (handle, _tools) =
+        modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await?;
+    Ok(handle)
+}
+
+/// `modron traces <session>`: tabulate the session's TurnTrace rows
+/// (2026-11-12 audit: the harness-observability records were persisted
+/// every turn with no reader anywhere).
+async fn run_traces(sessions_dir: &std::path::Path, session: &str) -> anyhow::Result<()> {
+    let id = uuid::Uuid::parse_str(session.trim())
+        .map_err(|_| anyhow::anyhow!("session must be a uuid (see `modron sessions list`)"))?;
+    let store = modron_store::JsonlSessionStore::new(sessions_dir);
+    let events = store.load(id).await?;
+    let mut rows = Vec::new();
+    for event in &events {
+        if let modron_core::SessionEvent::TurnTrace {
+            turn,
+            provider,
+            model,
+            prompt_hash,
+            latency_ms,
+            cost_usd,
+            usage,
+            verifier,
+            failure_label,
+            ..
+        } = event
+        {
+            rows.push((
+                *turn,
+                provider.clone(),
+                model.clone(),
+                prompt_hash.clone(),
+                *latency_ms,
+                *cost_usd,
+                *usage,
+                verifier.clone(),
+                failure_label.clone(),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        println!("no TurnTrace rows in session {id}");
+        return Ok(());
+    }
+    println!(
+        "  turn  provider   model                  latency    in+out      cost  verify   stop"
+    );
+    let mut total_cost = 0.0;
+    for (turn, provider, model, hash, latency, cost, usage, verifier, stop) in &rows {
+        let tok = usage
+            .map(|u| u.input_tokens + u.output_tokens)
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".into());
+        let lat = latency
+            .map(|l| format!("{l}ms"))
+            .unwrap_or_else(|| "-".into());
+        let cost_s = cost
+            .map(|c| {
+                total_cost += c;
+                format!("${:.4}", c)
+            })
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:>5}  {:<10} {:<22} {:>9} {:>9} {:>9}  {:<8} {}",
+            turn,
+            truncate(provider, 10),
+            truncate(model, 22),
+            lat,
+            tok,
+            cost_s,
+            verifier.as_deref().unwrap_or("-"),
+            stop.as_deref().unwrap_or("-")
+        );
+        if let Some(h) = hash {
+            println!("      prompt_hash: {}", &h[..h.len().min(16)]);
+        }
+    }
+    println!("{} turn(s) · total cost ${:.4}", rows.len(), total_cost);
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    }
 }
 
 /// The curated FREE model list (Phase 5f, OpenCode-style comparison):

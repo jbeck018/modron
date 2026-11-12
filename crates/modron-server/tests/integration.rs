@@ -21,7 +21,7 @@ fn note_text(payload: &Payload) -> Option<&str> {
 
 fn error_text(payload: &Payload) -> Option<&str> {
     match payload {
-        Payload::Error { message } => Some(message),
+        Payload::Error { message, .. } => Some(message),
         _ => None,
     }
 }

@@ -75,7 +75,7 @@ impl WireClient {
                 }
                 server_version
             }
-            Payload::Error { message } => return Err(anyhow!("handshake rejected: {message}")),
+            Payload::Error { message, .. } => return Err(anyhow!("handshake rejected: {message}")),
             other => {
                 return Err(anyhow!(
                     "expected welcome, got {:?}",
@@ -156,7 +156,7 @@ impl WireClient {
             };
             self.track_seq(&frame);
             if frame.id == Some(id) {
-                if let Payload::Error { message } = frame.payload {
+                if let Payload::Error { message, .. } = frame.payload {
                     return Err(anyhow!("request {id} failed: {message}"));
                 }
                 return Ok(frame);
@@ -303,7 +303,7 @@ pub fn payload_for(command: &Command, last_seq: u64) -> Payload {
         },
         Command::ListSessions => Payload::ListSessions {},
         Command::DeleteSession(id) => Payload::DeleteSession { session_id: *id },
-        Command::AuthProviders {} => Payload::AuthProviders { rows: Vec::new() },
+        Command::AuthProviders {} => Payload::AuthProvidersReq {},
         Command::PersistRouter {
             cheap,
             strong,
@@ -400,6 +400,11 @@ pub async fn run_client(
         }
     };
 
+    // Keepalive (2026-11-12 audit: Command::Ping existed, was mapped, and
+    // was never sent - an idle drop went unnoticed until the next action).
+    // 20s cadence; a dead TCP peer usually surfaces within two rounds.
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(20));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -410,11 +415,21 @@ pub async fn run_client(
                     break;
                 }
             }
+            _ = keepalive.tick() => {
+                if let Err(e) = client.send(Payload::Ping {}).await {
+                    let _ = event_tx.send(UiEvent::Disconnected(format!("{e:#}"))).await;
+                    break;
+                }
+            }
             frame = client.recv() => {
                 let Some(frame) = frame else {
                     let _ = event_tx.send(UiEvent::Disconnected("connection closed".into())).await;
                     break;
                 };
+                // Pongs are connection-scoped; not UI state.
+                if matches!(frame.payload, Payload::Pong {}) {
+                    continue;
+                }
                 if event_tx
                     .send(UiEvent::Frame(Box::new(frame)))
                     .await
@@ -672,6 +687,7 @@ mod tests {
                 0,
                 Payload::Error {
                     message: "no such session".into(),
+                    kind: None,
                 },
             );
             err.id = frame.id;

@@ -77,6 +77,7 @@ async fn serve_ws_connection(
                         seq: 0,
                         payload: modron_protocol::Payload::Error {
                             message: format!("unparseable frame: {e}"),
+                            kind: None,
                         },
                     },
                 );

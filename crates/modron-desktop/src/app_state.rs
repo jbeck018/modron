@@ -299,6 +299,8 @@ impl AppState {
                 self.last_note = Some(format!("published: {url}"));
             }
             Payload::AuthProviders { rows } => self.auth_providers = rows.clone(),
+            // The request shape never flows server->client.
+            Payload::AuthProvidersReq {} => {}
             Payload::Automations { rows } => self.automations = rows.clone(),
             // Client->server lifecycle frames echo nothing; the GUI drives
             // these itself via commands.
@@ -332,7 +334,7 @@ impl AppState {
                 }
                 self.last_note = Some(line);
             }
-            Payload::Error { message } => self.last_note = Some(message),
+            Payload::Error { message, .. } => self.last_note = Some(message),
             Payload::Pong {} => {}
             // Client-only payloads never arrive inbound.
             Payload::RouterDefaults {

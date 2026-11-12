@@ -1731,7 +1731,7 @@ fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
         Payload::RemoteControlStarted { url } => vec![LoopInput::Note(format!(
             "remote-control live — open {url} on any device to watch and drive this session"
         ))],
-        Payload::Error { message } => vec![LoopInput::Note(format!("server error: {message}"))],
+        Payload::Error { message, .. } => vec![LoopInput::Note(format!("server error: {message}"))],
         // Worktree-task status as a compact text block (the desktop shows
         // a review overlay; the TUI reads).
         Payload::TaskStatus {

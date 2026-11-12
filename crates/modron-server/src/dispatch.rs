@@ -95,11 +95,23 @@ fn reply(id: Option<u64>, session: Option<SessionId>, payload: Payload) -> Frame
 }
 
 fn error(frame_id: Option<u64>, message: impl Into<String>) -> Frame {
+    error_kind(frame_id, message, modron_protocol::ErrorKind::Other)
+}
+
+/// `error` with a machine-readable kind (2026-11-12 audit: clients should
+/// never have to match message strings).
+#[allow(dead_code)]
+fn error_kind(
+    frame_id: Option<u64>,
+    message: impl Into<String>,
+    kind: modron_protocol::ErrorKind,
+) -> Frame {
     reply(
         frame_id,
         None,
         Payload::Error {
             message: message.into(),
+            kind: Some(kind),
         },
     )
 }
@@ -134,7 +146,10 @@ pub async fn handle_frame(
             if let Err(message) =
                 pairing::check_token(trusted, token.as_deref(), &state.devices_dir)
             {
-                send(ctx, error(request_id, message));
+                send(
+                    ctx,
+                    error_kind(request_id, message, modron_protocol::ErrorKind::Auth),
+                );
                 return Flow::Close;
             }
             ctx.authed = true;
@@ -152,7 +167,14 @@ pub async fn handle_frame(
             return Flow::Continue;
         }
         _ if !ctx.authed => {
-            send(ctx, error(request_id, "send a hello frame first"));
+            send(
+                ctx,
+                error_kind(
+                    request_id,
+                    "send a hello frame first",
+                    modron_protocol::ErrorKind::Auth,
+                ),
+            );
             return Flow::Close;
         }
         Payload::Ping {} => {
@@ -240,7 +262,11 @@ pub async fn handle_frame(
                 Ok(false) => {
                     send(
                         ctx,
-                        error(request_id, format!("no such session {session_id}")),
+                        error_kind(
+                            request_id,
+                            format!("no such session {session_id}"),
+                            modron_protocol::ErrorKind::NotFound,
+                        ),
                     );
                 }
                 Err(e) => send(ctx, error(request_id, format!("delete failed: {e}"))),
@@ -535,7 +561,11 @@ pub async fn handle_frame(
             let Some(info) = info else {
                 send(
                     ctx,
-                    error(request_id, format!("unknown provider {provider}")),
+                    error_kind(
+                        request_id,
+                        format!("unknown provider {provider}"),
+                        modron_protocol::ErrorKind::NotFound,
+                    ),
                 );
                 return Flow::Continue;
             };
@@ -607,26 +637,10 @@ pub async fn handle_frame(
                 ),
             );
         }
-        Payload::AuthProviders { .. } => {
-            use modron_core::auth::{oauth_capable, oauth_signed_in, provider_registry};
-            let rows = provider_registry()
-                .iter()
-                .map(|info| {
-                    let status = if oauth_signed_in(info.provider_id) {
-                        "subscription (oauth)".to_string()
-                    } else if std::env::var(info.env_var).is_ok() {
-                        "api key".to_string()
-                    } else {
-                        "not configured".to_string()
-                    };
-                    modron_protocol::AuthProviderWire {
-                        id: info.provider_id.to_string(),
-                        label: info.name.to_string(),
-                        status,
-                        oauth_capable: oauth_capable(info.provider_id),
-                    }
-                })
-                .collect();
+        Payload::AuthProvidersReq {} | Payload::AuthProviders { .. } => {
+            // AuthProvidersReq is the documented request shape; the
+            // reply-shaped frame still works for older clients.
+            let rows = auth_provider_rows();
             send(
                 ctx,
                 reply(request_id, None, Payload::AuthProviders { rows }),
@@ -779,7 +793,11 @@ pub async fn handle_frame(
                 }
                 None => send(
                     ctx,
-                    error(request_id, format!("no such session {session_id}")),
+                    error_kind(
+                        request_id,
+                        format!("no such session {session_id}"),
+                        modron_protocol::ErrorKind::NotFound,
+                    ),
                 ),
             }
         }
@@ -1038,6 +1056,29 @@ async fn attach(
     });
 }
 
+/// Provider auth status rows (the AuthProvidersReq answer).
+fn auth_provider_rows() -> Vec<modron_protocol::AuthProviderWire> {
+    use modron_core::auth::{oauth_capable, oauth_signed_in, provider_registry};
+    provider_registry()
+        .iter()
+        .map(|info| {
+            let status = if oauth_signed_in(info.provider_id) {
+                "subscription (oauth)".to_string()
+            } else if std::env::var(info.env_var).is_ok() {
+                "api key".to_string()
+            } else {
+                "not configured".to_string()
+            };
+            modron_protocol::AuthProviderWire {
+                id: info.provider_id.to_string(),
+                label: info.name.to_string(),
+                status,
+                oauth_capable: oauth_capable(info.provider_id),
+            }
+        })
+        .collect()
+}
+
 /// The variant name for misuse diagnostics (no Debug on Payload, so read
 /// the serde tag shape instead).
 fn variant_name(payload: &Payload) -> &'static str {
@@ -1073,7 +1114,7 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::RouterDefaultsReq { .. } => "router_defaults_req",
         Payload::RouterDefaults { .. } => "router_defaults",
         Payload::AuthSetKey { .. } => "auth_set_key",
-        Payload::AuthProviders { .. } => "auth_providers",
+        Payload::AuthProviders { .. } | Payload::AuthProvidersReq {} => "auth_providers",
         Payload::PersistRouter { .. } => "persist_router",
         Payload::CreateTask { .. } => "create_task",
         Payload::GetTaskStatus { .. } => "get_task_status",

@@ -77,6 +77,21 @@ impl Frame {
 // Payload
 // ---------------------------------------------------------------------------
 
+/// Why a server-side failure happened (clients branch on this without
+/// string matching: auto re-auth on Auth, retry on Busy, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// Credentials missing/expired/revoked - re-auth fixes it.
+    Auth,
+    /// Unknown id / missing resource.
+    NotFound,
+    /// The request conflicts with live state (busy session, read-only).
+    Conflict,
+    /// Everything else (config errors, transport, internal).
+    Other,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Payload {
@@ -174,7 +189,10 @@ pub enum Payload {
         title: String,
         content_md: String,
     },
-    /// Provider auth status rows (answered by `auth_providers`).
+    /// Ask for provider auth status rows (answered by `auth_providers`).
+    /// (The reply-shaped `AuthProviders { rows: [] }` still works for
+    /// older clients; new clients send this.)
+    AuthProvidersReq {},
 
     /// Persist router defaults into the server's config.toml and apply
     /// them to future sessions. Answered by a correlated `note`.
@@ -295,8 +313,14 @@ pub enum Payload {
     Note { text: String },
     /// Answer to `ping`.
     Pong {},
-    /// A request failed (echoes the request `id`).
-    Error { message: String },
+    /// A request failed (echoes the request `id`). `kind` lets clients
+    /// react without string matching (e.g. auto re-auth on auth errors);
+    /// absent on older servers.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ErrorKind>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +918,7 @@ mod tests {
                 seq: 0,
                 payload: Payload::Error {
                     message: "no such session".into(),
+                    kind: None,
                 },
             },
         ];

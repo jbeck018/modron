@@ -172,6 +172,16 @@ async fn handle_frame(demo: &Arc<Demo>, frame: Frame, tx: &mpsc::Sender<Frame>) 
             demo.send_sessions(tx).await;
         }
         Payload::ListSessions {} => demo.send_sessions(tx).await,
+        Payload::AuthProvidersReq {} | Payload::AuthProviders { .. } => {
+            // The demo has no providers; answer so the settings page renders.
+            let _ = tx
+                .send(Frame::event(
+                    None,
+                    0,
+                    Payload::AuthProviders { rows: Vec::new() },
+                ))
+                .await;
+        }
         Payload::Ping {} => {
             let mut pong = Frame::event(None, 0, Payload::Pong {});
             pong.id = frame.id;

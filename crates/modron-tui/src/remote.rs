@@ -185,7 +185,7 @@ impl RemoteClient {
                 "server speaks protocol {protocol}, this build speaks {PROTOCOL_VERSION} ({target})"
             ),
             Some(Frame {
-                payload: Payload::Error { message },
+                payload: Payload::Error { message, kind: _ },
                 ..
             }) => bail!("server refused the connection: {message}"),
             _ => bail!("server did not answer the handshake ({target})"),
@@ -261,7 +261,7 @@ impl RemoteClient {
                         ..
                     }) => return Ok(sessions),
                     Some(Frame {
-                        payload: Payload::Error { message },
+                        payload: Payload::Error { message, kind: _ },
                         ..
                     }) => bail!("list_sessions failed: {message}"),
                     Some(_) => continue,
@@ -309,7 +309,7 @@ impl RemoteClient {
                         })
                     }
                     Some(Frame {
-                        payload: Payload::Error { message },
+                        payload: Payload::Error { message, kind: _ },
                         ..
                     }) => bail!("attach failed: {message}"),
                     Some(_) => continue,

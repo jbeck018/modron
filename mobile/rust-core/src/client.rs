@@ -502,7 +502,7 @@ impl RemoteClient {
     pub fn auth_providers(&self) -> Result<(), ClientError> {
         self.send_frame(Frame::request(
             self.next_request_id(),
-            Payload::AuthProviders { rows: Vec::new() },
+            Payload::AuthProvidersReq {},
         ))
     }
 
@@ -883,7 +883,7 @@ fn fold_frame(shared: &Shared, frame: Frame) {
                 user_code,
             });
         }
-        Payload::Error { message } => {
+        Payload::Error { message, .. } => {
             vm.last_error = Some(message.clone());
         }
         Payload::Pong {} => {}
