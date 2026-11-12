@@ -17,7 +17,7 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::Icon;
-use gpui_kit::component::{ActiveTheme, Selectable, Sizable};
+use gpui_kit::component::{ActiveTheme, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     actions, div, list, px, AnyElement, App, AppContext, ClickEvent, Context, Entity, FocusHandle,
@@ -1412,6 +1412,7 @@ impl DesktopApp {
             .flex()
             .flex_row()
             .items_center()
+            .gap_1()
             .mx_2()
             .px_2()
             .pt_2()
@@ -1448,66 +1449,73 @@ impl DesktopApp {
                         }),
                 );
         } else if self.select_mode {
-            // Bulk mode: the header becomes the action bar.
-            let entity_all = entity.clone();
+            // Bulk mode: the header becomes the action bar. Clear roles:
+            // a count, "select all" text, trash + count for delete
+            // (disabled at zero, destructive red on confirm), x to exit.
             let entity_cancel = entity.clone();
             let entity_delete = entity.clone();
             let count = self.selected_sessions.len();
             let confirm = self.bulk_confirm;
+            let count_label = if count == 0 {
+                "no sessions selected".to_string()
+            } else {
+                format!("{count} selected")
+            };
             header_row = header_row
                 .child(
                     div()
                         .flex_1()
+                        .truncate()
                         .text_size(px(crate::brand::text::SM))
                         .text_color(theme.foreground)
-                        .child(SharedString::from(format!("{count} selected"))),
+                        .child(SharedString::from(count_label)),
                 )
-                .child(
+                .child({
+                    let entity = entity.clone();
                     Button::new("select-all")
-                        .label("all")
+                        .label("select all")
                         .ghost()
                         .xsmall()
                         .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                            entity_all.update(cx, |this, cx| {
+                            entity.update(cx, |this, cx| {
                                 for s in &this.state.sessions {
                                     this.selected_sessions.insert(s.id);
                                 }
                                 this.refresh(cx);
                             });
-                        }),
-                )
+                        })
+                })
                 .child({
                     let mut delete = Button::new("bulk-delete")
-                        .label(if confirm {
-                            "confirm delete".to_string()
-                        } else if count > 0 {
-                            format!("delete {count}")
-                        } else {
-                            "delete".to_string()
-                        })
-                        .outline()
+                        .icon(Icon::default().path("icons/trash.svg").size_4())
+                        .label(format!("{count}"))
+                        .disabled(count == 0)
                         .xsmall();
                     if count > 0 {
-                        delete = delete.on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
-                            entity_delete.update(cx, |this, cx| {
-                                if !confirm {
+                        if confirm {
+                            delete = delete.danger().label("confirm").on_click(
+                                move |_e: &ClickEvent, _w, cx: &mut App| {
+                                    entity_delete.update(cx, |this, cx| {
+                                        let ids: Vec<uuid::Uuid> =
+                                            this.selected_sessions.drain().collect();
+                                        this.select_mode = false;
+                                        this.bulk_confirm = false;
+                                        for id in ids {
+                                            this.send(Command::DeleteSession(id));
+                                        }
+                                        this.send(Command::ListSessions {});
+                                        this.refresh(cx);
+                                    });
+                                },
+                            );
+                        } else {
+                            delete = delete.on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                                entity_delete.update(cx, |this, cx| {
                                     this.bulk_confirm = true;
                                     this.refresh(cx);
-                                    return;
-                                }
-                                let ids: Vec<uuid::Uuid> = this.selected_sessions.drain().collect();
-                                this.select_mode = false;
-                                this.bulk_confirm = false;
-                                for id in ids {
-                                    this.send(Command::DeleteSession(id));
-                                }
-                                this.send(Command::ListSessions {});
-                                this.refresh(cx);
+                                });
                             });
-                        });
-                    }
-                    if confirm {
-                        delete = delete.danger().label("confirm delete");
+                        }
                     }
                     delete.into_any_element()
                 })
@@ -1526,52 +1534,31 @@ impl DesktopApp {
                         }),
                 );
         } else {
-            header_row = header_row
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(crate::brand::text::SM))
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from("Sessions")),
-                )
-                .child({
-                    let entity = entity.clone();
-                    Button::new("bulk-toggle")
-                        .icon(Icon::default().path("icons/list-checks.svg").size_4())
-                        .ghost()
-                        .xsmall()
-                        .on_click(move |_e, _w, cx: &mut App| {
-                            entity.update(cx, |this, cx| {
-                                this.select_mode = true;
-                                this.refresh(cx);
-                            });
-                        })
-                })
-                .child({
-                    let entity = entity.clone();
-                    Button::new("search-toggle")
-                        .icon(Icon::default().path("icons/search.svg").size_4())
-                        .ghost()
-                        .xsmall()
-                        .selected(self.search_open)
-                        .on_click(move |_e, window, cx: &mut App| {
-                            entity.update(cx, |this, cx| {
-                                this.search_open = !this.search_open;
-                                if this.search_open {
-                                    this.session_filter.update(cx, |input, cx| {
-                                        let handle = input.focus_handle(cx);
-                                        window.focus(&handle, cx);
-                                    });
-                                } else {
-                                    // Esc grammar: closing the search clears it.
-                                    this.session_filter_query.clear();
-                                    this.session_filter
-                                        .update(cx, |input, cx| input.set_value("", window, cx));
-                                }
-                                this.refresh(cx);
-                            });
-                        })
-                });
+            header_row = header_row.child({
+                let entity = entity.clone();
+                Button::new("search-toggle")
+                    .icon(Icon::default().path("icons/search.svg").size_4())
+                    .ghost()
+                    .xsmall()
+                    .selected(self.search_open)
+                    .on_click(move |_e, window, cx: &mut App| {
+                        entity.update(cx, |this, cx| {
+                            this.search_open = !this.search_open;
+                            if this.search_open {
+                                this.session_filter.update(cx, |input, cx| {
+                                    let handle = input.focus_handle(cx);
+                                    window.focus(&handle, cx);
+                                });
+                            } else {
+                                // Esc grammar: closing the search clears it.
+                                this.session_filter_query.clear();
+                                this.session_filter
+                                    .update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                            this.refresh(cx);
+                        });
+                    })
+            });
         }
         let mut list = list.child(header_row);
 
