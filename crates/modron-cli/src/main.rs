@@ -1489,11 +1489,6 @@ impl RunMode {
         interactive: false,
         stream: false,
     };
-    /// Headless WITH streaming (serve/daemon/direct runs print deltas).
-    pub(crate) const STREAM: Self = Self {
-        interactive: false,
-        stream: true,
-    };
     /// The eval/bench path: tty approver AND stream.
     pub(crate) const INTERACTIVE_STREAM: Self = Self {
         interactive: true,

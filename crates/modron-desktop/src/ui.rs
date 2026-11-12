@@ -159,6 +159,27 @@ impl LaunchOptions {
 
 /// The desktop app entity. Protocol frames land in `state`; rendering is
 /// a pure projection (see `display` and the render_* methods).
+/// The overlay form inputs, grouped (2026-11-12 audit: the god-object
+/// field list spanned four unrelated forms; each now owns its inputs).
+pub struct Forms {
+    /// Automations add/edit-form fields (name/prompt/interval).
+    pub auto_name: Entity<InputState>,
+    pub auto_prompt: Entity<InputState>,
+    pub auto_interval: Entity<InputState>,
+    /// The automation being edited (remove+add flow on save).
+    pub editing_automation: Option<String>,
+    /// Onboarding wizard step (0 = providers, 1 = model wiring).
+    pub onboarding_step: Option<usize>,
+    pub onboarding_cheap: Entity<InputState>,
+    pub onboarding_strong: Entity<InputState>,
+    pub onboarding_strong_fb: Entity<InputState>,
+    /// The "New task" inline form (Conductor/Para grammar: a task spawns
+    /// an agent in its own worktree + branch).
+    pub new_task_open: bool,
+    pub new_task_title: Entity<InputState>,
+    pub new_task_base: Entity<InputState>,
+}
+
 pub struct DesktopApp {
     state: AppState,
     cmd_tx: async_channel::Sender<Command>,
@@ -232,22 +253,8 @@ pub struct DesktopApp {
     goal_input: Entity<InputState>,
     cheap_model_input: Entity<InputState>,
     strong_model_input: Entity<InputState>,
-    /// Automations add/edit-form fields (name/prompt/interval).
-    auto_name: Entity<InputState>,
-    auto_prompt: Entity<InputState>,
-    auto_interval: Entity<InputState>,
-    /// The automation being edited (remove+add flow on save).
-    editing_automation: Option<String>,
-    /// Onboarding wizard step (0 = providers, 1 = model wiring).
-    onboarding_step: Option<usize>,
-    onboarding_cheap: Entity<InputState>,
-    onboarding_strong: Entity<InputState>,
-    onboarding_strong_fb: Entity<InputState>,
-    /// The "New task" inline form (Conductor/Para grammar: a task spawns
-    /// an agent in its own worktree + branch).
-    new_task_open: bool,
-    new_task_title: Entity<InputState>,
-    new_task_base: Entity<InputState>,
+    /// The overlay forms (automations / onboarding / new task).
+    forms: Forms,
     /// Per-session review overlay (files +/- counts from task_status).
     review_open: Option<uuid::Uuid>,
     review_files: Vec<modron_protocol::TaskFileStat>,
@@ -398,28 +405,31 @@ impl DesktopApp {
             hovered_row: None,
             anim_tick: 0,
             settings_open: false,
-            new_task_open: false,
-            auto_name: cx.new(|cx| InputState::new(window, cx).placeholder("name")),
-            auto_prompt: cx
-                .new(|cx| InputState::new(window, cx).placeholder("prompt to run on schedule")),
-            auto_interval: cx
-                .new(|cx| InputState::new(window, cx).placeholder("interval (minutes)")),
-            editing_automation: None,
-            onboarding_step: None,
-            onboarding_cheap: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("cheap model (e.g. gpt-5.6-terra)")
-            }),
-            onboarding_strong: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("strong model (e.g. gpt-6-astra)")
-            }),
-            onboarding_strong_fb: cx
-                .new(|cx| InputState::new(window, cx).placeholder("strong fallback (optional)")),
+            forms: Forms {
+                new_task_open: false,
+                auto_name: cx.new(|cx| InputState::new(window, cx).placeholder("name")),
+                auto_prompt: cx
+                    .new(|cx| InputState::new(window, cx).placeholder("prompt to run on schedule")),
+                auto_interval: cx
+                    .new(|cx| InputState::new(window, cx).placeholder("interval (minutes)")),
+                editing_automation: None,
+                onboarding_step: None,
+                onboarding_cheap: cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("cheap model (e.g. gpt-5.6-terra)")
+                }),
+                onboarding_strong: cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("strong model (e.g. gpt-6-astra)")
+                }),
+                onboarding_strong_fb: cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("strong fallback (optional)")
+                }),
+                new_task_title: cx
+                    .new(|cx| InputState::new(window, cx).placeholder("what should the agent do?")),
+                new_task_base: cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("base branch (default: current)")
+                }),
+            },
             review_open: None,
-            new_task_title: cx
-                .new(|cx| InputState::new(window, cx).placeholder("what should the agent do?")),
-            new_task_base: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("base branch (default: current)")
-            }),
             review_files: Vec::new(),
             review_branch: String::new(),
             md_cache: Default::default(),
@@ -1042,12 +1052,12 @@ impl DesktopApp {
     fn add_automation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // If editing an existing automation, remove the old one first
         // (the new add replaces it).
-        if let Some(old_name) = self.editing_automation.take() {
+        if let Some(old_name) = self.forms.editing_automation.take() {
             self.send(Command::AutomationRemove { name: old_name });
         }
-        let name = self.auto_name.read(cx).value().trim().to_string();
-        let prompt = self.auto_prompt.read(cx).value().trim().to_string();
-        let interval = self.auto_interval.read(cx).value().trim().to_string();
+        let name = self.forms.auto_name.read(cx).value().trim().to_string();
+        let prompt = self.forms.auto_prompt.read(cx).value().trim().to_string();
+        let interval = self.forms.auto_interval.read(cx).value().trim().to_string();
         let Ok(minutes) = interval.parse::<u32>() else {
             self.state.last_note = Some("interval must be a number of minutes".into());
             self.refresh(cx);
@@ -1058,11 +1068,14 @@ impl DesktopApp {
             self.refresh(cx);
             return;
         }
-        self.auto_name
+        self.forms
+            .auto_name
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.auto_prompt
+        self.forms
+            .auto_prompt
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.auto_interval
+        self.forms
+            .auto_interval
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.send(Command::AutomationAdd {
             name,
@@ -1078,20 +1091,32 @@ impl DesktopApp {
     }
 
     fn open_onboarding(&mut self, cx: &mut Context<Self>) {
-        self.onboarding_step = Some(0);
+        self.forms.onboarding_step = Some(0);
         self.settings_open = false;
         self.send(Command::AuthProviders {});
         self.refresh(cx);
     }
 
     fn onboarding_next(&mut self, cx: &mut Context<Self>) {
-        match self.onboarding_step {
+        match self.forms.onboarding_step {
             Some(0) => {
-                self.onboarding_step = Some(1);
+                self.forms.onboarding_step = Some(1);
             }
             Some(1) => {
-                let cheap = self.onboarding_cheap.read(cx).value().trim().to_string();
-                let strong = self.onboarding_strong.read(cx).value().trim().to_string();
+                let cheap = self
+                    .forms
+                    .onboarding_cheap
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
+                let strong = self
+                    .forms
+                    .onboarding_strong
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_string();
                 if !cheap.is_empty() && !strong.is_empty() {
                     self.send(Command::PersistRouter {
                         cheap,
@@ -1100,9 +1125,9 @@ impl DesktopApp {
                         strong_fallback: None,
                     });
                 }
-                self.onboarding_step = None;
+                self.forms.onboarding_step = None;
             }
-            _ => self.onboarding_step = None,
+            _ => self.forms.onboarding_step = None,
         }
         self.refresh(cx);
     }
@@ -1110,8 +1135,14 @@ impl DesktopApp {
     // -- worktree tasks ----------------------------------------------------
 
     fn create_task(&mut self, cx: &mut Context<Self>) {
-        let title = self.new_task_title.read(cx).value().trim().to_string();
-        let base_raw = self.new_task_base.read(cx).value().trim().to_string();
+        let title = self
+            .forms
+            .new_task_title
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let base_raw = self.forms.new_task_base.read(cx).value().trim().to_string();
         if title.is_empty() {
             self.state.last_note = Some("give the task a description first".into());
             self.refresh(cx);
@@ -1122,7 +1153,7 @@ impl DesktopApp {
         } else {
             Some(base_raw)
         };
-        self.new_task_open = false;
+        self.forms.new_task_open = false;
         self.state.last_note = Some(format!("starting task: {title}"));
         self.send(Command::CreateTask { title, base });
         self.send(Command::ListSessions);
@@ -1130,8 +1161,8 @@ impl DesktopApp {
     }
 
     fn open_task_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_task_open = true;
-        self.new_task_title.update(cx, |input, cx| {
+        self.forms.new_task_open = true;
+        self.forms.new_task_title.update(cx, |input, cx| {
             let handle = input.focus_handle(cx);
             window.focus(&handle, cx);
         });
@@ -1460,12 +1491,18 @@ impl DesktopApp {
 
         // The new-task form (opened from its row): description + optional
         // base branch, then create/cancel.
-        let list = list.children(if self.new_task_open {
+        let list = list.children(if self.forms.new_task_open {
             let title_entity = entity.clone();
             let cancel_entity = entity.clone();
             vec![
-                div().px_3().pb_1().child(Input::new(&self.new_task_title)),
-                div().px_3().pb_1().child(Input::new(&self.new_task_base)),
+                div()
+                    .px_3()
+                    .pb_1()
+                    .child(Input::new(&self.forms.new_task_title)),
+                div()
+                    .px_3()
+                    .pb_1()
+                    .child(Input::new(&self.forms.new_task_base)),
                 div()
                     .px_3()
                     .pb_2()
@@ -1488,7 +1525,7 @@ impl DesktopApp {
                             .small()
                             .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
                                 cancel_entity.update(cx, |this, cx| {
-                                    this.new_task_open = false;
+                                    this.forms.new_task_open = false;
                                     this.refresh(cx);
                                 });
                             }),
@@ -3812,17 +3849,17 @@ impl DesktopApp {
                         .child(
                             div()
                                 .flex_1()
-                                .child(Input::new(&self.auto_name).id("auto-name")),
+                                .child(Input::new(&self.forms.auto_name).id("auto-name")),
                         )
                         .child(
                             div()
                                 .flex_1()
-                                .child(Input::new(&self.auto_prompt).id("auto-prompt")),
+                                .child(Input::new(&self.forms.auto_prompt).id("auto-prompt")),
                         )
                         .child(
                             div()
                                 .w(px(110.))
-                                .child(Input::new(&self.auto_interval).id("auto-interval")),
+                                .child(Input::new(&self.forms.auto_interval).id("auto-interval")),
                         ),
                 )
                 .child(
@@ -3984,9 +4021,9 @@ impl DesktopApp {
                             "wire the tiers (persisted in the server config)",
                         )),
                 );
-                panel = panel.child(div().child(Input::new(&self.onboarding_cheap)));
-                panel = panel.child(div().child(Input::new(&self.onboarding_strong)));
-                panel = panel.child(div().child(Input::new(&self.onboarding_strong_fb)));
+                panel = panel.child(div().child(Input::new(&self.forms.onboarding_cheap)));
+                panel = panel.child(div().child(Input::new(&self.forms.onboarding_strong)));
+                panel = panel.child(div().child(Input::new(&self.forms.onboarding_strong_fb)));
                 panel = panel.child(
                     div().flex().flex_row().justify_end().gap_1().child(
                         Button::new("ob-save")
@@ -4246,7 +4283,7 @@ impl Render for DesktopApp {
         if self.help_open {
             root = root.child(self.render_help(cx));
         }
-        if let Some(step) = self.onboarding_step {
+        if let Some(step) = self.forms.onboarding_step {
             root = root.child(self.render_onboarding(step, cx));
         }
         root

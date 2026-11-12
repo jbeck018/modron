@@ -120,15 +120,10 @@ pub(crate) fn handshake_timeout() -> Duration {
 }
 
 /// The uncorrelated hello frame (id 0 is reserved for it).
+/// The uncorrelated hello frame (id 0 is reserved for it) - shared
+/// construction via modron_protocol::client.
 pub(crate) fn hello_frame(token: Option<&str>) -> Frame {
-    Frame::request(
-        0,
-        Payload::Hello {
-            client: CLIENT_NAME.into(),
-            protocol: PROTOCOL_VERSION,
-            token: token.map(Into::into),
-        },
-    )
+    modron_protocol::client::hello_frame(CLIENT_NAME, token.map(Into::into))
 }
 
 // ---------------------------------------------------------------------------

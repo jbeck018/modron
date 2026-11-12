@@ -131,15 +131,69 @@ enum UiFrame {
 /// Poll cadence for crossterm events (and the spinner tick).
 const TICK: Duration = Duration::from_millis(50);
 
-/// Restores the terminal on EVERY exit path — a propagated `?` or a panic
-/// past the render loop would otherwise leave the user's shell in raw mode
-/// on the alternate screen. Idempotent.
-struct TerminalRestore {
+/// The ratatui terminal the render loop draws into (crossterm backend over
+/// stdout).
+type TuiTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
+
+/// Owns the terminal's raw-mode/alt-screen lifecycle: [`enter`](Self::enter)
+/// installs it and restores it on EVERY exit path — a propagated `?` or a
+/// panic past the render loop would otherwise leave the user's shell in raw
+/// mode on the alternate screen. Idempotent.
+struct TerminalGuard {
     kitty: bool,
     done: bool,
 }
 
-impl TerminalRestore {
+impl TerminalGuard {
+    /// Terminal setup: inline viewport, raw mode, hidden cursor.
+    /// Kitty keyboard protocol (kitty/Ghostty/WezTerm/iTerm2 3.5+): lets the
+    /// terminal report modifiers on Enter, making shift+enter a real newline
+    /// instead of a submit. The query returns quickly on any terminal that
+    /// answers device attributes; unsupported ones ignore the push entirely.
+    fn enter() -> anyhow::Result<(Self, TuiTerminal)> {
+        let kitty_keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let mut stdout = std::io::stdout();
+        crossterm::terminal::enable_raw_mode()?;
+        // From here on, every exit path must restore the terminal — the
+        // guard's Drop covers error returns and panics the inline teardown
+        // cannot.
+        let guard = TerminalGuard {
+            kitty: kitty_keyboard,
+            done: false,
+        };
+        // Bracketed paste (ctrl+V in most terminals delivers a paste event):
+        // multi-line pastes enter the input instead of submitting. Mouse
+        // capture: clicks position the input cursor (native text selection
+        // still works with shift held — the terminal's own escape hatch).
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableMouseCapture
+        );
+        if kitty_keyboard {
+            use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+            let _ = crossterm::execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
+        }
+        // Fullscreen: the alternate screen is the TUI's own canvas and the
+        // scrollback lives INSIDE it (pgup/pgdn, wheel) — scrolling no longer
+        // moves the whole terminal session. The earlier inline-viewport design
+        // (Phase 1d) traded this away for native selection; that trade is
+        // reversed by user direction.
+        let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        );
+        let backend = ratatui::backend::CrosstermBackend::new(stdout);
+        // A failure here unwinds through the guard's Drop: the terminal is
+        // already in raw mode on the alt screen.
+        let terminal = ratatui::Terminal::new(backend)?;
+        Ok((guard, terminal))
+    }
+
     fn restore(&mut self) {
         if self.done {
             return;
@@ -161,7 +215,7 @@ impl TerminalRestore {
     }
 }
 
-impl Drop for TerminalRestore {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.restore();
     }
@@ -184,6 +238,15 @@ struct ApprovalBus {
 /// returns an actionable error otherwise. The closure is fallible so a failed
 /// engine build surfaces as an error (terminal restored by the guard) instead
 /// of a panic.
+///
+/// Composition (each step a helper below): remote connect happens before the
+/// terminal goes raw; [`TerminalGuard::enter`] owns raw-mode/alt-screen setup
+/// and restores on every exit path; [`build_local_engine`] wires the engine's
+/// sinks to this loop; [`build_app`] + [`push_welcome_banner`] set up the
+/// first frame; [`RunState`] bundles the loop's channels and spawned-task
+/// slots so the event loop reads as the tick order — deltas, approvals,
+/// keyboard, pending commands, oauth, slow/clipboard, shell, remote frames,
+/// approve-rest mirror, outcomes, render.
 pub async fn run_with(
     build: impl FnOnce(TuiSinks) -> anyhow::Result<(Engine, Option<SessionId>)>,
     model_label: String,
@@ -203,112 +266,205 @@ pub async fn run_with(
         slot: Arc::new(Mutex::new(None)),
         rest_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
 
     // Remote-control connect happens BEFORE the terminal goes raw: a bad
     // target fails fast with a plain error, nothing to restore.
     let is_remote = remote.is_some();
     let remote_target = remote.as_ref().map(|spec| spec.target.clone());
-    let mut connected = None;
-    if let Some(spec) = remote {
-        let mut client = crate::remote::RemoteClient::connect(&spec.target).await?;
-        let session = match spec.resume {
-            None => None,
-            Some(want) => match want {
-                None => client.list_sessions().await?.first().map(|meta| meta.id),
-                Some(id) => Some(id),
-            },
-        };
-        let snapshot = match session {
-            Some(id) => Some(client.attach(id, 0).await?),
-            None => None,
-        };
-        connected = Some((client, snapshot));
-    }
+    let connected = match remote {
+        Some(spec) => Some(connect_remote(spec).await?),
+        None => None,
+    };
 
     // The engine builder gets sinks that talk to THIS loop. Remote mode
     // never calls it — the engine lives on the server — and the loop's
     // local branches hold an inert stand-in so the code stays uniform.
-    let (mut engine, resume_session) = if connected.is_some() {
+    let (engine, resume_session) = if connected.is_some() {
         (inert_engine(), None)
     } else {
-        let delta_sink_tx = delta_tx.clone();
-        let tool_tx = delta_tx.clone();
-        let approval_for_builder = approval.clone();
-        build(TuiSinks {
-            on_delta: Arc::new(move |delta| {
-                let _ = delta_sink_tx.send(DeltaOrTool::Delta(delta));
-            }),
-            on_tool_event: Arc::new(move |activity| {
-                let _ = tool_tx.send(DeltaOrTool::Tool(activity));
-            }),
-            approver: Arc::new(move |call| {
-                if approval_for_builder.rest_approved.load(Ordering::Relaxed) {
-                    return true;
-                }
-                let (respond, receiver) = mpsc::channel();
-                *approval_for_builder.slot.lock().unwrap() = Some((call.clone(), respond));
-                // Park the engine task until the render loop delivers the
-                // decision. block_in_place keeps other runtime workers alive.
-                tokio::task::block_in_place(|| receiver.recv().unwrap_or(false))
-            }),
-        })?
+        build_local_engine(build, &delta_tx, &approval)?
     };
 
-    // Terminal setup: inline viewport, raw mode, hidden cursor.
-    // Kitty keyboard protocol (kitty/Ghostty/WezTerm/iTerm2 3.5+): lets the
-    // terminal report modifiers on Enter, making shift+enter a real newline
-    // instead of a submit. The query returns quickly on any terminal that
-    // answers device attributes; unsupported ones ignore the push entirely.
-    let kitty_keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    let mut stdout = std::io::stdout();
-    crossterm::terminal::enable_raw_mode()?;
-    // From here on, every exit path must restore the terminal — the guard's
-    // Drop covers error returns and panics the inline teardown cannot.
-    let mut terminal_restore = TerminalRestore {
-        kitty: kitty_keyboard,
-        done: false,
-    };
-    // Bracketed paste (ctrl+V in most terminals delivers a paste event):
-    // multi-line pastes enter the input instead of submitting. Mouse
-    // capture: clicks position the input cursor (native text selection
-    // still works with shift held — the terminal's own escape hatch).
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
-    );
-    if kitty_keyboard {
-        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-        let _ = crossterm::execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-    }
-    // Fullscreen: the alternate screen is the TUI's own canvas and the
-    // scrollback lives INSIDE it (pgup/pgdn, wheel) — scrolling no longer
-    // moves the whole terminal session. The earlier inline-viewport design
-    // (Phase 1d) traded this away for native selection; that trade is
-    // reversed by user direction.
-    let _ = crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen);
-    let _ = crossterm::execute!(
-        stdout,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-    );
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = ratatui::Terminal::new(backend)?;
+    // Terminal setup (raw mode, kitty flags, bracketed paste, alt screen) +
+    // the guard that restores it on EVERY exit path from here on.
+    let (mut terminal_restore, mut terminal) = TerminalGuard::enter()?;
 
-    // Remote attach state drives a few App fields the local path takes
-    // from the engine (menus degrade gracefully: no personas/tool lists
-    // remotely yet — the server does not expose them over the protocol).
     let attached = connected.as_ref().and_then(|(_, snap)| snap.as_ref());
-    let mut app = App {
+    let mut app = build_app(
+        is_remote,
+        &engine,
+        attached,
+        resume_session,
+        &model_label,
+        upgrade_notice,
+    );
+    push_welcome_banner(&mut app, &model_label);
+
+    // Which session's log the scrollback currently mirrors; a different
+    // session's snapshot (e.g. after /new) resets it first. (Resolved inside
+    // backfill_remote_history, along with the remote banner + attach replay.)
+    let backfill_session =
+        backfill_remote_history(&mut app, remote_target.as_deref(), connected.as_ref());
+
+    #[allow(unused_assignments)]
+    let mut result: anyhow::Result<()> = Ok(());
+
+    // The loop's machinery — progress channels, spawned-task slots with
+    // their generations, and the remote-control driver (spawned here, after
+    // the App is ready, exactly where the inline setup did it) — bundled so
+    // each phase below is one call.
+    let mut state = RunState::new(
+        engine,
+        is_remote,
+        delta_tx,
+        delta_rx,
+        approval,
+        connected,
+        backfill_session,
+    );
+
+    loop {
+        // 1. Drain engine deltas/tool events.
+        state.drain_engine_events(&mut app);
+
+        // 2. Drain the approval slot into the App (redraw happens below).
+        state.drain_approval_slot(&mut app);
+
+        // 3. Poll keyboard (raw mode). Skip/Quit reproduce the old loop's
+        //    inline `continue`/`break` exactly.
+        match state.poll_keyboard(&mut app).await? {
+            IterationFlow::Skip => continue,
+            IterationFlow::Quit => {
+                result = Ok(());
+                break;
+            }
+            IterationFlow::Advance => {}
+        }
+
+        // 3b. Slash commands needing engine/store powers.
+        state.dispatch_pending_commands(&mut app).await;
+
+        // 3c. OAuth progress.
+        state.drain_oauth_progress(&mut app);
+
+        // 3d. Slow-command and clipboard results.
+        state.drain_slow_and_clipboard(&mut app);
+
+        // 3e. `!` shell passthrough result.
+        state.drain_shell_results(&mut app);
+
+        // 3f. Remote-control updates.
+        state.drain_ui_frames(&mut app);
+
+        // 4. Approve-rest mirror.
+        state.mirror_approve_rest(&mut app);
+
+        // 5. Engine settled?
+        state.drain_outcomes(&mut app);
+
+        if app.quit {
+            result = Ok(());
+            break;
+        }
+
+        // 6. Render the full screen; advance the spinner and age the toast.
+        app.tick();
+        terminal.draw(|frame| app.view(frame, frame.area()))?;
+    }
+
+    // Teardown (guard-backed): restore the terminal from the normal path
+    // too, then print the session id into the NORMAL buffer (it scrolls
+    // away with the alt screen otherwise).
+    terminal_restore.restore();
+    // A /fork that landed during the final tick still adopts its session.
+    state.adopt_pending_fork(&mut app);
+    if let Some(id) = app.session_id {
+        println!("session: {id} — resume with --resume {id}");
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// run_with building blocks: connect, engine wiring, app bootstrap
+// ---------------------------------------------------------------------------
+
+/// A successful remote connect: the client plus, when `--resume` named a
+/// session, its attach snapshot.
+type ConnectedRemote = (
+    crate::remote::RemoteClient,
+    Option<crate::remote::AttachSnapshot>,
+);
+
+/// Connect to the remote-control server and resolve the resume spec into a
+/// session: `None` = fresh on first submit; `Some(None)` = the server's
+/// newest session (`--resume` bare); `Some(Some(id))` = that id. Attaches the
+/// session when resolved (snapshot = persisted transcript + live state).
+async fn connect_remote(spec: RemoteSpec) -> anyhow::Result<ConnectedRemote> {
+    let mut client = crate::remote::RemoteClient::connect(&spec.target).await?;
+    let session = match spec.resume {
+        None => None,
+        Some(want) => match want {
+            None => client.list_sessions().await?.first().map(|meta| meta.id),
+            Some(id) => Some(id),
+        },
+    };
+    let snapshot = match session {
+        Some(id) => Some(client.attach(id, 0).await?),
+        None => None,
+    };
+    Ok((client, snapshot))
+}
+
+/// The local engine's sinks talk to THIS loop: deltas and tool events feed
+/// the std channel; the approver queues the call into the shared slot and
+/// parks the engine task until the render loop delivers the decision.
+fn build_local_engine(
+    build: impl FnOnce(TuiSinks) -> anyhow::Result<(Engine, Option<SessionId>)>,
+    delta_tx: &mpsc::Sender<DeltaOrTool>,
+    approval: &ApprovalBus,
+) -> anyhow::Result<(Engine, Option<SessionId>)> {
+    let delta_sink_tx = delta_tx.clone();
+    let tool_tx = delta_tx.clone();
+    let approval_for_builder = approval.clone();
+    build(TuiSinks {
+        on_delta: Arc::new(move |delta| {
+            let _ = delta_sink_tx.send(DeltaOrTool::Delta(delta));
+        }),
+        on_tool_event: Arc::new(move |activity| {
+            let _ = tool_tx.send(DeltaOrTool::Tool(activity));
+        }),
+        approver: Arc::new(move |call| {
+            if approval_for_builder.rest_approved.load(Ordering::Relaxed) {
+                return true;
+            }
+            let (respond, receiver) = mpsc::channel();
+            *approval_for_builder.slot.lock().unwrap() = Some((call.clone(), respond));
+            // Park the engine task until the render loop delivers the
+            // decision. block_in_place keeps other runtime workers alive.
+            tokio::task::block_in_place(|| receiver.recv().unwrap_or(false))
+        }),
+    })
+}
+
+/// Build the App's first frame. Remote attach state drives a few App fields
+/// the local path takes from the engine (menus degrade gracefully: no
+/// personas/tool lists remotely yet — the server does not expose them over
+/// the protocol).
+fn build_app(
+    is_remote: bool,
+    engine: &Engine,
+    attached: Option<&crate::remote::AttachSnapshot>,
+    resume_session: Option<SessionId>,
+    model_label: &str,
+    upgrade_notice: Option<String>,
+) -> App {
+    App {
         upgrade_notice,
         session_id: attached.map(|snap| snap.session_id).or(resume_session),
         model_label: attached
             .and_then(|snap| (!snap.live.model.is_empty()).then(|| snap.live.model.clone()))
-            .unwrap_or_else(|| model_label.clone()),
-        context_window: modron_router::lookup(&model_label)
+            .unwrap_or_else(|| model_label.to_string()),
+        context_window: modron_router::lookup(model_label)
             .map(|info| info.context_window)
             .unwrap_or(0),
         // Menu inputs (personas, tool list, current model) come from the
@@ -350,348 +506,441 @@ pub async fn run_with(
             engine.config.working_dir.clone()
         },
         ..App::default()
-    };
-
-    // Welcome banner (Phase 6g): the TUI opens onto content, not a void —
-    // now the first lines of the internal scrollback.
-    {
-        use ratatui::style::{Modifier, Style};
-        use ratatui::text::{Line, Span};
-        let welcome: Vec<Line<'static>> = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("✦ ", Style::default().fg(crate::ACCENT)),
-                Span::styled(
-                    "modron",
-                    Style::default()
-                        .fg(crate::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" v{}", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(crate::DIM),
-                ),
-            ]),
-            Line::from(Span::styled(
-                "  a token-efficient Rust coding agent",
-                Style::default().fg(crate::DIM),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  model ", Style::default().fg(crate::DIM)),
-                Span::styled(model_label.clone(), Style::default()),
-                Span::styled(
-                    "  ·  enter send · shift/alt+enter newline · pgup/pgdn scroll · esc interrupt/live",
-                    Style::default().fg(crate::DIM),
-                ),
-            ]),
-            Line::from(""),
-        ];
-        app.push_history(welcome);
     }
-    // Which session's log the scrollback currently mirrors; a different
-    // session's snapshot (e.g. after /new) resets it first.
-    let mut backfill_session: Option<SessionId> = None;
-    // Remote banner note + attach replay: the persisted transcript lands
-    // in scrollback (same styles as the live path) before anything runs.
-    if let Some(target) = remote_target.as_deref() {
+}
+
+/// Welcome banner (Phase 6g): the TUI opens onto content, not a void —
+/// now the first lines of the internal scrollback.
+fn push_welcome_banner(app: &mut App, model_label: &str) {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    let welcome: Vec<Line<'static>> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("✦ ", Style::default().fg(crate::ACCENT)),
+            Span::styled(
+                "modron",
+                Style::default()
+                    .fg(crate::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(crate::DIM),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "  a token-efficient Rust coding agent",
+            Style::default().fg(crate::DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  model ", Style::default().fg(crate::DIM)),
+            Span::styled(model_label.to_owned(), Style::default()),
+            Span::styled(
+                "  ·  enter send · shift/alt+enter newline · pgup/pgdn scroll · esc interrupt/live",
+                Style::default().fg(crate::DIM),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    app.push_history(welcome);
+}
+
+/// Remote banner note + attach replay: the persisted transcript lands
+/// in scrollback (same styles as the live path) before anything runs.
+/// Returns which session's log the scrollback now mirrors (a different
+/// session's snapshot — e.g. after /new — resets it first; the loop keeps
+/// tracking this in [`RunState::backfill_session`]).
+fn backfill_remote_history(
+    app: &mut App,
+    remote_target: Option<&str>,
+    connected: Option<&ConnectedRemote>,
+) -> Option<SessionId> {
+    if let Some(target) = remote_target {
         app.note(format!(
             "connected to {target} — sessions live on the server and survive this TUI"
         ));
     }
-    if let Some((_, Some(snap))) = connected.as_ref() {
+    let mut backfill_session: Option<SessionId> = None;
+    if let Some((_, Some(snap))) = connected {
         backfill_session = Some(snap.session_id);
         if !snap.events.is_empty() {
             app.reset_transcript();
             app.backfill_transcript(modron_view::replay(&snap.events));
         }
     }
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
-    // OAuth progress from the spawned flows: the interim update shows the
-    // URL (+ device-flow user code) in the modal, Done settles it.
-    let (oauth_tx, mut oauth_rx) = tokio::sync::mpsc::unbounded_channel::<OAuthProgress>();
-    let mut oauth_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut oauth_generation: u64 = 0;
-    // Slow slash commands (/tasks, /fork) run OFF the render loop — same
-    // spawn + channel + generation pattern as the OAuth flows — so redraws
-    // and Esc keep working while they await tools/store I/O.
-    let (slow_tx, mut slow_rx) = tokio::sync::mpsc::unbounded_channel::<SlowCommandProgress>();
-    let mut slow_command_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut slow_command_generation: u64 = 0;
-    // Clipboard I/O (pbcopy/wl-copy/osascript subprocesses) is also async.
-    let (clip_tx, mut clip_rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardProgress>();
-    let mut harvest_task: Option<tokio::task::JoinHandle<()>> = None;
-    // `!` shell passthrough is async too: a slow `make` must never freeze
-    // the render loop, and Esc gets to kill it (kill_on_drop).
-    let (shell_tx, mut shell_rx) = tokio::sync::mpsc::unbounded_channel::<ShellOutcome>();
-    let mut shell_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut engine_task: Option<tokio::task::JoinHandle<()>> = None;
+    backfill_session
+}
+
+/// What the loop does after the keyboard phase — the extracted phase's
+/// explicit form of the old inline `continue`/`break`, so iteration flow is
+/// preserved exactly: `Skip` leaves the remaining phases of this tick (and
+/// the redraw) untouched, `Quit` leaves the loop.
+enum IterationFlow {
+    /// Fall through to the remaining drains and the render.
+    Advance,
+    /// The old loop's `continue` (paste, busy submit, remote submit).
+    Skip,
+    /// The old loop's `break` on `Action::Quit`.
+    Quit,
+}
+
+/// The run loop's machinery, bundled so each phase of an iteration is one
+/// method call: the engine (local mode; an inert stand-in remotely), the
+/// progress channels, and the spawned-task slots with their generations.
+struct RunState {
+    engine: Engine,
+    is_remote: bool,
+    approval: ApprovalBus,
+    // Loop <- producers (drained each tick, in phase order).
+    delta_rx: mpsc::Receiver<DeltaOrTool>,
+    done_rx: tokio::sync::mpsc::UnboundedReceiver<Outcome>,
+    oauth_rx: tokio::sync::mpsc::UnboundedReceiver<OAuthProgress>,
+    slow_rx: tokio::sync::mpsc::UnboundedReceiver<SlowCommandProgress>,
+    clip_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardProgress>,
+    shell_rx: tokio::sync::mpsc::UnboundedReceiver<ShellOutcome>,
+    ui_rx: tokio::sync::mpsc::UnboundedReceiver<UiFrame>,
+    // Loop -> producers (cloned into the spawned tasks / the driver).
+    done_tx: tokio::sync::mpsc::UnboundedSender<Outcome>,
+    oauth_tx: tokio::sync::mpsc::UnboundedSender<OAuthProgress>,
+    slow_tx: tokio::sync::mpsc::UnboundedSender<SlowCommandProgress>,
+    clip_tx: tokio::sync::mpsc::UnboundedSender<ClipboardProgress>,
+    shell_tx: tokio::sync::mpsc::UnboundedSender<ShellOutcome>,
+    loop_cmd_tx: tokio::sync::mpsc::UnboundedSender<LoopCmd>,
+    // Spawned-task slots: at most one of each is in flight; Esc and quit
+    // abort by handle.
+    engine_task: Option<tokio::task::JoinHandle<()>>,
     // Remote mode's one-at-a-time flag (no JoinHandle exists to check).
-    let mut remote_busy = false;
+    remote_busy: bool,
+    oauth_task: Option<tokio::task::JoinHandle<()>>,
+    oauth_generation: u64,
+    slow_command_task: Option<tokio::task::JoinHandle<()>>,
+    slow_command_generation: u64,
+    harvest_task: Option<tokio::task::JoinHandle<()>>,
+    shell_task: Option<tokio::task::JoinHandle<()>>,
     // The first snapshot with events replays the transcript; later ones
     // (auto-attach echoes) must not duplicate history.
     // Which session's log the scrollback currently mirrors; a different
     // session's snapshot (e.g. after /new) resets it first.
-    #[allow(unused_assignments)]
-    let mut result: anyhow::Result<()> = Ok(());
+    backfill_session: Option<SessionId>,
+}
 
-    // Remote-control driver: owns the client, translates frames into the
-    // loop's channels. The loop talks to it through loop_cmd_tx.
-    let (loop_cmd_tx, loop_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<LoopCmd>();
-    if let Some((client, _)) = connected.take() {
-        spawn_remote_driver(
-            client,
-            loop_cmd_rx,
-            loop_cmd_tx.clone(),
-            delta_tx.clone(),
-            done_tx.clone(),
-            ui_tx.clone(),
-            approval.clone(),
-        );
+impl RunState {
+    /// Create the progress channels, bundle the task slots, and (when
+    /// connected) spawn the remote-control driver.
+    fn new(
+        engine: Engine,
+        is_remote: bool,
+        delta_tx: mpsc::Sender<DeltaOrTool>,
+        delta_rx: mpsc::Receiver<DeltaOrTool>,
+        approval: ApprovalBus,
+        connected: Option<ConnectedRemote>,
+        backfill_session: Option<SessionId>,
+    ) -> Self {
+        let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel::<Outcome>();
+        // OAuth progress from the spawned flows: the interim update shows the
+        // URL (+ device-flow user code) in the modal, Done settles it.
+        let (oauth_tx, oauth_rx) = tokio::sync::mpsc::unbounded_channel::<OAuthProgress>();
+        // Slow slash commands (/tasks, /fork) run OFF the render loop — same
+        // spawn + channel + generation pattern as the OAuth flows — so redraws
+        // and Esc keep working while they await tools/store I/O.
+        let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<SlowCommandProgress>();
+        // Clipboard I/O (pbcopy/wl-copy/osascript subprocesses) is also async.
+        let (clip_tx, clip_rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardProgress>();
+        // `!` shell passthrough is async too: a slow `make` must never freeze
+        // the render loop, and Esc gets to kill it (kill_on_drop).
+        let (shell_tx, shell_rx) = tokio::sync::mpsc::unbounded_channel::<ShellOutcome>();
+        // Remote-control driver: owns the client, translates frames into the
+        // loop's channels. The loop talks to it through loop_cmd_tx.
+        let (loop_cmd_tx, loop_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<LoopCmd>();
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
+        if let Some((client, _)) = connected {
+            spawn_remote_driver(
+                client,
+                loop_cmd_rx,
+                loop_cmd_tx.clone(),
+                delta_tx.clone(),
+                done_tx.clone(),
+                ui_tx,
+                approval.clone(),
+            );
+        }
+        Self {
+            engine,
+            is_remote,
+            approval,
+            delta_rx,
+            done_rx,
+            oauth_rx,
+            slow_rx,
+            clip_rx,
+            shell_rx,
+            ui_rx,
+            done_tx,
+            oauth_tx,
+            slow_tx,
+            clip_tx,
+            shell_tx,
+            loop_cmd_tx,
+            engine_task: None,
+            remote_busy: false,
+            oauth_task: None,
+            oauth_generation: 0,
+            slow_command_task: None,
+            slow_command_generation: 0,
+            harvest_task: None,
+            shell_task: None,
+            backfill_session,
+        }
     }
 
-    loop {
-        // 1. Drain engine deltas/tool events.
-        while let Ok(msg) = delta_rx.try_recv() {
+    /// Phase 1 of each tick: drain engine deltas/tool events. Called again
+    /// from [`RunState::drain_outcomes`] so deltas queued behind a Done
+    /// still land before the turn settles.
+    fn drain_engine_events(&mut self, app: &mut App) {
+        while let Ok(msg) = self.delta_rx.try_recv() {
             match msg {
                 DeltaOrTool::Delta(d) => app.on_delta(d),
                 DeltaOrTool::Tool(t) => app.on_tool(t),
             }
         }
+    }
 
-        // 2. Drain the approval slot into the App (redraw happens below).
-        //     The slot carries the REAL ToolCall (remote approvals arrive
-        //     with one; the local approver clones the one it was given) —
-        //     the old summary-string reconstruction is gone.
+    /// Phase 2: drain the approval slot into the App (redraw happens in the
+    /// render phase). The slot carries the REAL ToolCall (remote approvals
+    /// arrive with one; the local approver clones the one it was given) —
+    /// the old summary-string reconstruction is gone.
+    fn drain_approval_slot(&mut self, app: &mut App) {
         if app.pending_approval.is_none() {
-            if let Some((call, respond)) = approval.slot.lock().unwrap().take() {
+            if let Some((call, respond)) = self.approval.slot.lock().unwrap().take() {
                 app.pending_approval = Some(PendingApproval { call, respond });
             }
         }
+    }
 
-        // 3. Poll keyboard (raw mode).
-        if crossterm::event::poll(TICK)? {
-            match crossterm::event::read()? {
-                crossterm::event::Event::Paste(text) => {
-                    // Bracketed paste: multi-line text enters the input
-                    // verbatim — the terminal told us it is a paste, so it
-                    // must never submit. The auth wizard's key entry takes
-                    // precedence when open.
-                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                    app.paste_into_auth_or_input(&text);
-                    continue;
-                }
-                crossterm::event::Event::Mouse(me) => match me.kind {
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        app.on_click(me.column, me.row)
-                    }
-                    crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                        app.extend_selection(me.column, me.row)
-                    }
-                    crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                        // Selection release: copy asynchronously — the
-                        // clipboard helper shells out (pbcopy/wl-copy), and
-                        // the render loop must not wait on it.
-                        if let Some(text) = app.take_selected_text() {
-                            let chars = text.chars().count();
-                            app.toast(format!("copying {chars} chars…"));
-                            let tx = clip_tx.clone();
-                            tokio::spawn(async move {
-                                let ok = crate::clipboard::copy_text(&text);
-                                let _ = tx.send(ClipboardProgress::Copied { ok, chars });
-                            });
-                        }
-                    }
-                    crossterm::event::MouseEventKind::ScrollUp => app.scroll_history(3),
-                    crossterm::event::MouseEventKind::ScrollDown => app.scroll_history(-3),
-                    _ => {}
-                },
-                crossterm::event::Event::Key(key)
-                    if key.kind == crossterm::event::KeyEventKind::Press =>
-                {
-                    match app.on_key(key) {
-                        crate::Action::None => {}
-                        crate::Action::PasteImage => {
-                            // ctrl+V: image → staged attachment; text → into
-                            // the input. Spawned (bounded by the harvest
-                            // timeout inside) so the render loop never
-                            // waits on a clipboard service.
-                            if harvest_task.is_some() {
-                                app.toast("clipboard read already in flight");
-                                continue;
-                            }
-                            app.toast("reading clipboard…");
-                            let tx = clip_tx.clone();
-                            harvest_task = Some(tokio::spawn(async move {
-                                let content =
-                                    tokio::task::spawn_blocking(crate::clipboard::harvest)
-                                        .await
-                                        .unwrap_or(crate::clipboard::ClipboardContent::Empty);
-                                let _ = tx.send(ClipboardProgress::Harvested(content));
-                            }));
-                        }
-                        crate::Action::Submit(task) => {
-                            // `!` shell passthrough: the user typed it
-                            // themselves, so no approval gate — and it
-                            // never reaches the model. Echo the command in
-                            // accent, run it in the workspace (spawned; the
-                            // render loop keeps drawing), land the captured
-                            // output as dim history lines.
-                            if let Some(command) = shell_passthrough(&task) {
-                                if command.is_empty() {
-                                    app.toast("usage: !<shell command>");
-                                    continue;
-                                }
-                                if shell_task.is_some() {
-                                    app.toast("a shell command is still running — Esc cancels it");
-                                    continue;
-                                }
-                                let accent = ratatui::style::Style::default()
-                                    .fg(app.theme.resolved().accent);
-                                app.push_history(vec![ratatui::text::Line::from(format!(
-                                    "❯ !{command}"
-                                ))
-                                .style(accent)]);
-                                let tx = shell_tx.clone();
-                                let dir = if is_remote {
-                                    // `!` runs on the client machine; the
-                                    // server's working dir is its own.
-                                    std::env::current_dir()
-                                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                                } else {
-                                    engine.config.working_dir.clone()
-                                };
-                                shell_task = Some(tokio::spawn(async move {
-                                    let result = tokio::process::Command::new("sh")
-                                        .arg("-c")
-                                        .arg(&command)
-                                        .current_dir(&dir)
-                                        // Esc-abort kills the child, not
-                                        // just the awaiting task.
-                                        .kill_on_drop(true)
-                                        .output()
-                                        .await;
-                                    let _ = tx.send(ShellOutcome { command, result });
-                                }));
-                                continue;
-                            }
-                            // One engine task at a time: a second concurrent
-                            // spawn would overwrite the first JoinHandle
-                            // (unabortable orphan streaming into the App,
-                            // double finish_turn, clobbered approval slot).
-                            if engine_task.is_some() || remote_busy {
-                                app.toast("a turn is already running — Esc aborts it");
-                                continue;
-                            }
-                            let task = app.task_with_goal(&task);
-                            app.begin_task(&task);
-                            let attachments = app.take_attachments();
-                            if is_remote {
-                                // Server-authoritative: the session id
-                                // arrives on the auto-attach Snapshot
-                                // (first submit) or is already known;
-                                // TurnDone/Aborted clear the busy flag.
-                                let _ = loop_cmd_tx.send(LoopCmd::Submit {
-                                    session: app.session_id,
-                                    task,
-                                    attachments,
-                                });
-                                remote_busy = true;
-                                continue;
-                            }
-                            let engine = engine.clone();
-                            let done = done_tx.clone();
-                            let session = app.session_id;
-                            engine_task = Some(tokio::spawn(async move {
-                                let outcome = match session {
-                                    Some(id) => {
-                                        engine
-                                            .run_task_resuming_with_attachments(
-                                                id,
-                                                &task,
-                                                attachments,
-                                            )
-                                            .await
-                                    }
-                                    None => {
-                                        engine.run_task_with_attachments(&task, attachments).await
-                                    }
-                                };
-                                match outcome {
-                                    Ok(summary) => {
-                                        let _ = done.send(Outcome::Done(summary));
-                                    }
-                                    Err(e) => {
-                                        let _ = done.send(Outcome::Failed(e.to_string()));
-                                    }
-                                }
-                            }));
-                        }
-                        crate::Action::Abort => {
-                            if is_remote {
-                                // Server-authoritative interrupt: TurnAborted
-                                // drives finish_interrupted (a dead server
-                                // leaves the turn running rather than a fake
-                                // local abort).
-                                if remote_busy {
-                                    let _ = loop_cmd_tx.send(LoopCmd::Interrupt {
-                                        session: app.session_id,
-                                    });
-                                }
-                            } else {
-                                match (engine_task.take(), slow_command_task.take()) {
-                                    (Some(task), _) => {
-                                        task.abort();
-                                        // Give the runtime a beat to cancel.
-                                        tokio::time::sleep(Duration::from_millis(30)).await;
-                                        app.finish_interrupted();
-                                    }
-                                    // No engine running: Esc cancels a slow
-                                    // command instead. Bumping the generation
-                                    // drops any Done already sitting in the
-                                    // channel (an aborted /fork must not adopt
-                                    // its new session id).
-                                    (None, Some(task)) => {
-                                        slow_command_generation += 1;
-                                        task.abort();
-                                        app.toast("command cancelled");
-                                    }
-                                    (None, None) => {}
-                                }
-                            }
-                            // A pending `!` shell job cancels with Esc too
-                            // (kill_on_drop kills the child process).
-                            if let Some(task) = shell_task.take() {
-                                task.abort();
-                                app.toast("shell command cancelled");
-                            }
-                        }
-                        crate::Action::Quit => {
-                            if let Some(task) = engine_task.take() {
-                                task.abort();
-                            }
-                            if let Some(task) = slow_command_task.take() {
-                                slow_command_generation += 1;
-                                task.abort();
-                            }
-                            result = Ok(());
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
+    /// Phase 3: poll the keyboard (raw mode). Returns [`IterationFlow`] so
+    /// this extracted phase reproduces the old inline `continue`/`break`
+    /// verbs exactly — a paste, for instance, must not force a redraw this
+    /// tick.
+    async fn poll_keyboard(&mut self, app: &mut App) -> anyhow::Result<IterationFlow> {
+        if !crossterm::event::poll(TICK)? {
+            return Ok(IterationFlow::Advance);
         }
+        match crossterm::event::read()? {
+            crossterm::event::Event::Paste(text) => {
+                // Bracketed paste: multi-line text enters the input
+                // verbatim — the terminal told us it is a paste, so it
+                // must never submit. The auth wizard's key entry takes
+                // precedence when open.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                app.paste_into_auth_or_input(&text);
+                return Ok(IterationFlow::Skip);
+            }
+            crossterm::event::Event::Mouse(me) => match me.kind {
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                    app.on_click(me.column, me.row)
+                }
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                    app.extend_selection(me.column, me.row)
+                }
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                    // Selection release: copy asynchronously — the
+                    // clipboard helper shells out (pbcopy/wl-copy), and
+                    // the render loop must not wait on it.
+                    if let Some(text) = app.take_selected_text() {
+                        let chars = text.chars().count();
+                        app.toast(format!("copying {chars} chars…"));
+                        let tx = self.clip_tx.clone();
+                        tokio::spawn(async move {
+                            let ok = crate::clipboard::copy_text(&text);
+                            let _ = tx.send(ClipboardProgress::Copied { ok, chars });
+                        });
+                    }
+                }
+                crossterm::event::MouseEventKind::ScrollUp => app.scroll_history(3),
+                crossterm::event::MouseEventKind::ScrollDown => app.scroll_history(-3),
+                _ => {}
+            },
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Press =>
+            {
+                match app.on_key(key) {
+                    crate::Action::None => {}
+                    crate::Action::PasteImage => {
+                        // ctrl+V: image → staged attachment; text → into
+                        // the input. Spawned (bounded by the harvest
+                        // timeout inside) so the render loop never
+                        // waits on a clipboard service.
+                        if self.harvest_task.is_some() {
+                            app.toast("clipboard read already in flight");
+                            return Ok(IterationFlow::Skip);
+                        }
+                        app.toast("reading clipboard…");
+                        let tx = self.clip_tx.clone();
+                        self.harvest_task = Some(tokio::spawn(async move {
+                            let content = tokio::task::spawn_blocking(crate::clipboard::harvest)
+                                .await
+                                .unwrap_or(crate::clipboard::ClipboardContent::Empty);
+                            let _ = tx.send(ClipboardProgress::Harvested(content));
+                        }));
+                    }
+                    crate::Action::Submit(task) => {
+                        // `!` shell passthrough: the user typed it
+                        // themselves, so no approval gate — and it
+                        // never reaches the model. Echo the command in
+                        // accent, run it in the workspace (spawned; the
+                        // render loop keeps drawing), land the captured
+                        // output as dim history lines.
+                        if let Some(command) = shell_passthrough(&task) {
+                            if command.is_empty() {
+                                app.toast("usage: !<shell command>");
+                                return Ok(IterationFlow::Skip);
+                            }
+                            if self.shell_task.is_some() {
+                                app.toast("a shell command is still running — Esc cancels it");
+                                return Ok(IterationFlow::Skip);
+                            }
+                            let accent =
+                                ratatui::style::Style::default().fg(app.theme.resolved().accent);
+                            app.push_history(vec![ratatui::text::Line::from(format!(
+                                "❯ !{command}"
+                            ))
+                            .style(accent)]);
+                            let tx = self.shell_tx.clone();
+                            let dir = if self.is_remote {
+                                // `!` runs on the client machine; the
+                                // server's working dir is its own.
+                                std::env::current_dir()
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            } else {
+                                self.engine.config.working_dir.clone()
+                            };
+                            self.shell_task = Some(tokio::spawn(async move {
+                                let result = tokio::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(&command)
+                                    .current_dir(&dir)
+                                    // Esc-abort kills the child, not
+                                    // just the awaiting task.
+                                    .kill_on_drop(true)
+                                    .output()
+                                    .await;
+                                let _ = tx.send(ShellOutcome { command, result });
+                            }));
+                            return Ok(IterationFlow::Skip);
+                        }
+                        // One engine task at a time: a second concurrent
+                        // spawn would overwrite the first JoinHandle
+                        // (unabortable orphan streaming into the App,
+                        // double finish_turn, clobbered approval slot).
+                        if self.engine_task.is_some() || self.remote_busy {
+                            app.toast("a turn is already running — Esc aborts it");
+                            return Ok(IterationFlow::Skip);
+                        }
+                        let task = app.task_with_goal(&task);
+                        app.begin_task(&task);
+                        let attachments = app.take_attachments();
+                        if self.is_remote {
+                            // Server-authoritative: the session id
+                            // arrives on the auto-attach Snapshot
+                            // (first submit) or is already known;
+                            // TurnDone/Aborted clear the busy flag.
+                            let _ = self.loop_cmd_tx.send(LoopCmd::Submit {
+                                session: app.session_id,
+                                task,
+                                attachments,
+                            });
+                            self.remote_busy = true;
+                            return Ok(IterationFlow::Skip);
+                        }
+                        let engine = self.engine.clone();
+                        let done = self.done_tx.clone();
+                        let session = app.session_id;
+                        self.engine_task = Some(tokio::spawn(async move {
+                            let outcome = match session {
+                                Some(id) => {
+                                    engine
+                                        .run_task_resuming_with_attachments(id, &task, attachments)
+                                        .await
+                                }
+                                None => engine.run_task_with_attachments(&task, attachments).await,
+                            };
+                            match outcome {
+                                Ok(summary) => {
+                                    let _ = done.send(Outcome::Done(summary));
+                                }
+                                Err(e) => {
+                                    let _ = done.send(Outcome::Failed(e.to_string()));
+                                }
+                            }
+                        }));
+                    }
+                    crate::Action::Abort => {
+                        if self.is_remote {
+                            // Server-authoritative interrupt: TurnAborted
+                            // drives finish_interrupted (a dead server
+                            // leaves the turn running rather than a fake
+                            // local abort).
+                            if self.remote_busy {
+                                let _ = self.loop_cmd_tx.send(LoopCmd::Interrupt {
+                                    session: app.session_id,
+                                });
+                            }
+                        } else {
+                            match (self.engine_task.take(), self.slow_command_task.take()) {
+                                (Some(task), _) => {
+                                    task.abort();
+                                    // Give the runtime a beat to cancel.
+                                    tokio::time::sleep(Duration::from_millis(30)).await;
+                                    app.finish_interrupted();
+                                }
+                                // No engine running: Esc cancels a slow
+                                // command instead. Bumping the generation
+                                // drops any Done already sitting in the
+                                // channel (an aborted /fork must not adopt
+                                // its new session id).
+                                (None, Some(task)) => {
+                                    self.slow_command_generation += 1;
+                                    task.abort();
+                                    app.toast("command cancelled");
+                                }
+                                (None, None) => {}
+                            }
+                        }
+                        // A pending `!` shell job cancels with Esc too
+                        // (kill_on_drop kills the child process).
+                        if let Some(task) = self.shell_task.take() {
+                            task.abort();
+                            app.toast("shell command cancelled");
+                        }
+                    }
+                    crate::Action::Quit => {
+                        if let Some(task) = self.engine_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = self.slow_command_task.take() {
+                            self.slow_command_generation += 1;
+                            task.abort();
+                        }
+                        return Ok(IterationFlow::Quit);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(IterationFlow::Advance)
+    }
 
-        // 3b. Slash commands needing engine/store powers (Phase 14): the
-        //     App parks a PendingCommand; execute it here — the result
-        //     lines land in the internal scrollback. The OAuth login is
-        //     the exception: it waits on a browser round-trip, so it runs
-        //     as a spawned task (the TUI keeps rendering; Esc on the modal
-        //     cancels it).
+    /// Phase 3b: slash commands needing engine/store powers (Phase 14) —
+    /// the App parks a PendingCommand; execute it here, the result lines
+    /// land in the internal scrollback. The OAuth logins are the exception:
+    /// they wait on browser round-trips, so they run as spawned tasks (the
+    /// TUI keeps rendering; Esc on the modal cancels them).
+    async fn dispatch_pending_commands(&mut self, app: &mut App) {
         // NOTE: peek with matches! before take() — an `if let` over
         // `.take()` drops the value when the pattern fails.
-        if is_remote {
+        if self.is_remote {
             // Connected: config slash commands become SetConfig patches;
             // anything needing the local engine is refused EXPLICITLY
             // (OAuth flows, /tasks, /fork run on the machine that owns
@@ -704,34 +953,36 @@ pub async fn run_with(
                         if url.is_empty() {
                             app.toast("usage: /remote-control <bridge url> (deploy cloud/bridge)");
                         } else {
-                            let _ = loop_cmd_tx.send(LoopCmd::RemoteControl { bridge_url: url });
+                            let _ = self
+                                .loop_cmd_tx
+                                .send(LoopCmd::RemoteControl { bridge_url: url });
                         }
                     }
                     PendingCommand::Fork => {
-                        let _ = loop_cmd_tx.send(LoopCmd::Fork { session: None });
+                        let _ = self.loop_cmd_tx.send(LoopCmd::Fork { session: None });
                     }
                     PendingCommand::Tasks => {
-                        let _ = loop_cmd_tx.send(LoopCmd::Tasks { session: None });
+                        let _ = self.loop_cmd_tx.send(LoopCmd::Tasks { session: None });
                     }
                     PendingCommand::Publish { title, content_md } => {
-                        let _ = loop_cmd_tx.send(LoopCmd::Publish {
+                        let _ = self.loop_cmd_tx.send(LoopCmd::Publish {
                             session: None,
                             title,
                             content_md,
                         });
                     }
                     PendingCommand::Automations => {
-                        let _ = loop_cmd_tx.send(LoopCmd::ListAutomations);
+                        let _ = self.loop_cmd_tx.send(LoopCmd::ListAutomations);
                     }
                     PendingCommand::NewSession => {
-                        let _ = loop_cmd_tx.send(LoopCmd::NewSession { title: None });
+                        let _ = self.loop_cmd_tx.send(LoopCmd::NewSession { title: None });
                     }
                     other => match remote_slash_command(&other) {
                         Some((patch, mode_label)) => {
                             if let Some(label) = mode_label {
                                 app.approval_mode = label;
                             }
-                            let _ = loop_cmd_tx.send(LoopCmd::SetConfig(patch));
+                            let _ = self.loop_cmd_tx.send(LoopCmd::SetConfig(patch));
                         }
                         None => {
                             app.toast(
@@ -745,10 +996,10 @@ pub async fn run_with(
             let Some(PendingCommand::OAuthLogin { session }) = app.pending_command.take() else {
                 unreachable!("matches! guard above")
             };
-            oauth_generation += 1;
-            let gen = oauth_generation;
-            let tx = oauth_tx.clone();
-            oauth_task = Some(tokio::spawn(async move {
+            self.oauth_generation += 1;
+            let gen = self.oauth_generation;
+            let tx = self.oauth_tx.clone();
+            self.oauth_task = Some(tokio::spawn(async move {
                 let result: anyhow::Result<String> = async {
                     // Binds the listener FIRST, then opens the browser, so
                     // an instant approval can never race the socket.
@@ -772,10 +1023,10 @@ pub async fn run_with(
             let Some(PendingCommand::ZaiLogin { session }) = app.pending_command.take() else {
                 unreachable!("matches! guard above")
             };
-            oauth_generation += 1;
-            let gen = oauth_generation;
-            let tx = oauth_tx.clone();
-            oauth_task = Some(tokio::spawn(async move {
+            self.oauth_generation += 1;
+            let gen = self.oauth_generation;
+            let tx = self.oauth_tx.clone();
+            self.oauth_task = Some(tokio::spawn(async move {
                 let result: anyhow::Result<String> = async {
                     // Listener first, then the browser (same race rule as
                     // the Claude flow).
@@ -806,10 +1057,10 @@ pub async fn run_with(
             }));
         } else if matches!(app.pending_command, Some(PendingCommand::ChatGptLogin)) {
             app.pending_command = None;
-            oauth_generation += 1;
-            let gen = oauth_generation;
-            let tx = oauth_tx.clone();
-            oauth_task = Some(tokio::spawn(async move {
+            self.oauth_generation += 1;
+            let gen = self.oauth_generation;
+            let tx = self.oauth_tx.clone();
+            self.oauth_task = Some(tokio::spawn(async move {
                 let result: anyhow::Result<String> = async {
                     let device = modron_core::auth::oauth::chatgpt::start().await?;
                     // The verification page opens itself; the modal keeps
@@ -838,21 +1089,21 @@ pub async fn run_with(
                 let _ = tx.send(OAuthProgress::Done { gen, result });
             }));
         } else if app.pending_command.as_ref().is_some_and(is_slow_command)
-            && slow_command_task.is_none()
-            && engine_task.is_none()
+            && self.slow_command_task.is_none()
+            && self.engine_task.is_none()
         {
             // Slow commands (/tasks runs a tool, /fork rewrites the whole
             // session log) spawn instead of blocking the render loop.
             let Some(cmd) = app.pending_command.take() else {
                 unreachable!("guarded by is_some_and above")
             };
-            slow_command_generation += 1;
-            let gen = slow_command_generation;
-            let engine_for_task = engine.clone();
-            let tx = slow_tx.clone();
+            self.slow_command_generation += 1;
+            let gen = self.slow_command_generation;
+            let engine_for_task = self.engine.clone();
+            let tx = self.slow_tx.clone();
             let session = app.session_id;
             app.toast(format!("/{} running (Esc cancels)…", cmd_label(&cmd)));
-            slow_command_task = Some(tokio::spawn(async move {
+            self.slow_command_task = Some(tokio::spawn(async move {
                 let result = run_slow_pending_command(engine_for_task, cmd, session).await;
                 let _ = tx.send(SlowCommandProgress::Done { gen, result });
             }));
@@ -867,26 +1118,27 @@ pub async fn run_with(
                     _ => {}
                 }
             }
-            for line in run_pending_command(&mut engine, cmd).await {
+            for line in run_pending_command(&mut self.engine, cmd).await {
                 app.note(line);
             }
         }
+    }
 
-        // 3c. OAuth progress: interim updates render in the waiting modal,
-        //     Done settles it. The spawned flow is aborted whenever the
-        //     waiting screen isn't up (modal closed OR backed out to
-        //     another manager screen). Messages from an older
-        //     (cancelled/replaced) flow generation are dropped — they must
-        //     not stomp the current modal.
+    /// Phase 3c: OAuth progress — interim updates render in the waiting
+    /// modal, Done settles it. The spawned flow is aborted whenever the
+    /// waiting screen isn't up (modal closed OR backed out to another
+    /// manager screen). Messages from an older (cancelled/replaced) flow
+    /// generation are dropped — they must not stomp the current modal.
+    fn drain_oauth_progress(&mut self, app: &mut App) {
         if !matches!(app.auth_flow, Some(AuthFlow::WaitingOAuth { .. })) {
-            if let Some(task) = oauth_task.take() {
+            if let Some(task) = self.oauth_task.take() {
                 task.abort();
             }
         }
-        while let Ok(progress) = oauth_rx.try_recv() {
+        while let Ok(progress) = self.oauth_rx.try_recv() {
             let stale = match &progress {
                 OAuthProgress::Interim { gen, .. } | OAuthProgress::Done { gen, .. } => {
-                    *gen != oauth_generation
+                    *gen != self.oauth_generation
                 }
             };
             if stale {
@@ -911,7 +1163,7 @@ pub async fn run_with(
                     }
                 }
                 OAuthProgress::Done { result, .. } => {
-                    oauth_task = None;
+                    self.oauth_task = None;
                     // Only settle the modal when it is still up — a late
                     // Done must not close a manager the user deliberately
                     // backed out of (Esc keeps the manager open).
@@ -925,15 +1177,17 @@ pub async fn run_with(
                 }
             }
         }
+    }
 
-        // 3d. Slow-command and clipboard results land here (spawned above);
-        //     stale generations (aborted/replaced commands) are dropped.
-        while let Ok(progress) = slow_rx.try_recv() {
+    /// Phase 3d: slow-command and clipboard results land here (spawned
+    /// above); stale generations (aborted/replaced commands) are dropped.
+    fn drain_slow_and_clipboard(&mut self, app: &mut App) {
+        while let Ok(progress) = self.slow_rx.try_recv() {
             let SlowCommandProgress::Done { gen, result } = progress;
-            if gen != slow_command_generation {
+            if gen != self.slow_command_generation {
                 continue;
             }
-            slow_command_task = None;
+            self.slow_command_task = None;
             for line in result.lines {
                 app.note(line);
             }
@@ -941,19 +1195,20 @@ pub async fn run_with(
                 app.session_id = Some(id);
             }
         }
-        while let Ok(progress) = clip_rx.try_recv() {
+        while let Ok(progress) = self.clip_rx.try_recv() {
             if matches!(progress, ClipboardProgress::Harvested(_)) {
-                harvest_task = None;
+                self.harvest_task = None;
             }
-            apply_clipboard_progress(&mut app, progress);
+            apply_clipboard_progress(app, progress);
         }
+    }
 
-        // 3e. `!` shell passthrough result: stdout, stderr and the exit
-        //     code land as dim lines under the accent echo, bounded like
-        //     the bash tool's capture — a runaway `cat` must not flood
-        //     the scrollback.
-        while let Ok(outcome) = shell_rx.try_recv() {
-            shell_task = None;
+    /// Phase 3e: `!` shell passthrough result — stdout, stderr and the exit
+    /// code land as dim lines under the accent echo, bounded like the bash
+    /// tool's capture — a runaway `cat` must not flood the scrollback.
+    fn drain_shell_results(&mut self, app: &mut App) {
+        while let Ok(outcome) = self.shell_rx.try_recv() {
+            self.shell_task = None;
             match outcome.result {
                 Ok(output) => {
                     let stdout = cap_output(String::from_utf8_lossy(&output.stdout).trim_end());
@@ -973,12 +1228,14 @@ pub async fn run_with(
                 Err(e) => app.note(format!("!{}: {e}", outcome.command)),
             }
         }
+    }
 
-        // 3f. Remote-control updates: notes (server toasts/slash output,
-        //     oauth progress), config echoes (mode/model labels), and
-        //     auto-attach snapshots (the session id arrives here on a
-        //     first submit to a fresh session).
-        while let Ok(frame) = ui_rx.try_recv() {
+    /// Phase 3f: remote-control updates — notes (server toasts/slash
+    /// output, oauth progress), config echoes (mode/model labels), and
+    /// auto-attach snapshots (the session id arrives here on a first
+    /// submit to a fresh session).
+    fn drain_ui_frames(&mut self, app: &mut App) {
+        while let Ok(frame) = self.ui_rx.try_recv() {
             match frame {
                 UiFrame::Note(text) => app.note(text),
                 UiFrame::ConfigChanged(patch) => {
@@ -996,8 +1253,8 @@ pub async fn run_with(
                 }
                 UiFrame::Snapshot(snap) => {
                     app.session_id = Some(snap.session_id);
-                    if backfill_session != Some(snap.session_id) {
-                        backfill_session = Some(snap.session_id);
+                    if self.backfill_session != Some(snap.session_id) {
+                        self.backfill_session = Some(snap.session_id);
                         app.reset_transcript();
                     }
                     if !snap.events.is_empty() {
@@ -1012,35 +1269,34 @@ pub async fn run_with(
                     app.backfill_transcript(entries);
                 }
                 UiFrame::Disconnected => {
-                    remote_busy = false;
+                    self.remote_busy = false;
                     app.toast("server disconnected — restart with --connect to reattach");
                 }
             }
         }
+    }
 
-        // 4. Approve-rest mirror: when the user pressed `a`, future approvals
-        //    short-circuit in the approver; drain any queued one so an
-        //    approval parked BEFORE the `a` press is answered, not re-prompted.
+    /// Phase 4: approve-rest mirror — when the user pressed `a`, future
+    /// approvals short-circuit in the approver; drain any queued one so an
+    /// approval parked BEFORE the `a` press is answered, not re-prompted.
+    fn mirror_approve_rest(&mut self, app: &mut App) {
         if app.approve_rest {
-            approval
+            self.approval
                 .rest_approved
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some((_, respond)) = approval.slot.lock().unwrap().take() {
+            if let Some((_, respond)) = self.approval.slot.lock().unwrap().take() {
                 let _ = respond.send(true);
             }
         }
+    }
 
-        // 5. Engine settled? (Re-drain the event channels first: deltas and
-        // tool activities can queue behind the Done notification.)
-        while let Ok(outcome) = done_rx.try_recv() {
-            engine_task = None;
-            remote_busy = false;
-            while let Ok(msg) = delta_rx.try_recv() {
-                match msg {
-                    DeltaOrTool::Delta(d) => app.on_delta(d),
-                    DeltaOrTool::Tool(t) => app.on_tool(t),
-                }
-            }
+    /// Phase 5: engine settled? Re-drain the event channels first — deltas
+    /// and tool activities can queue behind the Done notification.
+    fn drain_outcomes(&mut self, app: &mut App) {
+        while let Ok(outcome) = self.done_rx.try_recv() {
+            self.engine_task = None;
+            self.remote_busy = false;
+            self.drain_engine_events(app);
             match outcome {
                 Outcome::Done(summary) => {
                     let swarm = app.swarm_summary();
@@ -1067,33 +1323,19 @@ pub async fn run_with(
                 }
             }
         }
-
-        if app.quit {
-            result = Ok(());
-            break;
-        }
-
-        // 6. Render the full screen; advance the spinner and age the toast.
-        app.tick();
-        terminal.draw(|frame| app.view(frame, frame.area()))?;
     }
 
-    // Teardown (guard-backed): restore the terminal from the normal path
-    // too, then print the session id into the NORMAL buffer (it scrolls
-    // away with the alt screen otherwise).
-    terminal_restore.restore();
-    // A /fork that landed during the final tick still adopts its session.
-    while let Ok(SlowCommandProgress::Done { gen, result }) = slow_rx.try_recv() {
-        if gen == slow_command_generation {
-            if let Some(id) = result.new_session {
-                app.session_id = Some(id);
+    /// Post-loop drain: a /fork that landed during the final tick still
+    /// adopts its session.
+    fn adopt_pending_fork(&mut self, app: &mut App) {
+        while let Ok(SlowCommandProgress::Done { gen, result }) = self.slow_rx.try_recv() {
+            if gen == self.slow_command_generation {
+                if let Some(id) = result.new_session {
+                    app.session_id = Some(id);
+                }
             }
         }
     }
-    if let Some(id) = app.session_id {
-        println!("session: {id} — resume with --resume {id}");
-    }
-    result
 }
 
 /// Execute a parked FAST slash command against the engine. Returns the

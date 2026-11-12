@@ -15,6 +15,8 @@
 //! Display-shaped payloads reuse [`modron_view`] types (`ToolEvent`) so
 //! every client groups identically.
 
+pub mod client;
+
 use modron_types::{
     Attachment, RunSummary, SandboxPolicy, SessionEvent, StreamDelta, ToolActivity, ToolCall, Usage,
 };

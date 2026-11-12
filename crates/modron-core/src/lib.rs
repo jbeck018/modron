@@ -24,6 +24,9 @@ pub mod judge;
 pub mod memory;
 pub mod rewind;
 pub mod sandbox;
+/// Speculative mid-stream execution subsystem (private to the crate; the
+/// engine's run loop is the only client).
+pub(crate) mod speculative;
 pub mod subagent;
 pub mod testing;
 

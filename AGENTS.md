@@ -68,12 +68,21 @@ forked per client.
 | Tool detail panel | ctrl+t overlay, click-to-open | Panel/drawer, click-to-open |
 | Theming | ANSI/ratatui palette themes | System appearance + semantic roles mapped to native colors |
 | Platform chrome | None (fullscreen terminal) | Native menus, dock, safe areas (mobile), virtual keyboard handling |
-| Remote-control registration | /remote-control <bridge-url> slash command (opens a tunnel through the deployed cloud/bridge relay; prints the share URL) | Desktop: /remote-control via the slash popup; mobile: /remote-control <bridge-url> slash (chat header carries share/fork/task controls; the protocol command and relay are shared) |
+| Remote-control registration | /remote-control <bridge-url> slash command (opens a tunnel through the deployed cloud/bridge relay; prints the share URL) | Desktop: /remote-control via the slash popup + share button; mobile: /remote-control <bridge-url> slash, the share URL lands in the note line (chat header carries share/fork/task controls; the protocol command and relay are shared) |
 | Layout | Single column, status line + live strip | Sidebar + panes / mobile stack |
 | Per-turn meta (model switches, usage notes) | Dim scrollback lines after each turn | Desktop: centered divider chip on model CHANGE only, per-turn usage folded into the status bar; mobile: usage notes |
 
 Divergence covers PRESENTATION and KEYS only. The words, the states, the
 ordering, and the semantics do not diverge.
+
+Closed by the 2026-11-12 audit (these were capability drift, now fixed):
+TUI serves /share (+/publish alias), /new, /settings and lists every
+executable command in its completion/help; TUI remote mode sends fork /
+tasks / publish / automations frames over the wire and folds live
+persisted events; mobile renders the live tool view, gates reasoning
+behind an opt-in toggle, says "allow all", shows the remote-control share
+URL, and can reconnect after a drop. AuthProviders requests use
+`AuthProvidersReq`; `Payload::Error` carries a machine-readable `kind`.
 
 ### Process rules for agents
 

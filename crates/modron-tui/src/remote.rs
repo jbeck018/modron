@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use modron_core::SessionEvent;
-use modron_protocol::{Frame, LiveState, Payload, PROTOCOL_VERSION};
+use modron_protocol::{Frame, LiveState, Payload};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -161,35 +161,12 @@ impl RemoteClient {
     /// `"unix:<path>"`, or `"ws://host:port"`.
     pub async fn connect(target: &str) -> Result<Self> {
         let mut link = Link::open(target).await?;
-        link.send(&Frame::request(
-            1,
-            Payload::Hello {
-                client: "modron-tui".into(),
-                protocol: PROTOCOL_VERSION,
-                token: None,
-            },
-        ))
-        .await?;
+        link.send(&modron_protocol::client::hello_frame("modron-tui", None))
+            .await?;
         let welcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, link.recv())
             .await
             .map_err(|_| anyhow!("handshake timeout ({target})"))?;
-        match welcome {
-            Some(Frame {
-                payload: Payload::Welcome { protocol, .. },
-                ..
-            }) if protocol == PROTOCOL_VERSION => {}
-            Some(Frame {
-                payload: Payload::Welcome { protocol, .. },
-                ..
-            }) => bail!(
-                "server speaks protocol {protocol}, this build speaks {PROTOCOL_VERSION} ({target})"
-            ),
-            Some(Frame {
-                payload: Payload::Error { message, kind: _ },
-                ..
-            }) => bail!("server refused the connection: {message}"),
-            _ => bail!("server did not answer the handshake ({target})"),
-        }
+        modron_protocol::client::check_welcome(welcome, target).map_err(anyhow::Error::msg)?;
 
         // Pump: owns the link, forwards both directions. The run loop
         // drains `frames` on its 50ms tick; send is sync/unbounded.
@@ -334,6 +311,9 @@ impl RemoteClient {
 mod tests {
     use super::*;
     use modron_core::Usage;
+    // Handshake now goes through modron_protocol::client, so the test
+    // fixtures import the protocol constant directly.
+    use modron_protocol::PROTOCOL_VERSION;
     use tokio::net::{TcpListener, UnixListener};
 
     /// A scripted Unix-socket server: reads hello, writes welcome; reads

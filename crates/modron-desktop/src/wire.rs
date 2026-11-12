@@ -12,7 +12,9 @@ use std::collections::VecDeque;
 use anyhow::{anyhow, Context as _};
 use futures::{SinkExt, StreamExt};
 use modron_core::Attachment;
-use modron_protocol::{ConfigPatch, Decision, Frame, Payload, PROTOCOL_VERSION};
+#[allow(unused_imports)]
+use modron_protocol::PROTOCOL_VERSION;
+use modron_protocol::{ConfigPatch, Decision, Frame, Payload};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
@@ -44,14 +46,7 @@ impl WireClient {
             .with_context(|| format!("dial {url}"))?;
         let (mut sink, mut stream) = ws.split();
 
-        let hello = Frame::request(
-            0,
-            Payload::Hello {
-                client: CLIENT_NAME.to_string(),
-                protocol: PROTOCOL_VERSION,
-                token: None,
-            },
-        );
+        let hello = modron_protocol::client::hello_frame(CLIENT_NAME, None);
         sink.send(WsMessage::text(serde_json::to_string(&hello)?))
             .await
             .context("send hello")?;
@@ -63,26 +58,8 @@ impl WireClient {
             .await
             .ok_or_else(|| anyhow!("connection closed before welcome"))?;
         let frame = decode(msg?).ok_or_else(|| anyhow!("non-text frame during handshake"))?;
-        let server_version = match frame.payload {
-            Payload::Welcome {
-                server_version,
-                protocol,
-            } => {
-                if protocol != PROTOCOL_VERSION {
-                    return Err(anyhow!(
-                        "protocol mismatch: server speaks {protocol}, we speak {PROTOCOL_VERSION}"
-                    ));
-                }
-                server_version
-            }
-            Payload::Error { message, .. } => return Err(anyhow!("handshake rejected: {message}")),
-            other => {
-                return Err(anyhow!(
-                    "expected welcome, got {:?}",
-                    std::mem::discriminant(&other)
-                ))
-            }
-        };
+        let server_version =
+            modron_protocol::client::check_welcome(Some(frame), url).map_err(anyhow::Error::msg)?;
 
         // Reader task: every subsequent inbound frame lands in the channel.
         let (tx, inbound) = mpsc::channel::<Frame>(256);

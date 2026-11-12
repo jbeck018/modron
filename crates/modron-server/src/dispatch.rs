@@ -543,7 +543,7 @@ pub async fn handle_frame(
 }
 
 async fn handle_router_defaults_req(
-    state: &Arc<ServerState>,
+    _state: &Arc<ServerState>,
     ctx: &mut ConnCtx,
     request_id: Option<u64>,
 ) {
@@ -858,7 +858,7 @@ async fn handle_auth_start(
 }
 
 async fn handle_auth_set_key(
-    state: &Arc<ServerState>,
+    _state: &Arc<ServerState>,
     ctx: &mut ConnCtx,
     request_id: Option<u64>,
     session_id: SessionId,

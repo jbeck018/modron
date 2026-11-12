@@ -11,6 +11,7 @@ use crate::budget::BudgetGovernor;
 use crate::compact;
 use crate::context;
 use crate::hooks;
+use crate::speculative;
 use crate::{
     estimate_tokens, judge, ActionKind, ApprovalMode, Engine, Error, JudgeMode, Message,
     ModelChoice, ModelProvider, Result, Role, RunSummary, SelectRequest, SessionEvent, SessionId,
@@ -47,18 +48,6 @@ against the evidence in this conversation. Your next message REPLACES the \
 run's final answer — correct any mismatch you find and state plainly \
 anything you cannot confirm.";
 
-/// Idempotent, side-effect-free tools eligible for speculative execution
-/// (started mid-stream when the provider completes a tool-call item early,
-/// reused by the dispatch once the turn finishes — oh-my-pi pattern).
-/// bash/write/edit stay out: side effects must never run on a call the
-/// model might still revise.
-const SPECULATIVE_TOOLS: [&str; 3] = ["read", "grep", "glob"];
-
-/// Identity key for a speculative result: (tool, exact wire args).
-fn speculative_key(call: &ToolCall) -> String {
-    format!("{}:{}", call.name, call.arguments)
-}
-
 /// Output-token ask for the compaction (summarizer) call — small by design
 /// (PLAN.md §4.10): a compact state is a few hundred tokens at most, and the
 /// summary is byte-capped again before it is persisted.
@@ -66,6 +55,100 @@ const COMPACTION_MAX_OUTPUT_TOKENS: u32 = 512;
 
 /// Characters of the task used as the session title.
 const TITLE_MAX_CHARS: usize = 60;
+
+// ---------------------------------------------------------------------------
+// Run-loop phase types (2026-11-12 audit): the per-run mutable locals the
+// turn loop and its helpers previously shared as ~15 loose locals plus five
+// separate `&mut` parameters are gathered into [`RunLoopState`]; the loop
+// body is split into route / execute / dispatch / finalize phases.
+// ---------------------------------------------------------------------------
+
+/// Routing decision for one turn — the output of the route/decide phase
+/// ([`Engine::route_turn`]) and the input to the execute-turn phase.
+struct TurnRoute {
+    choice: ModelChoice,
+    context_tokens: u64,
+    action: ActionKind,
+}
+
+/// One completed provider turn plus the bookkeeping its caller needs:
+/// accounting inputs (model, provider id, start instant) and the
+/// speculative mid-stream results the dispatch reuses.
+struct CompletedTurn {
+    response: TurnResponse,
+    model: String,
+    provider_id: String,
+    /// When this turn's provider call started (the TurnTrace latency).
+    started: std::time::Instant,
+    /// Speculative results computed during THIS turn's stream, keyed by
+    /// (tool, exact wire args).
+    speculative: std::collections::HashMap<String, ToolOutcome>,
+}
+
+/// Per-run mutable state for one [`Engine::run_loop`] execution.
+struct RunLoopState {
+    /// Conversation so far: rebuilt by compaction, extended by every
+    /// assistant message and tool result.
+    transcript: Vec<Message>,
+    /// Cumulative reported-usage budget for the whole run.
+    governor: BudgetGovernor,
+    turns: u32,
+    tool_calls_executed: u32,
+    /// Provider-reported ground-truth usage totals for the run summary.
+    total: Usage,
+    models_used: Vec<String>,
+    /// The run's final answer: annotated by the finish gate's give-up note,
+    /// replaced by the escalation turn on success.
+    answer: String,
+    /// Main turns completed since the last compaction (the compaction call
+    /// itself is not a turn).
+    turns_since_compaction: u32,
+    // Phase 13: memory ids this run surfaced via memory_search — folded
+    // back into the usefulness ledger when the run completes.
+    memory_hits: Vec<String>,
+    spend_usd: f64,
+    /// Finish-gate state: whether a mutating tool was dispatched this
+    /// run, and how many verification rounds have been spent.
+    mutated_this_run: bool,
+    verify_rounds: u32,
+    /// Whether the finish gate already injected its self-check turn —
+    /// a provider failure ON THAT TURN is non-fatal (keep the answer).
+    self_check_sent: bool,
+    /// Tier fallback (remote-control hardening): once an auth failure
+    /// promotes the run to a tier's fallback model, every later turn
+    /// uses the fallback directly (the dead primary would 401 again
+    /// each turn). `(primary model, fallback selection)`.
+    run_tier_override: Option<(String, ModelChoice)>,
+    /// Whether the most recent dispatch turn ENDED with a passing
+    /// `verify` call — the model's own evidence satisfies the gate.
+    last_dispatch_ended_with_passing_verify: bool,
+    /// Why the loop ended (`end_turn` / `max_turns` / `spend_cap` /
+    /// `budget_exhausted`) — the terminal TurnTrace's failure label.
+    stop_label: &'static str,
+}
+
+impl RunLoopState {
+    fn new(transcript: Vec<Message>, max_total_tokens: u64) -> Self {
+        Self {
+            transcript,
+            governor: BudgetGovernor::new(max_total_tokens),
+            turns: 0,
+            tool_calls_executed: 0,
+            total: Usage::default(),
+            models_used: Vec::new(),
+            answer: String::new(),
+            turns_since_compaction: 0,
+            memory_hits: Vec::new(),
+            spend_usd: 0.0,
+            mutated_this_run: false,
+            verify_rounds: 0,
+            self_check_sent: false,
+            run_tier_override: None,
+            last_dispatch_ended_with_passing_verify: false,
+            stop_label: "end_turn",
+        }
+    }
+}
 
 impl Engine {
     /// Run `task` to completion and return a summary.
@@ -178,11 +261,18 @@ impl Engine {
     /// Shared turn loop for fresh and resumed runs. `task` is the current
     /// user instruction (used for routing heuristics); `transcript` starts
     /// with that instruction as its last message.
+    ///
+    /// Phase shape (2026-11-12 audit): each iteration routes/decides
+    /// ([`Self::route_turn`]), executes one provider turn
+    /// ([`Self::execute_provider_turn`]), then either dispatches tool calls
+    /// ([`Self::dispatch_turn_tools`]) or runs the finish gate inline;
+    /// [`Self::finalize_run`] closes the run. Per-run mutable state lives in
+    /// [`RunLoopState`].
     async fn run_loop(
         &self,
         session_id: SessionId,
         task: &str,
-        mut transcript: Vec<Message>,
+        transcript: Vec<Message>,
     ) -> Result<RunSummary> {
         let tool_specs = self.tools.specs_prompt();
         let system = self.assemble_system(&tool_specs);
@@ -190,43 +280,16 @@ impl Engine {
         // (system + tool specs) — a change across turns means prefix
         // instability (cache busts), visible in TurnTrace records.
         let prompt_hash = prompt_wire_hash(&system, &tool_specs);
-        let mut stop_label: &'static str = "end_turn";
-        let mut governor = BudgetGovernor::new(self.config.max_total_tokens);
-
-        let mut turns: u32 = 0;
-        let mut tool_calls_executed: u32 = 0;
-        let mut total = Usage::default();
-        let mut models_used: Vec<String> = Vec::new();
-        let mut answer = String::new();
-        let mut turns_since_compaction: u32 = 0;
-        // Phase 13: memory ids this run surfaced via memory_search — folded
-        // back into the usefulness ledger when the run completes.
-        let mut memory_hits: Vec<String> = Vec::new();
-        let mut spend_usd = 0.0_f64;
-        // Finish-gate state: whether a mutating tool was dispatched this
-        // run, and how many verification rounds have been spent.
-        let mut mutated_this_run = false;
-        let mut verify_rounds: u32 = 0;
-        // Whether the finish gate already injected its self-check turn —
-        // a provider failure ON THAT TURN is non-fatal (keep the answer).
-        let mut self_check_sent = false;
-        // Tier fallback (remote-control hardening): once an auth failure
-        // promotes the run to a tier's fallback model, every later turn
-        // uses the fallback directly (the dead primary would 401 again
-        // each turn). `(primary model, fallback selection)`.
-        let mut run_tier_override: Option<(String, ModelChoice)> = None;
-        // Whether the most recent dispatch turn ENDED with a passing
-        // `verify` call — the model's own evidence satisfies the gate.
-        let mut last_dispatch_ended_with_passing_verify = false;
+        let mut state = RunLoopState::new(transcript, self.config.max_total_tokens);
 
         loop {
-            if turns >= self.config.max_turns {
+            if state.turns >= self.config.max_turns {
                 tracing::warn!(
-                    turns,
+                    turns = state.turns,
                     max = self.config.max_turns,
                     "stopping: max_turns reached"
                 );
-                stop_label = "max_turns";
+                state.stop_label = "max_turns";
                 break;
             }
 
@@ -234,349 +297,51 @@ impl Engine {
             // (from ModelChoice) is the compaction trigger — a 128k-window
             // free model must compact at 0.8×128k even when the global cap
             // is 180k.
-            let mut context_tokens = estimate_context_tokens(&system, &tool_specs, &transcript);
-            let action = if turns == 0 {
-                ActionKind::Chat
-            } else {
-                derive_action(&transcript)
-            };
-            let mut choice = self.selector.select(&SelectRequest {
-                task: task.to_string(),
-                action,
-                context_tokens,
-                budget_remaining_usd: self
-                    .config
-                    .max_cost_usd
-                    .map(|cap| (cap - spend_usd).max(0.0)),
-            });
-            let effective_cap = choice
-                .context_window
-                .unwrap_or(self.config.max_input_tokens)
-                .min(self.config.max_input_tokens);
+            let route = self
+                .route_turn(session_id, task, &system, &tool_specs, &mut state)
+                .await?;
 
-            // Autocompaction (PLAN.md §4.10): before any turn after the
-            // first, under context pressure and past the min-interval,
-            // summarize the older transcript. Runs before the pre-flight
-            // budget check so a compaction can rescue an over-cap context.
-            // The current selection is the model taking the NEXT turn —
-            // passed in so the bitmap attachment can be gated on its
-            // vision capability.
-            if self.should_compact_with_cap(
-                turns,
-                turns_since_compaction,
-                context_tokens,
-                effective_cap,
-            ) {
-                if let Some(outcome) = self.run_compaction(session_id, task, &choice.model).await? {
-                    governor.feed_turn(outcome.usage);
-                    spend_usd += self.turn_cost_usd(&outcome.model, &outcome.usage);
-                    total.input_tokens += outcome.usage.input_tokens;
-                    total.output_tokens += outcome.usage.output_tokens;
-                    total.cached_input_tokens += outcome.usage.cached_input_tokens;
-                    if !models_used.contains(&outcome.model) {
-                        models_used.push(outcome.model);
-                    }
-                    transcript = outcome.transcript;
-                    turns_since_compaction = 0;
-                    context_tokens = estimate_context_tokens(&system, &tool_specs, &transcript);
-                    // The context changed materially: re-route once.
-                    choice = self.selector.select(&SelectRequest {
-                        task: task.to_string(),
-                        action,
-                        context_tokens,
-                        budget_remaining_usd: self
-                            .config
-                            .max_cost_usd
-                            .map(|cap| (cap - spend_usd).max(0.0)),
-                    });
-                }
-            }
-
-            // Pre-flight budget check on the assembled context, against the
-            // effective cap (the model's window when known).
-            governor.check_input_with_cap(context_tokens, effective_cap)?;
-
-            // Async decision model (Phase-3b M1): consulted per JudgeMode.
-            // A verdict re-queries the sync selector with the mapped action —
-            // tier config, overrides, and budget rules stay in one place.
-            if let Some((router, mode)) = &self.config.async_router {
-                let consult = match mode {
-                    JudgeMode::Always => true,
-                    JudgeMode::Ambiguous => !choice.confident,
-                };
-                if consult {
-                    if let Some(verdict) = router.route(task, action).await {
-                        let synthetic = SelectRequest {
-                            task: task.to_string(),
-                            action: judge::verdict_action(verdict),
-                            context_tokens,
-                            budget_remaining_usd: self
-                                .config
-                                .max_cost_usd
-                                .map(|cap| (cap - spend_usd).max(0.0)),
-                        };
-                        let mut re = self.selector.select(&synthetic);
-                        re.reason = format!("async-router: {verdict:?} → {}", re.reason);
-                        choice = re;
-                    }
-                }
-            }
-            // Tier fallback: a run-level override (an earlier turn's auth
-            // failure promoted this model) applies immediately; otherwise
-            // the selector's choice stands. The fallback flag mirrors the
-            // override so a fresh primary failure can still be retried on
-            // a candidate.
-            let mut fallback: Option<ModelChoice> = match &run_tier_override {
-                Some((primary, fb)) if *primary == choice.model => Some(fb.clone()),
-                _ => None,
-            };
-            let mut attempted_fallback = fallback.is_some();
-            // Loop-external turn state: None = self-check short-circuit
+            // Loop-external turn state: `None` = self-check short-circuit
             // (the outer run loop ends with the preserved answer).
-            let mut turn_outcome: Option<(TurnResponse, String, String)> = None;
-            #[allow(unused_assignments)]
-            let mut turn_started = std::time::Instant::now();
-            // Speculative results computed during THIS turn's stream.
-            let mut speculative: std::collections::HashMap<String, ToolOutcome> =
-                std::collections::HashMap::new();
-            loop {
-                let active = fallback.clone().unwrap_or_else(|| choice.clone());
-                let (provider, model) = self.resolve_provider(&active)?;
-
-                self.store
-                    .append(
-                        session_id,
-                        &SessionEvent::ModelSelected {
-                            model: model.clone(),
-                            reason: active.reason.clone(),
-                            action: Some(format!("{action:?}")),
-                            context_tokens: Some(context_tokens),
-                        },
-                    )
-                    .await?;
-
-                let request = TurnRequest {
-                    model: model.clone(),
-                    system: system.clone(),
-                    messages: transcript.clone(),
-                    tools: tool_specs.clone(),
-                    max_tokens: MAX_OUTPUT_TOKENS,
-                };
-                tracing::info!(
-                    turn = turns + 1,
-                    provider = provider.id(),
-                    model = %model,
-                    "turn start"
-                );
-                // Streaming dispatch (Phase-1c I1): when a delta sink is
-                // configured, drive the provider through `turn_streaming` and
-                // forward deltas as they arrive (providers without an SSE
-                // implementation yield one Text delta via the trait default).
-                turn_started = std::time::Instant::now();
-                speculative.clear();
-                let response = match self.config.on_delta.clone() {
-                    Some(sink) => {
-                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
-                        // Speculative driver: forwards deltas to the sink,
-                        // and when the provider completes a tool-call item
-                        // mid-stream, immediately executes idempotent reads
-                        // so the dispatch below can reuse the result instead
-                        // of re-running the tool. Gated OFF when any observer
-                        // or gate would be bypassed: pre_tool/post_tool
-                        // hooks, the on_tool_event sink, and the --deny list
-                        // all must keep seeing every execution.
-                        let speculation_safe = self.config.hooks.pre_tool.is_none()
-                            && self.config.hooks.post_tool.is_none()
-                            && self.config.on_tool_event.is_none()
-                            && !self
-                                .config
-                                .approvals
-                                .deny
-                                .iter()
-                                .any(|d| SPECULATIVE_TOOLS.contains(&d.as_str()));
-                        if speculation_safe {
-                            let spec_results: std::sync::Arc<
-                                std::sync::Mutex<std::collections::HashMap<String, ToolOutcome>>,
-                            > = std::sync::Arc::default();
-                            let engine_for_spec = Arc::new(self.clone());
-                            let driver_map = Arc::clone(&spec_results);
-                            // The driver owns the in-flight handles so every
-                            // speculation is joined before the drain below.
-                            let driver = tokio::spawn(async move {
-                                let mut in_flight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-                                while let Some(delta) = rx.recv().await {
-                                    match delta {
-                                        StreamDelta::ToolCallReady(call) => {
-                                            if !SPECULATIVE_TOOLS.contains(&call.name.as_str()) {
-                                                continue;
-                                            }
-                                            let key = speculative_key(&call);
-                                            // Placeholder first: duplicate
-                                            // items for the same call must
-                                            // not spawn duplicate executions.
-                                            {
-                                                let mut map = driver_map
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                if map.contains_key(&key) {
-                                                    continue;
-                                                }
-                                                map.insert(
-                                                    key.clone(),
-                                                    ToolOutcome::err(String::new()),
-                                                );
-                                            }
-                                            let engine = Arc::clone(&engine_for_spec);
-                                            let map = Arc::clone(&driver_map);
-                                            in_flight.push(tokio::spawn(async move {
-                                                let name = call.name.clone();
-                                                let ctx = ToolCtx {
-                                                    sandbox: engine.config.sandbox,
-                                                    working_dir: engine.config.working_dir.clone(),
-                                                    engine: Some(Arc::clone(&engine)),
-                                                    session_id: Some(session_id),
-                                                };
-                                                let outcome = match engine.tools.get(&name) {
-                                                    Some(tool) => tool
-                                                        .execute(call.arguments.clone(), &ctx)
-                                                        .await
-                                                        .unwrap_or_else(|e| {
-                                                            ToolOutcome::err(e.to_string())
-                                                        }),
-                                                    None => ToolOutcome::err("unknown tool"),
-                                                };
-                                                map.lock()
-                                                    .unwrap()
-                                                    .insert(speculative_key(&call), outcome);
-                                            }));
-                                        }
-                                        other => sink(other),
-                                    }
-                                }
-                                in_flight
-                            });
-                            let result = provider.turn_streaming(request, tx).await;
-                            let in_flight = driver.await.unwrap_or_default();
-                            for handle in in_flight {
-                                let _ = handle.await;
-                            }
-                            let drained: Vec<_> = spec_results
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .drain()
-                                .collect();
-                            speculative.extend(drained);
-                            result
-                        } else {
-                            // Plain forwarder: speculation disabled (hooks,
-                            // event sink, or deny list present).
-                            let forwarder = tokio::spawn(async move {
-                                while let Some(delta) = rx.recv().await {
-                                    sink(delta);
-                                }
-                            });
-                            let result = provider.turn_streaming(request, tx).await;
-                            let _ = forwarder.await;
-                            result
-                        }
-                    }
-                    None => provider.turn(request).await,
-                };
-                match response {
-                    Ok(r) => {
-                        turn_outcome = Some((r, model, provider.id().to_string()));
-                        break;
-                    }
-                    Err(e) => {
-                        // The self-check turn is an ENHANCEMENT: if the
-                        // provider fails on it, keep the pre-check answer and
-                        // end the run — never destroy completed work for the
-                        // bonus turn.
-                        if self_check_sent && !answer.is_empty() {
-                            tracing::warn!(
-                                error = %e,
-                                "self-check turn failed; keeping the pre-check answer"
-                            );
-                            break;
-                        }
-                        // Auth-class failure on a tier's primary: retry ONCE
-                        // on the tier's fallback candidate (a dead token on
-                        // one provider must not take a tier another signed-in
-                        // provider serves). Auth failures precede streaming,
-                        // so nothing is re-emitted.
-                        if !attempted_fallback {
-                            if let Some(fb) =
-                                self.tier_fallback_after_auth_failure(&model, provider.id(), &e)
-                            {
-                                tracing::warn!(
-                                    from = %model,
-                                    to = %fb.model,
-                                    to_provider = %fb.provider,
-                                    error = %e,
-                                    "auth failure — falling back to the tier fallback model"
-                                );
-                                attempted_fallback = true;
-                                fallback = Some(fb.clone());
-                                run_tier_override = Some((model, fb));
-                                continue;
-                            }
-                        }
-                        // Phase 13 completion (2026-11-11): a FAILED run
-                        // is a failure signal for the memories it surfaced
-                        // — the ledger learns from both outcomes, not just
-                        // successes.
-                        if !memory_hits.is_empty() {
-                            if let Some(root) = &self.config.memory_root {
-                                if let Ok(store) = crate::memory::MemoryStore::for_workspace(
-                                    root,
-                                    &self.config.working_dir,
-                                ) {
-                                    store.record_outcome(&memory_hits, false);
-                                }
-                            }
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-            let Some((response, model, provider_id)) = turn_outcome else {
-                // Self-check short-circuit: the outer run loop ends with
-                // the preserved answer.
+            let Some(turn) = self
+                .execute_provider_turn(session_id, &system, &tool_specs, &route, &mut state)
+                .await?
+            else {
                 break;
             };
-            turns += 1;
+            state.turns += 1;
 
             // Usage: provider-reported ground truth, never estimates.
-            governor.feed_turn(response.usage);
-            total.input_tokens += response.usage.input_tokens;
-            total.output_tokens += response.usage.output_tokens;
-            total.cached_input_tokens += response.usage.cached_input_tokens;
+            state.governor.feed_turn(turn.response.usage);
+            state.total.input_tokens += turn.response.usage.input_tokens;
+            state.total.output_tokens += turn.response.usage.output_tokens;
+            state.total.cached_input_tokens += turn.response.usage.cached_input_tokens;
             self.store
                 .append(
                     session_id,
                     &SessionEvent::Usage {
-                        model: model.clone(),
-                        usage: response.usage,
+                        model: turn.model.clone(),
+                        usage: turn.response.usage,
                     },
                 )
                 .await?;
-            if !models_used.contains(&model) {
-                models_used.push(model.clone());
+            if !state.models_used.contains(&turn.model) {
+                state.models_used.push(turn.model.clone());
             }
-            let turn_cost = self.turn_cost_usd(&model, &response.usage);
-            spend_usd += turn_cost;
+            let turn_cost = self.turn_cost_usd(&turn.model, &turn.response.usage);
+            state.spend_usd += turn_cost;
             self.store
                 .append(
                     session_id,
                     &SessionEvent::TurnTrace {
-                        turn: turns,
+                        turn: state.turns,
                         harness_version: env!("CARGO_PKG_VERSION").to_string(),
-                        provider: provider_id.clone(),
-                        model: model.clone(),
+                        provider: turn.provider_id.clone(),
+                        model: turn.model.clone(),
                         prompt_hash: Some(prompt_hash.clone()),
-                        latency_ms: Some(turn_started.elapsed().as_millis() as u64),
+                        latency_ms: Some(turn.started.elapsed().as_millis() as u64),
                         cost_usd: Some(turn_cost),
-                        usage: Some(response.usage),
+                        usage: Some(turn.response.usage),
                         verifier: None,
                         failure_label: None,
                     },
@@ -587,18 +352,19 @@ impl Engine {
             // the injected price lookup — an honest estimate, checked after
             // the turn so the turn's real usage is what trips it.
             if let Some(cap) = self.config.max_cost_usd {
-                if spend_usd > cap {
+                if state.spend_usd > cap {
                     tracing::error!(
-                        spend = format!("${spend_usd:.4}"),
+                        spend = format!("${:.4}", state.spend_usd),
                         cap = format!("${cap:.4}"),
                         "stopping: USD spend cap exceeded"
                     );
-                    answer = format!(
-                        "{answer}\n\n[stopped: USD spend cap exceeded — spent ~${spend_usd:.4} of ${cap:.4} cap]"
+                    state.answer = format!(
+                        "{}\n\n[stopped: USD spend cap exceeded — spent ~${:.4} of ${cap:.4} cap]",
+                        state.answer, state.spend_usd
                     )
                     .trim()
                     .to_string();
-                    stop_label = "spend_cap";
+                    state.stop_label = "spend_cap";
                     break;
                 }
             }
@@ -606,8 +372,8 @@ impl Engine {
             // Record the assistant message (text and/or tool calls).
             let assistant = Message {
                 role: Role::Assistant,
-                content: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
+                content: turn.response.text.clone(),
+                tool_calls: turn.response.tool_calls.clone(),
                 tool_call_id: None,
                 attachments: Vec::new(),
             };
@@ -620,10 +386,12 @@ impl Engine {
                     },
                 )
                 .await?;
-            transcript.push(assistant);
-            answer = response.text;
+            state.transcript.push(assistant);
+            state.answer = turn.response.text;
 
-            if response.stop_reason != StopReason::ToolUse || response.tool_calls.is_empty() {
+            if turn.response.stop_reason != StopReason::ToolUse
+                || turn.response.tool_calls.is_empty()
+            {
                 // Finish gate (harness-enforced verification): a run that
                 // dispatched mutating tools must show verify evidence
                 // before it may end — outcome-only scoring hides unverified
@@ -632,18 +400,7 @@ impl Engine {
                 // configured); failures feed the output back verbatim and
                 // continue — StaminaBench's retry-with-test-feedback loop,
                 // bounded to MAX_VERIFY_ROUNDS per run.
-                if !self
-                    .run_finish_gate(
-                        session_id,
-                        &mut transcript,
-                        &mut mutated_this_run,
-                        &mut verify_rounds,
-                        &mut answer,
-                        last_dispatch_ended_with_passing_verify,
-                        &mut self_check_sent,
-                    )
-                    .await?
-                {
+                if !self.run_finish_gate(session_id, &mut state).await? {
                     // Escalation (ONE per run): the gate just exhausted its
                     // feedback rounds with verification still failing (the
                     // same two conditions its give-up note keys on) and the
@@ -656,24 +413,13 @@ impl Engine {
                     // fresh bound, like the gate rounds). Max-turns headroom
                     // is required: the persisted handoff message must not
                     // promise a re-check the loop can no longer service.
-                    if mutated_this_run
-                        && verify_rounds >= MAX_VERIFY_ROUNDS
-                        && turns < self.config.max_turns
+                    if state.mutated_this_run
+                        && state.verify_rounds >= MAX_VERIFY_ROUNDS
+                        && state.turns < self.config.max_turns
                         && self.config.escalate_on_check_failure.is_some()
                     {
                         if let Err(err) = self
-                            .run_escalation_turn(
-                                session_id,
-                                task,
-                                &system,
-                                &mut transcript,
-                                &mut answer,
-                                &mut turns,
-                                &mut total,
-                                &mut models_used,
-                                &mut governor,
-                                &mut spend_usd,
-                            )
+                            .run_escalation_turn(session_id, task, &system, &mut state)
                             .await
                         {
                             // Store-level failures degrade too: a completed
@@ -690,136 +436,458 @@ impl Engine {
                 continue;
             }
 
-            // A requested mutating call arms the finish gate (conservative:
-            // a vetoed or failed call still counts — the model ATTEMPTED a
-            // mutation, so unverified finishes stay blocked).
-            if response
-                .tool_calls
-                .iter()
-                .any(|c| MUTATING_TOOLS.contains(&c.name.as_str()))
-            {
-                mutated_this_run = true;
-            }
-
-            // Dispatch tool calls; each result enters the transcript. Hooks
-            // (H1) wrap execution: pre_tool may veto before the tool runs,
-            // post_tool observes after. Hook-spawn errors fail closed.
-            // Checkpoints (C1) capture the prior content of files that
-            // write/edit are about to mutate — only in ApproveAll mode, since
-            // any other mode blocks these tools before they can mutate.
-            let ctx = ToolCtx {
-                sandbox: self.config.sandbox,
-                working_dir: self.config.working_dir.clone(),
-                engine: Some(Arc::new(self.clone())),
-                session_id: Some(session_id),
-            };
-            // Phase 4: when every call in the turn is read-only, they run
-            // concurrently (order-preserving — the transcript is identical to
-            // the sequential case, only faster). Mutating calls stay
-            // sequential: checkpoints and approval gating are order-sensitive.
-            let all_read_only = response
-                .tool_calls
-                .iter()
-                .all(|c| !MUTATING_TOOLS.contains(&c.name.as_str()));
-            let outcomes: Vec<ToolOutcome> = if all_read_only && response.tool_calls.len() > 1 {
-                let futures = response
-                    .tool_calls
-                    .iter()
-                    .map(|call| self.dispatch_tool_call(session_id, call, &ctx, &speculative));
-                futures::future::join_all(futures).await
-            } else {
-                let mut outcomes = Vec::with_capacity(response.tool_calls.len());
-                for call in &response.tool_calls {
-                    if self.config.approvals.mode == ApprovalMode::ApproveAll {
-                        if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
-                            self.store.append(session_id, &checkpoint).await?;
-                        }
-                    }
-                    let outcome = self
-                        .dispatch_tool_call(session_id, call, &ctx, &speculative)
-                        .await;
-                    outcomes.push(outcome);
-                }
-                outcomes
-            };
-            last_dispatch_ended_with_passing_verify = response
-                .tool_calls
-                .last()
-                .map(|c| c.name == "verify")
-                .unwrap_or(false)
-                && outcomes.last().map(|o| !o.is_error).unwrap_or(false);
-
-            for (call, outcome) in response.tool_calls.iter().zip(&outcomes) {
-                tracing::info!(
-                    tool = %call.name,
-                    error = outcome.is_error,
-                    result_bytes = outcome.content.len(),
-                    "tool done"
-                );
-                if let Some(ids) = outcome
-                    .meta
-                    .as_ref()
-                    .and_then(|m| m.get("memory_hits"))
-                    .and_then(|v| v.as_array())
-                {
-                    memory_hits.extend(ids.iter().filter_map(|i| i.as_str().map(String::from)));
-                }
-                // Delegated spend (Phase 5c A2): usage spent behind a tool's
-                // interface joins the governor and the run totals — honest
-                // accounting to the token.
-                if let Some(usage) = outcome.usage {
-                    governor.feed_turn(usage);
-                    spend_usd += self.turn_cost_usd(&model, &usage);
-                    total.input_tokens += usage.input_tokens;
-                    total.output_tokens += usage.output_tokens;
-                    total.cached_input_tokens += usage.cached_input_tokens;
-                    self.store
-                        .append(
-                            session_id,
-                            &SessionEvent::Usage {
-                                model: format!("subagent ({})", call.name),
-                                usage,
-                            },
-                        )
-                        .await?;
-                }
-                self.store
-                    .append(
-                        session_id,
-                        &SessionEvent::ToolResult {
-                            call_id: call.id.clone(),
-                            outcome: outcome.clone(),
-                        },
-                    )
-                    .await?;
-                transcript.push(Message::tool_result(call.id.clone(), outcome));
-                tool_calls_executed += 1;
-            }
+            // Dispatch the tool calls (gate arming, hook pipeline, result
+            // bookkeeping — see [`Self::dispatch_turn_tools`]).
+            self.dispatch_turn_tools(
+                session_id,
+                &turn.response.tool_calls,
+                &turn.model,
+                &turn.speculative,
+                &mut state,
+            )
+            .await?;
 
             // A main turn completed: it counts toward the compaction
             // min-interval (the compaction call itself is not a turn).
-            turns_since_compaction += 1;
+            state.turns_since_compaction += 1;
 
-            if governor.exceeded() {
+            if state.governor.exceeded() {
                 tracing::warn!(
-                    cumulative = governor.cumulative(),
+                    cumulative = state.governor.cumulative(),
                     cap = self.config.max_total_tokens,
                     "stopping: cumulative token budget exceeded"
                 );
-                stop_label = "budget_exhausted";
+                state.stop_label = "budget_exhausted";
                 break;
             }
         }
 
+        self.finalize_run(session_id, &mut state).await
+    }
+
+    /// Route/decide phase of one loop iteration (Phase 5i): estimate the
+    /// context, select the model, maybe compact first — the selected
+    /// model's context window is the compaction trigger — pre-flight the
+    /// budget cap against that window, and consult the async decision
+    /// model. No session events are emitted here (compaction's own
+    /// excepted); the next provider turn appends `ModelSelected`.
+    async fn route_turn(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        system: &str,
+        tool_specs: &[ToolSpec],
+        state: &mut RunLoopState,
+    ) -> Result<TurnRoute> {
+        let mut context_tokens = estimate_context_tokens(system, tool_specs, &state.transcript);
+        let action = if state.turns == 0 {
+            ActionKind::Chat
+        } else {
+            derive_action(&state.transcript)
+        };
+        let mut choice = self.selector.select(&SelectRequest {
+            task: task.to_string(),
+            action,
+            context_tokens,
+            budget_remaining_usd: self
+                .config
+                .max_cost_usd
+                .map(|cap| (cap - state.spend_usd).max(0.0)),
+        });
+        let effective_cap = choice
+            .context_window
+            .unwrap_or(self.config.max_input_tokens)
+            .min(self.config.max_input_tokens);
+
+        // Autocompaction (PLAN.md §4.10): before any turn after the
+        // first, under context pressure and past the min-interval,
+        // summarize the older transcript. Runs before the pre-flight
+        // budget check so a compaction can rescue an over-cap context.
+        // The current selection is the model taking the NEXT turn —
+        // passed in so the bitmap attachment can be gated on its
+        // vision capability.
+        if self.should_compact_with_cap(
+            state.turns,
+            state.turns_since_compaction,
+            context_tokens,
+            effective_cap,
+        ) {
+            if let Some(outcome) = self.run_compaction(session_id, task, &choice.model).await? {
+                state.governor.feed_turn(outcome.usage);
+                state.spend_usd += self.turn_cost_usd(&outcome.model, &outcome.usage);
+                state.total.input_tokens += outcome.usage.input_tokens;
+                state.total.output_tokens += outcome.usage.output_tokens;
+                state.total.cached_input_tokens += outcome.usage.cached_input_tokens;
+                if !state.models_used.contains(&outcome.model) {
+                    state.models_used.push(outcome.model);
+                }
+                state.transcript = outcome.transcript;
+                state.turns_since_compaction = 0;
+                context_tokens = estimate_context_tokens(system, tool_specs, &state.transcript);
+                // The context changed materially: re-route once.
+                choice = self.selector.select(&SelectRequest {
+                    task: task.to_string(),
+                    action,
+                    context_tokens,
+                    budget_remaining_usd: self
+                        .config
+                        .max_cost_usd
+                        .map(|cap| (cap - state.spend_usd).max(0.0)),
+                });
+            }
+        }
+
+        // Pre-flight budget check on the assembled context, against the
+        // effective cap (the model's window when known).
+        state
+            .governor
+            .check_input_with_cap(context_tokens, effective_cap)?;
+
+        // Async decision model (Phase-3b M1): consulted per JudgeMode.
+        // A verdict re-queries the sync selector with the mapped action —
+        // tier config, overrides, and budget rules stay in one place.
+        if let Some((router, mode)) = &self.config.async_router {
+            let consult = match mode {
+                JudgeMode::Always => true,
+                JudgeMode::Ambiguous => !choice.confident,
+            };
+            if consult {
+                if let Some(verdict) = router.route(task, action).await {
+                    let synthetic = SelectRequest {
+                        task: task.to_string(),
+                        action: judge::verdict_action(verdict),
+                        context_tokens,
+                        budget_remaining_usd: self
+                            .config
+                            .max_cost_usd
+                            .map(|cap| (cap - state.spend_usd).max(0.0)),
+                    };
+                    let mut re = self.selector.select(&synthetic);
+                    re.reason = format!("async-router: {verdict:?} → {}", re.reason);
+                    choice = re;
+                }
+            }
+        }
+        Ok(TurnRoute {
+            choice,
+            context_tokens,
+            action,
+        })
+    }
+
+    /// Execute-turn phase: resolve the provider per the route (with the
+    /// tier-fallback retry ONCE on auth-class failures), drive the provider
+    /// call — streaming, with the speculative driver armed when the config
+    /// allows it — and classify the outcome:
+    ///
+    /// - `Ok(Some(turn))` — a completed turn with its accounting inputs and
+    ///   the speculative mid-stream results for the dispatch,
+    /// - `Ok(None)` — self-check short-circuit: the outer run loop ends
+    ///   with the preserved answer,
+    /// - `Err(e)` — the run fails (after the memory-ledger failure signal).
+    async fn execute_provider_turn(
+        &self,
+        session_id: SessionId,
+        system: &str,
+        tool_specs: &[ToolSpec],
+        route: &TurnRoute,
+        state: &mut RunLoopState,
+    ) -> Result<Option<CompletedTurn>> {
+        // Tier fallback: a run-level override (an earlier turn's auth
+        // failure promoted this model) applies immediately; otherwise
+        // the selector's choice stands. The fallback flag mirrors the
+        // override so a fresh primary failure can still be retried on
+        // a candidate.
+        let mut fallback: Option<ModelChoice> = match &state.run_tier_override {
+            Some((primary, fb)) if *primary == route.choice.model => Some(fb.clone()),
+            _ => None,
+        };
+        let mut attempted_fallback = fallback.is_some();
+        // Loop-external turn state: None = self-check short-circuit
+        // (the outer run loop ends with the preserved answer).
+        let mut turn_outcome: Option<(TurnResponse, String, String)> = None;
+        #[allow(unused_assignments)]
+        let mut turn_started = std::time::Instant::now();
+        // Speculative results computed during THIS turn's stream.
+        let mut speculative: std::collections::HashMap<String, ToolOutcome> =
+            std::collections::HashMap::new();
+        loop {
+            let active = fallback.clone().unwrap_or_else(|| route.choice.clone());
+            let (provider, model) = self.resolve_provider(&active)?;
+
+            self.store
+                .append(
+                    session_id,
+                    &SessionEvent::ModelSelected {
+                        model: model.clone(),
+                        reason: active.reason.clone(),
+                        action: Some(format!("{:?}", route.action)),
+                        context_tokens: Some(route.context_tokens),
+                    },
+                )
+                .await?;
+
+            let request = TurnRequest {
+                model: model.clone(),
+                system: system.to_string(),
+                messages: state.transcript.clone(),
+                tools: tool_specs.to_vec(),
+                max_tokens: MAX_OUTPUT_TOKENS,
+            };
+            tracing::info!(
+                turn = state.turns + 1,
+                provider = provider.id(),
+                model = %model,
+                "turn start"
+            );
+            // Streaming dispatch (Phase-1c I1): when a delta sink is
+            // configured, drive the provider through `turn_streaming` and
+            // forward deltas as they arrive (providers without an SSE
+            // implementation yield one Text delta via the trait default).
+            turn_started = std::time::Instant::now();
+            speculative.clear();
+            let response = match self.config.on_delta.clone() {
+                Some(sink) => {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
+                    // Speculative driver: forwards deltas to the sink,
+                    // and when the provider completes a tool-call item
+                    // mid-stream, immediately executes idempotent reads
+                    // so the dispatch below can reuse the result instead
+                    // of re-running the tool. Gated OFF when any observer
+                    // or gate would be bypassed: pre_tool/post_tool
+                    // hooks, the on_tool_event sink, and the --deny list
+                    // all must keep seeing every execution
+                    // ([`speculative::allowed_for`]).
+                    if speculative::allowed_for(&self.config) {
+                        let driver = speculative::SpeculativeDriver::spawn(
+                            Arc::new(self.clone()),
+                            session_id,
+                            sink,
+                            rx,
+                        );
+                        let result = provider.turn_streaming(request, tx).await;
+                        speculative.extend(driver.shutdown().await);
+                        result
+                    } else {
+                        // Plain forwarder: speculation disabled (hooks,
+                        // event sink, or deny list present).
+                        let forwarder = speculative::spawn_forwarder(sink, rx);
+                        let result = provider.turn_streaming(request, tx).await;
+                        let _ = forwarder.await;
+                        result
+                    }
+                }
+                None => provider.turn(request).await,
+            };
+            match response {
+                Ok(r) => {
+                    turn_outcome = Some((r, model, provider.id().to_string()));
+                    break;
+                }
+                Err(e) => {
+                    // The self-check turn is an ENHANCEMENT: if the
+                    // provider fails on it, keep the pre-check answer and
+                    // end the run — never destroy completed work for the
+                    // bonus turn.
+                    if state.self_check_sent && !state.answer.is_empty() {
+                        tracing::warn!(
+                            error = %e,
+                            "self-check turn failed; keeping the pre-check answer"
+                        );
+                        break;
+                    }
+                    // Auth-class failure on a tier's primary: retry ONCE
+                    // on the tier's fallback candidate (a dead token on
+                    // one provider must not take a tier another signed-in
+                    // provider serves). Auth failures precede streaming,
+                    // so nothing is re-emitted.
+                    if !attempted_fallback {
+                        if let Some(fb) =
+                            self.tier_fallback_after_auth_failure(&model, provider.id(), &e)
+                        {
+                            tracing::warn!(
+                                from = %model,
+                                to = %fb.model,
+                                to_provider = %fb.provider,
+                                error = %e,
+                                "auth failure — falling back to the tier fallback model"
+                            );
+                            attempted_fallback = true;
+                            fallback = Some(fb.clone());
+                            state.run_tier_override = Some((model, fb));
+                            continue;
+                        }
+                    }
+                    // Phase 13 completion (2026-11-11): a FAILED run
+                    // is a failure signal for the memories it surfaced
+                    // — the ledger learns from both outcomes, not just
+                    // successes.
+                    if !state.memory_hits.is_empty() {
+                        if let Some(root) = &self.config.memory_root {
+                            if let Ok(store) = crate::memory::MemoryStore::for_workspace(
+                                root,
+                                &self.config.working_dir,
+                            ) {
+                                store.record_outcome(&state.memory_hits, false);
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let Some((response, model, provider_id)) = turn_outcome else {
+            // Self-check short-circuit: the outer run loop ends with
+            // the preserved answer.
+            return Ok(None);
+        };
+        Ok(Some(CompletedTurn {
+            response,
+            model,
+            provider_id,
+            started: turn_started,
+            speculative,
+        }))
+    }
+
+    /// Dispatch phase: arm the finish gate when a mutating call was
+    /// requested, execute every tool call through the hook pipeline
+    /// (concurrently when all read-only), and bookkeep each result —
+    /// delegated spend, `ToolResult` events, transcript tool messages,
+    /// memory hits, verify evidence.
+    async fn dispatch_turn_tools(
+        &self,
+        session_id: SessionId,
+        tool_calls: &[ToolCall],
+        model: &str,
+        speculative: &std::collections::HashMap<String, ToolOutcome>,
+        state: &mut RunLoopState,
+    ) -> Result<()> {
+        // A requested mutating call arms the finish gate (conservative:
+        // a vetoed or failed call still counts — the model ATTEMPTED a
+        // mutation, so unverified finishes stay blocked).
+        if tool_calls
+            .iter()
+            .any(|c| MUTATING_TOOLS.contains(&c.name.as_str()))
+        {
+            state.mutated_this_run = true;
+        }
+
+        // Dispatch tool calls; each result enters the transcript. Hooks
+        // (H1) wrap execution: pre_tool may veto before the tool runs,
+        // post_tool observes after. Hook-spawn errors fail closed.
+        // Checkpoints (C1) capture the prior content of files that
+        // write/edit are about to mutate — only in ApproveAll mode, since
+        // any other mode blocks these tools before they can mutate.
+        let ctx = ToolCtx {
+            sandbox: self.config.sandbox,
+            working_dir: self.config.working_dir.clone(),
+            engine: Some(Arc::new(self.clone())),
+            session_id: Some(session_id),
+        };
+        // Phase 4: when every call in the turn is read-only, they run
+        // concurrently (order-preserving — the transcript is identical to
+        // the sequential case, only faster). Mutating calls stay
+        // sequential: checkpoints and approval gating are order-sensitive.
+        let all_read_only = tool_calls
+            .iter()
+            .all(|c| !MUTATING_TOOLS.contains(&c.name.as_str()));
+        let outcomes: Vec<ToolOutcome> = if all_read_only && tool_calls.len() > 1 {
+            let futures = tool_calls
+                .iter()
+                .map(|call| self.dispatch_tool_call(session_id, call, &ctx, speculative));
+            futures::future::join_all(futures).await
+        } else {
+            let mut outcomes = Vec::with_capacity(tool_calls.len());
+            for call in tool_calls {
+                if self.config.approvals.mode == ApprovalMode::ApproveAll {
+                    if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
+                        self.store.append(session_id, &checkpoint).await?;
+                    }
+                }
+                let outcome = self
+                    .dispatch_tool_call(session_id, call, &ctx, speculative)
+                    .await;
+                outcomes.push(outcome);
+            }
+            outcomes
+        };
+        state.last_dispatch_ended_with_passing_verify = tool_calls
+            .last()
+            .map(|c| c.name == "verify")
+            .unwrap_or(false)
+            && outcomes.last().map(|o| !o.is_error).unwrap_or(false);
+
+        for (call, outcome) in tool_calls.iter().zip(&outcomes) {
+            tracing::info!(
+                tool = %call.name,
+                error = outcome.is_error,
+                result_bytes = outcome.content.len(),
+                "tool done"
+            );
+            if let Some(ids) = outcome
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("memory_hits"))
+                .and_then(|v| v.as_array())
+            {
+                state
+                    .memory_hits
+                    .extend(ids.iter().filter_map(|i| i.as_str().map(String::from)));
+            }
+            // Delegated spend (Phase 5c A2): usage spent behind a tool's
+            // interface joins the governor and the run totals — honest
+            // accounting to the token.
+            if let Some(usage) = outcome.usage {
+                state.governor.feed_turn(usage);
+                state.spend_usd += self.turn_cost_usd(model, &usage);
+                state.total.input_tokens += usage.input_tokens;
+                state.total.output_tokens += usage.output_tokens;
+                state.total.cached_input_tokens += usage.cached_input_tokens;
+                self.store
+                    .append(
+                        session_id,
+                        &SessionEvent::Usage {
+                            model: format!("subagent ({})", call.name),
+                            usage,
+                        },
+                    )
+                    .await?;
+            }
+            self.store
+                .append(
+                    session_id,
+                    &SessionEvent::ToolResult {
+                        call_id: call.id.clone(),
+                        outcome: outcome.clone(),
+                    },
+                )
+                .await?;
+            state
+                .transcript
+                .push(Message::tool_result(call.id.clone(), outcome));
+            state.tool_calls_executed += 1;
+        }
+        Ok(())
+    }
+
+    /// Finalize phase (post-loop): the success signal for the memories this
+    /// run surfaced, the terminal trace record with the stop label, and the
+    /// run summary.
+    async fn finalize_run(
+        &self,
+        session_id: SessionId,
+        state: &mut RunLoopState,
+    ) -> Result<RunSummary> {
         // Phase 13 self-improving memory: a completed run is a success
         // signal for every memory it surfaced. (Failures currently go
         // unrecorded — an errored run returns Err before this point.)
-        if !memory_hits.is_empty() {
+        if !state.memory_hits.is_empty() {
             if let Some(root) = &self.config.memory_root {
                 if let Ok(store) =
                     crate::memory::MemoryStore::for_workspace(root, &self.config.working_dir)
                 {
-                    store.record_outcome(&memory_hits, true);
+                    store.record_outcome(&state.memory_hits, true);
                 }
             }
         }
@@ -831,7 +899,7 @@ impl Engine {
             .append(
                 session_id,
                 &SessionEvent::TurnTrace {
-                    turn: turns,
+                    turn: state.turns,
                     harness_version: env!("CARGO_PKG_VERSION").to_string(),
                     provider: String::new(),
                     model: String::new(),
@@ -840,17 +908,17 @@ impl Engine {
                     cost_usd: None,
                     usage: None,
                     verifier: None,
-                    failure_label: Some(stop_label.to_string()),
+                    failure_label: Some(state.stop_label.to_string()),
                 },
             )
             .await;
         Ok(RunSummary {
             session_id,
-            answer,
-            turns,
-            tool_calls: tool_calls_executed,
-            usage: total,
-            models_used,
+            answer: std::mem::take(&mut state.answer),
+            turns: state.turns,
+            tool_calls: state.tool_calls_executed,
+            usage: std::mem::take(&mut state.total),
+            models_used: std::mem::take(&mut state.models_used),
         })
     }
 
@@ -1220,22 +1288,17 @@ impl Engine {
     /// duplicate suite runs). Harness-initiated: direct tool execution, no
     /// approval prompt or hook veto; round bound is per-run (resume grants a
     /// fresh bound).
-    #[allow(clippy::too_many_arguments)]
     async fn run_finish_gate(
         &self,
         session_id: SessionId,
-        transcript: &mut Vec<Message>,
-        mutated: &mut bool,
-        rounds: &mut u32,
-        answer: &mut String,
-        last_dispatch_ended_with_passing_verify: bool,
-        self_check_sent: &mut bool,
+        state: &mut RunLoopState,
     ) -> Result<bool> {
-        if !*mutated || *rounds >= MAX_VERIFY_ROUNDS {
-            if *mutated && *rounds >= MAX_VERIFY_ROUNDS {
+        if !state.mutated_this_run || state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            if state.mutated_this_run && state.verify_rounds >= MAX_VERIFY_ROUNDS {
                 // Bound exhausted: let the run end, but never silently.
-                *answer = format!(
-                    "{answer}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]"
+                state.answer = format!(
+                    "{}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]",
+                    state.answer
                 )
                 .trim()
                 .to_string();
@@ -1248,11 +1311,11 @@ impl Engine {
             // and verifies each concrete detail against the environment
             // before ending. Targets the lucky-pass class (config formats,
             // exact names/passwords/ports) without needing a test command.
-            if !self.config.self_check_on_finish || *rounds >= MAX_VERIFY_ROUNDS {
+            if !self.config.self_check_on_finish || state.verify_rounds >= MAX_VERIFY_ROUNDS {
                 return Ok(false);
             }
-            *rounds += 1;
-            *self_check_sent = true;
+            state.verify_rounds += 1;
+            state.self_check_sent = true;
             let feedback = Message::user(
                 "Before finishing: re-read the ORIGINAL task instruction and list every \
                  concrete requirement it names — file paths, exact names, passwords, \
@@ -1270,16 +1333,16 @@ impl Engine {
                     },
                 )
                 .await?;
-            transcript.push(feedback);
+            state.transcript.push(feedback);
             return Ok(true);
         };
         // Skip when the previous dispatch already ended with a passing
         // verify (the model showed its evidence — no duplicate suite run).
-        if last_dispatch_ended_with_passing_verify {
-            *mutated = false;
+        if state.last_dispatch_ended_with_passing_verify {
+            state.mutated_this_run = false;
             return Ok(false);
         }
-        *rounds += 1;
+        state.verify_rounds += 1;
         let ctx = ToolCtx {
             sandbox: self.config.sandbox,
             working_dir: self.config.working_dir.clone(),
@@ -1291,7 +1354,7 @@ impl Engine {
             .await
             .unwrap_or_else(|err| ToolOutcome::err(err.to_string()));
         tracing::info!(
-            round = *rounds,
+            round = state.verify_rounds,
             passed = !outcome.is_error,
             "finish gate verification"
         );
@@ -1316,9 +1379,9 @@ impl Engine {
                 },
             )
             .await?;
-        transcript.push(feedback);
+        state.transcript.push(feedback);
         if passed {
-            *mutated = false;
+            state.mutated_this_run = false;
             return Ok(false);
         }
         Ok(true)
@@ -1342,19 +1405,12 @@ impl Engine {
     ///
     /// Store errors propagate (infrastructure — the run is already broken);
     /// provider/resolution failures are swallowed here.
-    #[allow(clippy::too_many_arguments)]
     async fn run_escalation_turn(
         &self,
         session_id: SessionId,
         task: &str,
         system: &str,
-        transcript: &mut Vec<Message>,
-        answer: &mut String,
-        turns: &mut u32,
-        total: &mut Usage,
-        models_used: &mut Vec<String>,
-        governor: &mut BudgetGovernor,
-        spend_usd: &mut f64,
+        state: &mut RunLoopState,
     ) -> Result<()> {
         let escalation_model = self
             .config
@@ -1373,7 +1429,7 @@ impl Engine {
         // provider → default-provider fallback ladder applies unchanged. A
         // model id from another provider rides the run's provider — a
         // mismatch surfaces as a provider error and degrades below.
-        let context_tokens = estimate_context_tokens(system, &[], transcript);
+        let context_tokens = estimate_context_tokens(system, &[], &state.transcript);
         let mut choice = self.selector.select(&SelectRequest {
             task: task.to_string(),
             action: ActionKind::Chat,
@@ -1381,7 +1437,7 @@ impl Engine {
             budget_remaining_usd: self
                 .config
                 .max_cost_usd
-                .map(|cap| (cap - *spend_usd).max(0.0)),
+                .map(|cap| (cap - state.spend_usd).max(0.0)),
         });
         choice.model = escalation_model.clone();
         choice.reason = format!(
@@ -1433,12 +1489,12 @@ impl Engine {
                 },
             )
             .await?;
-        transcript.push(handoff);
+        state.transcript.push(handoff);
 
         let request = TurnRequest {
             model: model.clone(),
             system: format!("{system}{ESCALATION_SYSTEM_ADDENDUM}"),
-            messages: transcript.clone(),
+            messages: state.transcript.clone(),
             // No tools: see the doc comment — a tool call the harness
             // cannot service must not be provoked.
             tools: Vec::new(),
@@ -1467,11 +1523,11 @@ impl Engine {
         // Honest accounting to the token: the escalation's usage joins the
         // governor, the run totals, the event log and the USD spend exactly
         // like a main-loop turn (compaction precedent).
-        *turns += 1;
-        governor.feed_turn(response.usage);
-        total.input_tokens += response.usage.input_tokens;
-        total.output_tokens += response.usage.output_tokens;
-        total.cached_input_tokens += response.usage.cached_input_tokens;
+        state.turns += 1;
+        state.governor.feed_turn(response.usage);
+        state.total.input_tokens += response.usage.input_tokens;
+        state.total.output_tokens += response.usage.output_tokens;
+        state.total.cached_input_tokens += response.usage.cached_input_tokens;
         self.store
             .append(
                 session_id,
@@ -1481,16 +1537,16 @@ impl Engine {
                 },
             )
             .await?;
-        if !models_used.contains(&model) {
-            models_used.push(model.clone());
+        if !state.models_used.contains(&model) {
+            state.models_used.push(model.clone());
         }
         let turn_cost = self.turn_cost_usd(&model, &response.usage);
-        *spend_usd += turn_cost;
+        state.spend_usd += turn_cost;
         self.store
             .append(
                 session_id,
                 &SessionEvent::TurnTrace {
-                    turn: *turns,
+                    turn: state.turns,
                     harness_version: env!("CARGO_PKG_VERSION").to_string(),
                     provider: provider.id().to_string(),
                     model: model.clone(),
@@ -1526,7 +1582,7 @@ impl Engine {
                 },
             )
             .await?;
-        transcript.push(assistant);
+        state.transcript.push(assistant);
 
         // An empty escalation is no replacement: models that refuse or
         // truncate yield "" and the honest give-up note must survive it.
@@ -1534,7 +1590,7 @@ impl Engine {
             tracing::warn!("escalation turn returned no text; keeping the pre-escalation answer");
             return Ok(());
         }
-        *answer = response.text;
+        state.answer = response.text;
         Ok(())
     }
 
@@ -1549,10 +1605,10 @@ impl Engine {
         ctx: &ToolCtx,
         speculative: &std::collections::HashMap<String, ToolOutcome>,
     ) -> ToolOutcome {
-        if SPECULATIVE_TOOLS.contains(&call.name.as_str())
+        if speculative::SPECULATIVE_TOOLS.contains(&call.name.as_str())
             && !self.config.approvals.deny.iter().any(|d| d == &call.name)
         {
-            if let Some(outcome) = speculative.get(&speculative_key(call)) {
+            if let Some(outcome) = speculative.get(&speculative::speculative_key(call)) {
                 tracing::info!(tool = %call.name, "speculative hit: reuse mid-stream result");
                 return outcome.clone();
             }
