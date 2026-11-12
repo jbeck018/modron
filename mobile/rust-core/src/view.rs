@@ -54,6 +54,16 @@ pub fn approval_mode_label(mode: Option<ApprovalModeWire>) -> &'static str {
     }
 }
 
+/// The sandbox label for the settings views, using the desktop's words
+/// (`off` / `seatbelt` / `bwrap`).
+pub fn sandbox_label(policy: modron_types::SandboxPolicy) -> &'static str {
+    match policy {
+        modron_types::SandboxPolicy::Off => "off",
+        modron_types::SandboxPolicy::Seatbelt => "seatbelt",
+        modron_types::SandboxPolicy::Bubblewrap => "bwrap",
+    }
+}
+
 /// Connection-state words for the mobile header.
 pub fn connection_label(state: &ConnectionState) -> &'static str {
     match state {
@@ -209,6 +219,12 @@ pub struct SessionViewModel {
     pub provider: String,
     pub goal: String,
     pub approval_mode: Option<ApprovalModeWire>,
+    /// Sandbox for tool execution (the last config patch; the settings
+    /// views cycle it).
+    pub sandbox: modron_types::SandboxPolicy,
+    /// Tool allow/deny lists (the last config patches).
+    pub allow_tools: Vec<String>,
+    pub deny_tools: Vec<String>,
     /// Sessions list (answers to `list_sessions`).
     pub sessions: Vec<SessionMetaWire>,
     /// Scheduled automations (answers to `list_automations`; settings
@@ -266,6 +282,11 @@ pub struct ViewModelSnapshot {
     pub approval_mode: Option<ApprovalModeWire>,
     /// `ask` / `yolo` / `deny`.
     pub approval_mode_label: String,
+    /// `off` / `seatbelt` / `bwrap` (the desktop's sandbox words).
+    pub sandbox: String,
+    /// Tool allow/deny lists (editable in the settings views).
+    pub allow_tools: Vec<String>,
+    pub deny_tools: Vec<String>,
     pub cumulative_usage: Usage,
     pub cumulative_tokens: u64,
     /// Session-cumulative cache hit rate, `None` before any tokens.
@@ -324,6 +345,9 @@ impl ViewModelSnapshot {
             pending_approval: vm.pending_approval.clone(),
             approval_mode: vm.approval_mode,
             approval_mode_label: approval_mode_label(vm.approval_mode).to_string(),
+            sandbox: sandbox_label(vm.sandbox).to_string(),
+            allow_tools: vm.allow_tools.clone(),
+            deny_tools: vm.deny_tools.clone(),
             cumulative_usage: vm.cumulative_usage,
             cumulative_tokens: vm.cumulative_usage.total(),
             session_cache_pct,

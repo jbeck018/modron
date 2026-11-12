@@ -87,6 +87,9 @@ interface Snapshot {
   subagent_rows: string[];
   pending_approval: PendingApproval | null;
   approval_mode_label: string;
+  sandbox: string;
+  allow_tools: string[];
+  deny_tools: string[];
   cumulative_tokens: number;
   session_cache_pct: number | null;
   turns_completed: number;
@@ -125,6 +128,11 @@ const autoPrompt = signal("");
 const autoInterval = signal("");
 // API-key drafts per provider id (settings providers card).
 const keyDrafts = signal<Record<string, string>>({});
+// Settings editors: tool lists and the standing goal (drafts overlay
+// the snapshot's current values until saved).
+const allowDraft = signal("");
+const denyDraft = signal("");
+const goalDraft = signal("");
 // Sessions-screen delete state: bulk-select mode, the selected ids, and
 // the row id whose delete control is armed (two-tap confirm, matching
 // the desktop's trash -> check flow).
@@ -313,6 +321,75 @@ function saveKey(provider: string): void {
   } catch (e) {
     connectError.set(e instanceof Error ? e.message : String(e));
   }
+}
+
+// Apply a config patch to the session (mode, sandbox, tools, goal).
+// The server applies patches to future turns only; demo echoes locally
+// so the controls stay interactive without a server.
+function setConfig(patch: Record<string, unknown>): void {
+  if (demo()) {
+    const next = { ...snap() };
+    if (typeof patch.approval_mode === "string") {
+      next.approval_mode_label =
+        patch.approval_mode === "approve_all" ? "yolo" : patch.approval_mode;
+    }
+    if (typeof patch.sandbox === "string") next.sandbox = patch.sandbox;
+    if (Array.isArray(patch.allow)) next.allow_tools = patch.allow as string[];
+    if (Array.isArray(patch.deny)) next.deny_tools = patch.deny as string[];
+    if (typeof patch.goal === "string") next.goal = patch.goal;
+    snap.set(next);
+    return;
+  }
+  try {
+    Remote.setConfigJson(JSON.stringify(patch));
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
+// Cycles match the TUI's shift+tab order for approval mode; sandbox
+// walks off -> seatbelt -> bwrap.
+const APPROVAL_CYCLE: Record<string, string> = {
+  ask: "yolo",
+  yolo: "deny",
+  deny: "ask",
+};
+const SANDBOX_CYCLE: Record<string, string> = {
+  off: "seatbelt",
+  seatbelt: "bwrap",
+  bwrap: "off",
+};
+
+function cycleApproval(): void {
+  const label = snap().approval_mode_label;
+  setConfig({ approval_mode: APPROVAL_CYCLE[label] ?? "yolo" });
+}
+
+function cycleSandbox(): void {
+  const label = snap().sandbox;
+  setConfig({ sandbox: SANDBOX_CYCLE[label] ?? "off" });
+}
+
+function splitList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function saveTools(): void {
+  setConfig({
+    allow: splitList(allowDraft() || snap().allow_tools.join(", ")),
+    deny: splitList(denyDraft() || snap().deny_tools.join(", ")),
+  });
+  allowDraft.set("");
+  denyDraft.set("");
+}
+
+function saveGoal(): void {
+  const goal = (goalDraft() || snap().goal).trim();
+  setConfig({ goal });
+  goalDraft.set("");
 }
 
 // Delete one session (two-tap confirm lands here) or every selected id
@@ -856,15 +933,80 @@ function SettingsScreen() {
             <Text class="text-destructive text-xs">{connectError()}</Text>
           ) : null}
         </View>
-        {/* Session facts: read-only for now (the bridge has no set-config
-            export, so the mode cannot be cycled from here yet). */}
-        <View class="rounded-xl border border-border bg-card p-3 gap-1">
+        {/* Session config: model/provider read-only, the rest editable
+            (the same patches the TUI's /mode, /sandbox, /goal and the
+            desktop settings page send). */}
+        <View class="rounded-xl border border-border bg-card p-3 gap-2">
           <Text class="text-muted-foreground text-xs">session</Text>
           <Text class="text-foreground text-sm">model: {snap().model}</Text>
           <Text class="text-foreground text-sm">provider: {snap().provider}</Text>
-          <Text class="text-foreground text-sm">
-            approval mode: {snap().approval_mode_label}
-          </Text>
+          <View class="flex-row items-center gap-2">
+            <Text class="text-foreground text-sm flex-1">
+              approval mode: {snap().approval_mode_label}
+            </Text>
+            <View
+              role="button"
+              class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+              onPress={() => cycleApproval()}
+            >
+              <Text class="text-secondary-foreground text-sm">cycle mode</Text>
+            </View>
+          </View>
+          <View class="flex-row items-center gap-2">
+            <Text class="text-foreground text-sm flex-1">
+              sandbox: {snap().sandbox}
+            </Text>
+            <View
+              role="button"
+              class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+              onPress={() => cycleSandbox()}
+            >
+              <Text class="text-secondary-foreground text-sm">
+                cycle sandbox
+              </Text>
+            </View>
+          </View>
+          <Input
+            class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+            value={allowDraft() || snap().allow_tools.join(", ")}
+            placeholder="allowed tools (comma separated)"
+            autoCorrect={false}
+            autoCapitalize="none"
+            onChange={(e) => allowDraft.set(e.value)}
+            onSubmit={() => saveTools()}
+          />
+          <Input
+            class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+            value={denyDraft() || snap().deny_tools.join(", ")}
+            placeholder="blocked tools (comma separated)"
+            autoCorrect={false}
+            autoCapitalize="none"
+            onChange={(e) => denyDraft.set(e.value)}
+            onSubmit={() => saveTools()}
+          />
+          <View
+            role="button"
+            class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+            onPress={() => saveTools()}
+          >
+            <Text class="text-secondary-foreground text-sm">save tools</Text>
+          </View>
+          <Input
+            class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+            value={goalDraft() || snap().goal}
+            placeholder="standing goal"
+            autoCorrect={false}
+            autoCapitalize="none"
+            onChange={(e) => goalDraft.set(e.value)}
+            onSubmit={() => saveGoal()}
+          />
+          <View
+            role="button"
+            class="rounded-(--radius) bg-primary px-3 py-1 active:opacity-80"
+            onPress={() => saveGoal()}
+          >
+            <Text class="text-primary-foreground text-sm">save goal</Text>
+          </View>
           <Text class="text-foreground text-sm">
             server: {snap().server_version}
           </Text>

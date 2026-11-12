@@ -208,6 +208,14 @@ fn do_auth_set_key(provider: &str, key: &str) -> Result<(), String> {
     client.auth_set_key(id, provider, key).map_err(err_text)
 }
 
+fn do_set_config_json(patch: &str) -> Result<(), String> {
+    let patch: modron_protocol::ConfigPatch =
+        serde_json::from_str(patch).map_err(|e| format!("bad patch: {e}"))?;
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    client.set_config(patch).map_err(err_text)
+}
+
 /// The shared slash-command table (`modron_view::slash`), as JSON: the
 /// composer's autocomplete and /help render it verbatim, so a command
 /// typed on any client means the same thing.
@@ -371,6 +379,13 @@ impl Remote {
         do_auth_set_key(&provider, &key)
     }
 
+    /// Apply a config patch (model, provider, sandbox, approval mode,
+    /// allow/deny tool lists, goal) as its JSON shape; the server
+    /// applies it to future turns only.
+    pub fn set_config_json(patch: String) -> Result<(), String> {
+        do_set_config_json(&patch)
+    }
+
     /// The folded view state plus every pre-rendered string, as JSON
     /// (`{}` before the first connect).
     pub fn snapshot_json() -> String {
@@ -471,6 +486,9 @@ fn demo_snapshot() -> String {
         model: "claude-opus-5".into(),
         provider: "anthropic".into(),
         goal: String::new(),
+        sandbox: "off".into(),
+        allow_tools: Vec::new(),
+        deny_tools: Vec::new(),
         automations: vec![modron_protocol::AutomationWire {
             name: "nightly repo audit".into(),
             prompt: "audit the repo for rot and open notes".into(),

@@ -760,6 +760,15 @@ fn apply_config(vm: &mut SessionViewModel, patch: &ConfigPatch) {
     if patch.approval_mode.is_some() {
         vm.approval_mode = patch.approval_mode;
     }
+    if let Some(policy) = patch.sandbox {
+        vm.sandbox = policy;
+    }
+    if let Some(allow) = &patch.allow {
+        vm.allow_tools = allow.clone();
+    }
+    if let Some(deny) = &patch.deny {
+        vm.deny_tools = deny.clone();
+    }
     if let Some(goal) = &patch.goal {
         vm.goal = goal.clone();
     }

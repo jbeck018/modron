@@ -102,4 +102,23 @@ test("settings renders the providers card", async () => {
   expect(app.texts()).toContain("save");
 });
 
+// Editable session config (parity P3): the cycles walk the same orders
+// the TUI uses, and demo echoes the patch locally.
+test("settings cycles approval mode and sandbox", async () => {
+  const app = await open("./App.tsx");
+  await app.press("settings");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("approval mode: ask");
+  expect(app.texts()).toContain("sandbox: off");
+  await app.press("cycle mode");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("approval mode: yolo");
+  await app.press("cycle sandbox");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("sandbox: seatbelt");
+  expect(app.texts()).toContain("save tools");
+  expect(app.texts()).toContain("save goal");
+});
+
+
 
