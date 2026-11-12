@@ -310,6 +310,19 @@ impl RemoteClient {
         self.shared.state.lock().unwrap().vm.connection == crate::view::ConnectionState::Connected
     }
 
+    /// Opt in to streamed reasoning (AGENTS.md invariant 5: reasoning
+    /// streams only when the user opted in; the TUI's `/reasoning` and
+    /// the desktop's reasoning chip default off). While off, reasoning
+    /// deltas are dropped in the fold and never reach the snapshot.
+    /// Turning it off clears the live buffer, like the TUI's toggle.
+    pub fn set_show_reasoning(&self, enable: bool) {
+        let mut st = self.shared.state.lock().unwrap();
+        st.vm.show_reasoning = enable;
+        if !enable {
+            st.vm.streaming_reasoning.clear();
+        }
+    }
+
     /// Resolves when the connection dies (server close, network loss).
     /// Errors (sender dropped with the last client clone) count as closed.
     pub async fn wait_closed(&self) {
@@ -363,7 +376,7 @@ impl RemoteClient {
     }
 
     /// Answer a pending approval: the three shared decisions
-    /// (`allow once` / `allow for this run` / `deny`); allow-all is
+    /// (`allow once` / `allow all` / `deny`); allow-all is
     /// sticky for the rest of the run, resolved server-side.
     pub fn approve(
         &self,
@@ -762,7 +775,15 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         Payload::Event { event } => fold.fold_event(vm, event),
         Payload::Delta { delta } => match delta {
             WireDelta::Text { text } => vm.streaming_text.push_str(&text),
-            WireDelta::Reasoning { text } => vm.streaming_reasoning.push_str(&text),
+            // Parity invariant 5 (reasoning streams only when the user
+            // opted in): dropped while `show_reasoning` is off, so the
+            // buffer stays empty and no shell can render it. The TUI's
+            // `/reasoning` and the desktop's reasoning chip default off.
+            WireDelta::Reasoning { text } => {
+                if vm.show_reasoning {
+                    vm.streaming_reasoning.push_str(&text);
+                }
+            }
             WireDelta::Done => {}
         },
         Payload::Tool { activity } => {
@@ -837,6 +858,11 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         }
         Payload::PagePublished { url } => {
             vm.last_note = Some(format!("published: {url}"));
+        }
+        // Desktop parity (app_state.rs folds this into last_note too): the
+        // share URL lands in the note, which the TSX renders in the chat.
+        Payload::RemoteControlStarted { url } => {
+            vm.last_note = Some(format!("remote-control live: {url} - open on any device"));
         }
         Payload::TurnDone { summary } => fold_turn_done(vm, fold, &summary),
         Payload::TurnFailed { error } => fold_turn_unfinished(vm, fold, Some(error)),
@@ -913,5 +939,80 @@ mod tests {
         assert!(validate_ws_url("http://127.0.0.1:7699").is_err());
         assert!(validate_ws_url("ws://").is_err());
         assert!(validate_ws_url("ws:///path").is_err());
+    }
+
+    /// Fold one frame into a fresh shared state and return the snapshot.
+    fn folded(frame: Frame) -> ViewModelSnapshot {
+        let shared = Shared::new();
+        fold_frame(&shared, frame);
+        let st = shared.state.lock().unwrap();
+        ViewModelSnapshot::from_vm(&st.vm)
+    }
+
+    #[test]
+    fn remote_control_started_lands_in_the_note() {
+        // Desktop parity: the share URL surfaces through last_note (the
+        // TSX renders the note in the chat scrollback).
+        let snap = folded(Frame::event(
+            None,
+            0,
+            Payload::RemoteControlStarted {
+                url: "https://bridge.example.com/s/abc".into(),
+            },
+        ));
+        assert_eq!(
+            snap.last_note.as_deref(),
+            Some("remote-control live: https://bridge.example.com/s/abc - open on any device")
+        );
+    }
+
+    #[test]
+    fn reasoning_deltas_gate_on_show_reasoning() {
+        let session = Uuid::new_v4();
+        let delta = |text: &str, seq: u64| {
+            Frame::event(
+                Some(session),
+                seq,
+                Payload::Delta {
+                    delta: WireDelta::Reasoning {
+                        text: text.to_string(),
+                    },
+                },
+            )
+        };
+        // Default is off: reasoning deltas never reach the folded state.
+        let shared = Shared::new();
+        fold_frame(&shared, delta("step one ", 1));
+        fold_frame(&shared, delta("step two", 2));
+        {
+            let st = shared.state.lock().unwrap();
+            assert!(!st.vm.show_reasoning, "show_reasoning defaults off");
+            assert_eq!(st.vm.streaming_reasoning, "", "dropped while off");
+            assert_eq!(st.vm.last_seq, 2, "the resume cursor still advances");
+        }
+        // Opt in (the bridge's set_show_reasoning): deltas land.
+        let client = RemoteClient {
+            shared: Arc::new(shared),
+        };
+        client.set_show_reasoning(true);
+        assert!(client.state().show_reasoning);
+        fold_frame(
+            &client.shared,
+            Frame::event(
+                Some(session),
+                3,
+                Payload::Delta {
+                    delta: WireDelta::Reasoning {
+                        text: "visible now".into(),
+                    },
+                },
+            ),
+        );
+        assert_eq!(client.state().streaming_reasoning, "visible now");
+        // Off again: the buffer clears (TUI toggle parity) and drops.
+        client.set_show_reasoning(false);
+        assert_eq!(client.state().streaming_reasoning, "");
+        fold_frame(&client.shared, delta("gone", 4));
+        assert_eq!(client.state().streaming_reasoning, "");
     }
 }

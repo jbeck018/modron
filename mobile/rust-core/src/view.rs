@@ -9,8 +9,10 @@
 //!   live half seeds streaming buffers, the tool tracker, the pending
 //!   approval, and cumulative usage.
 //! - `Delta::Text` appends `streaming_text`; `Delta::Reasoning` appends
-//!   `streaming_reasoning`. Buffers commit to history at `TurnDone` and
-//!   clear (uncommitted) on abort/failure — TUI streaming parity.
+//!   `streaming_reasoning` only when `show_reasoning` is on (invariant 5:
+//!   reasoning streams only when the user opted in). Buffers commit to
+//!   history at `TurnDone` and clear (uncommitted) on abort/failure —
+//!   TUI streaming parity.
 //! - `Event` frames append committed rows by folding through
 //!   [`modron_view::replay`] (see `FoldState` for the incremental
 //!   grouping bookkeeping).
@@ -35,12 +37,14 @@ use uuid::Uuid;
 // Parity constants — the exact shared words (AGENTS.md UI/UX parity contract)
 // ---------------------------------------------------------------------------
 
-/// Decision labels for the approval sheet, in protocol order. Same words
-/// as the TUI's approval strip (`y = allow once · a = allow for this run ·
-/// n/Esc = deny`, modron-tui run.rs); keys differ per the divergence table.
+/// Decision labels for the approval sheet, in protocol order. The shared
+/// words (AGENTS.md invariant 1, `allow once / allow all / deny`), same
+/// as the desktop's `decision_label`; the TUI's strip adds key hints
+/// (`y = allow once · a = allow for this run · n/Esc = deny`) which are
+/// TUI presentation only — keys differ per the divergence table.
 pub const DECISION_LABELS: [(Decision, &str); 3] = [
     (Decision::AllowOnce, "allow once"),
-    (Decision::AllowAll, "allow for this run"),
+    (Decision::AllowAll, "allow all"),
     (Decision::Deny, "deny"),
 ];
 
@@ -142,7 +146,7 @@ pub struct PendingApprovalView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionOption {
     pub decision: Decision,
-    /// Shared label (`allow once` / `allow for this run` / `deny`).
+    /// Shared label (`allow once` / `allow all` / `deny`).
     pub label: String,
 }
 
@@ -209,6 +213,12 @@ pub struct SessionViewModel {
     pub running: bool,
     pub streaming_text: String,
     pub streaming_reasoning: String,
+    /// Whether streamed reasoning surfaces at all (AGENTS.md streaming
+    /// invariant 5: reasoning streams only when the user opted in — the
+    /// TUI's `/reasoning` and the desktop's reasoning chip, default off).
+    /// While off, the fold drops reasoning deltas and the snapshot seeds
+    /// an empty buffer.
+    pub show_reasoning: bool,
     /// Live grouped tool strip (`ToolEvent::summary()` rows).
     pub turn_tools: Vec<ToolEvent>,
     /// Live swarm rows.
@@ -275,6 +285,9 @@ pub struct ViewModelSnapshot {
     pub status_line: String,
     pub streaming_text: String,
     pub streaming_reasoning: String,
+    /// Whether reasoning streaming is opted in (default off; mirrored
+    /// from the view model so shells can render the toggle's state).
+    pub show_reasoning: bool,
     /// Per-event rows (`✓ read — 2.1 KB` / `● bash …`).
     pub tool_lines: Vec<String>,
     /// The collapsed per-turn line (`⏺ 21 tools · glob ×9 …`), if any.
@@ -344,6 +357,7 @@ impl ViewModelSnapshot {
             status_line,
             streaming_text: vm.streaming_text.clone(),
             streaming_reasoning: vm.streaming_reasoning.clone(),
+            show_reasoning: vm.show_reasoning,
             tool_lines: vm.turn_tools.iter().map(ToolEvent::summary).collect(),
             turn_summary_line: vm.turn_summary_line(),
             subagent_rows: vm.subagents.iter().map(SwarmRow::summary).collect(),
@@ -543,7 +557,15 @@ pub(crate) fn fold_snapshot(
         .collect();
     fold.reset_to_prefix();
     vm.streaming_text = live.streaming_text.clone();
-    vm.streaming_reasoning = live.streaming_reasoning.clone();
+    // Reasoning is opt-in (invariant 5): a snapshot's live reasoning
+    // buffer only seeds when the user asked for it, same as the fold's
+    // delta gate. `streaming_text` always seeds — text streaming is on
+    // by definition.
+    vm.streaming_reasoning = if vm.show_reasoning {
+        live.streaming_reasoning.clone()
+    } else {
+        String::new()
+    };
     vm.running = live.running;
     vm.model = live.model.clone();
     vm.provider = live.provider.clone();
@@ -656,18 +678,40 @@ mod tests {
     }
 
     #[test]
-    fn decision_labels_match_the_tui_words() {
+    fn decision_labels_match_the_shared_words() {
         assert_eq!(DECISION_LABELS[0], (Decision::AllowOnce, "allow once"));
-        assert_eq!(
-            DECISION_LABELS[1],
-            (Decision::AllowAll, "allow for this run")
-        );
+        assert_eq!(DECISION_LABELS[1], (Decision::AllowAll, "allow all"));
         assert_eq!(DECISION_LABELS[2], (Decision::Deny, "deny"));
         assert_eq!(approval_mode_label(None), "ask");
         assert_eq!(
             approval_mode_label(Some(ApprovalModeWire::ApproveAll)),
             "yolo"
         );
+    }
+
+    #[test]
+    fn snapshot_seeds_reasoning_only_when_opted_in() {
+        // Invariant 5: reasoning streams only when opted in — also at the
+        // snapshot boundary (a reconnect must not surface a live
+        // reasoning buffer the user never asked to see).
+        let session = Uuid::nil();
+        let live = LiveState {
+            streaming_reasoning: "thinking".into(),
+            ..LiveState::default()
+        };
+        let mut vm = SessionViewModel::default();
+        let mut fold = FoldState::default();
+        fold_snapshot(&mut vm, &mut fold, session, 1, &[], &live);
+        assert!(!vm.show_reasoning, "show_reasoning defaults off");
+        assert_eq!(vm.streaming_reasoning, "", "not seeded while off");
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert!(!snap.show_reasoning);
+        assert_eq!(snap.streaming_reasoning, "");
+        // Opted in: the snapshot's live buffer seeds (mid-run attach).
+        vm.show_reasoning = true;
+        fold_snapshot(&mut vm, &mut fold, session, 1, &[], &live);
+        assert_eq!(vm.streaming_reasoning, "thinking");
+        assert!(ViewModelSnapshot::from_vm(&vm).show_reasoning);
     }
 
     #[test]

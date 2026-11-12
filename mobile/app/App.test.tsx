@@ -36,12 +36,27 @@ test("demo chat screen renders the shared copy", async () => {
   expect(texts).toContain("5900 tok \u00b7 cache 80%");
   // Streaming buffer with its caret.
   expect(texts).toContain("Migrating the router now;  _");
+  // The live turn strip while the demo run is in flight.
+  expect(texts).toContain("\u25cf bash \u2026");
+  expect(texts).toContain("\u23fa 4 tools \u00b7 read \u00d72 \u00b7 glob \u00b7 bash");
   // Approval sheet: the three shared decision labels.
   expect(texts).toContain("allow once");
-  expect(texts).toContain("allow for this run");
+  expect(texts).toContain("allow all");
   expect(texts).toContain("deny");
   // The stop control (running).
   expect(texts).toContain("stop");
+});
+
+// Reasoning is opt-in (parity invariant 5): the chip starts off and the
+// toggle flips it (demo carries no reasoning buffer, so only the chip
+// state changes on screen).
+test("reasoning chip toggles", async () => {
+  const app = await openDemoChat();
+  expect(app.texts()).toContain("reasoning off");
+  await app.press("reasoning off");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect(app.texts()).toContain("reasoning on");
+  expect(app.texts()).not.toContain("reasoning off");
 });
 
 test("demo approval resolves locally", async () => {

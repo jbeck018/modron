@@ -189,6 +189,27 @@ async fn handshake_attach_snapshot_folds_the_full_state() {
             &snapshot_frame(
                 session,
                 3,
+                events.clone(),
+                LiveState {
+                    running: true,
+                    streaming_text: "partial".into(),
+                    streaming_reasoning: "thinking".into(),
+                    model: "gpt-5.6-sol".into(),
+                    provider: "openai-compat".into(),
+                    ..LiveState::default()
+                },
+            ),
+        )
+        .await;
+        // Phase 2 (after the client opts in and sends the flush marker):
+        // a fresh snapshot whose live reasoning buffer now seeds.
+        let marker = read_frame(&mut ws).await;
+        assert!(matches!(marker.payload, Payload::SetConfig { .. }));
+        send_frame(
+            &mut ws,
+            &snapshot_frame(
+                session,
+                4,
                 events,
                 LiveState {
                     running: true,
@@ -217,7 +238,10 @@ async fn handshake_attach_snapshot_folds_the_full_state() {
     assert!(snap.running);
     assert_eq!(snap.running_label, "running");
     assert_eq!(snap.streaming_text, "partial");
-    assert_eq!(snap.streaming_reasoning, "thinking");
+    // Reasoning is opt-in (invariant 5): the snapshot's live reasoning
+    // buffer stays hidden while the user is opted out.
+    assert!(!snap.show_reasoning);
+    assert_eq!(snap.streaming_reasoning, "");
     assert_eq!(snap.model, "gpt-5.6-sol");
     assert_eq!(snap.provider, "openai-compat");
     assert_eq!(snap.status_line, "gpt-5.6-sol · 0 tok · ask");
@@ -227,6 +251,18 @@ async fn handshake_attach_snapshot_folds_the_full_state() {
     assert!(matches!(entries[0], TranscriptEntry::Task { .. }));
     assert_eq!(entry_texts(&client), vec!["❯ read a.rs"]);
     assert_eq!(snap.last_seq, 3);
+
+    // Opt in, signal the server (an empty patch doubles as the marker),
+    // and the next snapshot's reasoning buffer seeds.
+    client.set_show_reasoning(true);
+    client
+        .set_config(ConfigPatch::default())
+        .expect("send the flush marker");
+    wait_for(&client, |snap| !snap.streaming_reasoning.is_empty()).await;
+    let snap = client.state();
+    assert!(snap.show_reasoning);
+    assert_eq!(snap.streaming_reasoning, "thinking");
+    assert_eq!(snap.streaming_text, "partial");
 
     server.abort();
 }
@@ -474,7 +510,7 @@ async fn approval_pending_then_resolved() {
     assert_eq!(approval.tool, "edit");
     assert!(approval.args_summary.contains("a.rs"));
     let labels: Vec<String> = approval.options.iter().map(|o| o.label.clone()).collect();
-    assert_eq!(labels, vec!["allow once", "allow for this run", "deny"]);
+    assert_eq!(labels, vec!["allow once", "allow all", "deny"]);
 
     let taken = client.take_pending_approval().expect("take drains");
     assert_eq!(taken.request_id, "req-9");
@@ -892,6 +928,149 @@ async fn snapshot_seeds_live_tools_and_subagents() {
         vec!["⏵ [explore] running · 2 turns · 500 tok · last: grep"]
     );
     assert_eq!(snap.turn_summary_line.as_deref(), Some("⏺ 1 tool · read"));
+
+    server.abort();
+}
+
+// The share URL surfaces in the note (desktop parity): the TSX renders
+// last_note in the chat scrollback, so /remote-control can show it.
+#[tokio::test]
+async fn remote_control_started_lands_in_the_note() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let share_url = "https://bridge.example.com/s/xyz";
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                Some(session),
+                1,
+                Payload::RemoteControlStarted {
+                    url: share_url.into(),
+                },
+            ),
+        )
+        .await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    wait_for(&client, |snap| snap.last_note.is_some()).await;
+    let note = client.state().last_note.expect("note");
+    assert!(
+        note.contains("remote-control live")
+            && note.contains(share_url)
+            && note.contains("open on any device"),
+        "note names the share URL: {note}"
+    );
+
+    server.abort();
+}
+
+// Parity invariant 5 end to end: reasoning deltas are dropped while
+// show_reasoning is off (the default) and stream once opted in; the
+// snapshot-seeded live reasoning buffer follows the same gate.
+#[tokio::test]
+async fn reasoning_deltas_stream_only_when_opted_in() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        // A live half already carrying reasoning: must NOT surface while
+        // the user is opted out.
+        send_frame(
+            &mut ws,
+            &snapshot_frame(
+                session,
+                0,
+                vec![],
+                LiveState {
+                    running: true,
+                    streaming_reasoning: "seeded thought".into(),
+                    ..LiveState::default()
+                },
+            ),
+        )
+        .await;
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                Some(session),
+                1,
+                Payload::Delta {
+                    delta: WireDelta::Reasoning {
+                        text: "dropped ".into(),
+                    },
+                },
+            ),
+        )
+        .await;
+        // Wait for the opt-in to apply before streaming more, so the
+        // assertions are deterministic.
+        loop {
+            let frame = read_frame(&mut ws).await;
+            if matches!(frame.payload, Payload::SetConfig { .. }) {
+                break;
+            }
+        }
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                Some(session),
+                2,
+                Payload::Delta {
+                    delta: WireDelta::Reasoning {
+                        text: "kept".into(),
+                    },
+                },
+            ),
+        )
+        .await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    // Give the dropped delta time to arrive (it must not surface).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let snap = client.state();
+    assert!(!snap.show_reasoning, "default off");
+    assert_eq!(
+        snap.streaming_reasoning, "",
+        "snapshot seed and live deltas stay hidden while opted out"
+    );
+
+    // Opt in (no wire payload for it — a local preference), the live
+    // buffer is still empty because the earlier delta was dropped.
+    client.set_show_reasoning(true);
+    // An empty config patch doubles as the flush marker: it tells the
+    // scripted server the opt-in above has applied (the pattern the
+    // detach-as-signal test uses), so the next delta must land.
+    client
+        .set_config(ConfigPatch::default())
+        .expect("send the flush marker");
+    loop {
+        if client.state().streaming_reasoning == "kept" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(client.state().show_reasoning);
 
     server.abort();
 }

@@ -92,6 +92,7 @@ interface Snapshot {
   status_line: string;
   streaming_text: string;
   streaming_reasoning: string;
+  show_reasoning: boolean;
   tool_lines: string[];
   turn_summary_line: string | null;
   subagent_rows: string[];
@@ -133,6 +134,11 @@ const connectError = signal<string | null>(null);
 const busy = signal(false);
 // The /help note (and unknown-command hint), rendered above the composer.
 const helpNote = signal<string | null>(null);
+// Reasoning streaming is opt-in (AGENTS.md invariant 5; the TUI's
+// /reasoning and the desktop's reasoning chip default off). The TSX
+// signal gates the render and mirrors into the core via
+// Remote.setShowReasoning, whose fold drops deltas while off.
+const showReasoning = signal(false);
 // The automation add-form fields (settings view).
 const autoName = signal("");
 const autoPrompt = signal("");
@@ -216,6 +222,13 @@ async function connectAndOpen(): Promise<void> {
     if (sessions.length === 0) throw new Error("no sessions on the server yet");
 
     Remote.attach(sessions[0].id, 0);
+    // A fresh connect built a new client (preferences reset with it):
+    // re-apply the reasoning opt-in so the core's fold gate matches.
+    try {
+      Remote.setShowReasoning(showReasoning());
+    } catch {
+      // The client exists by now; never happens in practice.
+    }
     demo.set(false);
     snap.set(JSON.parse(Remote.snapshotJson()) as Snapshot);
     stack.push("chat");
@@ -627,6 +640,42 @@ function stopRun(): void {
   }
 }
 
+// Toggle streamed reasoning (AGENTS.md invariant 5): the TSX signal
+// gates the render, the core's fold drops deltas while off.
+function toggleReasoning(): void {
+  const next = !showReasoning();
+  showReasoning.set(next);
+  try {
+    Remote.setShowReasoning(next);
+  } catch {
+    // Demo mode has no client; the TSX gate still applies.
+  }
+}
+
+// Drop-recovery: resume the open session from the last seen seq (the
+// server replays exactly what was missed); the poll flips the header
+// back to "connected" once the handshake + re-attach settle.
+function reconnectSession(): void {
+  const session = snap().session_id;
+  if (!session || demo()) return;
+  try {
+    Remote.reconnect(url(), session, null);
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
+// Close the connection (settings connection card); connect starts a
+// fresh one. The transcript stays until the next connect re-replays it.
+function disconnect(): void {
+  try {
+    Remote.disconnect();
+    live.set(false);
+  } catch (e) {
+    connectError.set(e instanceof Error ? e.message : String(e));
+  }
+}
+
 function backOut(): void {
   // Parity: Esc backs out one screen.
   stack.pop();
@@ -660,6 +709,19 @@ function StatusHeader() {
         <Text class="text-muted-foreground text-sm">
           {snap().connection_label}
         </Text>
+        {/* Drop recovery: resume the open session from the last seen seq
+            instead of a fresh connect + full replay. */}
+        {!demo() &&
+        snap().connection_label === "disconnected" &&
+        snap().session_id ? (
+          <View
+            role="button"
+            class="rounded-(--radius) bg-accent px-2 py-1 active:opacity-80"
+            onPress={() => reconnectSession()}
+          >
+            <Text class="text-background text-xs">reconnect</Text>
+          </View>
+        ) : null}
         <View class="flex-1" />
         {snap().running ? (
           <View
@@ -686,6 +748,15 @@ function StatusHeader() {
           onPress={() => publishTranscript()}
         >
           <Text class="text-secondary-foreground text-xs">share</Text>
+        </View>
+        <View
+          role="button"
+          class="rounded-(--radius) bg-secondary px-2 py-1 active:opacity-80"
+          onPress={() => toggleReasoning()}
+        >
+          <Text class="text-secondary-foreground text-xs">
+            reasoning {showReasoning() ? "on" : "off"}
+          </Text>
         </View>
         <View
           role="button"
@@ -770,7 +841,24 @@ function ChatScreen() {
             {row.lines.join("\n")}
           </Text>
         ))}
-        {snap().streaming_reasoning.length > 0 ? (
+        {/* The live turn strip (TUI/desktop parity): the collapsed line
+            plus the per-event rows while a turn runs. The core clears
+            these at turn end, so non-empty means mid-turn. */}
+        {snap().turn_summary_line ? (
+          <Text class="text-muted-foreground text-xs">
+            {snap().turn_summary_line}
+          </Text>
+        ) : null}
+        {snap().tool_lines.map((line) => (
+          <Text class="text-muted-foreground text-xs">{line}</Text>
+        ))}
+        {/* Live swarm rows (the TUI's swarm block, in flight). */}
+        {snap().subagent_rows.map((line) => (
+          <Text class="text-muted-foreground text-xs">{line}</Text>
+        ))}
+        {/* Reasoning streams only when opted in (invariant 5): the core
+            drops deltas while off, and the render gate mirrors it. */}
+        {showReasoning() && snap().streaming_reasoning.length > 0 ? (
           <Text class="text-muted-foreground text-sm italic">
             {snap().streaming_reasoning}
           </Text>
@@ -797,7 +885,6 @@ function ChatScreen() {
         <View class="mx-3 mb-1 gap-1">
           {slashSuggestions().map((command) => (
             <View
-              key={command.name}
               role="button"
               class="flex-row items-center gap-2 rounded-(--radius) border border-border bg-card px-3 py-2 active:opacity-80"
               onPress={() => {
@@ -1083,9 +1170,22 @@ function SettingsScreen() {
               </Text>
             </View>
           </View>
-          <Text class="text-muted-foreground text-xs">
-            {snap().connection_label}
-          </Text>
+          <View class="flex-row gap-2 items-center">
+            <Text class="text-muted-foreground text-xs flex-1">
+              {snap().connection_label}
+            </Text>
+            {snap().connection_label === "connected" && !demo() ? (
+              <View
+                role="button"
+                class="rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+                onPress={() => disconnect()}
+              >
+                <Text class="text-secondary-foreground text-xs">
+                  disconnect
+                </Text>
+              </View>
+            ) : null}
+          </View>
           {connectError() ? (
             <Text class="text-destructive text-xs">{connectError()}</Text>
           ) : null}
@@ -1258,14 +1358,14 @@ function SettingsScreen() {
           {snap().oauth ? (
             <View class="gap-1">
               <Text class="text-accent text-sm">
-                {snap().oauth.provider} sign-in: {snap().oauth.stage}
+                {snap().oauth!.provider} sign-in: {snap().oauth!.stage}
               </Text>
               <Text class="text-muted-foreground text-xs">
-                {snap().oauth.message}
+                {snap().oauth!.message}
               </Text>
-              {snap().oauth.user_code ? (
+              {snap().oauth!.user_code ? (
                 <Text class="text-foreground text-sm">
-                  code: {snap().oauth.user_code}
+                  code: {snap().oauth!.user_code}
                 </Text>
               ) : null}
             </View>
@@ -1328,10 +1428,7 @@ function SettingsScreen() {
         <View class="rounded-xl border border-border bg-card p-3 gap-2">
           <Text class="text-muted-foreground text-xs">automations</Text>
           {snap().automations.map((automation) => (
-            <View
-              key={automation.name}
-              class="flex-row items-center gap-2"
-            >
+            <View class="flex-row items-center gap-2">
               <View class="flex-1 gap-1">
                 <Text class="text-foreground text-sm">{automation.name}</Text>
                 <Text class="text-muted-foreground text-xs">

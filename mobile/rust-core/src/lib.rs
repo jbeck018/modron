@@ -29,7 +29,7 @@
 //! and desktop use — [`modron_view::replay`] transcripts,
 //! [`modron_view::ActivityTracker`] grouping, `ToolEvent::summary()`
 //! rows, swarm rows, `human_bytes` sizes, the ask/yolo/deny mode words,
-//! and the allow once / allow for this run / deny decision labels. The
+//! and the allow once / allow all / deny decision labels. The
 //! snapshot pre-renders each row (`view::RenderedRow`) so a TSX screen
 //! displays the shared copy verbatim instead of re-formatting it.
 //!

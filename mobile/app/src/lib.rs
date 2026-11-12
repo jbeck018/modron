@@ -217,6 +217,17 @@ fn do_set_config_json(patch: &str) -> Result<(), String> {
     client.set_config(patch).map_err(err_text)
 }
 
+fn do_set_show_reasoning(enable: bool) -> Result<(), String> {
+    let guard = lock_client()?;
+    match guard.as_ref() {
+        Some(client) => {
+            client.set_show_reasoning(enable);
+            Ok(())
+        }
+        None => Err(not_connected()),
+    }
+}
+
 fn do_fork_session() -> Result<(), String> {
     let guard = lock_client()?;
     let client = guard.as_ref().ok_or_else(not_connected)?;
@@ -441,6 +452,13 @@ impl Remote {
         do_set_config_json(&patch)
     }
 
+    /// Opt in to streamed reasoning (default off; TUI `/reasoning` and
+    /// desktop reasoning-chip parity). While off, the core drops
+    /// reasoning deltas so they never reach the snapshot.
+    pub fn set_show_reasoning(enable: bool) -> Result<(), String> {
+        do_set_show_reasoning(enable)
+    }
+
     /// Fork the attached session; the note names the new id.
     pub fn fork_session() -> Result<(), String> {
         do_fork_session()
@@ -561,6 +579,7 @@ fn demo_snapshot() -> String {
         status_line: "claude-opus-5 \u{b7} 18.4k tok \u{b7} cache 71% \u{b7} ask".into(),
         streaming_text: "Migrating the router now; ".into(),
         streaming_reasoning: String::new(),
+        show_reasoning: false,
         tool_lines: vec!["\u{25cf} bash \u{2026}".into()],
         turn_summary_line: Some(
             "\u{23fa} 4 tools \u{b7} read \u{d7}2 \u{b7} glob \u{b7} bash".into(),

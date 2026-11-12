@@ -17,7 +17,7 @@ nsh package --target macos   # or ios, android, web, linux, windows
 
 The app boots in demo mode (scripted snapshot, no server). Toggle `demo off` and point at
 `ws://127.0.0.1:7699` (or any remote host) to drive a live session: connect, attach,
-transcript, streaming, approvals (allow once / allow for this run / deny), stop.
+transcript, streaming, approvals (allow once / allow all / deny), stop.
 
 `nsh` describes the crate's exports with a small program of the crate and builds the app's hosts with it linked in.
 TSX edits are hot updates; Rust edits rebuild and restart the app. The first build writes the crate's TypeScript declarations into
