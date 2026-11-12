@@ -68,7 +68,7 @@ forked per client.
 | Tool detail panel | ctrl+t overlay, click-to-open | Panel/drawer, click-to-open |
 | Theming | ANSI/ratatui palette themes | System appearance + semantic roles mapped to native colors |
 | Platform chrome | None (fullscreen terminal) | Native menus, dock, safe areas (mobile), virtual keyboard handling |
-| Remote-control registration | /remote-control <bridge-url> slash command (opens a tunnel through the deployed cloud/bridge relay; prints the share URL) | Desktop + mobile: share button next tranche; the protocol command and relay are shared |
+| Remote-control registration | /remote-control <bridge-url> slash command (opens a tunnel through the deployed cloud/bridge relay; prints the share URL) | Desktop: /remote-control via the slash popup; mobile: /remote-control <bridge-url> slash (chat header carries share/fork/task controls; the protocol command and relay are shared) |
 | Layout | Single column, status line + live strip | Sidebar + panes / mobile stack |
 | Per-turn meta (model switches, usage notes) | Dim scrollback lines after each turn | Desktop: centered divider chip on model CHANGE only, per-turn usage folded into the status bar; mobile: usage notes |
 
