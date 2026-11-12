@@ -4079,10 +4079,19 @@ impl Render for DesktopApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let entity = cx.entity();
-        // Outside-click collapse for the sidebar search: registered every
-        // frame while expanded. A press outside the input's bounds
-        // collapses an EMPTY search; typed text keeps it open (blur
-        // unfocuses without discarding the filter).
+        // App-wide click-outside unfocus: a capture-phase press moves
+        // focus to the window root, so any focused input blurs when the
+        // click lands outside it (inputs re-focus themselves on their own
+        // mousedown, so in-input clicks are unaffected). The model
+        // picker's keyboard flow needs the filter focused, so it is
+        // exempt; the sidebar search additionally collapses when empty.
+        if !self.picker_open {
+            window.on_mouse_event(move |_: &gpui_kit::MouseDownEvent, phase, window, cx| {
+                if phase == gpui_kit::DispatchPhase::Capture {
+                    window.blur(cx);
+                }
+            });
+        }
         if self.search_open {
             let entity_outside = entity.clone();
             window.on_mouse_event(
