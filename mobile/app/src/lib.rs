@@ -243,6 +243,13 @@ fn do_merge_task(message: Option<&str>) -> Result<(), String> {
     client.merge_task(id, message).map_err(err_text)
 }
 
+fn do_remote_control(bridge_url: &str) -> Result<(), String> {
+    let guard = lock_client()?;
+    let client = guard.as_ref().ok_or_else(not_connected)?;
+    let id = attached_session_id(client)?;
+    client.remote_control(id, bridge_url).map_err(err_text)
+}
+
 fn do_router_defaults_json() -> Result<String, String> {
     let guard = lock_client()?;
     let client = guard.as_ref().ok_or_else(not_connected)?;
@@ -452,6 +459,12 @@ impl Remote {
     /// Merge the attached task's branch into its base (lands as a note).
     pub fn merge_task(message: Option<String>) -> Result<(), String> {
         do_merge_task(message.as_deref())
+    }
+
+    /// Open a remote-control tunnel through the bridge relay; the share
+    /// URL lands in the snapshot's note.
+    pub fn remote_control(bridge_url: String) -> Result<(), String> {
+        do_remote_control(&bridge_url)
     }
 
     /// The router's default-model picture; also lands in the snapshot.

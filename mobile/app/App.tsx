@@ -266,7 +266,19 @@ function submitDraft(): void {
 
 // Only what this shell can execute - no invented exports. Everything
 // else in the shared table answers "unknown command" here.
-const EXECUTABLE_SLASH = new Set(["new", "share", "settings", "help", "model"]);
+const EXECUTABLE_SLASH = new Set([
+  "new",
+  "share",
+  "settings",
+  "help",
+  "model",
+  "fork",
+  "tasks",
+  "mode",
+  "sandbox",
+  "auth",
+  "remote-control",
+]);
 
 // The suggestions above the composer: the executable slice of the shared
 // table, filtered by the word being typed (hidden once args start).
@@ -547,6 +559,31 @@ function runSlash(raw: string): void {
       } catch (e) {
         connectError.set(e instanceof Error ? e.message : String(e));
       }
+      break;
+    case "fork":
+      forkSession();
+      break;
+    case "tasks":
+      // The tasks card (create) lives in settings; status/merge are in
+      // the chat header.
+      enterSettings();
+      break;
+    case "mode":
+      cycleApproval();
+      break;
+    case "sandbox":
+      cycleSandbox();
+      break;
+    case "auth":
+      // The providers card (sign in / set key) lives in settings.
+      enterSettings();
+      break;
+    case "remote-control":
+      if (args.length === 0) {
+        helpNote.set("use /remote-control <bridge-url>");
+        break;
+      }
+      tryRemote("remote control", () => Remote.remoteControl(args));
       break;
     default:
       helpNote.set("unknown command - try /help");
