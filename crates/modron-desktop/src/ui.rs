@@ -29,6 +29,7 @@ use modron_core::Attachment;
 use modron_protocol::{Decision, Payload};
 use modron_router::lookup;
 use modron_view::TranscriptEntry;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::app_state::{decision_label, model_patch, AppState, ConnState, Row};
@@ -202,6 +203,10 @@ pub struct DesktopApp {
     /// Settings-page inputs (session + defaults cards).
     provider_key_input: Entity<InputState>,
     key_target: Option<String>,
+    /// Bulk-delete mode: rows toggle selection; the header deletes.
+    select_mode: bool,
+    selected_sessions: HashSet<uuid::Uuid>,
+    bulk_confirm: bool,
     allow_input: Entity<InputState>,
     deny_input: Entity<InputState>,
     goal_input: Entity<InputState>,
@@ -329,6 +334,9 @@ impl DesktopApp {
             slash_candidates: Vec::new(),
             provider_key_input,
             key_target: None,
+            select_mode: false,
+            selected_sessions: HashSet::new(),
+            bulk_confirm: false,
             allow_input,
             deny_input,
             goal_input,
@@ -1439,6 +1447,84 @@ impl DesktopApp {
                             });
                         }),
                 );
+        } else if self.select_mode {
+            // Bulk mode: the header becomes the action bar.
+            let entity_all = entity.clone();
+            let entity_cancel = entity.clone();
+            let entity_delete = entity.clone();
+            let count = self.selected_sessions.len();
+            let confirm = self.bulk_confirm;
+            header_row = header_row
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(crate::brand::text::SM))
+                        .text_color(theme.foreground)
+                        .child(SharedString::from(format!("{count} selected"))),
+                )
+                .child(
+                    Button::new("select-all")
+                        .label("all")
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                            entity_all.update(cx, |this, cx| {
+                                for s in &this.state.sessions {
+                                    this.selected_sessions.insert(s.id);
+                                }
+                                this.refresh(cx);
+                            });
+                        }),
+                )
+                .child({
+                    let mut delete = Button::new("bulk-delete")
+                        .label(if confirm {
+                            "confirm delete".to_string()
+                        } else if count > 0 {
+                            format!("delete {count}")
+                        } else {
+                            "delete".to_string()
+                        })
+                        .outline()
+                        .xsmall();
+                    if count > 0 {
+                        delete = delete.on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                            entity_delete.update(cx, |this, cx| {
+                                if !confirm {
+                                    this.bulk_confirm = true;
+                                    this.refresh(cx);
+                                    return;
+                                }
+                                let ids: Vec<uuid::Uuid> = this.selected_sessions.drain().collect();
+                                this.select_mode = false;
+                                this.bulk_confirm = false;
+                                for id in ids {
+                                    this.send(Command::DeleteSession(id));
+                                }
+                                this.send(Command::ListSessions {});
+                                this.refresh(cx);
+                            });
+                        });
+                    }
+                    if confirm {
+                        delete = delete.danger().label("confirm delete");
+                    }
+                    delete.into_any_element()
+                })
+                .child(
+                    Button::new("select-cancel")
+                        .icon(Icon::default().path("icons/x.svg").size_4())
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_e: &ClickEvent, _w, cx: &mut App| {
+                            entity_cancel.update(cx, |this, cx| {
+                                this.select_mode = false;
+                                this.selected_sessions.clear();
+                                this.bulk_confirm = false;
+                                this.refresh(cx);
+                            });
+                        }),
+                );
         } else {
             header_row = header_row
                 .child(
@@ -1448,6 +1534,19 @@ impl DesktopApp {
                         .text_color(theme.muted_foreground)
                         .child(SharedString::from("Sessions")),
                 )
+                .child({
+                    let entity = entity.clone();
+                    Button::new("bulk-toggle")
+                        .icon(Icon::default().path("icons/list-checks.svg").size_4())
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_e, _w, cx: &mut App| {
+                            entity.update(cx, |this, cx| {
+                                this.select_mode = true;
+                                this.refresh(cx);
+                            });
+                        })
+                })
                 .child({
                     let entity = entity.clone();
                     Button::new("search-toggle")
@@ -1522,6 +1621,8 @@ impl DesktopApp {
                 // the transcript header, not the list). Fixed row height so
                 // hover-revealed controls never reflow the list.
                 let hovered = self.hovered_row == Some(id);
+                let select_mode = self.select_mode;
+                let checked_row = select_mode && self.selected_sessions.contains(&id);
                 let row = div()
                     .id(("session", ix))
                     // Hover is state-driven (the trash button reads
@@ -1561,10 +1662,41 @@ impl DesktopApp {
                     .min_h(px(32.))
                     .rounded_md()
                     .cursor_pointer()
-                    .when(attached, |row| row.bg(theme.secondary))
+                    .when(checked_row, |row| row.bg(theme.accent))
+                    .when(attached && !checked_row, |row| row.bg(theme.secondary))
                     .hover(move |row| row.bg(hover_bg))
                     .on_click(move |_event: &ClickEvent, _window, cx| {
-                        attach_entity.update(cx, |this, cx| this.attach(id, cx));
+                        if select_mode {
+                            attach_entity.update(cx, |this, cx| {
+                                if this.selected_sessions.contains(&id) {
+                                    this.selected_sessions.remove(&id);
+                                } else {
+                                    this.selected_sessions.insert(id);
+                                }
+                                this.refresh(cx);
+                            });
+                        } else {
+                            attach_entity.update(cx, |this, cx| this.attach(id, cx));
+                        }
+                    })
+                    .children(if select_mode {
+                        let checked = checked_row;
+                        Some(
+                            Icon::default()
+                                .path(if checked {
+                                    "icons/square-check-big.svg"
+                                } else {
+                                    "icons/square.svg"
+                                })
+                                .size_4()
+                                .text_color(if checked {
+                                    theme.accent_foreground
+                                } else {
+                                    theme.muted_foreground
+                                }),
+                        )
+                    } else {
+                        None
                     })
                     .child(
                         div()
@@ -1637,6 +1769,8 @@ impl DesktopApp {
                                     )
                                     .into_any_element(),
                             );
+                        } else if select_mode {
+                            // Bulk mode: no hover trash (the header deletes).
                         } else {
                             let entity_del = entity.clone();
                             trailing.push(
