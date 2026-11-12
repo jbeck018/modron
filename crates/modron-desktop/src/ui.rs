@@ -40,6 +40,18 @@ actions!(
     [PickerClose, PickerUp, PickerDown, CloseToolPanel]
 );
 
+/// Where the expanded sidebar search input sits on screen (prepaint
+/// listener writes it; the window-wide capture mousedown reads it to
+/// decide whether an outside click should collapse the search).
+fn set_search_bounds(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) {
+    SEARCH_BOUNDS.with(|slot| slot.set(Some(bounds)));
+}
+
+thread_local! {
+    static SEARCH_BOUNDS: std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// One model-picker row (the shared router catalog).
 struct ModelRow {
     name: String,
@@ -1442,12 +1454,21 @@ impl DesktopApp {
                 .child(
                     div()
                         .flex_1()
-                        .with_animation(
-                            "search-expand",
-                            Animation::new(Duration::from_millis(160)),
-                            |style, progress| style.opacity(progress),
-                        )
-                        .child(Input::new(&self.session_filter)),
+                        .on_children_prepainted(|children, _w, _cx| {
+                            if let Some(bounds) = children.first() {
+                                set_search_bounds(*bounds);
+                            }
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .with_animation(
+                                    "search-expand",
+                                    Animation::new(Duration::from_millis(160)),
+                                    |style, progress| style.opacity(progress),
+                                )
+                                .child(Input::new(&self.session_filter)),
+                        ),
                 )
                 .child(
                     Button::new("search-close")
@@ -4055,9 +4076,38 @@ impl Focusable for DesktopApp {
 }
 
 impl Render for DesktopApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let entity = cx.entity();
+        // Outside-click collapse for the sidebar search: registered every
+        // frame while expanded. A press outside the input's bounds
+        // collapses an EMPTY search; typed text keeps it open (blur
+        // unfocuses without discarding the filter).
+        if self.search_open {
+            let entity_outside = entity.clone();
+            window.on_mouse_event(
+                move |event: &gpui_kit::MouseDownEvent, phase, _window, cx| {
+                    if phase != gpui_kit::DispatchPhase::Capture {
+                        return;
+                    }
+                    let inside = SEARCH_BOUNDS
+                        .with(|slot| slot.get())
+                        .is_some_and(|b| b.contains(&event.position));
+                    if inside {
+                        return;
+                    }
+                    entity_outside.update(cx, |this, cx| {
+                        if this.search_open
+                            && this.session_filter.read(cx).value().trim().is_empty()
+                        {
+                            this.search_open = false;
+                            this.session_filter_query.clear();
+                            this.refresh(cx);
+                        }
+                    });
+                },
+            );
+        }
         let sidebar = self.render_sidebar(&entity, cx);
         let status = self.render_status_bar(&entity, cx);
         let mut root = div()
