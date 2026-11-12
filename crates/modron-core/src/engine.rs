@@ -191,8 +191,7 @@ impl Engine {
         // instability (cache busts), visible in TurnTrace records.
         let prompt_hash = prompt_wire_hash(&system, &tool_specs);
         let mut stop_label: &'static str = "end_turn";
-        let mut governor =
-            BudgetGovernor::new(self.config.max_total_tokens, self.config.max_input_tokens);
+        let mut governor = BudgetGovernor::new(self.config.max_total_tokens);
 
         let mut turns: u32 = 0;
         let mut tool_calls_executed: u32 = 0;
@@ -416,7 +415,9 @@ impl Engine {
                                             // items for the same call must
                                             // not spawn duplicate executions.
                                             {
-                                                let mut map = driver_map.lock().unwrap();
+                                                let mut map = driver_map
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 if map.contains_key(&key) {
                                                     continue;
                                                 }
@@ -459,7 +460,11 @@ impl Engine {
                             for handle in in_flight {
                                 let _ = handle.await;
                             }
-                            let drained: Vec<_> = spec_results.lock().unwrap().drain().collect();
+                            let drained: Vec<_> = spec_results
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .drain()
+                                .collect();
                             speculative.extend(drained);
                             result
                         } else {
@@ -1854,12 +1859,34 @@ fn estimate_context_tokens(system: &str, tools: &[ToolSpec], messages: &[Message
     for message in messages {
         tokens += estimate_tokens(&message.content);
         for call in &message.tool_calls {
-            if let Ok(json) = serde_json::to_string(call) {
-                tokens += estimate_tokens(&json);
-            }
+            // Serialized-size estimate WITHOUT building the JSON string:
+            // the per-turn pass walks every historical call, and the
+            // to_string allocation per call was the O(context) churn
+            // (2026-11-12 audit).
+            tokens += estimate_tokens(&call.name) + 48 + json_serialized_len(&call.arguments);
         }
     }
     tokens
+}
+
+/// Approximate serialized-JSON byte length by traversal (no string built).
+fn json_serialized_len(value: &serde_json::Value) -> u64 {
+    use serde_json::Value;
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(n) => n.to_string().len() as u64,
+        Value::String(s) => s.len() as u64 + 2,
+        Value::Array(items) => {
+            items.iter().map(json_serialized_len).sum::<u64>() + items.len() as u64 + 2
+        }
+        Value::Object(map) => {
+            map.iter()
+                .map(|(k, v)| k.len() as u64 + 3 + json_serialized_len(v))
+                .sum::<u64>()
+                + 2
+        }
+    }
 }
 
 #[cfg(test)]

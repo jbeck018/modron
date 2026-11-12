@@ -146,20 +146,35 @@ impl ModelProvider for RetryingProvider {
     }
 
     async fn turn(&self, request: TurnRequest) -> Result<TurnResponse> {
-        let inner = Arc::clone(&self.inner);
-        with_retry(
-            move || {
-                // Own the Arc and the request clone inside the future: the
-                // async-trait future borrows the provider, so it cannot borrow
-                // the closure's captured variables.
-                let inner = Arc::clone(&inner);
-                let request = request.clone();
-                async move { inner.turn(request).await }
-            },
-            &self.cfg,
-            &self.delay,
-        )
-        .await
+        // Same shape as turn_streaming's replay loop: the first (happy)
+        // attempt consumes the request without cloning; a clone happens
+        // only when a retry is actually about to run. The non-streaming
+        // call is idempotent to replay (nothing observable escapes).
+        let attempts = self.cfg.max_attempts.max(1);
+        let mut pending = Some(request);
+        for attempt in 1..=attempts {
+            let is_last = attempt == attempts;
+            let call_req = if is_last {
+                pending.take().expect("req held until the last attempt")
+            } else {
+                pending.as_ref().expect("req").clone()
+            };
+            match self.inner.turn(call_req).await {
+                Ok(response) => return Ok(response),
+                Err(err) if !is_last && is_retryable(&err) => {
+                    let wait = self.cfg.backoff_for(attempt - 1);
+                    tracing::debug!(
+                        attempt,
+                        backoff_ms = wait.as_millis() as u64,
+                        error = %err,
+                        "retryable provider error; backing off"
+                    );
+                    (self.delay)(wait).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("the loop returns on every path")
     }
 
     async fn turn_streaming(

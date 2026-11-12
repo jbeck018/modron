@@ -14,6 +14,7 @@
 //! Claude Code share links). Tunnel frames are trusted because the key
 //! was minted by this server.
 
+use crate::dispatch::Outbound;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -96,11 +97,14 @@ pub async fn run_tunnel(
     }
 
     let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            let text: String = match serde_json::to_string(&frame) {
-                Ok(text) => text,
-                Err(_) => break,
+        while let Some(outbound) = out_rx.recv().await {
+            let text = match outbound {
+                Outbound::Reply(frame) => serde_json::to_string(&frame),
+                // Broadcasts arrive pre-serialized (one JSON build shared
+                // by every viewer).
+                Outbound::Live(live) => Ok(live.json.to_string()),
             };
+            let Ok(text) = text else { break };
             if sink.send(WsMessage::Text(text.into())).await.is_err() {
                 break;
             }

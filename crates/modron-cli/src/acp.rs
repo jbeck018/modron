@@ -326,7 +326,10 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
                 let (respond, receive) = mpsc::channel();
-                approver_map.lock().unwrap().insert(request_id, respond);
+                approver_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(request_id, respond);
                 let request = permission_request(
                     &session,
                     &format!("call-{request_id}"),
@@ -383,7 +386,7 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                     if let Some(respond) = id
                         .as_ref()
                         .and_then(|v| v.as_u64())
-                        .and_then(|pid| pending_permissions.lock().unwrap().remove(&pid))
+                        .and_then(|pid| pending_permissions.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid))
                     {
                         let allow = parse_permission_response(&message);
                         let _ = respond.send(allow);
@@ -406,8 +409,8 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                         match modron_id.parse::<modron_core::SessionId>() {
                             Ok(parsed) => {
                                 let acp_session = uuid::Uuid::new_v4().to_string();
-                                *current_acp_session.lock().unwrap() = Some(acp_session.clone());
-                                sessions.lock().unwrap().insert(
+                                *current_acp_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(acp_session.clone());
+                                sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
                                     acp_session.clone(),
                                     AcSession {
                                         resume: Some(parsed),
@@ -423,8 +426,8 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                     }
                     "session/new" => {
                         let acp_session = uuid::Uuid::new_v4().to_string();
-                        *current_acp_session.lock().unwrap() = Some(acp_session.clone());
-                        sessions.lock().unwrap().insert(
+                        *current_acp_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(acp_session.clone());
+                        sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
                             acp_session.clone(),
                             AcSession {
                                 resume: None,
@@ -449,9 +452,9 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                         pending = Some((session_id.clone(), id.clone().unwrap_or(json!(null))));
                         // Label permission requests with the session that is
                         // actually RUNNING (the pending guard serializes).
-                        *current_acp_session.lock().unwrap() = Some(session_id.clone());
+                        *current_acp_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
                         let base_engine = {
-                            let sessions = sessions.lock().unwrap();
+                            let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
                             sessions
                                 .get(&session_id)
                                 .map(|s| s.engine.clone())
@@ -462,7 +465,7 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                         let sid = session_id.clone();
                         tokio::spawn(async move {
                             let modron_session =
-                                sessions.lock().unwrap().get(&sid).and_then(|s| s.resume);
+                                sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&sid).and_then(|s| s.resume);
                             let outcome = match modron_session {
                                 Some(id) => base_engine.run_task_resuming(id, &task).await,
                                 None => base_engine.run_task(&task).await,
@@ -478,7 +481,7 @@ pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<(
                 }
             }
             Some((session_id, request_id, outcome)) = done_rx.recv() => {
-                if let Some(entry) = sessions.lock().unwrap().get_mut(&session_id) {
+                if let Some(entry) = sessions.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&session_id) {
                     if entry.resume.is_none() {
                         entry.resume = outcome.as_ref().ok().map(|s| s.session_id);
                     }

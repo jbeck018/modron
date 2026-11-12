@@ -17,16 +17,16 @@ use crate::{Error, Result, Usage};
 #[derive(Clone, Debug)]
 pub struct BudgetGovernor {
     max_total_tokens: u64,
-    max_input_tokens: u64,
     cumulative: u64,
 }
 
 impl BudgetGovernor {
-    /// Create a governor for one task run with the two caps.
-    pub fn new(max_total_tokens: u64, max_input_tokens: u64) -> Self {
+    /// Create a governor for one task run with the cumulative cap. The
+    /// per-turn input cap is chosen per call (the model's window, not a
+    /// governor field - Phase 5i) and passed to [`Self::check_input_with_cap`].
+    pub fn new(max_total_tokens: u64) -> Self {
         Self {
             max_total_tokens,
-            max_input_tokens,
             cumulative: 0,
         }
     }
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn feed_turn_accumulates_and_remaining_shrinks() {
-        let mut governor = BudgetGovernor::new(1000, 500);
+        let mut governor = BudgetGovernor::new(1000);
         assert_eq!(governor.cumulative(), 0);
         assert_eq!(governor.remaining(), 1000);
 
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn check_input_trips_at_cap_with_actionable_error() {
-        let governor = BudgetGovernor::new(10_000, 2048);
+        let governor = BudgetGovernor::new(10_000);
         assert!(governor.check_input_with_cap(2048, 2048).is_ok());
 
         let err = governor.check_input_with_cap(2049, 2048).unwrap_err();
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn exceeded_trips_only_past_cap() {
-        let mut governor = BudgetGovernor::new(100, 50);
+        let mut governor = BudgetGovernor::new(100);
         governor.feed_turn(Usage {
             input_tokens: 60,
             output_tokens: 40,

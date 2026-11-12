@@ -4,6 +4,7 @@
 //! device token in the `hello` frame (TLS terminates at the tailscale /
 //! cloudflared sidecar in front of it).
 
+use crate::dispatch::Outbound;
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
@@ -40,12 +41,16 @@ async fn serve_ws_connection(
 
     // Single writer: dispatch replies and session fan-out frames queue
     // through this channel in order.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            let Ok(json) = serde_json::to_string(&frame) else {
-                break;
+        while let Some(outbound) = out_rx.recv().await {
+            // Broadcasts arrive pre-serialized (one JSON build shared by
+            // every viewer); replies serialize here.
+            let json = match outbound {
+                Outbound::Reply(frame) => serde_json::to_string(&frame),
+                Outbound::Live(live) => Ok(live.json.to_string()),
             };
+            let Ok(json) = json else { break };
             if sink.send(Message::text(json)).await.is_err() {
                 break;
             }

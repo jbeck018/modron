@@ -8,7 +8,7 @@ use modron_core::{
     Engine, EngineConfig, SessionEvent, SessionId, SessionStore, StreamDelta, ToolActivity,
     ToolCall, Usage,
 };
-use modron_protocol::{Decision, Payload, WireDelta};
+use modron_protocol::{Decision, Frame, Payload, WireDelta};
 use modron_server::{BroadcastingStore, SessionHub};
 use tokio::sync::broadcast;
 
@@ -35,6 +35,12 @@ fn test_hub() -> (SessionHub, SessionId) {
     (hub, id)
 }
 
+/// Parse a fanned-out LiveFrame back into a Frame (the broadcast carries
+/// pre-serialized JSON since the 2026-11-12 perf pass).
+fn parse_live(live: modron_server::hub::LiveFrame) -> Frame {
+    serde_json::from_str(&live.json).expect("live frame json parses")
+}
+
 /// Seq rises strictly with every published frame, session-scoped.
 #[tokio::test]
 async fn seq_is_monotonic_per_session() {
@@ -49,7 +55,7 @@ async fn seq_is_monotonic_per_session() {
     }
     let mut last = 0;
     for _ in 0..5 {
-        let frame = rx.recv().await.unwrap();
+        let frame = parse_live(rx.recv().await.unwrap());
         assert_eq!(frame.session, Some(id));
         assert!(
             frame.seq > last,
@@ -146,6 +152,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("request frame")
+        .map(parse_live)
         .unwrap();
     let request_id = match frame.payload {
         Payload::ApprovalRequested { request_id, call } => {
@@ -166,7 +173,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     assert!(handle.live_state().pending_approval.is_none());
     // Not sticky: a second call still asks (asserted by the re-prompt below).
     // Consume the Deny resolution echo before the next round.
-    let resolved = rx.recv().await.unwrap();
+    let resolved = parse_live(rx.recv().await.unwrap());
     assert!(matches!(
         resolved.payload,
         Payload::ApprovalResolved {
@@ -182,6 +189,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("second request frame")
+        .map(parse_live)
         .unwrap();
     let request_id = match frame.payload {
         Payload::ApprovalRequested { request_id, .. } => request_id,
@@ -197,7 +205,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
 
     // The AllowAll resolution echo is still in the stream; the sticky gate
     // then passes WITHOUT publishing anything more.
-    let resolved = rx.recv().await.unwrap();
+    let resolved = parse_live(rx.recv().await.unwrap());
     assert!(matches!(
         resolved.payload,
         Payload::ApprovalResolved {
@@ -254,6 +262,7 @@ async fn interrupt_unblocks_a_parked_approver_and_aborts_the_run() {
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .unwrap()
+        .map(parse_live)
         .unwrap();
     let _request_id = match frame.payload {
         Payload::ApprovalRequested { request_id, .. } => request_id,
@@ -267,7 +276,7 @@ async fn interrupt_unblocks_a_parked_approver_and_aborts_the_run() {
         .unwrap()
         .unwrap());
     // The terminal frame is TurnAborted, published exactly once.
-    let frame = rx.recv().await.unwrap();
+    let frame = parse_live(rx.recv().await.unwrap());
     assert!(matches!(frame.payload, Payload::TurnAborted {}));
     assert!(!handle.interrupt(), "second interrupt finds no active run");
     assert!(matches!(
@@ -294,7 +303,7 @@ async fn tool_call_ready_deltas_never_publish() {
     ));
     // Text deltas publish with the wire shape.
     handle.on_stream_delta(StreamDelta::Text("hi".into()));
-    let frame = rx.recv().await.unwrap();
+    let frame = parse_live(rx.recv().await.unwrap());
     assert!(matches!(
         frame.payload,
         Payload::Delta {
@@ -344,7 +353,7 @@ async fn broadcasting_store_persists_then_fans_out() {
     let events = store.load(meta.id).await.unwrap();
     assert_eq!(events.len(), 1);
     // ...and broadcast to the session's subscribers.
-    let frame = rx.recv().await.unwrap();
+    let frame = parse_live(rx.recv().await.unwrap());
     match frame.payload {
         Payload::Event { event } => match event {
             SessionEvent::Task { text } => assert_eq!(text, "hello"),

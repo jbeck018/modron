@@ -50,17 +50,25 @@ pub struct Subscription {
     pump: JoinHandle<()>,
 }
 
+/// What a connection's writer sends: per-connection replies (serialized
+/// here) or a session broadcast (JSON already serialized once at publish).
+#[derive(Debug)]
+pub enum Outbound {
+    Reply(Box<Frame>),
+    Live(Box<crate::hub::LiveFrame>),
+}
+
 /// Per-connection state.
 pub struct ConnCtx {
     /// Server->client frames (the transport's writer task drains it).
-    pub out: mpsc::UnboundedSender<Frame>,
+    pub out: mpsc::UnboundedSender<Outbound>,
     /// Set by the `hello` handshake.
     pub authed: bool,
     pub subscription: Option<Subscription>,
 }
 
 impl ConnCtx {
-    pub fn new(out: mpsc::UnboundedSender<Frame>) -> Self {
+    pub fn new(out: mpsc::UnboundedSender<Outbound>) -> Self {
         Self {
             out,
             authed: false,
@@ -119,7 +127,7 @@ fn error_kind(
 /// Fire-and-forget send to one connection (a closed transport just drops
 /// the frame).
 pub(crate) fn send(ctx: &ConnCtx, frame: Frame) {
-    let _ = ctx.out.send(frame);
+    let _ = ctx.out.send(Outbound::Reply(Box::new(frame)));
 }
 
 /// Handle one client frame. Returns [`Flow::Close`] on auth failures.
@@ -996,13 +1004,13 @@ async fn attach(
 
     // 1. Subscribe BEFORE loading anything, buffering live frames.
     let rx = handle.subscribe();
-    let (buf_tx, buf_rx) = mpsc::unbounded_channel::<Frame>();
+    let (buf_tx, buf_rx) = mpsc::unbounded_channel::<Outbound>();
     let forward = tokio::spawn(async move {
         let mut rx = rx;
         loop {
             match rx.recv().await {
-                Ok(frame) => {
-                    if buf_tx.send(frame).is_err() {
+                Ok(live) => {
+                    if buf_tx.send(Outbound::Live(Box::new(live))).is_err() {
                         break;
                     }
                 }
@@ -1034,7 +1042,7 @@ async fn attach(
             live: handle.live_state(),
         },
     };
-    if ctx.out.send(snapshot).is_err() {
+    if ctx.out.send(Outbound::Reply(Box::new(snapshot))).is_err() {
         forward.abort();
         return;
     }

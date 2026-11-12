@@ -4,6 +4,7 @@
 //! Unix-socket peers are always trusted: the file's permissions are the
 //! authentication.
 
+use crate::dispatch::Outbound;
 use std::sync::Arc;
 
 use modron_protocol::Frame;
@@ -33,11 +34,19 @@ async fn serve_unix_connection(stream: UnixStream, state: Arc<ServerState>) -> a
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     let writer_task = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            let Ok(mut line) = serde_json::to_string(&frame) else {
-                break;
+        while let Some(outbound) = out_rx.recv().await {
+            let mut line = match outbound {
+                Outbound::Reply(frame) => {
+                    let Ok(line) = serde_json::to_string(&frame) else {
+                        break;
+                    };
+                    line
+                }
+                // Broadcasts arrive pre-serialized (one JSON build shared
+                // by every viewer).
+                Outbound::Live(live) => live.json.to_string(),
             };
             line.push('\n');
             if writer.write_all(line.as_bytes()).await.is_err() {

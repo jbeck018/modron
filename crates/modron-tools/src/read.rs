@@ -57,15 +57,17 @@ impl Tool for ReadTool {
             .unwrap_or(MAX_LINES)
             .clamp(1, MAX_LINES);
 
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(content) => content,
-            Err(e) => {
-                return Ok(tool_err(
-                    NAME,
-                    format!("cannot read {}: {e}", path.display()),
-                    MAX_BYTES,
-                ))
-            }
+        // Stream lines with a bounded reader instead of slurping the whole
+        // file: offset=200000&limit=50 must not read 200k lines first
+        // (2026-11-12 audit). The gate still marks on any successful open.
+        let file = tokio::fs::File::open(&path).await;
+        let Ok(file) = file else {
+            let e = file.unwrap_err();
+            return Ok(tool_err(
+                NAME,
+                format!("cannot read {}: {e}", path.display()),
+                MAX_BYTES,
+            ));
         };
         // Read-before-edit gate (Phase 13): a successful read unlocks the
         // file for edit/write in this session.
@@ -73,18 +75,26 @@ impl Tool for ReadTool {
             engine.tools.read_gate.mark(&path);
         }
 
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
         let mut out = String::new();
         let mut shown = 0usize;
-        for (idx, line) in content.lines().enumerate().skip(offset - 1) {
+        let mut idx = 0usize;
+        while let Ok(Some(line)) = lines.next_line().await {
+            idx += 1;
+            if idx < offset {
+                continue;
+            }
             if shown >= limit {
                 break;
             }
-            out.push_str(&format!("{:>6}\t{line}\n", idx + 1));
+            out.push_str(&format!("{:>6}\t{line}\n", idx));
             shown += 1;
         }
 
         if shown == 0 {
-            let total = content.lines().count();
+            let total = idx;
             return Ok(ToolOutcome::ok(reduce_output(
                 format!("no lines in range: file has {total} line(s), requested offset {offset}"),
                 MAX_BYTES,

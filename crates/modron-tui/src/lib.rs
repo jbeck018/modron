@@ -3822,9 +3822,25 @@ impl App {
 /// chars (manual wrapping: ratatui's Paragraph wrap inside an inline
 /// viewport is a known misbehavior source — see LEDGER Phase 1d).
 pub fn streaming_tail(text: &str, max_lines: usize, width: usize) -> Vec<Line<'static>> {
+    // The visible tail needs at most `max_lines * width` CHARS; keep
+    // 4 bytes per char (the UTF-8 worst case) so even a wall of wide
+    // characters always covers max_lines lines, then wrap only that
+    // slice (2026-11-12 audit: re-wrapping the whole stream buffer every
+    // frame was O(streamed) per redraw).
     let width = width.max(20); // floor for pathological cases
+    let keep = max_lines
+        .max(1)
+        .saturating_mul(width)
+        .saturating_mul(4)
+        .min(text.len());
+    // Advance to a char boundary (multibyte answers must not panic).
+    let mut start = text.len() - keep;
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let tail = &text[start..];
     let mut wrapped: Vec<String> = Vec::new();
-    for line in text.lines() {
+    for line in tail.lines() {
         let chars: Vec<char> = line.chars().collect();
         if chars.len() <= width {
             wrapped.push(line.to_string());

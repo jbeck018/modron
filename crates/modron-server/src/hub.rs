@@ -206,6 +206,15 @@ impl SessionStore for PinnedCreateStore {
 /// variant to drive for this run).
 pub type RunFuture = Pin<Box<dyn Future<Output = modron_core::Result<RunSummary>> + Send>>;
 
+/// One fanned-out live frame: identity plus the JSON already serialized
+/// once at publish (every attached connection sends the same bytes).
+#[derive(Clone, Debug)]
+pub struct LiveFrame {
+    pub session: SessionId,
+    pub seq: u64,
+    pub json: std::sync::Arc<str>,
+}
+
 /// One live session: broadcast channel + seq counter + run state + the
 /// per-session [`Engine`] clone carrying the hub's sinks.
 ///
@@ -214,7 +223,7 @@ pub type RunFuture = Pin<Box<dyn Future<Output = modron_core::Result<RunSummary>
 /// busy flag AND the terminal-frame lock (see [`SessionHandle::complete`]).
 pub struct SessionHandle {
     pub id: SessionId,
-    tx: broadcast::Sender<Frame>,
+    tx: broadcast::Sender<LiveFrame>,
     seq: Mutex<u64>,
     /// The active run's task; `Some` = busy. Taken by whoever emits the
     /// terminal frame (interrupt on abort, the run task on completion).
@@ -259,8 +268,20 @@ impl SessionHandle {
     pub fn publish(&self, payload: Payload) {
         let mut seq = lock(&self.seq);
         *seq += 1;
-        let frame = Frame::event(Some(self.id), *seq, payload);
-        let _ = self.tx.send(frame); // Err = no attached clients
+        // Serialize ONCE for all viewers (2026-11-12 audit: the broadcast
+        // used to deep-clone the Frame per subscriber and every connection
+        // re-serialized it; large ToolResult events multiplied by viewer
+        // count). No viewers = no serialization either.
+        if self.tx.receiver_count() > 0 {
+            let frame = Frame::event(Some(self.id), *seq, payload);
+            if let Ok(json) = serde_json::to_string(&frame) {
+                let _ = self.tx.send(LiveFrame {
+                    session: self.id,
+                    seq: *seq,
+                    json: std::sync::Arc::from(json.as_str()),
+                });
+            }
+        }
     }
 
     /// The seq watermark a Snapshot should carry.
@@ -270,7 +291,7 @@ impl SessionHandle {
 
     /// Subscribe to this session's frame stream (attach step 1: subscribe
     /// BEFORE loading the snapshot so no live frame is missed).
-    pub fn subscribe(&self) -> broadcast::Receiver<Frame> {
+    pub fn subscribe(&self) -> broadcast::Receiver<LiveFrame> {
         self.tx.subscribe()
     }
 
@@ -677,9 +698,12 @@ impl SessionHub {
         if let Some(existing) = sessions.get(&id) {
             return existing.clone();
         }
-        let template = lock(&self.inner.template)
-            .clone()
-            .expect("SessionHub::set_engine must run before sessions are created");
+        // Startup-ordering regression guard: without a template (no
+        // set_engine yet) a session attach must 500 once with an
+        // actionable name, not panic inside the connection task forever.
+        let template = lock(&self.inner.template).clone().unwrap_or_else(|| {
+            panic!("SessionHub::set_engine must run before sessions are created (attach of {id})")
+        });
         let shared_store = Arc::clone(&template.store);
         let mut engine = template;
         engine.store = PinnedCreateStore::new(shared_store, pinned);

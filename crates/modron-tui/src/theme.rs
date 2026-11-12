@@ -91,14 +91,23 @@ impl Theme {
     /// Resolve to ratatui colors; invalid hex falls back to the default
     /// theme's slot (never break rendering over cosmetics).
     pub fn resolved(&self) -> Resolved {
+        // Fallback chain: field -> builtin default -> a fixed mid-gray.
+        // A bad hex literal anywhere must degrade to ugly, never panic
+        // (this runs on first render).
+        const LAST_RESORT: Color = Color::Rgb(0x88, 0x88, 0x88);
         let d = Theme::builtin("modron");
+        let pick = |field: &str, default: &str| {
+            parse_hex(field)
+                .or_else(|| parse_hex(default))
+                .unwrap_or(LAST_RESORT)
+        };
         Resolved {
-            accent: parse_hex(&self.accent).unwrap_or_else(|| parse_hex(&d.accent).unwrap()),
-            dim: parse_hex(&self.dim).unwrap_or_else(|| parse_hex(&d.dim).unwrap()),
-            tool: parse_hex(&self.tool).unwrap_or_else(|| parse_hex(&d.tool).unwrap()),
-            warning: parse_hex(&self.warning).unwrap_or_else(|| parse_hex(&d.warning).unwrap()),
-            error: parse_hex(&self.error).unwrap_or_else(|| parse_hex(&d.error).unwrap()),
-            success: parse_hex(&self.success).unwrap_or_else(|| parse_hex(&d.success).unwrap()),
+            accent: pick(&self.accent, &d.accent),
+            dim: pick(&self.dim, &d.dim),
+            tool: pick(&self.tool, &d.tool),
+            warning: pick(&self.warning, &d.warning),
+            error: pick(&self.error, &d.error),
+            success: pick(&self.success, &d.success),
         }
     }
 
