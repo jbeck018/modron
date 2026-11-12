@@ -182,43 +182,6 @@ pub fn rich_demo_provider() -> MockProvider {
     MockProvider::with_script(rich_demo_script()).then_repeat_last()
 }
 
-pub fn demo_script() -> Vec<TurnResponse> {
-    vec![
-        TurnResponse {
-            text: String::new(),
-            tool_calls: vec![ToolCall {
-                id: "demo-1".into(),
-                name: "bash".into(),
-                arguments: serde_json::json!({"command": "echo modron-mock-ok"}),
-            }],
-            usage: Usage {
-                input_tokens: 512,
-                output_tokens: 32,
-                cached_input_tokens: 0,
-            },
-            stop_reason: StopReason::ToolUse,
-        },
-        TurnResponse {
-            text: "Mock run complete — the loop, tools, store, and budget all executed.".into(),
-            tool_calls: Vec::new(),
-            usage: Usage {
-                input_tokens: 640,
-                output_tokens: 48,
-                cached_input_tokens: 0,
-            },
-            stop_reason: StopReason::EndTurn,
-        },
-    ]
-}
-
-/// [`MockProvider`] seeded with [`demo_script`] — the keyless demo provider
-/// the CLI registers for `--provider mock`.
-pub fn demo_provider() -> MockProvider {
-    // repeat_last: chat mode keeps one provider across exchanges, so the
-    // demo must not exhaust after the first exchange.
-    MockProvider::with_script(demo_script()).then_repeat_last()
-}
-
 #[async_trait]
 impl ModelProvider for MockProvider {
     fn id(&self) -> &str {
@@ -436,33 +399,6 @@ mod tests {
             .append(Uuid::new_v4(), &SessionEvent::Task { text: "x".into() })
             .await
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn demo_script_serves_bash_then_final_text() {
-        let mock = demo_provider();
-        let request = TurnRequest {
-            model: "m".into(),
-            system: String::new(),
-            messages: vec![Message::user("demo")],
-            tools: vec![],
-            max_tokens: 100,
-        };
-
-        let first = mock.turn(request.clone()).await.unwrap();
-        assert_eq!(first.stop_reason, StopReason::ToolUse);
-        assert_eq!(first.tool_calls.len(), 1);
-        assert_eq!(first.tool_calls[0].name, "bash");
-        assert_eq!(
-            first.tool_calls[0].arguments["command"],
-            "echo modron-mock-ok"
-        );
-        assert!(first.usage.total() > 0, "scripted usage must be non-zero");
-
-        let second = mock.turn(request).await.unwrap();
-        assert_eq!(second.stop_reason, StopReason::EndTurn);
-        assert!(second.text.contains("Mock run complete"));
-        assert!(second.tool_calls.is_empty());
     }
 }
 

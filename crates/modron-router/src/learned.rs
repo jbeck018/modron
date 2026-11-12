@@ -151,15 +151,9 @@ impl std::fmt::Debug for LearnedRouter {
 
 impl LearnedRouter {
     pub fn new(inner: HeuristicSelector) -> Self {
-        Self::with_embedder(inner, Arc::new(HashingEmbedder))
-    }
-
-    /// Swap the embedder (Phase 5d X2): centroids recompute lazily against
-    /// the bundled corpus with the new embedder's vectors.
-    pub fn with_embedder(inner: HeuristicSelector, embedder: Arc<dyn Embedder>) -> Self {
         Self {
             inner,
-            embedder,
+            embedder: Arc::new(HashingEmbedder),
             centroids: std::sync::OnceLock::new(),
         }
     }

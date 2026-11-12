@@ -11,7 +11,7 @@
 //! way visibly — no silent prompt fattening.
 
 use async_trait::async_trait;
-use modron_core::{estimate_tokens, Tool, ToolCall, ToolCtx, ToolOutcome, ToolSpec};
+use modron_core::{estimate_tokens, Tool, ToolCtx, ToolOutcome, ToolSpec};
 use serde_json::{json, Value};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -458,8 +458,3 @@ impl Tool for McpTool {
         }
     }
 }
-
-// Silence the unused-variant lint path: ToolCall is re-exported by the
-// prelude consumers; the type only appears in generated schemas.
-#[allow(dead_code)]
-fn _t(_: ToolCall) {}

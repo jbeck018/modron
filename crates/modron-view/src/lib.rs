@@ -251,10 +251,6 @@ impl ActivityTracker {
         lines
     }
 
-    pub fn is_idle(&self) -> bool {
-        self.turn_tools.is_empty() && self.subagents.is_empty()
-    }
-
     /// Reset the per-turn view (turn ended; events already committed).
     pub fn clear_turn(&mut self) {
         self.turn_tools.clear();

@@ -279,11 +279,6 @@ impl SessionHandle {
         lock(&self.run).is_some()
     }
 
-    /// Whether the sticky approve-rest flag is armed.
-    pub fn allow_rest_armed(&self) -> bool {
-        self.allow_rest.load(Ordering::Relaxed)
-    }
-
     /// The working dir this session's engine runs in (worktree tasks run
     /// inside their worktree).
     pub fn working_dir(&self) -> PathBuf {
@@ -659,11 +654,6 @@ impl SessionHub {
 
     pub fn handle(&self, id: &SessionId) -> Option<Arc<SessionHandle>> {
         lock(&self.inner.sessions).get(id).cloned()
-    }
-
-    /// Live session ids (tests, admin views).
-    pub fn session_ids(&self) -> Vec<SessionId> {
-        lock(&self.inner.sessions).keys().copied().collect()
     }
 
     /// Get or create the handle for `id`. `pinned` pre-reserves the

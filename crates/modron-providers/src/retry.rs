@@ -132,15 +132,6 @@ impl RetryingProvider {
         }
     }
 
-    /// Wrap `inner` with an explicit policy.
-    pub fn with_config(inner: Arc<dyn ModelProvider>, cfg: RetryConfig) -> Self {
-        Self {
-            inner,
-            cfg,
-            delay: tokio_sleep(),
-        }
-    }
-
     /// Override the sleep (tests use an immediate no-op).
     pub fn with_delay_fn(mut self, delay: DelayFn) -> Self {
         self.delay = delay;

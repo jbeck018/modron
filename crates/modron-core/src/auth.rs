@@ -960,11 +960,7 @@ pub mod oauth {
     /// endpoint; refresh tokens ROTATE — the response carries a NEW
     /// refresh_token and the old one dies, so callers must persist the
     /// returned pair.
-    pub async fn refresh_tokens(refresh_token: &str) -> anyhow::Result<TokenSet> {
-        refresh_tokens_at(TOKEN_URL, refresh_token).await
-    }
-
-    /// Endpoint-parameterized [`refresh_tokens`] (tests point it at a
+    /// Endpoint-parameterized refresh (tests point it at a
     /// mock and assert the wire format).
     pub async fn refresh_tokens_at(
         token_url: &str,

@@ -169,31 +169,6 @@ impl MemoryStore {
         }
     }
 
-    /// Index plus the bodies of the `limit` newest entries (newest first),
-    /// each under a `### <date> <title>` header. Unreadable entries are
-    /// skipped with a warning.
-    pub fn read_entries(&self, limit: usize) -> String {
-        let index = self.read_index();
-        if index.is_empty() {
-            return index;
-        }
-        let mut out = index;
-        for (label, target) in index_entries(&out).into_iter().take(limit) {
-            match fs::read_to_string(self.root.join(&target)) {
-                Ok(body) => {
-                    let body = body.trim();
-                    if !body.is_empty() {
-                        out.push_str(&format!("\n### {label}\n{body}\n"));
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(target = %target, error = %err, "skipping unreadable memory entry")
-                }
-            }
-        }
-        out
-    }
-
     /// Body of the newest entry titled `title`, `None` when not in the index.
     pub fn read_entry(&self, title: &str) -> Result<Option<String>> {
         let wanted = title.trim();
@@ -797,13 +772,6 @@ mod tests {
         let body = store.read_entry("rust version").unwrap().unwrap();
         assert_eq!(body.trim(), "pinned to 1.99.1");
 
-        let entries = store.read_entries(1);
-        assert!(
-            entries.contains(&index),
-            "read_entries starts with the index"
-        );
-        assert!(entries.contains("### ") && entries.contains("pinned to 1.99.1"));
-
         assert!(store.forget("rust version").unwrap());
         assert_eq!(store.read_index(), "");
         assert_eq!(store.read_entry("rust version").unwrap(), None);
@@ -826,32 +794,18 @@ mod tests {
         assert_eq!(index.lines().count(), 2, "both appends survive: {index}");
         let (beta_pos, alpha_pos) = (index.find("beta").unwrap(), index.find("alpha").unwrap());
         assert!(beta_pos < alpha_pos, "newest first: {index}");
-
-        let entries = store.read_entries(5);
-        assert!(entries.contains("alpha body") && entries.contains("beta body"));
-        assert!(entries.find("beta body").unwrap() < entries.find("alpha body").unwrap());
     }
 
     #[test]
-    fn read_entries_respects_limit_and_missing_workspace_is_empty() {
+    fn missing_workspace_reads_are_empty_and_create_nothing() {
         let root = tempdir().unwrap();
         let work = tempdir().unwrap();
         let store = store_for(root.path(), work.path());
         assert_eq!(store.read_index(), "");
-        assert_eq!(store.read_entries(5), "");
         assert_eq!(store.read_entry("x").unwrap(), None);
         assert!(!store.forget("x").unwrap());
         // Reads must not create anything on disk.
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
-
-        for i in 0..3 {
-            store
-                .append(&format!("fact {i}"), &format!("body {i}"))
-                .unwrap();
-        }
-        assert_eq!(store.read_entries(2).matches("### ").count(), 2);
-        assert_eq!(store.read_entries(0).matches("### ").count(), 0);
-        assert_eq!(store.read_entries(10).matches("### ").count(), 3);
     }
 
     #[test]

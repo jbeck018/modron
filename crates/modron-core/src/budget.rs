@@ -52,17 +52,6 @@ impl BudgetGovernor {
         Ok(())
     }
 
-    pub fn check_input(&self, estimated_input_tokens: u64) -> Result<()> {
-        if estimated_input_tokens > self.max_input_tokens {
-            return Err(Error::Budget(format!(
-                "assembled context is ~{estimated_input_tokens} tokens, above the per-turn \
-                 input cap of {} tokens — shrink the task/history or raise max_input_tokens",
-                self.max_input_tokens
-            )));
-        }
-        Ok(())
-    }
-
     /// Total provider-reported tokens accumulated so far.
     pub fn cumulative(&self) -> u64 {
         self.cumulative
@@ -110,9 +99,9 @@ mod tests {
     #[test]
     fn check_input_trips_at_cap_with_actionable_error() {
         let governor = BudgetGovernor::new(10_000, 2048);
-        assert!(governor.check_input(2048).is_ok());
+        assert!(governor.check_input_with_cap(2048, 2048).is_ok());
 
-        let err = governor.check_input(2049).unwrap_err();
+        let err = governor.check_input_with_cap(2049, 2048).unwrap_err();
         match err {
             Error::Budget(message) => {
                 assert!(
