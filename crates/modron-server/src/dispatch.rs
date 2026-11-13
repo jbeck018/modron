@@ -1129,21 +1129,23 @@ async fn attach(
     });
 
     // 2. Load the persisted log + live state; send the snapshot first.
-    let events = match state.store.load(session_id).await {
-        Ok(events) => events,
+    // The load holds the per-session APPEND lock: no append can write to
+    // disk or publish while it is held, so the watermark read afterwards
+    // is EXACT - frames at or below it are already inside the snapshot,
+    // frames above it are not (the cycle-2 M1 fix's watermark-after-load
+    // had a loss window: an append completing between load and the read
+    // was in NEITHER; cycle-3 F1 closed it by holding the append lock
+    // across both).
+    let (append_guard, events) = match state.store.load_snapshot_locked(session_id).await {
+        Ok(loaded) => loaded,
         Err(e) => {
             forward.abort();
             send(ctx, error(request_id, e.to_string()));
             return;
         }
     };
-    // Events whose seq is at or below this watermark were published
-    // BEFORE the load read the disk - they are already in the snapshot.
-    // Their buffered frames must be dropped or every client double-folds
-    // them (the doc claimed seq dedupe happened client-side; it never
-    // did - cycle-2 audit M1). Publishes for a session are serialized by
-    // its append lock, so seq order == persist order.
     let persisted_through = handle.current_seq();
+    drop(append_guard);
     // One watermark read: two reads could straddle a publish and put a
     // frame's seq above the snapshot's last_seq (cycle-2 audit L9).
     let watermark = handle.current_seq();

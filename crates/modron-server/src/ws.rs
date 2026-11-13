@@ -36,7 +36,14 @@ async fn serve_ws_connection(
     state: Arc<ServerState>,
     trusted: bool,
 ) -> anyhow::Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
+    // The default 64 MiB message cap is generous, but an explicit config
+    // documents the dependency (a multi-MB snapshot rides one frame).
+    // non_exhaustive: default-then-mutate (snapshot frames ride one WS
+    // message; the default 64MiB cap rejects multi-MB sessions).
+    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(256 * 1024 * 1024);
+    config.max_frame_size = Some(16 * 1024 * 1024);
+    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(config)).await?;
     let (mut sink, mut source) = ws.split();
 
     // Single writer: dispatch replies and session fan-out frames queue

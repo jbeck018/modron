@@ -156,9 +156,6 @@ impl Inner {
         let mut meta = self.meta_for(id)?;
         if let Ok(disk) = self.read_meta(id) {
             meta.message_count = meta.message_count.max(disk.message_count);
-            if disk.updated_at > meta.updated_at {
-                meta.updated_at = disk.updated_at;
-            }
         }
         meta.updated_at = chrono::Utc::now();
         if meta_bump {
@@ -211,6 +208,11 @@ impl Inner {
         // (cycle-2 audit M4).
         let guard = self.session_lock(id);
         let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
+        self.load_unlocked(id)
+    }
+
+    /// The parse, without the lock (callers that already hold it).
+    fn load_unlocked(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
         let path = self.jsonl_path(id);
         // Read bytes and decode per-line lossily: a torn multibyte write
         // must not fail the whole load — the documented contract is that a
@@ -248,13 +250,14 @@ impl Inner {
         {
             return Ok(*count);
         }
-        // Seed under the session lock (load_sync takes it): an append
-        // between the seed-read and the cache insert would be counted
-        // twice - once by the read, once by the append's counter bump -
-        // and checkpoint indexes would drift by one (cycle-2 audit M4).
-        let count = self.load_sync(id)?.len() as u64;
+        // Seed inside ONE session-lock span (cycle-3 adversarial F5: the
+        // previous read-then-lock let an append land in between - it found
+        // no counter to bump, and the stale seed stuck forever, drifting
+        // every checkpoint index one low). Inline read + parse without
+        // re-entering the lock (load_sync takes it; re-entry = deadlock).
         let guard = self.session_lock(id);
         let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
+        let count = self.load_unlocked(id)?.len() as u64;
         self.caches
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -312,9 +315,6 @@ impl Inner {
         let mut meta = self.meta_for(id)?;
         if let Ok(disk) = self.read_meta(id) {
             meta.message_count = meta.message_count.max(disk.message_count);
-            if disk.updated_at > meta.updated_at {
-                meta.updated_at = disk.updated_at;
-            }
         }
         meta.updated_at = chrono::Utc::now();
         meta.message_count = meta.message_count.saturating_add(meta_bumps as u32);

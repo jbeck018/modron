@@ -240,16 +240,15 @@ impl Engine {
         }
         // Rewind support (C2): when `resume_from_event` is set, events after
         // that index stay in the append-only log but never re-enter context.
+        let pruned;
         let reconstruct_from = match self.config.resume_from_event {
             Some(cut) => {
                 let sliced = &events[..(cut as usize).min(events.len())];
-                // The cut lands before the abandoned tool results, so the
-                // slice can end with an assistant message whose tool_calls
-                // have no answers. Both provider APIs reject a tool_use
-                // without its tool_result: prune the orphaned tail
-                // (2026-11-12 cycle-2 audit H1 - every post-rewind resume
-                // 400'd on the first turn).
-                prune_unanswered_tool_calls(sliced)
+                // The cut lands before the abandoned tool results; every
+                // kept assistant tool_use must have its tool_result in the
+                // slice or the provider 400s (cycle-2 audit H1).
+                pruned = prune_unanswered_tool_calls(sliced);
+                pruned.as_ref()
             }
             None => &events[..],
         };
@@ -1804,24 +1803,61 @@ fn prompt_wire_hash(system: &str, tools: &[ToolSpec]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Drop trailing assistant messages whose tool_calls were abandoned by
-/// the rewind cut (their results live after the cut and never re-enter
-/// context). An assistant message with NO tool_calls stops the walk.
-fn prune_unanswered_tool_calls(events: &[SessionEvent]) -> &[SessionEvent] {
-    let mut end = events.len();
-    while end > 0 {
-        match &events[end - 1] {
-            // Checkpoints around the cut carry no context - skip them.
-            SessionEvent::Checkpoint { .. } => end -= 1,
+/// Rewrite a rewind-cut slice so every kept assistant `tool_use` has its
+/// `tool_result`. The cut lands before abandoned results, but a MULTI-call
+/// turn interleaves them (`[assistant(c1,c2), ToolResult(c1),
+/// Checkpoint(c2), ToolResult(c2)]`): a tail-only trim still leaves c2
+/// unanswered, and both provider APIs reject tool_use without tool_result
+/// (cycle-2 audit H1; the cycle-3 adversarial pass caught the multi-call
+/// gap). Tool calls without a result in the slice are dropped from their
+/// assistant message; a message left with no calls AND no text disappears.
+fn prune_unanswered_tool_calls(events: &[SessionEvent]) -> std::borrow::Cow<'_, [SessionEvent]> {
+    let answered: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let needs_rewrite = events.iter().any(|e| {
+        matches!(
+            e,
             SessionEvent::Message { message, .. }
-                if message.role == Role::Assistant && !message.tool_calls.is_empty() =>
+                if message.role == Role::Assistant
+                    && message
+                        .tool_calls
+                        .iter()
+                        .any(|c| !answered.contains(c.id.as_str()))
+        )
+    });
+    if !needs_rewrite {
+        return std::borrow::Cow::Borrowed(events);
+    }
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        match event {
+            SessionEvent::Message { parent_id, message }
+                if message.role == Role::Assistant
+                    && message
+                        .tool_calls
+                        .iter()
+                        .any(|c| !answered.contains(c.id.as_str())) =>
             {
-                end -= 1;
+                let mut kept = message.clone();
+                kept.tool_calls.retain(|c| answered.contains(c.id.as_str()));
+                if !kept.tool_calls.is_empty() || !kept.content.is_empty() {
+                    out.push(SessionEvent::Message {
+                        parent_id: *parent_id,
+                        message: kept,
+                    });
+                }
             }
-            _ => break,
+            // Checkpoints around the cut carry no context.
+            SessionEvent::Checkpoint { .. } => {}
+            other => out.push(other.clone()),
         }
     }
-    &events[..end]
+    std::borrow::Cow::Owned(out)
 }
 
 fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) -> Vec<Message> {
@@ -2029,10 +2065,63 @@ mod tests {
             },
         ];
         // The rewind cut is at the checkpoint index: the slice keeps
-        // [task, assistant(c1), checkpoint] - the trailing orphan must go.
+        // [task, assistant(c1), checkpoint]. c1 was abandoned: the call is
+        // stripped, the assistant's prose survives, the checkpoint goes.
         let pruned = prune_unanswered_tool_calls(&events[..3]);
-        assert_eq!(pruned.len(), 1, "assistant(c1)+checkpoint pruned");
-        assert!(matches!(&pruned[0], SessionEvent::Task { .. }));
+        assert_eq!(pruned.len(), 2, "checkpoint dropped, prose kept");
+        let kept = match &pruned[1] {
+            SessionEvent::Message { message, .. } => message,
+            other => panic!("expected assistant, got {other:?}"),
+        };
+        assert!(kept.tool_calls.is_empty());
+        assert_eq!(kept.content, "reading the file");
+
+        // MULTI-call turn (cycle-3 adversarial F2): results interleave, the
+        // cut lands before the LAST result, and the kept assistant must
+        // lose only the unanswered call - not the whole turn.
+        let mut multi = Message::assistant("working on it");
+        multi.tool_calls = vec![
+            ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.rs"}),
+            },
+            ToolCall {
+                id: "c2".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path": "b.rs"}),
+            },
+        ];
+        let multi_events = [
+            SessionEvent::Task { text: "t".into() },
+            SessionEvent::Message {
+                parent_id: None,
+                message: multi,
+            },
+            SessionEvent::ToolResult {
+                call_id: "c1".into(),
+                outcome: ToolOutcome::ok("a"),
+            },
+            SessionEvent::Checkpoint {
+                path: "b.rs".into(),
+                prior_content_b64: None,
+                event_index: 4,
+            },
+            SessionEvent::ToolResult {
+                call_id: "c2".into(),
+                outcome: ToolOutcome::ok("b"),
+            },
+        ];
+        // Cut before the abandoned c2 result: keep [task, assistant(-c2),
+        // ToolResult(c1)].
+        let pruned = prune_unanswered_tool_calls(&multi_events[..4]);
+        assert_eq!(pruned.len(), 3, "checkpoint stripped, turn kept");
+        let kept_calls = match &pruned[1] {
+            SessionEvent::Message { message, .. } => &message.tool_calls,
+            other => panic!("expected assistant, got {other:?}"),
+        };
+        assert_eq!(kept_calls.len(), 1, "c2 (unanswered) dropped");
+        assert_eq!(kept_calls[0].id, "c1");
 
         // An answered run (full log) is untouched.
         assert_eq!(prune_unanswered_tool_calls(&events).len(), events.len());

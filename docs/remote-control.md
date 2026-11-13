@@ -36,9 +36,13 @@ Every connection starts with a `hello` frame and gets `welcome`:
 <- {"id":1,"seq":0,"type":"welcome","server_version":"0.1.2","protocol":1}
 ```
 
-Server-to-client event frames carry a per-session monotonic `seq`. A gap
-means you missed frames: re-`attach` with your `last_seq` and dedupe by
-`seq` (the snapshot plus the buffered live frames can overlap).
+Server-to-client event frames carry a per-session monotonic `seq`. The
+server deduplicates the snapshot/live overlap for you: an `attach` holds
+the session's append lock across "load the log + read the watermark" and
+drops any buffered frame at or below it, so the snapshot plus the
+buffered live frames tile exactly. If the server's buffer overflows
+while your socket is slow you get an explicit `error` frame (re-`attach`
+to resync) instead of silently missing frames.
 
 ### The 60-second client
 
@@ -55,7 +59,13 @@ submitting connection is attached automatically), `attach`
 (`last_seq`-based catch-up, answered by `snapshot`), `detach`,
 `interrupt`, `approve` (first responder wins), `set_config`
 (model/provider/sandbox/approval mode/allow/deny/persona/goal for future
-turns), `fork`, `new_session`, `list_sessions`, `ping`.
+turns), `fork`, `new_session`, `list_sessions`, `delete_session`,
+`create_task` / `get_task_status` / `merge_task` (worktree tasks),
+`automations_list` / `automation_add` / `automation_remove`,
+`remote_control` (open a tunnel), `publish_page` (share an answer),
+`auth_providers_req` (provider status rows), `persist_router` (write
+router defaults), `ping`. Every failure answers `error` with a
+machine-readable `kind` (auth / not_found / conflict / other).
 
 ## Pairing (remote auth)
 

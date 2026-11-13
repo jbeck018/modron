@@ -76,3 +76,24 @@ async fn resources_and_prompts_round_trip() {
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0].name, "greet");
 }
+
+/// A multibyte character straddling the reader's internal buffer boundary
+/// must survive (cycle-2 L2 fix: per-chunk from_utf8_lossy turned it into
+/// U+FFFDs). An 8 KiB run of ASCII followed by multibyte text forces the
+/// boundary into the wide characters.
+#[tokio::test]
+async fn multibyte_output_survives_buffer_boundaries() {
+    let bin = env!("CARGO_BIN_EXE_modron-mcp-echo");
+    let (handle, _) = McpServerHandle::spawn("echo", bin, &[], &[]).await.unwrap();
+    let mut handle = handle.lock().await;
+    // The echo tool repeats the message: 8190 ASCII chars (lands the
+    // boundary mid-run), then a wide char + trailing text.
+    let payload = format!("{}\u{1F40D}end", "a".repeat(8190));
+    let result = handle
+        .call_tool("echo", json!({"message": payload}))
+        .await
+        .unwrap();
+    assert!(!result.is_error);
+    assert_eq!(result.content, payload, "no U+FFFD corruption");
+    assert!(!result.content.contains('\u{FFFD}'));
+}

@@ -281,6 +281,20 @@ pub trait SessionStore: Send + Sync {
         }
         Ok(())
     }
+    /// Load events while HOLDING the store's per-session append lock,
+    /// returning the guard. `modron serve`'s attach needs "no append can
+    /// interleave between reading the disk and reading the seq
+    /// watermark" - under this guard the watermark read is exact.
+    /// Default: plain `load` under an unlocked guard (stores whose loads
+    /// are inherently serialized against appends need nothing more).
+    async fn load_snapshot_locked(
+        &self,
+        id: SessionId,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Vec<SessionEvent>)> {
+        let guard = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let events = self.load(id).await?;
+        Ok((guard, events))
+    }
     /// Number of parsed events in a session, cheaply. Default: a full
     /// `load` (correct everywhere). Stores with an on-disk log override
     /// this when callers ask repeatedly — the engine's checkpoint path

@@ -11,8 +11,11 @@
 // Trust model: possession of the share key is the credential.
 
 const MAX_BUFFER = 200;
-const MAX_FRAME = 1048576; // 1MB per websocket frame
-const PAGE_MAX_BYTES = 256 * 1024; // reject /pages bodies above 256KB
+const MAX_FRAME = 96 * 1024; // per-frame cap (DO storage values cap at 128 KiB)
+// Durable Object storage rejects values above 128 KiB - caps stay under
+// it (cycle-3 F4: the 256KB/1MB caps passed validation then blew up at
+// storage.put with an opaque 500 / silently-missing replay frame).
+const PAGE_MAX_BYTES = 96 * 1024; // /pages body cap (DO storage values cap at 128 KiB)
 const PAGE_TTL_MS = 7 * 24 * 3600 * 1000; // pages GC 7 days after publish
 const BUFFER_IDLE_MS = 6 * 3600 * 1000; // buffer GC 6h after both sides leave
 const REGISTRY_DO = "__pages__"; // DO name holding the page-id -> key registry
@@ -141,7 +144,7 @@ export class SessionBridge extends DurableObject {
     // 128-bit random, so a timing side channel is not exploitable.
     if (auth !== "Bearer " + key) return new Response("unauthorized", { status: 401 });
     const raw = await request.text();
-    if (raw.length > PAGE_MAX_BYTES) return new Response("page too large (max 256KB)", { status: 413 });
+    if (raw.length > PAGE_MAX_BYTES) return new Response("page too large (max 96KB)", { status: 413 });
     let body: { title?: string; content_md?: string };
     try { body = JSON.parse(raw) as { title?: string; content_md?: string }; }
     catch { return new Response("bad json", { status: 400 }); }

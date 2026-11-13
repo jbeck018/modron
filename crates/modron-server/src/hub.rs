@@ -108,6 +108,19 @@ impl SessionStore for BroadcastingStore {
         self.inner.load(id).await
     }
 
+    /// Hold the per-session APPEND lock across the read: attach's
+    /// watermark read is then exact (an append blocked on this lock can
+    /// neither write to disk nor publish) - the cycle-2 F1 fix.
+    async fn load_snapshot_locked(
+        &self,
+        id: SessionId,
+    ) -> modron_core::Result<(tokio::sync::OwnedMutexGuard<()>, Vec<SessionEvent>)> {
+        let lock = self.write_lock(id).await;
+        let guard = lock.clone().lock_owned().await;
+        let events = self.inner.load(id).await?;
+        Ok((guard, events))
+    }
+
     async fn list(&self) -> modron_core::Result<Vec<SessionMeta>> {
         self.inner.list().await
     }
@@ -249,6 +262,17 @@ pub struct SessionHandle {
     /// request_id -> decision channel; the engine parks on the receiver
     /// inside its approver (`block_in_place`, the TUI's pattern).
     pending: Mutex<HashMap<String, std::sync::mpsc::Sender<bool>>>,
+    /// Orders "insert into pending + publish the request" against
+    /// interrupt's "drain pending + publish resolutions + abort": a
+    /// request frame can never land after TurnAborted (cycle-3 F3 - the
+    /// cycle-2 fix narrowed this race but the drain could still land
+    /// between the gate's insert and its publish).
+    gate_order: Mutex<()>,
+    /// Set by interrupt (under gate_order): gates that arrive afterwards
+    /// decline silently instead of publishing into a dead run.
+    aborted: AtomicBool,
+    /// Approval wait before an auto-deny (injectable for tests; prod = 30s).
+    approval_timeout: Mutex<std::time::Duration>,
     /// Sticky approve-rest (the TUI's `a` answer): every later mutating
     /// call in this session auto-approves.
     allow_rest: AtomicBool,
@@ -389,15 +413,36 @@ impl SessionHandle {
     /// otherwise register the request, broadcast it to every attached
     /// client, and park the engine task on a sync channel until a client
     /// answers (or an interrupt drains the pending map with denials, or
-    /// [`APPROVAL_TIMEOUT`](Self::APPROVAL_TIMEOUT) elapses — an
+    /// the approval timeout elapses (30s in production) — an
     /// unanswered request can never wedge the session).
+    /// Override the approval wait (tests: prove the timeout path without
+    /// a 30s sleep).
+    pub fn set_approval_timeout(&self, timeout: std::time::Duration) {
+        *lock(&self.approval_timeout) = timeout;
+    }
+
+    fn approval_timeout(&self) -> std::time::Duration {
+        *lock(&self.approval_timeout)
+    }
+
     pub fn approve_gate(&self, call: &ToolCall) -> bool {
         if self.allow_rest.load(Ordering::Relaxed) {
             return true;
         }
-        const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let approval_timeout = self.approval_timeout();
         let request_id = format!("req-{}", Uuid::new_v4());
         let (respond, receive) = std::sync::mpsc::channel::<bool>();
+        // The insert + publish pair is atomic against interrupt(): if the
+        // run was already aborted (slot taken), the request is never
+        // published at all; otherwise any interrupt drain is ordered
+        // AFTER this publish, so the client sees request -> resolution ->
+        // abort, never request-after-abort (cycle-3 F3).
+        let order_guard = lock(&self.gate_order);
+        if self.aborted.load(Ordering::Relaxed) {
+            // Interrupt already published its resolutions + abort: a late
+            // gate must not re-open the strip (cycle-3 F3).
+            return false;
+        }
         lock(&self.pending).insert(request_id.clone(), respond);
         *lock(&self.live_approval) = Some(PendingApproval {
             request_id: request_id.clone(),
@@ -407,6 +452,7 @@ impl SessionHandle {
             request_id: request_id.clone(),
             call: call.clone(),
         });
+        drop(order_guard);
         // The whole round-trip is blocking inside an async context:
         // block_in_place frees the runtime's other workers while this task
         // waits for a decision.
@@ -416,7 +462,7 @@ impl SessionHandle {
         // publishes its own echo - only the timeout path publishes here.
         use std::sync::mpsc::RecvTimeoutError;
         let (allowed, timed_out) =
-            match tokio::task::block_in_place(|| receive.recv_timeout(APPROVAL_TIMEOUT)) {
+            match tokio::task::block_in_place(|| receive.recv_timeout(approval_timeout)) {
                 Ok(allowed) => (allowed, false),
                 Err(RecvTimeoutError::Timeout) => (false, true),
                 Err(RecvTimeoutError::Disconnected) => (false, false),
@@ -468,6 +514,11 @@ impl SessionHandle {
         // client never renders a phantom approval for an already-dead run
         // (the gate task could otherwise publish ApprovalRequested after
         // the abort - cycle-2 audit M3).
+        // The gate_order lock spans drain + resolutions + the abort frame:
+        // a gate either published before we locked (we drain its echo) or
+        // sees the empty run slot and publishes nothing (cycle-3 F3).
+        let order_guard = lock(&self.gate_order);
+        self.aborted.store(true, Ordering::Relaxed);
         let pending = lock(&self.pending).drain().collect::<Vec<_>>();
         for (request_id, respond) in pending {
             let _ = respond.send(false);
@@ -480,6 +531,7 @@ impl SessionHandle {
         if had_run {
             self.publish(Payload::TurnAborted {});
         }
+        drop(order_guard);
         had_run
     }
 
@@ -785,6 +837,9 @@ impl SessionHub {
             seq: Mutex::new(0),
             run: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            gate_order: Mutex::new(()),
+            aborted: AtomicBool::new(false),
+            approval_timeout: Mutex::new(std::time::Duration::from_secs(30)),
             allow_rest: AtomicBool::new(false),
             tracker: Mutex::new(ActivityTracker::new()),
             text: Mutex::new(String::new()),
@@ -819,6 +874,7 @@ impl SessionHub {
         if slot.is_some() {
             return Err("session busy (a run is active)".to_string());
         }
+        handle.aborted.store(false, Ordering::Relaxed);
         let owner = Arc::clone(&handle);
         let task = tokio::spawn(async move {
             let result = run.await;

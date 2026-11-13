@@ -372,3 +372,49 @@ async fn broadcasting_store_persists_then_fans_out() {
         other => panic!("expected event frame, got {other:?}"),
     }
 }
+
+/// The timeout path publishes ApprovalResolved{Deny} (cycle-2 M2 + cycle-3
+/// regression pin): a client that rendered the request must see the
+/// resolution, and pending must drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_timeout_publishes_a_deny_resolution() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    handle.set_approval_timeout(std::time::Duration::from_millis(100));
+    let mut rx = handle.subscribe();
+    let call = ToolCall {
+        id: "c1".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({}),
+    };
+    let gate = {
+        let parked = Arc::clone(&handle);
+        let call = call.clone();
+        tokio::spawn(async move { parked.approve_gate(&call) })
+    };
+    let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("request frame")
+        .map(parse_live)
+        .unwrap();
+    assert!(matches!(frame.payload, Payload::ApprovalRequested { .. }));
+
+    let denied = tokio::time::timeout(Duration::from_secs(2), gate)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!denied, "timeout denies");
+    let resolved = parse_live(rx.recv().await.unwrap());
+    assert!(
+        matches!(
+            resolved.payload,
+            Payload::ApprovalResolved {
+                decision: Decision::Deny,
+                ..
+            }
+        ),
+        "the client must see the timeout denial: {:?}",
+        resolved.payload
+    );
+    assert!(handle.live_state().pending_approval.is_none());
+}

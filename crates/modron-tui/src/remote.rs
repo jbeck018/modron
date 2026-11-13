@@ -21,7 +21,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
 /// Handshake deadline: a server that cannot answer Welcome in 5s is not a
@@ -70,9 +70,15 @@ impl Link {
             None if target == "unix" => default_socket_path(),
             None => {
                 return if target.starts_with("ws://") || target.starts_with("wss://") {
-                    let (stream, _) = connect_async(target)
-                        .await
-                        .with_context(|| format!("connecting to {target}"))?;
+                    // non_exhaustive: default-then-mutate.
+                    let mut config =
+                        tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+                    config.max_message_size = Some(256 * 1024 * 1024);
+                    config.max_frame_size = Some(16 * 1024 * 1024);
+                    let (stream, _) =
+                        tokio_tungstenite::connect_async_with_config(target, Some(config), false)
+                            .await
+                            .with_context(|| format!("connecting to {target}"))?;
                     Ok(Self::Ws {
                         stream: Box::new(stream),
                     })

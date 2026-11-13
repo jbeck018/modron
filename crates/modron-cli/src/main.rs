@@ -2011,6 +2011,16 @@ async fn run_sessions_vacuum(
 /// `modron sessions restart <id>` (Phase 6a): same session id, fresh
 /// context. The history stays on disk (append-only log) but the resume
 /// marker moves to the log's end, so the next `--resume` starts clean.
+/// Test hook (the fn is buried in the bin crate; phase1b pins the marker
+/// value).
+#[doc(hidden)]
+pub async fn run_sessions_restart_for_test(
+    sessions_dir: &Path,
+    id: SessionId,
+) -> anyhow::Result<()> {
+    run_sessions_restart(sessions_dir, id).await
+}
+
 async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Result<()> {
     let store = JsonlSessionStore::new(sessions_dir);
     let events = store
@@ -3146,6 +3156,29 @@ fn print_usage_row(model: &str, usage: &Usage, cost: f64) {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn restart_writes_a_zero_marker_so_resume_starts_fresh() {
+        use modron_store::JsonlSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let meta = store.create_session("to restart").await.unwrap();
+        store
+            .append(
+                meta.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: modron_core::Message::user("old work"),
+                },
+            )
+            .await
+            .unwrap();
+
+        run_sessions_restart(dir.path(), meta.id).await.unwrap();
+        let marker = dir.path().join(format!("{}.rewind", meta.id));
+        let contents = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(contents.trim(), "0", "fresh context = cut at 0");
+    }
     use super::*;
 
     #[test]

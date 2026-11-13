@@ -17,9 +17,7 @@ use modron_protocol::PROTOCOL_VERSION;
 use modron_protocol::{ConfigPatch, Decision, Frame, Payload};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream};
 
 /// The client name sent in `hello`.
 pub const CLIENT_NAME: &str = "modron-desktop";
@@ -41,7 +39,11 @@ impl WireClient {
     /// fail unless the server speaks [`PROTOCOL_VERSION`]. Returns the
     /// client and the server's version string.
     pub async fn connect(url: &str) -> anyhow::Result<(Self, String)> {
-        let (ws, _) = connect_async(url)
+        // non_exhaustive: default-then-mutate.
+        let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(256 * 1024 * 1024);
+        config.max_frame_size = Some(16 * 1024 * 1024);
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
             .await
             .with_context(|| format!("dial {url}"))?;
         let (mut sink, mut stream) = ws.split();

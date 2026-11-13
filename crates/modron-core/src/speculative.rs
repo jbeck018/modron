@@ -360,3 +360,15 @@ mod tests {
         assert!(!allowed_for(&observed));
     }
 }
+
+/// A panicked speculative task leaves the empty-error placeholder in the
+/// map: dispatch treats it as a MISS and re-executes for real (cycle-3
+/// adversarial F6/M6 pin). The placeholder value itself is asserted here.
+#[test]
+fn placeholder_is_recognizable_as_a_miss() {
+    let placeholder = ToolOutcome::err(String::new());
+    assert!(placeholder.is_error && placeholder.content.is_empty());
+    // A real failure with content is NOT a miss (it is reused verbatim).
+    let real_failure = ToolOutcome::err(String::from("grep exploded"));
+    assert!(!(real_failure.is_error && real_failure.content.is_empty()));
+}
