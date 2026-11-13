@@ -100,7 +100,7 @@ impl SessionStore for BroadcastingStore {
         let lock = self.write_lock(id).await;
         let _guard = lock.lock().await;
         self.inner.append(id, event).await?;
-        self.hub.on_persisted(id, event.clone());
+        self.hub.on_persisted(id, event);
         Ok(())
     }
 
@@ -131,9 +131,10 @@ impl SessionStore for BroadcastingStore {
             .inner
             .create_session(&format!("fork of {from}"))
             .await?;
-        for event in &events {
-            self.inner.append(meta.id, event).await?;
-        }
+        // One batched write: per-event appends meant one meta rewrite +
+        // several syscalls PER EVENT (a 5k-event fork churned the disk for
+        // seconds; cycle-2 audit H5).
+        self.inner.append_batch(meta.id, &events).await?;
         Ok(meta.id)
     }
 }
@@ -166,15 +167,29 @@ impl SessionStore for PinnedCreateStore {
             // existing meta instead of opening a second one. If the session
             // has vanished in the meantime, fall through to a fresh create.
             Some(id) => {
-                let existing = self
-                    .inner
-                    .list()
-                    .await?
-                    .into_iter()
-                    .find(|meta| meta.id == id);
-                match existing {
-                    Some(meta) => Ok(meta),
-                    None => self.inner.create_session(title).await,
+                // Existence probe via event_count - cheap after the store's
+                // one-time seed (a full list() parsed every meta on disk
+                // per adopted submit; cycle-2 audit H14).
+                let exists = self.inner.event_count(id).await;
+                match exists {
+                    Ok(_) => self
+                        .inner
+                        .list()
+                        .await?
+                        .into_iter()
+                        .find(|m| m.id == id)
+                        .ok_or_else(|| {
+                            modron_core::Error::Session(format!(
+                                "pinned session {id} metadata unreadable"
+                            ))
+                        }),
+                    // Adoption of a vanished session must fail LOUDLY: the
+                    // old fallback minted a brand-new uuid the caller's
+                    // sinks do not know - a run with zero live frames under
+                    // a surprise id (cycle-2 audit L4).
+                    Err(e) => Err(modron_core::Error::Session(format!(
+                        "pinned session {id} vanished before adoption: {e}"
+                    ))),
                 }
             }
             None => self.inner.create_session(title).await,
@@ -231,7 +246,6 @@ pub struct SessionHandle {
     /// Set by [`SessionHandle::interrupt`](Self::interrupt) before the
     /// abort lands, so the completing run knows a TurnAborted was already
     /// published on its behalf.
-    aborted: AtomicBool,
     /// request_id -> decision channel; the engine parks on the receiver
     /// inside its approver (`block_in_place`, the TUI's pattern).
     pending: Mutex<HashMap<String, std::sync::mpsc::Sender<bool>>>,
@@ -396,10 +410,25 @@ impl SessionHandle {
         // The whole round-trip is blocking inside an async context:
         // block_in_place frees the runtime's other workers while this task
         // waits for a decision.
-        let allowed =
-            tokio::task::block_in_place(|| receive.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false));
-        lock(&self.pending).remove(&request_id);
+        // A TIMEOUT is a Deny the client never saw resolved: without the
+        // frame the desktop's approval strip stays up on a dead request
+        // until the next abort (cycle-2 audit M2). An explicit resolve()
+        // publishes its own echo - only the timeout path publishes here.
+        use std::sync::mpsc::RecvTimeoutError;
+        let (allowed, timed_out) =
+            match tokio::task::block_in_place(|| receive.recv_timeout(APPROVAL_TIMEOUT)) {
+                Ok(allowed) => (allowed, false),
+                Err(RecvTimeoutError::Timeout) => (false, true),
+                Err(RecvTimeoutError::Disconnected) => (false, false),
+            };
+        let was_resolved = lock(&self.pending).remove(&request_id).is_none();
         *lock(&self.live_approval) = None;
+        if timed_out && !was_resolved {
+            self.publish(Payload::ApprovalResolved {
+                request_id: request_id.clone(),
+                decision: modron_protocol::Decision::Deny,
+            });
+        }
         allowed
     }
 
@@ -431,13 +460,21 @@ impl SessionHandle {
         let task = lock(&self.run).take();
         let had_run = task.is_some();
         if had_run {
-            self.aborted.store(true, Ordering::Relaxed);
             if let Some(task) = task {
                 task.abort();
             }
         }
-        for (_, respond) in lock(&self.pending).drain() {
+        // Publish each drained gate's resolution BEFORE TurnAborted so a
+        // client never renders a phantom approval for an already-dead run
+        // (the gate task could otherwise publish ApprovalRequested after
+        // the abort - cycle-2 audit M3).
+        let pending = lock(&self.pending).drain().collect::<Vec<_>>();
+        for (request_id, respond) in pending {
             let _ = respond.send(false);
+            self.publish(Payload::ApprovalResolved {
+                request_id,
+                decision: modron_protocol::Decision::Deny,
+            });
         }
         *lock(&self.live_approval) = None;
         if had_run {
@@ -456,6 +493,12 @@ impl SessionHandle {
             return; // interrupted: the slot (and the terminal frame) went to it
         }
         drop(slot);
+        // Clear the live buffers on the terminal frame: a provider error
+        // after text deltas otherwise leaves the stale prefix glued to the
+        // NEXT turn's stream for every late attacher (cycle-2 audit L1).
+        lock(&self.text).clear();
+        lock(&self.reasoning).clear();
+        lock(&self.tracker).clear_turn();
         match result {
             Ok(summary) => self.publish(Payload::TurnDone {
                 summary: WireRunSummary::from(&summary),
@@ -741,7 +784,6 @@ impl SessionHub {
             tx,
             seq: Mutex::new(0),
             run: Mutex::new(None),
-            aborted: AtomicBool::new(false),
             pending: Mutex::new(HashMap::new()),
             allow_rest: AtomicBool::new(false),
             tracker: Mutex::new(ActivityTracker::new()),
@@ -761,9 +803,9 @@ impl SessionHub {
     /// One persisted event reached the shared store: fold it into the
     /// session's live view and fan it out. Unknown sessions (e.g. events
     /// appended outside the server) are ignored.
-    pub fn on_persisted(&self, id: SessionId, event: SessionEvent) {
+    pub fn on_persisted(&self, id: SessionId, event: &SessionEvent) {
         if let Some(handle) = self.handle(&id) {
-            handle.on_persisted(&event);
+            handle.on_persisted(event);
         }
     }
 

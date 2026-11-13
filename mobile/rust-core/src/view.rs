@@ -14,8 +14,7 @@
 //!   history at `TurnDone` and clear (uncommitted) on abort/failure —
 //!   TUI streaming parity.
 //! - `Event` frames append committed rows by folding through
-//!   [`modron_view::replay`] (see `FoldState` for the incremental
-//!   grouping bookkeeping).
+//!   [`modron_view::ReplayFolder`] one push at a time (see `FoldState`).
 //! - `Tool` frames feed [`modron_view::ActivityTracker`] (the live strip).
 //! - `ApprovalRequested` blocks on a decision; `ApprovalResolved` clears
 //!   it. Config changes are label updates for future turns only.
@@ -29,7 +28,7 @@ use modron_protocol::{
     ApprovalModeWire, Decision, LiveState, PendingApproval, SessionMetaWire, WireRunSummary,
 };
 use modron_types::{Role, SessionEvent, ToolActivity, ToolCall, Usage};
-use modron_view::{replay, ActivityTracker, SwarmRow, ToolEvent, TranscriptEntry};
+use modron_view::{replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -101,15 +100,11 @@ pub fn entry_lines(entry: &TranscriptEntry) -> Vec<String> {
         TranscriptEntry::Usage { usage, .. } => {
             // Same arithmetic and words as the TUI's per-turn usage note
             // (`{total} tok · cache {pct}%`); the turn count lives in the
-            // status line on mobile instead.
-            let all = usage.input_tokens + usage.cached_input_tokens;
-            let cache = if all > 0 {
-                format!(
-                    "cache {:.0}%",
-                    100.0 * usage.cached_input_tokens as f64 / all as f64
-                )
-            } else {
-                "cache —".to_string()
+            // status line on mobile instead. The cache percentage is the
+            // shared `cache_hit_pct` (the canonical arithmetic).
+            let cache = match modron_view::cache_hit_pct(usage) {
+                Some(pct) => format!("cache {pct:.0}%"),
+                None => "cache —".to_string(),
             };
             vec![format!("{} tok · {}", usage.total(), cache)]
         }
@@ -255,10 +250,36 @@ pub struct SessionViewModel {
     /// Last `Note` frame text (slash-command results).
     pub last_note: Option<String>,
     pub oauth: Option<OAuthProgressView>,
-    /// Committed transcript, in order.
-    pub history: Vec<TranscriptEntry>,
+    /// Committed transcript, in order, pre-rendered: the shared strings
+    /// are produced once at commit time ([`commit`]), so a snapshot
+    /// ([`ViewModelSnapshot::from_vm`], polled 4x/sec by the shell)
+    /// clones finished rows instead of re-rendering every entry.
+    pub history: Vec<RenderedRow>,
     /// Entries not yet drained by `take_new_entries`.
     pub new_entries: Vec<TranscriptEntry>,
+}
+
+/// Committed-transcript bound: both `history` and the `new_entries`
+/// drain queue drop their oldest rows past this (the poll reads the
+/// whole snapshot and nothing else drains the queue, so an uncapped
+/// transcript would grow without bound on a long session).
+const HISTORY_CAP: usize = 500;
+
+/// Drop the oldest rows past [`HISTORY_CAP`] (FIFO; the display is the
+/// most recent transcript either way).
+fn cap_rows<T>(rows: &mut Vec<T>) {
+    if rows.len() > HISTORY_CAP {
+        rows.drain(..rows.len() - HISTORY_CAP);
+    }
+}
+
+/// Render one committed row once: the typed entry plus its shared
+/// strings ([`entry_lines`]).
+fn rendered_row(entry: &TranscriptEntry) -> RenderedRow {
+    RenderedRow {
+        entry: entry.clone(),
+        lines: entry_lines(entry),
+    }
 }
 
 impl SessionViewModel {
@@ -330,21 +351,16 @@ pub struct ViewModelSnapshot {
 
 impl ViewModelSnapshot {
     pub fn from_vm(vm: &SessionViewModel) -> Self {
-        let cache_denom =
-            vm.cumulative_usage.input_tokens + vm.cumulative_usage.cached_input_tokens;
-        let session_cache_pct = (cache_denom > 0)
-            .then(|| 100.0 * vm.cumulative_usage.cached_input_tokens as f64 / cache_denom as f64);
+        // The shared cache-hit arithmetic (None before any tokens).
+        let session_cache_pct = modron_view::cache_hit_pct(&vm.cumulative_usage);
         let mut status_line = if vm.model.is_empty() {
             "modron".to_string()
         } else {
             vm.model.clone()
         };
         status_line.push_str(&format!(" · {} tok", vm.cumulative_usage.total()));
-        if cache_denom > 0 {
-            status_line.push_str(&format!(
-                " · cache {:.0}%",
-                100.0 * vm.cumulative_usage.cached_input_tokens as f64 / cache_denom as f64
-            ));
+        if let Some(pct) = session_cache_pct {
+            status_line.push_str(&format!(" · cache {pct:.0}%"));
         }
         status_line.push_str(&format!(" · {}", approval_mode_label(vm.approval_mode)));
         Self {
@@ -383,37 +399,46 @@ impl ViewModelSnapshot {
             last_error: vm.last_error.clone(),
             last_note: vm.last_note.clone(),
             oauth: vm.oauth.clone(),
-            history: vm
-                .history
-                .iter()
-                .map(|entry| RenderedRow {
-                    entry: entry.clone(),
-                    lines: entry_lines(entry),
-                })
-                .collect(),
+            // Rows are rendered at commit time (`commit`/`fold_snapshot`);
+            // this is a plain clone per poll, never a re-render. (The one
+            // commit outside the per-event flow is the held ToolSummary
+            // tail at the turn boundary — `FoldState::flush_tools` — and
+            // it renders exactly the same once.)
+            history: vm.history.clone(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Incremental folding state (Event frames through replay())
+// Incremental folding state (Event frames through ReplayFolder)
 // ---------------------------------------------------------------------------
 
-/// Bookkeeping for folding live `Event` frames through
-/// [`modron_view::replay`] one event at a time while keeping replay's
-/// grouping identical: `pending_log` is the naming prefix (the most recent
-/// assistant `Message`, which carries `tool_calls`) plus the current
-/// unflushed event group; `prefix_entries` counts the rows replay yields
-/// for the prefix alone so those are skipped on every re-replay. A
-/// trailing `ToolSummary` is held open (`held`) until the next flush
-/// point, exactly like replay's end-of-log flush.
+/// Bookkeeping for folding live `Event` frames: a
+/// [`modron_view::ReplayFolder`] IS the replay algorithm, so `fold_event`
+/// is a single `folder.push` (O(new rows), never a re-replay of the log)
+/// and a live fold groups tools exactly like a whole-log `replay` by
+/// construction. The mobile-only bits (streaming-buffer clears, usage
+/// accumulation, the committed-tools guard) stay here, fed from the
+/// entries each push returns.
+///
+/// The folder holds a trailing run of `ToolResult` events open (no
+/// summary row yet) until the next boundary event — replay's own
+/// end-of-log behavior. `flush_tools` mirrors that flush at the turn
+/// boundary: the still-open group is re-folded through `replay` (the
+/// naming prefix rides along so call ids recover their tool names), the
+/// held summary commits like any other row, and the folder resets to the
+/// prefix (the old `reset_to_prefix`) so the next turn starts clean.
 #[derive(Default)]
 pub(crate) struct FoldState {
     pub tracker: ActivityTracker,
-    pub prefix: Vec<SessionEvent>,
-    pub pending_log: Vec<SessionEvent>,
-    pub prefix_entries: usize,
-    pub held: Option<TranscriptEntry>,
+    folder: ReplayFolder,
+    /// The naming prefix: the most recent assistant `Message` (it carries
+    /// `tool_calls`); replayed into a fresh folder after every reset.
+    prefix: Vec<SessionEvent>,
+    /// `ToolResult` events of the still-open tool group (the folder
+    /// flushed it already once a boundary arrived). Empty at every
+    /// boundary; the turn-end flush commits what it holds.
+    open_group: Vec<SessionEvent>,
     /// Whether this turn already committed a tool summary (via the
     /// Event/ToolResult path); guards the live-strip commit at turn end
     /// against servers that send both.
@@ -421,21 +446,38 @@ pub(crate) struct FoldState {
 }
 
 impl FoldState {
-    /// Commit what is held (end of the current tool group), reset the log
-    /// to the naming prefix.
+    /// Commit what the folder still holds open (end of the current tool
+    /// group), then reset it to the naming prefix.
     pub fn flush_tools(&mut self, vm: &mut SessionViewModel) {
-        if let Some(entry) = self.held.take() {
-            if matches!(entry, TranscriptEntry::ToolSummary { .. }) {
-                self.committed_tools = true;
+        if !self.open_group.is_empty() {
+            let mut log = Vec::with_capacity(self.prefix.len() + self.open_group.len());
+            log.extend_from_slice(&self.prefix);
+            log.extend_from_slice(&self.open_group);
+            // The prefix's own rows committed when it was folded live;
+            // only the group's held summary is new.
+            let entries = replay(&log);
+            let skip = replay(&self.prefix).len().min(entries.len());
+            for entry in &entries[skip..] {
+                if matches!(entry, TranscriptEntry::ToolSummary { .. }) {
+                    self.committed_tools = true;
+                }
+                commit(vm, entry.clone());
             }
-            commit(vm, entry);
         }
         self.reset_to_prefix();
     }
 
+    /// Reset the folder to the naming prefix: the group's rows are all
+    /// committed by now, so later events fold from the prefix forward
+    /// (a fresh tool run, named by the prefix's `tool_calls`).
     fn reset_to_prefix(&mut self) {
-        self.pending_log = self.prefix.clone();
-        self.prefix_entries = replay(&self.pending_log).len();
+        self.folder.reset();
+        for event in &self.prefix {
+            // The prefix's own rows committed when it was folded live;
+            // only the folder's naming state (call ids) matters here.
+            let _ = self.folder.push(event);
+        }
+        self.open_group.clear();
     }
 
     /// Fold one live `SessionEvent` into committed rows.
@@ -448,38 +490,34 @@ impl FoldState {
                 vm.streaming_reasoning.clear();
             }
         }
-        let is_tool_result = matches!(event, SessionEvent::ToolResult { .. });
-        if !is_tool_result {
-            // replay flushes an open tool group before every non-tool row.
-            self.flush_tools(vm);
-        }
-        self.pending_log.push(event.clone());
-        let entries = replay(&self.pending_log);
-        let skip = self.prefix_entries.min(entries.len());
-        // A trailing ToolSummary stays open (more results may follow).
-        let held = match entries.last() {
-            Some(TranscriptEntry::ToolSummary { .. }) => entries.last().cloned(),
-            _ => None,
-        };
-        let committed_end = entries.len() - usize::from(held.is_some());
-        for entry in &entries[skip..committed_end] {
-            commit(vm, entry.clone());
-        }
-        self.held = held;
-        if self.held.is_none() {
-            // Group fully flushed; the naming prefix rolls forward.
-            if let SessionEvent::Message { message, .. } = &event {
-                if message.role == Role::Assistant {
-                    self.prefix = vec![event.clone()];
-                }
+        // The single incremental push: the folder returns exactly the
+        // rows this event lands (a boundary event flushes the open tool
+        // group first, a ToolResult joins it). A trailing ToolSummary
+        // stays open inside the folder until the next boundary — the
+        // old `held` bookkeeping, done by the shared fold.
+        for entry in self.folder.push(&event) {
+            if matches!(entry, TranscriptEntry::ToolSummary { .. }) {
+                self.committed_tools = true;
             }
-            self.reset_to_prefix();
+            commit(vm, entry.clone());
         }
         // Usage accounting: persisted Usage events are ground truth.
         if let SessionEvent::Usage { usage, .. } = event {
             vm.cumulative_usage.input_tokens += usage.input_tokens;
             vm.cumulative_usage.output_tokens += usage.output_tokens;
             vm.cumulative_usage.cached_input_tokens += usage.cached_input_tokens;
+        }
+        // Track the open group for the turn-end flush (`flush_tools`):
+        // the naming prefix rolls forward on every persisted assistant
+        // message, and ToolResults accumulate until the next boundary
+        // clears them.
+        match &event {
+            SessionEvent::ToolResult { .. } => self.open_group.push(event),
+            SessionEvent::Message { message, .. } if message.role == Role::Assistant => {
+                self.prefix = vec![event];
+                self.open_group.clear();
+            }
+            _ => self.open_group.clear(),
         }
     }
 
@@ -503,10 +541,9 @@ impl FoldState {
         };
         vm.turn_tools = self.tracker.turn_tools.clone();
         vm.subagents = self.tracker.subagents.clone();
+        self.folder.reset();
         self.prefix.clear();
-        self.pending_log.clear();
-        self.prefix_entries = 0;
-        self.held = None;
+        self.open_group.clear();
         self.committed_tools = false;
     }
 
@@ -518,10 +555,15 @@ impl FoldState {
     }
 }
 
-/// Append a committed row to history and the drain queue.
+/// Append a committed row to history and the drain queue, rendering the
+/// shared strings ONCE here (a poll clones the finished rows; it never
+/// re-runs `entry_lines`). Both stores drop their oldest rows past
+/// [`HISTORY_CAP`].
 pub(crate) fn commit(vm: &mut SessionViewModel, entry: TranscriptEntry) {
-    vm.history.push(entry.clone());
+    vm.history.push(rendered_row(&entry));
+    cap_rows(&mut vm.history);
     vm.new_entries.push(entry);
+    cap_rows(&mut vm.new_entries);
 }
 
 /// Fold a snapshot: `replay(events)` replaces the committed history in
@@ -538,9 +580,15 @@ pub(crate) fn fold_snapshot(
 ) {
     vm.session_id = Some(session_id);
     vm.last_seq = vm.last_seq.max(last_seq);
+    // Snapshot replay becomes the committed history: rendered once here,
+    // never again per poll. (The `new_entries` batch carries the typed
+    // entries for incremental shells.)
     let entries = replay(events);
-    vm.history = entries.clone();
+    let rows: Vec<RenderedRow> = entries.iter().map(rendered_row).collect();
+    vm.history = rows;
     vm.new_entries = entries;
+    cap_rows(&mut vm.history);
+    cap_rows(&mut vm.new_entries);
     fold.prefix = events
         .iter()
         .rev()
@@ -607,7 +655,7 @@ pub(crate) fn fold_turn_done(
     }
     // Servers that persist the assistant message AND send TurnDone would
     // double-commit; the identical last assistant row suppresses that.
-    let last_assistant = vm.history.iter().rev().find_map(|entry| match entry {
+    let last_assistant = vm.history.iter().rev().find_map(|row| match &row.entry {
         TranscriptEntry::Assistant { text } => Some(text.as_str()),
         _ => None,
     });
@@ -751,9 +799,65 @@ mod tests {
             fold.fold_event(&mut vm, event.clone());
         }
         fold.flush_tools(&mut vm);
-        let incremental = vm.history.clone();
+        let incremental: Vec<TranscriptEntry> =
+            vm.history.iter().map(|row| row.entry.clone()).collect();
         let whole = replay(&events);
         assert_eq!(incremental, whole, "incremental fold == one-shot replay");
+    }
+
+    #[test]
+    fn turn_end_flush_commits_an_open_tool_group() {
+        // A log ending in a run of ToolResults: replay commits the group
+        // at end-of-log; the live fold holds it open inside the folder
+        // and the turn boundary (`flush_tools`) commits the same row.
+        let events = vec![
+            SessionEvent::Task {
+                text: "edit a.rs".into(),
+            },
+            assistant_with_calls("making the change", "call-1"),
+            SessionEvent::ToolResult {
+                call_id: "call-1".into(),
+                outcome: ToolOutcome::ok("written"),
+            },
+            SessionEvent::ToolResult {
+                call_id: "call-1".into(),
+                outcome: ToolOutcome::err("boom"),
+            },
+        ];
+        let mut vm = SessionViewModel::default();
+        let mut fold = FoldState::default();
+        for event in &events {
+            fold.fold_event(&mut vm, event.clone());
+        }
+        assert!(
+            vm.history
+                .iter()
+                .all(|row| !matches!(row.entry, TranscriptEntry::ToolSummary { .. })),
+            "the trailing group stays open before the flush"
+        );
+        fold.flush_tools(&mut vm);
+        let incremental: Vec<TranscriptEntry> =
+            vm.history.iter().map(|row| row.entry.clone()).collect();
+        assert_eq!(incremental, replay(&events));
+        assert!(fold.committed_tools, "the held summary marks the commit");
+        // The next turn folds from the prefix forward: another result of
+        // the same call lands in a FRESH group (one summary), and the
+        // committed_tools guard resets with it.
+        fold.committed_tools = false;
+        fold.fold_event(
+            &mut vm,
+            SessionEvent::ToolResult {
+                call_id: "call-1".into(),
+                outcome: ToolOutcome::ok("more"),
+            },
+        );
+        fold.flush_tools(&mut vm);
+        let summaries = vm
+            .history
+            .iter()
+            .filter(|row| matches!(row.entry, TranscriptEntry::ToolSummary { .. }))
+            .count();
+        assert_eq!(summaries, 2, "each turn's group lands as one summary");
     }
 
     #[test]

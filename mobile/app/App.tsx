@@ -3,7 +3,7 @@
 // snapshot's pre-rendered strings verbatim (AGENTS.md parity contract):
 // status_line, tool lines, transcript rows, decision labels are the same
 // copy the TUI and desktop show - TSX styles them, never re-formats them.
-import { mount, signal, Text, View } from "nsh";
+import { mount, signal, computed, Text, View } from "nsh";
 import { Input, NavStack, createNavStack } from "nsh/base";
 import { Scroll } from "nsh";
 import { Remote } from "modron-remote/native";
@@ -146,10 +146,13 @@ const autoInterval = signal("");
 // API-key drafts per provider id (settings providers card).
 const keyDrafts = signal<Record<string, string>>({});
 // Settings editors: tool lists and the standing goal (drafts overlay
-// the snapshot's current values until saved).
-const allowDraft = signal("");
-const denyDraft = signal("");
-const goalDraft = signal("");
+// the snapshot's current values until saved). Null = untouched (falls
+// back to the snapshot's value); "" = the user cleared the field, which
+// saves the empty value so the server clears it (ConfigPatch carries
+// Some([]) / Some("") for exactly that).
+const allowDraft = signal<string | null>(null);
+const denyDraft = signal<string | null>(null);
+const goalDraft = signal<string | null>(null);
 // Router defaults card drafts (cheap/strong model ids).
 const cheapDraft = signal("");
 const strongDraft = signal("");
@@ -172,17 +175,30 @@ try {
 }
 
 const POLL_MS = 250;
+// The raw snapshot JSON, kept so the poll can gate on string equality:
+// a tick that receives the same bytes as the last one (the common case
+// at 4 polls/sec) re-parses nothing and notifies no consumer. Signals
+// already compare with `===` (the SignalOptions.equals default), which
+// is the string equality wanted here.
+const rawSnap = signal("");
 const poll = setInterval(() => {
-  if (!live()) return;
+  if (!live() || demo()) return;
   try {
-    // Drain incremental rows too (kept for large transcripts; the full
-    // history re-render below is fine at chat scale).
-    Remote.takeNewEntriesJson();
-    snap.set(JSON.parse(Remote.snapshotJson()) as Snapshot);
+    const json = Remote.snapshotJson();
+    if (json === rawSnap()) return;
+    applySnapshotJson(json);
   } catch {
     // between connections the snapshot is `{}`-shaped; keep the old one
   }
 }, POLL_MS);
+
+// Parse a fresh snapshot JSON into the render signal. The raw copy is
+// the poll's equality gate; keeping both in one helper means the gate
+// is never left stale by a direct set.
+function applySnapshotJson(json: string): void {
+  rawSnap.set(json);
+  snap.set(JSON.parse(json) as Snapshot);
+}
 
 const stack = createNavStack<"sessions" | "chat" | "settings">(["sessions"]);
 
@@ -230,9 +246,12 @@ async function connectAndOpen(): Promise<void> {
       // The client exists by now; never happens in practice.
     }
     demo.set(false);
-    snap.set(JSON.parse(Remote.snapshotJson()) as Snapshot);
+    applySnapshotJson(Remote.snapshotJson());
     stack.push("chat");
   } catch (e) {
+    // A failed connect must not leave live on: the poll would keep
+    // parsing the `{}`-shaped no-client snapshot over the demo view.
+    live.set(false);
     connectError.set(e instanceof Error ? e.message : String(e));
   } finally {
     busy.set(false);
@@ -277,21 +296,14 @@ function submitDraft(): void {
   }
 }
 
-// Only what this shell can execute - no invented exports. Everything
-// else in the shared table answers "unknown command" here.
-const EXECUTABLE_SLASH = new Set([
-  "new",
-  "share",
-  "settings",
-  "help",
-  "model",
-  "fork",
-  "tasks",
-  "mode",
-  "sandbox",
-  "auth",
-  "remote-control",
-]);
+// Only what this shell can execute - no invented exports. The set is
+// DERIVED from the served table (`slashCommands`, modron-view::slash):
+// this shell implements every command the shared table lists, so a
+// shared addition flows through with no hand-copied drift, and the
+// App.test.tsx drift guard pins the served table to what /help shows.
+const EXECUTABLE_SLASH = new Set(
+  slashCommands().map((command) => command.name),
+);
 
 // The suggestions above the composer: the executable slice of the shared
 // table, filtered by the word being typed (hidden once args start).
@@ -371,6 +383,10 @@ function saveKey(provider: string): void {
 function setConfig(patch: Record<string, unknown>): void {
   if (demo()) {
     const next = { ...snap() };
+    // The TSX cannot call Rust here, so this echo mirrors the canonical
+    // mapping by hand: modron_mobile_core::approval_mode_label
+    // (mobile/rust-core/src/view.rs: ApproveAll -> "yolo", Ask/None ->
+    // "ask", Deny -> "deny"). Keep the two in sync.
     if (typeof patch.approval_mode === "string") {
       next.approval_mode_label =
         patch.approval_mode === "approve_all" ? "yolo" : patch.approval_mode;
@@ -420,18 +436,22 @@ function splitList(raw: string): string[] {
 }
 
 function saveTools(): void {
+  // `??` falls back only when untouched (null): a cleared field ("")
+  // sends the empty list so the server clears the tools.
   setConfig({
-    allow: splitList(allowDraft() || snap().allow_tools.join(", ")),
-    deny: splitList(denyDraft() || snap().deny_tools.join(", ")),
+    allow: splitList(allowDraft() ?? snap().allow_tools.join(", ")),
+    deny: splitList(denyDraft() ?? snap().deny_tools.join(", ")),
   });
-  allowDraft.set("");
-  denyDraft.set("");
+  allowDraft.set(null);
+  denyDraft.set(null);
 }
 
 function saveGoal(): void {
-  const goal = (goalDraft() || snap().goal).trim();
+  // Same null-vs-"" rule: cleared sends the empty goal so the server
+  // clears it; untouched re-saves the current goal (a no-op).
+  const goal = (goalDraft() ?? snap().goal).trim();
   setConfig({ goal });
-  goalDraft.set("");
+  goalDraft.set(null);
 }
 
 // Demo gates: fork/tasks/router writes need a live server; the demo
@@ -608,10 +628,15 @@ function runSlash(raw: string): void {
 function addAutomationFromForm(): void {
   const name = autoName().trim();
   const prompt = autoPrompt().trim();
-  const minutes = Number.parseInt(autoInterval(), 10);
+  const parsed = Number.parseInt(autoInterval(), 10);
   if (name.length === 0 || prompt.length === 0) return;
+  // An empty field defaults to 60; a parsed interval must be positive
+  // (0 or a negative like "-5" is a nonsense schedule and the bridge
+  // takes a u32).
+  const minutes = Number.isNaN(parsed) ? 60 : parsed;
+  if (minutes <= 0) return;
   try {
-    Remote.addAutomation(name, prompt, Number.isNaN(minutes) ? 60 : minutes);
+    Remote.addAutomation(name, prompt, minutes);
     Remote.listAutomationsJson();
     autoName.set("");
     autoPrompt.set("");
@@ -674,11 +699,6 @@ function disconnect(): void {
   } catch (e) {
     connectError.set(e instanceof Error ? e.message : String(e));
   }
-}
-
-function backOut(): void {
-  // Parity: Esc backs out one screen.
-  stack.pop();
 }
 
 // ---- shared bits ----
@@ -832,6 +852,10 @@ function ApprovalCard(props: { approval: PendingApproval }) {
 }
 
 function ChatScreen() {
+  // The JSX below reads the suggestions twice (count gate + rows); the
+  // computed runs the filter once per draft change and both reads share
+  // the memoized list.
+  const suggestions = computed(() => slashSuggestions());
   return (
     <View class="flex-1 bg-background">
       <StatusHeader />
@@ -881,9 +905,9 @@ function ChatScreen() {
           <Text class="text-muted-foreground text-xs">{helpNote()}</Text>
         </View>
       ) : null}
-      {slashSuggestions().length > 0 ? (
+      {suggestions().length > 0 ? (
         <View class="mx-3 mb-1 gap-1">
-          {slashSuggestions().map((command) => (
+          {suggestions().map((command) => (
             <View
               role="button"
               class="flex-row items-center gap-2 rounded-(--radius) border border-border bg-card px-3 py-2 active:opacity-80"
@@ -952,9 +976,17 @@ function SessionsScreen() {
               demo.update((d) => !d);
               if (demo()) {
                 snap.set(JSON.parse(Remote.demoSnapshotJson()) as Snapshot);
-              } else if (!snap().session_id) {
-                // Not connected yet: keep rendering the demo snapshot.
+              } else if (!live()) {
+                // Not connected (or the last connect failed): there is
+                // no live snapshot to fall back to - re-arm demo so the
+                // screen keeps working. (The demo snapshot always sets
+                // session_id, so that field cannot tell the two apart.)
                 demo.set(true);
+              } else {
+                // Back to the live snapshot: reset the poll's equality
+                // gate so the next tick re-parses even if the server
+                // bytes have not changed since demo took over.
+                rawSnap.set("");
               }
             }}
           >
@@ -1225,7 +1257,7 @@ function SettingsScreen() {
           </View>
           <Input
             class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
-            value={allowDraft() || snap().allow_tools.join(", ")}
+            value={allowDraft() ?? snap().allow_tools.join(", ")}
             placeholder="allowed tools (comma separated)"
             autoCorrect={false}
             autoCapitalize="none"
@@ -1234,7 +1266,7 @@ function SettingsScreen() {
           />
           <Input
             class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
-            value={denyDraft() || snap().deny_tools.join(", ")}
+            value={denyDraft() ?? snap().deny_tools.join(", ")}
             placeholder="blocked tools (comma separated)"
             autoCorrect={false}
             autoCapitalize="none"
@@ -1250,7 +1282,7 @@ function SettingsScreen() {
           </View>
           <Input
             class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
-            value={goalDraft() || snap().goal}
+            value={goalDraft() ?? snap().goal}
             placeholder="standing goal"
             autoCorrect={false}
             autoCapitalize="none"

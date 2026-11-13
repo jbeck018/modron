@@ -58,8 +58,20 @@ async fn serve_unix_connection(stream: UnixStream, state: Arc<ServerState>) -> a
     let mut ctx = ConnCtx::new(out_tx.clone());
     let mut flow = Flow::Continue;
     while flow == Flow::Continue {
-        let Some(line) = lines.next_line().await? else {
-            break;
+        // One invalid-UTF-8 line must not kill a trusted local connection
+        // (cycle-2 audit L9): skip + warn, same posture as the TUI's pump.
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::warn!("unix socket: skipping non-UTF-8 line");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if line.len() > 16 * 1024 * 1024 {
+            tracing::warn!(bytes = line.len(), "unix socket: oversized line skipped");
+            continue;
         };
         match serde_json::from_str::<Frame>(&line) {
             Ok(frame) => flow = handle_frame(&state, &mut ctx, true, frame).await,

@@ -118,12 +118,15 @@ pub struct AppState {
     /// Incremental replay state: one event per frame, never a full pass
     /// (the full fold only runs on snapshot reset).
     folder: ReplayFolder,
-    transcript: Vec<TranscriptEntry>,
-    /// Committed rows (the presentation fold of `transcript`): maintained
-    /// incrementally per folded event so a frame never re-clones the whole
-    /// history (2026-11-12 audit perf fix; `rebuild_transcript` is the only
-    /// full pass, on snapshot reset).
+    /// Committed rows (the presentation fold of the replayed entries):
+    /// maintained incrementally per folded event so a frame never
+    /// re-clones the whole history (2026-11-12 audit perf fix;
+    /// `rebuild_transcript` is the only full pass, on snapshot reset).
     committed_rows: Vec<Row>,
+    /// Index into `committed_rows` where the LAST applied Event frame's
+    /// rows begin; [`AppState::take_new_rows`] drains from here so the
+    /// renderer splices its list incrementally instead of rebuilding.
+    last_fold_start: usize,
     /// Last model name seen by the row fold (divider chips only on change).
     last_model: Option<String>,
 
@@ -164,17 +167,6 @@ pub fn decision_label(decision: Decision) -> &'static str {
     }
 }
 
-/// Truncate to `max_chars` with an ellipsis -- the TUI's `short()` helper.
-/// (Presentation glue only; grouping/copy formats stay in modron-view.)
-pub fn short(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max_chars).collect();
-        format!("{cut}…")
-    }
-}
-
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -207,11 +199,14 @@ impl AppState {
             Payload::Event { event } => {
                 // Incremental: fold the single new event into the replay
                 // folder and the committed rows instead of replaying the
-                // whole log (2026-11-12 audit perf fix).
-                let new_entries = self.folder.push(&event).to_vec();
+                // whole log (2026-11-12 audit perf fix). `last_fold_start`
+                // marks what THIS frame added; the renderer drains it with
+                // [`Self::take_new_rows`] and splices its list.
+                let committed_before = self.committed_rows.len();
+                let folded = self.folder.push(&event).to_vec();
                 self.events.push(event);
-                self.transcript.extend(new_entries.iter().cloned());
-                for entry in &new_entries {
+                self.last_fold_start = committed_before;
+                for entry in folded {
                     self.push_entry_row(entry);
                 }
             }
@@ -259,8 +254,7 @@ impl AppState {
                 let swarm = self.tracker.take_swarm_summary();
                 if !swarm.is_empty() {
                     let entry = TranscriptEntry::Swarm { lines: swarm };
-                    self.push_entry_row(&entry);
-                    self.transcript.push(entry);
+                    self.push_entry_row(entry);
                 }
                 self.tracker.clear_turn();
             }
@@ -392,42 +386,43 @@ impl AppState {
         for event in &self.events {
             self.folder.push(event);
         }
-        self.transcript = self.folder.entries().to_vec();
         // One full fold pass; afterwards every frame extends incrementally.
         self.committed_rows.clear();
+        self.last_fold_start = 0;
         self.last_model = None;
-        let entries = std::mem::take(&mut self.transcript);
-        for entry in &entries {
+        let entries = self.folder.entries().to_vec();
+        for entry in entries {
             self.push_entry_row(entry);
         }
-        self.transcript = entries;
     }
 
     /// The presentation fold for ONE committed entry (the exact per-entry
     /// logic of the former whole-transcript `rows()` walk; parity test
-    /// `incremental_rows_match_full_fold` pins them together).
-    fn push_entry_row(&mut self, entry: &TranscriptEntry) {
+    /// `incremental_rows_match_full_fold` pins them together). Takes
+    /// ownership: the entry moves into its row instead of being cloned
+    /// (2026-11-12 audit perf fix — the Event path cloned each new entry
+    /// three times).
+    fn push_entry_row(&mut self, entry: TranscriptEntry) {
         match entry {
             TranscriptEntry::Model { model, .. } => {
                 if self.last_model.as_deref() != Some(model.as_str()) {
                     self.committed_rows.push(Row::Divider {
                         text: format!("model: {model}"),
                     });
-                    self.last_model = Some(model.clone());
+                    self.last_model = Some(model);
                 }
             }
             TranscriptEntry::Usage { .. } => {}
             TranscriptEntry::Plan { items } => {
-                self.committed_rows.push(Row::Entry(TranscriptEntry::Plan {
-                    items: items.clone(),
-                }));
+                self.committed_rows
+                    .push(Row::Entry(TranscriptEntry::Plan { items }));
             }
             TranscriptEntry::Compaction {
                 summarized_events, ..
             } => self.committed_rows.push(Row::Divider {
                 text: format!("compacted {summarized_events} earlier events"),
             }),
-            other => self.committed_rows.push(Row::Entry(other.clone())),
+            other => self.committed_rows.push(Row::Entry(other)),
         }
     }
 
@@ -479,6 +474,18 @@ impl AppState {
     /// them instead of re-cloning the history per frame.
     pub fn committed_rows(&self) -> &[Row] {
         &self.committed_rows
+    }
+
+    /// The rows the LAST applied Event frame added to the committed rows,
+    /// draining the marker (a second call returns nothing until the next
+    /// Event frame). The renderer consumes this right after
+    /// [`Self::apply_frame`] to splice its list incrementally — O(new
+    /// rows), not the former O(n) rebuild per persisted event. Snapshot
+    /// and turn-boundary frames rebuild the display wholesale instead.
+    pub fn take_new_rows(&mut self) -> Vec<Row> {
+        let new_rows = self.committed_rows[self.last_fold_start..].to_vec();
+        self.last_fold_start = self.committed_rows.len();
+        new_rows
     }
 
     /// The live tail rows (opted-in reasoning + the typewriter streaming
@@ -573,7 +580,7 @@ impl AppState {
         Some(format!(
             "⚠ allow {} {}?",
             pending.call.name,
-            short(&pending.call.arguments.to_string(), 80)
+            modron_view::short(&pending.call.arguments.to_string(), 80)
         ))
     }
 
@@ -594,12 +601,8 @@ impl AppState {
             parts.push(self.provider.clone());
         }
         parts.push(format!("{} tok", self.cumulative.total()));
-        let cache_denom = self.cumulative.input_tokens + self.cumulative.cached_input_tokens;
-        if cache_denom > 0 {
-            parts.push(format!(
-                "cache {:.0}%",
-                100.0 * self.cumulative.cached_input_tokens as f64 / cache_denom as f64
-            ));
+        if let Some(pct) = modron_view::cache_hit_pct(&self.cumulative) {
+            parts.push(format!("cache {pct:.0}%"));
         }
         parts.push(self.approval_mode.clone());
         parts.push(format!("turns {}", self.turn_count));
@@ -614,7 +617,7 @@ impl AppState {
             parts.push("idle".to_string());
         }
         if !self.goal.is_empty() {
-            parts.push(format!("goal: {}", short(&self.goal, 40)));
+            parts.push(format!("goal: {}", modron_view::short(&self.goal, 40)));
         }
         parts.join(" · ")
     }
@@ -654,13 +657,14 @@ pub fn approval_mode_label(mode: ApprovalModeWire) -> &'static str {
     }
 }
 
-/// The `SetConfig` patch for a model switch: the model pins AND the
-/// provider follows (parity with the TUI's /model), resolved from the
-/// same shared catalog the TUI uses ([`modron_router::lookup`]).
+/// The `SetConfig` patch for a model switch: model-only. The server's
+/// hub follows the provider through the shared catalog (mobile and the
+/// TUI's remote control already send model-only patches); pinning it
+/// client-side was a stale duplicate of the server's
+/// [`modron_router::lookup`] (2026-11-12 audit DRY fix).
 pub fn model_patch(model: &str) -> ConfigPatch {
     ConfigPatch {
         model: Some(model.to_string()),
-        provider: modron_router::lookup(model).map(|m| m.provider.clone()),
         ..ConfigPatch::default()
     }
 }
@@ -1172,12 +1176,59 @@ mod tests {
     }
 
     #[test]
-    fn model_patch_follows_the_provider() {
-        // /model parity: the patch carries model AND provider, from the
-        // same shared catalog the TUI consults.
+    fn model_patch_is_model_only() {
+        // DELIBERATE change (2026-11-12 audit DRY fix): the patch no
+        // longer pins the provider client-side — the server's hub follows
+        // the provider through the catalog (mobile and TUI-remote already
+        // send model-only). The demo echo test pins the server filling it
+        // back in on ConfigChanged.
         let patch = model_patch("claude-haiku-5-5");
         assert_eq!(patch.model.as_deref(), Some("claude-haiku-5-5"));
-        assert_eq!(patch.provider.as_deref(), Some("anthropic"));
+        assert_eq!(patch.provider, None);
+    }
+
+    #[test]
+    fn take_new_rows_drains_the_last_frames_rows() {
+        let mut s = AppState::new();
+        s.apply_frame(event_frame(
+            1,
+            Payload::Event {
+                event: SessionEvent::Task { text: "hi".into() },
+            },
+        ));
+        let fresh = s.take_new_rows();
+        assert_eq!(fresh.len(), 1, "the task row is this frame's delta");
+        assert!(s.take_new_rows().is_empty(), "drained after the first call");
+        // A ToolResult accumulates: zero rows until a boundary event
+        // flushes the tool summary.
+        s.apply_frame(event_frame(
+            2,
+            Payload::Event {
+                event: SessionEvent::ToolResult {
+                    call_id: "c1".into(),
+                    outcome: ToolOutcome::ok("x"),
+                },
+            },
+        ));
+        assert!(
+            s.take_new_rows().is_empty(),
+            "tool results ride the summary"
+        );
+        s.apply_frame(event_frame(
+            3,
+            Payload::Event {
+                event: SessionEvent::Message {
+                    parent_id: None,
+                    message: Message::assistant("done"),
+                },
+            },
+        ));
+        let rows = s.take_new_rows();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the boundary flushes the tool summary + the assistant row"
+        );
     }
 
     #[test]
@@ -1335,7 +1386,10 @@ mod tests {
 
     #[test]
     fn truncated_args_get_an_ellipsis() {
-        assert_eq!(short("abcde", 5), "abcde");
-        assert_eq!(short("abcdefgh", 4), "abcd…");
+        // The desktop consumed the shared modron_view::short (the local
+        // byte-identical copy dropped, 2026-11-12 audit DRY fix); the
+        // projection parity stays pinned here.
+        assert_eq!(modron_view::short("abcde", 5), "abcde");
+        assert_eq!(modron_view::short("abcdefgh", 4), "abcd…");
     }
 }

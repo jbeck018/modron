@@ -25,7 +25,7 @@ pub const PROVIDER_ID: &str = "anthropic";
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-use crate::http::build_client;
+use crate::http::{build_client, check_status, finish_json, with_401_retry};
 
 /// Anthropic Messages API client.
 pub struct AnthropicProvider {
@@ -109,21 +109,15 @@ impl AnthropicProvider {
 
     /// Send one `/v1/messages` request with the mode's headers; a 401 in
     /// subscription mode triggers one refresh-and-retry (refresh tokens
-    /// rotate — the new pair is persisted before the retry). A failed
-    /// refresh does not mask the original 401: the server's diagnostic is
-    /// what the caller needs to see (revoked token, expired grant).
+    /// rotate — the new pair is persisted before the retry). The cycle is
+    /// the shared [`with_401_retry`] helper (the openai-responses provider
+    /// shipped the same twin; 2026-11-12 audit DRY fix).
     async fn post_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
-        let mut response = self.send_messages(url, body).await?;
-        if response.status().as_u16() == 401 {
-            match self.refresh_if_possible().await {
-                Ok(true) => response = self.send_messages(url, body).await?,
-                Ok(false) => {}
-                Err(refresh_err) => {
-                    tracing::warn!("{refresh_err:#} — surfacing the original 401");
-                }
-            }
-        }
-        Ok(response)
+        with_401_retry(
+            || self.send_messages(url, body),
+            || self.refresh_if_possible(),
+        )
+        .await
     }
 
     async fn send_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
@@ -254,15 +248,9 @@ impl AnthropicProvider {
         );
 
         let response = self.post_messages(&url, &body).await?;
-        let status = response.status();
-        if !status.is_success() {
-            // Streaming failures arrive as a plain (non-SSE) error body.
-            let text = response
-                .text()
-                .await
-                .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-            return Err(crate::http_error(PROVIDER_ID, status, &text));
-        }
+        // Streaming failures arrive as a plain (non-SSE) error body; the
+        // shared status check maps them to the canonical error text.
+        let response = check_status(PROVIDER_ID, response).await?;
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut byte_stream = response.bytes_stream();
@@ -808,19 +796,9 @@ impl ModelProvider for AnthropicProvider {
         );
 
         let response = self.post_messages(&url, &body).await?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-        if !status.is_success() {
-            return Err(crate::http_error(PROVIDER_ID, status, &text));
-        }
-
-        let value: Value = serde_json::from_str(&text).map_err(|err| Error::Provider {
-            provider: PROVIDER_ID.into(),
-            message: format!("malformed response: {err}"),
-        })?;
+        // Text + status-check + parse tail is the shared [`finish_json`]
+        // (the 401 retry already ran inside post_messages).
+        let value = finish_json(PROVIDER_ID, response).await?;
         let parsed = parse_response(value)?;
         tracing::debug!(
             provider = PROVIDER_ID,

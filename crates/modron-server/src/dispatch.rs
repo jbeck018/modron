@@ -40,6 +40,10 @@ pub struct ServerState {
     /// Session -> share key (minted by /remote-control; used to auth
     /// page publishes).
     pub rc_keys: std::sync::Mutex<HashMap<SessionId, String>>,
+    /// Session -> the live tunnel's abort handle: re-registration aborts
+    /// the previous tunnel instead of stacking duplicate pumpers
+    /// (2026-11-12 cycle-2 audit L7).
+    pub rc_tunnels: std::sync::Mutex<HashMap<SessionId, tokio::task::AbortHandle>>,
 }
 
 /// The live frames of one subscription: the broadcast->buffer forwarder
@@ -1003,11 +1007,21 @@ async fn submit(
         Some(id) => {
             // Known session: resume when the log has events; adopt (pinned
             // run) when it is an empty shell from `new_session`. An unknown
-            // id is an error, never a silent new session.
-            let events = match state.store.load(id).await {
-                Ok(events) => events,
+            // id is an error, never a silent new session. event_count, not
+            // load: this runs per submit, and the engine re-loads the log
+            // itself for the resume - parsing it here too was O(log) twice
+            // (cycle-2 audit H6).
+            let event_count = match state.store.event_count(id).await {
+                Ok(count) => count,
                 Err(e) => {
-                    send(ctx, error(request_id, format!("no such session {id}: {e}")));
+                    send(
+                        ctx,
+                        error_kind(
+                            request_id,
+                            format!("no such session {id}: {e}"),
+                            modron_protocol::ErrorKind::NotFound,
+                        ),
+                    );
                     return;
                 }
             };
@@ -1015,7 +1029,7 @@ async fn submit(
             let engine = handle.engine_cell().clone();
             let goal = handle_goal(&handle);
             let full_task = task_with_goal(&goal, &task);
-            let run: RunFuture = if events.is_empty() {
+            let run: RunFuture = if event_count == 0 {
                 let task = full_task;
                 Box::pin(async move { engine.run_task_with_attachments(&task, attachments).await })
             } else {
@@ -1064,8 +1078,9 @@ async fn attach(
         Some(handle) => handle,
         None => {
             // Known on disk? Unknown ids stay an error even though ensure
-            // would happily fabricate a handle.
-            match state.store.load(session_id).await {
+            // would happily fabricate a handle. event_count: cheap probe,
+            // no full parse (cycle-2 audit H6).
+            match state.store.event_count(session_id).await {
                 Ok(_) => {}
                 Err(e) => {
                     send(
@@ -1081,7 +1096,7 @@ async fn attach(
 
     // 1. Subscribe BEFORE loading anything, buffering live frames.
     let rx = handle.subscribe();
-    let (buf_tx, buf_rx) = mpsc::unbounded_channel::<Outbound>();
+    let (buf_tx, mut buf_rx) = mpsc::unbounded_channel::<Outbound>();
     let forward = tokio::spawn(async move {
         let mut rx = rx;
         loop {
@@ -1091,8 +1106,22 @@ async fn attach(
                         break;
                     }
                 }
+                // A lagged receiver silently skipped frames forever -
+                // deltas would garble and events left holes with no
+                // client-visible signal (cycle-2 audit M8). End the
+                // subscription and tell the client to re-attach (its
+                // re-attach replays from the authoritative store).
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "client lagged the session stream");
+                    tracing::warn!(skipped = n, "client lagged the session stream - detaching");
+                    let _ = buf_tx.send(Outbound::Reply(Box::new(Frame::event(
+                        None,
+                        0,
+                        Payload::Error {
+                            message: "live stream lagged - re-attach to resync".into(),
+                            kind: Some(modron_protocol::ErrorKind::Conflict),
+                        },
+                    ))));
+                    break;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -1108,13 +1137,23 @@ async fn attach(
             return;
         }
     };
+    // Events whose seq is at or below this watermark were published
+    // BEFORE the load read the disk - they are already in the snapshot.
+    // Their buffered frames must be dropped or every client double-folds
+    // them (the doc claimed seq dedupe happened client-side; it never
+    // did - cycle-2 audit M1). Publishes for a session are serialized by
+    // its append lock, so seq order == persist order.
+    let persisted_through = handle.current_seq();
+    // One watermark read: two reads could straddle a publish and put a
+    // frame's seq above the snapshot's last_seq (cycle-2 audit L9).
+    let watermark = handle.current_seq();
     let snapshot = Frame {
         id: request_id,
         session: Some(session_id),
-        seq: handle.current_seq(),
+        seq: watermark,
         payload: Payload::Snapshot {
             session_id,
-            last_seq: handle.current_seq(),
+            last_seq: watermark,
             events,
             live: handle.live_state(),
         },
@@ -1124,12 +1163,19 @@ async fn attach(
         return;
     }
 
-    // 3. Forward the buffered live frames (clients dedupe by seq).
+    // 3. Forward the buffered live frames, dropping the duplicated
+    // prefix: frames at or below persisted_through are already inside
+    // the snapshot (cycle-2 audit M1 - the doc claimed clients deduped
+    // by seq; none ever did).
     let out = ctx.out.clone();
     let pump = tokio::spawn(async move {
-        let mut buf_rx = buf_rx;
-        while let Some(frame) = buf_rx.recv().await {
-            if out.send(frame).is_err() {
+        while let Some(outbound) = buf_rx.recv().await {
+            if let Outbound::Live(live) = &outbound {
+                if live.seq <= persisted_through {
+                    continue;
+                }
+            }
+            if out.send(outbound).is_err() {
                 break;
             }
         }

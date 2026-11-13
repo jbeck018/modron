@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use modron_core::SessionEvent;
 use modron_protocol::AutomationWire;
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +48,13 @@ pub fn save(state: &ServerState, automations: &[Automation]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(automations)?)?;
+    // Write-then-rename: a torn truncate-in-place write would be silently
+    // swallowed by load's unwrap_or_default and PERMANENTLY wipe the
+    // registry (cycle-2 audit L3; the session store has had this since
+    // phase 1).
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(automations)?)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -122,15 +127,10 @@ pub fn spawn_scheduler(state: Arc<ServerState>) {
 /// run in the registry.
 async fn fire(state: &Arc<ServerState>, automation: &Automation) -> Result<()> {
     let meta = state.store.create_session(&automation.name).await?;
-    state
-        .store
-        .append(
-            meta.id,
-            &SessionEvent::Task {
-                text: automation.prompt.clone(),
-            },
-        )
-        .await?;
+    // NO pre-appended Task event: run_task_with_attachments appends its own,
+    // so the old pre-append duplicated the prompt in every automation
+    // transcript (dispatch's adoption path never pre-appends either;
+    // cycle-2 audit L3).
     let handle = state.hub.ensure_session(meta.id, Some(meta.id));
     let engine = handle.engine_cell().clone();
     // Scheduler runs carry no frame sinks; results persist in the store.

@@ -34,13 +34,17 @@ async fn read_capped_line(
     cap: usize,
 ) -> anyhow::Result<usize> {
     let mut total = 0usize;
+    let mut hit_newline = false;
+    // Raw-byte accumulation across fill_buf chunks: decoding per chunk
+    // corrupted a multibyte char straddling the buffer boundary into
+    // U+FFFDs (cycle-2 audit L2). One lossy decode of the whole line.
+    let mut raw: Vec<u8> = Vec::with_capacity(256);
     loop {
         let buf = reader.fill_buf().await?;
         if buf.is_empty() {
-            return Ok(total); // EOF
+            break; // EOF
         }
         let mut consumed = 0;
-        let mut hit_newline = false;
         for &b in buf {
             if total >= cap {
                 return Err(anyhow::anyhow!(
@@ -54,16 +58,18 @@ async fn read_capped_line(
             consumed += 1;
             total += 1;
         }
-        line.push_str(&String::from_utf8_lossy(&buf[..consumed]));
+        raw.extend_from_slice(&buf[..consumed]);
         // Consume the newline TOO: leaving it buffered makes every later
         // call return an instantly-empty line without consuming anything —
         // a busy loop (read_line parity: it consumes the newline).
         if hit_newline {
             reader.consume(consumed + 1);
-            return Ok(total + 1);
+            break;
         }
         reader.consume(consumed);
     }
+    line.push_str(&String::from_utf8_lossy(&raw));
+    Ok(total + u64::from(hit_newline) as usize)
 }
 
 /// Metadata for one tool a server exposes.
@@ -339,12 +345,24 @@ impl McpServerHandle {
         tool: &str,
         arguments: Value,
     ) -> anyhow::Result<McpCallResult> {
-        let result = tokio::time::timeout(
+        let result = match tokio::time::timeout(
             self.timeout,
             self.request("tools/call", json!({"name": tool, "arguments": arguments})),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("tools/call timed out"))??;
+        {
+            Ok(inner) => inner?,
+            // The outer timeout can fire before the inner per-read deadline
+            // (it starts before `send`): dropping request mid-read leaves
+            // the BufReader mid-line. Mark the handle unusable or the next
+            // call reads a torn tail (cycle-2 audit M7).
+            Err(_) => {
+                self.poisoned = true;
+                return Err(anyhow::anyhow!(
+                    "tools/call timed out (connection marked unusable)"
+                ));
+            }
+        };
         // MCP result shape: {content: [{type: "text", text}], isError?}.
         let mut text = String::new();
         let is_error = result

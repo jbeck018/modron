@@ -26,7 +26,7 @@ use tokio::sync::mpsc::UnboundedSender;
 /// ChatGPT (subscription) provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "chatgpt";
 
-use crate::http::build_client;
+use crate::http::{build_client, check_status, with_401_retry};
 const DONE_SENTINEL: &str = "[DONE]";
 
 /// Live credentials behind a lock: a successful refresh swaps them in
@@ -107,14 +107,9 @@ impl OpenAiResponsesProvider {
         let url = self.base_url.trim_end_matches('/').to_string();
         let body = build_body(req);
         let response = self.post(&url, &body).await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response
-                .text()
-                .await
-                .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-            return Err(crate::http_error(PROVIDER_ID, status, &text));
-        }
+        // Streaming failures arrive as a plain (non-SSE) error body; the
+        // shared status check maps them to the canonical error text.
+        let response = check_status(PROVIDER_ID, response).await?;
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut byte_stream = response.bytes_stream();
@@ -138,20 +133,10 @@ impl OpenAiResponsesProvider {
     }
 
     /// POST with the stored bearer; a 401 triggers one single-flight
-    /// refresh-and-retry. A failed refresh does not mask the original 401 —
-    /// the backend's diagnostic is what the caller needs to see.
+    /// refresh-and-retry via the shared [`with_401_retry`] (anthropic
+    /// shipped the same twin; 2026-11-12 audit DRY fix).
     async fn post(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
-        let mut response = self.send(url, body).await?;
-        if response.status().as_u16() == 401 {
-            match self.refresh_if_possible().await {
-                Ok(true) => response = self.send(url, body).await?,
-                Ok(false) => {}
-                Err(refresh_err) => {
-                    tracing::warn!("{refresh_err:#} — surfacing the original 401");
-                }
-            }
-        }
-        Ok(response)
+        with_401_retry(|| self.send(url, body), || self.refresh_if_possible()).await
     }
 
     async fn send(&self, url: &str, body: &Value) -> Result<reqwest::Response> {

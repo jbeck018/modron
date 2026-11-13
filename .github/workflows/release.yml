@@ -8,8 +8,24 @@ permissions:
   contents: write
 
 jobs:
+  # Publish gate: the offline suite (mock provider is the acceptance
+  # harness) must pass before any binary is built or published.
+  test:
+    name: offline tests (release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-gate
+      - name: Tests (offline — the mock provider is the acceptance harness)
+        run: cargo test --workspace --exclude modron-desktop
+
   build:
     name: build ${{ matrix.target }}
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +39,7 @@ jobs:
             target: aarch64-apple-darwin
             archive_os: apple-darwin
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -31,17 +48,51 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+      # -p modron-cli: ship the CLI, not the desktop crate (macOS-only gpui).
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p modron-cli
       - name: Package (modron-<arch>-<os>.tar.gz with a `modron` binary)
         run: |
           mkdir -p stage
           cp "target/${{ matrix.target }}/release/modron" stage/modron
           ARCHIVE="modron-${{ matrix.target }}.tar.gz"
           tar -czf "$ARCHIVE" -C stage modron
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          cat "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
-      - name: Create release and upload archive
+      - name: Create release and upload archive + per-archive sha256
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ARCHIVE }}
+          files: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
           generate_release_notes: true
+
+  # Combined checksum manifest over the finished release's archives,
+  # uploaded both as a workflow artifact and onto the release itself.
+  checksums:
+    name: SHA256SUMS manifest
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download release archives
+        run: |
+          mkdir -p assets
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'modron-*.tar.gz' \
+            --dir assets
+      - name: Generate SHA256SUMS
+        run: |
+          cd assets
+          shasum -a 256 modron-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: assets/SHA256SUMS
+      - name: Attach SHA256SUMS to the release
+        run: gh release upload "$GITHUB_REF_NAME" assets/SHA256SUMS --clobber

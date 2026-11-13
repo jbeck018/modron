@@ -272,6 +272,15 @@ pub trait SessionStore: Send + Sync {
         }
         Ok(new)
     }
+    /// Append many events under ONE meta write (fork of a large session:
+    /// per-event appends meant O(n) tiny meta rewrites - cycle-2 audit
+    /// H5). Default: loop [`Self::append`].
+    async fn append_batch(&self, id: SessionId, events: &[SessionEvent]) -> Result<()> {
+        for event in events {
+            self.append(id, event).await?;
+        }
+        Ok(())
+    }
     /// Number of parsed events in a session, cheaply. Default: a full
     /// `load` (correct everywhere). Stores with an on-disk log override
     /// this when callers ask repeatedly — the engine's checkpoint path

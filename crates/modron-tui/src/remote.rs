@@ -268,7 +268,11 @@ impl RemoteClient {
             tokio::select! {
                 _ = &mut deadline => bail!("attach timeout waiting for snapshot"),
                 frame = self.frames.recv() => match frame {
+                    // Correlate by REQUEST id and session: two overlapping
+                    // attaches (session switch mid-snapshot) must not adopt
+                    // each other's snapshot (cycle-2 audit L6).
                     Some(Frame {
+                        id: Some(frame_id),
                         payload:
                             Payload::Snapshot {
                                 session_id,
@@ -277,7 +281,7 @@ impl RemoteClient {
                                 live,
                             },
                         ..
-                    }) => {
+                    }) if frame_id == id && session_id == session => {
                         return Ok(AttachSnapshot {
                             session_id,
                             last_seq,

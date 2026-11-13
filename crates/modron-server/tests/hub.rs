@@ -275,7 +275,17 @@ async fn interrupt_unblocks_a_parked_approver_and_aborts_the_run() {
         .await
         .unwrap()
         .unwrap());
-    // The terminal frame is TurnAborted, published exactly once.
+    // The drained gate's Deny resolution lands BEFORE the abort (a client
+    // must never render a phantom approval for an already-dead run - the
+    // 2026-11-12 cycle-2 M3 fix), then TurnAborted exactly once.
+    let resolved = parse_live(rx.recv().await.unwrap());
+    assert!(matches!(
+        resolved.payload,
+        Payload::ApprovalResolved {
+            decision: Decision::Deny,
+            ..
+        }
+    ));
     let frame = parse_live(rx.recv().await.unwrap());
     assert!(matches!(frame.payload, Payload::TurnAborted {}));
     assert!(!handle.interrupt(), "second interrupt finds no active run");

@@ -117,7 +117,17 @@ impl SpeculativeDriver {
     /// outcomes, never placeholders, because every execution was joined
     /// before the drain.
     pub(crate) async fn shutdown(self) -> HashMap<String, ToolOutcome> {
-        let in_flight = self.pump.await.unwrap_or_default();
+        // A panicking pump must not silently discard in-flight handles: they
+        // would keep running detached while drain() hands out placeholders
+        // (cycle-2 audit M6; the empty placeholder is treated as a miss by
+        // dispatch_tool_call, so the real tool re-executes).
+        let in_flight = match self.pump.await {
+            Ok(handles) => handles,
+            Err(err) => {
+                tracing::warn!(error = %err, "speculative pump panicked - its in-flight tools were lost");
+                Vec::new()
+            }
+        };
         for handle in in_flight {
             let _ = handle.await;
         }

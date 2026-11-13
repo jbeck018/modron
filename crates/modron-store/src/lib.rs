@@ -109,6 +109,13 @@ impl Inner {
         let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        // FD ceiling: handles accumulate for every session ever appended
+        // to; a long-lived daemon (automations mint a session per fire)
+        // would exhaust the default 256-FD limit (cycle-2 audit H11).
+        // Dropping a handle only costs a reopen on the next append.
+        if !caches.handles.contains_key(&id) && caches.handles.len() >= 64 {
+            caches.handles.clear();
+        }
         // Reuse the cached handle; opening fresh only on the first append
         // (or after a delete). NotFound maps to the documented
         // unknown-session error.
@@ -141,8 +148,18 @@ impl Inner {
         drop(caches);
 
         // Mirror the append into the meta file (updated_at + message count),
-        // via the in-memory mirror instead of a fresh read+parse.
+        // via the in-memory mirror instead of re-parsing anything big.
+        // The mirror is merged with the on-disk meta first: another
+        // process (`modron --resume` in a second terminal) may have
+        // appended since our cache was written - writing the cache back
+        // verbatim would REGRESS its message_count (cycle-2 audit M5).
         let mut meta = self.meta_for(id)?;
+        if let Ok(disk) = self.read_meta(id) {
+            meta.message_count = meta.message_count.max(disk.message_count);
+            if disk.updated_at > meta.updated_at {
+                meta.updated_at = disk.updated_at;
+            }
+        }
         meta.updated_at = chrono::Utc::now();
         if meta_bump {
             meta.message_count = meta.message_count.saturating_add(1);
@@ -189,6 +206,11 @@ impl Inner {
     }
 
     fn load_sync(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
+        // Same per-session lock the append holds: a concurrent append's
+        // two-syscall writeln could otherwise be observed mid-line
+        // (cycle-2 audit M4).
+        let guard = self.session_lock(id);
+        let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.jsonl_path(id);
         // Read bytes and decode per-line lossily: a torn multibyte write
         // must not fail the whole load — the documented contract is that a
@@ -226,14 +248,87 @@ impl Inner {
         {
             return Ok(*count);
         }
-        // Seed: one full parse, then O(1) forever (appends bump the seed).
+        // Seed under the session lock (load_sync takes it): an append
+        // between the seed-read and the cache insert would be counted
+        // twice - once by the read, once by the append's counter bump -
+        // and checkpoint indexes would drift by one (cycle-2 audit M4).
         let count = self.load_sync(id)?.len() as u64;
+        let guard = self.session_lock(id);
+        let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
         self.caches
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .counts
             .insert(id, count);
         Ok(count)
+    }
+
+    fn append_batch_sync(&self, id: SessionId, lines: &[String], meta_bumps: usize) -> Result<()> {
+        self.ensure_root()?;
+        let guard = self.session_lock(id);
+        let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        if !caches.handles.contains_key(&id) && caches.handles.len() >= 64 {
+            caches.handles.clear();
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = caches.handles.entry(id) {
+            let file = OpenOptions::new()
+                .append(true)
+                .open(self.jsonl_path(id))
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        Error::Session(format!(
+                            "unknown session {id}: no transcript at {}",
+                            self.jsonl_path(id).display()
+                        ))
+                    } else {
+                        Error::Session(format!(
+                            "could not open {}: {e}",
+                            self.jsonl_path(id).display()
+                        ))
+                    }
+                })?;
+            entry.insert(file);
+        }
+        {
+            let file = caches.handles.get_mut(&id).expect("handle inserted above");
+            let mut buffer = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+            for line in lines {
+                buffer.push_str(line);
+                buffer.push('\n');
+            }
+            file.write_all(buffer.as_bytes()).map_err(|e| {
+                Error::Session(format!(
+                    "could not append to {}: {e}",
+                    self.jsonl_path(id).display()
+                ))
+            })?;
+        }
+        drop(caches);
+
+        // ONE meta write for the whole batch (fork of 5k events: was 5k
+        // pretty-serializations + ~15k syscalls).
+        let mut meta = self.meta_for(id)?;
+        if let Ok(disk) = self.read_meta(id) {
+            meta.message_count = meta.message_count.max(disk.message_count);
+            if disk.updated_at > meta.updated_at {
+                meta.updated_at = disk.updated_at;
+            }
+        }
+        meta.updated_at = chrono::Utc::now();
+        meta.message_count = meta.message_count.saturating_add(meta_bumps as u32);
+        self.write_meta(&meta)?;
+        self.caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .metas
+            .insert(id, meta);
+        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = caches.counts.get_mut(&id) {
+            *count += lines.len() as u64;
+        }
+        Ok(())
     }
 
     fn delete_sync(&self, id: SessionId) -> Result<bool> {
@@ -378,6 +473,27 @@ impl SessionStore for JsonlSessionStore {
     async fn delete(&self, id: SessionId) -> Result<bool> {
         self.block(move |inner| inner.delete_sync(id)).await
     }
+
+    async fn append_batch(&self, id: SessionId, events: &[SessionEvent]) -> Result<()> {
+        // Serialize on the async side; ONE blocking pass writes all lines
+        // and one meta rewrite.
+        let mut lines = Vec::with_capacity(events.len());
+        let mut meta_bumps = 0usize;
+        for event in events {
+            lines.push(
+                serde_json::to_string(event)
+                    .map_err(|e| Error::Session(format!("could not serialize event: {e}")))?,
+            );
+            if matches!(
+                event,
+                SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
+            ) {
+                meta_bumps += 1;
+            }
+        }
+        self.block(move |inner| inner.append_batch_sync(id, &lines, meta_bumps))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +617,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.event_count(meta2.id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_merges_external_meta_writers_instead_of_regressing() {
+        // A second store instance (the CLI resuming in another terminal)
+        // appends between our appends: the mirror must adopt its count,
+        // not write the stale cached one back over it (cycle-2 audit M5).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let ours = JsonlSessionStore::new(&root);
+        let theirs = JsonlSessionStore::new(&root);
+        let meta = ours.create_session("shared").await.unwrap();
+        let user = || SessionEvent::Message {
+            parent_id: None,
+            message: Message::user("x"),
+        };
+        ours.append(meta.id, &user()).await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        theirs.append(meta.id, &user()).await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ours.append(meta.id, &user()).await.unwrap();
+
+        let listed = ours.list().await.unwrap();
+        assert_eq!(
+            listed[0].message_count, 3,
+            "external append counted, not clobbered"
+        );
+        assert_eq!(
+            theirs.list().await.unwrap()[0].message_count,
+            3,
+            "both instances agree with disk"
+        );
     }
 
     #[tokio::test]

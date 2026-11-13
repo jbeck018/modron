@@ -2021,7 +2021,11 @@ async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Res
         anyhow::bail!("session {id} has no events — nothing to restart");
     }
     let marker = sessions_dir.join(format!("{id}.rewind"));
-    std::fs::write(&marker, events.len().to_string())
+    // Marker semantics (engine resume): events FROM the index onward are
+    // abandoned - context is events[..cut]. `0` therefore means "fresh
+    // context, full history on disk" - writing events.len() here made
+    // restart a semantic no-op (cycle-2 audit H2).
+    std::fs::write(&marker, "0")
         .map_err(|err| anyhow::anyhow!("cannot write restart marker: {err}"))?;
     println!(
         "session {id} restarted: {} events kept on disk, context starts fresh on the next --resume",

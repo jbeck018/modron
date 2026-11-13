@@ -241,7 +241,16 @@ impl Engine {
         // Rewind support (C2): when `resume_from_event` is set, events after
         // that index stay in the append-only log but never re-enter context.
         let reconstruct_from = match self.config.resume_from_event {
-            Some(cut) => &events[..(cut as usize).min(events.len())],
+            Some(cut) => {
+                let sliced = &events[..(cut as usize).min(events.len())];
+                // The cut lands before the abandoned tool results, so the
+                // slice can end with an assistant message whose tool_calls
+                // have no answers. Both provider APIs reject a tool_use
+                // without its tool_result: prune the orphaned tail
+                // (2026-11-12 cycle-2 audit H1 - every post-rewind resume
+                // 400'd on the first turn).
+                prune_unanswered_tool_calls(sliced)
+            }
             None => &events[..],
         };
         let mut transcript =
@@ -1611,8 +1620,15 @@ impl Engine {
             && !self.config.approvals.deny.iter().any(|d| d == &call.name)
         {
             if let Some(outcome) = speculative.get(&speculative::speculative_key(call)) {
-                tracing::info!(tool = %call.name, "speculative hit: reuse mid-stream result");
-                return outcome.clone();
+                // The empty error is the driver's placeholder: a task that
+                // panicked before overwriting it must NOT feed the model an
+                // empty tool result - fall through and execute for real
+                // (cycle-2 audit M6).
+                if !(outcome.is_error && outcome.content.is_empty()) {
+                    tracing::info!(tool = %call.name, "speculative hit: reuse mid-stream result");
+                    return outcome.clone();
+                }
+                tracing::warn!(tool = %call.name, "speculative placeholder left by a panicked task - re-executing");
             }
         }
         self.execute_tool_with_hooks(session_id, call, ctx)
@@ -1788,6 +1804,26 @@ fn prompt_wire_hash(system: &str, tools: &[ToolSpec]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Drop trailing assistant messages whose tool_calls were abandoned by
+/// the rewind cut (their results live after the cut and never re-enter
+/// context). An assistant message with NO tool_calls stops the walk.
+fn prune_unanswered_tool_calls(events: &[SessionEvent]) -> &[SessionEvent] {
+    let mut end = events.len();
+    while end > 0 {
+        match &events[end - 1] {
+            // Checkpoints around the cut carry no context - skip them.
+            SessionEvent::Checkpoint { .. } => end -= 1,
+            SessionEvent::Message { message, .. }
+                if message.role == Role::Assistant && !message.tool_calls.is_empty() =>
+            {
+                end -= 1;
+            }
+            _ => break,
+        }
+    }
+    &events[..end]
+}
+
 fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) -> Vec<Message> {
     let mut messages = Vec::new();
     for event in events {
@@ -1916,6 +1952,19 @@ fn estimate_context_tokens(system: &str, tools: &[ToolSpec], messages: &[Message
     }
     for message in messages {
         tokens += estimate_tokens(&message.content);
+        // Attachments ride the first user message as base64 blocks; the
+        // pre-flight budget check must see them or a big image spend goes
+        // unaccounted until the provider rejects the request (cycle-2 L5).
+        for attachment in &message.attachments {
+            match attachment {
+                crate::Attachment::Image { data, .. } => {
+                    tokens += (data.len() as u64).div_ceil(4);
+                }
+                crate::Attachment::Document { text, .. } => {
+                    tokens += estimate_tokens(text);
+                }
+            }
+        }
         for call in &message.tool_calls {
             // Serialized-size estimate WITHOUT building the JSON string:
             // the per-turn pass walks every historical call, and the
@@ -1953,6 +2002,54 @@ mod tests {
     use crate::{EngineConfig, Tool, ToolOutcome, ToolRegistry, TurnResponse};
     use async_trait::async_trait;
     use serde_json::json;
+
+    #[test]
+    fn prune_unanswered_tool_calls_trims_the_orphaned_rewind_tail() {
+        use crate::ToolOutcome;
+        let mut assistant_with_call = Message::assistant("reading the file");
+        assistant_with_call.tool_calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        }];
+        let events = vec![
+            SessionEvent::Task { text: "t".into() },
+            SessionEvent::Message {
+                parent_id: None,
+                message: assistant_with_call,
+            },
+            SessionEvent::Checkpoint {
+                path: "f".into(),
+                prior_content_b64: None,
+                event_index: 3,
+            },
+            SessionEvent::ToolResult {
+                call_id: "c1".into(),
+                outcome: ToolOutcome::ok("contents"),
+            },
+        ];
+        // The rewind cut is at the checkpoint index: the slice keeps
+        // [task, assistant(c1), checkpoint] - the trailing orphan must go.
+        let pruned = prune_unanswered_tool_calls(&events[..3]);
+        assert_eq!(pruned.len(), 1, "assistant(c1)+checkpoint pruned");
+        assert!(matches!(&pruned[0], SessionEvent::Task { .. }));
+
+        // An answered run (full log) is untouched.
+        assert_eq!(prune_unanswered_tool_calls(&events).len(), events.len());
+
+        // A text-only trailing assistant stays.
+        let text_only = vec![
+            SessionEvent::Task { text: "t".into() },
+            SessionEvent::Message {
+                parent_id: None,
+                message: Message::assistant("done, no tools"),
+            },
+        ];
+        assert_eq!(
+            prune_unanswered_tool_calls(&text_only).len(),
+            text_only.len()
+        );
+    }
 
     #[test]
     fn title_is_first_line_truncated() {

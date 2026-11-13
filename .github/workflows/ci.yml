@@ -8,6 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Same-ref pushes/PRs supersede each other. NOTE: a GitHub-hosted runner
+# loss (macOS capacity, spot reclamation) also cancels the run — that
+# needs a manual re-run; we deliberately do NOT vendor a retry action.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test + clippy + fmt (${{ matrix.os }})
@@ -16,6 +23,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -44,7 +52,7 @@ jobs:
       - name: Startup performance gate (the ~6ms promise — fails above 50ms)
         if: matrix.os == 'macos-latest'
         run: |
-          cargo build --release
+          cargo build --release -p modron-cli
           cat > /tmp/startup_gate.py <<'PY'
           import subprocess, time
           times = []
@@ -65,11 +73,14 @@ jobs:
   deny:
     name: supply chain (cargo-deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
-        run: cargo install --locked cargo-deny || cargo install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
       - name: cargo-deny check (advisories, licenses, bans, sources)
         run: cargo deny check
 
@@ -83,6 +94,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.1

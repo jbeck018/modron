@@ -225,13 +225,24 @@ pub fn start_remote_control(
     let key = share_key();
     let (tunnel_url, open_url) = tunnel_urls(bridge_base, &key);
     state.rc_keys.lock().unwrap().insert(session, key.clone());
-    let state = Arc::clone(state);
+    let state_moved = Arc::clone(state);
     let bridge = bridge_base.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = run_tunnel(state, session, bridge, key.clone()).await {
+    let tunnel_task = tokio::spawn(async move {
+        if let Err(e) = run_tunnel(state_moved, session, bridge, key.clone()).await {
             tracing::warn!(key = %key, error = %e, "remote-control tunnel ended");
         }
     });
+    // Abort the previous tunnel for this session, if any: a re-registration
+    // used to stack duplicate pumpers on stale bridge sockets forever
+    // (cycle-2 audit L7).
+    if let Some(old) = state
+        .rc_tunnels
+        .lock()
+        .unwrap()
+        .insert(session, tunnel_task.abort_handle())
+    {
+        old.abort();
+    }
     let _ = tunnel_url;
     Ok(open_url)
 }

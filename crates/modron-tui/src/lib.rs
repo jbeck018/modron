@@ -592,6 +592,10 @@ pub struct App {
     pub goal: Option<String>,
     /// Active color theme (/theme <name> switches live).
     pub theme: Theme,
+    /// Cached `theme.resolved()` (hex parsing per frame was 21
+    /// from_str_radix calls per 50ms tick; cycle-2 audit H14). Invalidate
+    /// via [`Self::invalidate_theme_cache`] on any theme change.
+    pub resolved_cache: Option<crate::theme::Resolved>,
     /// Pending multimodal attachments (ctrl+V images) for the next task.
     pub attachments: Vec<modron_core::Attachment>,
     /// Display labels for the pending attachments (rendered as chips).
@@ -606,6 +610,10 @@ pub struct App {
     /// live `@` token (the walk runs on the RENDER thread — once per
     /// @-session, never per keystroke) and invalidated on submit.
     pub file_completions: Option<Vec<String>>,
+    /// Lowercased twins of `file_completions`, built once per @-session:
+    /// matching ran `to_lowercase()` per path PER FRAME while the popup
+    /// was open (cycle-2 audit H12).
+    pub file_completions_folded: Option<Vec<String>>,
     /// The engine's working dir — the walk root for `@file` completion
     /// (injected by the run loop; empty = the process cwd).
     pub working_dir: std::path::PathBuf,
@@ -2157,18 +2165,37 @@ impl App {
     /// the slash popup's prefix for paths). The walk itself runs on the
     /// render thread, so it happens ONCE per @-session ([`App::tick`] does
     /// not touch it; the Enter submit invalidates it).
+    /// The resolved palette (cached; parse-on-invalidate).
+    pub fn resolved_theme(&mut self) -> crate::theme::Resolved {
+        if let Some(cached) = self.resolved_cache {
+            return cached;
+        }
+        let resolved = self.theme.resolved();
+        self.resolved_cache = Some(resolved);
+        resolved
+    }
+
+    pub fn invalidate_theme_cache(&mut self) {
+        self.resolved_cache = None;
+    }
+
     pub fn file_matches(&mut self) -> Vec<String> {
         let Some((_, frag)) = self.at_token() else {
             return Vec::new();
         };
         if self.file_completions.is_none() {
-            self.file_completions = Some(collect_files(self.walk_root()));
+            let files = collect_files(self.walk_root());
+            self.file_completions_folded = Some(files.iter().map(|f| f.to_lowercase()).collect());
+            self.file_completions = Some(files);
         }
+        let frag_folded = frag.to_lowercase();
+        let folded = self.file_completions_folded.as_deref().unwrap_or_default();
         let files = self.file_completions.as_deref().unwrap_or_default();
         files
             .iter()
-            .filter(|path| list_matches(&frag, &[path]))
-            .cloned()
+            .zip(folded)
+            .filter(|(_, folded_path)| folded_path.contains(&frag_folded))
+            .map(|(path, _)| path.clone())
             .collect()
     }
 
@@ -2638,12 +2665,14 @@ impl App {
                     self.open_theme_menu();
                 } else if Theme::builtin_names().contains(&name) {
                     self.theme = Theme::builtin(name);
+                    self.invalidate_theme_cache();
                     self.current_theme = name.to_string();
                     self.note(format!("theme: {name}"));
                 } else {
                     match Theme::load(&crate::theme_dir(), name) {
                         Some(theme) => {
                             self.theme = theme;
+                            self.invalidate_theme_cache();
                             self.current_theme = name.to_string();
                             self.note(format!("theme: {name}"));
                         }
@@ -3094,7 +3123,7 @@ impl App {
     /// for meta, cyan for tools, red for errors). Takes `&mut self` to
     /// record the input box's geometry and scroll state for mouse mapping.
     pub fn view(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        let th = self.theme.resolved();
+        let th = self.resolved_theme();
         use ratatui::layout::{Constraint, Layout};
         use ratatui::widgets::Paragraph;
 

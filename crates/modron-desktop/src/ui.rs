@@ -70,7 +70,68 @@ fn catalog_rows() -> Vec<ModelRow> {
         .collect()
 }
 
+/// Entries kept before the eviction sweep drops the older half.
+const MD_CACHE_MAX: usize = 1024;
+
+/// Parsed markdown per committed assistant row, keyed by (row index,
+/// text length). A committed assistant row at a given display index is
+/// immutable, so the pair pins the parse WITHOUT re-hashing the full text
+/// every render (2026-11-12 audit perf fix: the old hash-per-render
+/// walked every visible answer's bytes each 16ms frame). Insertion order
+/// evicts the OLDEST HALF once the map outgrows [`MD_CACHE_MAX`] — a
+/// wholesale clear would re-parse the entire visible history in one
+/// frame. Cleared only on session switches / snapshot resets, which
+/// re-key every index.
+#[derive(Default)]
+struct MdCache {
+    map: std::collections::HashMap<(usize, usize), Vec<crate::markdown::MdBlock>>,
+    order: std::collections::VecDeque<(usize, usize)>,
+}
+
+impl MdCache {
+    fn get_or_parse(&mut self, ix: usize, text: &str) -> &[crate::markdown::MdBlock] {
+        let key = (ix, text.len());
+        if !self.map.contains_key(&key) {
+            // First sight of the key: make room BEFORE growing past the
+            // cap, dropping the older half by insertion order.
+            if self.map.len() >= MD_CACHE_MAX {
+                let evict = self.map.len() - MD_CACHE_MAX / 2 + 1;
+                for _ in 0..evict {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.map.remove(&oldest);
+                    }
+                }
+            }
+            self.order.push_back(key);
+        }
+        self.map
+            .entry(key)
+            .or_insert_with(|| crate::markdown::parse_blocks(text))
+    }
+
+    /// Session switches re-key every index: drop the lot (attach and
+    /// snapshot paths only, never per frame).
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 gpui_kit::actions!(modron_desktop, [NewChat, ComposerSubmit]);
+
+/// The TUI's model-switch wording (provider + window from the shared
+/// catalog; the patch itself is model-only — following the provider is
+/// the server's job, see `app_state::model_patch`).
+fn model_switch_note(name: &str) -> String {
+    match lookup(name) {
+        Some(info) => format!(
+            "model: {name} — provider {}, {}k window (applies from the next turn)",
+            info.provider,
+            info.context_window / 1000
+        ),
+        None => format!("model: {name} (unknown to the catalog; applies from the next turn)"),
+    }
+}
 
 static NEXT_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -184,15 +245,15 @@ pub struct DesktopApp {
     state: AppState,
     cmd_tx: async_channel::Sender<Command>,
     /// The rows the transcript list renders (committed rows + live tail,
-    /// maintained incrementally - see refresh/refresh_tail).
+    /// maintained incrementally - see refresh/refresh_event/refresh_tail).
     display: Vec<Row>,
     list_state: ListState,
-    /// Parsed markdown per assistant text (hash-keyed). Completed messages
-    /// never change; without this every visible answer re-parsed every
-    /// frame (16ms while streaming). Cleared wholesale when large.
-    md_cache: std::cell::RefCell<std::collections::HashMap<u64, Vec<crate::markdown::MdBlock>>>,
+    /// Parsed markdown per committed assistant row (see [`MdCache`]);
+    /// RefCell because the render path only holds `&DesktopApp`.
+    md_cache: std::cell::RefCell<MdCache>,
     composer: Entity<TextareaState>,
-    /// Live slash-command candidates (a leading "/" in the composer).
+    /// Live slash-command candidates (a leading "/" in the composer): the
+    /// shared table's names from [`modron_view::slash::suggestions`].
     slash_candidates: Vec<&'static str>,
     /// The /help overlay (the shared slash-command table).
     help_open: bool,
@@ -297,24 +358,20 @@ impl DesktopApp {
         let strong_model_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("strong model"));
 
-        // Typing updates the slash-command popup: a leading "/" filters
-        // the shared table (modron_view::slash); Enter-free selection via
-        // click keeps the grammar simple (cmd+enter sends).
+        // Typing updates the slash-command popup: a leading "/" pulls the
+        // shared candidates (modron_view::slash::suggestions); Enter-free
+        // selection via click keeps the grammar simple (cmd+enter sends).
         cx.subscribe_in(
             &composer,
             window,
             |this, _input, event: &InputEvent, _window, cx| {
                 if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
                     let text = this.composer.read(cx).value().to_string();
-                    let next = if let Some(token) = text.strip_prefix('/') {
-                        let token = token.split_whitespace().next().unwrap_or("");
-                        modron_view::slash::SLASH_COMMANDS
-                            .iter()
-                            .filter(|c| c.name.starts_with(token))
-                            .map(|c| c.name)
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
+                    let next = match text.strip_prefix('/') {
+                        Some(token) => modron_view::slash::suggestions(
+                            token.split_whitespace().next().unwrap_or(""),
+                        ),
+                        None => Vec::new(),
                     };
                     if next != this.slash_candidates {
                         this.slash_candidates = next;
@@ -432,7 +489,7 @@ impl DesktopApp {
             review_open: None,
             review_files: Vec::new(),
             review_branch: String::new(),
-            md_cache: Default::default(),
+            md_cache: std::cell::RefCell::new(MdCache::default()),
         };
         // Typewriter streaming: advance the visible cursor a few chars per
         // tick so chunk-granular deltas read like a per-character stream.
@@ -463,12 +520,37 @@ impl DesktopApp {
 
     /// Recompute the renderer-visible projections and redraw. FULL path:
     /// rebuilds `display` from the state's committed rows. Frames that
-    /// change only the streaming tail use [`Self::refresh_tail`] instead
-    /// (2026-11-12 audit perf fix: a delta must not re-clone history).
+    /// change only the streaming tail use [`Self::refresh_tail`] and
+    /// persisted-event frames the incremental [`Self::refresh_event`]
+    /// instead (2026-11-12 audit perf fix: only a snapshot/turn boundary
+    /// may re-clone history).
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.rebuild_display();
         self.sync_filters(cx);
         self.list_state.reset(self.display.len());
+        cx.notify();
+    }
+
+    /// EVENT path: the last frame appended committed rows. Splices
+    /// `display` and the virtualized list in place — O(new rows), not the
+    /// former O(n) rebuild+reset per persisted event (2026-11-12 audit
+    /// perf fix). `committed_before` is the committed-row count captured
+    /// BEFORE `apply_frame` folded the frame.
+    fn refresh_event(&mut self, committed_before: usize, cx: &mut Context<Self>) {
+        let old_len = self.display.len();
+        let new_rows = self.state.take_new_rows();
+        self.display.truncate(committed_before);
+        self.display.extend(new_rows);
+        self.display.extend(self.state.tail_rows());
+        // splice, not reset: reset drops the scroll anchor (and drops
+        // scroll events until the next paint) and re-measures everything;
+        // splice re-measures only the replaced range — which also covers
+        // the streaming tail's changing heights (H15) — and keeps the
+        // anchor arithmetic for rows above the splice.
+        self.list_state.splice(
+            committed_before..old_len,
+            self.display.len() - committed_before,
+        );
         cx.notify();
     }
 
@@ -484,10 +566,24 @@ impl DesktopApp {
         self.display.extend(self.state.tail_rows());
     }
 
+    /// Re-derive the live tail rows and tell the list. H15 (2026-11-12
+    /// audit): without a list notification the streamed tail never
+    /// rendered on first appearance — the virtualized list still held the
+    /// old item count — and the growing streaming row's height clipped
+    /// once visible. splice on count changes; remeasure when the row
+    /// count is unchanged but the tail's content (height) grew.
     fn extend_tail(&mut self) {
         let committed = self.state.committed_rows().len();
+        let old_len = self.display.len();
         self.display.truncate(committed);
         self.display.extend(self.state.tail_rows());
+        if self.display.len() != old_len {
+            self.list_state
+                .splice(committed..old_len, self.display.len() - committed);
+        } else if self.display.len() > committed {
+            self.list_state
+                .remeasure_items(committed..self.display.len());
+        }
     }
 
     fn sync_filters(&mut self, cx: &mut Context<Self>) {
@@ -501,11 +597,14 @@ impl DesktopApp {
 
     fn apply_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         // What kind of display work does this frame need? Full = the
-        // committed rows changed (rebuild display); Tail = only the live
-        // streaming tail (cheap truncate+extend); None = the display is
-        // unaffected (the renderer still redraws panels from state).
+        // committed rows changed wholesale (rebuild display); Event = one
+        // persisted event appended rows (incremental splice); Tail = only
+        // the live streaming tail (cheap truncate+extend); None = the
+        // display is unaffected (the renderer still redraws panels from
+        // state).
         enum RowImpact {
             Full,
+            Event,
             Tail,
             None,
         }
@@ -519,15 +618,24 @@ impl DesktopApp {
                     }
                 }
                 let is_sessions = matches!(frame.payload, Payload::Sessions { .. });
+                // Event frames splice incrementally; the count is taken
+                // BEFORE the fold (refresh_event needs the old boundary).
+                let committed_before = self.state.committed_rows().len();
                 let impact = match frame.payload {
                     Payload::Snapshot { .. }
-                    | Payload::Event { .. }
                     | Payload::TurnDone { .. }
                     | Payload::TurnFailed { .. }
                     | Payload::TurnAborted { .. } => RowImpact::Full,
+                    Payload::Event { .. } => RowImpact::Event,
                     Payload::Delta { .. } => RowImpact::Tail,
                     _ => RowImpact::None,
                 };
+                if matches!(frame.payload, Payload::Snapshot { .. }) {
+                    // A snapshot rebuilds every display index; stale
+                    // markdown-cache entries could pin another session's
+                    // answer to a recycled (index, length) key.
+                    self.md_cache.borrow_mut().clear();
+                }
                 // Review-overlay updates: task_status/merged answers land in
                 // DesktopApp fields (not the transcript).
                 match &frame.payload {
@@ -576,6 +684,7 @@ impl DesktopApp {
                 }
                 match impact {
                     RowImpact::Full => self.refresh(cx),
+                    RowImpact::Event => self.refresh_event(committed_before, cx),
                     RowImpact::Tail => self.refresh_tail(cx),
                     RowImpact::None => {
                         self.sync_filters(cx);
@@ -603,6 +712,9 @@ impl DesktopApp {
     fn attach(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
         self.state.attached = Some(id);
         self.state.last_note = None;
+        // A session switch re-keys every display index; stale markdown
+        // parses must not survive it (see MdCache).
+        self.md_cache.borrow_mut().clear();
         self.send(Command::Attach(id));
         self.refresh(cx);
     }
@@ -1015,7 +1127,7 @@ impl DesktopApp {
                         media_type: media_type.into(),
                         data: modron_core::b64::encode(&bytes),
                     },
-                    format!("{name} · {} KB", meta.len() / 1024),
+                    format!("{name} · {}", modron_view::human_bytes(meta.len())),
                     thumb,
                 )
             }
@@ -1232,15 +1344,7 @@ impl DesktopApp {
         self.send(Command::SetConfig(model_patch(&name)));
         // The TUI's exact switch wording (provider follows the model;
         // future-turn semantics are the server's to apply and echo).
-        let note = match lookup(&name) {
-            Some(info) => format!(
-                "model: {name} — provider {}, {}k window (applies from the next turn)",
-                info.provider,
-                info.context_window / 1000
-            ),
-            None => format!("model: {name} (unknown to the catalog; applies from the next turn)"),
-        };
-        self.state.last_note = Some(note);
+        self.state.last_note = Some(model_switch_note(&name));
         self.refresh(cx);
     }
 
@@ -2152,17 +2256,8 @@ impl DesktopApp {
             | Row::Entry(TranscriptEntry::User { text }) => user_bubble(text),
             Row::Entry(TranscriptEntry::Assistant { text }) => {
                 let app = entity.read(cx);
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::hash::DefaultHasher::new();
-                text.hash(&mut hasher);
-                let key = hasher.finish();
                 let mut cache = app.md_cache.borrow_mut();
-                if cache.len() > 512 {
-                    cache.clear();
-                }
-                let blocks = cache
-                    .entry(key)
-                    .or_insert_with(|| crate::markdown::parse_blocks(text));
+                let blocks = cache.get_or_parse(ix, text);
                 div()
                     .id(("transcript-row", ix))
                     .px_4()
@@ -2713,14 +2808,14 @@ impl DesktopApp {
                     let token = query
                         .strip_prefix('/')
                         .and_then(|t| t.split_whitespace().next())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    for spec in modron_view::slash::SLASH_COMMANDS {
-                        if !spec.name.starts_with(&token) {
-                            continue;
-                        }
+                        .unwrap_or("");
+                    for name in modron_view::slash::suggestions(token) {
                         let entity_click = entity_popup.clone();
-                        let name = spec.name;
+                        // The about line rides the shared spec (names come
+                        // from suggestions; the table holds the copy).
+                        let about = modron_view::slash::slash_lookup(name)
+                            .expect("candidate from the shared table")
+                            .about;
                         popup = popup.child(
                             div()
                                 .id(SharedString::from(format!("slash-{name}")))
@@ -2748,7 +2843,7 @@ impl DesktopApp {
                                     div()
                                         .text_size(px(crate::brand::text::SM))
                                         .text_color(theme.accent_foreground)
-                                        .child(SharedString::from(format!("/{}", spec.name))),
+                                        .child(SharedString::from(format!("/{name}"))),
                                 )
                                 .child(
                                     div()
@@ -2756,7 +2851,7 @@ impl DesktopApp {
                                         .truncate()
                                         .text_size(px(crate::brand::text::XS))
                                         .text_color(theme.muted_foreground)
-                                        .child(SharedString::from(spec.about)),
+                                        .child(SharedString::from(about)),
                                 ),
                         );
                     }
@@ -2831,7 +2926,6 @@ impl DesktopApp {
                                                             }
                                                             _ => "image/png",
                                                         };
-                                                        let kb = image.bytes.len() / 1024;
                                                         let thumb = Some(render_image(
                                                             image.format,
                                                             image.bytes.clone(),
@@ -2843,7 +2937,12 @@ impl DesktopApp {
                                                                     &image.bytes,
                                                                 ),
                                                             },
-                                                            format!("pasted image · {kb} KB"),
+                                                            format!(
+                                                                "pasted image · {}",
+                                                                modron_view::human_bytes(
+                                                                    image.bytes.len() as u64
+                                                                )
+                                                            ),
                                                             thumb,
                                                         ));
                                                         took = true;

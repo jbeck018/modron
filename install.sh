@@ -39,12 +39,21 @@ mkdir -p "$INSTALL_DIR"
 TARBALL="$(mktemp "${TMPDIR:-/tmp}/modron.tar.gz.XXXXXX")"
 trap 'rm -f "$TARBALL"' EXIT
 
+# Try the release binary; any failure along the way (no curl, 404, or a
+# tar that cannot unpack it) falls through to the source build.
+INSTALLED=0
 if command -v curl >/dev/null 2>&1 && curl -fsSL -o "$TARBALL" "$URL" 2>/dev/null; then
-  tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron
-  rm -f "$TARBALL"
-  info "installed release binary"
-else
-  info "no matching release binary — building from source (requires Rust 1.99+)"
+  if tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron 2>/dev/null; then
+    rm -f "$TARBALL"
+    info "installed release binary"
+    INSTALLED=1
+  else
+    info "release archive could not be unpacked"
+  fi
+fi
+
+if [ "$INSTALLED" -ne 1 ]; then
+  info "no usable release binary — building from source (requires Rust 1.99+)"
   command -v cargo >/dev/null 2>&1 || fail "cargo not found — install rustup from https://rustup.rs"
   command -v git >/dev/null 2>&1 || fail "git not found — install git to build from source"
   TMPDIR_BUILD="$(mktemp -d)"

@@ -160,6 +160,38 @@ test("chat header has share, fork and task controls", async () => {
   expect(texts).toContain("merge task");
 });
 
+// Drift guard: EXECUTABLE_SLASH is derived from the served table
+// (modron-view::slash via Remote.slashCommandsJson), and /help renders
+// exactly that table. The names below are the shared table's contract -
+// if the served table and what the shell lists ever disagree, this
+// fails either way.
+test("slash help lists exactly the served table", async () => {
+  const app = await openDemoChat();
+  await app.type("demo mode - connect to type", "/help");
+  await app.press("send");
+  const note = app.texts().find((t) => t.startsWith("slash commands:"));
+  expect(note).toBeDefined();
+  const listed = (note as string)
+    .split("\n")
+    .slice(1)
+    .map((line) => line.split(" ")[0])
+    .sort();
+  const served = [
+    "model",
+    "mode",
+    "sandbox",
+    "new",
+    "fork",
+    "tasks",
+    "share",
+    "remote-control",
+    "auth",
+    "settings",
+    "help",
+  ].map((name) => "/" + name);
+  expect(listed).toEqual([...served].sort());
+});
+
 
 
 

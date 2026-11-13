@@ -25,7 +25,7 @@ use tokio::sync::mpsc::UnboundedSender;
 pub const PROVIDER_ID: &str = "openai-compat";
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-use crate::http::build_client;
+use crate::http::{build_client, check_status, post_json};
 
 /// Any OpenAI-compatible chat-completions endpoint.
 pub struct OpenAiCompatProvider {
@@ -52,6 +52,16 @@ impl OpenAiCompatProvider {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// The Bearer header when a key is set; an empty key sends NO
+    /// Authorization header at all (local servers ignore credentials).
+    fn bearer_headers(&self) -> Vec<(&'static str, String)> {
+        if self.api_key.is_empty() {
+            Vec::new()
+        } else {
+            vec![("Authorization", format!("Bearer {}", self.api_key))]
+        }
     }
 
     /// Configured base URL (for diagnostics and factory tests).
@@ -111,15 +121,9 @@ impl OpenAiCompatProvider {
             .send()
             .await
             .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-        let status = response.status();
-        if !status.is_success() {
-            // Streaming failures arrive as a plain (non-SSE) error body.
-            let text = response
-                .text()
-                .await
-                .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-            return Err(crate::http_error(PROVIDER_ID, status, &text));
-        }
+        // Streaming failures arrive as a plain (non-SSE) error body; the
+        // shared status check maps them to the canonical error text.
+        let response = check_status(PROVIDER_ID, response).await?;
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut byte_stream = response.bytes_stream();
@@ -554,27 +558,12 @@ impl ModelProvider for OpenAiCompatProvider {
             "sending turn request"
         );
 
-        let mut request = self.http.post(&url).json(&body);
-        if !self.api_key.is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", self.api_key));
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-        if !status.is_success() {
-            return Err(crate::http_error(PROVIDER_ID, status, &text));
-        }
-
-        let value: Value = serde_json::from_str(&text).map_err(|err| Error::Provider {
-            provider: PROVIDER_ID.into(),
-            message: format!("malformed response: {err}"),
-        })?;
+        // POST + status-check + parse is the shared [`post_json`]; the
+        // Bearer header rides only when a key is set (2026-11-12 audit
+        // DRY fix — the inline scaffold was a verbatim twin of the
+        // responses provider's).
+        let headers = self.bearer_headers();
+        let value = post_json(&self.http, PROVIDER_ID, &url, &headers, &body).await?;
         let parsed = parse_response(value)?;
         tracing::debug!(
             provider = PROVIDER_ID,

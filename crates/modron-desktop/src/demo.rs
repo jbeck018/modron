@@ -741,7 +741,11 @@ mod tests {
         match reply.payload {
             Payload::ConfigChanged { ref patch } => {
                 assert_eq!(patch.model.as_deref(), Some("gpt-5.6-sol"));
-                assert_eq!(patch.provider.as_deref(), Some("chatgpt"));
+                // DELIBERATE change (2026-11-12 audit DRY fix): the patch
+                // is model-only now; the demo echoes verbatim, so provider
+                // stays unset here. The REAL server's hub follows the
+                // provider through the catalog and fills it on the echo.
+                assert_eq!(patch.provider, None);
             }
             other => panic!("expected config_changed, got {other:?}"),
         }
@@ -749,7 +753,10 @@ mod tests {
         let mut state = AppState::new();
         state.apply_frame(reply);
         assert_eq!(state.model, "gpt-5.6-sol");
-        assert_eq!(state.provider, "chatgpt");
+        assert_eq!(
+            state.provider, "",
+            "a model-only patch leaves the label alone"
+        );
     }
 
     #[tokio::test]

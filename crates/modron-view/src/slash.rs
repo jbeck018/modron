@@ -120,6 +120,21 @@ pub fn slash_lookup(name: &str) -> Option<&'static SlashSpec> {
     SLASH_COMMANDS.iter().find(|c| c.name == name)
 }
 
+/// Completion candidates for a typed `/token` (prefix/substring match,
+/// canonical order). The desktop shipped this filter twice; one copy now
+/// (the TSX keeps its JS filter over the served table).
+pub fn suggestions(token: &str) -> Vec<&'static str> {
+    let token = token.trim_start_matches('/').to_lowercase();
+    if token.is_empty() {
+        return SLASH_COMMANDS.iter().map(|c| c.name).collect();
+    }
+    SLASH_COMMANDS
+        .iter()
+        .map(|c| c.name)
+        .filter(|name| name.starts_with(&token) || name.contains(&token))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

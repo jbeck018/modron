@@ -92,6 +92,7 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
         tasks: crate::tasks::TaskRegistry::new(),
         bridge_base: options.bridge_base.clone(),
         rc_keys: std::sync::Mutex::new(HashMap::new()),
+        rc_tunnels: std::sync::Mutex::new(HashMap::new()),
     });
 
     let mut tasks = Vec::new();
