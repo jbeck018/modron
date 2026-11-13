@@ -85,6 +85,28 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Truncate to `max_chars` with an ellipsis (the TUI's historical
+/// `short()`; the desktop and CLI shipped byte-identical copies).
+pub fn short(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max_chars).collect();
+        format!("{cut}\u{2026}")
+    }
+}
+
+/// Cache-hit percentage for one turn's usage: `100 * cached / (input +
+/// cached)`, `None` when the denominator is zero (the "-" case every
+/// client hand-rolled; six copies collapsed 2026-11-12 cycle-2 audit).
+pub fn cache_hit_pct(usage: &modron_types::Usage) -> Option<f64> {
+    let denom = usage.input_tokens + usage.cached_input_tokens;
+    if denom == 0 {
+        return None;
+    }
+    Some(100.0 * usage.cached_input_tokens as f64 / denom as f64)
+}
+
 /// One subagent row of the swarm view (serde-safe: epoch millis instead
 /// of `Instant`, so every client renders the same elapsed clock).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
