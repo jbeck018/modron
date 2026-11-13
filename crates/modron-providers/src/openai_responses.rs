@@ -99,13 +99,13 @@ impl OpenAiResponsesProvider {
     /// One streaming turn against the Responses endpoint.
     async fn turn_streaming_inner(
         &self,
-        req: TurnRequest,
+        req: &TurnRequest,
         tx: UnboundedSender<modron_core::StreamDelta>,
     ) -> Result<TurnResponse> {
         // BACKEND_URL is the complete endpoint — no path to append
         // (double-appending /responses 404s with {"detail":"Not Found"}).
         let url = self.base_url.trim_end_matches('/').to_string();
-        let body = build_body(&req);
+        let body = build_body(req);
         let response = self.post(&url, &body).await?;
         let status = response.status();
         if !status.is_success() {
@@ -258,17 +258,17 @@ impl ModelProvider for OpenAiResponsesProvider {
         PROVIDER_ID
     }
 
-    async fn turn(&self, req: TurnRequest) -> Result<TurnResponse> {
+    async fn turn(&self, req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        self.turn_streaming_inner(req, tx).await
+        self.turn_streaming_inner(&req, tx).await
     }
 
     async fn turn_streaming(
         &self,
-        req: TurnRequest,
+        req: std::sync::Arc<TurnRequest>,
         tx: UnboundedSender<modron_core::StreamDelta>,
     ) -> Result<TurnResponse> {
-        self.turn_streaming_inner(req, tx).await
+        self.turn_streaming_inner(&req, tx).await
     }
 }
 

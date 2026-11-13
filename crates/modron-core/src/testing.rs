@@ -36,7 +36,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Default)]
 pub struct MockProvider {
     script: Mutex<VecDeque<TurnResponse>>,
-    requests: Mutex<Vec<TurnRequest>>,
+    requests: Mutex<Vec<std::sync::Arc<TurnRequest>>>,
     /// When set, an exhausted script replays its last response forever —
     /// what multi-turn chat tests need (the conversation continues).
     repeat_last: Mutex<bool>,
@@ -102,7 +102,7 @@ impl MockProvider {
     }
 
     /// Every request received so far, in arrival order.
-    pub fn requests(&self) -> Vec<TurnRequest> {
+    pub fn requests(&self) -> Vec<std::sync::Arc<TurnRequest>> {
         lock(&self.requests).clone()
     }
 }
@@ -188,7 +188,7 @@ impl ModelProvider for MockProvider {
         "mock"
     }
 
-    async fn turn(&self, request: TurnRequest) -> Result<TurnResponse> {
+    async fn turn(&self, request: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
         lock(&self.requests).push(request);
         let mut script = lock(&self.script);
         match script.pop_front() {
@@ -332,10 +332,25 @@ mod tests {
             max_tokens: 100,
         };
 
-        assert_eq!(mock.turn(request.clone()).await.unwrap().text, "one");
-        assert_eq!(mock.turn(request.clone()).await.unwrap().text, "two");
+        assert_eq!(
+            mock.turn(std::sync::Arc::new(request.clone()))
+                .await
+                .unwrap()
+                .text,
+            "one"
+        );
+        assert_eq!(
+            mock.turn(std::sync::Arc::new(request.clone()))
+                .await
+                .unwrap()
+                .text,
+            "two"
+        );
 
-        let err = mock.turn(request.clone()).await.unwrap_err();
+        let err = mock
+            .turn(std::sync::Arc::new(request.clone()))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Provider { ref provider, .. } if provider == "mock"));
 
         let requests = mock.requests();
@@ -348,13 +363,13 @@ mod tests {
         let mock =
             MockProvider::new().then_tool_call("c1", "read", serde_json::json!({"path": "x"}));
         let response = mock
-            .turn(TurnRequest {
+            .turn(std::sync::Arc::new(TurnRequest {
                 model: "m".into(),
                 system: String::new(),
                 messages: vec![],
                 tools: vec![],
                 max_tokens: 1,
-            })
+            }))
             .await
             .unwrap();
         assert_eq!(response.stop_reason, StopReason::ToolUse);

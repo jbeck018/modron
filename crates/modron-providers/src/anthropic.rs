@@ -238,11 +238,11 @@ impl AnthropicProvider {
     /// result.
     async fn turn_streaming_inner(
         &self,
-        req: TurnRequest,
+        req: &TurnRequest,
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<TurnResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut body = build_body_with_prefix(&req, self.system_prefix());
+        let mut body = build_body_with_prefix(req, self.system_prefix());
         body["stream"] = json!(true);
         tracing::debug!(
             provider = PROVIDER_ID,
@@ -543,16 +543,32 @@ pub fn build_body(req: &TurnRequest) -> Value {
 ///   `cache_control: {"type": "ephemeral"}` — prompt cache breakpoint #2,
 ///   marking the end of the cacheable tools+system prefix.
 pub fn build_body_with_prefix(req: &TurnRequest, system_prefix: &str) -> Value {
+    let mut body = build_body_inner(req);
     if system_prefix.is_empty() {
-        return build_body_inner(req);
+        return body;
     }
-    let mut req = req.clone();
-    req.system = if req.system.is_empty() {
+    // Splice the prefix into the assembled system blocks - no request
+    // clone (the subscription path ran this every turn over the whole
+    // transcript; 2026-11-12 cycle-2 audit).
+    let combined = if req.system.is_empty() {
         system_prefix.to_string()
     } else {
         format!("{system_prefix}\n\n{}", req.system)
     };
-    build_body_inner(&req)
+    if let Some(system) = body.get_mut("system").and_then(|v| v.as_array_mut()) {
+        if let Some(first) = system.first_mut() {
+            if let Some(text) = first.get_mut("text") {
+                if text.is_string() {
+                    *text = serde_json::Value::String(combined);
+                    return body;
+                }
+            }
+        }
+        system.insert(0, serde_json::json!({"type": "text", "text": combined}));
+        return body;
+    }
+    body["system"] = serde_json::json!([{ "type": "text", "text": combined }]);
+    body
 }
 
 fn build_body_inner(req: &TurnRequest) -> Value {
@@ -769,16 +785,16 @@ impl ModelProvider for AnthropicProvider {
     /// concrete-type callers.
     async fn turn_streaming(
         &self,
-        req: TurnRequest,
+        req: std::sync::Arc<TurnRequest>,
         tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
     ) -> Result<TurnResponse> {
-        self.turn_streaming_inner(req, tx).await
+        self.turn_streaming_inner(&req, tx).await
     }
     fn id(&self) -> &str {
         PROVIDER_ID
     }
 
-    async fn turn(&self, req: TurnRequest) -> Result<TurnResponse> {
+    async fn turn(&self, req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = build_body_with_prefix(&req, self.system_prefix());
         // Log shapes and sizes only — never the API key or full body.

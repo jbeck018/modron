@@ -68,7 +68,7 @@ impl ModelProvider for DelayedProvider {
     fn id(&self) -> &str {
         "mock"
     }
-    async fn turn(&self, req: TurnRequest) -> Result<TurnResponse> {
+    async fn turn(&self, req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
         tokio::time::sleep(self.delay).await;
         self.inner.turn(req).await
     }

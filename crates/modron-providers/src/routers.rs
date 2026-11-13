@@ -41,7 +41,7 @@ impl AsyncRouter for LlmJudgeRouter {
             tools: Vec::new(),
             max_tokens: 8,
         };
-        let response = match self.provider.turn(request).await {
+        let response = match self.provider.turn(std::sync::Arc::new(request)).await {
             Ok(response) => response,
             Err(e) => {
                 tracing::warn!(error = %e, "llm judge call failed — keeping sync choice");

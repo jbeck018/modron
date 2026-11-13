@@ -627,13 +627,15 @@ impl Engine {
                 )
                 .await?;
 
-            let request = TurnRequest {
+            // Shared by Arc: retries/escalation re-send it without
+            // re-cloning the transcript.
+            let request = std::sync::Arc::new(TurnRequest {
                 model: model.clone(),
                 system: system.to_string(),
                 messages: state.transcript.clone(),
                 tools: tool_specs.to_vec(),
                 max_tokens: MAX_OUTPUT_TOKENS,
-            };
+            });
             tracing::info!(
                 turn = state.turns + 1,
                 provider = provider.id(),
@@ -1491,7 +1493,7 @@ impl Engine {
             .await?;
         state.transcript.push(handoff);
 
-        let request = TurnRequest {
+        let request = std::sync::Arc::new(TurnRequest {
             model: model.clone(),
             system: format!("{system}{ESCALATION_SYSTEM_ADDENDUM}"),
             messages: state.transcript.clone(),
@@ -1499,7 +1501,7 @@ impl Engine {
             // cannot service must not be provoked.
             tools: Vec::new(),
             max_tokens: MAX_OUTPUT_TOKENS,
-        };
+        });
         tracing::info!(
             provider = provider.id(),
             model = %model,
@@ -1666,13 +1668,13 @@ impl Engine {
         });
         let (provider, model) = self.resolve_provider(&choice)?;
 
-        let request = TurnRequest {
+        let request = std::sync::Arc::new(TurnRequest {
             model: model.clone(),
             system: compact::summarizer_prompt().to_string(),
             messages: vec![Message::user(older_text.as_str())],
             tools: Vec::new(),
             max_tokens: COMPACTION_MAX_OUTPUT_TOKENS,
-        };
+        });
         tracing::info!(
             provider = provider.id(),
             model = %model,
@@ -2165,12 +2167,12 @@ mod tests {
         fn id(&self) -> &str {
             "spec-stream"
         }
-        async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+        async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
             unreachable!("streaming path under test")
         }
         async fn turn_streaming(
             &self,
-            _req: TurnRequest,
+            _req: std::sync::Arc<TurnRequest>,
             tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
         ) -> Result<TurnResponse> {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {

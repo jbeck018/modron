@@ -87,11 +87,11 @@ impl OpenAiCompatProvider {
     /// with a `connection error: …` prefix rather than a partial result.
     async fn turn_streaming_inner(
         &self,
-        req: TurnRequest,
+        req: &TurnRequest,
         tx: UnboundedSender<StreamDelta>,
     ) -> Result<TurnResponse> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut body = build_body(&req);
+        let mut body = build_body(req);
         body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
         tracing::debug!(
@@ -533,16 +533,16 @@ impl ModelProvider for OpenAiCompatProvider {
     /// concrete-type callers.
     async fn turn_streaming(
         &self,
-        req: TurnRequest,
+        req: std::sync::Arc<TurnRequest>,
         tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
     ) -> Result<TurnResponse> {
-        self.turn_streaming_inner(req, tx).await
+        self.turn_streaming_inner(&req, tx).await
     }
     fn id(&self) -> &str {
         PROVIDER_ID
     }
 
-    async fn turn(&self, req: TurnRequest) -> Result<TurnResponse> {
+    async fn turn(&self, req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = build_body(&req);
         tracing::debug!(

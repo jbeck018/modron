@@ -145,21 +145,14 @@ impl ModelProvider for RetryingProvider {
         self.inner.id()
     }
 
-    async fn turn(&self, request: TurnRequest) -> Result<TurnResponse> {
-        // Same shape as turn_streaming's replay loop: the first (happy)
-        // attempt consumes the request without cloning; a clone happens
-        // only when a retry is actually about to run. The non-streaming
-        // call is idempotent to replay (nothing observable escapes).
+    async fn turn(&self, request: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
+        // The request is shared by Arc: every attempt (including the
+        // first) re-sends it without a deep clone. Non-streaming turns
+        // are idempotent to replay (nothing observable escapes).
         let attempts = self.cfg.max_attempts.max(1);
-        let mut pending = Some(request);
         for attempt in 1..=attempts {
             let is_last = attempt == attempts;
-            let call_req = if is_last {
-                pending.take().expect("req held until the last attempt")
-            } else {
-                pending.as_ref().expect("req").clone()
-            };
-            match self.inner.turn(call_req).await {
+            match self.inner.turn(Arc::clone(&request)).await {
                 Ok(response) => return Ok(response),
                 Err(err) if !is_last && is_retryable(&err) => {
                     let wait = self.cfg.backoff_for(attempt - 1);
@@ -179,7 +172,7 @@ impl ModelProvider for RetryingProvider {
 
     async fn turn_streaming(
         &self,
-        req: TurnRequest,
+        req: std::sync::Arc<TurnRequest>,
         tx: tokio::sync::mpsc::UnboundedSender<modron_core::StreamDelta>,
     ) -> Result<TurnResponse> {
         // Streaming replays a turn ONLY when nothing observable was
@@ -191,16 +184,10 @@ impl ModelProvider for RetryingProvider {
         // every streaming turn to one blocking non-streaming call.)
         use std::sync::atomic::{AtomicBool, Ordering};
         let attempts = self.cfg.max_attempts.max(1);
-        let mut pending = Some(req);
         for attempt in 1..=attempts {
             let is_last = attempt == attempts;
-            let call_req = if is_last {
-                pending.take().expect("req held until the last attempt")
-            } else {
-                // Keep the original for a possible replay; the request can
-                // be large, so the happy path (first attempt) never clones.
-                pending.as_ref().expect("req").clone()
-            };
+            // Shared by Arc: no attempt ever deep-clones the request.
+            let call_req = Arc::clone(&req);
             let (fwd_tx, mut fwd_rx) =
                 tokio::sync::mpsc::unbounded_channel::<modron_core::StreamDelta>();
             let emitted = std::sync::Arc::new(AtomicBool::new(false));
@@ -271,13 +258,13 @@ mod tests {
             "dead-then-alive"
         }
 
-        async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+        async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
             unreachable!("streaming path under test")
         }
 
         async fn turn_streaming(
             &self,
-            _req: TurnRequest,
+            _req: std::sync::Arc<TurnRequest>,
             tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
         ) -> Result<TurnResponse> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -305,13 +292,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let response = provider
             .turn_streaming(
-                TurnRequest {
+                Arc::new(TurnRequest {
                     model: "m".into(),
                     system: String::new(),
                     messages: vec![Message::user("hi")],
                     tools: vec![],
                     max_tokens: 16,
-                },
+                }),
                 tx,
             )
             .await
@@ -335,12 +322,12 @@ mod tests {
             fn id(&self) -> &str {
                 "died-mid-stream"
             }
-            async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+            async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
                 unreachable!()
             }
             async fn turn_streaming(
                 &self,
-                _req: TurnRequest,
+                _req: std::sync::Arc<TurnRequest>,
                 tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
             ) -> Result<TurnResponse> {
                 let _ = tx.send(StreamDelta::Text("partial ".into()));
@@ -351,13 +338,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let err = provider
             .turn_streaming(
-                TurnRequest {
+                Arc::new(TurnRequest {
                     model: "m".into(),
                     system: String::new(),
                     messages: vec![Message::user("hi")],
                     tools: vec![],
                     max_tokens: 16,
-                },
+                }),
                 tx,
             )
             .await
@@ -486,7 +473,7 @@ mod tests {
             "flaky"
         }
 
-        async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+        async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.failures {
                 Err(provider_err("HTTP 503 Service Unavailable: overloaded"))
@@ -511,13 +498,13 @@ mod tests {
         let provider = RetryingProvider::new(inner).with_delay_fn(noop_delay());
 
         let response = provider
-            .turn(TurnRequest {
+            .turn(Arc::new(TurnRequest {
                 model: "m".into(),
                 system: String::new(),
                 messages: vec![],
                 tools: vec![],
                 max_tokens: 16,
-            })
+            }))
             .await
             .unwrap();
         assert_eq!(response.text, "ok");

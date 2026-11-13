@@ -28,7 +28,7 @@ impl ModelProvider for AuthFail {
         self.id
     }
 
-    async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+    async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(Error::Provider {
             provider: self.id.to_string(),
@@ -49,7 +49,7 @@ impl ModelProvider for ServerFail {
         self.id
     }
 
-    async fn turn(&self, _req: TurnRequest) -> Result<TurnResponse> {
+    async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
         Err(Error::Provider {
             provider: self.id.to_string(),
             message: "HTTP 500 Internal Server Error: overloaded".into(),

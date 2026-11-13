@@ -221,7 +221,10 @@ pub trait ModelProvider: Send + Sync {
     /// Stable identifier, e.g. "anthropic", "openai-compat", "mock".
     fn id(&self) -> &str;
     /// One model turn. Non-streaming for MVP; streaming is a later crate feature.
-    async fn turn(&self, req: TurnRequest) -> Result<TurnResponse>;
+    /// Requests are shared by Arc: retries and escalation re-send the
+    /// same turn without re-cloning the transcript (the request is
+    /// immutable once built).
+    async fn turn(&self, req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse>;
     /// Streaming variant (Phase-1b S1 lift, additive): sends `StreamDelta`s
     /// on `tx` while the turn runs and still returns the complete
     /// `TurnResponse`. Default: run [`Self::turn`] and emit one `Text` delta
@@ -230,7 +233,7 @@ pub trait ModelProvider: Send + Sync {
     /// would re-emit deltas.
     async fn turn_streaming(
         &self,
-        req: TurnRequest,
+        req: std::sync::Arc<TurnRequest>,
         tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
     ) -> Result<TurnResponse> {
         let _ = &tx;

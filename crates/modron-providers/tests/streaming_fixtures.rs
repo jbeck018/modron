@@ -25,6 +25,7 @@ use modron_providers::retry::is_retryable;
 use modron_providers::stream::StreamDelta;
 use modron_providers::{AnthropicProvider, OpenAiCompatProvider};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 mod common;
@@ -203,7 +204,7 @@ async fn anthropic_streaming_fixture_matches_non_streaming_contract() {
         .with_base_url(format!("http://{addr}"));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let response = provider
-        .turn_streaming(simple_request("claude-sonnet-4-5"), tx)
+        .turn_streaming(Arc::new(simple_request("claude-sonnet-4-5")), tx)
         .await
         .expect("streaming turn succeeds");
     let recorded = server.await.expect("server task");
@@ -256,7 +257,7 @@ async fn anthropic_streaming_thinking_surfaces_reasoning_only() {
         .with_base_url(format!("http://{addr}"));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let response = provider
-        .turn_streaming(simple_request("claude-sonnet-4-5"), tx)
+        .turn_streaming(Arc::new(simple_request("claude-sonnet-4-5")), tx)
         .await
         .expect("streaming turn succeeds");
     let _ = server.await.expect("server task");
@@ -286,7 +287,7 @@ async fn anthropic_truncated_stream_is_connection_error_not_retryable() {
         .with_base_url(format!("http://{addr}"));
     let (tx, _rx) = mpsc::unbounded_channel();
     let err = provider
-        .turn_streaming(simple_request("claude-sonnet-4-5"), tx)
+        .turn_streaming(Arc::new(simple_request("claude-sonnet-4-5")), tx)
         .await
         .expect_err("truncated stream must fail, not return a partial turn");
     let _ = server.await.expect("server task");
@@ -384,7 +385,7 @@ async fn openai_streaming_fixture_matches_non_streaming_contract() {
         .with_base_url(format!("http://{addr}"));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let response = provider
-        .turn_streaming(simple_request("gpt-5-mini"), tx)
+        .turn_streaming(Arc::new(simple_request("gpt-5-mini")), tx)
         .await
         .expect("streaming turn succeeds");
     let recorded = server.await.expect("server task");
@@ -441,7 +442,7 @@ async fn openai_streaming_without_usage_chunk_reports_zeros() {
         .with_base_url(format!("http://{addr}"));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let response = provider
-        .turn_streaming(simple_request("gpt-5-mini"), tx)
+        .turn_streaming(Arc::new(simple_request("gpt-5-mini")), tx)
         .await
         .expect("stream without usage still completes");
     let _ = server.await.expect("server task");
@@ -470,7 +471,7 @@ async fn openai_truncated_stream_is_connection_error_not_retryable() {
         .with_base_url(format!("http://{addr}"));
     let (tx, _rx) = mpsc::unbounded_channel();
     let err = provider
-        .turn_streaming(simple_request("gpt-5-mini"), tx)
+        .turn_streaming(Arc::new(simple_request("gpt-5-mini")), tx)
         .await
         .expect_err("truncated stream must fail, not return a partial turn");
     let _ = server.await.expect("server task");
