@@ -183,29 +183,38 @@ fn resolve_inside(working_dir: &std::path::Path, path: &str) -> Option<std::path
 /// The events a resumed run may see after a rewind. No cut: everything.
 /// Cut only: `events[..cut]`. Cut and end: `events[..cut]` followed by
 /// `events[end..]`, i.e. only the abandoned range `[cut, end)` is skipped.
-fn rewind_view(
-    events: &[SessionEvent],
+fn rewind_view<'a>(
+    events: &'a [SessionEvent],
     cut: Option<u64>,
     end: Option<u64>,
-) -> std::borrow::Cow<'_, [SessionEvent]> {
+    earlier: &[(u64, u64)],
+) -> std::borrow::Cow<'a, [SessionEvent]> {
     use std::borrow::Cow;
-    let Some(cut) = cut else {
-        return Cow::Borrowed(events);
-    };
-    let cut = usize::try_from(cut).unwrap_or(usize::MAX).min(events.len());
-    match end {
-        Some(end) => {
-            let end = usize::try_from(end)
-                .unwrap_or(usize::MAX)
-                .clamp(cut, events.len());
-            if end == events.len() {
-                return Cow::Borrowed(&events[..cut]);
-            }
-            let mut kept = events[..cut].to_vec();
-            kept.extend_from_slice(&events[end..]);
-            Cow::Owned(kept)
-        }
-        None => Cow::Borrowed(&events[..cut]),
+    let len = events.len();
+    let clamp = |v: u64| usize::try_from(v).unwrap_or(usize::MAX).min(len);
+    // Every abandoned range as [start, end) in event indices. The current
+    // marker without an end keeps the old meaning: drop to the log end.
+    let mut ranges: Vec<(usize, usize)> = earlier
+        .iter()
+        .map(|&(start, end)| (clamp(start), clamp(end)))
+        .collect();
+    if let Some(cut) = cut {
+        let start = clamp(cut);
+        ranges.push((start, end.map_or(len, clamp).max(start)));
+    }
+    ranges.retain(|&(start, end)| start < end);
+    match ranges.as_slice() {
+        [] => Cow::Borrowed(events),
+        // One range reaching the log end: a plain prefix, no copy.
+        [(start, end)] if *end == len => Cow::Borrowed(&events[..*start]),
+        _ => Cow::Owned(
+            events
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !ranges.iter().any(|&(s, e)| (s..e).contains(idx)))
+                .map(|(_, event)| event.clone())
+                .collect(),
+        ),
     }
 }
 
@@ -431,6 +440,7 @@ impl Engine {
             &events,
             self.config.resume_from_event,
             self.config.resume_skip_end,
+            &self.config.resume_skip_ranges,
         );
         let sliced: &[SessionEvent] = &kept;
         // Every resume goes through the prune, not only rewind resumes: an
@@ -1958,6 +1968,7 @@ impl Engine {
             &events,
             self.config.resume_from_event,
             self.config.resume_skip_end,
+            &self.config.resume_skip_ranges,
         )
         .into_owned();
         let (older, tail) =
@@ -2364,23 +2375,38 @@ mod tests {
                 .collect()
         };
         // No cut: everything.
-        assert_eq!(texts(&rewind_view(&events, None, Some(3))).len(), 5);
+        assert_eq!(texts(&rewind_view(&events, None, Some(3), &[])).len(), 5);
         // Cut only: the old meaning, everything from the cut is dropped.
-        assert_eq!(texts(&rewind_view(&events, Some(2), None)), ["a", "b"]);
+        assert_eq!(texts(&rewind_view(&events, Some(2), None, &[])), ["a", "b"]);
         // Cut and end: [2, 4) abandoned, later work kept.
         assert_eq!(
-            texts(&rewind_view(&events, Some(2), Some(4))),
+            texts(&rewind_view(&events, Some(2), Some(4), &[])),
             ["a", "b", "e"]
         );
         // Restart (cut 0) keeps only post-restart work.
-        assert_eq!(texts(&rewind_view(&events, Some(0), Some(3))), ["d", "e"]);
-        // End at or past the log end, or below the cut, never panics.
-        assert_eq!(texts(&rewind_view(&events, Some(2), Some(99))), ["a", "b"]);
         assert_eq!(
-            texts(&rewind_view(&events, Some(4), Some(1))),
+            texts(&rewind_view(&events, Some(0), Some(3), &[])),
+            ["d", "e"]
+        );
+        // End at or past the log end, or below the cut, never panics.
+        assert_eq!(
+            texts(&rewind_view(&events, Some(2), Some(99), &[])),
+            ["a", "b"]
+        );
+        assert_eq!(
+            texts(&rewind_view(&events, Some(4), Some(1), &[])),
             ["a", "b", "c", "d", "e"]
         );
-        assert_eq!(texts(&rewind_view(&events, Some(99), None)).len(), 5);
+        assert_eq!(texts(&rewind_view(&events, Some(99), None, &[])).len(), 5);
+        // Earlier rewinds stay abandoned when a later one is recorded.
+        assert_eq!(
+            texts(&rewind_view(&events, Some(3), Some(4), &[(0, 1)])),
+            ["b", "c", "e"]
+        );
+        assert_eq!(
+            texts(&rewind_view(&events, None, None, &[(1, 3)])),
+            ["a", "d", "e"]
+        );
     }
 
     use super::*;

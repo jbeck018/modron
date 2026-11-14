@@ -556,6 +556,10 @@ pub struct EngineConfig {
     /// `>= end`) do. `None` with a cut set keeps the old meaning (everything
     /// from the cut onward is dropped).
     pub resume_skip_end: Option<u64>,
+    /// Ranges `[start, end)` abandoned by EARLIER rewinds of this session.
+    /// They stay out of context when a later rewind is recorded, so a
+    /// second rewind cannot let the first abandoned range back in.
+    pub resume_skip_ranges: Vec<(u64, u64)>,
     /// Force one self-check turn before ending when no verify tool exists.
     pub self_check_on_finish: bool,
     /// Verify-failure escalation (additive, `None` by default): when the
@@ -653,6 +657,7 @@ impl Default for EngineConfig {
             hooks: hooks::HookConfig::default(),
             resume_from_event: None,
             resume_skip_end: None,
+            resume_skip_ranges: Vec::new(),
             self_check_on_finish: false,
             escalate_on_check_failure: None,
             sandbox: SandboxPolicy::Off,
@@ -686,6 +691,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("hooks", &self.hooks)
             .field("resume_from_event", &self.resume_from_event)
             .field("resume_skip_end", &self.resume_skip_end)
+            .field("resume_skip_ranges", &self.resume_skip_ranges)
             .field("escalate_on_check_failure", &self.escalate_on_check_failure)
             .field("sandbox", &self.sandbox)
             .field("approver", &self.approver.is_some())

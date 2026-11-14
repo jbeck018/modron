@@ -1228,6 +1228,11 @@ fn build_agent_with(
         // context; events appended after the rewind (index >= end) do.
         resume_from_event: rewind_marker.map(|m| m.cut),
         resume_skip_end: rewind_marker.and_then(|m| m.end),
+        resume_skip_ranges: cli
+            .resume
+            .flatten()
+            .map(|id| read_rewind_history(&sessions_dir, id))
+            .unwrap_or_default(),
         hooks: cfg
             .hooks
             .clone()
@@ -2982,9 +2987,12 @@ async fn run_rewind(
         .await
         .map_err(|err| anyhow::anyhow!("cannot count session events: {err}"))?;
     let marker = sessions_dir.join(format!("{}.rewind", session_id));
+    // Append: ranges abandoned by earlier rewinds stay recorded, so they
+    // cannot re-enter context after this one.
+    let existing = std::fs::read_to_string(&marker).unwrap_or_default();
     std::fs::write(
         &marker,
-        format_rewind_marker(outcome.truncated_at_event, end),
+        append_rewind_marker(&existing, outcome.truncated_at_event, end),
     )
     .map_err(|err| anyhow::anyhow!("cannot write rewind marker {}: {err}", marker.display()))?;
     Ok(())
@@ -3003,6 +3011,9 @@ struct RewindMarker {
 /// Parses `"<cut>"` (old form) or `"<cut> <end>"`. Anything else, including
 /// an `end` below `cut`, is treated as no marker.
 fn parse_rewind_marker(text: &str) -> Option<RewindMarker> {
+    // The marker file is one line per rewind; the LAST line is the current
+    // marker, earlier lines are the ranges abandoned by earlier rewinds.
+    let text = text.lines().rev().find(|line| !line.trim().is_empty())?;
     let mut parts = text.split_whitespace();
     let cut: u64 = parts.next()?.parse().ok()?;
     let end = match parts.next() {
@@ -3021,6 +3032,42 @@ fn parse_rewind_marker(text: &str) -> Option<RewindMarker> {
 /// The two-number marker text: `"<cut> <end>"`.
 fn format_rewind_marker(cut: u64, end: u64) -> String {
     format!("{cut} {end}")
+}
+
+/// Ranges `[cut, end)` recorded by rewinds BEFORE the current (last) line.
+/// Lines that are not a complete, well-formed range are ignored.
+fn parse_rewind_history(text: &str) -> Vec<(u64, u64)> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some((_current, earlier)) = lines.split_last() else {
+        return Vec::new();
+    };
+    earlier
+        .iter()
+        .filter_map(|line| parse_rewind_marker(line))
+        .filter_map(|m| m.end.map(|end| (m.cut, end)))
+        .collect()
+}
+
+/// The marker file text after recording a new rewind `[cut, end)`: every
+/// earlier range is kept (an old one-number line, which meant "everything
+/// from its cut onward", is closed at this rewind's `end`), and the new
+/// range becomes the current, last line.
+fn append_rewind_marker(existing: &str, cut: u64, end: u64) -> String {
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter_map(parse_rewind_marker)
+        .map(|m| format_rewind_marker(m.cut, m.end.unwrap_or(end).max(m.cut)))
+        .collect();
+    lines.push(format_rewind_marker(cut, end));
+    lines.join("\n")
+}
+
+/// Earlier abandoned ranges for a session (see [`parse_rewind_history`]).
+fn read_rewind_history(sessions_dir: &Path, id: SessionId) -> Vec<(u64, u64)> {
+    let marker = sessions_dir.join(format!("{id}.rewind"));
+    std::fs::read_to_string(marker)
+        .map(|text| parse_rewind_history(&text))
+        .unwrap_or_default()
 }
 
 /// Engine cut for a session's marker, read synchronously while building
@@ -3060,7 +3107,15 @@ async fn upgrade_rewind_marker(
         .event_count(id)
         .await
         .map_err(|err| anyhow::anyhow!("cannot count session events: {err}"))?;
-    std::fs::write(&marker, format_rewind_marker(parsed.cut, end))
+    // Rewrite only the current (last) line; earlier ranges are kept.
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.pop();
+    lines.push(format_rewind_marker(parsed.cut, end));
+    std::fs::write(&marker, lines.join("\n"))
         .map_err(|err| anyhow::anyhow!("cannot rewrite rewind marker: {err}"))?;
     Ok(())
 }
@@ -3352,6 +3407,32 @@ mod tests {
             }),
             "fresh context = cut at 0, abandoning everything up to the log end"
         );
+    }
+
+    #[test]
+    fn rewind_marker_history_keeps_earlier_ranges() {
+        use super::{
+            append_rewind_marker, parse_rewind_history, parse_rewind_marker, RewindMarker,
+        };
+        // First rewind, then a later one further along the log.
+        let first = append_rewind_marker("", 2, 6);
+        assert_eq!(first, "2 6");
+        assert!(parse_rewind_history(&first).is_empty());
+        let second = append_rewind_marker(&first, 9, 12);
+        assert_eq!(second, "2 6\n9 12");
+        assert_eq!(
+            parse_rewind_marker(&second),
+            Some(RewindMarker {
+                cut: 9,
+                end: Some(12)
+            }),
+            "the last line is the current marker"
+        );
+        assert_eq!(parse_rewind_history(&second), vec![(2, 6)]);
+        // An old one-number marker is closed at the new rewind's end.
+        assert_eq!(append_rewind_marker("3", 8, 10), "3 10\n8 10");
+        // Junk lines are dropped, not propagated.
+        assert_eq!(append_rewind_marker("junk\n1 2", 4, 5), "1 2\n4 5");
     }
 
     #[test]
