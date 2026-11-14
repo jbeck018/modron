@@ -824,7 +824,18 @@ impl Engine {
         // sequential: checkpoints and approval gating are order-sensitive.
         // Gated calls (A1) also stay sequential: approval prompts must not
         // interleave.
-        let all_read_only = tool_calls.iter().all(|c| !is_gated(&c.name));
+        // A gated call only forces the sequential path when it would
+        // actually prompt; under ApproveAll or an allow-list entry it keeps
+        // the concurrency it had before the gate widened (parallel
+        // delegates).
+        let prompts = |name: &str| {
+            is_gated(name)
+                && self.config.approvals.mode != ApprovalMode::ApproveAll
+                && !self.config.approvals.allow.iter().any(|a| a == name)
+        };
+        let all_read_only = tool_calls
+            .iter()
+            .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(&c.name));
         let outcomes: Vec<ToolOutcome> = if all_read_only && tool_calls.len() > 1 {
             let futures = tool_calls
                 .iter()
