@@ -1995,13 +1995,26 @@ pub mod oauth {
 
         /// A started device login: show `user_code` + `verification_uri`
         /// to the user, then call [`finish`].
-        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[derive(Clone, PartialEq, Eq)]
         pub struct DeviceLogin {
             pub device_auth_id: String,
             pub user_code: String,
             pub verification_uri: String,
             /// Poll interval the server asked for (seconds).
             pub interval: u64,
+        }
+
+        /// `device_auth_id` is the poll credential for this login and
+        /// `user_code` authorizes it; neither may reach a log line.
+        impl std::fmt::Debug for DeviceLogin {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("DeviceLogin")
+                    .field("device_auth_id", &"<redacted>")
+                    .field("user_code", &"<redacted>")
+                    .field("verification_uri", &self.verification_uri)
+                    .field("interval", &self.interval)
+                    .finish()
+            }
         }
 
         /// Start the sign-in; returns the code the user enters at

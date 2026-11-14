@@ -126,7 +126,7 @@ pub struct JudgeConfig {
 }
 
 /// `[kev]` section (Phase-3b M3).
-#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct KevConfig {
     /// Base URL of the Kev/Jev server, e.g. http://127.0.0.1:8009.
     pub endpoint: String,
@@ -136,6 +136,18 @@ pub struct KevConfig {
     pub api_key: Option<String>,
     /// Same gating as `[judge]`.
     pub mode: Option<String>,
+}
+
+/// The bearer token must not reach a log line through `{:?}` of the config.
+impl std::fmt::Debug for KevConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KevConfig")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("mode", &self.mode)
+            .finish()
+    }
 }
 
 /// `[router]` section (Phase-3a R1).

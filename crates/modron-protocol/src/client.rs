@@ -53,12 +53,19 @@ pub fn check_welcome(frame: Option<Frame>, target: &str) -> HandshakeResult {
 /// Monotonic request ids, never reused (the id the client assigns is how
 /// replies correlate; restarting from 0 mid-connection could collide with
 /// an in-flight reply).
-#[derive(Default)]
 pub struct RequestIds(AtomicU64);
 
+impl Default for RequestIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RequestIds {
+    /// Ids start at 1: id 0 is reserved for the hello frame, so a reply to
+    /// hello can never be mistaken for the reply to a later request.
     pub fn new() -> Self {
-        Self::default()
+        Self(AtomicU64::new(1))
     }
 
     /// The next id (monotonic, never reused).
@@ -89,9 +96,9 @@ mod tests {
     #[test]
     fn ids_are_monotonic_and_never_reuse_zero() {
         let ids = RequestIds::new();
-        assert_eq!(ids.next(), 0);
         assert_eq!(ids.next(), 1);
         assert_eq!(ids.next(), 2);
+        assert_eq!(RequestIds::default().next(), 1, "default also skips 0");
     }
 
     #[test]
