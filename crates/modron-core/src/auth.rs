@@ -323,7 +323,7 @@ pub mod discovery {
 
     /// The tokens to persist on import — the two subscription flows
     /// Modron implements end to end.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub enum DetectedCredentials {
         ChatGpt {
             access_token: String,
@@ -334,6 +334,28 @@ pub mod discovery {
             access_token: String,
             refresh_token: Option<String>,
         },
+    }
+
+    impl std::fmt::Debug for DetectedCredentials {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ChatGpt {
+                    refresh_token,
+                    account_id,
+                    ..
+                } => f
+                    .debug_struct("ChatGpt")
+                    .field("access_token", &"<redacted>")
+                    .field("refresh_token", &oauth::redacted_opt(refresh_token))
+                    .field("account_id", account_id)
+                    .finish(),
+                Self::Anthropic { refresh_token, .. } => f
+                    .debug_struct("Anthropic")
+                    .field("access_token", &"<redacted>")
+                    .field("refresh_token", &oauth::redacted_opt(refresh_token))
+                    .finish(),
+            }
+        }
     }
 
     impl DetectedSignin {
@@ -776,6 +798,23 @@ mod tests {
     }
 
     #[test]
+    fn credential_structs_debug_without_secrets() {
+        let creds = discovery::DetectedCredentials::ChatGpt {
+            access_token: "SECRET-CG-AT".into(),
+            refresh_token: Some("SECRET-CG-RT".into()),
+            account_id: "acct-visible".into(),
+        };
+        let dbg = format!("{creds:?}");
+        assert!(!dbg.contains("SECRET-CG"), "{dbg}");
+        assert!(dbg.contains("acct-visible"), "{dbg}");
+        let anth = discovery::DetectedCredentials::Anthropic {
+            access_token: "SECRET-AN-AT".into(),
+            refresh_token: Some("SECRET-AN-RT".into()),
+        };
+        assert!(!format!("{anth:?}").contains("SECRET-AN"));
+    }
+
+    #[test]
     fn keys_are_masked_for_display() {
         assert_eq!(mask_key("sk-ant-1234567890"), "sk-…7890");
         assert_eq!(mask_key("short"), "…");
@@ -825,12 +864,24 @@ pub mod oauth {
 
     /// A prepared login: everything needed to show the URL and later
     /// exchange the code (the verifier must stay secret until then).
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct LoginSession {
         pub url: String,
         pub state: String,
         pub verifier: String,
         pub port: u16,
+    }
+
+    impl std::fmt::Debug for LoginSession {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // `url` embeds the state, so it is redacted too.
+            f.debug_struct("LoginSession")
+                .field("url", &"<redacted>")
+                .field("state", &"<redacted>")
+                .field("verifier", &"<redacted>")
+                .field("port", &self.port)
+                .finish()
+        }
     }
 
     /// Prepare a login: PKCE pair + state + the authorize URL, bound to a
@@ -1062,7 +1113,7 @@ pub mod oauth {
 
     /// Parse a token endpoint response. Refresh tokens may be absent on
     /// refresh grants that reuse the existing one.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct TokenSet {
         pub access_token: String,
         pub refresh_token: Option<String>,
@@ -1072,11 +1123,57 @@ pub mod oauth {
         pub id_token: Option<String>,
     }
 
+    impl std::fmt::Debug for TokenSet {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TokenSet")
+                .field("access_token", &"<redacted>")
+                .field("refresh_token", &redacted_opt(&self.refresh_token))
+                .field("expires_in", &self.expires_in)
+                .field("id_token", &redacted_opt(&self.id_token))
+                .finish()
+        }
+    }
+
+    /// Debug helper for secret fields: shows whether a secret is present
+    /// (`Some("<redacted>")` / `None`) without ever printing its value.
+    pub(super) fn redacted_opt(value: &Option<String>) -> Option<&'static str> {
+        value.as_ref().map(|_| "<redacted>")
+    }
+
+    /// Describe a response body for an error message WITHOUT echoing it:
+    /// the body may hold tokens. Only top-level field names are reported
+    /// (or a note that the body is not a JSON object).
+    pub(super) fn describe_body(body: &Value) -> String {
+        match body {
+            Value::Object(map) => {
+                let mut names: Vec<&str> = map.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                names.truncate(16);
+                format!("response fields: [{}]", names.join(", "))
+            }
+            _ => "response is not a JSON object".to_string(),
+        }
+    }
+
+    /// [`describe_body`] for raw response text: fields when it is JSON,
+    /// otherwise only its byte length.
+    pub(super) fn describe_text(text: &str) -> String {
+        match serde_json::from_str::<Value>(text) {
+            Ok(value) => describe_body(&value),
+            Err(_) => format!("non-JSON response of {} bytes", text.len()),
+        }
+    }
+
     pub fn parse_token_response(body: &Value) -> anyhow::Result<TokenSet> {
         let access_token = body
             .get("access_token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("token response missing access_token: {body}"))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "token response missing access_token ({})",
+                    describe_body(body)
+                )
+            })?
             .to_string();
         Ok(TokenSet {
             access_token,
@@ -1478,12 +1575,22 @@ pub mod oauth {
                 .get("user_code")
                 .or_else(|| body.get("usercode"))
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("usercode response missing user_code: {body}"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "usercode response missing user_code ({})",
+                        describe_body(&body)
+                    )
+                })?;
             Ok(DeviceLogin {
                 device_auth_id: body
                     .get("device_auth_id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("usercode response missing device_auth_id: {body}"))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "usercode response missing device_auth_id ({})",
+                            describe_body(&body)
+                        )
+                    })?
                     .to_string(),
                 user_code: user_code.to_string(),
                 verification_uri: VERIFY_URL.to_string(),
@@ -1529,18 +1636,32 @@ pub mod oauth {
                     continue;
                 }
                 if !status.is_success() {
+                    // The body may carry tokens: report its shape only.
                     let body = response.text().await.unwrap_or_default();
-                    return Err(anyhow!("device auth failed with status {status}: {body}"));
+                    return Err(anyhow!(
+                        "device auth failed with status {status} ({})",
+                        describe_text(&body)
+                    ));
                 }
                 let body: Value = response.json().await?;
                 let authorization_code = body
                     .get("authorization_code")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("poll response missing authorization_code: {body}"))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "poll response missing authorization_code ({})",
+                            describe_body(&body)
+                        )
+                    })?;
                 let code_verifier = body
                     .get("code_verifier")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("poll response missing code_verifier: {body}"))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "poll response missing code_verifier ({})",
+                            describe_body(&body)
+                        )
+                    })?;
                 let response = client
                     .post(token_url)
                     .form(&[
@@ -1620,11 +1741,21 @@ pub mod oauth {
         }
 
         /// Stored ChatGPT credentials: what the Responses provider needs.
-        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[derive(Clone, PartialEq, Eq)]
         pub struct ChatGptAuth {
             pub access_token: String,
             pub refresh_token: Option<String>,
             pub account_id: String,
+        }
+
+        impl std::fmt::Debug for ChatGptAuth {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("ChatGptAuth")
+                    .field("access_token", &"<redacted>")
+                    .field("refresh_token", &redacted_opt(&self.refresh_token))
+                    .field("account_id", &self.account_id)
+                    .finish()
+            }
         }
 
         pub fn token_file() -> anyhow::Result<PathBuf> {
@@ -1840,7 +1971,9 @@ pub mod oauth {
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("400"), "{err}");
-            assert!(err.to_string().contains("access_denied"), "{err}");
+            // The body is described by field NAME only, never echoed.
+            assert!(err.to_string().contains("error"), "{err}");
+            assert!(!err.to_string().contains("access_denied"), "{err}");
         }
 
         #[test]
@@ -2077,6 +2210,87 @@ pub mod oauth {
             );
             assert!(request.contains(r#""refresh_token":"rt-old""#), "{request}");
             assert!(request.contains(r#""client_id":"9d1c250a"#), "{request}");
+        }
+
+        /// Serve one canned HTTP response; returns the base URL.
+        fn one_shot_http(response: &'static str) -> String {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(response.as_bytes());
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        #[test]
+        fn secret_fields_never_appear_in_debug_output() {
+            let tokens = TokenSet {
+                access_token: "SECRET-AT-1".into(),
+                refresh_token: Some("SECRET-RT-1".into()),
+                expires_in: Some(28800),
+                id_token: Some("SECRET-ID-1".into()),
+            };
+            let dbg = format!("{tokens:?}");
+            for secret in ["SECRET-AT-1", "SECRET-RT-1", "SECRET-ID-1"] {
+                assert!(!dbg.contains(secret), "{dbg}");
+            }
+            assert!(dbg.contains("28800"), "{dbg}");
+
+            let login = LoginSession {
+                url: "https://claude.ai/oauth/authorize?state=SECRET-STATE-1".into(),
+                state: "SECRET-STATE-1".into(),
+                verifier: "SECRET-VERIFIER-1".into(),
+                port: 54545,
+            };
+            let dbg = format!("{login:?}");
+            assert!(!dbg.contains("SECRET-STATE-1"), "{dbg}");
+            assert!(!dbg.contains("SECRET-VERIFIER-1"), "{dbg}");
+            assert!(dbg.contains("54545"), "{dbg}");
+
+            let stored = chatgpt::ChatGptAuth {
+                access_token: "SECRET-GPT-AT".into(),
+                refresh_token: Some("SECRET-GPT-RT".into()),
+                account_id: "acct-visible".into(),
+            };
+            let dbg = format!("{stored:?}");
+            assert!(!dbg.contains("SECRET-GPT"), "{dbg}");
+            assert!(dbg.contains("acct-visible"), "{dbg}");
+        }
+
+        #[test]
+        fn token_response_errors_never_echo_the_body() {
+            let err = parse_token_response(&json!({
+                "refresh_token": "SECRET-RT-ECHO",
+                "error": "invalid_grant"
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(!err.contains("SECRET-RT-ECHO"), "{err}");
+            assert!(err.contains("access_token"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn device_poll_errors_never_echo_the_body() {
+            let poll = one_shot_http(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 54\r\nConnection: close\r\n\r\n{\"error\":\"server_error\",\"secret\":\"SECRET-POLL-BODY-1\"}",
+            );
+            let login = chatgpt::DeviceLogin {
+                device_auth_id: "dev-1".into(),
+                user_code: "ABCD-1234".into(),
+                verification_uri: chatgpt::VERIFY_URL.into(),
+                interval: 1,
+            };
+            let err = chatgpt::finish_at(&format!("{poll}/poll"), "http://127.0.0.1:9/t", &login)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains("SECRET-POLL-BODY-1"), "{err}");
+            assert!(err.contains("500"), "{err}");
         }
     }
 }
