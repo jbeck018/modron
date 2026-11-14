@@ -20,6 +20,115 @@ pub(crate) fn resolve_path(working_dir: &Path, raw: &str) -> PathBuf {
     }
 }
 
+/// A tool path resolved the way the filesystem will resolve it.
+pub(crate) struct ToolPath {
+    /// Absolute path: every existing ancestor is canonicalized (symlinks and
+    /// `..` resolved by the kernel), the not-yet-existing tail re-appended.
+    pub(crate) path: PathBuf,
+    /// True when some component of the raw path (below the working dir's own
+    /// location) is a symlink.
+    pub(crate) via_symlink: bool,
+}
+
+/// Resolves `raw` against `working_dir` as the filesystem will see it. The
+/// longest existing prefix is canonicalized; a `..` in the non-existing tail
+/// is an error because it cannot be resolved safely.
+pub(crate) fn resolve_tool_path(working_dir: &Path, raw: &str) -> std::io::Result<ToolPath> {
+    use std::path::Component;
+    let joined = resolve_path(working_dir, raw);
+    let comps: Vec<Component<'_>> = joined.components().collect();
+    let prefix = |n: usize| -> PathBuf { comps[..n].iter().collect() };
+
+    // lstat-based existence: a dangling symlink still counts as existing, so
+    // it is never silently treated as a plain missing name.
+    let mut k = comps.len();
+    while k > 0 && std::fs::symlink_metadata(prefix(k)).is_err() {
+        k -= 1;
+    }
+    if k == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no existing ancestor",
+        ));
+    }
+    let mut resolved = std::fs::canonicalize(prefix(k))?;
+    for comp in &comps[k..] {
+        match comp {
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "`..` in a path whose parent does not exist",
+                ))
+            }
+        }
+    }
+
+    let mut via_symlink = false;
+    for j in 1..=k {
+        let p = prefix(j);
+        if working_dir.starts_with(&p) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            via_symlink = true;
+            break;
+        }
+    }
+    Ok(ToolPath {
+        path: resolved,
+        via_symlink,
+    })
+}
+
+/// True when a resolved path is write-protected: its file name is an
+/// instruction source (`AGENTS.md`, `CLAUDE.md`), or a path component below
+/// the working dir is `.modron`, `.claude` or `.git`. ASCII case-insensitive.
+pub(crate) fn is_protected_path(resolved: &Path, canonical_working_dir: &Path) -> bool {
+    let name = resolved
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.eq_ignore_ascii_case("AGENTS.md") || name.eq_ignore_ascii_case("CLAUDE.md") {
+        return true;
+    }
+    let rel = resolved
+        .strip_prefix(canonical_working_dir)
+        .unwrap_or(resolved);
+    rel.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        [".modron", ".claude", ".git"]
+            .iter()
+            .any(|p| s.eq_ignore_ascii_case(p))
+    })
+}
+
+/// Gate for `write` and `edit`: returns the resolved path to write, or the
+/// message to report. Refuses symlink-mediated escapes out of the workspace
+/// and protected targets; plain absolute paths outside it are not refused.
+pub(crate) fn check_write_path(
+    working_dir: &Path,
+    raw: &str,
+) -> std::result::Result<PathBuf, String> {
+    let tool_path =
+        resolve_tool_path(working_dir, raw).map_err(|e| format!("cannot resolve `{raw}`: {e}"))?;
+    let canonical_wd =
+        std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    if tool_path.via_symlink && !tool_path.path.starts_with(&canonical_wd) {
+        return Err(format!(
+            "path resolves outside the workspace through a symlink: {raw}"
+        ));
+    }
+    if is_protected_path(&tool_path.path, &canonical_wd) {
+        return Err(format!(
+            "`{raw}` is write-protected (instruction/memory source); \
+             edit it yourself outside the agent"
+        ));
+    }
+    Ok(tool_path.path)
+}
+
 /// Extracts an optional non-negative integer argument. Accepts integral
 /// floats (`2000.0`) because some providers serialize integers that way.
 pub(crate) fn opt_usize(args: &Value, key: &str) -> Option<usize> {

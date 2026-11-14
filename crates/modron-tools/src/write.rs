@@ -1,6 +1,6 @@
 //! `write` tool (LEDGER T1) — create or overwrite text files.
 
-use crate::common::{arg_str, opt_bool, resolve_path, tool_err};
+use crate::common::{arg_str, check_write_path, opt_bool, resolve_path, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
@@ -35,22 +35,18 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-        // Protected instruction sources (Phase: competitive review A3) —
-        // the agent must not edit the files that instruct it. bash remains
-        // the documented escape hatch (and is approval-gated).
-        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-            if is_protected_path(path) {
-                return Ok(tool_err(
-                    NAME,
-                    format!(
-                        "`{path}` is write-protected (instruction/memory source); \
-                             edit it yourself outside the agent"
-                    ),
-                    MAX_BYTES,
-                ));
-            }
-        }
         const NAME: &str = "write";
+        // Protected instruction sources (Phase: competitive review A3) and
+        // workspace containment (D4): checked on the resolved path, so
+        // symlinks, `..` and letter case cannot route around it. bash remains
+        // the documented escape hatch (and is approval-gated).
+        let resolved = match args.get("path").and_then(|v| v.as_str()) {
+            Some(raw) => match check_write_path(&ctx.working_dir, raw) {
+                Ok(path) => Some(path),
+                Err(message) => return Ok(tool_err(NAME, message, MAX_BYTES)),
+            },
+            None => None,
+        };
         let spec = self.spec();
         if let Err(message) = validate_args(&spec, &args) {
             return Ok(tool_err(
@@ -61,6 +57,7 @@ impl Tool for WriteTool {
         }
         // Hard read-before-edit gate (Phase 13): overwriting an existing
         // file the session has not read is blocked; brand-new files are fine.
+        // The gate keys on the lexical path, the same key `read` records.
         if let (Some(engine), Some(raw_path)) =
             (&ctx.engine, args.get("path").and_then(|v| v.as_str()))
         {
@@ -76,12 +73,10 @@ impl Tool for WriteTool {
                 ));
             }
         }
-        let (Some(raw_path), Some(content)) = (arg_str(&args, "path"), arg_str(&args, "content"))
-        else {
+        let (Some(content), Some(path)) = (arg_str(&args, "content"), resolved) else {
             return Ok(tool_err(NAME, "missing `path` or `content`", MAX_BYTES));
         };
         let overwrite = opt_bool(&args, "overwrite").unwrap_or(false);
-        let path = resolve_path(&ctx.working_dir, raw_path);
 
         if tokio::fs::try_exists(&path).await.unwrap_or(false) && !overwrite {
             return Ok(tool_err(
@@ -234,22 +229,6 @@ mod tests {
     }
 }
 
-/// Files the agent may not modify: instruction and memory sources.
-fn is_protected_path(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    let name = p
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if name == "AGENTS.md" || name == "CLAUDE.md" {
-        return true;
-    }
-    p.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        s == ".modron" || s == ".claude" || s == ".git"
-    })
-}
-
 #[cfg(test)]
 mod protection_tests {
     use super::*;
@@ -286,5 +265,116 @@ mod protection_tests {
             .await
             .unwrap();
         assert!(!ok.is_error);
+    }
+
+    #[tokio::test]
+    async fn protected_names_match_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".GIT/hooks")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".Modron")).unwrap();
+        for path in [
+            ".GIT/hooks/x",
+            "agents.md",
+            ".Modron/config.toml",
+            "claude.md",
+        ] {
+            let outcome = WriteTool
+                .execute(
+                    serde_json::json!({"path": path, "content": "hijacked", "overwrite": true}),
+                    &ToolCtx::new(dir.path()),
+                )
+                .await
+                .unwrap();
+            assert!(
+                outcome.is_error,
+                "{path} must be refused: {}",
+                outcome.content
+            );
+            assert!(
+                outcome.content.contains("write-protected"),
+                "{path}: {}",
+                outcome.content
+            );
+        }
+        assert!(!dir.path().join(".GIT/hooks/x").exists());
+        assert!(!dir.path().join("agents.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_directory_symlink_into_git_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        std::os::unix::fs::symlink(".git/hooks", dir.path().join("docs")).unwrap();
+
+        let outcome = WriteTool
+            .execute(
+                serde_json::json!({"path": "docs/pre-commit", "content": "evil"}),
+                &ToolCtx::new(dir.path()),
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("write-protected"),
+            "{}",
+            outcome.content
+        );
+        assert!(!dir.path().join(".git/hooks/pre-commit").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overwrite_through_symlink_to_outside_file_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("bashrc");
+        std::fs::write(&victim, "original").unwrap();
+        std::os::unix::fs::symlink(&victim, ws.path().join("notes")).unwrap();
+
+        let outcome = WriteTool
+            .execute(
+                serde_json::json!({"path": "notes", "content": "evil", "overwrite": true}),
+                &ToolCtx::new(ws.path()),
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.is_error, "{}", outcome.content);
+        assert!(
+            outcome
+                .content
+                .contains("outside the workspace through a symlink"),
+            "{}",
+            outcome.content
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overwrite_through_symlink_inside_workspace_still_works() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("real.txt"), "old").unwrap();
+        std::os::unix::fs::symlink("real.txt", ws.path().join("link.txt")).unwrap();
+
+        let outcome = WriteTool
+            .execute(
+                serde_json::json!({"path": "link.txt", "content": "new", "overwrite": true}),
+                &ToolCtx::new(ws.path()),
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("real.txt")).unwrap(),
+            "new"
+        );
+        assert!(std::fs::symlink_metadata(ws.path().join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }
