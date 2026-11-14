@@ -423,7 +423,7 @@ async fn live_streaming_commits_on_turn_done() {
         texts,
         vec![
             "❯ count the files",
-            "100 tok · cache 40%",
+            "100 tok · cache 67%",
             "⏺ 1 tool · glob",
             "There are 42 files.",
         ],
@@ -435,7 +435,7 @@ async fn live_streaming_commits_on_turn_done() {
     assert_eq!(done.turns_completed, 1);
     assert_eq!(done.tool_calls_total, 1);
     assert_eq!(done.cumulative_tokens, 100);
-    assert_eq!(done.session_cache_pct, Some(40.0));
+    assert_eq!(done.session_cache_pct.map(|p| p.round()), Some(67.0));
     assert_eq!(done.running_label, "idle");
 
     server.abort();

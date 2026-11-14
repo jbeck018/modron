@@ -2327,14 +2327,9 @@ impl App {
                     self.note(format!("model {model} ({reason})"));
                 }
                 TranscriptEntry::Usage { model, usage } => {
-                    let denom = usage.input_tokens + usage.cached_input_tokens;
-                    let cache = if denom > 0 {
-                        format!(
-                            " · cache {:.0}%",
-                            100.0 * usage.cached_input_tokens as f64 / denom as f64
-                        )
-                    } else {
-                        String::new()
+                    let cache = match modron_view::cache_hit_pct(&usage) {
+                        Some(pct) => format!(" · cache {pct:.0}%"),
+                        None => String::new(),
                     };
                     self.note(format!("{} · {} tok{}", model, usage.total(), cache));
                 }
@@ -2862,32 +2857,18 @@ impl App {
         // Cache discipline: per-turn ratio plus the SESSION cumulative —
         // a falling cache hit rate is the cheapest early warning that
         // request prefixes went unstable (cost multiplies silently).
-        let session_cache = {
-            let all = self.cumulative.input_tokens + self.cumulative.cached_input_tokens;
-            if all > 0 {
-                format!(
-                    " (session {:.0}%)",
-                    100.0 * self.cumulative.cached_input_tokens as f64 / all as f64
-                )
-            } else {
-                String::new()
-            }
+        let session_cache = match modron_view::cache_hit_pct(&self.cumulative) {
+            Some(pct) => format!(" (session {pct:.0}%)"),
+            None => String::new(),
         };
         lines.push(
             Line::from(format!(
                 "  {} tok · {} turns · {} cache{session_cache}",
                 usage.total(),
                 turns,
-                {
-                    let all = usage.input_tokens + usage.cached_input_tokens;
-                    if all > 0 {
-                        format!(
-                            "{:.0}%",
-                            100.0 * usage.cached_input_tokens as f64 / all as f64
-                        )
-                    } else {
-                        "—".to_string()
-                    }
+                match modron_view::cache_hit_pct(&usage) {
+                    Some(pct) => format!("{pct:.0}%"),
+                    None => "—".to_string(),
                 }
             ))
             .style(Style::default().fg(t.dim)),
@@ -3027,15 +3008,8 @@ impl App {
         // Session-cumulative cache hit rate — a falling number is the
         // cheapest early warning that request prefixes went unstable
         // (same arithmetic as finish_turn's summary line).
-        let cache_denom = self.cumulative.input_tokens + self.cumulative.cached_input_tokens;
-        if cache_denom > 0 {
-            spans.push(Span::styled(
-                format!(
-                    " · cache {:.0}%",
-                    100.0 * self.cumulative.cached_input_tokens as f64 / cache_denom as f64
-                ),
-                dim,
-            ));
+        if let Some(pct) = modron_view::cache_hit_pct(&self.cumulative) {
+            spans.push(Span::styled(format!(" · cache {pct:.0}%"), dim));
         }
         // Estimated context pressure; at the 80% compaction trigger the
         // segment flips to the warning color and shouts `!`.
