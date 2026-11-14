@@ -468,9 +468,13 @@ Serial: D1 -> D2 -> D3 -> D4 -> D5 -> D6.
 - Files: `crates/modron-tools/src/edit.rs`, `write.rs` if it has its own
   call site (+ tests).
 - Change: canonicalize the deepest existing ancestor, re-append the rest,
-  compare components case-insensitively.
+  compare components case-insensitively. Also (follow-up from D1, which
+  made `write_atomic` write THROUGH symlinks): `write` and `edit` refuse a
+  path whose resolved target is outside `ctx.working_dir` when any
+  component of the path is a symlink (a repo-shipped `notes -> ~/.bashrc`
+  must not be writable through the link).
 - Acceptance: tests - `docs -> .git/hooks` symlink then `docs/pre-commit`
-  is refused; `.GIT/hooks/x` and `agents.md` are refused.
+  is refused; a symlink pointing outside the workspace is refused; `.GIT/hooks/x` and `agents.md` are refused.
 
 **D5 | H | low - Bounded reads on model-supplied paths**
 - Files: `crates/modron-tools/src/read.rs`, `grep.rs`, `minify.rs`,
@@ -673,14 +677,14 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 
 | ID | Tier | Sev | Status | Worker | Commit | Evidence / notes |
 |----|------|-----|--------|--------|--------|------------------|
-| A1 | H+ | critical | TODO | | | |
+| A1 | H+ | critical | DONE | | a34ca85 | Haiku. Leader follow-up: gated calls stay concurrent when they would not prompt. 3 new tests. |
 | A2 | H+ | high | TODO | | | |
 | A3 | H+ | high | TODO | | | |
 | A4 | H | high | TODO | | | |
 | A5 | H | medium | TODO | | | |
 | A6 | H | medium | TODO | | | |
 | A7 | L | medium | TODO | | | |
-| B1 | H+ | critical | TODO | | | |
+| B1 | H+ | critical | DONE | | bebc4b3 | Haiku, one BLOCKED round (scope widened to tests/common/mod.rs). Leader follow-up: --allow-origin flag. 5 new tests. |
 | B2 | H+ | high | TODO | | | |
 | B3 | H | high | TODO | | | |
 | B4 | H | medium | TODO | | | |
@@ -688,19 +692,19 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 | B6 | H | medium | TODO | | | |
 | B7 | H | low | TODO | | | |
 | B8 | H | critical | TODO | | | after B1 |
-| C1 | H+ | high | TODO | | | needs-macos |
+| C1 | H+ | high | DONE | | 4d0ea46 | Haiku. Desktop and App.tsx edits NOT compiled (needs-macos, no node_modules). 7 new tests on Linux crates. |
 | C2 | H | high | TODO | | | |
 | C3 | H | medium | TODO | | | |
 | C4 | H | medium | TODO | | | |
 | C5 | H+ | medium | TODO | | | after B3; needs-macos |
 | C6 | H | high | TODO | | | needs-macos; cargo-deny |
-| D1 | H+ | medium | TODO | | | |
+| D1 | H+ | medium | DONE | | 4e4b6cc | Haiku. 4 new tests. Follow-up added to D4 (write-through symlink outside workspace). |
 | D2 | H | medium | TODO | | | |
 | D3 | H+ | medium | TODO | | | |
 | D4 | H | medium | TODO | | | |
 | D5 | H | low | TODO | | | |
 | D6 | L | medium | TODO | | | |
-| E1 | H | medium | TODO | | | |
+| E1 | H | medium | DONE | | 8bb9ea5 | Haiku. Idle tests use real short timers, not paused time. 4 new tests. |
 | E2 | H | medium | TODO | | | |
 | E3 | H | medium | TODO | | | |
 | E4 | H | medium | TODO | | | |
@@ -713,11 +717,20 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 | F3 | H | low | TODO | | | |
 | F4 | H | medium | TODO | | | |
 | F5 | H | low | TODO | | | after B6 |
-| G1 | H | medium | TODO | | | |
-| G2 | H | low | TODO | | | |
-| G3 | H | medium | TODO | | | |
-| G4 | H | medium | TODO | | | |
-| G5 | H | low | TODO | | | |
+| G1 | H | medium | DONE | | db6b845 | Leader. bash -n ok; not run in a container. |
+| G2 | H | low | DONE | | db6b845 | Leader. NOT built (no docker daemon). |
+| G3 | H | medium | DONE | | 2e475c9 | Leader. Good and bad checksum paths tested against a local fake release. |
+| G4 | H | medium | DONE | | 4852bfa | Leader. SHAs from git ls-remote; YAML parses; workflows not run. |
+| G5 | H | low | DONE | | 728a8e7 | Leader. |
+
+Wave 1 gate evidence (leader, 2026-11-14): fmt clean, clippy clean, 658
+tests pass on `cargo test --workspace --exclude modron-desktop` after a
+full rebuild.
+
+Lesson from wave 1: workers must NOT share one CARGO_TARGET_DIR across
+worktrees - it produced a stale modron-core artifact and a false test
+failure in the leader's workspace run. Each worker uses its own target
+dir; the leader touches all sources before the merge gates.
 
 ## 6. Suggested wave order
 
