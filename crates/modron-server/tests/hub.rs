@@ -221,6 +221,43 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
 
     // Unknown request ids never resolve.
     assert!(handle.resolve("req-ghost", Decision::Deny).is_err());
+
+    // Allow-all is per RUN: starting the next run clears it, so the first
+    // mutating call of that run asks again.
+    hub.start_run(
+        id,
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(modron_core::RunSummary {
+                session_id: id,
+                answer: "unreachable".into(),
+                turns: 0,
+                tool_calls: 0,
+                usage: Default::default(),
+                models_used: vec![],
+            })
+        }),
+    )
+    .unwrap();
+    let parked = Arc::clone(&handle);
+    let call_clone = call.clone();
+    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone) });
+    let request_id = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the next run must ask again")
+            .map(parse_live)
+            .unwrap();
+        if let Payload::ApprovalRequested { request_id, .. } = frame.payload {
+            break request_id;
+        }
+    };
+    handle.resolve(&request_id, Decision::Deny).unwrap();
+    assert!(!tokio::time::timeout(Duration::from_secs(2), gate)
+        .await
+        .unwrap()
+        .unwrap());
+    handle.interrupt();
 }
 
 /// Interrupt: a run occupying the slot is aborted, a parked approver

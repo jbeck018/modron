@@ -875,6 +875,9 @@ impl SessionHub {
             return Err("session busy (a run is active)".to_string());
         }
         handle.aborted.store(false, Ordering::Relaxed);
+        // "Allow all" is sticky for the rest of the RUN only (AGENTS.md
+        // interaction semantics): a new run starts un-approved.
+        handle.allow_rest.store(false, Ordering::Relaxed);
         let owner = Arc::clone(&handle);
         let task = tokio::spawn(async move {
             let result = run.await;
