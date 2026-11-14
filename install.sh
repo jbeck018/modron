@@ -36,31 +36,60 @@ fi
 info "installing modron ($TARGET) into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-TARBALL="$(mktemp "${TMPDIR:-/tmp}/modron.tar.gz.XXXXXX")"
-trap 'rm -f "$TARBALL"' EXIT
+WORKDIR_DL="$(mktemp -d "${TMPDIR:-/tmp}/modron-install.XXXXXX")"
+trap 'rm -rf "$WORKDIR_DL"' EXIT
+ARCHIVE="modron-$TARGET.tar.gz"
+TARBALL="$WORKDIR_DL/$ARCHIVE"
 
-# Try the release binary; any failure along the way (no curl, 404, or a
-# tar that cannot unpack it) falls through to the source build.
-INSTALLED=0
-if command -v curl >/dev/null 2>&1 && curl -fsSL -o "$TARBALL" "$URL" 2>/dev/null; then
-  if tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron 2>/dev/null; then
-    rm -f "$TARBALL"
-    info "installed release binary"
-    INSTALLED=1
+sha256_check() {
+  # Verifies "<hash>  <file>" lines in $1 against files in the cwd.
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$1"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "$1"
   else
-    info "release archive could not be unpacked"
+    fail "neither sha256sum nor shasum found - cannot verify the download"
   fi
+}
+
+# Try the release binary. Only "no release for this platform" (HTTP 404)
+# or a missing curl falls through to the source build; a checksum
+# mismatch or a broken archive is fatal - never install an unverified
+# binary and never paper over a tampered one by building something else.
+INSTALLED=0
+if command -v curl >/dev/null 2>&1; then
+  HTTP_CODE="$(curl -sSL -o "$TARBALL" -w '%{http_code}' "$URL")" || fail "download failed: $URL"
+  case "$HTTP_CODE" in
+    200)
+      curl -fsSL -o "$TARBALL.sha256" "$URL.sha256" \
+        || fail "release has no checksum file ($URL.sha256) - refusing to install an unverified binary"
+      (cd "$WORKDIR_DL" && sha256_check "$ARCHIVE.sha256" >/dev/null) \
+        || fail "checksum mismatch for $ARCHIVE - refusing to install"
+      tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron \
+        || fail "release archive could not be unpacked"
+      info "installed release binary (sha256 verified)"
+      INSTALLED=1
+      ;;
+    404) info "no release binary for $TARGET ($VERSION)" ;;
+    *) fail "unexpected HTTP $HTTP_CODE fetching $URL" ;;
+  esac
+else
+  info "curl not found - cannot fetch a release binary"
 fi
 
 if [ "$INSTALLED" -ne 1 ]; then
-  info "no usable release binary — building from source (requires Rust 1.99+)"
-  command -v cargo >/dev/null 2>&1 || fail "cargo not found — install rustup from https://rustup.rs"
-  command -v git >/dev/null 2>&1 || fail "git not found — install git to build from source"
-  TMPDIR_BUILD="$(mktemp -d)"
-  git clone --depth 1 "https://github.com/$REPO.git" "$TMPDIR_BUILD/modron"
-  (cd "$TMPDIR_BUILD/modron" && cargo build --release)
-  cp "$TMPDIR_BUILD/modron/target/release/modron" "$INSTALL_DIR/modron"
-  rm -rf "$TMPDIR_BUILD"
+  info "building from source (requires Rust 1.99+)"
+  command -v cargo >/dev/null 2>&1 || fail "cargo not found - install rustup from https://rustup.rs"
+  command -v git >/dev/null 2>&1 || fail "git not found - install git to build from source"
+  SRC="$WORKDIR_DL/src"
+  if [ "$VERSION" = "latest" ]; then
+    git clone --depth 1 "https://github.com/$REPO.git" "$SRC"
+  else
+    git clone --depth 1 --branch "$VERSION" "https://github.com/$REPO.git" "$SRC"
+  fi
+  # -p modron-cli: the CLI only (the desktop crate needs GUI system libs).
+  (cd "$SRC" && cargo build --release --locked -p modron-cli)
+  cp "$SRC/target/release/modron" "$INSTALL_DIR/modron"
   info "built and installed from source"
 fi
 
@@ -68,4 +97,4 @@ case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) info "note: add $INSTALL_DIR to your PATH (export PATH=\"$INSTALL_DIR:\$PATH\")" ;;
 esac
-info "done — run: modron --help"
+info "done - run: modron --help"
