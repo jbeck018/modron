@@ -7,8 +7,15 @@ use crate::client::{handshake_timeout, hello_frame, In};
 use crate::error::ClientError;
 use futures_util::{SinkExt, StreamExt};
 use modron_protocol::{Frame, Payload, PROTOCOL_VERSION};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+
+/// Largest whole message accepted: the server sends a full snapshot in one
+/// frame. Same limits as the desktop client (`modron-desktop` wire.rs), so a
+/// session that opens on desktop opens here.
+const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -54,7 +61,12 @@ pub(crate) async fn handshake(
     url: &str,
     token: Option<&str>,
 ) -> Result<(Conn, String), ClientError> {
-    let (ws, _) = connect_async(url)
+    // Limits are set explicitly (the tungstenite defaults are 64 MiB per
+    // message); `connect` itself is bounded by the caller's connect deadline.
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_MESSAGE_BYTES);
+    config.max_frame_size = Some(MAX_FRAME_BYTES);
+    let (ws, _) = connect_async_with_config(url, Some(config), false)
         .await
         .map_err(|e| ClientError::Connect(e.to_string()))?;
     let (mut sink, mut stream) = ws.split();

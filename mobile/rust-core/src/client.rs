@@ -47,7 +47,55 @@ pub fn default_url() -> String {
     format!("ws://127.0.0.1:{DEFAULT_PORT}")
 }
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the whole connect: TCP/TLS open plus the hello/welcome
+/// handshake (native), or the browser open plus welcome (web).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Protocol keepalive: a `ping` every `ping_every` while connected. A
+/// connection with no inbound frame for `idle_timeout` counts as dropped
+/// (checked on the ping cadence, so the drop lands within one `ping_every`
+/// after that window).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepaliveConfig {
+    pub ping_every: Duration,
+    pub idle_timeout: Duration,
+}
+
+impl Default for KeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            ping_every: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(90),
+        }
+    }
+}
+
+/// Per-client connect settings. Defaults: loopback-only plain `ws://`,
+/// the 15 second connect deadline, and the 30s/90s keepalive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectOptions {
+    /// Allow plain `ws://` to a non-loopback host (trusted LAN only). The
+    /// shell's explicit opt-in toggle; `wss://` never needs it.
+    pub allow_insecure: bool,
+    /// Deadline for connect plus handshake.
+    pub connect_timeout: Duration,
+    pub keepalive: KeepaliveConfig,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            allow_insecure: false,
+            connect_timeout: HANDSHAKE_TIMEOUT,
+            keepalive: KeepaliveConfig::default(),
+        }
+    }
+}
+
+/// The one notice a connection shows when it receives a frame this client
+/// cannot decode (shared copy: the same words in every client).
+pub const UNDECODABLE_NOTE: &str =
+    "received a frame this client version cannot read - some updates may be missing; upgrade modron";
 
 /// Inbound events after the handshake; the transport-specific shapes
 /// (tungstenite messages / browser events) normalize to these.
@@ -209,6 +257,8 @@ struct Shared {
     gen: AtomicU64,
     /// Request-id counter (0 is reserved for the uncorrelated hello).
     next_id: AtomicU64,
+    /// Connect deadline and keepalive, fixed for this client's lifetime.
+    options: ConnectOptions,
 }
 
 #[derive(Default)]
@@ -235,7 +285,7 @@ fn retire(slot: &mut Option<Live>) {
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(options: ConnectOptions) -> Self {
         let (closed_tx, closed_rx) = watch::channel(false);
         Self {
             state: Mutex::new(CoreState::default()),
@@ -244,6 +294,7 @@ impl Shared {
             closed_rx,
             gen: AtomicU64::new(0),
             next_id: AtomicU64::new(0),
+            options,
         }
     }
 
@@ -280,9 +331,19 @@ impl RemoteClient {
     /// (and `connection` goes `Disconnected`); only a malformed URL
     /// fails synchronously.
     pub fn connect(url: &str, token: Option<&str>) -> Result<Self, ClientError> {
-        validate_ws_url(url, false)?;
+        Self::connect_with_options(url, token, ConnectOptions::default())
+    }
+
+    /// [`Self::connect`] with explicit options: the LAN `ws://` opt-in
+    /// (`allow_insecure`), the connect deadline, and the keepalive timing.
+    pub fn connect_with_options(
+        url: &str,
+        token: Option<&str>,
+        options: ConnectOptions,
+    ) -> Result<Self, ClientError> {
+        validate_ws_url(url, options.allow_insecure)?;
         let client = Self {
-            shared: Arc::new(Shared::new()),
+            shared: Arc::new(Shared::new(options)),
         };
         client.spin_up(url, token, None);
         Ok(client)
@@ -298,7 +359,19 @@ impl RemoteClient {
         session_id: Uuid,
         token: Option<&str>,
     ) -> Result<(), ClientError> {
-        validate_ws_url(url, false)?;
+        self.reconnect_with_options(url, session_id, token, false)
+    }
+
+    /// [`Self::reconnect`] with the LAN `ws://` opt-in (`allow_insecure`),
+    /// passed through to the URL check exactly as at connect time.
+    pub fn reconnect_with_options(
+        &self,
+        url: &str,
+        session_id: Uuid,
+        token: Option<&str>,
+        allow_insecure: bool,
+    ) -> Result<(), ClientError> {
+        validate_ws_url(url, allow_insecure)?;
         let last_seq = {
             let st = self.shared.state.lock().unwrap();
             st.vm.last_seq
@@ -324,6 +397,7 @@ impl RemoteClient {
             st.vm.connection = crate::view::ConnectionState::Connecting;
             st.vm.last_error = None;
             st.vm.sessions.clear();
+            st.vm.pending_approvals.clear();
         }
         let _ = self.shared.closed_tx.send(false);
         let shared = self.shared.clone();
@@ -348,13 +422,19 @@ impl RemoteClient {
         std::mem::take(&mut st.vm.new_entries)
     }
 
-    /// Take the pending approval out of the view (the wire truth stays
-    /// authoritative: the server's `ApprovalResolved` echo clears the
-    /// rest of the state). Non-destructive reads use
-    /// `state().pending_approval`.
+    /// Take the front pending approval out of the queue (the wire truth
+    /// stays authoritative: the server's `ApprovalResolved` echo removes
+    /// the rest). The next queued request becomes the front. Non-destructive
+    /// reads use `state().pending_approval`.
     pub fn take_pending_approval(&self) -> Option<PendingApprovalView> {
         let mut st = self.shared.state.lock().unwrap();
-        st.vm.pending_approval.take()
+        st.vm.pending_approvals.pop_front()
+    }
+
+    /// Frames this client could not decode, since the client was created
+    /// (each one also counts toward the single per-connection notice).
+    pub fn undecodable_frames(&self) -> u64 {
+        self.shared.state.lock().unwrap().vm.undecodable_frames
     }
 
     /// Last seen server seq for the attached session (reconnect resumes
@@ -440,13 +520,19 @@ impl RemoteClient {
         request_id: impl Into<String>,
         decision: Decision,
     ) -> Result<(), ClientError> {
+        let request_id = request_id.into();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Approve {
-                request_id: request_id.into(),
+                request_id: request_id.clone(),
                 decision,
             },
-        ))
+        ))?;
+        // Answered: the view moves on to the next queued request now. The
+        // server's ApprovalResolved echo is then a no-op for this id.
+        let mut st = self.shared.state.lock().unwrap();
+        crate::view::resolve_approval(&mut st.vm, &request_id);
+        Ok(())
     }
 
     /// Mutate config for future turns only (server semantics).
@@ -686,6 +772,7 @@ impl RemoteClient {
             let mut st = self.shared.state.lock().unwrap();
             st.vm.connection = crate::view::ConnectionState::Disconnected;
             st.vm.last_error = None;
+            st.vm.pending_approvals.clear();
         }
         drop(slot);
         let _ = self.shared.closed_tx.send(true);
@@ -719,7 +806,18 @@ async fn establish(
     token: Option<String>,
     resume: Option<(Uuid, u64)>,
 ) {
-    match transport::handshake(&url, token.as_deref()).await {
+    // One deadline over connect plus handshake, on every transport: a
+    // server that accepts the socket but never welcomes fails here with a
+    // clear error instead of hanging the connecting state.
+    let deadline = shared.options.connect_timeout;
+    let attempt = transport::handshake(&url, token.as_deref());
+    let handshake = match with_timeout(deadline, attempt).await {
+        Some(result) => result,
+        None => Err(ClientError::Connect(format!(
+            "timed out after {deadline:?} waiting to connect and receive the server's welcome"
+        ))),
+    };
+    match handshake {
         Ok((mut conn, server_version)) => {
             let (tx, rx) = mpsc::unbounded_channel();
             let (close, close_rx) = oneshot::channel();
@@ -773,6 +871,20 @@ async fn run_loop(
     mut rx: mpsc::UnboundedReceiver<Frame>,
     mut close_rx: oneshot::Receiver<()>,
 ) {
+    let keepalive = shared.options.keepalive;
+    // Keepalive runs on one timer (one per ping period, never per frame).
+    // Each tick sends a ping and checks whether any inbound frame arrived
+    // since the previous tick; `silent_limit` consecutive silent ticks mean
+    // the idle window has passed, so the drop lands between `idle_timeout`
+    // and `idle_timeout + ping_every` after the last frame.
+    let ping_ms = keepalive.ping_every.as_millis().max(1);
+    let silent_limit = keepalive.idle_timeout.as_millis().div_ceil(ping_ms).max(1);
+    let mut next_ping = Box::pin(delay(keepalive.ping_every));
+    let mut heard_since_tick = false;
+    let mut silent_ticks: u128 = 0;
+    // One undecodable-frame notice per connection (this loop is one
+    // connection; a reconnect runs a fresh loop with the flag cleared).
+    let mut noted_undecodable = false;
     let reason: Option<String> = loop {
         tokio::select! {
             // Retired by disconnect() or a newer connect(): close the socket.
@@ -798,20 +910,62 @@ async fn run_loop(
                     break None;
                 }
             },
-            msg = conn.next_in() => match msg {
-                Some(Ok(In::Text(json))) => match serde_json::from_str::<Frame>(&json) {
-                    Ok(frame) => fold_frame(&shared, frame),
-                    Err(e) => tracing::warn!(error = %e, "inbound frame decode failed"),
-                },
-                Some(Ok(In::Open)) => {}
-                Some(Ok(In::Closed)) | None => {
-                    break Some("server closed the connection".into());
+            msg = conn.next_in() => {
+                if matches!(msg, Some(Ok(_))) {
+                    heard_since_tick = true;
                 }
-                Some(Err(e)) => break Some(e.to_string()),
+                match msg {
+                    Some(Ok(In::Text(json))) => match serde_json::from_str::<Frame>(&json) {
+                        Ok(frame) => fold_frame(&shared, frame),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "inbound frame decode failed");
+                            note_undecodable(&shared, &mut noted_undecodable);
+                        }
+                    },
+                    Some(Ok(In::Open)) => {}
+                    Some(Ok(In::Closed)) | None => {
+                        break Some("server closed the connection".into());
+                    }
+                    Some(Err(e)) => break Some(e.to_string()),
+                }
+            },
+            _ = &mut next_ping => {
+                next_ping = Box::pin(delay(keepalive.ping_every));
+                if std::mem::take(&mut heard_since_tick) {
+                    silent_ticks = 0;
+                } else {
+                    silent_ticks += 1;
+                }
+                if silent_ticks >= silent_limit {
+                    conn.close().await;
+                    break Some(format!(
+                        "connection lost: no frames from the server for {:?}",
+                        keepalive.idle_timeout
+                    ));
+                }
+                let ping = Frame::request(shared.next_request_id(), Payload::Ping {});
+                let sent = match serde_json::to_string(&ping) {
+                    Ok(json) => conn.send_text(&json).await,
+                    Err(e) => Err(ClientError::Json(e.to_string())),
+                };
+                if let Err(e) = sent {
+                    break Some(format!("keepalive failed: {e}"));
+                }
             },
         }
     };
     shutdown(&shared, gen, reason);
+}
+
+/// Count one undecodable frame; the first in a connection also raises the
+/// shared notice (later ones only count).
+fn note_undecodable(shared: &Shared, noted: &mut bool) {
+    let mut st = shared.state.lock().unwrap();
+    st.vm.undecodable_frames += 1;
+    if !*noted {
+        *noted = true;
+        st.vm.last_note = Some(UNDECODABLE_NOTE.into());
+    }
 }
 
 /// Mark the connection down and release the command channel. Guarded by
@@ -828,6 +982,7 @@ fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
         let mut st = shared.state.lock().unwrap();
         st.vm.connection = crate::view::ConnectionState::Disconnected;
         st.vm.last_error = reason;
+        st.vm.pending_approvals.clear();
     }
     drop(slot);
     let _ = shared.closed_tx.send(true);
@@ -883,16 +1038,10 @@ fn fold_frame(shared: &Shared, frame: Frame) {
             fold.fold_tool(vm, &core);
         }
         Payload::ApprovalRequested { request_id, call } => {
-            vm.pending_approval = Some(PendingApprovalView::new(request_id, &call));
+            crate::view::enqueue_approval(vm, request_id, &call);
         }
         Payload::ApprovalResolved { request_id, .. } => {
-            if vm
-                .pending_approval
-                .as_ref()
-                .is_some_and(|p| p.request_id == request_id)
-            {
-                vm.pending_approval = None;
-            }
+            crate::view::resolve_approval(vm, &request_id);
         }
         Payload::ConfigChanged { patch } => apply_config(vm, &patch),
         Payload::Sessions { sessions } => vm.sessions = sessions,
@@ -1035,7 +1184,7 @@ mod tests {
 
     /// Fold one frame into a fresh shared state and return the snapshot.
     fn folded(frame: Frame) -> ViewModelSnapshot {
-        let shared = Shared::new();
+        let shared = Shared::new(ConnectOptions::default());
         fold_frame(&shared, frame);
         let st = shared.state.lock().unwrap();
         ViewModelSnapshot::from_vm(&st.vm)
@@ -1073,7 +1222,7 @@ mod tests {
             )
         };
         // Default is off: reasoning deltas never reach the folded state.
-        let shared = Shared::new();
+        let shared = Shared::new(ConnectOptions::default());
         fold_frame(&shared, delta("step one ", 1));
         fold_frame(&shared, delta("step two", 2));
         {

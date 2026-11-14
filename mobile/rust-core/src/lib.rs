@@ -50,7 +50,9 @@ pub(crate) use transport_native as transport;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use transport_web as transport;
 
-pub use client::{default_url, RemoteClient, CLIENT_NAME};
+pub use client::{
+    default_url, ConnectOptions, KeepaliveConfig, RemoteClient, CLIENT_NAME, UNDECODABLE_NOTE,
+};
 pub use error::ClientError;
 pub use view::{
     approval_mode_label, connection_label, entry_lines, ConnectionState, DecisionOption,

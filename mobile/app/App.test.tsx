@@ -59,6 +59,19 @@ test("reasoning chip toggles", async () => {
   expect(app.texts()).not.toContain("reasoning off");
 });
 
+// The LAN opt-in (plain ws:// to a non-loopback host): off by default, and
+// the chip flips it. Only the next connect carries it, so no reconnect here.
+test("insecure ws toggle is off by default and flips", async () => {
+  const app = await open("./App.tsx");
+  expect(app.texts()).toContain("allow insecure ws:// (LAN only): off");
+  await app.press("allow insecure ws:// (LAN only): off");
+  await settle();
+  expect(app.texts()).toContain("allow insecure ws:// (LAN only): on");
+  await app.press("allow insecure ws:// (LAN only): on");
+  await settle();
+  expect(app.texts()).toContain("allow insecure ws:// (LAN only): off");
+});
+
 test("demo approval resolves locally", async () => {
   const app = await openDemoChat();
   expect(app.texts()).toContain("approve edit?");

@@ -16,8 +16,11 @@
 //! - `Event` frames append committed rows by folding through
 //!   [`modron_view::ReplayFolder`] one push at a time (see `FoldState`).
 //! - `Tool` frames feed [`modron_view::ActivityTracker`] (the live strip).
-//! - `ApprovalRequested` blocks on a decision; `ApprovalResolved` clears
-//!   it. Config changes are label updates for future turns only.
+//! - `ApprovalRequested` joins a FIFO queue; the view shows the front.
+//!   `ApprovalResolved` removes its request id wherever it sits in the
+//!   queue; answering removes the front. A `Snapshot` replaces the queue
+//!   with the snapshot's own pending approval; a disconnect clears it.
+//!   Config changes are label updates for future turns only.
 //!
 //! Usage accounting: cumulative usage grows from persisted `Usage` events
 //! (`usage_totals` arithmetic) and resets to the snapshot's live value on
@@ -30,6 +33,7 @@ use modron_protocol::{
 use modron_types::{Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_view::{replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -221,7 +225,11 @@ pub struct SessionViewModel {
     pub turn_tools: Vec<ToolEvent>,
     /// Live swarm rows.
     pub subagents: Vec<SwarmRow>,
-    pub pending_approval: Option<PendingApprovalView>,
+    /// Approvals awaiting a decision, oldest first. The view shows the
+    /// front; see the module docs for the queue rules.
+    pub pending_approvals: VecDeque<PendingApprovalView>,
+    /// Inbound frames this client could not decode (counted, not shown).
+    pub undecodable_frames: u64,
     pub cumulative_usage: Usage,
     pub model: String,
     pub provider: String,
@@ -380,7 +388,7 @@ impl ViewModelSnapshot {
             tool_lines: vm.turn_tools.iter().map(ToolEvent::summary).collect(),
             turn_summary_line: vm.turn_summary_line(),
             subagent_rows: vm.subagents.iter().map(SwarmRow::summary).collect(),
-            pending_approval: vm.pending_approval.clone(),
+            pending_approval: vm.pending_approvals.front().cloned(),
             approval_mode: vm.approval_mode,
             approval_mode_label: approval_mode_label(vm.approval_mode).to_string(),
             sandbox: sandbox_label(vm.sandbox).to_string(),
@@ -634,11 +642,60 @@ pub(crate) fn fold_snapshot(
     vm.allow_tools = live.allow.clone();
     vm.deny_tools = live.deny.clone();
     vm.cumulative_usage = live.cumulative_usage;
-    vm.pending_approval = live
-        .pending_approval
-        .clone()
-        .map(|PendingApproval { request_id, call }| PendingApprovalView::new(request_id, &call));
+    // The snapshot is the whole truth for approvals: its one pending
+    // request (if any) replaces whatever was queued before the reattach.
+    vm.pending_approvals.clear();
+    if let Some(PendingApproval { request_id, call }) = &live.pending_approval {
+        enqueue_approval(vm, request_id.clone(), call);
+    }
+    // Counters are re-derived from the log, not accumulated onto the old
+    // values (a reattach would otherwise double-count).
+    let (turns, tool_calls) = count_log(events);
+    vm.turns_completed = turns;
+    vm.tool_calls_total = tool_calls;
     fold.seed_from_live(vm, live);
+}
+
+/// Session counters from a persisted log, the same units the live
+/// `TurnDone` summary reports: one model turn per per-turn `TurnTrace`
+/// record (verifier records and the terminal stop record are not turns),
+/// and one tool call per `ToolResult` (the engine appends one per executed
+/// call).
+pub(crate) fn count_log(events: &[SessionEvent]) -> (u32, u32) {
+    let mut turns = 0u32;
+    let mut tool_calls = 0u32;
+    for event in events {
+        match event {
+            SessionEvent::TurnTrace {
+                verifier: None,
+                failure_label: None,
+                ..
+            } => turns += 1,
+            SessionEvent::ToolResult { .. } => tool_calls += 1,
+            _ => {}
+        }
+    }
+    (turns, tool_calls)
+}
+
+/// Queue an approval request. A repeat of an id already queued replaces
+/// that entry in place (no double prompt for one request).
+pub(crate) fn enqueue_approval(vm: &mut SessionViewModel, request_id: String, call: &ToolCall) {
+    let view = PendingApprovalView::new(request_id, call);
+    match vm
+        .pending_approvals
+        .iter()
+        .position(|p| p.request_id == view.request_id)
+    {
+        Some(index) => vm.pending_approvals[index] = view,
+        None => vm.pending_approvals.push_back(view),
+    }
+}
+
+/// Remove one request from the queue wherever it sits. Unknown ids are a
+/// no-op (the server echo of an answer the client already removed).
+pub(crate) fn resolve_approval(vm: &mut SessionViewModel, request_id: &str) {
+    vm.pending_approvals.retain(|p| p.request_id != request_id);
 }
 
 /// `TurnDone`: held tool rows commit, the streaming buffer commits as the
@@ -685,7 +742,7 @@ pub(crate) fn fold_turn_done(
     vm.turn_tools.clear();
     vm.subagents.clear();
     vm.running = false;
-    vm.pending_approval = None;
+    vm.pending_approvals.clear();
     vm.turns_completed += summary.turns;
     vm.tool_calls_total += summary.tool_calls;
 }
@@ -716,7 +773,7 @@ pub(crate) fn fold_turn_unfinished(
     vm.turn_tools.clear();
     vm.subagents.clear();
     vm.running = false;
-    vm.pending_approval = None;
+    vm.pending_approvals.clear();
     if let Some(error) = error {
         vm.last_error = Some(error);
     }
