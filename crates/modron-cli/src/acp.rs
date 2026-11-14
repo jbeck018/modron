@@ -248,29 +248,41 @@ pub fn prompt_text(params: &Value) -> Option<String> {
     Some(text).filter(|t| !t.trim().is_empty())
 }
 
-/// Tool-call id bookkeeping for one prompt run. Engine tool activity carries
-/// only the tool name, so a completion is matched to its start by name, first
-/// in first out. Ids are `call-<n>`; a completion with no open start gets a
-/// fresh id rather than reusing another call's.
+/// Tool-call id bookkeeping for one prompt run. A tool activity that carries
+/// the model's `call_id` is paired exactly: its completion is the one with the
+/// same `call_id`. Activity without a call id (older peers) is matched to its
+/// start by tool name, first in first out. Ids are `call-<n>`; a completion
+/// with no open start gets a fresh id rather than reusing another call's.
 #[derive(Default)]
 pub struct ToolCallIds {
     counter: u64,
     open: HashMap<String, VecDeque<String>>,
+    by_call_id: HashMap<String, String>,
 }
 
 impl ToolCallIds {
-    fn start(&mut self, name: &str) -> String {
+    fn start(&mut self, name: &str, call_id: Option<&str>) -> String {
         self.counter += 1;
         let id = format!("call-{}", self.counter);
-        self.open
-            .entry(name.to_string())
-            .or_default()
-            .push_back(id.clone());
+        match call_id {
+            Some(call_id) => {
+                self.by_call_id.insert(call_id.to_string(), id.clone());
+            }
+            None => self
+                .open
+                .entry(name.to_string())
+                .or_default()
+                .push_back(id.clone()),
+        }
         id
     }
 
-    fn finish(&mut self, name: &str) -> String {
-        match self.open.get_mut(name).and_then(VecDeque::pop_front) {
+    fn finish(&mut self, name: &str, call_id: Option<&str>) -> String {
+        let started = match call_id {
+            Some(call_id) => self.by_call_id.remove(call_id),
+            None => self.open.get_mut(name).and_then(VecDeque::pop_front),
+        };
+        match started {
             Some(id) => id,
             None => {
                 self.counter += 1;
@@ -300,12 +312,17 @@ pub fn update_to_line(
             Some(message_chunk_notification(session_id, t).to_string())
         }
         AcUpdate::Delta(_) => None,
-        AcUpdate::Tool(ToolActivity::Start { name }) => {
-            let id = tools.start(name);
+        AcUpdate::Tool(ToolActivity::Start { name, call_id }) => {
+            let id = tools.start(name, call_id.as_deref());
             Some(tool_call_notification(session_id, &id, name, "in_progress").to_string())
         }
-        AcUpdate::Tool(ToolActivity::Done { name, is_error, .. }) => {
-            let id = tools.finish(name);
+        AcUpdate::Tool(ToolActivity::Done {
+            name,
+            is_error,
+            call_id,
+            ..
+        }) => {
+            let id = tools.finish(name, call_id.as_deref());
             Some(
                 tool_call_update_notification(session_id, &id, None, status_for(*is_error))
                     .to_string(),
@@ -899,6 +916,7 @@ mod tests {
 
         let tool = update_to_line(
             &AcUpdate::Tool(ToolActivity::Start {
+                call_id: None,
                 name: "bash".into(),
             }),
             "s1",
@@ -910,11 +928,86 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_calls_pair_by_call_id_not_name() {
+        // Two parallel calls to the same tool finish in reverse order. Name
+        // FIFO would hand the first completion the first start's id; the
+        // call id must give each completion its own start's id.
+        let mut tools = ToolCallIds::default();
+        let start = |call_id: &str| {
+            AcUpdate::Tool(ToolActivity::Start {
+                name: "read".into(),
+                call_id: Some(call_id.into()),
+            })
+        };
+        let done = |call_id: &str, bytes: usize| {
+            AcUpdate::Tool(ToolActivity::Done {
+                name: "read".into(),
+                is_error: false,
+                bytes,
+                call_id: Some(call_id.into()),
+            })
+        };
+        let frame = |update: &AcUpdate, tools: &mut ToolCallIds| -> Value {
+            serde_json::from_str(&update_to_line(update, "s1", tools).unwrap()).unwrap()
+        };
+        let start_a = frame(&start("toolu_a"), &mut tools);
+        let start_b = frame(&start("toolu_b"), &mut tools);
+        let id_a = start_a["params"]["update"]["toolCallId"].clone();
+        let id_b = start_b["params"]["update"]["toolCallId"].clone();
+        assert_ne!(id_a, id_b);
+
+        // B finishes first, then A.
+        let finish_b = frame(&done("toolu_b", 1), &mut tools);
+        let finish_a = frame(&done("toolu_a", 2), &mut tools);
+        assert_eq!(finish_b["params"]["update"]["toolCallId"], id_b);
+        assert_eq!(finish_a["params"]["update"]["toolCallId"], id_a);
+        assert_eq!(finish_a["params"]["update"]["status"], "completed");
+    }
+
+    #[test]
+    fn nameless_call_ids_fall_back_to_name_fifo() {
+        // Activity from an older peer (no call id) still pairs by name.
+        let mut tools = ToolCallIds::default();
+        let start: Value = serde_json::from_str(
+            &update_to_line(
+                &AcUpdate::Tool(ToolActivity::Start {
+                    name: "bash".into(),
+                    call_id: None,
+                }),
+                "s1",
+                &mut tools,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let done: Value = serde_json::from_str(
+            &update_to_line(
+                &AcUpdate::Tool(ToolActivity::Done {
+                    name: "bash".into(),
+                    is_error: true,
+                    bytes: 1,
+                    call_id: None,
+                }),
+                "s1",
+                &mut tools,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            &done["params"]["update"]["toolCallId"],
+            &start["params"]["update"]["toolCallId"]
+        );
+        assert_eq!(done["params"]["update"]["status"], "failed");
+    }
+
+    #[test]
     fn tool_completion_reuses_the_start_id() {
         let mut tools = ToolCallIds::default();
         let start: Value = serde_json::from_str(
             &update_to_line(
                 &AcUpdate::Tool(ToolActivity::Start {
+                    call_id: None,
                     name: "write".into(),
                 }),
                 "s1",
@@ -926,6 +1019,7 @@ mod tests {
         let done: Value = serde_json::from_str(
             &update_to_line(
                 &AcUpdate::Tool(ToolActivity::Done {
+                    call_id: None,
                     name: "write".into(),
                     is_error: false,
                     bytes: 3,

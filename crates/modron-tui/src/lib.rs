@@ -2733,7 +2733,7 @@ impl App {
     pub fn on_tool(&mut self, activity: ToolActivity) {
         // The in-flight tool name for the status strip is TUI-only; the
         // grouping itself is the shared tracker (desktop/mobile parity).
-        if let ToolActivity::Start { name } = &activity {
+        if let ToolActivity::Start { name, .. } = &activity {
             self.current_tool = Some(name.clone());
         }
         if matches!(activity, ToolActivity::Done { .. }) {

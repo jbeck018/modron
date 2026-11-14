@@ -191,9 +191,11 @@ fn non_decision_keys_do_not_swallow_a_pending_approval() {
 fn tool_lines_render_start_and_done() {
     let mut app = App::default();
     app.on_tool(ToolActivity::Start {
+        call_id: None,
         name: "bash".into(),
     });
     app.on_tool(ToolActivity::Done {
+        call_id: None,
         name: "bash".into(),
         is_error: false,
         bytes: 42,
@@ -211,6 +213,7 @@ fn tool_lines_render_start_and_done() {
 fn finish_turn_flushes_tools_and_answer_and_updates_totals() {
     let mut app = App::default();
     app.on_tool(ToolActivity::Done {
+        call_id: None,
         name: "bash".into(),
         is_error: false,
         bytes: 10,
@@ -1814,8 +1817,12 @@ fn tool_summary_counts_and_panel_expand_flow() {
     let mut app = App::default();
     app.begin_task("do things");
     for name in ["glob", "glob", "glob", "read", "read", "grep"] {
-        app.on_tool(ToolActivity::Start { name: name.into() });
+        app.on_tool(ToolActivity::Start {
+            name: name.into(),
+            call_id: None,
+        });
         app.on_tool(ToolActivity::Done {
+            call_id: None,
             name: name.into(),
             is_error: false,
             bytes: 100,

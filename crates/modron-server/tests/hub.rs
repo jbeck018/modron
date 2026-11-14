@@ -153,11 +153,13 @@ async fn live_state_projects_buffers_tracker_and_usage() {
     handle.on_stream_delta(StreamDelta::Reasoning("thinking".into()));
     handle.on_tool_activity(ToolActivity::Start {
         name: "bash".into(),
+        call_id: None,
     });
     handle.on_tool_activity(ToolActivity::Done {
         name: "bash".into(),
         is_error: false,
         bytes: 120,
+        call_id: None,
     });
     handle.on_persisted(&SessionEvent::Usage {
         model: "mock-model".into(),

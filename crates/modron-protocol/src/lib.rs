@@ -545,11 +545,18 @@ impl WireDelta {
 pub enum WireToolActivity {
     Start {
         name: String,
+        /// The model's tool-call id. Absent on frames from older peers and
+        /// omitted when `None`, so pre-LM JSON parses and round-trips.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     Done {
         name: String,
         is_error: bool,
         bytes: u64,
+        /// Matches the `call_id` of the `Start` it completes (see `Start`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     SubagentStarted {
         id: String,
@@ -575,15 +582,20 @@ pub enum WireToolActivity {
 impl From<&ToolActivity> for WireToolActivity {
     fn from(a: &ToolActivity) -> Self {
         match a {
-            ToolActivity::Start { name } => Self::Start { name: name.clone() },
+            ToolActivity::Start { name, call_id } => Self::Start {
+                name: name.clone(),
+                call_id: call_id.clone(),
+            },
             ToolActivity::Done {
                 name,
                 is_error,
                 bytes,
+                call_id,
             } => Self::Done {
                 name: name.clone(),
                 is_error: *is_error,
                 bytes: *bytes as u64,
+                call_id: call_id.clone(),
             },
             ToolActivity::SubagentStarted { id, label } => Self::SubagentStarted {
                 id: id.clone(),
@@ -622,15 +634,17 @@ impl From<&ToolActivity> for WireToolActivity {
 impl From<WireToolActivity> for ToolActivity {
     fn from(w: WireToolActivity) -> Self {
         match w {
-            WireToolActivity::Start { name } => Self::Start { name },
+            WireToolActivity::Start { name, call_id } => Self::Start { name, call_id },
             WireToolActivity::Done {
                 name,
                 is_error,
                 bytes,
+                call_id,
             } => Self::Done {
                 name,
                 is_error,
                 bytes: bytes as usize,
+                call_id,
             },
             WireToolActivity::SubagentStarted { id, label } => Self::SubagentStarted { id, label },
             WireToolActivity::SubagentProgress {
@@ -892,6 +906,7 @@ mod tests {
                         name: "bash".into(),
                         is_error: false,
                         bytes: 120,
+                        call_id: None,
                     },
                 },
             ),
@@ -1012,11 +1027,23 @@ mod tests {
         let variants = vec![
             ToolActivity::Start {
                 name: "read".into(),
+                call_id: None,
+            },
+            ToolActivity::Start {
+                name: "read".into(),
+                call_id: Some("call_1".into()),
             },
             ToolActivity::Done {
                 name: "bash".into(),
                 is_error: true,
                 bytes: 4_000_000_000usize,
+                call_id: None,
+            },
+            ToolActivity::Done {
+                name: "bash".into(),
+                is_error: false,
+                bytes: 7,
+                call_id: Some("call_1".into()),
             },
             ToolActivity::SubagentStarted {
                 id: "a".into(),
@@ -1045,6 +1072,52 @@ mod tests {
             let parsed: WireToolActivity = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, wire);
         }
+    }
+
+    #[test]
+    fn tool_activity_call_id_is_optional_on_the_wire() {
+        // Pre-LM JSON (no call_id) still parses, to call_id None.
+        let old_start: WireToolActivity =
+            serde_json::from_str(r#"{"kind":"start","name":"read"}"#).unwrap();
+        assert_eq!(
+            old_start,
+            WireToolActivity::Start {
+                name: "read".into(),
+                call_id: None,
+            }
+        );
+        let old_done: WireToolActivity =
+            serde_json::from_str(r#"{"kind":"done","name":"read","is_error":false,"bytes":3}"#)
+                .unwrap();
+        assert_eq!(
+            ToolActivity::from(old_done),
+            ToolActivity::Done {
+                name: "read".into(),
+                is_error: false,
+                bytes: 3,
+                call_id: None,
+            }
+        );
+        // None is never serialized, so old peers see the exact old shape.
+        let json = serde_json::to_string(&WireToolActivity::Start {
+            name: "read".into(),
+            call_id: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"kind":"start","name":"read"}"#);
+        // Some round-trips and is serialized.
+        let with_id = WireToolActivity::Done {
+            name: "read".into(),
+            is_error: false,
+            bytes: 3,
+            call_id: Some("call_9".into()),
+        };
+        let json = serde_json::to_string(&with_id).unwrap();
+        assert!(json.contains(r#""call_id":"call_9""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<WireToolActivity>(&json).unwrap(),
+            with_id
+        );
     }
 
     #[test]
