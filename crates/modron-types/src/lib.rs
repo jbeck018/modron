@@ -296,13 +296,22 @@ pub enum SessionEvent {
         items: Vec<PlanItem>,
     },
     /// Pre-mutation file snapshot (Phase-1b C1, additive): captured before
-    /// `write`/`edit` execute. `prior_content_b64: None` means the file was
-    /// new (rewind deletes it) or exceeded the 256KB snapshot cap. Bash
-    /// mutations are a documented v1 limitation — use git.
+    /// `write`/`edit` execute. Three states (D8):
+    /// - `prior_content_b64: None, uncaptured: false` = the file did not
+    ///   exist; rewind deletes it.
+    /// - `prior_content_b64: Some(b64)` = the prior bytes; rewind restores.
+    /// - `prior_content_b64: None, uncaptured: true` = the original was not
+    ///   a regular file, exceeded the 256KB snapshot cap, or was unreadable;
+    ///   rewind refuses and changes nothing.
+    ///
+    /// Bash mutations are a documented v1 limitation — use git.
     Checkpoint {
         path: String,
         prior_content_b64: Option<String>,
         event_index: u64,
+        /// Absent in older logs: `#[serde(default)]` reads them as `false`.
+        #[serde(default)]
+        uncaptured: bool,
     },
 }
 
