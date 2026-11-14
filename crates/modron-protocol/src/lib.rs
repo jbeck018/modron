@@ -445,6 +445,21 @@ pub struct AuthProviderWire {
 
 /// The live (non-persisted) half of a snapshot: what a fresh attach needs
 /// to render the in-flight state a late joiner would otherwise miss.
+///
+/// UI effects on attach (Snapshot handling, every client):
+/// - `approval_mode`: sets the approval-mode label (`ask`/`yolo`/`deny`)
+///   through the same mapping ConfigChanged uses. Absent keeps the
+///   client's default label (`ask`).
+/// - `sandbox`: sets the sandbox label (`off`/`seatbelt`/`bwrap`) through
+///   the same mapping ConfigChanged uses. Absent keeps the default (`off`).
+/// - `allow` / `deny`: replace the client's copy of the server's tool
+///   allow and deny lists (the TUI's `RemoteLists`, the mobile tool
+///   editor). Absent means the server has no entries, so the copy is
+///   emptied; a SetConfig sends the whole list back.
+///
+/// The four config fields are optional on the wire (`skip_serializing_if`
+/// and serde defaults), so an older peer that omits them still parses,
+/// and a newer server talking to an older client is ignored by it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LiveState {
@@ -468,6 +483,18 @@ pub struct LiveState {
     pub provider: String,
     /// Standing goal (the /goal command).
     pub goal: String,
+    /// The server's approval mode (see the struct docs: sets the label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalModeWire>,
+    /// The server's sandbox policy (see the struct docs: sets the label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxPolicy>,
+    /// The server's tool allow list (see the struct docs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// The server's tool deny list (see the struct docs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
 }
 
 /// An approval awaiting a decision.
@@ -1076,6 +1103,66 @@ mod tests {
                 assert!(live.running);
                 assert_eq!(live.streaming_text, "");
                 assert_eq!(live.model, "");
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_state_config_fields_round_trip() {
+        // C5: the server's mode, sandbox and allow/deny lists ride the
+        // snapshot so a fresh attach shows the real labels.
+        let frame = Frame::event(
+            None,
+            1,
+            Payload::Snapshot {
+                session_id: Uuid::new_v4(),
+                last_seq: 0,
+                events: vec![],
+                live: LiveState {
+                    approval_mode: Some(ApprovalModeWire::ApproveAll),
+                    sandbox: Some(SandboxPolicy::Bubblewrap),
+                    allow: vec!["diagnostics".into()],
+                    deny: vec!["bash".into(), "write".into()],
+                    ..LiveState::default()
+                },
+            },
+        );
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"approval_mode\":\"approve_all\""));
+        assert!(json.contains("\"sandbox\":\"bubblewrap\""));
+        assert!(json.contains("\"allow\":[\"diagnostics\"]"));
+        assert!(json.contains("\"deny\":[\"bash\",\"write\"]"));
+        assert_roundtrip(&frame);
+    }
+
+    #[test]
+    fn live_state_config_fields_are_omitted_when_unset() {
+        // An unset LiveState writes none of the C5 keys, so an older
+        // client sees exactly the bytes it always did.
+        let value = serde_json::to_value(LiveState::default()).unwrap();
+        let object = value.as_object().unwrap();
+        for key in ["approval_mode", "sandbox", "allow", "deny"] {
+            assert!(!object.contains_key(key), "{key} should be omitted");
+        }
+    }
+
+    #[test]
+    fn snapshot_without_config_fields_still_parses() {
+        // A pre-C5 server's snapshot: no approval_mode, sandbox, allow or
+        // deny. The fields default to unset / empty.
+        let json = format!(
+            r#"{{"seq":1,"type":"snapshot","session_id":"{u}","last_seq":0,"events":[],"live":{{"running":false,"model":"m","provider":"p"}}}}"#,
+            u = Uuid::new_v4()
+        );
+        let frame: Frame = serde_json::from_str(&json).expect("old snapshot loads");
+        match frame.payload {
+            Payload::Snapshot { live, .. } => {
+                assert_eq!(live.approval_mode, None);
+                assert_eq!(live.sandbox, None);
+                assert!(live.allow.is_empty());
+                assert!(live.deny.is_empty());
+                assert_eq!(live.model, "m");
             }
             other => panic!("expected snapshot, got {other:?}"),
         }

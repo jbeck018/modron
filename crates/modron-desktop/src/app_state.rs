@@ -378,6 +378,14 @@ impl AppState {
         self.provider = live.provider;
         self.goal = live.goal;
         self.running = live.running;
+        // C5: the server's real mode and sandbox, through the same label
+        // mappings ConfigChanged uses. Absent keeps the client's default.
+        if let Some(mode) = live.approval_mode {
+            self.approval_mode = approval_mode_label(mode).to_string();
+        }
+        if let Some(policy) = live.sandbox {
+            self.sandbox = sandbox_label(policy).to_string();
+        }
         self.resync_stream_cache();
     }
 
@@ -456,11 +464,7 @@ impl AppState {
             self.approval_mode = approval_mode_label(mode).to_string();
         }
         if let Some(policy) = patch.sandbox {
-            self.sandbox = match policy {
-                modron_core::SandboxPolicy::Seatbelt => "seatbelt".into(),
-                modron_core::SandboxPolicy::Bubblewrap => "bwrap".into(),
-                modron_core::SandboxPolicy::Off => "off".into(),
-            };
+            self.sandbox = sandbox_label(policy).to_string();
         }
         if let Some(goal) = &patch.goal {
             self.goal = goal.clone();
@@ -658,6 +662,16 @@ pub fn approval_mode_label(mode: ApprovalModeWire) -> &'static str {
         ApprovalModeWire::Deny => "deny",
         ApprovalModeWire::Ask => "ask",
         ApprovalModeWire::ApproveAll => "yolo",
+    }
+}
+
+/// The sandbox words the settings control shows (`off` / `seatbelt` /
+/// `bwrap`). Shared by ConfigChanged and the attach snapshot.
+pub fn sandbox_label(policy: modron_core::SandboxPolicy) -> &'static str {
+    match policy {
+        modron_core::SandboxPolicy::Seatbelt => "seatbelt",
+        modron_core::SandboxPolicy::Bubblewrap => "bwrap",
+        modron_core::SandboxPolicy::Off => "off",
     }
 }
 
@@ -1146,6 +1160,27 @@ mod tests {
         ));
         assert!(s.pending_approval.is_none());
         assert!(s.approval_prompt().is_none());
+    }
+
+    #[test]
+    fn snapshot_carries_the_server_mode_and_sandbox_labels() {
+        // C5: a client attaching to a yolo session shows yolo, not the
+        // default ask. (Not compiled on Linux; written for the macOS gate.)
+        let mut s = AppState::new();
+        let live = LiveState {
+            approval_mode: Some(ApprovalModeWire::ApproveAll),
+            sandbox: Some(modron_core::SandboxPolicy::Bubblewrap),
+            ..LiveState::default()
+        };
+        s.apply_frame(snapshot_frame(Vec::new(), live));
+        assert_eq!(s.approval_mode, "yolo");
+        assert_eq!(s.sandbox, "bwrap");
+        assert!(s.status_line().contains(" · yolo · "));
+
+        // An old snapshot without the fields keeps the labels it has.
+        s.apply_frame(snapshot_frame(Vec::new(), LiveState::default()));
+        assert_eq!(s.approval_mode, "yolo");
+        assert_eq!(s.sandbox, "bwrap");
     }
 
     #[test]

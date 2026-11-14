@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use modron_core::{
-    Engine, EngineConfig, SessionEvent, SessionId, SessionStore, StreamDelta, ToolActivity,
-    ToolCall, Usage,
+    ApprovalMode, ApprovalPolicy, Engine, EngineConfig, SandboxPolicy, SessionEvent, SessionId,
+    SessionStore, StreamDelta, ToolActivity, ToolCall, Usage,
 };
-use modron_protocol::{Decision, Frame, Payload, WireDelta};
+use modron_protocol::{ApprovalModeWire, ConfigPatch, Decision, Frame, Payload, WireDelta};
 use modron_server::{BroadcastingStore, SessionHub};
 use tokio::sync::broadcast;
 
@@ -33,6 +33,65 @@ fn test_hub() -> (SessionHub, SessionId) {
     let id = uuid::Uuid::new_v4();
     hub.ensure_session(id, None);
     (hub, id)
+}
+
+/// C5: the snapshot's mode, sandbox and allow/deny come from the
+/// session's effective config, at creation and after SetConfig.
+#[tokio::test]
+async fn live_state_reflects_engine_config_and_config_changes() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    let live = handle.live_state();
+    assert_eq!(live.approval_mode, Some(ApprovalModeWire::Ask));
+    assert_eq!(live.sandbox, Some(SandboxPolicy::Off));
+    assert!(live.allow.is_empty());
+    assert!(live.deny.is_empty());
+
+    handle
+        .apply_config(&ConfigPatch {
+            approval_mode: Some(ApprovalModeWire::ApproveAll),
+            allow: Some(vec!["diagnostics".into()]),
+            deny: Some(vec!["bash".into(), "write".into()]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let live = handle.live_state();
+    assert_eq!(live.approval_mode, Some(ApprovalModeWire::ApproveAll));
+    assert_eq!(live.allow, vec!["diagnostics".to_string()]);
+    assert_eq!(live.deny, vec!["bash".to_string(), "write".to_string()]);
+}
+
+/// C5: a session created from an engine already in yolo reports yolo on
+/// its first snapshot, without any SetConfig.
+#[tokio::test]
+async fn new_session_reports_the_template_engine_mode() {
+    let hub = SessionHub::empty();
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::new());
+    let engine = Engine {
+        selector: Arc::new(modron_core::testing::StaticSelector::new(
+            "mock-model",
+            "mock",
+        )),
+        providers: Default::default(),
+        tools: Arc::new(modron_core::ToolRegistry::new()),
+        store,
+        config: EngineConfig {
+            default_model: "mock-model".into(),
+            default_provider: "mock".into(),
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                deny: vec!["bash".into()],
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        },
+    };
+    hub.set_engine(engine);
+    let id = uuid::Uuid::new_v4();
+    let handle = hub.ensure_session(id, None);
+    let live = handle.live_state();
+    assert_eq!(live.approval_mode, Some(ApprovalModeWire::ApproveAll));
+    assert_eq!(live.deny, vec!["bash".to_string()]);
 }
 
 /// Parse a fanned-out LiveFrame back into a Frame (the broadcast carries

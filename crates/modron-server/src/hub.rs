@@ -25,8 +25,8 @@ use modron_core::{
     ToolActivity, ToolCall, Usage,
 };
 use modron_protocol::{
-    ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval, WireDelta, WireRunSummary,
-    WireSwarmRow, WireToolActivity,
+    ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval, WireDelta,
+    WireRunSummary, WireSwarmRow, WireToolActivity,
 };
 use modron_view::ActivityTracker;
 use tokio::sync::broadcast;
@@ -346,8 +346,31 @@ impl SessionHandle {
 
     /// The live (non-persisted) half of a snapshot.
     pub fn live_state(&self) -> LiveState {
+        // The effective config is the source of truth for the mode,
+        // sandbox and allow/deny lists (apply_config writes it, the
+        // session's engine clone carries it). Copy them out and drop the
+        // engine lock before taking the tracker lock.
+        let (approval_mode, sandbox, allow, deny) = {
+            let engine = self.engine_cell();
+            let config = &engine.config;
+            let mode = match config.approvals.mode {
+                modron_core::ApprovalMode::Deny => ApprovalModeWire::Deny,
+                modron_core::ApprovalMode::Ask => ApprovalModeWire::Ask,
+                modron_core::ApprovalMode::ApproveAll => ApprovalModeWire::ApproveAll,
+            };
+            (
+                Some(mode),
+                Some(config.sandbox),
+                config.approvals.allow.clone(),
+                config.approvals.deny.clone(),
+            )
+        };
         let tracker = lock(&self.tracker);
         LiveState {
+            approval_mode,
+            sandbox,
+            allow,
+            deny,
             running: self.is_busy(),
             streaming_text: lock(&self.text).clone(),
             streaming_reasoning: lock(&self.reasoning).clone(),
