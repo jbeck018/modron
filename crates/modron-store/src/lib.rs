@@ -21,9 +21,56 @@ use modron_core::{Error, Result, SessionEvent, SessionId, SessionMeta, SessionSt
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+/// Directory builder for the sessions root: owner-only (0700) from creation.
+#[cfg(unix)]
+fn private_dir_builder() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+}
+
+#[cfg(not(unix))]
+fn private_dir_builder() -> std::fs::DirBuilder {
+    std::fs::DirBuilder::new()
+}
+
+/// Open options for session files: owner-only (0600) from creation, so no
+/// other local user can read a transcript during the window before a chmod.
+#[cfg(unix)]
+fn private_file_options() -> OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.mode(0o600);
+    options
+}
+
+#[cfg(not(unix))]
+fn private_file_options() -> OpenOptions {
+    OpenOptions::new()
+}
+
+/// Reduces an existing file or directory to `mode` when it grants any bit
+/// outside it (group/other access left by an older build or a manual copy).
+/// Never widens and never touches a path that is already private enough.
+#[cfg(unix)]
+fn tighten(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if current & !mode != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// Per-session caches. Everything here is an accelerator; every miss falls
 /// back to the on-disk truth, so a cache that silently vanished would only
@@ -65,8 +112,20 @@ impl Inner {
     }
 
     fn ensure_root(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.root)
-            .map_err(|e| Error::Session(format!("could not create {}: {e}", self.root.display())))
+        let fail = |e: std::io::Error| {
+            Error::Session(format!("could not create {}: {e}", self.root.display()))
+        };
+        // Parents keep the umask default; only the sessions dir itself is
+        // private. An existing root is tightened, never widened.
+        if let Some(parent) = self.root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(fail)?;
+        }
+        match private_dir_builder().create(&self.root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(fail(e)),
+        }
+        tighten(&self.root, 0o700).map_err(fail)
     }
 
     fn read_meta(&self, id: SessionId) -> Result<SessionMeta> {
@@ -85,7 +144,12 @@ impl Inner {
         // crash corrupts the meta file and permanently bricks every future
         // append (read_meta fails forever after).
         let tmp = self.root.join(format!("{}.meta.json.tmp", meta.id));
-        std::fs::write(&tmp, data)
+        private_file_options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(data.as_bytes()))
             .map_err(|e| Error::Session(format!("could not write {}: {e}", tmp.display())))?;
         std::fs::rename(&tmp, &path)
             .map_err(|e| Error::Session(format!("could not replace {}: {e}", path.display())))
@@ -136,6 +200,13 @@ impl Inner {
                         ))
                     }
                 })?;
+            // Tighten a transcript left looser by an older build.
+            tighten(&self.jsonl_path(id), 0o600).map_err(|e| {
+                Error::Session(format!(
+                    "could not tighten {}: {e}",
+                    self.jsonl_path(id).display()
+                ))
+            })?;
             entry.insert(file);
         }
         let file = caches.handles.get_mut(&id).expect("handle inserted above");
@@ -197,7 +268,11 @@ impl Inner {
         caches.counts.insert(id, 0);
         drop(caches);
         self.write_meta(&meta)?;
-        std::fs::File::create(self.jsonl_path(id))
+        private_file_options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(self.jsonl_path(id))
             .map_err(|e| Error::Session(format!("could not create transcript: {e}")))?;
         Ok(meta)
     }
@@ -219,6 +294,9 @@ impl Inner {
         // partially damaged log stays loadable (bad lines warn + skip).
         let data = std::fs::read(&path)
             .map_err(|e| Error::Session(format!("could not read {}: {e}", path.display())))?;
+        if let Err(e) = tighten(&path, 0o600) {
+            tracing::warn!(session = %id, error = %e, "could not tighten transcript permissions");
+        }
         let text = String::from_utf8_lossy(&data);
         let mut events = Vec::new();
         for (idx, line) in text.lines().enumerate() {
@@ -292,6 +370,13 @@ impl Inner {
                         ))
                     }
                 })?;
+            // Tighten a transcript left looser by an older build.
+            tighten(&self.jsonl_path(id), 0o600).map_err(|e| {
+                Error::Session(format!(
+                    "could not tighten {}: {e}",
+                    self.jsonl_path(id).display()
+                ))
+            })?;
             entry.insert(file);
         }
         {
@@ -855,5 +940,66 @@ mod tests {
         );
         // Load of a deleted session errors (missing file) — documented.
         assert!(store.load(meta.id).await.is_err());
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_files_are_private_from_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let store = JsonlSessionStore::new(&root);
+        let meta = store.create_session("private").await.unwrap();
+        store
+            .append(meta.id, &SessionEvent::Task { text: "t".into() })
+            .await
+            .unwrap();
+
+        assert_eq!(mode_of(&root), 0o700, "sessions dir is owner-only");
+        assert_eq!(
+            mode_of(&root.join(format!("{}.jsonl", meta.id))),
+            0o600,
+            "transcript is owner-only"
+        );
+        assert_eq!(
+            mode_of(&root.join(format!("{}.meta.json", meta.id))),
+            0o600,
+            "meta is owner-only"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loose_permissions_on_existing_files_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let store = JsonlSessionStore::new(&root);
+        let meta = store.create_session("loose").await.unwrap();
+        let jsonl = root.join(format!("{}.jsonl", meta.id));
+        let meta_path = root.join(format!("{}.meta.json", meta.id));
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&jsonl, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // A fresh instance (a new process, in effect) opens the session again.
+        let reopened = JsonlSessionStore::new(&root);
+        reopened
+            .append(meta.id, &SessionEvent::Task { text: "t".into() })
+            .await
+            .unwrap();
+
+        assert_eq!(mode_of(&root), 0o700, "loose dir tightened");
+        assert_eq!(mode_of(&jsonl), 0o600, "loose transcript tightened");
+        assert_eq!(mode_of(&meta_path), 0o600, "loose meta tightened");
     }
 }
