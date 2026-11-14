@@ -191,6 +191,40 @@ const ANTHROPIC_DELTA_USAGE_STREAM: &[&str] = &[
     "",
 ];
 
+/// Some OpenAI-compatible servers report a mid-stream failure as a top-level
+/// `error` chunk instead of closing with an HTTP error.
+const OPENAI_MIDSTREAM_ERROR: &[&str] = &[
+    r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Par"},"finish_reason":null}]}"#,
+    "",
+    r#"data: {"error":{"message":"upstream model overloaded","type":"server_error"}}"#,
+    "",
+];
+
+#[tokio::test]
+async fn openai_midstream_error_chunk_fails_as_a_stream_error() {
+    let body = sse_body(OPENAI_MIDSTREAM_ERROR);
+    let (addr, server) = spawn_sse_server(vec![(sse_response(&body), 0)]).await;
+    let provider = OpenAiCompatProvider::new("sk-test-key")
+        .expect("provider")
+        .with_base_url(format!("http://{addr}/v1"));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let err = provider
+        .turn_streaming(Arc::new(simple_request("gpt-test")), tx)
+        .await
+        .expect_err("an error chunk must fail the turn");
+    server.await.expect("server task");
+    match &err {
+        Error::Provider { message, .. } => {
+            assert_eq!(message, "stream error: upstream model overloaded");
+        }
+        other => panic!("expected a provider error, got {other:?}"),
+    }
+    assert!(
+        !is_retryable(&err),
+        "a server-reported stream error is not replayed"
+    );
+}
+
 #[tokio::test]
 async fn anthropic_streaming_usage_is_not_double_counted_from_message_delta() {
     let body = sse_body(ANTHROPIC_DELTA_USAGE_STREAM);

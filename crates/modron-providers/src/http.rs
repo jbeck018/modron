@@ -32,11 +32,66 @@ pub const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
 /// The shared reqwest client: same connect timeout, same construction
 /// everywhere. Deliberately has no total timeout (see [`REQUEST_TIMEOUT`]).
+/// Redirects are never followed: reqwest strips `Authorization` on a
+/// cross-origin hop but forwards custom credential headers such as
+/// `x-api-key`, so a 3xx surfaces as an `HTTP <status>` error instead.
 pub fn build_client() -> Result<Client> {
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| Error::Other(anyhow::anyhow!("failed to build HTTP client: {err}")))
+}
+
+/// Whether a URL host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The host a cleartext `http://` URL would send credentials to, when that
+/// host is not loopback. `None` for `https://`, loopback and unparseable
+/// URLs.
+pub(crate) fn cleartext_remote_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    (!is_loopback_host(host)).then(|| host.to_string())
+}
+
+/// Records one cleartext warning per distinct URL. Returns the host to warn
+/// about the first time a remote cleartext URL is seen, `None` otherwise.
+pub(crate) fn claim_cleartext_warning(
+    registry: &std::sync::Mutex<std::collections::HashSet<String>>,
+    base_url: &str,
+) -> Option<String> {
+    let host = cleartext_remote_host(base_url)?;
+    let mut seen = registry.lock().ok()?;
+    seen.insert(base_url.to_string()).then_some(host)
+}
+
+/// Warn (once per distinct URL per process) that an `http://` endpoint off
+/// the loopback interface will receive credentials in clear text. Does not
+/// block the request.
+pub(crate) fn warn_cleartext_once(provider_id: &str, base_url: &str) {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let registry = REGISTRY.get_or_init(Default::default);
+    if let Some(host) = claim_cleartext_warning(registry, base_url) {
+        tracing::warn!(
+            provider = provider_id,
+            "API key will be sent in clear text to {host}"
+        );
+    }
 }
 
 /// The `timeout: …` error the retry policy classifies as transient.
@@ -523,5 +578,87 @@ mod tests {
         .expect_err("pending forever");
         let message = provider_message(err);
         assert!(message.starts_with("timeout: "), "{message}");
+    }
+
+    /// Model endpoints never need a redirect, so a 3xx is an error and is
+    /// never followed: custom auth headers (`x-api-key`) must not reach the
+    /// `Location` target, which is recorded here.
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind target");
+        let target_addr = target.local_addr().expect("target addr");
+        let contacted = tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_millis(500), target.accept()).await {
+                Ok(Ok((mut socket, _))) => {
+                    let mut scratch = [0u8; 4096];
+                    let _ = socket.read(&mut scratch).await;
+                    let _ = socket
+                        .write_all(response("HTTP/1.1 200 OK", "{}").as_bytes())
+                        .await;
+                    true
+                }
+                _ => false,
+            }
+        });
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://{target_addr}/collect\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        let addr = serve_once(vec![redirect]).await;
+        let client = build_client().unwrap();
+        let headers = vec![("x-api-key", "sk-test".to_string())];
+        let err = post_json(
+            &client,
+            "test",
+            &format!("http://{addr}/"),
+            &headers,
+            &serde_json::json!({}),
+        )
+        .await
+        .expect_err("a 3xx is an error, not a followed redirect");
+        assert!(err.to_string().contains("HTTP 302"), "{err}");
+        assert!(
+            !contacted.await.expect("target task"),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    #[test]
+    fn cleartext_host_classification() {
+        assert_eq!(
+            cleartext_remote_host("http://api.example.com/v1"),
+            Some("api.example.com".into())
+        );
+        assert_eq!(
+            cleartext_remote_host("http://10.0.0.5:8000/v1"),
+            Some("10.0.0.5".into())
+        );
+        assert_eq!(cleartext_remote_host("https://api.example.com/v1"), None);
+        assert_eq!(cleartext_remote_host("http://localhost:11434/v1"), None);
+        assert_eq!(cleartext_remote_host("http://LOCALHOST./v1"), None);
+        assert_eq!(cleartext_remote_host("http://127.0.0.1:8080/"), None);
+        assert_eq!(cleartext_remote_host("http://127.8.9.10/"), None);
+        assert_eq!(cleartext_remote_host("http://[::1]:8000/"), None);
+        assert_eq!(cleartext_remote_host("not a url"), None);
+    }
+
+    #[test]
+    fn cleartext_warning_is_claimed_once_per_url() {
+        let registry = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert_eq!(
+            claim_cleartext_warning(&registry, "http://gw.example.com/v1"),
+            Some("gw.example.com".to_string())
+        );
+        assert_eq!(
+            claim_cleartext_warning(&registry, "http://gw.example.com/v1"),
+            None,
+            "second use of the same URL stays silent"
+        );
+        assert_eq!(
+            claim_cleartext_warning(&registry, "http://localhost:11434/v1"),
+            None,
+            "loopback never warns"
+        );
     }
 }

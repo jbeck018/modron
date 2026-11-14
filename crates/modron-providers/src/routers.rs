@@ -55,7 +55,10 @@ impl AsyncRouter for LlmJudgeRouter {
 /// Kev / Jev SystemOne client (Phase-3b M2). One `choice` question with two
 /// criteria; the answer's `choice` field is the tier, `confidence` gates it.
 pub struct KevRouter {
-    http: reqwest::Client,
+    /// `None` only when the shared client cannot be built; `route` then keeps
+    /// the sync choice rather than falling back to a redirect-following
+    /// default client.
+    http: Option<reqwest::Client>,
     endpoint: String,
     api_key: Option<String>,
     /// Answers below this confidence keep the sync selector's choice.
@@ -69,16 +72,22 @@ impl KevRouter {
         model: impl Into<String>,
     ) -> Self {
         let _ = model; // reserved: forward the model id once servers require it
+        let endpoint = endpoint.into();
+        if api_key.is_some() {
+            crate::http::warn_cleartext_once("kev", &endpoint);
+        }
         Self {
-            // Bounded like every other client: `route` runs inside the
-            // engine's per-turn path, so a stalled endpoint must fail with
-            // a timeout, not hang the turn forever.
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
-            endpoint: endpoint.into(),
+            // Shared client: connect timeout, no redirects. `route` runs in
+            // the engine's per-turn path, so the per-request deadline below
+            // makes a stalled endpoint fail instead of hanging the turn.
+            http: match crate::http::build_client() {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::warn!(error = %err, "kev client unavailable, keeping sync choice");
+                    None
+                }
+            },
+            endpoint,
             api_key,
             min_confidence: 0.6,
         }
@@ -121,8 +130,12 @@ impl KevRouter {
 #[async_trait]
 impl AsyncRouter for KevRouter {
     async fn route(&self, task: &str, _action: ActionKind) -> Option<RouteVerdict> {
+        let http = self.http.as_ref()?;
         let url = format!("{}/v1/systemone", self.endpoint.trim_end_matches('/'));
-        let mut request = self.http.post(&url).json(&Self::build_body(task));
+        let mut request = http
+            .post(&url)
+            .timeout(crate::http::REQUEST_TIMEOUT)
+            .json(&Self::build_body(task));
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
@@ -201,6 +214,60 @@ mod tests {
             None
         );
         assert_eq!(KevRouter::parse_response_with(0.6, &json!({})), None);
+    }
+
+    /// A redirect from the Kev endpoint is not followed: the verdict from
+    /// the redirect target must not be used, and the target never sees the
+    /// request (which may carry the bearer key).
+    #[tokio::test]
+    async fn kev_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let contacted = tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), target.accept()).await
+            {
+                Ok(Ok((mut socket, _))) => {
+                    let mut scratch = [0u8; 4096];
+                    let _ = socket.read(&mut scratch).await;
+                    let body = r#"{"answers": {"tier": {"type": "choice", "choice": "mechanical", "confidence": 0.93}}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    true
+                }
+                _ => false,
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 4096];
+            let _ = socket.read(&mut scratch).await;
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/v1/systemone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(redirect.as_bytes()).await;
+        });
+
+        let router = KevRouter::new(
+            format!("http://{addr}"),
+            Some("kev-secret".into()),
+            "kev-latest",
+        );
+        assert_eq!(
+            router.route("list the sessions", ActionKind::Chat).await,
+            None,
+            "a redirect is a failed call: the sync choice stands"
+        );
+        assert!(
+            !contacted.await.unwrap(),
+            "the redirect target must never be contacted"
+        );
     }
 
     #[tokio::test]
