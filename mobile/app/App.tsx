@@ -139,6 +139,9 @@ const url = signal(Remote.defaultUrl());
 // Optional paired device token for servers that require one. Held in
 // memory only: never logged, never written to notes or storage.
 const deviceToken = signal("");
+// Explicit opt-in for plain ws:// to a non-loopback host (a trusted LAN
+// only; the core refuses it otherwise). Default off, held in memory only.
+const allowInsecure = signal(false);
 const draft = signal("");
 const connectError = signal<string | null>(null);
 const busy = signal(false);
@@ -225,7 +228,7 @@ async function connectAndOpen(): Promise<void> {
   busy.set(true);
   live.set(true);
   try {
-    Remote.connect(url(), tokenArg());
+    Remote.connect(url(), tokenArg(), allowInsecure());
     let connected = false;
     for (let i = 0; i < 40; i++) {
       const s = JSON.parse(Remote.snapshotJson()) as Snapshot;
@@ -737,10 +740,16 @@ function reconnectSession(): void {
   const session = snap().session_id;
   if (!session || demo()) return;
   try {
-    Remote.reconnect(url(), session, tokenArg());
+    Remote.reconnect(url(), session, tokenArg(), allowInsecure());
   } catch (e) {
     connectError.set(e instanceof Error ? e.message : String(e));
   }
+}
+
+// The LAN opt-in (both connect forms). Flipping it changes the next
+// connect or reconnect only; it never drops a live connection.
+function toggleAllowInsecure(): void {
+  allowInsecure.set(!allowInsecure());
 }
 
 // Close the connection (settings connection card); connect starts a
@@ -853,6 +862,21 @@ function StatusHeader() {
           <Text class="text-secondary-foreground text-xs">merge task</Text>
         </View>
       </View>
+    </View>
+  );
+}
+
+// The LAN opt-in chip shown under each connect form.
+function InsecureToggle() {
+  return (
+    <View
+      role="button"
+      class="self-start rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+      onPress={() => toggleAllowInsecure()}
+    >
+      <Text class="text-secondary-foreground text-xs">
+        allow insecure ws:// (LAN only): {allowInsecure() ? "on" : "off"}
+      </Text>
     </View>
   );
 }
@@ -1100,6 +1124,7 @@ function SessionsScreen() {
           onChange={(e) => deviceToken.set(e.value)}
           onSubmit={() => void connectAndOpen()}
         />
+        <InsecureToggle />
         {editMode() ? (
           <View class="flex-row items-center gap-2">
             <Text class="text-muted-foreground text-xs">
@@ -1289,6 +1314,7 @@ function SettingsScreen() {
             onChange={(e) => deviceToken.set(e.value)}
             onSubmit={() => void connectAndOpen()}
           />
+          <InsecureToggle />
           <View class="flex-row gap-2 items-center">
             <Text class="text-muted-foreground text-xs flex-1">
               {snap().connection_label}
