@@ -111,6 +111,26 @@ pub fn slugify(title: &str) -> String {
     }
 }
 
+/// Reject a client-supplied base before it reaches git: it must be a
+/// non-empty ref name with no leading dash and no whitespace or control
+/// characters (so it can never be read as a git option).
+pub fn validate_base(base: &str) -> Result<()> {
+    if base.is_empty() {
+        return Err(anyhow!("invalid base: the base branch name is empty"));
+    }
+    if base.starts_with('-') {
+        return Err(anyhow!(
+            "invalid base `{base}`: a base name cannot start with `-`"
+        ));
+    }
+    if base.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(anyhow!(
+            "invalid base {base:?}: a base name cannot contain whitespace or control characters"
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the merge target: an explicit base stands; "HEAD" resolves to
 /// the current branch name so the merge target does not drift.
 async fn resolve_base(cwd: &Path, base: Option<&str>) -> Result<String> {
@@ -133,6 +153,9 @@ pub async fn create_task(
     title: &str,
     base: Option<&str>,
 ) -> Result<TaskRecord> {
+    if let Some(b) = base {
+        validate_base(b)?;
+    }
     git(cwd, &["rev-parse", "--is-inside-work-tree"])
         .await
         .context("the server working dir is not a git repository")?;
@@ -241,6 +264,17 @@ pub async fn merge_task(
         .tasks
         .get(session_id)
         .ok_or_else(|| anyhow!("session {session_id} is not a task"))?;
+    // The merge lands in whatever is checked out here, so refuse unless it
+    // is the branch the task was created from. Nothing is changed on refusal.
+    let current = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+    let current = current.trim();
+    if current != record.base {
+        return Err(anyhow!(
+            "cannot merge task {session_id}: the working directory is on `{current}`, the task was created from `{}`; check out `{}` first",
+            record.base,
+            record.base
+        ));
+    }
     let message = message
         .map(|m| m.to_string())
         .unwrap_or_else(|| format!("Merge task '{}'", record.title));
@@ -258,10 +292,9 @@ pub async fn merge_task(
             ),
         )),
         Err(merge_error) => {
-            // Conflicted (or otherwise failed): abort cleanly so the base
-            // stays untouched, then distinguish conflicts from other
-            // failures.
-            let _ = git(cwd, &["merge", "--abort"]).await;
+            // Conflicted (or otherwise failed): collect the unmerged paths
+            // BEFORE aborting (abort clears them), then abort cleanly so the
+            // base stays untouched.
             let conflicted = git(cwd, &["diff", "--name-only", "--diff-filter=U"])
                 .await
                 .unwrap_or_default();
@@ -269,13 +302,14 @@ pub async fn merge_task(
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .collect();
+            let _ = git(cwd, &["merge", "--abort"]).await;
             if conflicts.is_empty() {
                 return Err(anyhow!(
                     "merge failed (aborted cleanly, base untouched): {merge_error}"
                 ));
             }
             Err(anyhow!(
-                "merge conflicts (aborted cleanly, base untouched): {}",
+                "merge conflicts (aborted cleanly, base untouched): {} - {merge_error}",
                 conflicts.join(", ")
             ))
         }
@@ -338,5 +372,27 @@ mod tests {
         assert_eq!(slugify("a  b"), "a-b");
         let long = slugify(&"x".repeat(80));
         assert!(long.len() <= 48);
+    }
+
+    #[test]
+    fn validates_base_names() {
+        for ok in ["main", "HEAD", "release/1.2", "feature_x"] {
+            assert!(validate_base(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in [
+            "-x",
+            "--output=/tmp/x",
+            "",
+            "a b",
+            "a\tb",
+            "main\n",
+            "a\u{7}b",
+        ] {
+            let err = validate_base(bad).expect_err(bad);
+            assert!(
+                err.to_string().starts_with("invalid base"),
+                "{bad:?}: {err}"
+            );
+        }
     }
 }
