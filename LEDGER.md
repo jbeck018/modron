@@ -1370,3 +1370,8 @@ NOT verified, needs a macOS / mobile / CI pass before release:
 edits (C1, C4, C6), the Seatbelt profile changes (D6), `cargo deny check`
 after the tokio-tungstenite rustls feature (C6), the GitHub workflows
 (G4), and the cloud container image (G1, G2).
+
+Round 2 (same day): the low-severity findings and open items were worked
+through as well - see sections 7 and 8 of `docs/SECURITY_PLAN.md` for
+what was done, what is still open and why. Gate evidence: 922 tests pass,
+clippy and fmt clean on Linux.

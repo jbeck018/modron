@@ -778,25 +778,60 @@ Cross-lane file overlaps the leader must sequence by hand:
   `modron-core/src/context.rs`: neither is in lane A's file set, no
   conflict, but rebase before merge.
 
-## 7. Not in this plan (backlog)
+## 7. Round 2: low-severity findings and open items (2026-11-14)
+
+Same operating model. Haiku workers did LA-LM; the leader did the rest.
+
+| ID | Who | Status | What |
+|----|-----|--------|------|
+| LA | Haiku | DONE | Engine: speculative reads are not reused after a mutation in the same turn; auth-failure detection matches the `HTTP 401/403` prefix; saturating usage totals; the capped turn's text is kept. |
+| LB | Haiku | DONE | Hooks killed on timeout, large args on stdin (env capped at 32 KiB); memory store locking, unique temp files, corrupt stats preserved. |
+| LC | Haiku | DONE | LSP: per-document versions, percent-encoded URIs, waits for `initialize`, bounded and cached probe, servers keyed by workspace root. No live server run. |
+| LD | Haiku | DONE | Delegate: git spawns scrubbed, merge error labels and relative paths, background delegates capped at 4 and abortable. |
+| LE | Haiku | DONE | Bounded skill reads, minify gap underflow, char-safe memory snippets, private per-user relay directory with pruning. |
+| LF | Haiku | DONE | TUI: `@` completion offsets, 300 ms approval type-ahead guard, explicit allow-all verdict in remote mode, one notice for undecodable frames. |
+| LG | Haiku | DONE | Server: config patches apply atomically, delete cleans up tunnel/key/task/lock state, interrupt/start ordering, attach watermark, adoption re-arm, WebSocket outbound backlog cap (4096). |
+| LH | Haiku | DONE | Server: token files and Unix sockets private from creation, daemon line cap, plaintext `ws://` bridges only on loopback, task records persisted. |
+| LI | Haiku | DONE | Providers: no redirects, cleartext base-URL warning, mid-stream `error` chunks surfaced, one retry predicate for streaming and non-streaming. |
+| LJ | Haiku | DONE | Mobile core: connect deadline and size limits, keepalive, counter reset on snapshot, undecodable notice, approval queue, allow-insecure opt-in. App.tsx NOT compiled. |
+| LK | Haiku | DONE (uncompiled) | Desktop: approval queue, stale state cleared on turn end / disconnect, click guard, form submits real input, welcome timeout. |
+| LM | Haiku | DONE | Tool activity carries the call id; ACP pairs start and completion exactly. |
+| - | Leader | DONE | Bridge: separate agent and viewer keys (a share link cannot connect as the agent), large snapshots relayed, keepalives not stored, `npm ci` fixed, tsc clean. |
+| - | Leader | DONE | Every rewind range is recorded (`resume_skip_ranges`). |
+| - | Leader | DONE | Read-before-edit ledger is per session; interrupt hooks; TUI Esc/quit abort background delegates. |
+| - | Leader | DONE | A task session re-created after a restart runs in its recorded worktree. |
+| - | Leader | DONE | Request ids start at 1; `DeviceLogin` and the Kev API key redacted in Debug; hooks kill their process group; one shared undecodable-frame notice in modron-view. |
+
+Round 2 gate evidence (leader): fmt clean, clippy clean, 922 tests pass on
+Linux (`--workspace --exclude modron-desktop`).
+
+## 8. Still open after round 2
 
 Accepted risk (owner decision): `remember` is ungated, so an injected
 instruction can persist a global memory into future system prompts.
-Revisit if memory poisoning is observed.
 
-New from the remediation work: delegate.rs git spawns are not env-scrubbed;
-skill.rs reads SKILL.md bodies unbounded; DeviceLogin derives Debug; ACP
-tool-call ids are paired by name (ToolActivity needs a call id); only one
-rewind range is recorded per session; the WS outbound queue is unbounded
-(30 s write timeout is the only cutoff); mobile has no allow-insecure
-toggle; `npm ci` in cloud/bridge fails with a peer-dependency conflict.
+Not fixed, with the reason:
+- Token usage of a delegate that FAILS is not counted against the budget:
+  the child's usage is dropped on the error path; fixing it needs an error
+  type that carries usage across modron-types, modron-core and
+  modron-tools.
+- Z.ai sign-in has no PKCE: adding it needs the provider to support it,
+  which could not be confirmed here. The callback listener now also binds
+  `[::1]`, which closes the local-listener variant of the issue.
+- Session transcripts are not fsynced on every append (a deliberate
+  throughput trade-off; a crash can lose the last events).
+- The Unix-socket and bridge-tunnel outbound queues have no backlog cap
+  (only the WebSocket listener does).
+- The spend-capped turn's text is in the final answer but not persisted as
+  a session event, so `--resume` does not see it.
+- Views (TUI, desktop, mobile) still pair tool completion with its start by
+  name; only ACP uses the call id.
+- `std::env::set_var` is called from a multi-threaded runtime when a key
+  is saved at runtime.
 
-Low severity: speculative-read staleness within a mixed turn; auth-failure substring
-match on "401"/"403"; memory store locking; process-wide ReadGate; LSP
-protocol details (didChange version, URI encoding, initialize wait);
-delegate error labels; `@` completion byte/char offset; minify line-count
-underflow; request id 0 reuse; stale state on session delete; attach
-watermark race; desktop single approval slot; desktop gen-UI placeholder
-submit; mobile handshake generation check and keepalive; Z.ai login
-without PKCE; cross-host redirect forwarding `x-api-key`. Promote any of
-these into a packet when a lane runs dry.
+Needs a macOS / mobile / CI pass (nothing here could build them):
+`crates/modron-desktop` (all desktop edits in both rounds),
+`mobile/app/App.tsx` and `mobile/app/src/lib.rs`, the wasm build of
+`mobile/rust-core`, the Seatbelt profile, `cargo deny check`, the GitHub
+workflows, the container image, and a deployed bridge (the two-key change
+requires deploying the bridge and upgrading modron together).
