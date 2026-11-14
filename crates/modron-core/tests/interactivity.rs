@@ -694,3 +694,120 @@ async fn memory_hits_fold_success_into_the_ledger() {
     assert_eq!(stat.successes, 1, "{id}: {stat:?}");
     assert_eq!(stat.failures, 0);
 }
+
+/// A1: a stub tool under an arbitrary name that counts its executions, so the
+/// gate tests can tell "blocked before running" from "ran".
+struct CountingTool {
+    name: String,
+    ran: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl modron_core::Tool for CountingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.clone(),
+            description: "counting stub".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &modron_core::ToolCtx,
+    ) -> modron_core::Result<ToolOutcome> {
+        self.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolOutcome::ok("ran"))
+    }
+}
+
+/// Runs one model-requested call to `name` through the real engine loop with
+/// a counting stub registered under that name. Returns (tool result text,
+/// number of times the stub actually executed).
+async fn run_single_named_call(
+    name: &str,
+    mode: ApprovalMode,
+    allow: Vec<String>,
+) -> (String, usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::default());
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider = MockProvider::new()
+        .then_response(tool_call_response("c1", name, json!({})))
+        .then_response(text_response("done"));
+    let mut providers = HashMap::new();
+    providers.insert(
+        "mock".to_string(),
+        Arc::new(provider) as Arc<dyn ModelProvider>,
+    );
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CountingTool {
+        name: name.to_string(),
+        ran: Arc::clone(&ran),
+    }));
+    let engine = Engine {
+        selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+        providers,
+        tools: Arc::new(registry),
+        store: Arc::clone(&store),
+        config: EngineConfig {
+            working_dir: dir.path().to_path_buf(),
+            approvals: ApprovalPolicy {
+                mode,
+                non_interactive: false,
+                allow,
+                deny: Vec::new(),
+            },
+            approver: None,
+            ..EngineConfig::default()
+        },
+    };
+    let summary = engine.run_task("do it").await.unwrap();
+    let events = store.load(summary.session_id).await.unwrap();
+    let content = events
+        .iter()
+        .find_map(|e| match e {
+            modron_core::SessionEvent::ToolResult { outcome, .. } => Some(outcome.content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    (content, ran.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A1 (D1): the newly gated tool classes never run without approval, in ask
+/// (no approver) and deny mode.
+#[tokio::test]
+async fn newly_gated_tools_are_blocked_without_approval() {
+    for mode in [ApprovalMode::Ask, ApprovalMode::Deny] {
+        for name in ["diagnostics", "interact", "delegate", "mcp__x__y"] {
+            let (content, ran) = run_single_named_call(name, mode, Vec::new()).await;
+            assert!(
+                content.contains("blocked by approval mode"),
+                "{name} in {mode:?} was not blocked: {content}"
+            );
+            assert_eq!(ran, 0, "{name} in {mode:?} executed despite the gate");
+        }
+    }
+}
+
+/// A1 (D1): read-only tools stay ungated in ask mode with no approver.
+#[tokio::test]
+async fn read_only_tools_stay_ungated_in_ask_mode() {
+    for name in ["read", "grep", "glob", "remember"] {
+        let (content, ran) = run_single_named_call(name, ApprovalMode::Ask, Vec::new()).await;
+        assert_eq!(content, "ran", "{name} was unexpectedly gated");
+        assert_eq!(ran, 1, "{name} did not execute");
+    }
+}
+
+/// A1 (D1): the allow list pre-approves a newly gated tool.
+#[tokio::test]
+async fn allow_list_unblocks_diagnostics() {
+    let (content, ran) = run_single_named_call(
+        "diagnostics",
+        ApprovalMode::Ask,
+        vec!["diagnostics".to_string()],
+    )
+    .await;
+    assert_eq!(content, "ran");
+    assert_eq!(ran, 1);
+}

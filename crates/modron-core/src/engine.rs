@@ -24,10 +24,33 @@ use std::sync::Arc;
 /// output cap; this is a sane non-streaming default).
 const MAX_OUTPUT_TOKENS: u32 = 8192;
 
-/// The mutating tool class gated by [`crate::ApprovalPolicy`] (A1): these
-/// change system state (run commands, write files). Everything else
-/// (`read`, `glob`, `grep`, `remember`, …) is read-only and never gated.
-const MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
+/// The approval-gated tool class (A1, decision D1): these change system state
+/// or run model-supplied commands, so they need an explicit approval outside
+/// `ApproveAll`. Every tool whose name starts with `mcp__` is gated too (see
+/// [`is_gated`]). `remember` and the read-only tools stay ungated.
+///
+/// Every new tool needs an explicit gated/ungated decision here: a tool that
+/// is not added to this list runs without approval.
+const MUTATING_TOOLS: [&str; 7] = [
+    "bash",
+    "write",
+    "edit",
+    "verify",
+    "diagnostics",
+    "interact",
+    "delegate",
+];
+
+/// The file-mutating subset of the approval-gated class. Finish-gate arming
+/// and pre-mutation checkpoints key off this list, not [`MUTATING_TOOLS`]:
+/// widening the approval gate must not change their behavior.
+const FILE_MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
+
+/// Whether a tool call needs approval before it runs (A1, D1): any name in
+/// [`MUTATING_TOOLS`] or any `mcp__`-prefixed tool.
+fn is_gated(name: &str) -> bool {
+    MUTATING_TOOLS.contains(&name) || name.starts_with("mcp__")
+}
 
 /// Finish-gate bound: verification feedback rounds before the run may end
 /// without passing verification (StaminaBench: gains plateau after 3-5
@@ -778,7 +801,7 @@ impl Engine {
         // mutation, so unverified finishes stay blocked).
         if tool_calls
             .iter()
-            .any(|c| MUTATING_TOOLS.contains(&c.name.as_str()))
+            .any(|c| FILE_MUTATING_TOOLS.contains(&c.name.as_str()))
         {
             state.mutated_this_run = true;
         }
@@ -799,9 +822,9 @@ impl Engine {
         // concurrently (order-preserving — the transcript is identical to
         // the sequential case, only faster). Mutating calls stay
         // sequential: checkpoints and approval gating are order-sensitive.
-        let all_read_only = tool_calls
-            .iter()
-            .all(|c| !MUTATING_TOOLS.contains(&c.name.as_str()));
+        // Gated calls (A1) also stay sequential: approval prompts must not
+        // interleave.
+        let all_read_only = tool_calls.iter().all(|c| !is_gated(&c.name));
         let outcomes: Vec<ToolOutcome> = if all_read_only && tool_calls.len() > 1 {
             let futures = tool_calls
                 .iter()
@@ -1090,7 +1113,7 @@ impl Engine {
 
     /// Execute one tool call through the registry, converting hard failures
     /// (unknown tool, tool crash) into error outcomes so the model can react
-    /// instead of the run dying. Mutating tools ([`MUTATING_TOOLS`]) pass the
+    /// instead of the run dying. Gated tools ([`is_gated`]) pass the
     /// approval gate first (A1): anything short of `ApproveAll` blocks the
     /// execution and hands the model an error outcome it can adapt to.
     /// Build the pre-mutation `Checkpoint` event for a tool call (C1): only
@@ -1231,7 +1254,7 @@ impl Engine {
         }
         // Allow list bypasses Ask mode (deny already checked).
         let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == &call.name);
-        if MUTATING_TOOLS.contains(&call.name.as_str())
+        if is_gated(&call.name)
             && !explicitly_allowed
             && self.config.approvals.mode != ApprovalMode::ApproveAll
         {
