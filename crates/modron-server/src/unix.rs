@@ -5,14 +5,43 @@
 //! authentication.
 
 use crate::dispatch::Outbound;
+use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
 use modron_protocol::Frame;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::dispatch::{handle_frame, send, ConnCtx, Flow, ServerState};
+use crate::pairing::{create_private_dir, restrict_to_owner};
+
+/// Bind a local control socket at `path` for owner-only use.
+///
+/// The parent directory is created 0700 when missing. An existing path that
+/// is a symlink is refused (never followed or removed); a stale socket file
+/// from a crash is replaced. The socket is chmod'ed 0600 right after bind,
+/// since the file's permissions are the only authentication on this socket.
+pub fn bind_private_socket(path: &Path) -> anyhow::Result<UnixListener> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        create_private_dir(parent)?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+            "refusing to start: {} is a symlink; remove it and retry",
+            path.display()
+        ),
+        Ok(_) => {
+            let _ = std::fs::remove_file(path); // stale socket from a crash
+        }
+        Err(_) => {}
+    }
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("cannot bind unix socket {}", path.display()))?;
+    restrict_to_owner(path);
+    Ok(listener)
+}
 
 /// Accept loop for the bound Unix socket.
 pub async fn run_unix_listener(listener: UnixListener, state: Arc<ServerState>) {
@@ -30,12 +59,13 @@ pub async fn run_unix_listener(listener: UnixListener, state: Arc<ServerState>) 
 }
 
 /// Largest accepted line (the same 16 MiB cap as before; now enforced
-/// while reading, so an oversized line never fully allocates).
-const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// while reading, so an oversized line never fully allocates). The daemon
+/// socket (modron-cli) uses the same cap.
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One line read by [`read_line_capped`].
 #[derive(Debug, PartialEq, Eq)]
-enum LineRead {
+pub enum LineRead {
     /// A complete line, newline and any trailing `\r` removed.
     Line(Vec<u8>),
     /// The line exceeded the cap; its bytes were discarded up to the newline.
@@ -45,7 +75,7 @@ enum LineRead {
 /// Read one newline-delimited line, holding at most `max` bytes. Returns
 /// `None` at end of stream. A line without a trailing newline at EOF is
 /// returned as-is, like `BufRead::lines`.
-async fn read_line_capped<R: AsyncBufRead + Unpin>(
+pub async fn read_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
 ) -> std::io::Result<Option<LineRead>> {
@@ -186,6 +216,35 @@ mod tests {
             read_line_capped(&mut reader, 4).await.unwrap(),
             Some(LineRead::Line(b"abcd".to_vec()))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_socket_and_its_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("modron-home");
+        let path = dir.join("serve.sock");
+        let _listener = bind_private_socket(&path).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "socket must be owner-only");
+        assert_eq!(mode(&dir), 0o700, "a directory created here must be 0700");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_socket_path_is_refused_and_target_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("victim.txt");
+        std::fs::write(&target, b"keep me").unwrap();
+        let path = root.path().join("serve.sock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(bind_private_socket(&path).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[tokio::test]

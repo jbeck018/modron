@@ -77,23 +77,86 @@ fn base64url_encode(bytes: &[u8]) -> String {
 }
 
 /// Mint a token for `name`, persist it (0600), and return the record.
+///
+/// The token is written to a temp file created 0600 from the start (never
+/// readable under the umask default), then renamed over the final name, so
+/// there is no window where the secret sits with looser permissions.
 pub fn grant(dir: &Path, name: &str) -> anyhow::Result<DeviceToken> {
     let path = token_path(dir, name)?;
-    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    create_private_dir(dir)?;
     let record = DeviceToken {
         name: name.trim().to_string(),
         token: generate_token(),
         created_at: chrono_now(),
     };
     let json = serde_json::to_string_pretty(&record)?;
-    std::fs::write(&path, json).with_context(|| format!("could not write {}", path.display()))?;
-    restrict_to_owner(&path);
+    write_private_atomic(&path, json.as_bytes())?;
     Ok(record)
 }
 
-/// Best-effort 0600 (Unix); a failed chmod is not fatal, the directory is
-/// already user-private under `~/.modron`.
-fn restrict_to_owner(path: &Path) {
+/// Write `bytes` to `path` atomically with owner-only permissions: a temp
+/// file in the same directory is created 0600 from the start (never readable
+/// under the umask default), written, synced, then renamed over `path`. A
+/// torn in-place write can therefore never replace a good file.
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    create_private_dir(dir)?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", Uuid::new_v4().simple()));
+    let write = || -> std::io::Result<()> {
+        let mut file = private_file_options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow!("could not write {}: {e}", path.display())
+    })
+}
+
+/// Create `dir` (and missing parents) owner-only: 0700 on Unix, where the
+/// directory is created here. An existing directory is left as it is.
+pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .with_context(|| format!("could not create {}", dir.display()))
+}
+
+/// Open options for a secret file: created 0600 from the start on Unix.
+#[cfg(unix)]
+fn private_file_options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.mode(0o600);
+    options
+}
+
+#[cfg(not(unix))]
+fn private_file_options() -> std::fs::OpenOptions {
+    std::fs::OpenOptions::new()
+}
+
+/// Best-effort owner-only permissions on an existing path (Unix). Used by
+/// the listeners for their socket files.
+pub fn restrict_to_owner(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -101,6 +164,33 @@ fn restrict_to_owner(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+#[cfg(all(test, unix))]
+mod mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn grant_creates_private_dir_and_0600_token_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("clients");
+        let record = grant(&dir, "phone").unwrap();
+        assert_eq!(mode(&dir), 0o700, "clients dir must be owner-only");
+        assert_eq!(mode(&dir.join("phone.token")), 0o600);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "phone.token")
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+        assert_eq!(list(&dir).unwrap(), vec![record]);
+    }
 }
 
 /// Every stored device record (sorted by name).

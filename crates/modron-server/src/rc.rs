@@ -62,6 +62,53 @@ pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
     )
 }
 
+/// Is `host` (no scheme, port or userinfo; IPv6 without brackets) a loopback
+/// name: `localhost`, `127.0.0.0/8`, or `::1`?
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    host.parse::<std::net::Ipv6Addr>()
+        .is_ok_and(|v6| v6.is_loopback())
+}
+
+/// The host part of a `scheme://authority/...` URL (`rest` is what follows
+/// the scheme). Strips userinfo, the port, and IPv6 brackets.
+fn url_host(rest: &str) -> &str {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        return bracketed.split(']').next().unwrap_or("");
+    }
+    host_port.split(':').next().unwrap_or("")
+}
+
+/// Check that a bridge URL may carry tunnel or publish traffic. `wss://` and
+/// `https://` are accepted for any host. Plaintext `ws://` and `http://` are
+/// accepted only for a loopback host: the tunnel key, the publish token and
+/// the transcript would otherwise cross the network in clear.
+pub fn check_bridge_transport(bridge_url: &str) -> Result<()> {
+    if bridge_url.starts_with("wss://") || bridge_url.starts_with("https://") {
+        return Ok(());
+    }
+    let plaintext = [("ws://", "wss"), ("http://", "https")]
+        .into_iter()
+        .find_map(|(prefix, secure)| bridge_url.strip_prefix(prefix).map(|rest| (rest, secure)));
+    let Some((rest, secure)) = plaintext else {
+        return Err(anyhow!("bridge url must start with ws:// or wss://"));
+    };
+    if is_loopback_host(url_host(rest)) {
+        return Ok(());
+    }
+    let scheme = bridge_url.split("://").next().unwrap_or("ws");
+    Err(anyhow!(
+        "refusing a plaintext {scheme}:// bridge on a non-loopback host; use {secure}://"
+    ))
+}
+
 /// Generate a share key: the full 32 lowercase hex chars of a v4 UUID
 /// (122 random bits, D4). Uuid-derived, so no new dependencies.
 pub fn share_key() -> String {
@@ -218,6 +265,7 @@ async fn publish_page_with_lookup(
     content_md: &str,
 ) -> Result<String> {
     let token = publish_token_from(lookup)?;
+    check_bridge_transport(bridge_base)?;
     let base = bridge_base.trim_end_matches('/');
     let host = base
         .strip_prefix("wss://")
@@ -272,6 +320,9 @@ pub fn start_remote_control(
             "bridge url must start with ws:// or wss:// (deploy cloud/bridge first)"
         ));
     }
+    // The share key and the whole transcript travel over this socket: plaintext
+    // only to loopback.
+    check_bridge_transport(bridge_base)?;
     if !working_dir.join(".modron").exists() {
         return Err(anyhow!(
             "remote-control hands the agent its working directory - run from inside a \
@@ -444,6 +495,45 @@ mod key_tests {
         assert_eq!(
             viewer_key("0123456789abcdef0123456789abcdef"),
             "1e14cd6450e5f6e627a9c619807f506c"
+        );
+    }
+
+    #[test]
+    fn bridge_transport_allows_tls_anywhere_and_plaintext_only_on_loopback() {
+        use super::check_bridge_transport;
+        for ok in [
+            "ws://localhost:8787",
+            "ws://LOCALHOST",
+            "ws://127.0.0.1",
+            "ws://127.9.9.9:8787/base",
+            "ws://[::1]:1",
+            "http://127.0.0.1:9000",
+            "wss://example.com",
+            "https://example.com/base",
+        ] {
+            assert!(
+                check_bridge_transport(ok).is_ok(),
+                "{ok} should be accepted"
+            );
+        }
+        for bad in [
+            "ws://example.com",
+            "ws://127.0.0.1.example.com",
+            "ws://localhost@example.com",
+            "ws://10.0.0.5:7000",
+            "ws://[2001:db8::1]:8787",
+            "http://x",
+            "ftp://example.com",
+        ] {
+            assert!(
+                check_bridge_transport(bad).is_err(),
+                "{bad} should be refused"
+            );
+        }
+        let err = check_bridge_transport("ws://example.com").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "refusing a plaintext ws:// bridge on a non-loopback host; use wss://"
         );
     }
 

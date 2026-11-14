@@ -169,6 +169,12 @@ it - treat the URL like a password and share it only over a private
 channel. A share link cannot change configuration, set API keys, manage
 automations, delete or list other sessions, or open further tunnels.
 
+The bridge URL must be `wss://` (or `https://` for publishing) for any
+host. Plaintext `ws://` (or `http://`) is accepted only when the host is
+loopback (`localhost`, `127.0.0.0/8`, `[::1]`); any other host is refused,
+because the share key, publish token and transcript would cross the
+network in clear.
+
 ## Notes and limits
 
 - Sessions and transcripts are the shared JSONL store
