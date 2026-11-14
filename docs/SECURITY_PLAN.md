@@ -109,11 +109,17 @@ D8. **Checkpoints distinguish three states**: `Absent` (file did not
     deletes only on `Absent`; on `Uncaptured` it refuses with an actionable
     message and changes nothing.
 
-D9. **Children never inherit provider secrets.** Every spawned tool process
-    (bash, verify, diagnostics, interact, hooks, lsp) has env vars matching
-    `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `ANTHROPIC_*`, `OPENAI_*`, `ZAI_*`
-    removed, via one helper in modron-tools `common.rs`. MCP servers are
-    exempt (they are user-configured and may need their own keys).
+D9. **Children never inherit model-provider secrets.** Every spawned tool
+    process (bash, verify, diagnostics, interact, hooks, lsp) has these env
+    vars removed, via `modron_core::hooks::is_secret_env`: names ending in
+    `_API_KEY`, names starting with `ANTHROPIC_`, `OPENAI_`, `ZAI_`, and
+    Modron's own `GITHUB_MODELS_TOKEN`, `MODRON_GITHUB_TOKEN`,
+    `MODRON_DEVICE_TOKEN`, `MODRON_PUBLISH_TOKEN`. Generic `_TOKEN`,
+    `_SECRET`, `_PASSWORD` names are deliberately KEPT (leader decision at
+    D3 review): the agent's shell needs `GITHUB_TOKEN` and similar to run
+    gh, git push, cargo publish and tests. MCP servers are exempt (they
+    are user-configured and may need their own keys). Not yet covered: the
+    sandboxed bash path (D6) and the git spawns in delegate.rs.
 
 ---
 

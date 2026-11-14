@@ -57,8 +57,20 @@ const SCRUB_EXEMPT: &[&str] = &[
 /// secrets, whatever follows the prefix.
 const TOOL_CONTRACT_PREFIX: &str = "MODRON_TOOL_";
 
-/// Name suffixes that mark a credential (matched case-insensitively).
-const SECRET_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
+/// Name suffixes that mark a model-provider credential (matched
+/// case-insensitively). Deliberately narrow: generic `_TOKEN` / `_SECRET` /
+/// `_PASSWORD` names are NOT scrubbed, because the agent's shell needs the
+/// user's own tooling credentials (`GITHUB_TOKEN` for gh and git,
+/// `CARGO_REGISTRY_TOKEN`, database passwords for tests) to do its job.
+const SECRET_SUFFIXES: &[&str] = &["_API_KEY"];
+
+/// Modron's own non-`_API_KEY` credentials, by exact name.
+const SECRET_EXACT: &[&str] = &[
+    "GITHUB_MODELS_TOKEN",
+    "MODRON_GITHUB_TOKEN",
+    "MODRON_DEVICE_TOKEN",
+    "MODRON_PUBLISH_TOKEN",
+];
 
 /// Name prefixes that mark a provider credential or config (matched
 /// case-insensitively).
@@ -72,7 +84,8 @@ pub fn is_secret_env(name: &str) -> bool {
     if upper.starts_with(TOOL_CONTRACT_PREFIX) || SCRUB_EXEMPT.contains(&upper.as_str()) {
         return false;
     }
-    SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
+    SECRET_EXACT.contains(&upper.as_str())
+        || SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
         || SECRET_PREFIXES.iter().any(|p| upper.starts_with(p))
 }
 
@@ -246,16 +259,18 @@ mod tests {
             "ANTHROPIC_BASE_URL",
             "OPENAI_BASE_URL",
             "zai_model",
-            "GITHUB_TOKEN",
-            "CARGO_REGISTRY_TOKEN",
-            "my_secret",
-            "DB_PASSWORD",
             "Stripe_Api_Key",
+            "GITHUB_MODELS_TOKEN",
+            "modron_device_token",
         ];
         for name in secret {
             assert!(is_secret_env(name), "{name} should be scrubbed");
         }
         let kept = [
+            "GITHUB_TOKEN",
+            "CARGO_REGISTRY_TOKEN",
+            "my_secret",
+            "DB_PASSWORD",
             "PATH",
             "HOME",
             "USER",
@@ -283,48 +298,48 @@ mod tests {
     #[test]
     fn scrub_std_command_removes_secret_vars_only() {
         // Unique name: no other test reads or sets it.
-        std::env::set_var("MODRON_TEST_STD_TOKEN", "sekrit-std");
+        std::env::set_var("MODRON_TEST_STD_API_KEY", "sekrit-std");
         let mut cmd = std::process::Command::new("sh");
         scrub_std_command(&mut cmd);
         let out = cmd
             .arg("-c")
-            .arg("printf '%s|%s' \"${MODRON_TEST_STD_TOKEN-unset}\" \"${PATH:+path}\"")
+            .arg("printf '%s|%s' \"${MODRON_TEST_STD_API_KEY-unset}\" \"${PATH:+path}\"")
             .output()
             .unwrap();
-        std::env::remove_var("MODRON_TEST_STD_TOKEN");
+        std::env::remove_var("MODRON_TEST_STD_API_KEY");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|path");
     }
 
     #[tokio::test]
     async fn scrub_tokio_command_removes_secret_vars_only() {
         // Unique name: no other test reads or sets it.
-        std::env::set_var("MODRON_TEST_TOKIO_SECRET", "sekrit-tokio");
+        std::env::set_var("MODRON_TEST_TOKIO_API_KEY", "sekrit-tokio");
         let mut cmd = tokio::process::Command::new("sh");
         scrub_tokio_command(&mut cmd);
         let out = cmd
             .arg("-c")
-            .arg("printf '%s|%s' \"${MODRON_TEST_TOKIO_SECRET-unset}\" \"${PATH:+path}\"")
+            .arg("printf '%s|%s' \"${MODRON_TEST_TOKIO_API_KEY-unset}\" \"${PATH:+path}\"")
             .output()
             .await
             .unwrap();
-        std::env::remove_var("MODRON_TEST_TOKIO_SECRET");
+        std::env::remove_var("MODRON_TEST_TOKIO_API_KEY");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|path");
     }
 
     #[tokio::test]
     async fn hook_env_does_not_leak_provider_secret() {
         // Unique name: no other test reads or sets it.
-        std::env::set_var("MODRON_TEST_HOOK_PASSWORD", "sekrit-hook");
+        std::env::set_var("MODRON_TEST_HOOK_API_KEY", "sekrit-hook");
         let dir = tempfile::tempdir().unwrap();
         let seen = dir.path().join("seen.txt");
         let script = format!(
-            "printf '%s' \"${{MODRON_TEST_HOOK_PASSWORD-unset}}\" > {}",
+            "printf '%s' \"${{MODRON_TEST_HOOK_API_KEY-unset}}\" > {}",
             seen.display()
         );
         let out = run_hook(&script, &[], Duration::from_secs(5))
             .await
             .unwrap();
-        std::env::remove_var("MODRON_TEST_HOOK_PASSWORD");
+        std::env::remove_var("MODRON_TEST_HOOK_API_KEY");
         assert!(!out.blocked, "{}", out.message);
         assert_eq!(std::fs::read_to_string(&seen).unwrap(), "unset");
     }
