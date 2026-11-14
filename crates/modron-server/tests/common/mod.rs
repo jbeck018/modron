@@ -295,4 +295,18 @@ impl WsClient {
     pub async fn close(&mut self) {
         let _ = self.ws.close(None).await;
     }
+
+    /// True when the server ends the connection (close frame, end of
+    /// stream, or transport error) within 5s. Ping/pong are skipped; any
+    /// data frame means the server still answers, so returns false.
+    pub async fn expect_closed(&mut self) -> bool {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await {
+                Err(_) => return false,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return true,
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+                Ok(Some(Ok(_))) => return false,
+            }
+        }
+    }
 }
