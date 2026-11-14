@@ -60,8 +60,12 @@ fn parse_decision(decision: &str) -> Result<modron_protocol::Decision, String> {
 // Plain helpers (no macro rewriting)
 // ---------------------------------------------------------------------------
 
-fn do_connect(url: &str, token: Option<&str>) -> Result<(), String> {
-    let client = RemoteClient::connect(url, token).map_err(err_text)?;
+fn do_connect(url: &str, token: Option<&str>, allow_insecure: bool) -> Result<(), String> {
+    let options = modron_mobile_core::ConnectOptions {
+        allow_insecure,
+        ..Default::default()
+    };
+    let client = RemoteClient::connect_with_options(url, token, options).map_err(err_text)?;
     let mut guard = lock_client()?;
     *guard = Some(client);
     Ok(())
@@ -76,11 +80,18 @@ fn do_attach(session_id: &str, last_seq: u64) -> Result<(), String> {
     }
 }
 
-fn do_reconnect(url: &str, session_id: &str, token: Option<&str>) -> Result<(), String> {
+fn do_reconnect(
+    url: &str,
+    session_id: &str,
+    token: Option<&str>,
+    allow_insecure: bool,
+) -> Result<(), String> {
     let session = parse_session(session_id)?;
     let guard = lock_client()?;
     match guard.as_ref() {
-        Some(client) => client.reconnect(url, session, token).map_err(err_text),
+        Some(client) => client
+            .reconnect_with_options(url, session, token, allow_insecure)
+            .map_err(err_text),
         None => Err(not_connected()),
     }
 }
@@ -346,15 +357,31 @@ impl Remote {
         modron_mobile_core::default_url()
     }
 
-    /// Connect and run the hello/welcome handshake.
-    pub fn connect(url: String, token: Option<String>) -> Result<(), String> {
-        do_connect(&url, token.as_deref())
+    /// Connect and run the hello/welcome handshake. `allow_insecure` is
+    /// the user's explicit opt-in to plain `ws://` on a non-loopback host
+    /// (trusted LAN only); absent means off.
+    pub fn connect(
+        url: String,
+        token: Option<String>,
+        allow_insecure: Option<bool>,
+    ) -> Result<(), String> {
+        do_connect(&url, token.as_deref(), allow_insecure.unwrap_or(false))
     }
 
     /// Reconnect from the last seen seq and re-attach; the server replays
     /// the missed events.
-    pub fn reconnect(url: String, session_id: String, token: Option<String>) -> Result<(), String> {
-        do_reconnect(&url, &session_id, token.as_deref())
+    pub fn reconnect(
+        url: String,
+        session_id: String,
+        token: Option<String>,
+        allow_insecure: Option<bool>,
+    ) -> Result<(), String> {
+        do_reconnect(
+            &url,
+            &session_id,
+            token.as_deref(),
+            allow_insecure.unwrap_or(false),
+        )
     }
 
     /// Subscribe to a session's events; waits for the snapshot fold.
