@@ -13,6 +13,8 @@
 //! allow all / deny", mode names "ask / yolo / deny", the status strip's
 //! `* N tok * cache N%`, the `warn: allow <tool> <args>?` prompt).
 
+use std::collections::VecDeque;
+
 use modron_core::{SessionEvent, ToolActivity, Usage};
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval,
@@ -94,7 +96,6 @@ pub struct AppState {
     pub router_defaults: Option<modron_protocol::RouterDefaults>,
     /// Scheduled automations (wire rows).
     pub automations: Vec<modron_protocol::AutomationWire>,
-    /// Provider auth status rows (onboarding wizard/settings).pub auth_providers: Vec<modron_protocol::AuthProviderWire>,
     pub conn: ConnState,
     pub sessions: Vec<SessionRow>,
     /// The attached session, if any.
@@ -136,7 +137,11 @@ pub struct AppState {
     pub show_reasoning: bool,
 
     pub tracker: ActivityTracker,
+    /// The approval the strip shows (the FRONT of the queue).
     pub pending_approval: Option<PendingApproval>,
+    /// Approvals waiting behind the front, FIFO. Invariant: empty while
+    /// `pending_approval` is `None`.
+    pub queued_approvals: VecDeque<PendingApproval>,
 
     pub model: String,
     pub provider: String,
@@ -225,11 +230,11 @@ impl AppState {
                 self.tracker.on_tool(&core);
             }
             Payload::ApprovalRequested { request_id, call } => {
-                self.pending_approval = Some(PendingApproval { request_id, call });
+                self.enqueue_approval(PendingApproval { request_id, call });
             }
-            Payload::ApprovalResolved { .. } => {
-                // First responder wins; the echo clears the strip everywhere.
-                self.pending_approval = None;
+            Payload::ApprovalResolved { request_id, .. } => {
+                // First responder wins; the echo clears that request everywhere.
+                self.resolve_approval(&request_id);
             }
             Payload::ConfigChanged { patch } => self.apply_config_patch(&patch),
             Payload::Sessions { sessions } => {
@@ -251,6 +256,7 @@ impl AppState {
                 // replayed); the live buffers and the per-turn strip land
                 // as replay rows, the swarm block commits here.
                 self.clear_buffers();
+                self.clear_approvals();
                 let swarm = self.tracker.take_swarm_summary();
                 if !swarm.is_empty() {
                     let entry = TranscriptEntry::Swarm { lines: swarm };
@@ -261,6 +267,7 @@ impl AppState {
             Payload::TurnFailed { error } => {
                 self.running = false;
                 self.clear_buffers();
+                self.clear_approvals();
                 self.tracker.clear_turn();
                 self.last_note = Some(error);
             }
@@ -269,8 +276,8 @@ impl AppState {
                 // persisted (the replay already shows them).
                 self.running = false;
                 self.clear_buffers();
+                self.clear_approvals();
                 self.tracker.clear_turn();
-                self.pending_approval = None;
             }
             // The client's own delete request echoes back; ignore it.
             Payload::DeleteSession { .. } => {}
@@ -373,11 +380,20 @@ impl AppState {
         self.tracker.turn_tools = live.turn_tools;
         self.tracker.subagents = live.subagents.iter().map(swarm_row_from_wire).collect();
         self.pending_approval = live.pending_approval;
+        self.queued_approvals.clear();
         self.cumulative = live.cumulative_usage;
         self.model = live.model;
         self.provider = live.provider;
         self.goal = live.goal;
         self.running = live.running;
+        // C5: the server's real mode and sandbox, through the same label
+        // mappings ConfigChanged uses. Absent keeps the client's default.
+        if let Some(mode) = live.approval_mode {
+            self.approval_mode = approval_mode_label(mode).to_string();
+        }
+        if let Some(policy) = live.sandbox {
+            self.sandbox = sandbox_label(policy).to_string();
+        }
         self.resync_stream_cache();
     }
 
@@ -444,6 +460,66 @@ impl AppState {
         self.streaming_reasoning.clear();
     }
 
+    /// Whether a request id is already the front or queued (dedupe key).
+    fn approval_held(&self, request_id: &str) -> bool {
+        self.pending_approval
+            .as_ref()
+            .is_some_and(|p| p.request_id == request_id)
+            || self
+                .queued_approvals
+                .iter()
+                .any(|p| p.request_id == request_id)
+    }
+
+    /// A new approval request: the front slot when it is free, else FIFO
+    /// behind it. A request id already held is ignored.
+    fn enqueue_approval(&mut self, pending: PendingApproval) {
+        if self.approval_held(&pending.request_id) {
+            return;
+        }
+        if self.pending_approval.is_none() {
+            self.pending_approval = Some(pending);
+        } else {
+            self.queued_approvals.push_back(pending);
+        }
+    }
+
+    /// Resolve one request by id (the server echo, or the local clear after
+    /// a click). The front matching promotes the next queued request; a
+    /// queued match is removed; anything else is a no-op.
+    pub fn resolve_approval(&mut self, request_id: &str) {
+        if self
+            .pending_approval
+            .as_ref()
+            .is_some_and(|p| p.request_id == request_id)
+        {
+            self.pending_approval = self.queued_approvals.pop_front();
+        } else if let Some(ix) = self
+            .queued_approvals
+            .iter()
+            .position(|p| p.request_id == request_id)
+        {
+            self.queued_approvals.remove(ix);
+        }
+    }
+
+    /// Drop every approval (the run ended, so none can be answered).
+    fn clear_approvals(&mut self) {
+        self.pending_approval = None;
+        self.queued_approvals.clear();
+    }
+
+    /// The socket dropped or never came up: nothing runs, no approval can
+    /// be answered, and the in-flight buffers can no longer complete
+    /// (AGENTS.md invariant 5: buffers clear on abort).
+    pub fn on_disconnected(&mut self) {
+        self.conn = ConnState::Offline;
+        self.running = false;
+        self.clear_approvals();
+        self.clear_buffers();
+        self.tracker.clear_turn();
+    }
+
     fn apply_config_patch(&mut self, patch: &ConfigPatch) {
         // Future-turn semantics live server-side; the labels just follow.
         if let Some(model) = &patch.model {
@@ -456,11 +532,7 @@ impl AppState {
             self.approval_mode = approval_mode_label(mode).to_string();
         }
         if let Some(policy) = patch.sandbox {
-            self.sandbox = match policy {
-                modron_core::SandboxPolicy::Seatbelt => "seatbelt".into(),
-                modron_core::SandboxPolicy::Bubblewrap => "bwrap".into(),
-                modron_core::SandboxPolicy::Off => "off".into(),
-            };
+            self.sandbox = sandbox_label(policy).to_string();
         }
         if let Some(goal) = &patch.goal {
             self.goal = goal.clone();
@@ -580,7 +652,11 @@ impl AppState {
         Some(format!(
             "⚠ allow {} {}?",
             pending.call.name,
-            modron_view::short(&pending.call.arguments.to_string(), 80)
+            modron_view::approval_summary(
+                &pending.call.name,
+                &pending.call.arguments,
+                modron_view::APPROVAL_SUMMARY_MAX
+            )
         ))
     }
 
@@ -654,6 +730,16 @@ pub fn approval_mode_label(mode: ApprovalModeWire) -> &'static str {
         ApprovalModeWire::Deny => "deny",
         ApprovalModeWire::Ask => "ask",
         ApprovalModeWire::ApproveAll => "yolo",
+    }
+}
+
+/// The sandbox words the settings control shows (`off` / `seatbelt` /
+/// `bwrap`). Shared by ConfigChanged and the attach snapshot.
+pub fn sandbox_label(policy: modron_core::SandboxPolicy) -> &'static str {
+    match policy {
+        modron_core::SandboxPolicy::Seatbelt => "seatbelt",
+        modron_core::SandboxPolicy::Bubblewrap => "bwrap",
+        modron_core::SandboxPolicy::Off => "off",
     }
 }
 
@@ -919,7 +1005,7 @@ mod tests {
         assert_eq!(s.model, "claude-haiku-5-5");
         assert_eq!(s.provider, "anthropic");
         assert!(s.status_line().contains("110 tok"));
-        assert!(s.status_line().contains("cache 29%"), "{}", s.status_line());
+        assert!(s.status_line().contains("cache 40%"), "{}", s.status_line());
         assert_eq!(s.last_seq, 5);
     }
 
@@ -991,6 +1077,7 @@ mod tests {
             1,
             Payload::Tool {
                 activity: WireToolActivity::Start {
+                    call_id: None,
                     name: "read".into(),
                 },
             },
@@ -999,6 +1086,7 @@ mod tests {
             2,
             Payload::Tool {
                 activity: WireToolActivity::Start {
+                    call_id: None,
                     name: "bash".into(),
                 },
             },
@@ -1007,6 +1095,7 @@ mod tests {
             3,
             Payload::Tool {
                 activity: WireToolActivity::Done {
+                    call_id: None,
                     name: "read".into(),
                     is_error: false,
                     bytes: 2150,
@@ -1126,7 +1215,7 @@ mod tests {
         // TUI's exact prompt wording.
         assert_eq!(
             s.approval_prompt().as_deref(),
-            Some(r#"⚠ allow edit {"path":"src/lib.rs"}?"#)
+            Some("⚠ allow edit src/lib.rs?")
         );
         // The decision labels are the shared copy.
         assert_eq!(decision_label(Decision::AllowOnce), "allow once");
@@ -1142,6 +1231,27 @@ mod tests {
         ));
         assert!(s.pending_approval.is_none());
         assert!(s.approval_prompt().is_none());
+    }
+
+    #[test]
+    fn snapshot_carries_the_server_mode_and_sandbox_labels() {
+        // C5: a client attaching to a yolo session shows yolo, not the
+        // default ask. (Not compiled on Linux; written for the macOS gate.)
+        let mut s = AppState::new();
+        let live = LiveState {
+            approval_mode: Some(ApprovalModeWire::ApproveAll),
+            sandbox: Some(modron_core::SandboxPolicy::Bubblewrap),
+            ..LiveState::default()
+        };
+        s.apply_frame(snapshot_frame(Vec::new(), live));
+        assert_eq!(s.approval_mode, "yolo");
+        assert_eq!(s.sandbox, "bwrap");
+        assert!(s.status_line().contains(" · yolo · "));
+
+        // An old snapshot without the fields keeps the labels it has.
+        s.apply_frame(snapshot_frame(Vec::new(), LiveState::default()));
+        assert_eq!(s.approval_mode, "yolo");
+        assert_eq!(s.sandbox, "bwrap");
     }
 
     #[test]
@@ -1353,7 +1463,7 @@ mod tests {
             "glm-5.3",
             "zai",
             "900 tok",
-            "cache 20%",
+            "cache 25%",
             "ask",
             "turns 3",
             "tools 21",
@@ -1378,10 +1488,165 @@ mod tests {
             ..LiveState::default()
         };
         s.apply_frame(snapshot_frame(Vec::new(), live));
-        assert_eq!(
-            s.approval_prompt().as_deref(),
-            Some(r#"⚠ allow write {"path":"x.txt"}?"#)
+        assert_eq!(s.approval_prompt().as_deref(), Some("⚠ allow write x.txt?"));
+    }
+
+    #[test]
+    fn approval_prompt_uses_the_shared_summary_and_marks_truncation() {
+        let mut s = AppState::new();
+        let command = format!("echo {}", "a".repeat(120));
+        s.pending_approval = Some(PendingApproval {
+            request_id: "req-2".into(),
+            call: ToolCall {
+                id: "c".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": command.clone() }),
+            },
+        });
+        let expected = format!(
+            "⚠ allow bash {}?",
+            modron_view::approval_summary("bash", &serde_json::json!({ "command": command }), 80)
         );
+        assert_eq!(s.approval_prompt().as_deref(), Some(expected.as_str()));
+        assert!(expected.ends_with(" [+45 chars]?"), "{expected}");
+    }
+
+    fn approval_request(id: &str) -> PendingApproval {
+        PendingApproval {
+            request_id: id.into(),
+            call: ToolCall {
+                id: format!("call-{id}"),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": "ls" }),
+            },
+        }
+    }
+
+    fn requested_frame(seq: u64, id: &str) -> Frame {
+        let call = approval_request(id).call;
+        event_frame(
+            seq,
+            Payload::ApprovalRequested {
+                request_id: id.into(),
+                call,
+            },
+        )
+    }
+
+    fn resolved_frame(seq: u64, id: &str) -> Frame {
+        event_frame(
+            seq,
+            Payload::ApprovalResolved {
+                request_id: id.into(),
+                decision: Decision::AllowOnce,
+            },
+        )
+    }
+
+    fn front_id(s: &AppState) -> Option<&str> {
+        s.pending_approval.as_ref().map(|p| p.request_id.as_str())
+    }
+
+    fn queued_ids(s: &AppState) -> Vec<&str> {
+        s.queued_approvals
+            .iter()
+            .map(|p| p.request_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn approvals_queue_fifo_behind_the_front() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(requested_frame(3, "c"));
+        assert_eq!(front_id(&s), Some("a"));
+        assert_eq!(queued_ids(&s), vec!["b", "c"]);
+        // The front resolves: the next queued request is promoted.
+        s.apply_frame(resolved_frame(4, "a"));
+        assert_eq!(front_id(&s), Some("b"));
+        assert_eq!(queued_ids(&s), vec!["c"]);
+        // A queued request resolves elsewhere: removed, front untouched.
+        s.apply_frame(resolved_frame(5, "c"));
+        assert_eq!(front_id(&s), Some("b"));
+        assert!(queued_ids(&s).is_empty());
+        s.apply_frame(resolved_frame(6, "b"));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+    }
+
+    #[test]
+    fn duplicate_approval_request_ids_are_ignored() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "a"));
+        s.apply_frame(requested_frame(3, "b"));
+        s.apply_frame(requested_frame(4, "b"));
+        assert_eq!(front_id(&s), Some("a"));
+        assert_eq!(queued_ids(&s), vec!["b"]);
+    }
+
+    #[test]
+    fn resolving_an_unknown_approval_is_a_noop() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(resolved_frame(3, "zzz"));
+        assert_eq!(front_id(&s), Some("a"));
+        assert_eq!(queued_ids(&s), vec!["b"]);
+    }
+
+    #[test]
+    fn turn_failure_and_abort_clear_every_approval() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(event_frame(
+            3,
+            Payload::TurnFailed {
+                error: "boom".into(),
+            },
+        ));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+
+        s.apply_frame(requested_frame(4, "c"));
+        s.apply_frame(event_frame(5, Payload::TurnAborted {}));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+    }
+
+    #[test]
+    fn snapshot_reset_drops_the_queue() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(snapshot_frame(Vec::new(), LiveState::default()));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+    }
+
+    #[test]
+    fn disconnect_clears_approvals_and_in_flight_buffers() {
+        let mut s = AppState::new();
+        s.apply_frame(event_frame(
+            1,
+            Payload::Delta {
+                delta: WireDelta::Text {
+                    text: "partial".into(),
+                },
+            },
+        ));
+        s.apply_frame(requested_frame(2, "a"));
+        s.apply_frame(requested_frame(3, "b"));
+        s.running = true;
+        s.on_disconnected();
+        assert_eq!(s.conn, ConnState::Offline);
+        assert!(!s.running);
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+        assert!(s.streaming_text.is_empty());
+        assert!(s.displayed_streaming().is_empty());
     }
 
     #[test]

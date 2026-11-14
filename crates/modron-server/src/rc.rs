@@ -1,7 +1,9 @@
 //! rc.rs — remote-control tunnels (the `/remote-control` flow): one
 //! outbound WebSocket from this server to a relay bridge (a deployed
 //! cloud/bridge worker), keyed by a share code. The relay is
-//! transport-only: it stores nothing, it relays Frames.
+//! transport-only for live traffic: it relays Frames and keeps only a
+//! bounded replay buffer per session. Published pages are kept by the
+//! relay for a limited time (see cloud/bridge/README.md).
 //!
 //! Over the tunnel this server acts as a normal protocol connection: the
 //! web/phone page on the other side of the relay sends ClientMsg frames
@@ -27,8 +29,20 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::dispatch::{handle_frame, ConnCtx, Flow, ServerState};
 use modron_core::SessionId;
 
-/// Build the relay URLs for a bridge base + share key: the agent tunnel
-/// `ws(s)://host/agent/{key}` and the viewer page `base/s/{key}`.
+/// The key that goes into a share link: a one-way hash of the agent's
+/// secret key. The bridge derives the same value from the agent's
+/// connection, so both sides meet in one relay session, but someone holding
+/// a share link cannot recover the agent key and connect as the agent.
+/// Must match `viewerKeyOf` in cloud/bridge/src/index.ts.
+pub fn viewer_key(agent_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("modron-viewer:{agent_key}").as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Build the relay URLs for a bridge base + agent key: the agent tunnel
+/// `ws(s)://host/agent/{key}` and the viewer page `base/s/{viewer key}`
+/// (see [`viewer_key`]; the share link never contains the agent key).
 pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
     let base = bridge_base.trim_end_matches('/');
     let ws_scheme = if base.starts_with("wss://") || base.starts_with("https://") {
@@ -44,14 +58,61 @@ pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
         .unwrap_or(base);
     (
         format!("{ws_scheme}://{host}/agent/{key}"),
-        format!("{base}/s/{key}"),
+        format!("{base}/s/{}", viewer_key(key)),
     )
 }
 
-/// Generate a share key: short, lowercase, URL-safe (uuid-derived, no new
-/// dependencies).
+/// Is `host` (no scheme, port or userinfo; IPv6 without brackets) a loopback
+/// name: `localhost`, `127.0.0.0/8`, or `::1`?
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    host.parse::<std::net::Ipv6Addr>()
+        .is_ok_and(|v6| v6.is_loopback())
+}
+
+/// The host part of a `scheme://authority/...` URL (`rest` is what follows
+/// the scheme). Strips userinfo, the port, and IPv6 brackets.
+fn url_host(rest: &str) -> &str {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        return bracketed.split(']').next().unwrap_or("");
+    }
+    host_port.split(':').next().unwrap_or("")
+}
+
+/// Check that a bridge URL may carry tunnel or publish traffic. `wss://` and
+/// `https://` are accepted for any host. Plaintext `ws://` and `http://` are
+/// accepted only for a loopback host: the tunnel key, the publish token and
+/// the transcript would otherwise cross the network in clear.
+pub fn check_bridge_transport(bridge_url: &str) -> Result<()> {
+    if bridge_url.starts_with("wss://") || bridge_url.starts_with("https://") {
+        return Ok(());
+    }
+    let plaintext = [("ws://", "wss"), ("http://", "https")]
+        .into_iter()
+        .find_map(|(prefix, secure)| bridge_url.strip_prefix(prefix).map(|rest| (rest, secure)));
+    let Some((rest, secure)) = plaintext else {
+        return Err(anyhow!("bridge url must start with ws:// or wss://"));
+    };
+    if is_loopback_host(url_host(rest)) {
+        return Ok(());
+    }
+    let scheme = bridge_url.split("://").next().unwrap_or("ws");
+    Err(anyhow!(
+        "refusing a plaintext {scheme}:// bridge on a non-loopback host; use {secure}://"
+    ))
+}
+
+/// Generate a share key: the full 32 lowercase hex chars of a v4 UUID
+/// (122 random bits, D4). Uuid-derived, so no new dependencies.
 pub fn share_key() -> String {
-    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Run the tunnel for one session until the socket closes or the server
@@ -64,16 +125,21 @@ pub async fn run_tunnel(
     bridge_base: String,
     key: String,
 ) -> Result<()> {
+    // The agent URL carries the share key: never put it in an error
+    // message or a log line, only the bridge base.
     let (agent_url, _open_url) = tunnel_urls(&bridge_base, &key);
-    let (socket, _) = connect_async(agent_url.clone())
+    let (socket, _) = connect_async(agent_url)
         .await
-        .with_context(|| format!("connecting to the remote-control bridge at {agent_url}"))?;
+        .with_context(|| format!("connecting to the remote-control bridge at {bridge_base}"))?;
     let (mut sink, mut stream) = socket.split();
 
     // Server->relay writer: drains the connection's outbound frames (the
     // dispatch pipeline pushes every reply here via ConnCtx).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    let mut ctx = ConnCtx::new(out_tx);
+    // The tunnel is authenticated by construction (its key was minted by
+    // this server) and pinned to its one session (D5): the relay's frames
+    // get the scoped allowlist, never the server-wide one.
+    let mut ctx = ConnCtx::scoped(out_tx, session);
 
     // Handshake + eager subscribe before handing the sink to the writer.
     let hello = modron_protocol::Frame::request(
@@ -113,8 +179,7 @@ pub async fn run_tunnel(
     });
 
     // Relay loop: every frame from the bridge goes through the SAME
-    // dispatch as local clients (loopback-trusted: the tunnel key was
-    // minted by this server).
+    // dispatch as local clients, under the tunnel's scope (see ConnCtx::scoped).
     loop {
         let frame = tokio::select! {
             frame = stream.next() => match frame {
@@ -148,9 +213,29 @@ pub fn share_key_for(state: &ServerState, session: &SessionId) -> Option<String>
     state.rc_keys.lock().unwrap().get(session).cloned()
 }
 
+/// Environment variable holding the bridge's `PUBLISH_TOKEN` secret.
+pub const PUBLISH_TOKEN_ENV: &str = "MODRON_PUBLISH_TOKEN";
+
+/// Read the publish token through `lookup` (the process environment in
+/// production, a closure in tests). Empty counts as unset.
+fn publish_token_from(lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
+    lookup(PUBLISH_TOKEN_ENV)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow!("publishing needs MODRON_PUBLISH_TOKEN (the bridge's PUBLISH_TOKEN secret)")
+        })
+}
+
+/// The `Authorization` header value the bridge expects for publishing.
+pub fn publish_auth_header(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
 /// Publish an assistant answer as a shareable web page on the bridge.
-/// `key` authenticates the agent; the bridge stores the page and serves
-/// it at /p/<id> with no auth (public share, paradev "pages" grammar).
+/// The request is authorized by the deploy-time `PUBLISH_TOKEN` (read from
+/// `MODRON_PUBLISH_TOKEN`), never by the share key. `key` only selects the
+/// bridge's storage object. Pages are served at /p/<id> with no auth.
+/// Fails before sending anything if the token is unset or empty.
 pub async fn publish_page(
     bridge_base: &str,
     key: &str,
@@ -158,6 +243,29 @@ pub async fn publish_page(
     title: &str,
     content_md: &str,
 ) -> Result<String> {
+    publish_page_with_lookup(
+        |name| std::env::var(name).ok(),
+        bridge_base,
+        key,
+        session,
+        title,
+        content_md,
+    )
+    .await
+}
+
+/// `publish_page` with the environment lookup injected (tests use this so
+/// they never mutate process env).
+async fn publish_page_with_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+    bridge_base: &str,
+    key: &str,
+    session: SessionId,
+    title: &str,
+    content_md: &str,
+) -> Result<String> {
+    let token = publish_token_from(lookup)?;
+    check_bridge_transport(bridge_base)?;
     let base = bridge_base.trim_end_matches('/');
     let host = base
         .strip_prefix("wss://")
@@ -179,7 +287,7 @@ pub async fn publish_page(
     let response = client
         .post(format!("{http}://{host}/pages/{key}"))
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {key}"))
+        .header("authorization", publish_auth_header(&token))
         .body(body.to_string())
         .send()
         .await
@@ -199,7 +307,7 @@ pub async fn publish_page(
     Ok(format!("{http}://{host}/p/{id}"))
 }
 
-/// Register a remote-control tunnel for `session`:/// Register a remote-control tunnel for `session`: validates the session,
+/// Register a remote-control tunnel for `session`: validates the session,
 /// mints the share key, spawns the tunnel task. Returns the open URL.
 pub fn start_remote_control(
     state: &Arc<ServerState>,
@@ -212,6 +320,9 @@ pub fn start_remote_control(
             "bridge url must start with ws:// or wss:// (deploy cloud/bridge first)"
         ));
     }
+    // The share key and the whole transcript travel over this socket: plaintext
+    // only to loopback.
+    check_bridge_transport(bridge_base)?;
     if !working_dir.join(".modron").exists() {
         return Err(anyhow!(
             "remote-control hands the agent its working directory - run from inside a \
@@ -228,8 +339,8 @@ pub fn start_remote_control(
     let state_moved = Arc::clone(state);
     let bridge = bridge_base.to_string();
     let tunnel_task = tokio::spawn(async move {
-        if let Err(e) = run_tunnel(state_moved, session, bridge, key.clone()).await {
-            tracing::warn!(key = %key, error = %e, "remote-control tunnel ended");
+        if let Err(e) = run_tunnel(state_moved, session, bridge, key).await {
+            tracing::warn!(%session, error = %e, "remote-control tunnel ended");
         }
     });
     // Abort the previous tunnel for this session, if any: a re-registration
@@ -245,4 +356,196 @@ pub fn start_remote_control(
     }
     let _ = tunnel_url;
     Ok(open_url)
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve one HTTP request on a local port. Returns the base URL and a
+    /// receiver that yields the request head (lowercased) once it arrives.
+    fn one_shot_bridge() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let head_end = loop {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while buf.len() < head_end + length {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body = r#"{"id":"page-1"}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(reply.as_bytes()).unwrap();
+            let _ = tx.send(head.to_lowercase());
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[test]
+    fn auth_header_is_bearer_token() {
+        assert_eq!(publish_auth_header("s3cret"), "Bearer s3cret");
+    }
+
+    #[test]
+    fn unset_or_empty_token_is_an_error() {
+        assert_eq!(
+            publish_token_from(|_| Some("t".into())).unwrap(),
+            "t".to_string()
+        );
+        assert!(publish_token_from(|_| Some(String::new())).is_err());
+        let message = publish_token_from(|_| None).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            "publishing needs MODRON_PUBLISH_TOKEN (the bridge's PUBLISH_TOKEN secret)"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_without_token_makes_no_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let err = publish_page_with_lookup(
+            |_| None,
+            &base,
+            "0123456789abcdef0123456789abcdef",
+            uuid::Uuid::new_v4(),
+            "title",
+            "body",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("MODRON_PUBLISH_TOKEN"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no connection may reach the bridge without a token"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_header_carries_publish_token_not_share_key() {
+        let (base, head_rx) = one_shot_bridge();
+        let key = "0123456789abcdef0123456789abcdef";
+        let url = publish_page_with_lookup(
+            |name| (name == PUBLISH_TOKEN_ENV).then(|| "pub-token-xyz".to_string()),
+            &base,
+            key,
+            uuid::Uuid::new_v4(),
+            "title",
+            "# body",
+        )
+        .await
+        .unwrap();
+        assert!(url.ends_with("/p/page-1"), "unexpected url {url}");
+        let head = head_rx.recv().unwrap();
+        assert!(head.starts_with(&format!("post /pages/{key} ")), "{head}");
+        assert!(
+            head.contains("authorization: bearer pub-token-xyz"),
+            "{head}"
+        );
+        assert!(
+            !head.contains(&format!("bearer {key}")),
+            "share key used as bearer: {head}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{tunnel_urls, viewer_key};
+
+    /// The same vector is produced by `viewerKeyOf` in the bridge
+    /// (sha256("modron-viewer:" + key), first 16 bytes, hex). If this
+    /// changes, share links stop meeting their agent on the relay.
+    #[test]
+    fn viewer_key_matches_the_bridge_derivation() {
+        assert_eq!(
+            viewer_key("0123456789abcdef0123456789abcdef"),
+            "1e14cd6450e5f6e627a9c619807f506c"
+        );
+    }
+
+    #[test]
+    fn bridge_transport_allows_tls_anywhere_and_plaintext_only_on_loopback() {
+        use super::check_bridge_transport;
+        for ok in [
+            "ws://localhost:8787",
+            "ws://LOCALHOST",
+            "ws://127.0.0.1",
+            "ws://127.9.9.9:8787/base",
+            "ws://[::1]:1",
+            "http://127.0.0.1:9000",
+            "wss://example.com",
+            "https://example.com/base",
+        ] {
+            assert!(
+                check_bridge_transport(ok).is_ok(),
+                "{ok} should be accepted"
+            );
+        }
+        for bad in [
+            "ws://example.com",
+            "ws://127.0.0.1.example.com",
+            "ws://localhost@example.com",
+            "ws://10.0.0.5:7000",
+            "ws://[2001:db8::1]:8787",
+            "http://x",
+            "ftp://example.com",
+        ] {
+            assert!(
+                check_bridge_transport(bad).is_err(),
+                "{bad} should be refused"
+            );
+        }
+        let err = check_bridge_transport("ws://example.com").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "refusing a plaintext ws:// bridge on a non-loopback host; use wss://"
+        );
+    }
+
+    #[test]
+    fn share_link_never_contains_the_agent_key() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let (agent_url, share_url) = tunnel_urls("wss://bridge.example", key);
+        assert_eq!(agent_url, format!("wss://bridge.example/agent/{key}"));
+        assert!(!share_url.contains(key), "{share_url}");
+        assert_eq!(
+            share_url,
+            format!("wss://bridge.example/s/{}", viewer_key(key))
+        );
+    }
 }

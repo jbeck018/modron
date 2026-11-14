@@ -4,8 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+# Default: read-only. Only the jobs that upload release assets get write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Publish gate: the offline suite (mock provider is the acceptance
@@ -15,9 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-gate
       - name: Tests (offline — the mock provider is the acceptance harness)
@@ -40,28 +43,35 @@ jobs:
             archive_os: apple-darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
       # -p modron-cli: ship the CLI, not the desktop crate (macOS-only gpui).
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p modron-cli
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET" -p modron-cli
       - name: Package (modron-<arch>-<os>.tar.gz with a `modron` binary)
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           mkdir -p stage
-          cp "target/${{ matrix.target }}/release/modron" stage/modron
-          ARCHIVE="modron-${{ matrix.target }}.tar.gz"
+          cp "target/$TARGET/release/modron" stage/modron
+          ARCHIVE="modron-$TARGET.tar.gz"
           tar -czf "$ARCHIVE" -C stage modron
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           cat "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
       - name: Create release and upload archive + per-archive sha256
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             ${{ env.ARCHIVE }}
@@ -75,6 +85,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -90,7 +102,7 @@ jobs:
           cd assets
           shasum -a 256 modron-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: SHA256SUMS
           path: assets/SHA256SUMS

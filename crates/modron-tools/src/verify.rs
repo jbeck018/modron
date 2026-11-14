@@ -61,12 +61,18 @@ impl Tool for VerifyTool {
             ));
         }
 
+        // D6/D9: the verify command runs under the session's sandbox policy
+        // (it executes repo code), with provider secrets scrubbed.
+        let mut prepared =
+            match modron_core::sandbox::shell_command(ctx.sandbox, &self.command, &ctx.working_dir)
+            {
+                Ok(prepared) => prepared,
+                Err(err) => return Ok(tool_err(NAME, err.to_string(), MAX_BYTES)),
+            };
         let output = tokio::time::timeout(
             TIMEOUT,
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&self.command)
-                .current_dir(&ctx.working_dir)
+            prepared
+                .command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

@@ -96,15 +96,69 @@ pub fn short(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Cache-hit percentage for one turn's usage: `100 * cached / (input +
-/// cached)`, `None` when the denominator is zero (the "-" case every
-/// client hand-rolled; six copies collapsed 2026-11-12 cycle-2 audit).
+/// Shown once per connection when a client receives a frame it cannot
+/// decode (a newer server speaking to an older client). Shared so every
+/// client says the same words.
+pub const UNDECODABLE_FRAME_NOTICE: &str =
+    "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+
+/// Character cap for the one-line approval summary. Every client calls
+/// [`approval_summary`] with this value so the prompt reads the same.
+pub const APPROVAL_SUMMARY_MAX: usize = 80;
+
+/// Replace control characters and bidi overrides/isolates with `?` so a
+/// tool call cannot hide or reorder text on an approval prompt.
+pub fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let bidi = matches!(
+                c,
+                '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            );
+            if c.is_control() || bidi {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The one-line approval prompt text (AGENTS.md D7): the essential
+/// argument first (`bash` -> the command, `write`/`edit` -> the path,
+/// anything else -> compact JSON), sanitized, capped at `max` chars. A
+/// truncated summary ends with ` [+N chars]` where N is the hidden count.
+pub fn approval_summary(name: &str, args: &serde_json::Value, max: usize) -> String {
+    let essential = match name {
+        "bash" => args.get("command").and_then(serde_json::Value::as_str),
+        "write" | "edit" => args.get("path").and_then(serde_json::Value::as_str),
+        _ => None,
+    };
+    let raw = match essential {
+        Some(text) => text.to_string(),
+        None => serde_json::to_string(args).unwrap_or_default(),
+    };
+    let clean = sanitize_display(&raw);
+    let total = clean.chars().count();
+    if total <= max {
+        clean
+    } else {
+        let head: String = clean.chars().take(max).collect();
+        format!("{head} [+{} chars]", total - max)
+    }
+}
+
+/// Cache-hit percentage for usage: `100 * cached / input`, clamped to
+/// `0..=100`. `Usage.input_tokens` already includes cache reads and writes
+/// (E3), so `cached` is a subset of it and no addition is needed. `None`
+/// when `input` is zero, so clients keep omitting the figure before any
+/// tokens exist (the "absent before any tokens" contract).
 pub fn cache_hit_pct(usage: &modron_types::Usage) -> Option<f64> {
-    let denom = usage.input_tokens + usage.cached_input_tokens;
-    if denom == 0 {
+    if usage.input_tokens == 0 {
         return None;
     }
-    Some(100.0 * usage.cached_input_tokens as f64 / denom as f64)
+    let pct = 100.0 * usage.cached_input_tokens as f64 / usage.input_tokens as f64;
+    Some(pct.clamp(0.0, 100.0))
 }
 
 /// One subagent row of the swarm view (serde-safe: epoch millis instead
@@ -172,7 +226,7 @@ impl ActivityTracker {
     /// swarm-row updates).
     pub fn on_tool(&mut self, activity: &ToolActivity) {
         match activity {
-            ToolActivity::Start { name } => {
+            ToolActivity::Start { name, .. } => {
                 self.turn_tools.push(ToolEvent {
                     name: name.clone(),
                     bytes: None,
@@ -184,6 +238,7 @@ impl ActivityTracker {
                 name,
                 is_error,
                 bytes,
+                ..
             } => {
                 if let Some(event) = self
                     .turn_tools
@@ -539,9 +594,34 @@ pub fn usage_totals(events: &[SessionEvent]) -> Usage {
 mod tests {
     use super::*;
     use modron_types::{Message, ToolCall, ToolOutcome};
+    use serde_json::json;
+
+    #[test]
+    fn cache_hit_pct_is_cached_over_input() {
+        let usage = modron_types::Usage {
+            input_tokens: 1000,
+            output_tokens: 10,
+            cached_input_tokens: 250,
+        };
+        assert_eq!(cache_hit_pct(&usage), Some(25.0));
+    }
+
+    #[test]
+    fn cache_hit_pct_is_absent_without_input_and_clamped() {
+        let empty = modron_types::Usage::default();
+        assert_eq!(cache_hit_pct(&empty), None);
+        // Corrupt data (cached > input) must not report more than 100%.
+        let corrupt = modron_types::Usage {
+            input_tokens: 10,
+            output_tokens: 0,
+            cached_input_tokens: 40,
+        };
+        assert_eq!(cache_hit_pct(&corrupt), Some(100.0));
+    }
 
     fn done(name: &str, bytes: u64, is_error: bool) -> ToolActivity {
         ToolActivity::Done {
+            call_id: None,
             name: name.to_string(),
             is_error,
             bytes: bytes as usize,
@@ -552,9 +632,11 @@ mod tests {
     fn groups_start_then_done_in_place() {
         let mut t = ActivityTracker::new();
         t.on_tool(&ToolActivity::Start {
+            call_id: None,
             name: "read".into(),
         });
         t.on_tool(&ToolActivity::Start {
+            call_id: None,
             name: "bash".into(),
         });
         t.on_tool(&done("read", 2150, false));
@@ -581,12 +663,14 @@ mod tests {
         let mut t = ActivityTracker::new();
         for _ in 0..9 {
             t.on_tool(&ToolActivity::Start {
+                call_id: None,
                 name: "glob".into(),
             });
             t.on_tool(&done("glob", 1, false));
         }
         for _ in 0..8 {
             t.on_tool(&ToolActivity::Start {
+                call_id: None,
                 name: "read".into(),
             });
             t.on_tool(&done("read", 1, false));
@@ -784,5 +868,54 @@ mod tests {
         assert!(json.contains("\"kind\":\"tool_summary\""));
         let back: TranscriptEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn approval_summary_leads_with_the_essential_argument() {
+        // bash: the command itself, not a JSON wrapper around it.
+        let s = approval_summary("bash", &json!({"command": "cargo test"}), 80);
+        assert_eq!(s, "cargo test");
+        // write / edit: the path.
+        for tool in ["write", "edit"] {
+            let s = approval_summary(tool, &json!({"path": "src/a.rs", "content": "x"}), 80);
+            assert!(s.starts_with("src/a.rs"), "{tool}: {s}");
+        }
+        // Anything else: compact JSON of the whole call.
+        let s = approval_summary("grep", &json!({"pattern": "todo"}), 80);
+        assert_eq!(s, r#"{"pattern":"todo"}"#);
+        // A bash call with no string command falls back to compact JSON.
+        let s = approval_summary("bash", &json!({"cmd": 3}), 80);
+        assert_eq!(s, r#"{"cmd":3}"#);
+    }
+
+    #[test]
+    fn approval_summary_marks_truncation_with_the_hidden_count() {
+        let long = "x".repeat(100);
+        let s = approval_summary("bash", &json!({ "command": long }), 20);
+        assert_eq!(s, format!("{} [+80 chars]", "x".repeat(20)));
+        // Exactly at the cap is not truncated: no marker.
+        let fits = "y".repeat(20);
+        assert_eq!(
+            approval_summary("bash", &json!({ "command": fits.clone() }), 20),
+            fits
+        );
+        // The marker counts chars, not bytes.
+        let multi = "\u{e9}".repeat(30);
+        let s = approval_summary("write", &json!({ "path": multi }), 10);
+        assert!(s.ends_with(" [+20 chars]"), "{s}");
+    }
+
+    #[test]
+    fn approval_summary_replaces_control_and_bidi_characters() {
+        let s = approval_summary("bash", &json!({"command": "ls\u{1b}[2J\u{202e}rm"}), 80);
+        assert_eq!(s, "ls?[2J?rm");
+        assert!(!s.contains('\u{1b}') && !s.contains('\u{202e}'));
+        let s = approval_summary("write", &json!({"path": "a\u{2066}b\nc"}), 80);
+        assert_eq!(s, "a?b?c");
+    }
+
+    #[test]
+    fn approval_max_is_the_one_shared_cap() {
+        assert_eq!(APPROVAL_SUMMARY_MAX, 80);
     }
 }

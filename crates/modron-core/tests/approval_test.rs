@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use modron_core::testing::{InMemoryStore, MockProvider, StaticSelector};
 use modron_core::{
     ApprovalMode, ApprovalPolicy, Engine, EngineConfig, Message, ModelProvider, Result, Role,
-    SessionEvent, StopReason, Tool, ToolCall, ToolCtx, ToolOutcome, ToolRegistry, ToolSpec,
-    TurnResponse, Usage,
+    SessionEvent, SessionStore, StopReason, Tool, ToolCall, ToolCtx, ToolOutcome, ToolRegistry,
+    ToolSpec, TurnResponse, Usage,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -282,4 +282,234 @@ async fn resume_unaffected_by_blocks() {
     assert_eq!(resumed_first.role, Role::User);
     assert_eq!(resumed_first.content, "try to write");
     let _ = Message::user("shape check");
+}
+
+/// Engine rooted at `dir` with a shared in-memory store, so tests can read
+/// back the checkpoint events the run wrote.
+fn engine_in(
+    dir: &std::path::Path,
+    provider: Arc<dyn ModelProvider>,
+    approvals: ApprovalPolicy,
+    approver: Option<Arc<modron_core::Approver>>,
+    store: Arc<InMemoryStore>,
+) -> Engine {
+    let tools = registry().0;
+    let mut providers = HashMap::new();
+    providers.insert("mock".to_string(), provider);
+    Engine {
+        selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+        providers,
+        tools,
+        store: store as Arc<dyn SessionStore>,
+        config: EngineConfig {
+            working_dir: dir.to_path_buf(),
+            approvals,
+            approver,
+            ..EngineConfig::default()
+        },
+    }
+}
+
+fn write_turn(path: &str) -> Arc<MockProvider> {
+    Arc::new(
+        MockProvider::new()
+            .then_response(call_response_with_args(
+                "c1",
+                "write",
+                json!({ "path": path }),
+            ))
+            .then_text("done"),
+    )
+}
+
+fn call_response_with_args(id: &str, name: &str, arguments: serde_json::Value) -> TurnResponse {
+    TurnResponse {
+        text: String::new(),
+        tool_calls: vec![ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }],
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+    }
+}
+
+fn checkpoints(events: &[SessionEvent]) -> Vec<SessionEvent> {
+    events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::Checkpoint { .. }))
+        .cloned()
+        .collect()
+}
+
+fn policy(mode: ApprovalMode) -> ApprovalPolicy {
+    ApprovalPolicy {
+        mode,
+        non_interactive: false,
+        allow: Vec::new(),
+        deny: Vec::new(),
+    }
+}
+
+/// D8/A3: a write checkpoints the prior content in every mode that lets the
+/// call run (ApproveAll, and Ask with an approving approver), not only in
+/// ApproveAll.
+#[tokio::test]
+async fn checkpoint_taken_in_every_allowing_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"before").unwrap();
+    let allow: Arc<modron_core::Approver> = Arc::new(|_c: &ToolCall| true);
+    for (mode, approver) in [
+        (ApprovalMode::ApproveAll, None),
+        (ApprovalMode::Ask, Some(allow)),
+    ] {
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine_in(
+            dir.path(),
+            write_turn("a.txt"),
+            policy(mode),
+            approver,
+            Arc::clone(&store),
+        );
+        let summary = engine.run_task("edit").await.unwrap();
+        let events = store.load(summary.session_id).await.unwrap();
+        let cps = checkpoints(&events);
+        assert_eq!(cps.len(), 1, "mode {mode:?}: one checkpoint");
+        match &cps[0] {
+            SessionEvent::Checkpoint {
+                path,
+                prior_content_b64,
+                uncaptured,
+                ..
+            } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(
+                    prior_content_b64.as_deref(),
+                    Some(modron_core::b64::encode(b"before").as_str()),
+                    "mode {mode:?}: prior content captured"
+                );
+                assert!(!uncaptured, "mode {mode:?}: small file is captured");
+            }
+            other => panic!("expected checkpoint, got {other:?}"),
+        }
+    }
+}
+
+/// A3: a refused call records no checkpoint (the gate runs first).
+#[tokio::test]
+async fn refused_write_records_no_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"before").unwrap();
+    let deny: Arc<modron_core::Approver> = Arc::new(|_c: &ToolCall| false);
+    for (mode, approver) in [(ApprovalMode::Deny, None), (ApprovalMode::Ask, Some(deny))] {
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine_in(
+            dir.path(),
+            write_turn("a.txt"),
+            policy(mode),
+            approver,
+            Arc::clone(&store),
+        );
+        let summary = engine.run_task("edit").await.unwrap();
+        let events = store.load(summary.session_id).await.unwrap();
+        assert!(
+            checkpoints(&events).is_empty(),
+            "mode {mode:?}: refused call must record no checkpoint"
+        );
+    }
+}
+
+/// A3: a file that did not exist is checkpointed as absent (None, captured),
+/// so rewind will delete it.
+#[tokio::test]
+async fn new_file_checkpoint_is_absent_not_uncaptured() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(InMemoryStore::new());
+    let engine = engine_in(
+        dir.path(),
+        write_turn("fresh.txt"),
+        policy(ApprovalMode::ApproveAll),
+        None,
+        Arc::clone(&store),
+    );
+    let summary = engine.run_task("create").await.unwrap();
+    let events = store.load(summary.session_id).await.unwrap();
+    match checkpoints(&events).as_slice() {
+        [SessionEvent::Checkpoint {
+            prior_content_b64,
+            uncaptured,
+            ..
+        }] => {
+            assert_eq!(*prior_content_b64, None);
+            assert!(!uncaptured);
+        }
+        other => panic!("expected one absent checkpoint, got {other:?}"),
+    }
+}
+
+/// A3: a pre-existing file over the 256 KB cap is recorded as uncaptured,
+/// and the snapshot is never read into the log.
+#[tokio::test]
+async fn oversized_file_is_recorded_uncaptured() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.bin"), vec![7u8; 300 * 1024]).unwrap();
+    let store = Arc::new(InMemoryStore::new());
+    let engine = engine_in(
+        dir.path(),
+        write_turn("big.bin"),
+        policy(ApprovalMode::ApproveAll),
+        None,
+        Arc::clone(&store),
+    );
+    let summary = engine.run_task("edit").await.unwrap();
+    let events = store.load(summary.session_id).await.unwrap();
+    match checkpoints(&events).as_slice() {
+        [SessionEvent::Checkpoint {
+            prior_content_b64,
+            uncaptured,
+            ..
+        }] => {
+            assert_eq!(*prior_content_b64, None);
+            assert!(uncaptured, "oversized original must be marked uncaptured");
+        }
+        other => panic!("expected one uncaptured checkpoint, got {other:?}"),
+    }
+}
+
+/// A3: only paths that resolve inside the working dir are checkpointed:
+/// an absolute path elsewhere, a `..` escape, and a symlink whose target is
+/// outside all record nothing.
+#[tokio::test]
+async fn path_outside_working_dir_records_nothing() {
+    let work = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("secret.txt");
+    std::fs::write(&outside_file, b"outside").unwrap();
+    let escape = format!(
+        "../{}/secret.txt",
+        outside.path().file_name().unwrap().to_string_lossy()
+    );
+    let mut targets = vec![outside_file.to_string_lossy().to_string(), escape];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside_file, work.path().join("link.txt")).unwrap();
+        targets.push("link.txt".to_string());
+    }
+    for target in targets {
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine_in(
+            work.path(),
+            write_turn(&target),
+            policy(ApprovalMode::ApproveAll),
+            None,
+            Arc::clone(&store),
+        );
+        let summary = engine.run_task("edit").await.unwrap();
+        let events = store.load(summary.session_id).await.unwrap();
+        assert!(
+            checkpoints(&events).is_empty(),
+            "target {target}: outside working dir must record no checkpoint"
+        );
+    }
 }

@@ -25,6 +25,7 @@ interface PendingApproval {
   request_id: string;
   tool: string;
   args_summary: string;
+  arguments_text: string;
   options: DecisionOption[];
 }
 
@@ -124,11 +125,23 @@ interface Snapshot {
 // Demo mode renders the scripted snapshot with no server; toggle off to
 // talk to a real one (ws://127.0.0.1:7699 by default).
 const demo = signal(true);
+// The device token for a connect call: empty means no token (null).
+function tokenArg(): string | null {
+  const t = deviceToken().trim();
+  return t === "" ? null : t;
+}
+
 // Once a connect starts, real server state must flow into the snapshot
 // even while demo is technically still on (it flips off on success).
 const live = signal(false);
 const snap = signal<Snapshot>(JSON.parse(Remote.demoSnapshotJson()) as Snapshot);
 const url = signal(Remote.defaultUrl());
+// Optional paired device token for servers that require one. Held in
+// memory only: never logged, never written to notes or storage.
+const deviceToken = signal("");
+// Explicit opt-in for plain ws:// to a non-loopback host (a trusted LAN
+// only; the core refuses it otherwise). Default off, held in memory only.
+const allowInsecure = signal(false);
 const draft = signal("");
 const connectError = signal<string | null>(null);
 const busy = signal(false);
@@ -162,6 +175,8 @@ const taskTitle = signal("");
 // the row id whose delete control is armed (two-tap confirm, matching
 // the desktop's trash -> check flow).
 const editMode = signal(false);
+// Approval sheet: the expandable full-call block (parity D7 "view full call").
+const approvalDetail = signal(false);
 const selectedIds = signal<string[]>([]);
 const confirmingId = signal<string | null>(null);
 
@@ -213,7 +228,7 @@ async function connectAndOpen(): Promise<void> {
   busy.set(true);
   live.set(true);
   try {
-    Remote.connect(url(), null);
+    Remote.connect(url(), tokenArg(), allowInsecure());
     let connected = false;
     for (let i = 0; i < 40; i++) {
       const s = JSON.parse(Remote.snapshotJson()) as Snapshot;
@@ -387,11 +402,17 @@ function setConfig(patch: Record<string, unknown>): void {
     // mapping by hand: modron_mobile_core::approval_mode_label
     // (mobile/rust-core/src/view.rs: ApproveAll -> "yolo", Ask/None ->
     // "ask", Deny -> "deny"). Keep the two in sync.
+    // Wire values are the server's serde names (ApprovalModeWire,
+    // SandboxPolicy); an unknown wire value leaves the label alone, so a
+    // wrong name shows up in the demo as a change that never lands.
     if (typeof patch.approval_mode === "string") {
-      next.approval_mode_label =
-        patch.approval_mode === "approve_all" ? "yolo" : patch.approval_mode;
+      const label = APPROVAL_LABEL_BY_WIRE[patch.approval_mode];
+      if (label !== undefined) next.approval_mode_label = label;
     }
-    if (typeof patch.sandbox === "string") next.sandbox = patch.sandbox;
+    if (typeof patch.sandbox === "string") {
+      const label = SANDBOX_LABEL_BY_WIRE[patch.sandbox];
+      if (label !== undefined) next.sandbox = label;
+    }
     if (Array.isArray(patch.allow)) next.allow_tools = patch.allow as string[];
     if (Array.isArray(patch.deny)) next.deny_tools = patch.deny as string[];
     if (typeof patch.goal === "string") next.goal = patch.goal;
@@ -405,27 +426,47 @@ function setConfig(patch: Record<string, unknown>): void {
   }
 }
 
-// Cycles match the TUI's shift+tab order for approval mode; sandbox
-// walks off -> seatbelt -> bwrap.
+// The server's wire names (serde of ApprovalModeWire and SandboxPolicy):
+// approval `ask` / `approve_all` / `deny`, sandbox `off` / `seatbelt` /
+// `bubblewrap`. The labels the snapshot shows differ ("yolo" for
+// approve_all, "bwrap" for bubblewrap), so the mapping is explicit.
+const APPROVAL_LABEL_BY_WIRE: Record<string, string> = {
+  ask: "ask",
+  approve_all: "yolo",
+  deny: "deny",
+};
+const SANDBOX_LABEL_BY_WIRE: Record<string, string> = {
+  off: "off",
+  seatbelt: "seatbelt",
+  bubblewrap: "bwrap",
+};
+
+// Cycles follow the TUI's shift+tab order, keyed on the label the
+// snapshot shows, and send the WIRE name of the next value.
+// Approval: ask -> yolo -> deny -> ask. An unknown current label falls
+// back to `ask`, never to approve_all.
 const APPROVAL_CYCLE: Record<string, string> = {
-  ask: "yolo",
+  ask: "approve_all",
   yolo: "deny",
   deny: "ask",
 };
+// Sandbox: off -> seatbelt -> bwrap -> off. An unknown current label
+// sends nothing, so the current value is kept.
 const SANDBOX_CYCLE: Record<string, string> = {
   off: "seatbelt",
-  seatbelt: "bwrap",
+  seatbelt: "bubblewrap",
   bwrap: "off",
 };
 
 function cycleApproval(): void {
   const label = snap().approval_mode_label;
-  setConfig({ approval_mode: APPROVAL_CYCLE[label] ?? "yolo" });
+  setConfig({ approval_mode: APPROVAL_CYCLE[label] ?? "ask" });
 }
 
 function cycleSandbox(): void {
-  const label = snap().sandbox;
-  setConfig({ sandbox: SANDBOX_CYCLE[label] ?? "off" });
+  const next = SANDBOX_CYCLE[snap().sandbox];
+  if (next === undefined) return;
+  setConfig({ sandbox: next });
 }
 
 function splitList(raw: string): string[] {
@@ -435,15 +476,30 @@ function splitList(raw: string): string[] {
     .filter(Boolean);
 }
 
+function sameList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, i) => item === b[i]);
+}
+
 function saveTools(): void {
-  // `??` falls back only when untouched (null): a cleared field ("")
-  // sends the empty list so the server clears the tools.
-  setConfig({
-    allow: splitList(allowDraft() ?? snap().allow_tools.join(", ")),
-    deny: splitList(denyDraft() ?? snap().deny_tools.join(", ")),
-  });
+  // Send only the list(s) the user edited (a null draft is untouched) and
+  // actually changed. Sending both would wipe the list the user did not
+  // touch: an allow-only edit must not clear the server's deny list.
+  // A cleared field ("") is an edit to the empty list, so it still sends
+  // [] and the server clears those tools.
+  const patch: Record<string, string[]> = {};
+  const allowNext = allowDraft();
+  if (allowNext !== null) {
+    const list = splitList(allowNext);
+    if (!sameList(list, snap().allow_tools)) patch.allow = list;
+  }
+  const denyNext = denyDraft();
+  if (denyNext !== null) {
+    const list = splitList(denyNext);
+    if (!sameList(list, snap().deny_tools)) patch.deny = list;
+  }
   allowDraft.set(null);
   denyDraft.set(null);
+  if (Object.keys(patch).length > 0) setConfig(patch);
 }
 
 function saveGoal(): void {
@@ -684,10 +740,16 @@ function reconnectSession(): void {
   const session = snap().session_id;
   if (!session || demo()) return;
   try {
-    Remote.reconnect(url(), session, null);
+    Remote.reconnect(url(), session, tokenArg(), allowInsecure());
   } catch (e) {
     connectError.set(e instanceof Error ? e.message : String(e));
   }
+}
+
+// The LAN opt-in (both connect forms). Flipping it changes the next
+// connect or reconnect only; it never drops a live connection.
+function toggleAllowInsecure(): void {
+  allowInsecure.set(!allowInsecure());
 }
 
 // Close the connection (settings connection card); connect starts a
@@ -804,6 +866,21 @@ function StatusHeader() {
   );
 }
 
+// The LAN opt-in chip shown under each connect form.
+function InsecureToggle() {
+  return (
+    <View
+      role="button"
+      class="self-start rounded-(--radius) bg-secondary px-3 py-1 active:opacity-80"
+      onPress={() => toggleAllowInsecure()}
+    >
+      <Text class="text-secondary-foreground text-xs">
+        allow insecure ws:// (LAN only): {allowInsecure() ? "on" : "off"}
+      </Text>
+    </View>
+  );
+}
+
 function ApprovalSheet() {
   // `<If>` re-evaluates as the snapshot changes (components run once);
   // the sheet appears while an approval is pending.
@@ -821,9 +898,23 @@ function ApprovalCard(props: { approval: PendingApproval }) {
       <Text class="text-foreground font-semibold">
         approve {approval.tool}?
       </Text>
-      <Text class="text-muted-foreground text-xs line-clamp-2">
+      <Text class="text-muted-foreground text-xs">
         {approval.args_summary}
       </Text>
+      <View
+        role="button"
+        class="self-start active:opacity-80"
+        onPress={() => approvalDetail.set(!approvalDetail())}
+      >
+        <Text class="text-primary text-xs">
+          {approvalDetail() ? "hide full call" : "view full call"}
+        </Text>
+      </View>
+      <If when={approvalDetail() ? approval.arguments_text : null}>
+        {(text) => (
+          <Text class="text-muted-foreground text-xs">{text()}</Text>
+        )}
+      </If>
       <View class="flex-row gap-2">
         {approval.options.map((option) => (
           <View
@@ -1023,6 +1114,17 @@ function SessionsScreen() {
             </Text>
           </View>
         </View>
+        <Input
+          class="rounded-(--radius) border border-border bg-card px-3 py-2 text-foreground"
+          value={deviceToken()}
+          placeholder="device token (optional)"
+          secureTextEntry
+          autoCorrect={false}
+          autoCapitalize="none"
+          onChange={(e) => deviceToken.set(e.value)}
+          onSubmit={() => void connectAndOpen()}
+        />
+        <InsecureToggle />
         {editMode() ? (
           <View class="flex-row items-center gap-2">
             <Text class="text-muted-foreground text-xs">
@@ -1202,6 +1304,17 @@ function SettingsScreen() {
               </Text>
             </View>
           </View>
+          <Input
+            class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+            value={deviceToken()}
+            placeholder="device token (optional)"
+            secureTextEntry
+            autoCorrect={false}
+            autoCapitalize="none"
+            onChange={(e) => deviceToken.set(e.value)}
+            onSubmit={() => void connectAndOpen()}
+          />
+          <InsecureToggle />
           <View class="flex-row gap-2 items-center">
             <Text class="text-muted-foreground text-xs flex-1">
               {snap().connection_label}

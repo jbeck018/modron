@@ -90,12 +90,20 @@ pub enum ErrorKind {
     NotFound,
     /// The request conflicts with live state (busy session, read-only).
     Conflict,
+    /// The connection is not allowed to perform this request, e.g. a
+    /// share-link tunnel asking for a server-wide action; re-auth does not
+    /// help.
+    Forbidden,
     /// Everything else (config errors, transport, internal).
     Other,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// A Snapshot carries the whole live state by value. Payloads are
+// short-lived (built, serialized, dropped) and boxing one variant would
+// change every construction site in four clients for no real saving.
+#[allow(clippy::large_enum_variant)]
 pub enum Payload {
     // ---- client -> server ----
     /// First frame on a connection. `token` authenticates remote
@@ -441,6 +449,21 @@ pub struct AuthProviderWire {
 
 /// The live (non-persisted) half of a snapshot: what a fresh attach needs
 /// to render the in-flight state a late joiner would otherwise miss.
+///
+/// UI effects on attach (Snapshot handling, every client):
+/// - `approval_mode`: sets the approval-mode label (`ask`/`yolo`/`deny`)
+///   through the same mapping ConfigChanged uses. Absent keeps the
+///   client's default label (`ask`).
+/// - `sandbox`: sets the sandbox label (`off`/`seatbelt`/`bwrap`) through
+///   the same mapping ConfigChanged uses. Absent keeps the default (`off`).
+/// - `allow` / `deny`: replace the client's copy of the server's tool
+///   allow and deny lists (the TUI's `RemoteLists`, the mobile tool
+///   editor). Absent means the server has no entries, so the copy is
+///   emptied; a SetConfig sends the whole list back.
+///
+/// The four config fields are optional on the wire (`skip_serializing_if`
+/// and serde defaults), so an older peer that omits them still parses,
+/// and a newer server talking to an older client is ignored by it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LiveState {
@@ -464,6 +487,18 @@ pub struct LiveState {
     pub provider: String,
     /// Standing goal (the /goal command).
     pub goal: String,
+    /// The server's approval mode (see the struct docs: sets the label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalModeWire>,
+    /// The server's sandbox policy (see the struct docs: sets the label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxPolicy>,
+    /// The server's tool allow list (see the struct docs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// The server's tool deny list (see the struct docs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
 }
 
 /// An approval awaiting a decision.
@@ -514,11 +549,18 @@ impl WireDelta {
 pub enum WireToolActivity {
     Start {
         name: String,
+        /// The model's tool-call id. Absent on frames from older peers and
+        /// omitted when `None`, so pre-LM JSON parses and round-trips.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     Done {
         name: String,
         is_error: bool,
         bytes: u64,
+        /// Matches the `call_id` of the `Start` it completes (see `Start`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     SubagentStarted {
         id: String,
@@ -544,15 +586,20 @@ pub enum WireToolActivity {
 impl From<&ToolActivity> for WireToolActivity {
     fn from(a: &ToolActivity) -> Self {
         match a {
-            ToolActivity::Start { name } => Self::Start { name: name.clone() },
+            ToolActivity::Start { name, call_id } => Self::Start {
+                name: name.clone(),
+                call_id: call_id.clone(),
+            },
             ToolActivity::Done {
                 name,
                 is_error,
                 bytes,
+                call_id,
             } => Self::Done {
                 name: name.clone(),
                 is_error: *is_error,
                 bytes: *bytes as u64,
+                call_id: call_id.clone(),
             },
             ToolActivity::SubagentStarted { id, label } => Self::SubagentStarted {
                 id: id.clone(),
@@ -591,15 +638,17 @@ impl From<&ToolActivity> for WireToolActivity {
 impl From<WireToolActivity> for ToolActivity {
     fn from(w: WireToolActivity) -> Self {
         match w {
-            WireToolActivity::Start { name } => Self::Start { name },
+            WireToolActivity::Start { name, call_id } => Self::Start { name, call_id },
             WireToolActivity::Done {
                 name,
                 is_error,
                 bytes,
+                call_id,
             } => Self::Done {
                 name,
                 is_error,
                 bytes: bytes as usize,
+                call_id,
             },
             WireToolActivity::SubagentStarted { id, label } => Self::SubagentStarted { id, label },
             WireToolActivity::SubagentProgress {
@@ -690,6 +739,32 @@ mod tests {
     fn roundtrip(frame: &Frame) -> Frame {
         let json = serde_json::to_string(frame).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    /// `forbidden` is a wire name clients can branch on: it serializes as
+    /// the bare string and round-trips inside an error frame.
+    #[test]
+    fn forbidden_error_kind_roundtrips_as_forbidden() {
+        assert_eq!(
+            serde_json::to_string(&ErrorKind::Forbidden).unwrap(),
+            "\"forbidden\""
+        );
+        let frame = Frame {
+            id: Some(9),
+            session: None,
+            seq: 0,
+            payload: Payload::Error {
+                message: "not allowed on a share link".into(),
+                kind: Some(ErrorKind::Forbidden),
+            },
+        };
+        let json = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["kind"], "forbidden");
+        let back: Frame = serde_json::from_value(json).unwrap();
+        match back.payload {
+            Payload::Error { kind, .. } => assert_eq!(kind, Some(ErrorKind::Forbidden)),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
     }
 
     /// Equality via the wire: core payload types do not implement
@@ -835,6 +910,7 @@ mod tests {
                         name: "bash".into(),
                         is_error: false,
                         bytes: 120,
+                        call_id: None,
                     },
                 },
             ),
@@ -955,11 +1031,23 @@ mod tests {
         let variants = vec![
             ToolActivity::Start {
                 name: "read".into(),
+                call_id: None,
+            },
+            ToolActivity::Start {
+                name: "read".into(),
+                call_id: Some("call_1".into()),
             },
             ToolActivity::Done {
                 name: "bash".into(),
                 is_error: true,
                 bytes: 4_000_000_000usize,
+                call_id: None,
+            },
+            ToolActivity::Done {
+                name: "bash".into(),
+                is_error: false,
+                bytes: 7,
+                call_id: Some("call_1".into()),
             },
             ToolActivity::SubagentStarted {
                 id: "a".into(),
@@ -988,6 +1076,52 @@ mod tests {
             let parsed: WireToolActivity = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, wire);
         }
+    }
+
+    #[test]
+    fn tool_activity_call_id_is_optional_on_the_wire() {
+        // Pre-LM JSON (no call_id) still parses, to call_id None.
+        let old_start: WireToolActivity =
+            serde_json::from_str(r#"{"kind":"start","name":"read"}"#).unwrap();
+        assert_eq!(
+            old_start,
+            WireToolActivity::Start {
+                name: "read".into(),
+                call_id: None,
+            }
+        );
+        let old_done: WireToolActivity =
+            serde_json::from_str(r#"{"kind":"done","name":"read","is_error":false,"bytes":3}"#)
+                .unwrap();
+        assert_eq!(
+            ToolActivity::from(old_done),
+            ToolActivity::Done {
+                name: "read".into(),
+                is_error: false,
+                bytes: 3,
+                call_id: None,
+            }
+        );
+        // None is never serialized, so old peers see the exact old shape.
+        let json = serde_json::to_string(&WireToolActivity::Start {
+            name: "read".into(),
+            call_id: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"kind":"start","name":"read"}"#);
+        // Some round-trips and is serialized.
+        let with_id = WireToolActivity::Done {
+            name: "read".into(),
+            is_error: false,
+            bytes: 3,
+            call_id: Some("call_9".into()),
+        };
+        let json = serde_json::to_string(&with_id).unwrap();
+        assert!(json.contains(r#""call_id":"call_9""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<WireToolActivity>(&json).unwrap(),
+            with_id
+        );
     }
 
     #[test]
@@ -1046,6 +1180,66 @@ mod tests {
                 assert!(live.running);
                 assert_eq!(live.streaming_text, "");
                 assert_eq!(live.model, "");
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_state_config_fields_round_trip() {
+        // C5: the server's mode, sandbox and allow/deny lists ride the
+        // snapshot so a fresh attach shows the real labels.
+        let frame = Frame::event(
+            None,
+            1,
+            Payload::Snapshot {
+                session_id: Uuid::new_v4(),
+                last_seq: 0,
+                events: vec![],
+                live: LiveState {
+                    approval_mode: Some(ApprovalModeWire::ApproveAll),
+                    sandbox: Some(SandboxPolicy::Bubblewrap),
+                    allow: vec!["diagnostics".into()],
+                    deny: vec!["bash".into(), "write".into()],
+                    ..LiveState::default()
+                },
+            },
+        );
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"approval_mode\":\"approve_all\""));
+        assert!(json.contains("\"sandbox\":\"bubblewrap\""));
+        assert!(json.contains("\"allow\":[\"diagnostics\"]"));
+        assert!(json.contains("\"deny\":[\"bash\",\"write\"]"));
+        assert_roundtrip(&frame);
+    }
+
+    #[test]
+    fn live_state_config_fields_are_omitted_when_unset() {
+        // An unset LiveState writes none of the C5 keys, so an older
+        // client sees exactly the bytes it always did.
+        let value = serde_json::to_value(LiveState::default()).unwrap();
+        let object = value.as_object().unwrap();
+        for key in ["approval_mode", "sandbox", "allow", "deny"] {
+            assert!(!object.contains_key(key), "{key} should be omitted");
+        }
+    }
+
+    #[test]
+    fn snapshot_without_config_fields_still_parses() {
+        // A pre-C5 server's snapshot: no approval_mode, sandbox, allow or
+        // deny. The fields default to unset / empty.
+        let json = format!(
+            r#"{{"seq":1,"type":"snapshot","session_id":"{u}","last_seq":0,"events":[],"live":{{"running":false,"model":"m","provider":"p"}}}}"#,
+            u = Uuid::new_v4()
+        );
+        let frame: Frame = serde_json::from_str(&json).expect("old snapshot loads");
+        match frame.payload {
+            Payload::Snapshot { live, .. } => {
+                assert_eq!(live.approval_mode, None);
+                assert_eq!(live.sandbox, None);
+                assert!(live.allow.is_empty());
+                assert!(live.deny.is_empty());
+                assert_eq!(live.model, "m");
             }
             other => panic!("expected snapshot, got {other:?}"),
         }

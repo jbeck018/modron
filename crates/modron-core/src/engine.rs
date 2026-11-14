@@ -24,10 +24,199 @@ use std::sync::Arc;
 /// output cap; this is a sane non-streaming default).
 const MAX_OUTPUT_TOKENS: u32 = 8192;
 
-/// The mutating tool class gated by [`crate::ApprovalPolicy`] (A1): these
-/// change system state (run commands, write files). Everything else
-/// (`read`, `glob`, `grep`, `remember`, …) is read-only and never gated.
-const MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
+/// The approval-gated tool class (A1, decision D1): these change system state
+/// or run model-supplied commands, so they need an explicit approval outside
+/// `ApproveAll`. Every tool whose name starts with `mcp__` is gated too (see
+/// [`is_gated`]). `remember` and the read-only tools stay ungated.
+///
+/// Every new tool needs an explicit gated/ungated decision here: a tool that
+/// is not added to this list runs without approval.
+const MUTATING_TOOLS: [&str; 7] = [
+    "bash",
+    "write",
+    "edit",
+    "verify",
+    "diagnostics",
+    "interact",
+    "delegate",
+];
+
+/// The file-mutating subset of the approval-gated class. Finish-gate arming
+/// and pre-mutation checkpoints key off this list, not [`MUTATING_TOOLS`]:
+/// widening the approval gate must not change their behavior.
+const FILE_MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
+
+/// Accumulate provider-reported usage into a run total. Counts come from
+/// the provider (possibly hostile or buggy), so every field saturates
+/// instead of wrapping (release) or panicking (debug).
+fn add_usage(total: &mut Usage, delta: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(delta.cached_input_tokens);
+}
+
+/// True when `message` starts with the canonical HTTP-layer status prefix
+/// `HTTP <code>` followed by a space or `:` (the shape
+/// `modron-providers` produces as `HTTP <status>: <snippet>`). Anything else,
+/// including a provider body that merely mentions the code, is not a match.
+fn has_http_status_prefix(message: &str, code: &str) -> bool {
+    message
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.strip_prefix(code))
+        .is_some_and(|tail| tail.starts_with(' ') || tail.starts_with(':'))
+}
+
+/// Whether a tool call needs approval before it runs (A1, D1): any name in
+/// [`MUTATING_TOOLS`] or any `mcp__`-prefixed tool.
+fn is_gated(name: &str) -> bool {
+    MUTATING_TOOLS.contains(&name) || name.starts_with("mcp__")
+}
+
+/// The approval policy's verdict on one tool name, before any prompt (A5).
+/// Model-issued calls and harness-initiated calls (the finish gate's verify)
+/// both go through [`Engine::admission`], so the rules live in one place.
+enum Admission {
+    /// Runs without asking: ungated, allow-listed, or ApproveAll.
+    Run,
+    /// Needs an interactive decision: Ask mode with an approver installed.
+    Ask,
+    /// Refused outright; the payload is the error the model (or the gate)
+    /// sees.
+    Refused(String),
+}
+
+/// The block message for an approval mode that will not run a gated call.
+fn approval_block_hint(mode: ApprovalMode) -> String {
+    match mode {
+        ApprovalMode::Deny => "blocked by approval mode: deny".to_string(),
+        _ => "blocked by approval mode: ask (non-interactive run — rerun with \
+              --approve-all to allow mutating tools)"
+            .to_string(),
+    }
+}
+
+/// Largest file whose prior bytes a checkpoint captures (D8).
+const SNAPSHOT_CAP: u64 = 256 * 1024;
+
+/// The state of a file before a checkpointed mutation (D8).
+#[derive(Debug, PartialEq, Eq)]
+enum PriorState {
+    /// The file did not exist: rewind deletes what the tool creates.
+    Absent,
+    /// The file's bytes, base64-encoded: rewind restores them.
+    Captured(String),
+    /// The file exists but cannot be captured (not a regular file, over the
+    /// cap, or unreadable): rewind refuses and changes nothing.
+    Uncaptured,
+}
+
+/// Decide a file's prior state. The file type and size are checked with
+/// `symlink_metadata` BEFORE any read, so a FIFO, device or huge file is
+/// never opened for content.
+fn prior_state(path: &std::path::Path) -> PriorState {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PriorState::Absent,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot stat file for checkpoint");
+            return PriorState::Uncaptured;
+        }
+    };
+    if !meta.file_type().is_file() {
+        tracing::warn!(path = %path.display(), "checkpoint skipped: not a regular file");
+        return PriorState::Uncaptured;
+    }
+    if meta.len() > SNAPSHOT_CAP {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = meta.len(),
+            "file exceeds 256KB checkpoint cap — rewind cannot restore it"
+        );
+        return PriorState::Uncaptured;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() as u64 <= SNAPSHOT_CAP => {
+            PriorState::Captured(crate::b64::encode(&bytes))
+        }
+        Ok(_) => PriorState::Uncaptured,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot read file for checkpoint");
+            PriorState::Uncaptured
+        }
+    }
+}
+
+/// Resolve a tool's `path` argument to the real location it would touch,
+/// following symlinks on the part that exists. Returns `None` unless that
+/// location is inside `working_dir` (A3). The `..` components are resolved
+/// by the kernel through the existing prefix, never folded lexically, so a
+/// symlink followed by `..` cannot make a path look inside.
+fn resolve_inside(working_dir: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+    let base = std::fs::canonicalize(working_dir).ok()?;
+    let raw = Path::new(path);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        base.join(raw)
+    };
+    // Walk up to the longest existing ancestor. Components that do not
+    // exist yet must be plain names: a `..` in that tail is refused.
+    let mut existing: &Path = joined.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while std::fs::symlink_metadata(existing).is_err() {
+        match existing.components().next_back() {
+            Some(Component::Normal(name)) => tail.push(name.to_os_string()),
+            _ => return None,
+        }
+        existing = existing.parent()?;
+    }
+    let mut resolved: PathBuf = std::fs::canonicalize(existing).ok()?;
+    for name in tail.iter().rev() {
+        resolved.push(name);
+    }
+    resolved.starts_with(&base).then_some(resolved)
+}
+
+/// The events a resumed run may see after a rewind. No cut: everything.
+/// Cut only: `events[..cut]`. Cut and end: `events[..cut]` followed by
+/// `events[end..]`, i.e. only the abandoned range `[cut, end)` is skipped.
+fn rewind_view<'a>(
+    events: &'a [SessionEvent],
+    cut: Option<u64>,
+    end: Option<u64>,
+    earlier: &[(u64, u64)],
+) -> std::borrow::Cow<'a, [SessionEvent]> {
+    use std::borrow::Cow;
+    let len = events.len();
+    let clamp = |v: u64| usize::try_from(v).unwrap_or(usize::MAX).min(len);
+    // Every abandoned range as [start, end) in event indices. The current
+    // marker without an end keeps the old meaning: drop to the log end.
+    let mut ranges: Vec<(usize, usize)> = earlier
+        .iter()
+        .map(|&(start, end)| (clamp(start), clamp(end)))
+        .collect();
+    if let Some(cut) = cut {
+        let start = clamp(cut);
+        ranges.push((start, end.map_or(len, clamp).max(start)));
+    }
+    ranges.retain(|&(start, end)| start < end);
+    match ranges.as_slice() {
+        [] => Cow::Borrowed(events),
+        // One range reaching the log end: a plain prefix, no copy.
+        [(start, end)] if *end == len => Cow::Borrowed(&events[..*start]),
+        _ => Cow::Owned(
+            events
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !ranges.iter().any(|&(s, e)| (s..e).contains(idx)))
+                .map(|(_, event)| event.clone())
+                .collect(),
+        ),
+    }
+}
 
 /// Finish-gate bound: verification feedback rounds before the run may end
 /// without passing verification (StaminaBench: gains plateau after 3-5
@@ -111,9 +300,13 @@ struct RunLoopState {
     /// run, and how many verification rounds have been spent.
     mutated_this_run: bool,
     verify_rounds: u32,
-    /// Whether the finish gate already injected its self-check turn —
-    /// a provider failure ON THAT TURN is non-fatal (keep the answer).
+    /// Whether the finish gate already injected its self-check turn. The
+    /// self-check runs at most once per run.
     self_check_sent: bool,
+    /// Set when the self-check message is injected, cleared by the next
+    /// provider turn. Only that turn is non-fatal on a provider error (keep
+    /// the answer); a provider error on any later turn propagates (A6).
+    self_check_turn_pending: bool,
     /// Tier fallback (remote-control hardening): once an auth failure
     /// promotes the run to a tier's fallback model, every later turn
     /// uses the fallback directly (the dead primary would 401 again
@@ -143,6 +336,7 @@ impl RunLoopState {
             mutated_this_run: false,
             verify_rounds: 0,
             self_check_sent: false,
+            self_check_turn_pending: false,
             run_tier_override: None,
             last_dispatch_ended_with_passing_verify: false,
             stop_label: "end_turn",
@@ -240,20 +434,22 @@ impl Engine {
         }
         // Rewind support (C2): when `resume_from_event` is set, events after
         // that index stay in the append-only log but never re-enter context.
-        let pruned;
-        let reconstruct_from = match self.config.resume_from_event {
-            Some(cut) => {
-                let sliced = &events[..(cut as usize).min(events.len())];
-                // The cut lands before the abandoned tool results; every
-                // kept assistant tool_use must have its tool_result in the
-                // slice or the provider 400s (cycle-2 audit H1).
-                pruned = prune_unanswered_tool_calls(sliced);
-                pruned.as_ref()
-            }
-            None => &events[..],
-        };
-        let mut transcript =
-            reconstruct_transcript(reconstruct_from, self.config.compaction.tail_messages);
+        // With `resume_skip_end` only the abandoned range `[cut, end)` is
+        // dropped, so work appended after the rewind survives later resumes.
+        let kept = rewind_view(
+            &events,
+            self.config.resume_from_event,
+            self.config.resume_skip_end,
+            &self.config.resume_skip_ranges,
+        );
+        let sliced: &[SessionEvent] = &kept;
+        // Every resume goes through the prune, not only rewind resumes: an
+        // interrupt mid-tool leaves an assistant tool_use with no result in
+        // the log, and both provider APIs reject that (cycle-2 audit H1).
+        // The cut (if any) lands before abandoned results, so the same
+        // rewrite also trims a rewind tail.
+        let pruned = prune_unanswered_tool_calls(sliced);
+        let mut transcript = reconstruct_transcript(&pruned, self.config.compaction.tail_messages);
         self.store
             .append(
                 session_id,
@@ -321,9 +517,7 @@ impl Engine {
 
             // Usage: provider-reported ground truth, never estimates.
             state.governor.feed_turn(turn.response.usage);
-            state.total.input_tokens += turn.response.usage.input_tokens;
-            state.total.output_tokens += turn.response.usage.output_tokens;
-            state.total.cached_input_tokens += turn.response.usage.cached_input_tokens;
+            add_usage(&mut state.total, &turn.response.usage);
             self.store
                 .append(
                     session_id,
@@ -366,6 +560,9 @@ impl Engine {
                         cap = format!("${cap:.4}"),
                         "stopping: USD spend cap exceeded"
                     );
+                    // The capped turn's own text is the run's final answer;
+                    // keep it (not the previous turn's) ahead of the note.
+                    state.answer = turn.response.text.clone();
                     state.answer = format!(
                         "{}\n\n[stopped: USD spend cap exceeded — spent ~${:.4} of ${cap:.4} cap]",
                         state.answer, state.spend_usd
@@ -523,9 +720,7 @@ impl Engine {
             if let Some(outcome) = self.run_compaction(session_id, task, &choice.model).await? {
                 state.governor.feed_turn(outcome.usage);
                 state.spend_usd += self.turn_cost_usd(&outcome.model, &outcome.usage);
-                state.total.input_tokens += outcome.usage.input_tokens;
-                state.total.output_tokens += outcome.usage.output_tokens;
-                state.total.cached_input_tokens += outcome.usage.cached_input_tokens;
+                add_usage(&mut state.total, &outcome.usage);
                 if !state.models_used.contains(&outcome.model) {
                     state.models_used.push(outcome.model);
                 }
@@ -611,6 +806,9 @@ impl Engine {
             _ => None,
         };
         let mut attempted_fallback = fallback.is_some();
+        // Consume the self-check marker: only THIS provider turn may swallow
+        // a failure (A6). Set by the finish gate just before this turn.
+        let self_check_turn = std::mem::take(&mut state.self_check_turn_pending);
         // Loop-external turn state: None = self-check short-circuit
         // (the outer run loop ends with the preserved answer).
         let mut turn_outcome: Option<(TurnResponse, String, String)> = None;
@@ -696,10 +894,11 @@ impl Engine {
                 }
                 Err(e) => {
                     // The self-check turn is an ENHANCEMENT: if the
-                    // provider fails on it, keep the pre-check answer and
-                    // end the run — never destroy completed work for the
-                    // bonus turn.
-                    if state.self_check_sent && !state.answer.is_empty() {
+                    // provider fails on the turn right after the self-check
+                    // message, keep the pre-check answer and end the run —
+                    // never destroy completed work for the bonus turn. A
+                    // failure on any later turn is a real error (A6).
+                    if self_check_turn && !state.answer.is_empty() {
                         tracing::warn!(
                             error = %e,
                             "self-check turn failed; keeping the pre-check answer"
@@ -773,22 +972,13 @@ impl Engine {
         speculative: &std::collections::HashMap<String, ToolOutcome>,
         state: &mut RunLoopState,
     ) -> Result<()> {
-        // A requested mutating call arms the finish gate (conservative:
-        // a vetoed or failed call still counts — the model ATTEMPTED a
-        // mutation, so unverified finishes stay blocked).
-        if tool_calls
-            .iter()
-            .any(|c| MUTATING_TOOLS.contains(&c.name.as_str()))
-        {
-            state.mutated_this_run = true;
-        }
-
         // Dispatch tool calls; each result enters the transcript. Hooks
         // (H1) wrap execution: pre_tool may veto before the tool runs,
         // post_tool observes after. Hook-spawn errors fail closed.
-        // Checkpoints (C1) capture the prior content of files that
-        // write/edit are about to mutate — only in ApproveAll mode, since
-        // any other mode blocks these tools before they can mutate.
+        // Checkpoints (C1, A3) capture the prior content of files that
+        // write/edit are about to mutate; they are recorded inside
+        // `execute_tool` after the approval gate allows the call, in every
+        // approval mode, so a refused call records nothing.
         let ctx = ToolCtx {
             sandbox: self.config.sandbox,
             working_dir: self.config.working_dir.clone(),
@@ -799,29 +989,63 @@ impl Engine {
         // concurrently (order-preserving — the transcript is identical to
         // the sequential case, only faster). Mutating calls stay
         // sequential: checkpoints and approval gating are order-sensitive.
+        // Gated calls (A1) also stay sequential: approval prompts must not
+        // interleave.
+        // A gated call only forces the sequential path when it would
+        // actually prompt; under ApproveAll or an allow-list entry it keeps
+        // the concurrency it had before the gate widened (parallel
+        // delegates).
+        let prompts = |name: &str| {
+            is_gated(name)
+                && self.config.approvals.mode != ApprovalMode::ApproveAll
+                && !self.config.approvals.allow.iter().any(|a| a == name)
+        };
         let all_read_only = tool_calls
             .iter()
-            .all(|c| !MUTATING_TOOLS.contains(&c.name.as_str()));
-        let outcomes: Vec<ToolOutcome> = if all_read_only && tool_calls.len() > 1 {
-            let futures = tool_calls
-                .iter()
-                .map(|call| self.dispatch_tool_call(session_id, call, &ctx, speculative));
+            .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(&c.name));
+        // A speculative result was computed mid-stream, before this turn's
+        // calls ran. It is only valid for a call when no file-mutating call
+        // precedes it in this turn; otherwise `[edit X, read X]` would reuse
+        // the pre-edit content of X.
+        let mut mutated_earlier_in_turn = false;
+        let speculation_ok: Vec<bool> = tool_calls
+            .iter()
+            .map(|call| {
+                let ok = !mutated_earlier_in_turn;
+                if FILE_MUTATING_TOOLS.contains(&call.name.as_str()) {
+                    mutated_earlier_in_turn = true;
+                }
+                ok
+            })
+            .collect();
+        let dispatched: Vec<(ToolOutcome, bool)> = if all_read_only && tool_calls.len() > 1 {
+            let futures = tool_calls.iter().zip(&speculation_ok).map(|(call, ok)| {
+                self.dispatch_tool_call(session_id, call, &ctx, speculative, *ok)
+            });
             futures::future::join_all(futures).await
         } else {
-            let mut outcomes = Vec::with_capacity(tool_calls.len());
-            for call in tool_calls {
-                if self.config.approvals.mode == ApprovalMode::ApproveAll {
-                    if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
-                        self.store.append(session_id, &checkpoint).await?;
-                    }
-                }
-                let outcome = self
-                    .dispatch_tool_call(session_id, call, &ctx, speculative)
+            let mut dispatched = Vec::with_capacity(tool_calls.len());
+            for (call, ok) in tool_calls.iter().zip(&speculation_ok) {
+                let result = self
+                    .dispatch_tool_call(session_id, call, &ctx, speculative, *ok)
                     .await;
-                outcomes.push(outcome);
+                dispatched.push(result);
             }
-            outcomes
+            dispatched
         };
+        // A mutating call arms the finish gate only once it actually ran
+        // (A5): a call refused by deny/approval, vetoed by a hook, or
+        // stopped at the checkpoint never touched the workspace, so it
+        // must not make the run owe verification.
+        if tool_calls
+            .iter()
+            .zip(&dispatched)
+            .any(|(c, (_, ran))| *ran && FILE_MUTATING_TOOLS.contains(&c.name.as_str()))
+        {
+            state.mutated_this_run = true;
+        }
+        let outcomes: Vec<ToolOutcome> =
+            dispatched.into_iter().map(|(outcome, _)| outcome).collect();
         state.last_dispatch_ended_with_passing_verify = tool_calls
             .last()
             .map(|c| c.name == "verify")
@@ -851,9 +1075,7 @@ impl Engine {
             if let Some(usage) = outcome.usage {
                 state.governor.feed_turn(usage);
                 state.spend_usd += self.turn_cost_usd(model, &usage);
-                state.total.input_tokens += usage.input_tokens;
-                state.total.output_tokens += usage.output_tokens;
-                state.total.cached_input_tokens += usage.cached_input_tokens;
+                add_usage(&mut state.total, &usage);
                 self.store
                     .append(
                         session_id,
@@ -1000,10 +1222,12 @@ impl Engine {
     fn is_auth_failure(error: &Error) -> bool {
         match error {
             Error::Provider { message, .. } => {
+                if has_http_status_prefix(message, "401") || has_http_status_prefix(message, "403")
+                {
+                    return true;
+                }
                 let m = message.to_ascii_lowercase();
                 [
-                    "401",
-                    "403",
                     "unauthorized",
                     "revoked",
                     "invalid_grant",
@@ -1090,7 +1314,7 @@ impl Engine {
 
     /// Execute one tool call through the registry, converting hard failures
     /// (unknown tool, tool crash) into error outcomes so the model can react
-    /// instead of the run dying. Mutating tools ([`MUTATING_TOOLS`]) pass the
+    /// instead of the run dying. Gated tools ([`is_gated`]) pass the
     /// approval gate first (A1): anything short of `ApproveAll` blocks the
     /// execution and hands the model an error outcome it can adapt to.
     /// Build the pre-mutation `Checkpoint` event for a tool call (C1): only
@@ -1103,44 +1327,43 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
     ) -> Result<Option<SessionEvent>> {
-        const SNAPSHOT_CAP: usize = 256 * 1024;
         if !matches!(call.name.as_str(), "write" | "edit") {
             return Ok(None);
         }
         let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
             return Ok(None);
         };
-        let absolute = if std::path::Path::new(path).is_absolute() {
-            std::path::PathBuf::from(path)
-        } else {
-            self.config.working_dir.join(path)
+        // Only paths that resolve inside the working dir are checkpointed
+        // (A3): anything else records nothing.
+        let Some(resolved) = resolve_inside(&self.config.working_dir, path) else {
+            tracing::warn!(path = %path, "checkpoint skipped: path resolves outside the working dir");
+            return Ok(None);
         };
-        let (prior, warned) = match std::fs::read(&absolute) {
-            Ok(bytes) if bytes.len() <= SNAPSHOT_CAP => (Some(crate::b64::encode(&bytes)), false),
-            Ok(bytes) => {
-                tracing::warn!(
-                    path = %path,
-                    bytes = bytes.len(),
-                    "file exceeds 256KB checkpoint cap — rewind cannot restore it"
-                );
-                (None, true)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false),
-            Err(e) => {
-                tracing::warn!(path = %path, error = %e, "cannot read file for checkpoint");
-                (None, true)
-            }
+        let (prior_content_b64, uncaptured) = match prior_state(&resolved) {
+            PriorState::Absent => (None, false),
+            PriorState::Captured(encoded) => (Some(encoded), false),
+            PriorState::Uncaptured => (None, true),
         };
-        let _ = warned;
-        // event_count, not load: this runs per mutating tool call in
-        // ApproveAll mode, and a full log parse per call compounds over a
-        // write-heavy run (2026-11-12 audit perf fix).
+        // event_count, not load: this runs per mutating tool call, and a
+        // full log parse per call compounds over a write-heavy run (2026-11-12
+        // audit perf fix).
         let event_index = self.store.event_count(session_id).await? + 1;
         Ok(Some(SessionEvent::Checkpoint {
             path: path.to_string(),
-            prior_content_b64: prior,
+            prior_content_b64,
             event_index,
+            uncaptured,
         }))
+    }
+
+    /// Record the pre-mutation checkpoint for an allowed call (A3). Called
+    /// from `execute_tool` only after the deny and approval gates pass, so a
+    /// refused call records nothing.
+    async fn record_checkpoint(&self, session_id: SessionId, call: &ToolCall) -> Result<()> {
+        if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
+            self.store.append(session_id, &checkpoint).await?;
+        }
+        Ok(())
     }
 
     /// Dispatch one tool call through the hook pipeline (H1): a `pre_tool`
@@ -1155,7 +1378,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
         ctx: &ToolCtx,
-    ) -> Result<ToolOutcome> {
+    ) -> Result<(ToolOutcome, bool)> {
         let hook_envs = |exit: Option<u8>| {
             let mut envs: Vec<(String, String)> = vec![
                 ("MODRON_TOOL_NAME".to_string(), call.name.clone()),
@@ -1174,24 +1397,29 @@ impl Engine {
         if let Some(pre) = self.config.hooks.pre_tool.clone() {
             let outcome = hooks::run_hook(&pre, &hook_envs(None), hooks::HOOK_TIMEOUT).await?;
             if outcome.blocked {
-                return Ok(ToolOutcome::err(format!(
-                    "blocked by pre_tool hook: {}",
-                    outcome.message
-                )));
+                return Ok((
+                    ToolOutcome::err(format!("blocked by pre_tool hook: {}", outcome.message)),
+                    false,
+                ));
             }
         }
 
+        // An empty provider id cannot pair start and completion, so it is
+        // reported as `None` and consumers fall back to name pairing.
+        let call_id = (!call.id.is_empty()).then(|| call.id.clone());
         if let Some(sink) = self.config.on_tool_event.as_ref() {
             sink(ToolActivity::Start {
                 name: call.name.clone(),
+                call_id: call_id.clone(),
             });
         }
-        let executed = self.execute_tool(call, ctx).await;
+        let (executed, ran) = self.execute_tool(session_id, call, ctx).await;
         if let Some(sink) = self.config.on_tool_event.as_ref() {
             sink(ToolActivity::Done {
                 name: call.name.clone(),
                 is_error: executed.is_error,
                 bytes: executed.content.len(),
+                call_id,
             });
         }
 
@@ -1203,10 +1431,66 @@ impl Engine {
                 tracing::warn!(tool = %call.name, error = %err, "post_tool hook failed (non-blocking)");
             }
         }
-        Ok(executed)
+        Ok((executed, ran))
     }
 
-    async fn execute_tool(&self, call: &ToolCall, ctx: &ToolCtx) -> ToolOutcome {
+    /// The approval policy's verdict for a tool name (A1, A5): the deny list
+    /// first (any mode), then the ungated / allow-listed / ApproveAll fast
+    /// path, then Ask-with-approver (a prompt), otherwise refused. Pure rules:
+    /// model-issued calls and the finish gate both route through here.
+    fn admission(&self, name: &str) -> Admission {
+        if self.config.approvals.deny.iter().any(|d| d == name) {
+            return Admission::Refused(format!("tool `{name}` denied by configuration (--deny)"));
+        }
+        let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == name);
+        if !is_gated(name)
+            || explicitly_allowed
+            || self.config.approvals.mode == ApprovalMode::ApproveAll
+        {
+            return Admission::Run;
+        }
+        if self.config.approvals.mode == ApprovalMode::Ask && self.config.approver.is_some() {
+            return Admission::Ask;
+        }
+        let mode = self.config.approvals.mode;
+        tracing::warn!(
+            tool = %name,
+            mode = ?mode,
+            "tool blocked by approval mode — run with --approve-all to allow mutating tools"
+        );
+        Admission::Refused(approval_block_hint(mode))
+    }
+
+    /// Whether the finish gate may run `verify` right now (A5). Uses the
+    /// same admission rules as a model-issued call: an Ask decision goes to
+    /// the approver, and a refusal or a missing approver skips verification.
+    fn finish_gate_may_verify(&self) -> bool {
+        match self.admission("verify") {
+            Admission::Run => true,
+            Admission::Ask => {
+                let call = ToolCall {
+                    id: "finish-gate-verify".into(),
+                    name: "verify".into(),
+                    arguments: serde_json::json!({}),
+                };
+                self.config
+                    .approver
+                    .as_ref()
+                    .is_some_and(|approver| approver(&call))
+            }
+            Admission::Refused(_) => false,
+        }
+    }
+
+    /// Execute one call through the approval gate and the pre-mutation
+    /// checkpoint. The flag is `true` only when the tool itself ran (A5), so
+    /// a refused, unknown or checkpoint-blocked call never arms the finish gate.
+    async fn execute_tool(
+        &self,
+        session_id: SessionId,
+        call: &ToolCall,
+        ctx: &ToolCtx,
+    ) -> (ToolOutcome, bool) {
         let Some(tool) = self.tools.get(&call.name).cloned() else {
             let available = self
                 .tools
@@ -1215,55 +1499,55 @@ impl Engine {
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return ToolOutcome::err(format!(
-                "unknown tool `{}` — available tools: {available}",
-                call.name
-            ));
+            return (
+                ToolOutcome::err(format!(
+                    "unknown tool `{}` — available tools: {available}",
+                    call.name
+                )),
+                false,
+            );
         };
 
-        // Approval gate (A1): mutating tools never execute unless approved.
-        // Deny list: any tool, any mode, always wins.
-        if self.config.approvals.deny.iter().any(|d| d == &call.name) {
-            return ToolOutcome::err(format!(
-                "tool `{}` denied by configuration (--deny)",
-                call.name
-            ));
-        }
-        // Allow list bypasses Ask mode (deny already checked).
-        let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == &call.name);
-        if MUTATING_TOOLS.contains(&call.name.as_str())
-            && !explicitly_allowed
-            && self.config.approvals.mode != ApprovalMode::ApproveAll
-        {
-            // Ask mode with an interactive approver (Phase-1c I2): offer the
-            // call to the callback; a denial falls through to the block.
-            let approved = self.config.approvals.mode == ApprovalMode::Ask
-                && self
+        match self.admission(&call.name) {
+            Admission::Run => {}
+            Admission::Ask => {
+                // Ask mode with an interactive approver (Phase-1c I2): a
+                // denial falls through to the block.
+                let approved = self
                     .config
                     .approver
                     .as_ref()
                     .is_some_and(|approver| approver(call));
-            if !approved {
-                let mode = self.config.approvals.mode;
-                tracing::warn!(
-                    tool = %call.name,
-                    mode = ?mode,
-                    "tool blocked by approval mode — run with --approve-all to allow mutating tools"
-                );
-                let hint = match mode {
-                    ApprovalMode::Deny => "blocked by approval mode: deny".to_string(),
-                    _ => "blocked by approval mode: ask (non-interactive run — rerun with \
-                          --approve-all to allow mutating tools)"
-                        .to_string(),
-                };
-                return ToolOutcome::err(hint);
+                if !approved {
+                    return (
+                        ToolOutcome::err(approval_block_hint(self.config.approvals.mode)),
+                        false,
+                    );
+                }
             }
+            Admission::Refused(message) => return (ToolOutcome::err(message), false),
         }
 
-        match tool.execute(call.arguments.clone(), ctx).await {
+        // Pre-mutation checkpoint (D8, A3): taken only now, after the gates
+        // allowed the call, in every approval mode. If it cannot be recorded
+        // the call fails closed: a write rewind cannot undo must not run.
+        if let Err(err) = self.record_checkpoint(session_id, call).await {
+            return (
+                ToolOutcome::err(format!(
+                    "checkpoint not recorded; `{}` did not run: {err}",
+                    call.name
+                )),
+                false,
+            );
+        }
+
+        // From here the tool runs, whatever it returns: a bash call that
+        // wrote before failing has still mutated the workspace.
+        let outcome = match tool.execute(call.arguments.clone(), ctx).await {
             Ok(outcome) => outcome,
             Err(err) => ToolOutcome::err(format!("tool `{}` failed to run: {err}", call.name)),
-        }
+        };
+        (outcome, true)
     }
 
     /// Whether the autocompaction trigger fires before this turn (X1): never
@@ -1303,16 +1587,7 @@ impl Engine {
         session_id: SessionId,
         state: &mut RunLoopState,
     ) -> Result<bool> {
-        if !state.mutated_this_run || state.verify_rounds >= MAX_VERIFY_ROUNDS {
-            if state.mutated_this_run && state.verify_rounds >= MAX_VERIFY_ROUNDS {
-                // Bound exhausted: let the run end, but never silently.
-                state.answer = format!(
-                    "{}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]",
-                    state.answer
-                )
-                .trim()
-                .to_string();
-            }
+        if !state.mutated_this_run {
             return Ok(false);
         }
         let Some(verify_tool) = self.tools.get("verify") else {
@@ -1321,11 +1596,15 @@ impl Engine {
             // and verifies each concrete detail against the environment
             // before ending. Targets the lucky-pass class (config formats,
             // exact names/passwords/ports) without needing a test command.
-            if !self.config.self_check_on_finish || state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            // At most one self-check per run (A6). No verification runs on
+            // this path, so the gate disarms here: nothing can "still fail",
+            // and the failure note and escalation (both verify-only) stay off.
+            if !self.config.self_check_on_finish || state.self_check_sent {
                 return Ok(false);
             }
-            state.verify_rounds += 1;
             state.self_check_sent = true;
+            state.self_check_turn_pending = true;
+            state.mutated_this_run = false;
             let feedback = Message::user(
                 "Before finishing: re-read the ORIGINAL task instruction and list every \
                  concrete requirement it names — file paths, exact names, passwords, \
@@ -1346,10 +1625,34 @@ impl Engine {
             state.transcript.push(feedback);
             return Ok(true);
         };
+        if state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            // Bound exhausted: let the run end, but never silently.
+            state.answer = format!(
+                "{}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]",
+                state.answer
+            )
+            .trim()
+            .to_string();
+            return Ok(false);
+        }
         // Skip when the previous dispatch already ended with a passing
         // verify (the model showed its evidence — no duplicate suite run).
         if state.last_dispatch_ended_with_passing_verify {
             state.mutated_this_run = false;
+            return Ok(false);
+        }
+        // A5: the harness runs verify only where the approval policy would
+        // let the model run it (same admission rules as a model-issued call).
+        // Otherwise the gate stands down, the skip is stated, and the run ends.
+        if !self.finish_gate_may_verify() {
+            tracing::warn!("finish gate skipped verification: verify is not permitted");
+            state.mutated_this_run = false;
+            state.answer = format!(
+                "{}\n\n[verification skipped: verify is not permitted in this approval mode]",
+                state.answer
+            )
+            .trim()
+            .to_string();
             return Ok(false);
         }
         state.verify_rounds += 1;
@@ -1535,9 +1838,7 @@ impl Engine {
         // like a main-loop turn (compaction precedent).
         state.turns += 1;
         state.governor.feed_turn(response.usage);
-        state.total.input_tokens += response.usage.input_tokens;
-        state.total.output_tokens += response.usage.output_tokens;
-        state.total.cached_input_tokens += response.usage.cached_input_tokens;
+        add_usage(&mut state.total, &response.usage);
         self.store
             .append(
                 session_id,
@@ -1614,8 +1915,12 @@ impl Engine {
         call: &ToolCall,
         ctx: &ToolCtx,
         speculative: &std::collections::HashMap<String, ToolOutcome>,
-    ) -> ToolOutcome {
-        if speculative::SPECULATIVE_TOOLS.contains(&call.name.as_str())
+        speculation_ok: bool,
+    ) -> (ToolOutcome, bool) {
+        // `speculation_ok` is false when a file-mutating call precedes this
+        // one in the same turn: the mid-stream result may be stale.
+        if speculation_ok
+            && speculative::SPECULATIVE_TOOLS.contains(&call.name.as_str())
             && !self.config.approvals.deny.iter().any(|d| d == &call.name)
         {
             if let Some(outcome) = speculative.get(&speculative::speculative_key(call)) {
@@ -1625,14 +1930,16 @@ impl Engine {
                 // (cycle-2 audit M6).
                 if !(outcome.is_error && outcome.content.is_empty()) {
                     tracing::info!(tool = %call.name, "speculative hit: reuse mid-stream result");
-                    return outcome.clone();
+                    // Speculation only covers read-only tools, so nothing
+                    // mutated here.
+                    return (outcome.clone(), false);
                 }
                 tracing::warn!(tool = %call.name, "speculative placeholder left by a panicked task - re-executing");
             }
         }
         self.execute_tool_with_hooks(session_id, call, ctx)
             .await
-            .unwrap_or_else(|err| ToolOutcome::err(err.to_string()))
+            .unwrap_or_else(|err| (ToolOutcome::err(err.to_string()), false))
     }
 
     /// One compaction pass (X1, PLAN.md §4.10): load the session's events,
@@ -1660,6 +1967,15 @@ impl Engine {
         next_model: &str,
     ) -> Result<Option<CompactionOutcome>> {
         let events = self.store.load(session_id).await?;
+        // Same view as a resume: a rewound range must not be summarized
+        // back into context by a later compaction.
+        let events = rewind_view(
+            &events,
+            self.config.resume_from_event,
+            self.config.resume_skip_end,
+            &self.config.resume_skip_ranges,
+        )
+        .into_owned();
         let (older, tail) =
             compact::split_older_tail(&events, self.config.compaction.tail_messages);
         let summarized_count = older
@@ -1671,8 +1987,10 @@ impl Engine {
             return Ok(None);
         }
         let summarized_events = u32::try_from(summarized_count).unwrap_or(u32::MAX);
+        // Only what the previous compaction did not already cover (A7),
+        // capped so the summarizer request cannot outgrow its window.
         let older_text =
-            compact::older_transcript_text(&events, self.config.compaction.tail_messages);
+            compact::incremental_transcript_text(&events, self.config.compaction.tail_messages);
 
         // Route the summarization (cheap model for Summarize per PLAN §4.3).
         let choice = self.selector.select(&SelectRequest {
@@ -1819,16 +2137,28 @@ fn prune_unanswered_tool_calls(events: &[SessionEvent]) -> std::borrow::Cow<'_, 
             _ => None,
         })
         .collect();
-    let needs_rewrite = events.iter().any(|e| {
-        matches!(
-            e,
-            SessionEvent::Message { message, .. }
-                if message.role == Role::Assistant
-                    && message
-                        .tool_calls
-                        .iter()
-                        .any(|c| !answered.contains(c.id.as_str()))
-        )
+    // Calls actually present in the slice; a result whose call is missing
+    // is an orphan and would 400 the provider just like an unanswered call.
+    let called: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Message { message, .. } if message.role == Role::Assistant => {
+                Some(message.tool_calls.iter().map(|c| c.id.as_str()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let needs_rewrite = events.iter().any(|e| match e {
+        SessionEvent::Message { message, .. } => {
+            message.role == Role::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|c| !answered.contains(c.id.as_str()))
+        }
+        SessionEvent::ToolResult { call_id, .. } => !called.contains(call_id.as_str()),
+        _ => false,
     });
     if !needs_rewrite {
         return std::borrow::Cow::Borrowed(events);
@@ -1854,6 +2184,8 @@ fn prune_unanswered_tool_calls(events: &[SessionEvent]) -> std::borrow::Cow<'_, 
             }
             // Checkpoints around the cut carry no context.
             SessionEvent::Checkpoint { .. } => {}
+            // A result whose call is gone would be an orphan tool message.
+            SessionEvent::ToolResult { call_id, .. } if !called.contains(call_id.as_str()) => {}
             other => out.push(other.clone()),
         }
     }
@@ -2034,6 +2366,54 @@ fn json_serialized_len(value: &serde_json::Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rewind_view_skips_only_the_abandoned_range() {
+        use super::rewind_view;
+        let ev = |t: &str| crate::SessionEvent::Task { text: t.into() };
+        let events = vec![ev("a"), ev("b"), ev("c"), ev("d"), ev("e")];
+        let texts = |v: &[crate::SessionEvent]| -> Vec<String> {
+            v.iter()
+                .map(|e| match e {
+                    crate::SessionEvent::Task { text } => text.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        };
+        // No cut: everything.
+        assert_eq!(texts(&rewind_view(&events, None, Some(3), &[])).len(), 5);
+        // Cut only: the old meaning, everything from the cut is dropped.
+        assert_eq!(texts(&rewind_view(&events, Some(2), None, &[])), ["a", "b"]);
+        // Cut and end: [2, 4) abandoned, later work kept.
+        assert_eq!(
+            texts(&rewind_view(&events, Some(2), Some(4), &[])),
+            ["a", "b", "e"]
+        );
+        // Restart (cut 0) keeps only post-restart work.
+        assert_eq!(
+            texts(&rewind_view(&events, Some(0), Some(3), &[])),
+            ["d", "e"]
+        );
+        // End at or past the log end, or below the cut, never panics.
+        assert_eq!(
+            texts(&rewind_view(&events, Some(2), Some(99), &[])),
+            ["a", "b"]
+        );
+        assert_eq!(
+            texts(&rewind_view(&events, Some(4), Some(1), &[])),
+            ["a", "b", "c", "d", "e"]
+        );
+        assert_eq!(texts(&rewind_view(&events, Some(99), None, &[])).len(), 5);
+        // Earlier rewinds stay abandoned when a later one is recorded.
+        assert_eq!(
+            texts(&rewind_view(&events, Some(3), Some(4), &[(0, 1)])),
+            ["b", "c", "e"]
+        );
+        assert_eq!(
+            texts(&rewind_view(&events, None, None, &[(1, 3)])),
+            ["a", "d", "e"]
+        );
+    }
+
     use super::*;
     use crate::{EngineConfig, Tool, ToolOutcome, ToolRegistry, TurnResponse};
     use async_trait::async_trait;
@@ -2058,6 +2438,7 @@ mod tests {
                 path: "f".into(),
                 prior_content_b64: None,
                 event_index: 3,
+                uncaptured: false,
             },
             SessionEvent::ToolResult {
                 call_id: "c1".into(),
@@ -2106,6 +2487,7 @@ mod tests {
                 path: "b.rs".into(),
                 prior_content_b64: None,
                 event_index: 4,
+                uncaptured: false,
             },
             SessionEvent::ToolResult {
                 call_id: "c2".into(),
@@ -2125,6 +2507,25 @@ mod tests {
 
         // An answered run (full log) is untouched.
         assert_eq!(prune_unanswered_tool_calls(&events).len(), events.len());
+
+        // Orphan result (its call is not in the slice): dropped, so no
+        // tool message reaches the provider without an assistant call.
+        let orphan = vec![
+            SessionEvent::Task { text: "t".into() },
+            SessionEvent::ToolResult {
+                call_id: "gone".into(),
+                outcome: ToolOutcome::ok("stray"),
+            },
+            SessionEvent::Message {
+                parent_id: None,
+                message: Message::assistant("next"),
+            },
+        ];
+        let pruned = prune_unanswered_tool_calls(&orphan);
+        assert_eq!(pruned.len(), 2, "orphan result removed");
+        assert!(!pruned
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ToolResult { .. })));
 
         // A text-only trailing assistant stays.
         let text_only = vec![
@@ -2254,7 +2655,7 @@ mod tests {
             providers,
             tools: std::sync::Arc::new(registry),
             store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
-            config: EngineConfig::default(),
+            config: approve_all_config(),
         };
         (engine, verify)
     }
@@ -2463,6 +2864,237 @@ mod tests {
         );
     }
 
+    /// Streams one glob `ToolCallReady` mid-stream (speculated), then ends
+    /// its first turn with `final_calls`; turn 2+ finishes with text.
+    struct StreamThenCalls {
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+        final_calls: Vec<ToolCall>,
+    }
+    #[async_trait]
+    impl ModelProvider for StreamThenCalls {
+        fn id(&self) -> &str {
+            "spec-stream"
+        }
+        async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
+            unreachable!("streaming path under test")
+        }
+        async fn turn_streaming(
+            &self,
+            _req: std::sync::Arc<TurnRequest>,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        ) -> Result<TurnResponse> {
+            if self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Ok(text("done"));
+            }
+            let speculated = ToolCall {
+                id: "spec-glob".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            };
+            let _ = tx.send(StreamDelta::ToolCallReady(speculated));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(TurnResponse {
+                text: String::new(),
+                tool_calls: self.final_calls.clone(),
+                usage: Default::default(),
+                stop_reason: StopReason::ToolUse,
+            })
+        }
+    }
+
+    /// Run one streamed turn whose final calls are `final_calls`; returns
+    /// how many times glob actually executed.
+    async fn glob_executions_for_turn(final_calls: Vec<ToolCall>) -> usize {
+        use std::collections::HashMap;
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(CountingGlob(Arc::clone(&executions))));
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "spec-stream".into(),
+            Arc::new(StreamThenCalls {
+                turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                final_calls,
+            }),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "spec-stream")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                on_delta: Some(Arc::new(|_delta| {})),
+                approvals: crate::ApprovalPolicy {
+                    mode: ApprovalMode::ApproveAll,
+                    ..crate::ApprovalPolicy::default()
+                },
+                ..EngineConfig::default()
+            },
+        };
+        engine.run_task("edit then read").await.unwrap();
+        executions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn speculative_read_after_a_mutation_in_the_same_turn_is_reexecuted() {
+        // [edit X, read X]: the mid-stream glob ran before the write, so the
+        // dispatch must run glob again rather than reuse the stale result.
+        let executions = glob_executions_for_turn(vec![
+            ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "g1".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+        ])
+        .await;
+        assert_eq!(
+            executions, 2,
+            "speculated glob + a real re-execution after the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_read_before_a_mutation_is_still_reused() {
+        // [read X, edit X]: nothing mutated before the read, so the
+        // speculated result is still valid and reused (one execution).
+        let executions = glob_executions_for_turn(vec![
+            ToolCall {
+                id: "g1".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: json!({}),
+            },
+        ])
+        .await;
+        assert_eq!(
+            executions, 1,
+            "read before any mutation reuses the speculation"
+        );
+    }
+
+    #[test]
+    fn auth_failure_matches_the_http_status_prefix_only() {
+        let provider_err = |message: &str| Error::Provider {
+            provider: "p".into(),
+            message: message.into(),
+        };
+        assert!(Engine::is_auth_failure(&provider_err(
+            "HTTP 401 Unauthorized: bad key"
+        )));
+        assert!(Engine::is_auth_failure(&provider_err(
+            "HTTP 403 Forbidden: no access"
+        )));
+        // A 429 whose body mentions "40300 tokens" is not an auth failure.
+        assert!(!Engine::is_auth_failure(&provider_err(
+            "HTTP 429 Too Many Requests: request asks for 40300 tokens"
+        )));
+        // A non-auth status whose body quotes 401 is not an auth failure.
+        assert!(!Engine::is_auth_failure(&provider_err(
+            "HTTP 500 Internal Server Error: upstream said 401"
+        )));
+    }
+
+    #[tokio::test]
+    async fn spend_cap_stop_keeps_the_capped_turn_text() {
+        use std::collections::HashMap;
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(crate::testing::MockProvider::with_script(vec![
+                TurnResponse {
+                    text: "final words".into(),
+                    tool_calls: Vec::new(),
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                    },
+                    stop_reason: StopReason::EndTurn,
+                },
+            ])),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                max_cost_usd: Some(0.5),
+                // $1 per million input tokens: the single turn costs $1 > $0.50.
+                price_lookup: Some(Arc::new(|_: &str| Some((1.0, 1.0)))),
+                ..EngineConfig::default()
+            },
+        };
+        let summary = engine.run_task("big task").await.unwrap();
+        assert!(
+            summary.answer.starts_with("final words"),
+            "the capped turn's text is kept: {:?}",
+            summary.answer
+        );
+        assert!(
+            summary.answer.contains("spend cap"),
+            "the cap note is still appended: {:?}",
+            summary.answer
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_totals_saturate_instead_of_wrapping() {
+        // Hostile counts: turn 1 reports u64::MAX, turn 2 adds more. Plain
+        // `+=` would wrap (release) or panic (debug) on the second add.
+        use std::collections::HashMap;
+        let huge = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+        };
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(crate::testing::MockProvider::with_script(vec![
+                TurnResponse {
+                    usage: huge,
+                    ..call("write")
+                },
+                TurnResponse {
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_input_tokens: 1,
+                    },
+                    ..text("done")
+                },
+            ])),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                max_total_tokens: u64::MAX,
+                ..EngineConfig::default()
+            },
+        };
+        let summary = engine.run_task("overflow me").await.unwrap();
+        assert_eq!(summary.usage.input_tokens, u64::MAX);
+        assert_eq!(summary.usage.output_tokens, u64::MAX);
+        assert_eq!(summary.usage.cached_input_tokens, u64::MAX);
+        assert_eq!(summary.turns, 2);
+    }
+
     #[tokio::test]
     async fn finish_gate_is_inert_without_a_registered_verify_tool() {
         use std::collections::HashMap;
@@ -2510,7 +3142,7 @@ mod tests {
             providers,
             tools: std::sync::Arc::new(registry),
             store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
-            config: EngineConfig::default(),
+            config: approve_all_config(),
         };
         let summary = engine.run_task("ship it").await.unwrap();
         assert_eq!(
@@ -2545,6 +3177,7 @@ mod tests {
             store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
             config: EngineConfig {
                 escalate_on_check_failure: escalate.map(str::to_string),
+                approvals: approve_all(),
                 ..EngineConfig::default()
             },
         };
@@ -2660,6 +3293,172 @@ mod tests {
         assert_eq!(
             requests.last().map(|r| r.model.as_str()),
             Some("claude-opus-escalated")
+        );
+    }
+
+    /// Mutating tools execute without prompting. The default policy is Ask
+    /// with no approver, which blocks every edit, so finish-gate fixtures
+    /// that expect a real edit must opt in.
+    fn approve_all() -> crate::ApprovalPolicy {
+        crate::ApprovalPolicy {
+            mode: crate::ApprovalMode::ApproveAll,
+            ..crate::ApprovalPolicy::default()
+        }
+    }
+
+    fn approve_all_config() -> EngineConfig {
+        EngineConfig {
+            approvals: approve_all(),
+            ..EngineConfig::default()
+        }
+    }
+
+    /// Engine over the write tool (plus the counting verify tool when
+    /// `with_verify`) with an explicit config. Returns the verify handle and
+    /// the mock for request inspection.
+    fn finish_engine(
+        script: Vec<TurnResponse>,
+        config: EngineConfig,
+        with_verify: bool,
+    ) -> (
+        Engine,
+        std::sync::Arc<GateVerifyTool>,
+        std::sync::Arc<crate::testing::MockProvider>,
+    ) {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let verify = std::sync::Arc::new(GateVerifyTool(std::sync::atomic::AtomicUsize::new(0)));
+        if with_verify {
+            registry.register(std::sync::Arc::clone(&verify) as std::sync::Arc<dyn Tool>);
+        }
+        let mock = std::sync::Arc::new(crate::testing::MockProvider::with_script(script));
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::clone(&mock) as std::sync::Arc<dyn ModelProvider>,
+        );
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config,
+        };
+        (engine, verify, mock)
+    }
+
+    #[tokio::test]
+    async fn blocked_edit_does_not_arm_the_finish_gate() {
+        // Default policy (Ask, no approver): the write is refused and never
+        // executes, so the finish gate must not run verify on the user's behalf.
+        let (engine, verify, _mock) = finish_engine(
+            vec![call("write"), text("done")],
+            EngineConfig::default(),
+            true,
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(
+            verify.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked edit must not arm verify"
+        );
+        assert_eq!(summary.answer, "done", "no verification note either");
+        assert_eq!(summary.turns, 2);
+    }
+
+    #[tokio::test]
+    async fn denied_verify_is_never_run_by_the_finish_gate() {
+        // A real edit arms the gate, but `verify` is on the deny list: the
+        // gate skips verification and the run ends with a visible note.
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: crate::ApprovalMode::ApproveAll,
+                deny: vec!["verify".into()],
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let (engine, verify, _mock) =
+            finish_engine(vec![call("write"), text("done")], config, true);
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(verify.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            summary.answer,
+            "done\n\n[verification skipped: verify is not permitted in this approval mode]"
+        );
+        assert_eq!(summary.turns, 2, "the skip ends the run, no feedback turn");
+    }
+
+    /// A tool-call turn that also carries non-empty assistant text.
+    fn call_with_text(text: &str, name: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            ..call(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn no_verify_tool_runs_exactly_one_self_check() {
+        // Self-check on, no verify tool, escalation configured: the first
+        // finish earns ONE self-check turn; the second finish ends the run.
+        // No failure note and no escalation turn.
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            escalate_on_check_failure: Some("claude-opus-escalated".into()),
+            ..approve_all_config()
+        };
+        let (engine, _verify, mock) = finish_engine(
+            vec![call("write"), text("attempt 1"), text("attempt 2")],
+            config,
+            false,
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "attempt 2");
+        assert_eq!(
+            mock.requests().len(),
+            3,
+            "edit, first answer, exactly one self-check reply"
+        );
+        assert!(mock.requests().iter().all(|r| r.model == "m"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_on_the_self_check_turn_keeps_the_answer() {
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            ..approve_all_config()
+        };
+        // The self-check reply hits the exhausted script: the pre-check
+        // answer survives and the run stays Ok.
+        let (engine, _verify, _mock) =
+            finish_engine(vec![call("write"), text("attempt 1")], config, false);
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "attempt 1");
+    }
+
+    #[tokio::test]
+    async fn provider_error_after_the_self_check_turn_propagates() {
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            ..approve_all_config()
+        };
+        // The self-check reply is a tool turn with text; the turn after it
+        // errors (script exhausted). Only the immediate self-check turn may
+        // be swallowed, so the error must reach the caller.
+        let (engine, _verify, _mock) = finish_engine(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                call_with_text("checking", "write"),
+            ],
+            config,
+            false,
+        );
+        let result = engine.run_task("ship it").await;
+        assert!(
+            result.is_err(),
+            "a provider error on a later turn must propagate, got {result:?}"
         );
     }
 }

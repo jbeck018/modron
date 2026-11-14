@@ -389,6 +389,7 @@ async fn scripted_run(
         session,
         Payload::Tool {
             activity: WireToolActivity::Start {
+                call_id: None,
                 name: "read".into(),
             },
         },
@@ -401,6 +402,7 @@ async fn scripted_run(
         session,
         Payload::Tool {
             activity: WireToolActivity::Done {
+                call_id: None,
                 name: "read".into(),
                 is_error: false,
                 bytes: 2150,
@@ -427,6 +429,7 @@ async fn scripted_run(
         session,
         Payload::Tool {
             activity: WireToolActivity::Start {
+                call_id: None,
                 name: "bash".into(),
             },
         },
@@ -439,6 +442,7 @@ async fn scripted_run(
         session,
         Payload::Tool {
             activity: WireToolActivity::Done {
+                call_id: None,
                 name: "bash".into(),
                 is_error: false,
                 bytes: 512,

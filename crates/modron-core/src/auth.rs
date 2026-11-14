@@ -183,12 +183,52 @@ pub fn parse_env_file(content: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Write/replace one provider key in the env file (0600 on create).
+/// True for a shell-style variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Refuse an entry the env file cannot hold safely. The value is written
+/// inside double quotes and the file is line-oriented and sourced by the
+/// shell, so newlines, quotes, backticks, `$` and backslashes would break
+/// the line or inject commands. Errors never echo the value (it is a key).
+fn validate_env_entry(env_var: &str, value: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if !valid_env_name(env_var) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "invalid environment variable name {env_var:?}: use letters, digits and \
+                 underscores, and do not start with a digit"
+            ),
+        ));
+    }
+    if let Some(bad) = value
+        .chars()
+        .find(|c| matches!(c, '\n' | '\r' | '"' | '`' | '$' | '\\'))
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to store {env_var}: the value contains the forbidden character {bad:?} \
+                 (newlines, quotes, backticks, '$' and backslashes are not allowed in keys)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Write/replace one provider key in the env file (0600 on create). The
+/// name and value are validated BEFORE the file is touched, and the write
+/// is atomic (see [`write_private`]).
 pub fn set_key_in_env_file(
     path: &std::path::Path,
     env_var: &str,
     key: &str,
 ) -> std::io::Result<()> {
+    validate_env_entry(env_var, key)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -199,9 +239,7 @@ pub fn set_key_in_env_file(
         .map(String::from)
         .collect();
     lines.push(format!("export {env_var}=\"{key}\""));
-    write_private(path, &(lines.join("\n") + "\n"))?;
-    chmod_600(path);
-    Ok(())
+    write_private(path, &(lines.join("\n") + "\n"))
 }
 
 /// Remove one provider's key line. Ok(false) = nothing was stored.
@@ -222,37 +260,158 @@ pub fn remove_key_from_env_file(path: &std::path::Path, env_var: &str) -> std::i
     Ok(true)
 }
 
-#[cfg(unix)]
-fn chmod_600(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+/// Cross-process lock around an OAuth token refresh (E8). Refresh tokens
+/// are single-use: two Modron processes (a TUI and a daemon, two terminals)
+/// that both hit a 401 must not both spend the same refresh token, or the
+/// loser is signed out and, with reuse detection, so is the winner.
+///
+/// The lock is a file next to the token file, created exclusively. It is
+/// advisory and fail-open by design: a holder that crashed leaves a lock
+/// that is treated as stale after [`RefreshFileLock::STALE_AFTER`], and a
+/// waiter that cannot get the lock within [`RefreshFileLock::MAX_WAIT`]
+/// proceeds without it (the pre-E8 behavior) rather than failing the turn.
+/// Callers MUST re-read the token file after acquiring: the previous
+/// holder has usually just written fresh tokens.
+pub struct RefreshFileLock {
+    path: Option<std::path::PathBuf>,
 }
-#[cfg(not(unix))]
-fn chmod_600(_path: &std::path::Path) {}
 
-/// Overwrite a file holding credentials so it is 0600 from the moment of
-/// creation — `fs::write` + later chmod leaves a world-readable window on
-/// first create.
+impl RefreshFileLock {
+    /// A refresh request is bounded by the HTTP timeout (120 s); anything
+    /// older than this was left behind by a dead process.
+    pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(150);
+    /// Longest a caller waits for another process to finish its refresh.
+    pub const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Acquire the lock for the token file at `token_file`.
+    pub async fn acquire(token_file: &std::path::Path) -> Self {
+        Self::acquire_with(token_file, Self::MAX_WAIT, Self::STALE_AFTER).await
+    }
+
+    /// [`Self::acquire`] with injectable bounds (tests).
+    pub async fn acquire_with(
+        token_file: &std::path::Path,
+        max_wait: std::time::Duration,
+        stale_after: std::time::Duration,
+    ) -> Self {
+        let mut name = token_file.as_os_str().to_os_string();
+        name.push(".refresh-lock");
+        let path = std::path::PathBuf::from(name);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path: Some(path) },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age >= stale_after);
+                    if stale {
+                        // Left by a dead process: clear it and retry at once.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if started.elapsed() >= max_wait {
+                        tracing::warn!(
+                            lock = %path.display(),
+                            "token refresh lock not acquired in time; refreshing without it"
+                        );
+                        return Self { path: None };
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                // Unwritable directory etc.: proceed without a lock.
+                Err(_) => return Self { path: None },
+            }
+        }
+    }
+
+    /// Whether the lock file is actually held (false = fail-open path).
+    pub fn is_held(&self) -> bool {
+        self.path.is_some()
+    }
+}
+
+impl Drop for RefreshFileLock {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Replace a file holding credentials ATOMICALLY and privately: the new
+/// contents go to a uniquely named temp file in the same directory, created
+/// 0600 from the start (`create_new`, so a stale or planted name is never
+/// reused), synced, then renamed over the target. A crash or a concurrent
+/// reader sees either the old file or the new one, never a torn write, and
+/// a pre-existing wider mode is replaced rather than kept.
 pub fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "credential path has no file name"))?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut collisions = 0;
+    let (tmp_path, file) = loop {
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(file_name);
+        tmp_name.push(format!(".{}.{nanos}.{seq}.tmp", std::process::id()));
+        let tmp_path = dir.join(tmp_name);
+        match create_private_new(&tmp_path) {
+            Ok(file) => break (tmp_path, file),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists && collisions < 8 => {
+                collisions += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let result = commit_private(file, &tmp_path, path, contents);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn create_private_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents.as_bytes())?;
-        // mode() applies only on create; narrow a pre-existing wider file.
-        chmod_600(path);
-        Ok(())
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
+    options.open(path)
+}
+
+fn commit_private(
+    mut file: std::fs::File,
+    tmp_path: &std::path::Path,
+    path: &std::path::Path,
+    contents: &str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp_path, path)
 }
 
 /// Mask a key for display: `sk-…wxyz` (fully hidden when very short).
@@ -323,7 +482,7 @@ pub mod discovery {
 
     /// The tokens to persist on import — the two subscription flows
     /// Modron implements end to end.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub enum DetectedCredentials {
         ChatGpt {
             access_token: String,
@@ -334,6 +493,28 @@ pub mod discovery {
             access_token: String,
             refresh_token: Option<String>,
         },
+    }
+
+    impl std::fmt::Debug for DetectedCredentials {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ChatGpt {
+                    refresh_token,
+                    account_id,
+                    ..
+                } => f
+                    .debug_struct("ChatGpt")
+                    .field("access_token", &"<redacted>")
+                    .field("refresh_token", &oauth::redacted_opt(refresh_token))
+                    .field("account_id", account_id)
+                    .finish(),
+                Self::Anthropic { refresh_token, .. } => f
+                    .debug_struct("Anthropic")
+                    .field("access_token", &"<redacted>")
+                    .field("refresh_token", &oauth::redacted_opt(refresh_token))
+                    .finish(),
+            }
+        }
     }
 
     impl DetectedSignin {
@@ -545,6 +726,76 @@ pub mod discovery {
 
     #[cfg(test)]
     mod tests {
+        #[tokio::test]
+        async fn refresh_lock_is_exclusive_and_released_on_drop() {
+            use crate::auth::RefreshFileLock;
+            use std::time::Duration;
+            let dir = tempfile::tempdir().unwrap();
+            let token_file = dir.path().join("auth").join("anthropic.json");
+            let first = RefreshFileLock::acquire(&token_file).await;
+            assert!(first.is_held());
+            // A second taker waits, then proceeds WITHOUT the lock (fail-open).
+            let second = RefreshFileLock::acquire_with(
+                &token_file,
+                Duration::from_millis(120),
+                Duration::from_secs(60),
+            )
+            .await;
+            assert!(!second.is_held(), "the lock is exclusive while held");
+            drop(second);
+            // Dropping an unheld guard must not remove the holder's file.
+            let third = RefreshFileLock::acquire_with(
+                &token_file,
+                Duration::from_millis(60),
+                Duration::from_secs(60),
+            )
+            .await;
+            assert!(!third.is_held());
+            drop(first);
+            let fourth = RefreshFileLock::acquire(&token_file).await;
+            assert!(fourth.is_held(), "released on drop");
+        }
+
+        #[tokio::test]
+        async fn refresh_lock_waiter_gets_it_when_the_holder_finishes() {
+            use crate::auth::RefreshFileLock;
+            use std::time::Duration;
+            let dir = tempfile::tempdir().unwrap();
+            let token_file = dir.path().join("t.json");
+            let holder = RefreshFileLock::acquire(&token_file).await;
+            let waiter_path = token_file.clone();
+            let waiter = tokio::spawn(async move {
+                RefreshFileLock::acquire_with(
+                    &waiter_path,
+                    Duration::from_secs(5),
+                    Duration::from_secs(60),
+                )
+                .await
+                .is_held()
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(holder);
+            assert!(waiter.await.unwrap(), "the waiter takes over the lock");
+        }
+
+        #[tokio::test]
+        async fn stale_refresh_lock_from_a_dead_process_is_cleared() {
+            use crate::auth::RefreshFileLock;
+            use std::time::Duration;
+            let dir = tempfile::tempdir().unwrap();
+            let token_file = dir.path().join("t.json");
+            // A lock file nobody will ever release.
+            std::fs::write(dir.path().join("t.json.refresh-lock"), b"").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let lock = RefreshFileLock::acquire_with(
+                &token_file,
+                Duration::from_secs(5),
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(lock.is_held(), "a stale lock is cleared, not waited out");
+        }
+
         use super::*;
 
         fn codex_fixture(account: Option<&str>) -> String {
@@ -776,6 +1027,81 @@ mod tests {
     }
 
     #[test]
+    fn env_file_rejects_unsafe_names_and_values_and_keeps_the_file() {
+        let dir = std::env::temp_dir().join(format!("modron-core-envval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("env");
+        set_key_in_env_file(&path, "ZAI_API_KEY", "sk-good").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let bad_values = [
+            "a\nexport EVIL=\"1",
+            "a\rb",
+            "a\"b",
+            "$(id)",
+            "a`id`",
+            "a$HOME",
+            "a\\b",
+        ];
+        for value in bad_values {
+            let err = set_key_in_env_file(&path, "GROQ_API_KEY", value)
+                .expect_err("unsafe value must be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        }
+        let bad_names = ["BAD\nNAME", "A\"B", "1ABC", "A-B", "", "A B", "$(id)"];
+        for name in bad_names {
+            assert!(
+                set_key_in_env_file(&path, name, "sk-ok").is_err(),
+                "name {name:?} must be rejected"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_file_write_is_atomic_private_and_leaves_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!("modron-core-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("env");
+        set_key_in_env_file(&path, "ZAI_API_KEY", "sk-round_trip.1").unwrap();
+        let pairs = parse_env_file(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(
+            pairs,
+            vec![("ZAI_API_KEY".to_string(), "sk-round_trip.1".to_string())]
+        );
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["env".to_string()], "temp file left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_structs_debug_without_secrets() {
+        let creds = discovery::DetectedCredentials::ChatGpt {
+            access_token: "SECRET-CG-AT".into(),
+            refresh_token: Some("SECRET-CG-RT".into()),
+            account_id: "acct-visible".into(),
+        };
+        let dbg = format!("{creds:?}");
+        assert!(!dbg.contains("SECRET-CG"), "{dbg}");
+        assert!(dbg.contains("acct-visible"), "{dbg}");
+        let anth = discovery::DetectedCredentials::Anthropic {
+            access_token: "SECRET-AN-AT".into(),
+            refresh_token: Some("SECRET-AN-RT".into()),
+        };
+        assert!(!format!("{anth:?}").contains("SECRET-AN"));
+    }
+
+    #[test]
     fn keys_are_masked_for_display() {
         assert_eq!(mask_key("sk-ant-1234567890"), "sk-…7890");
         assert_eq!(mask_key("short"), "…");
@@ -825,12 +1151,24 @@ pub mod oauth {
 
     /// A prepared login: everything needed to show the URL and later
     /// exchange the code (the verifier must stay secret until then).
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct LoginSession {
         pub url: String,
         pub state: String,
         pub verifier: String,
         pub port: u16,
+    }
+
+    impl std::fmt::Debug for LoginSession {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // `url` embeds the state, so it is redacted too.
+            f.debug_struct("LoginSession")
+                .field("url", &"<redacted>")
+                .field("state", &"<redacted>")
+                .field("verifier", &"<redacted>")
+                .field("port", &self.port)
+                .finish()
+        }
     }
 
     /// Prepare a login: PKCE pair + state + the authorize URL, bound to a
@@ -873,35 +1211,214 @@ pub mod oauth {
         expected_state: &str,
         open_url: Option<&str>,
     ) -> anyhow::Result<String> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let (v4, v6) = bind_callback_listeners(port).await?;
         if let Some(url) = open_url {
             super::open_browser(url);
         }
-        let (mut socket, _) = listener.accept().await?;
-        // The request may arrive TCP-segmented (or after a non-navigation
-        // probe connection): read until the header terminator instead of
-        // trusting one read, bounded at 16KB.
-        let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 4096];
-        while buf.len() < 16384 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = socket.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+        await_callback(v4, v6, expected_state, CALLBACK_TIMEOUT).await
+    }
+
+    /// How long the browser has to complete sign-in before the listener
+    /// gives up. Stray or invalid requests never end the wait early.
+    pub const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Bind the callback socket on IPv4 loopback (required) and IPv6
+    /// loopback (best effort). A browser that resolves `localhost` to
+    /// `::1` then reaches the same listener instead of getting refused.
+    async fn bind_callback_listeners(
+        port: u16,
+    ) -> anyhow::Result<(tokio::net::TcpListener, Option<tokio::net::TcpListener>)> {
+        let v4 = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let v6 = tokio::net::TcpListener::bind(("::1", port)).await.ok();
+        Ok((v4, v6))
+    }
+
+    /// Accept connections until one carries the expected `state` (and a
+    /// code, or an authorization error). Each connection is served on its
+    /// own task so a stalled stray socket cannot hold up the real callback.
+    async fn await_callback(
+        v4: tokio::net::TcpListener,
+        v6: Option<tokio::net::TcpListener>,
+        expected_state: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<String> {
+        let (done_tx, mut done_rx) =
+            tokio::sync::mpsc::unbounded_channel::<anyhow::Result<String>>();
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    return Err(anyhow!(
+                        "sign-in timed out after {timeout:?} waiting for the browser callback — run it again"
+                    ));
+                }
+                accepted = accept_either(&v4, v6.as_ref()) => {
+                    let socket = accepted?;
+                    let expected = expected_state.to_string();
+                    let done = done_tx.clone();
+                    tokio::spawn(serve_callback_request(socket, expected, done));
+                }
+                Some(result) = done_rx.recv() => return result,
             }
-            buf.extend_from_slice(&chunk[..n]);
         }
-        let request = String::from_utf8_lossy(&buf).to_string();
-        let request_line = request.lines().next().unwrap_or("");
+    }
+
+    async fn accept_either(
+        v4: &tokio::net::TcpListener,
+        v6: Option<&tokio::net::TcpListener>,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        match v6 {
+            Some(v6) => tokio::select! {
+                r = v4.accept() => r.map(|(socket, _)| socket),
+                r = v6.accept() => r.map(|(socket, _)| socket),
+            },
+            None => v4.accept().await.map(|(socket, _)| socket),
+        }
+    }
+
+    const SUCCESS_PAGE: &str = "Authorized. Return to your terminal.";
+    const FAILURE_PAGE: &str = "Sign-in was not completed. Return to your terminal and try again.";
+
+    /// Answer one callback connection. Only a request that validates
+    /// (right path, matching state, a code or an authorization error) gets
+    /// a verdict on the login; everything else is answered 400 and the
+    /// listener keeps waiting.
+    async fn serve_callback_request(
+        mut socket: tokio::net::TcpStream,
+        expected_state: String,
+        done: tokio::sync::mpsc::UnboundedSender<anyhow::Result<String>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Read the request head: it may arrive TCP-segmented. Bounded in
+        // both size and time so a silent probe connection is just dropped.
+        let head = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while buf.len() < 16384 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok::<_, std::io::Error>(String::from_utf8_lossy(&buf).into_owned())
+        })
+        .await;
+        let Ok(Ok(head)) = head else {
+            return;
+        };
+        let verdict = classify_request_head(&head, &expected_state);
+        let (status, page) = match &verdict {
+            CallbackVerdict::Code(_) => ("200 OK", SUCCESS_PAGE),
+            CallbackVerdict::Failed(_) | CallbackVerdict::Stray => {
+                ("400 Bad Request", FAILURE_PAGE)
+            }
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.shutdown().await;
+        match verdict {
+            CallbackVerdict::Code(code) => {
+                let _ = done.send(Ok(code));
+            }
+            CallbackVerdict::Failed(message) => {
+                let _ = done.send(Err(anyhow!(message)));
+            }
+            CallbackVerdict::Stray => {}
+        }
+    }
+
+    /// Outcome of looking at one callback request.
+    #[derive(Debug, PartialEq, Eq)]
+    enum CallbackVerdict {
+        /// Validated: state matches and a code was delivered.
+        Code(String),
+        /// State matches but the authorization server reported a failure
+        /// (or sent no code): the login ends with this message.
+        Failed(String),
+        /// Not our callback (wrong path, method or state, or unparsable):
+        /// ignored, the listener keeps waiting.
+        Stray,
+    }
+
+    /// Validate the request line and query of a callback request head.
+    fn classify_request_head(head: &str, expected_state: &str) -> CallbackVerdict {
         // "GET /callback?code=…&state=… HTTP/1.1"
-        let target = request_line.split_whitespace().nth(1).unwrap_or("");
-        let callback_url = format!("http://localhost:{port}{target}");
-        let _ = socket
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 37\r\nConnection: close\r\n\r\nAuthorized. Return to your terminal.\r\n",
-            )
-            .await;
-        parse_callback_url(&callback_url, expected_state)
+        let mut parts = head.lines().next().unwrap_or("").split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("");
+        if method != "GET" {
+            return CallbackVerdict::Stray;
+        }
+        match target.split_once('?') {
+            Some(("/callback", query)) => classify_query(query, expected_state),
+            _ => CallbackVerdict::Stray,
+        }
+    }
+
+    /// Validate a callback query string. Values are percent-decoded before
+    /// they are compared or returned.
+    fn classify_query(query: &str, expected_state: &str) -> CallbackVerdict {
+        let mut code: Option<String> = None;
+        let mut error: Option<String> = None;
+        let mut saw_state = false;
+        for pair in query.split('&') {
+            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            let (Some(key), Some(value)) = (percent_decode(raw_key), percent_decode(raw_value))
+            else {
+                return CallbackVerdict::Stray;
+            };
+            match key.as_str() {
+                "state" => {
+                    // Any state that differs (even alongside a valid one)
+                    // makes the request suspect: not our callback.
+                    if expected_state.is_empty() || value != expected_state {
+                        return CallbackVerdict::Stray;
+                    }
+                    saw_state = true;
+                }
+                "code" => code = Some(value),
+                "error" => error = Some(value),
+                _ => {}
+            }
+        }
+        if !saw_state {
+            return CallbackVerdict::Stray;
+        }
+        if let Some(error) = error {
+            return CallbackVerdict::Failed(format!("authorization failed: {error}"));
+        }
+        match code {
+            Some(code) if !code.is_empty() => CallbackVerdict::Code(code),
+            _ => CallbackVerdict::Failed("callback URL missing code".to_string()),
+        }
+    }
+
+    /// Decode `%XX` escapes (`+` is left alone: authorization codes are
+    /// URL-safe). None for a malformed escape or non-UTF-8 output.
+    fn percent_decode(raw: &str) -> Option<String> {
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = bytes.get(i + 1..i + 3)?;
+                if !hex.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
+                let text = std::str::from_utf8(hex).ok()?;
+                out.push(u8::from_str_radix(text, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
     }
 
     /// Exchange the callback code for tokens. Anthropic's endpoint is
@@ -1062,7 +1579,7 @@ pub mod oauth {
 
     /// Parse a token endpoint response. Refresh tokens may be absent on
     /// refresh grants that reuse the existing one.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct TokenSet {
         pub access_token: String,
         pub refresh_token: Option<String>,
@@ -1072,11 +1589,57 @@ pub mod oauth {
         pub id_token: Option<String>,
     }
 
+    impl std::fmt::Debug for TokenSet {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TokenSet")
+                .field("access_token", &"<redacted>")
+                .field("refresh_token", &redacted_opt(&self.refresh_token))
+                .field("expires_in", &self.expires_in)
+                .field("id_token", &redacted_opt(&self.id_token))
+                .finish()
+        }
+    }
+
+    /// Debug helper for secret fields: shows whether a secret is present
+    /// (`Some("<redacted>")` / `None`) without ever printing its value.
+    pub(super) fn redacted_opt(value: &Option<String>) -> Option<&'static str> {
+        value.as_ref().map(|_| "<redacted>")
+    }
+
+    /// Describe a response body for an error message WITHOUT echoing it:
+    /// the body may hold tokens. Only top-level field names are reported
+    /// (or a note that the body is not a JSON object).
+    pub(super) fn describe_body(body: &Value) -> String {
+        match body {
+            Value::Object(map) => {
+                let mut names: Vec<&str> = map.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                names.truncate(16);
+                format!("response fields: [{}]", names.join(", "))
+            }
+            _ => "response is not a JSON object".to_string(),
+        }
+    }
+
+    /// [`describe_body`] for raw response text: fields when it is JSON,
+    /// otherwise only its byte length.
+    pub(super) fn describe_text(text: &str) -> String {
+        match serde_json::from_str::<Value>(text) {
+            Ok(value) => describe_body(&value),
+            Err(_) => format!("non-JSON response of {} bytes", text.len()),
+        }
+    }
+
     pub fn parse_token_response(body: &Value) -> anyhow::Result<TokenSet> {
         let access_token = body
             .get("access_token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("token response missing access_token: {body}"))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "token response missing access_token ({})",
+                    describe_body(body)
+                )
+            })?
             .to_string();
         Ok(TokenSet {
             access_token,
@@ -1135,27 +1698,16 @@ pub mod oauth {
     /// "state-validated" must not mean "validated only when present".
     pub fn parse_callback_url(url: &str, expected_state: &str) -> anyhow::Result<String> {
         let query = url
-            .split('?')
-            .nth(1)
+            .split_once('?')
+            .map(|(_, query)| query)
             .ok_or_else(|| anyhow!("callback URL has no query"))?;
-        let mut code = None;
-        let mut saw_state = false;
-        for pair in query.split('&') {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            match k {
-                "code" => code = Some(v.to_string()),
-                "state" if v != expected_state => {
-                    return Err(anyhow!("state mismatch — possible CSRF; aborting"));
-                }
-                "state" => saw_state = true,
-                "error" => return Err(anyhow!("authorization failed: {v}")),
-                _ => {}
-            }
+        match classify_query(query, expected_state) {
+            CallbackVerdict::Code(code) => Ok(code),
+            CallbackVerdict::Failed(message) => Err(anyhow!(message)),
+            CallbackVerdict::Stray => Err(anyhow!(
+                "callback state missing or mismatched — possible CSRF; aborting"
+            )),
         }
-        if !expected_state.is_empty() && !saw_state {
-            return Err(anyhow!("callback missing state — possible CSRF; aborting"));
-        }
-        code.ok_or_else(|| anyhow!("callback URL missing code"))
     }
 
     /// ── Z.ai (GLM Coding Plan) browser sign-in ────────────────────────
@@ -1443,13 +1995,26 @@ pub mod oauth {
 
         /// A started device login: show `user_code` + `verification_uri`
         /// to the user, then call [`finish`].
-        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[derive(Clone, PartialEq, Eq)]
         pub struct DeviceLogin {
             pub device_auth_id: String,
             pub user_code: String,
             pub verification_uri: String,
             /// Poll interval the server asked for (seconds).
             pub interval: u64,
+        }
+
+        /// `device_auth_id` is the poll credential for this login and
+        /// `user_code` authorizes it; neither may reach a log line.
+        impl std::fmt::Debug for DeviceLogin {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("DeviceLogin")
+                    .field("device_auth_id", &"<redacted>")
+                    .field("user_code", &"<redacted>")
+                    .field("verification_uri", &self.verification_uri)
+                    .field("interval", &self.interval)
+                    .finish()
+            }
         }
 
         /// Start the sign-in; returns the code the user enters at
@@ -1478,12 +2043,22 @@ pub mod oauth {
                 .get("user_code")
                 .or_else(|| body.get("usercode"))
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("usercode response missing user_code: {body}"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "usercode response missing user_code ({})",
+                        describe_body(&body)
+                    )
+                })?;
             Ok(DeviceLogin {
                 device_auth_id: body
                     .get("device_auth_id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("usercode response missing device_auth_id: {body}"))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "usercode response missing device_auth_id ({})",
+                            describe_body(&body)
+                        )
+                    })?
                     .to_string(),
                 user_code: user_code.to_string(),
                 verification_uri: VERIFY_URL.to_string(),
@@ -1529,18 +2104,32 @@ pub mod oauth {
                     continue;
                 }
                 if !status.is_success() {
+                    // The body may carry tokens: report its shape only.
                     let body = response.text().await.unwrap_or_default();
-                    return Err(anyhow!("device auth failed with status {status}: {body}"));
+                    return Err(anyhow!(
+                        "device auth failed with status {status} ({})",
+                        describe_text(&body)
+                    ));
                 }
                 let body: Value = response.json().await?;
                 let authorization_code = body
                     .get("authorization_code")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("poll response missing authorization_code: {body}"))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "poll response missing authorization_code ({})",
+                            describe_body(&body)
+                        )
+                    })?;
                 let code_verifier = body
                     .get("code_verifier")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("poll response missing code_verifier: {body}"))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "poll response missing code_verifier ({})",
+                            describe_body(&body)
+                        )
+                    })?;
                 let response = client
                     .post(token_url)
                     .form(&[
@@ -1620,11 +2209,21 @@ pub mod oauth {
         }
 
         /// Stored ChatGPT credentials: what the Responses provider needs.
-        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[derive(Clone, PartialEq, Eq)]
         pub struct ChatGptAuth {
             pub access_token: String,
             pub refresh_token: Option<String>,
             pub account_id: String,
+        }
+
+        impl std::fmt::Debug for ChatGptAuth {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("ChatGptAuth")
+                    .field("access_token", &"<redacted>")
+                    .field("refresh_token", &redacted_opt(&self.refresh_token))
+                    .field("account_id", &self.account_id)
+                    .finish()
+            }
         }
 
         pub fn token_file() -> anyhow::Result<PathBuf> {
@@ -1840,7 +2439,9 @@ pub mod oauth {
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("400"), "{err}");
-            assert!(err.to_string().contains("access_denied"), "{err}");
+            // The body is described by field NAME only, never echoed.
+            assert!(err.to_string().contains("error"), "{err}");
+            assert!(!err.to_string().contains("access_denied"), "{err}");
         }
 
         #[test]
@@ -2077,6 +2678,175 @@ pub mod oauth {
             );
             assert!(request.contains(r#""refresh_token":"rt-old""#), "{request}");
             assert!(request.contains(r#""client_id":"9d1c250a"#), "{request}");
+        }
+
+        /// Serve one canned HTTP response; returns the base URL.
+        fn one_shot_http(response: &'static str) -> String {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(response.as_bytes());
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        #[test]
+        fn secret_fields_never_appear_in_debug_output() {
+            let tokens = TokenSet {
+                access_token: "SECRET-AT-1".into(),
+                refresh_token: Some("SECRET-RT-1".into()),
+                expires_in: Some(28800),
+                id_token: Some("SECRET-ID-1".into()),
+            };
+            let dbg = format!("{tokens:?}");
+            for secret in ["SECRET-AT-1", "SECRET-RT-1", "SECRET-ID-1"] {
+                assert!(!dbg.contains(secret), "{dbg}");
+            }
+            assert!(dbg.contains("28800"), "{dbg}");
+
+            let login = LoginSession {
+                url: "https://claude.ai/oauth/authorize?state=SECRET-STATE-1".into(),
+                state: "SECRET-STATE-1".into(),
+                verifier: "SECRET-VERIFIER-1".into(),
+                port: 54545,
+            };
+            let dbg = format!("{login:?}");
+            assert!(!dbg.contains("SECRET-STATE-1"), "{dbg}");
+            assert!(!dbg.contains("SECRET-VERIFIER-1"), "{dbg}");
+            assert!(dbg.contains("54545"), "{dbg}");
+
+            let stored = chatgpt::ChatGptAuth {
+                access_token: "SECRET-GPT-AT".into(),
+                refresh_token: Some("SECRET-GPT-RT".into()),
+                account_id: "acct-visible".into(),
+            };
+            let dbg = format!("{stored:?}");
+            assert!(!dbg.contains("SECRET-GPT"), "{dbg}");
+            assert!(dbg.contains("acct-visible"), "{dbg}");
+        }
+
+        #[test]
+        fn token_response_errors_never_echo_the_body() {
+            let err = parse_token_response(&json!({
+                "refresh_token": "SECRET-RT-ECHO",
+                "error": "invalid_grant"
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(!err.contains("SECRET-RT-ECHO"), "{err}");
+            assert!(err.contains("access_token"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn device_poll_errors_never_echo_the_body() {
+            let poll = one_shot_http(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 54\r\nConnection: close\r\n\r\n{\"error\":\"server_error\",\"secret\":\"SECRET-POLL-BODY-1\"}",
+            );
+            let login = chatgpt::DeviceLogin {
+                device_auth_id: "dev-1".into(),
+                user_code: "ABCD-1234".into(),
+                verification_uri: chatgpt::VERIFY_URL.into(),
+                interval: 1,
+            };
+            let err = chatgpt::finish_at(&format!("{poll}/poll"), "http://127.0.0.1:9/t", &login)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains("SECRET-POLL-BODY-1"), "{err}");
+            assert!(err.contains("500"), "{err}");
+        }
+
+        /// Blocking raw GET against the callback listener; returns the
+        /// whole response (the server closes after answering).
+        fn raw_get(addr: std::net::SocketAddr, target: &str) -> String {
+            use std::io::{Read, Write};
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            write!(sock, "GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            let mut out = String::new();
+            let _ = sock.read_to_string(&mut out);
+            out
+        }
+
+        #[tokio::test]
+        async fn callback_stray_requests_do_not_abort_and_codes_are_decoded() {
+            let (v4, v6) = bind_callback_listeners(0).await.unwrap();
+            let addr = v4.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                let favicon = raw_get(addr, "/favicon.ico");
+                assert!(favicon.starts_with("HTTP/1.1 400"), "{favicon}");
+                let wrong_state = raw_get(addr, "/callback?code=stolen&state=attacker");
+                assert!(wrong_state.starts_with("HTTP/1.1 400"), "{wrong_state}");
+                assert!(!wrong_state.contains("Authorized"), "{wrong_state}");
+                let real = raw_get(addr, "/callback?code=the%2Bcode%3D&state=S-123");
+                assert!(real.starts_with("HTTP/1.1 200"), "{real}");
+                assert!(real.contains("Authorized"), "{real}");
+            });
+            let code = await_callback(v4, v6, "S-123", std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+            assert_eq!(code, "the+code=");
+            client.join().unwrap();
+        }
+
+        #[tokio::test]
+        async fn callback_wrong_state_never_completes_the_login() {
+            let (v4, v6) = bind_callback_listeners(0).await.unwrap();
+            let addr = v4.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                raw_get(
+                    addr,
+                    "/callback?code=stolen&state=attacker&error=access_denied",
+                )
+            });
+            let err = await_callback(v4, v6, "S-123", std::time::Duration::from_millis(400))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+            assert!(client.join().unwrap().starts_with("HTTP/1.1 400"));
+        }
+
+        #[tokio::test]
+        async fn callback_times_out_with_a_clear_error_when_nothing_arrives() {
+            let (v4, v6) = bind_callback_listeners(0).await.unwrap();
+            let err = await_callback(v4, v6, "S-123", std::time::Duration::from_millis(50))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("timed out"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn callback_authorization_error_with_valid_state_fails_the_login() {
+            let (v4, v6) = bind_callback_listeners(0).await.unwrap();
+            let addr = v4.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                raw_get(addr, "/callback?error=access_denied&state=S-123")
+            });
+            let err = await_callback(v4, v6, "S-123", std::time::Duration::from_secs(10))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("access_denied"), "{err}");
+            assert!(client.join().unwrap().starts_with("HTTP/1.1 400"));
+        }
+
+        #[test]
+        fn callback_query_values_are_percent_decoded() {
+            assert_eq!(
+                parse_callback_url(
+                    "http://localhost:1/callback?code=a%2Fb%3D%2B&state=s1",
+                    "s1"
+                )
+                .unwrap(),
+                "a/b=+"
+            );
+            // A malformed escape is not our callback.
+            assert!(
+                parse_callback_url("http://localhost:1/callback?code=a%ZZ&state=s1", "s1").is_err()
+            );
         }
     }
 }

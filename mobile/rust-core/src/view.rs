@@ -16,8 +16,11 @@
 //! - `Event` frames append committed rows by folding through
 //!   [`modron_view::ReplayFolder`] one push at a time (see `FoldState`).
 //! - `Tool` frames feed [`modron_view::ActivityTracker`] (the live strip).
-//! - `ApprovalRequested` blocks on a decision; `ApprovalResolved` clears
-//!   it. Config changes are label updates for future turns only.
+//! - `ApprovalRequested` joins a FIFO queue; the view shows the front.
+//!   `ApprovalResolved` removes its request id wherever it sits in the
+//!   queue; answering removes the front. A `Snapshot` replaces the queue
+//!   with the snapshot's own pending approval; a disconnect clears it.
+//!   Config changes are label updates for future turns only.
 //!
 //! Usage accounting: cumulative usage grows from persisted `Usage` events
 //! (`usage_totals` arithmetic) and resets to the snapshot's live value on
@@ -30,6 +33,7 @@ use modron_protocol::{
 use modron_types::{Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_view::{replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -129,10 +133,15 @@ pub struct PendingApprovalView {
     pub request_id: String,
     /// Tool name.
     pub tool: String,
-    /// One-line arguments summary (truncated JSON).
+    /// One-line summary: `modron_view::approval_summary` (essential
+    /// argument first, `[+N chars]` when truncated), shared with the TUI
+    /// and desktop.
     pub args_summary: String,
     /// Full parsed arguments for the detail sheet.
     pub arguments: serde_json::Value,
+    /// The full call as sanitized compact JSON, for the sheet's expandable
+    /// block (never truncated; bidi/control characters replaced).
+    pub arguments_text: String,
     /// The three decisions with their shared labels, protocol order.
     pub options: Vec<DecisionOption>,
 }
@@ -145,21 +154,19 @@ pub struct DecisionOption {
     pub label: String,
 }
 
-/// Arguments summary cap (chars); keeps the sheet to one line.
-const ARGS_SUMMARY_MAX: usize = 120;
-
 impl PendingApprovalView {
     pub fn new(request_id: String, call: &ToolCall) -> Self {
         let full = serde_json::to_string(&call.arguments).unwrap_or_default();
-        let mut args_summary: String = full.chars().take(ARGS_SUMMARY_MAX).collect();
-        if full.chars().count() > ARGS_SUMMARY_MAX {
-            args_summary.push('…');
-        }
         Self {
             request_id,
             tool: call.name.clone(),
-            args_summary,
+            args_summary: modron_view::approval_summary(
+                &call.name,
+                &call.arguments,
+                modron_view::APPROVAL_SUMMARY_MAX,
+            ),
             arguments: call.arguments.clone(),
+            arguments_text: modron_view::sanitize_display(&full),
             options: DECISION_LABELS
                 .iter()
                 .map(|(d, label)| DecisionOption {
@@ -218,7 +225,11 @@ pub struct SessionViewModel {
     pub turn_tools: Vec<ToolEvent>,
     /// Live swarm rows.
     pub subagents: Vec<SwarmRow>,
-    pub pending_approval: Option<PendingApprovalView>,
+    /// Approvals awaiting a decision, oldest first. The view shows the
+    /// front; see the module docs for the queue rules.
+    pub pending_approvals: VecDeque<PendingApprovalView>,
+    /// Inbound frames this client could not decode (counted, not shown).
+    pub undecodable_frames: u64,
     pub cumulative_usage: Usage,
     pub model: String,
     pub provider: String,
@@ -377,7 +388,7 @@ impl ViewModelSnapshot {
             tool_lines: vm.turn_tools.iter().map(ToolEvent::summary).collect(),
             turn_summary_line: vm.turn_summary_line(),
             subagent_rows: vm.subagents.iter().map(SwarmRow::summary).collect(),
-            pending_approval: vm.pending_approval.clone(),
+            pending_approval: vm.pending_approvals.front().cloned(),
             approval_mode: vm.approval_mode,
             approval_mode_label: approval_mode_label(vm.approval_mode).to_string(),
             sandbox: sandbox_label(vm.sandbox).to_string(),
@@ -619,12 +630,72 @@ pub(crate) fn fold_snapshot(
     vm.model = live.model.clone();
     vm.provider = live.provider.clone();
     vm.goal = live.goal.clone();
+    // C5: the server's real approval mode and sandbox (an absent field
+    // keeps the client's default), and the server's allow/deny lists, so
+    // the tool editor starts from what the server holds.
+    if let Some(mode) = live.approval_mode {
+        vm.approval_mode = Some(mode);
+    }
+    if let Some(policy) = live.sandbox {
+        vm.sandbox = policy;
+    }
+    vm.allow_tools = live.allow.clone();
+    vm.deny_tools = live.deny.clone();
     vm.cumulative_usage = live.cumulative_usage;
-    vm.pending_approval = live
-        .pending_approval
-        .clone()
-        .map(|PendingApproval { request_id, call }| PendingApprovalView::new(request_id, &call));
+    // The snapshot is the whole truth for approvals: its one pending
+    // request (if any) replaces whatever was queued before the reattach.
+    vm.pending_approvals.clear();
+    if let Some(PendingApproval { request_id, call }) = &live.pending_approval {
+        enqueue_approval(vm, request_id.clone(), call);
+    }
+    // Counters are re-derived from the log, not accumulated onto the old
+    // values (a reattach would otherwise double-count).
+    let (turns, tool_calls) = count_log(events);
+    vm.turns_completed = turns;
+    vm.tool_calls_total = tool_calls;
     fold.seed_from_live(vm, live);
+}
+
+/// Session counters from a persisted log, the same units the live
+/// `TurnDone` summary reports: one model turn per per-turn `TurnTrace`
+/// record (verifier records and the terminal stop record are not turns),
+/// and one tool call per `ToolResult` (the engine appends one per executed
+/// call).
+pub(crate) fn count_log(events: &[SessionEvent]) -> (u32, u32) {
+    let mut turns = 0u32;
+    let mut tool_calls = 0u32;
+    for event in events {
+        match event {
+            SessionEvent::TurnTrace {
+                verifier: None,
+                failure_label: None,
+                ..
+            } => turns += 1,
+            SessionEvent::ToolResult { .. } => tool_calls += 1,
+            _ => {}
+        }
+    }
+    (turns, tool_calls)
+}
+
+/// Queue an approval request. A repeat of an id already queued replaces
+/// that entry in place (no double prompt for one request).
+pub(crate) fn enqueue_approval(vm: &mut SessionViewModel, request_id: String, call: &ToolCall) {
+    let view = PendingApprovalView::new(request_id, call);
+    match vm
+        .pending_approvals
+        .iter()
+        .position(|p| p.request_id == view.request_id)
+    {
+        Some(index) => vm.pending_approvals[index] = view,
+        None => vm.pending_approvals.push_back(view),
+    }
+}
+
+/// Remove one request from the queue wherever it sits. Unknown ids are a
+/// no-op (the server echo of an answer the client already removed).
+pub(crate) fn resolve_approval(vm: &mut SessionViewModel, request_id: &str) {
+    vm.pending_approvals.retain(|p| p.request_id != request_id);
 }
 
 /// `TurnDone`: held tool rows commit, the streaming buffer commits as the
@@ -671,7 +742,7 @@ pub(crate) fn fold_turn_done(
     vm.turn_tools.clear();
     vm.subagents.clear();
     vm.running = false;
-    vm.pending_approval = None;
+    vm.pending_approvals.clear();
     vm.turns_completed += summary.turns;
     vm.tool_calls_total += summary.tool_calls;
 }
@@ -702,7 +773,7 @@ pub(crate) fn fold_turn_unfinished(
     vm.turn_tools.clear();
     vm.subagents.clear();
     vm.running = false;
-    vm.pending_approval = None;
+    vm.pending_approvals.clear();
     if let Some(error) = error {
         vm.last_error = Some(error);
     }
@@ -727,6 +798,42 @@ mod tests {
     }
 
     #[test]
+    fn pending_approval_summary_is_the_shared_string() {
+        let long = "p".repeat(200);
+        let call = ToolCall {
+            id: "c".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": long.clone() }),
+        };
+        let view = PendingApprovalView::new("r".into(), &call);
+        assert_eq!(
+            view.args_summary,
+            modron_view::approval_summary(
+                "bash",
+                &call.arguments,
+                modron_view::APPROVAL_SUMMARY_MAX
+            )
+        );
+        assert!(
+            view.args_summary.ends_with(" [+120 chars]"),
+            "{}",
+            view.args_summary
+        );
+        // The sheet's expandable block carries the whole call, untruncated.
+        assert!(view.arguments_text.contains(&long));
+
+        // Bidi overrides cannot reorder the full-call text either.
+        let call = ToolCall {
+            id: "c".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": "a\u{202e}b" }),
+        };
+        let view = PendingApprovalView::new("r".into(), &call);
+        assert_eq!(view.args_summary, r#"a?b"#);
+        assert_eq!(view.arguments_text, r#"{"path":"a?b"}"#);
+    }
+
+    #[test]
     fn decision_labels_match_the_shared_words() {
         assert_eq!(DECISION_LABELS[0], (Decision::AllowOnce, "allow once"));
         assert_eq!(DECISION_LABELS[1], (Decision::AllowAll, "allow all"));
@@ -736,6 +843,47 @@ mod tests {
             approval_mode_label(Some(ApprovalModeWire::ApproveAll)),
             "yolo"
         );
+    }
+
+    #[test]
+    fn snapshot_carries_mode_sandbox_and_lists() {
+        // C5: attach to a yolo session: the label is yolo, the sandbox and
+        // the allow/deny copy come from the server.
+        let live = LiveState {
+            approval_mode: Some(ApprovalModeWire::ApproveAll),
+            sandbox: Some(modron_types::SandboxPolicy::Bubblewrap),
+            allow: vec!["diagnostics".into()],
+            deny: vec!["bash".into()],
+            ..LiveState::default()
+        };
+        let mut vm = SessionViewModel::default();
+        let mut fold = FoldState::default();
+        fold_snapshot(&mut vm, &mut fold, Uuid::nil(), 1, &[], &live);
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(snap.approval_mode_label, "yolo");
+        assert_eq!(snap.sandbox, "bwrap");
+        assert_eq!(snap.allow_tools, vec!["diagnostics".to_string()]);
+        assert_eq!(snap.deny_tools, vec!["bash".to_string()]);
+        assert!(
+            snap.status_line.ends_with(" · yolo"),
+            "{}",
+            snap.status_line
+        );
+
+        // An old snapshot without the fields: the label stays at its
+        // default (ask) and the lists are empty.
+        let mut fresh = SessionViewModel::default();
+        fold_snapshot(
+            &mut fresh,
+            &mut fold,
+            Uuid::nil(),
+            1,
+            &[],
+            &LiveState::default(),
+        );
+        let snap = ViewModelSnapshot::from_vm(&fresh);
+        assert_eq!(snap.approval_mode_label, "ask");
+        assert!(snap.allow_tools.is_empty() && snap.deny_tools.is_empty());
     }
 
     #[test]
@@ -902,7 +1050,7 @@ mod tests {
             ..SessionViewModel::default()
         };
         let snap = ViewModelSnapshot::from_vm(&vm);
-        assert_eq!(snap.status_line, "gpt-5.6-sol · 400 tok · cache 25% · yolo");
+        assert_eq!(snap.status_line, "gpt-5.6-sol · 400 tok · cache 33% · yolo");
         assert_eq!(snap.running_label, "idle");
     }
 
@@ -925,6 +1073,6 @@ mod tests {
                 cached_input_tokens: 25,
             },
         });
-        assert_eq!(rows, vec!["100 tok · cache 25%"]);
+        assert_eq!(rows, vec!["100 tok · cache 33%"]);
     }
 }

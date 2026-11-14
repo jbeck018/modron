@@ -698,8 +698,7 @@ impl DesktopApp {
                 self.refresh(cx);
             }
             UiEvent::Disconnected(reason) => {
-                self.state.conn = ConnState::Offline;
-                self.state.running = false;
+                self.state.on_disconnected();
                 self.state.last_note = Some(reason);
                 self.refresh(cx);
             }
@@ -1066,15 +1065,12 @@ impl DesktopApp {
         let mut lines = vec![title.clone()];
         for (i, field) in fields.iter().enumerate() {
             let label = field.label.clone().unwrap_or_else(|| field.name.clone());
+            // The user's actual input; an empty field sends "" (the model's
+            // placeholder is display-only and never submitted as a value).
             let value = inputs
                 .get(i)
                 .map(|input| input.read(cx).value().to_string())
                 .unwrap_or_default();
-            let value = if value.is_empty() {
-                field.placeholder.clone().unwrap_or_default()
-            } else {
-                value
-            };
             lines.push(format!("{}: {}", label, value));
         }
         self.state.mark_running();
@@ -1320,17 +1316,24 @@ impl DesktopApp {
         self.refresh(cx);
     }
 
-    fn approve(&mut self, decision: Decision, cx: &mut Context<Self>) {
+    fn approve(&mut self, decision: Decision, shown_id: String, cx: &mut Context<Self>) {
         let Some(pending) = self.state.pending_approval.clone() else {
             return;
         };
+        // Click-swap guard: the buttons were rendered for `shown_id`. If the
+        // front changed since, the user has not read the call now in front,
+        // so send nothing and re-render the strip instead.
+        if pending.request_id != shown_id {
+            self.refresh(cx);
+            return;
+        }
         self.send(Command::Approve {
-            request_id: pending.request_id,
+            request_id: pending.request_id.clone(),
             decision,
         });
-        // Optimistic clear; the server echo is a no-op (first responder
-        // wins).
-        self.state.pending_approval = None;
+        // Optimistic clear of this request (promotes the next queued one);
+        // the server echo is a no-op (first responder wins).
+        self.state.resolve_approval(&pending.request_id);
         self.refresh(cx);
     }
 
@@ -2594,6 +2597,17 @@ impl DesktopApp {
         }
         if let Some(prompt) = self.state.approval_prompt() {
             let prompt: SharedString = prompt.into();
+            // The request these buttons answer, captured at render time; the
+            // click handler re-checks it against the front (click-swap guard).
+            let shown_id = self
+                .state
+                .pending_approval
+                .as_ref()
+                .map(|p| p.request_id.clone())
+                .unwrap_or_default();
+            let shown_once = shown_id.clone();
+            let shown_all = shown_id.clone();
+            let shown_deny = shown_id;
             live = live.child(
                 div()
                     .flex()
@@ -2615,28 +2629,26 @@ impl DesktopApp {
                         Button::new("allow-once")
                             .label(decision_label(Decision::AllowOnce))
                             .small()
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.approve(Decision::AllowOnce, cx)
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.approve(Decision::AllowOnce, shown_once.clone(), cx)
                             })),
                     )
                     .child(
                         Button::new("allow-all")
                             .label(decision_label(Decision::AllowAll))
                             .small()
-                            .on_click(
-                                cx.listener(|this, _e, _w, cx| {
-                                    this.approve(Decision::AllowAll, cx)
-                                }),
-                            ),
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.approve(Decision::AllowAll, shown_all.clone(), cx)
+                            })),
                     )
                     .child(
                         Button::new("deny")
                             .label(decision_label(Decision::Deny))
                             .danger()
                             .small()
-                            .on_click(
-                                cx.listener(|this, _e, _w, cx| this.approve(Decision::Deny, cx)),
-                            ),
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.approve(Decision::Deny, shown_deny.clone(), cx)
+                            })),
                     ),
             );
         }

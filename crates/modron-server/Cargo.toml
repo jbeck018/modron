@@ -28,6 +28,8 @@ tracing.workspace = true
 uuid.workspace = true
 # automations.rs: RFC3339 last_run stamps for the scheduler.
 chrono.workspace = true
+# automations.rs: registry file name = sha256 prefix of the working dir.
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

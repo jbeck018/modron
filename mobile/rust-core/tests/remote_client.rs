@@ -4,7 +4,7 @@
 //! interrupt, disconnect/reconnect resume.
 
 use futures_util::{SinkExt, StreamExt};
-use modron_mobile_core::{ClientError, RemoteClient};
+use modron_mobile_core::{ClientError, ConnectOptions, KeepaliveConfig, RemoteClient};
 use modron_protocol::{
     ConfigPatch, Decision, Frame, LiveState, Payload, WireDelta, WireToolActivity, PROTOCOL_VERSION,
 };
@@ -52,6 +52,11 @@ async fn send_frame(ws: &mut Ws, frame: &Frame) {
 
 /// Server-side handshake: read hello, verify protocol, send welcome.
 async fn greet(ws: &mut Ws) {
+    greet_with_version(ws, "0.1.2").await;
+}
+
+/// [`greet`] with a chosen server version in the welcome.
+async fn greet_with_version(ws: &mut Ws, version: &str) {
     let hello = read_frame(ws).await;
     match hello.payload {
         Payload::Hello {
@@ -71,7 +76,7 @@ async fn greet(ws: &mut Ws) {
             None,
             0,
             Payload::Welcome {
-                server_version: "0.1.2".into(),
+                server_version: version.into(),
                 protocol: PROTOCOL_VERSION,
             },
         ),
@@ -134,8 +139,12 @@ async fn wait_for(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting; last error: {:?}",
-            snap.last_error
+            "timed out waiting; last error: {:?}, last note: {:?}, turns: {}, tools: {}, undecodable: {}",
+            snap.last_error,
+            snap.last_note,
+            snap.turns_completed,
+            snap.tool_calls_total,
+            client.undecodable_frames()
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -312,6 +321,7 @@ async fn live_streaming_commits_on_turn_done() {
                 Payload::Tool {
                     activity: WireToolActivity::Start {
                         name: "glob".into(),
+                        call_id: None,
                     },
                 },
             ),
@@ -329,6 +339,7 @@ async fn live_streaming_commits_on_turn_done() {
                         name: "glob".into(),
                         is_error: false,
                         bytes: 2150,
+                        call_id: None,
                     },
                 },
             ),
@@ -418,7 +429,7 @@ async fn live_streaming_commits_on_turn_done() {
         texts,
         vec![
             "❯ count the files",
-            "100 tok · cache 40%",
+            "100 tok · cache 67%",
             "⏺ 1 tool · glob",
             "There are 42 files.",
         ],
@@ -430,7 +441,7 @@ async fn live_streaming_commits_on_turn_done() {
     assert_eq!(done.turns_completed, 1);
     assert_eq!(done.tool_calls_total, 1);
     assert_eq!(done.cumulative_tokens, 100);
-    assert_eq!(done.session_cache_pct, Some(40.0));
+    assert_eq!(done.session_cache_pct.map(|p| p.round()), Some(67.0));
     assert_eq!(done.running_label, "idle");
 
     server.abort();
@@ -1073,4 +1084,609 @@ async fn reasoning_deltas_stream_only_when_opted_in() {
     assert!(client.state().show_reasoning);
 
     server.abort();
+}
+
+/// Wait up to 2s for the server side of a socket to observe the client's
+/// close (a close frame, end of stream, or a reset). Text frames sent
+/// before the close are skipped.
+async fn expect_closed(ws: &mut Ws, who: &str) {
+    let deadline = std::time::Duration::from_secs(2);
+    let observed = tokio::time::timeout(deadline, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(_) | WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                _ => return,
+            }
+        }
+    })
+    .await;
+    assert!(observed.is_ok(), "{who}: socket still open after 2s");
+}
+
+#[tokio::test]
+async fn disconnect_closes_the_socket_on_the_server() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        expect_closed(&mut ws, "after disconnect").await;
+    });
+
+    let client = connect_client(&url).await;
+    client.disconnect();
+    client.wait_closed().await;
+    assert_eq!(client.state().connection_label, "disconnected");
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn connecting_again_tears_down_the_previous_connection() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut first = accept_ws(&listener).await;
+        greet(&mut first).await;
+        // The second connect must retire the first socket by itself.
+        let mut second = accept_ws(&listener).await;
+        greet(&mut second).await;
+        expect_closed(&mut first, "superseded connection").await;
+        // Exactly one live connection: the second carries the attach.
+        let attach = read_frame(&mut second).await;
+        assert!(matches!(attach.payload, Payload::Attach { .. }));
+        // Keep the second socket open until the client has checked.
+        let _ = done_rx.await;
+    });
+
+    let client = connect_client(&url).await;
+    client
+        .reconnect(&url, session, None)
+        .expect("second connect");
+    wait_connected(&client).await;
+    assert_eq!(client.state().connection_label, "connected");
+    let _ = done_tx.send(());
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn stale_handshake_cannot_replace_the_newer_connection() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (stale_go_tx, stale_go_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        // Stale socket: accepted, but its welcome is held back.
+        let mut stale = accept_ws(&listener).await;
+        let _ = ready_tx.send(());
+        // Fresh socket: greeted straight away.
+        let mut fresh = accept_ws(&listener).await;
+        greet_with_version(&mut fresh, "fresh").await;
+        // Once the client is connected on the fresh socket, the late
+        // welcome lands on the stale one.
+        stale_go_rx.await.expect("client signal");
+        send_frame(
+            &mut stale,
+            &Frame::event(
+                None,
+                0,
+                Payload::Welcome {
+                    server_version: "stale".into(),
+                    protocol: PROTOCOL_VERSION,
+                },
+            ),
+        )
+        .await;
+        expect_closed(&mut stale, "stale handshake").await;
+        // Keep the fresh socket open until the client has checked.
+        let _ = done_rx.await;
+    });
+
+    let client = RemoteClient::connect(&url, None).expect("connect accepted");
+    ready_rx.await.expect("stale socket accepted");
+    client
+        .reconnect(&url, session, None)
+        .expect("reconnect supersedes the stale handshake");
+    wait_connected(&client).await;
+    assert_eq!(client.state().server_version, "fresh");
+    stale_go_tx.send(()).expect("server signal");
+
+    // Give the stale handshake time to complete; it must change nothing.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let snap = client.state();
+    assert_eq!(snap.connection_label, "connected");
+    assert_eq!(snap.server_version, "fresh");
+    let _ = done_tx.send(());
+    server.await.expect("server task");
+}
+
+// ---------------------------------------------------------------------------
+// LJ: connect deadline, keepalive, counters, undecodable frames, approval
+// queue, insecure toggle.
+// ---------------------------------------------------------------------------
+
+fn lj_options(connect_ms: u64, ping_ms: u64, idle_ms: u64) -> ConnectOptions {
+    ConnectOptions {
+        allow_insecure: false,
+        connect_timeout: std::time::Duration::from_millis(connect_ms),
+        keepalive: KeepaliveConfig {
+            ping_every: std::time::Duration::from_millis(ping_ms),
+            idle_timeout: std::time::Duration::from_millis(idle_ms),
+        },
+    }
+}
+
+fn lj_call(id: &str, name: &str, path: &str) -> modron_types::ToolCall {
+    modron_types::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: serde_json::json!({ "path": path }),
+    }
+}
+
+#[tokio::test]
+async fn connect_deadline_reports_a_clear_error_when_no_welcome_arrives() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+
+    // Accept, read the hello, then go silent: no welcome ever.
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        let _hello = read_frame(&mut ws).await;
+        let _ = ws.next().await;
+    });
+
+    let client = RemoteClient::connect_with_options(&url, None, lj_options(200, 30_000, 90_000))
+        .expect("connect accepted");
+    wait_for(&client, |snap| snap.last_error.is_some()).await;
+    let snap = client.state();
+    assert_eq!(snap.connection_label, "disconnected");
+    let error = snap.last_error.expect("error");
+    assert!(error.contains("timed out"), "clear timeout error: {error}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn silent_connection_is_dropped_after_the_idle_timeout() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        // Pings arrive and go unanswered; the client then closes the socket.
+        let mut saw_ping = false;
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(json))) => {
+                    let frame: Frame = serde_json::from_str(&json).expect("frame");
+                    if matches!(frame.payload, Payload::Ping {}) {
+                        saw_ping = true;
+                    }
+                }
+                Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
+        assert!(saw_ping, "keepalive ping must be sent while connected");
+    });
+
+    let client = RemoteClient::connect_with_options(&url, None, lj_options(5_000, 50, 300))
+        .expect("connect accepted");
+    wait_connected(&client).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+
+    wait_for(&client, |snap| snap.connection_label == "disconnected").await;
+    let error = client.state().last_error.expect("drop reason");
+    assert!(error.contains("no frames"), "drop reason: {error}");
+    assert!(
+        client.attach(session, 0).is_err(),
+        "commands fail once dropped"
+    );
+    server.await.expect("server script");
+}
+
+#[tokio::test]
+async fn answered_keepalive_pings_keep_a_quiet_connection_alive() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        // Answer every ping with a pong (what the real server does).
+        loop {
+            let frame = read_frame(&mut ws).await;
+            if let Payload::Ping {} = frame.payload {
+                send_frame(
+                    &mut ws,
+                    &Frame {
+                        id: frame.id,
+                        session: None,
+                        seq: 0,
+                        payload: Payload::Pong {},
+                    },
+                )
+                .await;
+            }
+        }
+    });
+
+    let client = RemoteClient::connect_with_options(&url, None, lj_options(5_000, 50, 300))
+        .expect("connect accepted");
+    wait_connected(&client).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+
+    // Three idle windows pass; the pongs keep the connection up.
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    assert_eq!(client.state().connection_label, "connected");
+    assert!(client.state().last_error.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn snapshot_resets_turn_and_tool_counters_from_the_log() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let trace = |verifier: Option<&str>, failure_label: Option<&str>| {
+        modron_types::SessionEvent::TurnTrace {
+            turn: 1,
+            harness_version: "test".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            prompt_hash: None,
+            latency_ms: None,
+            cost_usd: None,
+            usage: None,
+            verifier: verifier.map(Into::into),
+            failure_label: failure_label.map(Into::into),
+        }
+    };
+    let tool_result = |id: &str| modron_types::SessionEvent::ToolResult {
+        call_id: id.into(),
+        outcome: modron_types::ToolOutcome::ok("done"),
+    };
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        // A finished run: the live counters move.
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                Some(session),
+                1,
+                Payload::TurnDone {
+                    summary: modron_protocol::WireRunSummary {
+                        session_id: session,
+                        answer: String::new(),
+                        turns: 5,
+                        tool_calls: 7,
+                        usage: modron_types::Usage::default(),
+                        models_used: vec![],
+                    },
+                },
+            ),
+        )
+        .await;
+        // Let the client observe the live counters before the reattach.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // A reattach: the log holds 2 model turns (the verifier record and the
+        // terminal stop record are not turns) and 3 tool results. The counters
+        // reset to exactly that instead of accumulating.
+        let events = vec![
+            trace(None, None),
+            tool_result("a"),
+            trace(None, None),
+            trace(Some("pass"), None),
+            tool_result("b"),
+            tool_result("c"),
+            trace(None, Some("end_turn")),
+        ];
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 1, events, LiveState::default()),
+        )
+        .await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_for(&client, |snap| snap.turns_completed == 5).await;
+    assert_eq!(client.state().tool_calls_total, 7);
+    wait_for(&client, |snap| snap.turns_completed == 2).await;
+    assert_eq!(client.state().tool_calls_total, 3, "reset, not accumulated");
+    server.abort();
+}
+
+const LJ_UNDECODABLE_NOTE: &str =
+    "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+
+#[tokio::test]
+async fn undecodable_frames_surface_one_note_per_connection() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let note = move |seq: u64, text: &str| {
+        Frame::event(
+            Some(session),
+            seq,
+            Payload::Note {
+                text: text.to_string(),
+            },
+        )
+    };
+    let unknown = r#"{"type":"from_a_future_server"}"#;
+
+    let server = tokio::spawn(async move {
+        // Connection one: an unknown frame, a pause the client observes the
+        // note in, then a marker; a second unknown frame must not re-note.
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        ws.send(WsMessage::Text(unknown.into()))
+            .await
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        send_frame(&mut ws, &note(1, "first marker")).await;
+        ws.send(WsMessage::Text(unknown.into()))
+            .await
+            .expect("send");
+        send_frame(&mut ws, &note(2, "second marker")).await;
+        drop(ws);
+
+        // Connection two (after a reconnect): the note fires once more.
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 2, vec![], LiveState::default()),
+        )
+        .await;
+        ws.send(WsMessage::Text(unknown.into()))
+            .await
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        send_frame(&mut ws, &note(3, "after reconnect")).await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    wait_for(&client, |snap| {
+        snap.last_note.as_deref() == Some(LJ_UNDECODABLE_NOTE)
+    })
+    .await;
+    wait_for(&client, |snap| {
+        snap.last_note.as_deref() == Some("second marker")
+    })
+    .await;
+    assert_eq!(client.undecodable_frames(), 2);
+
+    client.reconnect(&url, session, None).expect("reconnect");
+    wait_for(&client, |snap| {
+        snap.last_note.as_deref() == Some(LJ_UNDECODABLE_NOTE)
+    })
+    .await;
+    wait_for(&client, |snap| {
+        snap.last_note.as_deref() == Some("after reconnect")
+    })
+    .await;
+    assert_eq!(client.undecodable_frames(), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn approvals_queue_fifo_and_resolve_by_id() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        for (seq, id) in [(1, "req-1"), (2, "req-2"), (3, "req-3")] {
+            send_frame(
+                &mut ws,
+                &Frame::event(
+                    Some(session),
+                    seq,
+                    Payload::ApprovalRequested {
+                        request_id: id.into(),
+                        call: lj_call(id, "edit", "a.rs"),
+                    },
+                ),
+            )
+            .await;
+        }
+        // The middle request resolves on the wire while it is still queued.
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                Some(session),
+                4,
+                Payload::ApprovalResolved {
+                    request_id: "req-2".into(),
+                    decision: Decision::Deny,
+                },
+            ),
+        )
+        .await;
+        let first = read_frame(&mut ws).await;
+        match first.payload {
+            Payload::Approve {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(decision, Decision::AllowOnce);
+            }
+            other => panic!("expected approve req-1, got {other:?}"),
+        }
+        let second = read_frame(&mut ws).await;
+        match second.payload {
+            Payload::Approve {
+                request_id,
+                decision,
+            } => {
+                assert_eq!(request_id, "req-3");
+                assert_eq!(decision, Decision::Deny);
+            }
+            other => panic!("expected approve req-3, got {other:?}"),
+        }
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+
+    wait_for(&client, |snap| {
+        snap.pending_approval
+            .as_ref()
+            .map(|p| p.request_id.as_str())
+            == Some("req-1")
+    })
+    .await;
+    client
+        .approve("req-1", Decision::AllowOnce)
+        .expect("approve front");
+    // The next request shows; the resolved middle one was skipped.
+    wait_for(&client, |snap| {
+        snap.pending_approval
+            .as_ref()
+            .map(|p| p.request_id.as_str())
+            == Some("req-3")
+    })
+    .await;
+    client.approve("req-3", Decision::Deny).expect("approve");
+    wait_for(&client, |snap| snap.pending_approval.is_none()).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn snapshot_replaces_the_approval_queue_and_disconnect_clears_it() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        for (seq, id) in [(1, "stale-a"), (2, "stale-b")] {
+            send_frame(
+                &mut ws,
+                &Frame::event(
+                    Some(session),
+                    seq,
+                    Payload::ApprovalRequested {
+                        request_id: id.into(),
+                        call: lj_call(id, "bash", "x"),
+                    },
+                ),
+            )
+            .await;
+        }
+        // A fresh snapshot carries exactly one pending approval: it replaces
+        // the queue.
+        let live = LiveState {
+            pending_approval: Some(modron_protocol::PendingApproval {
+                request_id: "from-snapshot".into(),
+                call: lj_call("s", "edit", "b.rs"),
+            }),
+            ..LiveState::default()
+        };
+        send_frame(&mut ws, &snapshot_frame(session, 3, vec![], live)).await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_for(&client, |snap| {
+        snap.pending_approval
+            .as_ref()
+            .map(|p| p.request_id.as_str())
+            == Some("from-snapshot")
+    })
+    .await;
+    // Only the snapshot's approval exists: answering it leaves nothing.
+    client
+        .approve("from-snapshot", Decision::AllowOnce)
+        .expect("approve");
+    assert!(client.state().pending_approval.is_none(), "stale ones gone");
+
+    // Disconnect clears whatever is queued.
+    client.disconnect();
+    assert!(client.state().pending_approval.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn non_loopback_plain_ws_needs_the_insecure_opt_in() {
+    let refused = RemoteClient::connect_with_options(
+        "ws://192.168.1.20:7699",
+        None,
+        ConnectOptions::default(),
+    );
+    assert!(matches!(refused, Err(ClientError::Connect(_))));
+
+    // The LAN opt-in lets the same URL through validation (the connect itself
+    // runs in the background and is not awaited here).
+    let allowed = RemoteClient::connect_with_options(
+        "ws://192.168.1.20:7699",
+        None,
+        ConnectOptions {
+            allow_insecure: true,
+            ..ConnectOptions::default()
+        },
+    )
+    .expect("insecure opt-in accepted");
+    allowed.disconnect();
 }

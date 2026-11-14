@@ -57,16 +57,52 @@ pub struct EvalResult {
     pub failure_note: Option<String>,
 }
 
-/// Run one eval task end-to-end in a fresh temp workspace.
+/// Workspace directory name for one (task, model) pair. The model id is
+/// reduced to `[A-Za-z0-9._-]` so it is filesystem-safe, and including it
+/// keeps models in a `--models a,b` comparison from sharing a workspace.
+pub(crate) fn workspace_dir_name(task_id: &str, model: &str) -> String {
+    let safe: String = model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("eval-{task_id}-{safe}")
+}
+
+/// Create a clean workspace for one (task, model) run. Any directory left by
+/// an earlier run with the same name is removed first, so a run never starts
+/// inside a solved workspace from a previous run.
+pub(crate) fn prepare_workspace(
+    root: &Path,
+    task_id: &str,
+    model: &str,
+) -> std::io::Result<PathBuf> {
+    let workspace = root.join(workspace_dir_name(task_id, model));
+    match std::fs::symlink_metadata(&workspace) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&workspace)?,
+        Ok(_) => std::fs::remove_file(&workspace)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(&workspace)?;
+    Ok(workspace)
+}
+
+/// Run one eval task end-to-end in a fresh workspace for `model`.
 pub async fn run_eval_task(
     engine: &Engine,
     task: &EvalTask,
+    model: &str,
     workspaces: &Path,
 ) -> anyhow::Result<EvalResult> {
     use tokio::process::Command;
 
-    let workspace = workspaces.join(format!("eval-{}", task.id));
-    std::fs::create_dir_all(&workspace)?;
+    let workspace = prepare_workspace(workspaces, &task.id, model)?;
 
     let started = Instant::now();
     let mut failure_note = None;
@@ -242,7 +278,7 @@ pub(crate) async fn run_evals(
             if task.max_turns.is_none() {
                 task.max_turns = Some(16);
             }
-            let mut result = run_eval_task(&agent.engine, &task, &workspaces_root).await?;
+            let mut result = run_eval_task(&agent.engine, &task, model, &workspaces_root).await?;
             result.model = model.clone();
             println!(
                 "{:<3} {:<24} {:>4} turns {:>3} tools {:>7} tok {:>6} ms",
@@ -350,7 +386,9 @@ mod tests {
             budget_tokens: Some(50_000),
         };
         let dir = tempfile::tempdir().unwrap();
-        let result = run_eval_task(&engine, &task, dir.path()).await.unwrap();
+        let result = run_eval_task(&engine, &task, "mock-model", dir.path())
+            .await
+            .unwrap();
         assert!(result.passed, "solved: {:?}", result.failure_note);
     }
 
@@ -379,9 +417,38 @@ mod tests {
             budget_tokens: Some(50_000),
         };
         let dir = tempfile::tempdir().unwrap();
-        let result = run_eval_task(&engine, &task, dir.path()).await.unwrap();
+        let result = run_eval_task(&engine, &task, "mock-model", dir.path())
+            .await
+            .unwrap();
         assert!(!result.passed, "uncompleted work must fail the verifier");
         assert!(result.failure_note.is_some());
+    }
+
+    #[test]
+    fn workspace_is_per_model_and_starts_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let a = prepare_workspace(root.path(), "answer", "model-a").unwrap();
+        std::fs::write(a.join("answer.txt"), "42").unwrap();
+
+        // Model b must not see model a's solved workspace.
+        let b = prepare_workspace(root.path(), "answer", "model-b").unwrap();
+        assert_ne!(a, b, "each model gets its own workspace path");
+        assert!(!b.join("answer.txt").exists(), "model b starts clean");
+
+        // A re-run for model a removes the stale file from its earlier run.
+        let a_again = prepare_workspace(root.path(), "answer", "model-a").unwrap();
+        assert_eq!(a, a_again);
+        assert!(!a_again.join("answer.txt").exists(), "stale file removed");
+        assert!(a_again.is_dir());
+    }
+
+    #[test]
+    fn workspace_name_sanitizes_the_model_id() {
+        assert_eq!(
+            workspace_dir_name("answer", "vendor/model:v1.2 beta"),
+            "eval-answer-vendor_model_v1.2_beta"
+        );
+        assert_eq!(workspace_dir_name("t", "a-b_c.d"), "eval-t-a-b_c.d");
     }
 
     #[test]

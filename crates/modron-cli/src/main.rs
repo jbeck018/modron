@@ -130,6 +130,15 @@ enum Command {
         /// Remote-control bridge base (wss://host) used by /publish.
         #[arg(long)]
         bridge: Option<String>,
+        /// Require a paired device token on every hello, even when listening
+        /// on loopback. Use this behind tailscale-serve or cloudflared.
+        #[arg(long)]
+        require_token: bool,
+        /// Browser origin allowed to open the WebSocket (repeatable, exact
+        /// match, e.g. https://app.example.com). Default: none - every
+        /// upgrade that carries an Origin header is refused.
+        #[arg(long = "allow-origin")]
+        allow_origin: Vec<String>,
     },
     /// Manage paired remote devices (Phase 3): mint, list, revoke the
     /// bearer tokens remote clients send in their hello frame.
@@ -472,7 +481,7 @@ fn init_tracing(verbose: bool, tui: bool) {
         .init();
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(mut cli: Cli) -> anyhow::Result<()> {
     // `modron --upgrade` — flag alias for the upgrade subcommand.
     if cli.upgrade {
         return crate::upgrade::run_upgrade().await;
@@ -549,6 +558,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return crate::upgrade::run_upgrade().await;
     }
 
+    // Bare `--resume` resolves to the latest session here, before any mode
+    // builds its agent, so every mode honors that session's rewind marker
+    // exactly like `--resume=<id>` (F1). With no sessions it stays bare and
+    // the one-shot path reports that itself.
+    if matches!(cli.resume, Some(None)) {
+        let store = JsonlSessionStore::new(&sessions_dir);
+        if let Some(meta) = latest_session(&store).await? {
+            eprintln!("resuming: {} ({})", meta.id, meta.title);
+            cli.resume = Some(Some(meta.id));
+        }
+    }
+    if let Some(Some(id)) = cli.resume {
+        let store = JsonlSessionStore::new(&sessions_dir);
+        upgrade_rewind_marker(&store, &sessions_dir, id).await?;
+    }
+
     // `modron doctor` — setup diagnostics (Phase 8).
     if let Some(Command::Doctor) = cli.command {
         return run_doctor(&cfg);
@@ -561,7 +586,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // `modron serve` — the remote-control session server (Phase 2). Built
     // exactly like `daemon start`: same agent path, long-lived process.
-    if let Some(Command::Serve { listen, bridge }) = &cli.command {
+    if let Some(Command::Serve {
+        listen,
+        bridge,
+        require_token,
+        allow_origin,
+    }) = &cli.command
+    {
         let mcp = spawn_mcp_servers(&cfg).await?;
         let agent = build_agent_with(
             &cli,
@@ -575,6 +606,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             &modron_server::ServeOptions {
                 listen: Some(listen.clone()),
                 bridge_base: bridge.clone(),
+                require_token: *require_token,
+                allowed_origins: allow_origin.clone(),
                 ..modron_server::ServeOptions::default()
             },
         )
@@ -889,7 +922,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         outcome.summary
     } else {
         match resume_session_id {
-            Some(session_id) => agent.engine.run_task_resuming(session_id, &task).await?,
+            Some(session_id) => {
+                agent
+                    .engine
+                    .run_task_resuming_with_attachments(session_id, &task, attachments)
+                    .await?
+            }
             None => {
                 agent
                     .engine
@@ -913,7 +951,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         println!("{}", summary.answer);
     }
 
-    print_usage_table(&events[usage_baseline..])?;
+    // The log can shrink below the cached baseline (corruption, concurrent
+    // vacuum); an out-of-range slice must not panic the run summary.
+    print_usage_table(events.get(usage_baseline..).unwrap_or(&[]))?;
     println!();
     println!(
         "session: {}  (turns: {}, tool calls: {})",
@@ -1042,9 +1082,7 @@ fn build_agent_with(
         .unwrap_or_else(|| engine_defaults.default_model.clone());
 
     if let Some(threshold) = cli.compact_threshold {
-        if !(threshold > 0.0 && threshold < 1.0) {
-            anyhow::bail!("--compact-threshold must be strictly between 0 and 1, got {threshold}");
-        }
+        validate_compact_threshold(threshold, "--compact-threshold")?;
     }
     // Precedence: engine default < [compaction] in config.toml < CLI flags.
     let mut compaction = CompactionPolicy::default();
@@ -1053,7 +1091,8 @@ fn build_agent_with(
             compaction.enabled = v;
         }
         if let Some(v) = section.threshold_frac {
-            compaction.threshold_frac = v;
+            compaction.threshold_frac =
+                validate_compact_threshold(v, "[compaction].threshold_frac")?;
         }
         if let Some(v) = section.min_interval_turns {
             compaction.min_interval_turns = v;
@@ -1139,6 +1178,10 @@ fn build_agent_with(
         })
         .transpose()?;
 
+    let rewind_marker = cli
+        .resume
+        .flatten()
+        .and_then(|id| read_rewind_marker(&sessions_dir, id));
     let mut engine_config = EngineConfig {
         working_dir: working_dir.clone(),
         system: persona
@@ -1180,14 +1223,16 @@ fn build_agent_with(
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),
-        // Honors a prior `modron rewind` of this session (C2): abandoned
-        // events stay in the log but never re-enter context.
-        resume_from_event: cli.resume.flatten().and_then(|id| {
-            let marker = sessions_dir.join(format!("{id}.rewind"));
-            std::fs::read_to_string(&marker)
-                .ok()
-                .and_then(|text| text.trim().parse::<u64>().ok())
-        }),
+        // Honors a prior `modron rewind` of this session (C2): the
+        // abandoned range `[cut, end)` stays in the log but never re-enters
+        // context; events appended after the rewind (index >= end) do.
+        resume_from_event: rewind_marker.map(|m| m.cut),
+        resume_skip_end: rewind_marker.and_then(|m| m.end),
+        resume_skip_ranges: cli
+            .resume
+            .flatten()
+            .map(|id| read_rewind_history(&sessions_dir, id))
+            .unwrap_or_default(),
         hooks: cfg
             .hooks
             .clone()
@@ -1318,14 +1363,15 @@ fn build_agent_with(
     // read_minified) are on-demand and discoverable via tool_search.
     modron_tools::tier_default_tools(&mut registry);
     for reg in mcp {
-        registry.register(Arc::new(modron_mcp::McpTool::new(
-            Arc::clone(&reg.handle),
-            &reg.server,
-            reg.info.clone(),
-        )));
+        let tool = modron_mcp::McpTool::new(Arc::clone(&reg.handle), &reg.server, reg.info.clone());
+        // The registry keys tools by their spec name, which for MCP tools is
+        // `mcp__<server>__<tool>`. Demote using that same key; the bare tool
+        // name could collide with a built-in and demote the wrong tool.
+        let registered = tool.qualified_name();
+        registry.register(Arc::new(tool));
         // Phase 13 dynamic discovery: MCP tools stay callable but leave the
         // system prompt — the model finds them via tool_search.
-        registry.mark_on_demand(&reg.info.name);
+        registry.mark_on_demand(&registered);
     }
     // Personas (Phase 5c A2): catalog-resolve providers so delegates can
     // force (model, provider) pairs without a catalog dependency in core.
@@ -1972,7 +2018,7 @@ async fn run_sessions_vacuum(
     older_than_days: u64,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(clamp_vacuum_days(older_than_days));
     let store = JsonlSessionStore::new(sessions_dir);
     let sessions = store
         .list()
@@ -2035,7 +2081,7 @@ async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Res
     // abandoned - context is events[..cut]. `0` therefore means "fresh
     // context, full history on disk" - writing events.len() here made
     // restart a semantic no-op (cycle-2 audit H2).
-    std::fs::write(&marker, "0")
+    std::fs::write(&marker, format_rewind_marker(0, events.len() as u64))
         .map_err(|err| anyhow::anyhow!("cannot write restart marker: {err}"))?;
     println!(
         "session {id} restarted: {} events kept on disk, context starts fresh on the next --resume",
@@ -2209,7 +2255,7 @@ async fn run_traces(sessions_dir: &std::path::Path, session: &str) -> anyhow::Re
             stop.as_deref().unwrap_or("-")
         );
         if let Some(h) = hash {
-            println!("      prompt_hash: {}", &h[..h.len().min(16)]);
+            println!("      prompt_hash: {}", short_hash(h));
         }
     }
     println!("{} turn(s) · total cost ${:.4}", rows.len(), total_cost);
@@ -2223,6 +2269,31 @@ fn truncate(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
     }
+}
+
+/// Upper bound for session-age inputs (`--older-than-days`, `ttl_days`).
+/// 100 years is far beyond any retention window and keeps
+/// `chrono::Duration::days` well inside its range (it panics when too large).
+const MAX_VACUUM_DAYS: u64 = 36_500;
+
+/// Clamp a user-supplied session age so `chrono::Duration::days` cannot panic.
+fn clamp_vacuum_days(days: u64) -> i64 {
+    days.min(MAX_VACUUM_DAYS) as i64
+}
+
+/// First 16 characters of a prompt hash for display. Char-based, so a
+/// corrupt or non-ASCII log value cannot panic on a byte boundary.
+fn short_hash(h: &str) -> String {
+    h.chars().take(16).collect()
+}
+
+/// Validate a compaction threshold fraction. Shared by the `--compact-threshold`
+/// flag and `[compaction].threshold_frac` so both reject the same values.
+fn validate_compact_threshold(threshold: f64, source: &str) -> anyhow::Result<f64> {
+    if !(threshold > 0.0 && threshold < 1.0) {
+        anyhow::bail!("{source} must be strictly between 0 and 1, got {threshold}");
+    }
+    Ok(threshold)
 }
 
 /// The curated FREE model list (Phase 5f, OpenCode-style comparison):
@@ -2293,6 +2364,9 @@ async fn run_bench(
         }
         return Ok(());
     }
+    // Record before any run so the end-of-bench cleanup knows whether the
+    // file was ours to delete.
+    let marker_preexisted = cli.working_dir.join("bench-marker.txt").exists();
     let models: Vec<String> = match models_arg {
         // Empty CSV segments (`"a,,b"`, `","`) must not become empty-string
         // model names that only fail later inside provider calls.
@@ -2569,9 +2643,11 @@ async fn run_bench(
     // Bench hygiene: the suite's mutation tasks create files in the working
     // dir (bench-marker.txt) — remove the known artifacts so benches never
     // pollute the target repo.
+    // Only remove the marker when this bench run created it: a user's own
+    // bench-marker.txt that predates the run must survive.
     let mut artifact = cli.working_dir.clone();
     artifact.push("bench-marker.txt");
-    if std::fs::remove_file(&artifact).is_ok() {
+    if !marker_preexisted && std::fs::remove_file(&artifact).is_ok() {
         tracing::debug!(path = %artifact.display(), "removed bench artifact");
     }
     Ok(())
@@ -2903,12 +2979,157 @@ async fn run_rewind(
         "session {} resumes from event {} ({} later events stay in the log, unused)",
         session_id, outcome.truncated_at_event, outcome.abandoned_events
     );
-    // Persist the truncation point: the next `--resume <id>` picks it up
-    // (a later rewind overwrites it; delete the marker to resume fully).
+    // Persist the abandoned range `[cut, end)`: the next `--resume` picks up
+    // the cut (a later rewind overwrites the marker). `end` is the event
+    // count now, so events appended after this point are not in the range.
+    let end = store
+        .event_count(session_id)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot count session events: {err}"))?;
     let marker = sessions_dir.join(format!("{}.rewind", session_id));
-    std::fs::write(&marker, outcome.truncated_at_event.to_string())
-        .map_err(|err| anyhow::anyhow!("cannot write rewind marker {}: {err}", marker.display()))?;
+    // Append: ranges abandoned by earlier rewinds stay recorded, so they
+    // cannot re-enter context after this one.
+    let existing = std::fs::read_to_string(&marker).unwrap_or_default();
+    std::fs::write(
+        &marker,
+        append_rewind_marker(&existing, outcome.truncated_at_event, end),
+    )
+    .map_err(|err| anyhow::anyhow!("cannot write rewind marker {}: {err}", marker.display()))?;
     Ok(())
+}
+
+/// A parsed `<id>.rewind` marker. `cut` is the first abandoned event index.
+/// `end` is the event count when the range was recorded (`[cut, end)` is
+/// abandoned). `None` marks the old one-number form, which
+/// [`upgrade_rewind_marker`] rewrites in the two-number form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RewindMarker {
+    cut: u64,
+    end: Option<u64>,
+}
+
+/// Parses `"<cut>"` (old form) or `"<cut> <end>"`. Anything else, including
+/// an `end` below `cut`, is treated as no marker.
+fn parse_rewind_marker(text: &str) -> Option<RewindMarker> {
+    // The marker file is one line per rewind; the LAST line is the current
+    // marker, earlier lines are the ranges abandoned by earlier rewinds.
+    let text = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    let mut parts = text.split_whitespace();
+    let cut: u64 = parts.next()?.parse().ok()?;
+    let end = match parts.next() {
+        None => None,
+        Some(raw) => Some(raw.parse::<u64>().ok()?),
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    if matches!(end, Some(end) if end < cut) {
+        return None;
+    }
+    Some(RewindMarker { cut, end })
+}
+
+/// The two-number marker text: `"<cut> <end>"`.
+fn format_rewind_marker(cut: u64, end: u64) -> String {
+    format!("{cut} {end}")
+}
+
+/// Ranges `[cut, end)` recorded by rewinds BEFORE the current (last) line.
+/// Lines that are not a complete, well-formed range are ignored.
+fn parse_rewind_history(text: &str) -> Vec<(u64, u64)> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let Some((_current, earlier)) = lines.split_last() else {
+        return Vec::new();
+    };
+    earlier
+        .iter()
+        .filter_map(|line| parse_rewind_marker(line))
+        .filter_map(|m| m.end.map(|end| (m.cut, end)))
+        .collect()
+}
+
+/// The marker file text after recording a new rewind `[cut, end)`: every
+/// earlier range is kept (an old one-number line, which meant "everything
+/// from its cut onward", is closed at this rewind's `end`), and the new
+/// range becomes the current, last line.
+fn append_rewind_marker(existing: &str, cut: u64, end: u64) -> String {
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter_map(parse_rewind_marker)
+        .map(|m| format_rewind_marker(m.cut, m.end.unwrap_or(end).max(m.cut)))
+        .collect();
+    lines.push(format_rewind_marker(cut, end));
+    lines.join("\n")
+}
+
+/// Earlier abandoned ranges for a session (see [`parse_rewind_history`]).
+fn read_rewind_history(sessions_dir: &Path, id: SessionId) -> Vec<(u64, u64)> {
+    let marker = sessions_dir.join(format!("{id}.rewind"));
+    std::fs::read_to_string(marker)
+        .map(|text| parse_rewind_history(&text))
+        .unwrap_or_default()
+}
+
+/// Engine cut for a session's marker, read synchronously while building
+/// the agent. Both marker forms yield the same cut.
+#[cfg(test)]
+fn read_rewind_cut(sessions_dir: &Path, id: SessionId) -> Option<u64> {
+    read_rewind_marker(sessions_dir, id).map(|m| m.cut)
+}
+
+/// A session's rewind marker (cut and, when recorded, the end of the
+/// abandoned range), read synchronously while building the agent.
+fn read_rewind_marker(sessions_dir: &Path, id: SessionId) -> Option<RewindMarker> {
+    let marker = sessions_dir.join(format!("{id}.rewind"));
+    let text = std::fs::read_to_string(marker).ok()?;
+    parse_rewind_marker(&text)
+}
+
+/// Rewrites an old one-number marker as `"<cut> <end>"`, with `end` = the
+/// event count at this moment. Already-upgraded and missing markers are left
+/// alone.
+async fn upgrade_rewind_marker(
+    store: &JsonlSessionStore,
+    sessions_dir: &Path,
+    id: SessionId,
+) -> anyhow::Result<()> {
+    let marker = sessions_dir.join(format!("{id}.rewind"));
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return Ok(());
+    };
+    let Some(parsed) = parse_rewind_marker(&text) else {
+        return Ok(());
+    };
+    if parsed.end.is_some() {
+        return Ok(());
+    }
+    let end = store
+        .event_count(id)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot count session events: {err}"))?;
+    // Rewrite only the current (last) line; earlier ranges are kept.
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.pop();
+    lines.push(format_rewind_marker(parsed.cut, end));
+    std::fs::write(&marker, lines.join("\n"))
+        .map_err(|err| anyhow::anyhow!("cannot rewrite rewind marker: {err}"))?;
+    Ok(())
+}
+
+/// The most recently updated session, if any (`list` sorts newest first).
+async fn latest_session(
+    store: &JsonlSessionStore,
+) -> anyhow::Result<Option<modron_core::SessionMeta>> {
+    use modron_core::SessionStore as _;
+    let sessions = store
+        .list()
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot list sessions: {e}"))?;
+    Ok(sessions.into_iter().next())
 }
 
 /// `modron sessions` (DX1): newest first.
@@ -3174,10 +3395,152 @@ mod tests {
             .await
             .unwrap();
 
+        let count = store.event_count(meta.id).await.unwrap();
         run_sessions_restart(dir.path(), meta.id).await.unwrap();
         let marker = dir.path().join(format!("{}.rewind", meta.id));
         let contents = std::fs::read_to_string(&marker).unwrap();
-        assert_eq!(contents.trim(), "0", "fresh context = cut at 0");
+        assert_eq!(
+            parse_rewind_marker(&contents),
+            Some(RewindMarker {
+                cut: 0,
+                end: Some(count)
+            }),
+            "fresh context = cut at 0, abandoning everything up to the log end"
+        );
+    }
+
+    #[test]
+    fn rewind_marker_history_keeps_earlier_ranges() {
+        use super::{
+            append_rewind_marker, parse_rewind_history, parse_rewind_marker, RewindMarker,
+        };
+        // First rewind, then a later one further along the log.
+        let first = append_rewind_marker("", 2, 6);
+        assert_eq!(first, "2 6");
+        assert!(parse_rewind_history(&first).is_empty());
+        let second = append_rewind_marker(&first, 9, 12);
+        assert_eq!(second, "2 6\n9 12");
+        assert_eq!(
+            parse_rewind_marker(&second),
+            Some(RewindMarker {
+                cut: 9,
+                end: Some(12)
+            }),
+            "the last line is the current marker"
+        );
+        assert_eq!(parse_rewind_history(&second), vec![(2, 6)]);
+        // An old one-number marker is closed at the new rewind's end.
+        assert_eq!(append_rewind_marker("3", 8, 10), "3 10\n8 10");
+        // Junk lines are dropped, not propagated.
+        assert_eq!(append_rewind_marker("junk\n1 2", 4, 5), "1 2\n4 5");
+    }
+
+    #[test]
+    fn rewind_marker_parses_both_forms_and_rejects_junk() {
+        use super::{parse_rewind_marker, RewindMarker};
+        assert_eq!(
+            parse_rewind_marker("3 7\n"),
+            Some(RewindMarker {
+                cut: 3,
+                end: Some(7)
+            })
+        );
+        assert_eq!(
+            parse_rewind_marker("3"),
+            Some(RewindMarker { cut: 3, end: None })
+        );
+        assert_eq!(parse_rewind_marker(""), None);
+        assert_eq!(parse_rewind_marker("a b"), None);
+        assert_eq!(parse_rewind_marker("1 2 3"), None);
+        assert_eq!(parse_rewind_marker("5 2"), None, "end below cut is invalid");
+        assert_eq!(super::format_rewind_marker(3, 7), "3 7");
+    }
+
+    #[tokio::test]
+    async fn old_one_number_marker_is_upgraded_with_current_event_count() {
+        use modron_store::JsonlSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let meta = store.create_session("upgrade me").await.unwrap();
+        for text in ["one", "two", "three"] {
+            store
+                .append(
+                    meta.id,
+                    &SessionEvent::Message {
+                        parent_id: None,
+                        message: modron_core::Message::user(text),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let count = store.event_count(meta.id).await.unwrap();
+        let marker = dir.path().join(format!("{}.rewind", meta.id));
+        std::fs::write(&marker, "1").unwrap();
+
+        upgrade_rewind_marker(&store, dir.path(), meta.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("1 {count}")
+        );
+        assert_eq!(read_rewind_cut(dir.path(), meta.id), Some(1));
+
+        // Already two-number: left untouched even if the log has grown.
+        store
+            .append(
+                meta.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: modron_core::Message::user("later"),
+                },
+            )
+            .await
+            .unwrap();
+        upgrade_rewind_marker(&store, dir.path(), meta.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("1 {count}")
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_resume_resolves_latest_session_and_its_marker_cut() {
+        use modron_store::JsonlSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let older = store.create_session("older").await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let latest = store.create_session("latest").await.unwrap();
+        std::fs::write(dir.path().join(format!("{}.rewind", latest.id)), "2 4").unwrap();
+        std::fs::write(dir.path().join(format!("{}.rewind", older.id)), "9 9").unwrap();
+
+        let picked = latest_session(&store).await.unwrap().expect("a session");
+        assert_eq!(picked.id, latest.id);
+        assert_eq!(read_rewind_cut(dir.path(), picked.id), Some(2));
+    }
+
+    #[tokio::test]
+    async fn bare_resume_with_no_sessions_resolves_to_nothing() {
+        use modron_store::JsonlSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path().join("missing"));
+        assert!(latest_session(&store).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn read_rewind_cut_handles_missing_and_both_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let id: SessionId = uuid::Uuid::new_v4();
+        assert_eq!(read_rewind_cut(dir.path(), id), None);
+        let marker = dir.path().join(format!("{id}.rewind"));
+        std::fs::write(&marker, "4 9").unwrap();
+        assert_eq!(read_rewind_cut(dir.path(), id), Some(4));
+        std::fs::write(&marker, "4").unwrap();
+        assert_eq!(read_rewind_cut(dir.path(), id), Some(4));
     }
     use super::*;
 
@@ -3258,5 +3621,30 @@ mod tests {
             },
         ];
         print_compaction_lines(&tiny, 0, 6);
+    }
+
+    #[test]
+    fn vacuum_days_are_clamped_so_duration_cannot_panic() {
+        assert_eq!(clamp_vacuum_days(7), 7);
+        assert_eq!(clamp_vacuum_days(u64::MAX), 36_500);
+        // Would panic inside chrono before the clamp (value past i64 range).
+        let _ = chrono::Utc::now() - chrono::Duration::days(clamp_vacuum_days(u64::MAX));
+    }
+
+    #[test]
+    fn short_hash_is_char_safe() {
+        assert_eq!(short_hash("abc"), "abc");
+        assert_eq!(short_hash(&"é".repeat(40)).chars().count(), 16);
+        assert_eq!(short_hash("0123456789abcdef9999"), "0123456789abcdef");
+    }
+
+    #[test]
+    fn compact_threshold_range_is_shared_by_flag_and_config() {
+        assert!(validate_compact_threshold(0.5, "x").is_ok());
+        for bad in [0.0, 1.0, -0.1, 1.5, f64::NAN] {
+            let err = validate_compact_threshold(bad, "[compaction].threshold_frac")
+                .expect_err("out-of-range threshold must be rejected");
+            assert!(err.to_string().starts_with("[compaction].threshold_frac"));
+        }
     }
 }

@@ -65,13 +65,24 @@ turns), `fork`, `new_session`, `list_sessions`, `delete_session`,
 `remote_control` (open a tunnel), `publish_page` (share an answer),
 `auth_providers_req` (provider status rows), `persist_router` (write
 router defaults), `ping`. Every failure answers `error` with a
-machine-readable `kind` (auth / not_found / conflict / other).
+machine-readable `kind` (auth / not_found / conflict / forbidden / other).
 
 ## Pairing (remote auth)
 
-Loopback and Unix-socket connections are trusted -- no token. Any
-non-loopback `--listen` bind requires a device token in the `hello`
+The Unix socket is trusted -- no token. A loopback `--listen` bind is
+trusted too UNLESS you pass `--require-token`. Any non-loopback bind, and
+any bind with `--require-token`, requires a device token in the `hello`
 frame.
+
+Trust follows the listening address, not the peer. A reverse proxy or
+tunnel in front of a loopback bind (tailscale serve, cloudflared, nginx)
+makes every remote client look like a loopback peer, so ALWAYS pass
+`--require-token` when anything proxies to the listener.
+
+Browsers: a WebSocket upgrade that carries an `Origin` header is refused
+with 403 unless the origin was allowed with `--allow-origin <origin>`
+(repeatable, exact match). This stops a web page you happen to visit from
+driving a local server. Native clients send no `Origin` and are unaffected.
 
 ```sh
 modron pair myphone     # mint + print a 32-char token (stored 0600)
@@ -94,36 +105,38 @@ hello. `modron serve` writes `~/.modron/serve.pid` and removes the socket
 
 ### Tailscale
 
-Simplest secure setup: bind loopback and let tailscale expose it with
-identity-based access control.
-
-```sh
-modron serve --listen 127.0.0.1:7699 &
-tailscale serve --bg --https=443 http://127.0.0.1:7699
-```
-
-Clients connect to `wss://<machine>.<tailnet>.ts.net`. Tailscale
-terminates TLS and authenticates the tailnet identity in front of the
-plain-WS listener.
-
-Alternative: bind the tailnet IP directly (skips `tailscale serve`; the
-address is non-loopback, so device tokens are REQUIRED):
+Recommended: bind the tailnet IP directly. The address is non-loopback,
+so device tokens are required automatically, and WireGuard encrypts the
+link.
 
 ```sh
 modron serve --listen 100.101.102.103:7699   # your tailscale IPv4
 modron pair myphone                          # token for the hello frame
 ```
 
-WireGuard encryption applies either way; with the direct bind, add
-`tailscale serve` ACLs or rely on the token gate.
+Alternative: bind loopback and let `tailscale serve` terminate TLS in
+front of it. The proxy makes every tailnet peer look like loopback, so
+`--require-token` is mandatory:
+
+```sh
+modron serve --listen 127.0.0.1:7699 --require-token &
+modron pair myphone
+tailscale serve --bg --https=443 http://127.0.0.1:7699
+```
+
+Clients connect to `wss://<machine>.<tailnet>.ts.net` and send the token
+in their hello frame.
 
 ### Cloudflare Tunnel
 
-Run the server loopback-only and put a `cloudflared` sidecar in front
-(TLS terminates at Cloudflare's edge):
+Run the server loopback-only WITH `--require-token` and put a
+`cloudflared` sidecar in front (TLS terminates at Cloudflare's edge).
+Without `--require-token` the tunnel hostname is an unauthenticated
+full-control endpoint for anyone who learns it.
 
 ```sh
-modron serve --listen 127.0.0.1:7699 &
+modron serve --listen 127.0.0.1:7699 --require-token &
+modron pair myphone
 
 # quick tunnel (ephemeral URL, fine for trying it out):
 cloudflared tunnel --url http://127.0.0.1:7699
@@ -131,22 +144,36 @@ cloudflared tunnel --url http://127.0.0.1:7699
 # named tunnel (stable hostname):
 cloudflared tunnel create modron
 cloudflared tunnel route dns modron modron.example.com
-cat > ~/.cloudflared/config.yml <<'EOF'
+cat > ~/.cloudflared/config.yml <<'YAML'
 tunnel: modron
 credentials-file: /Users/you/.cloudflared/<tunnel-id>.json
 ingress:
   - hostname: modron.example.com
     service: http://127.0.0.1:7699
   - service: http_status:404
-EOF
+YAML
 cloudflared tunnel run modron
 ```
 
-Clients connect to `wss://modron.example.com`. For zero-trust access
-(recommended), put a Cloudflare Access application in front of the
-hostname: the browser/client authenticates to Access first, then the
-token gate inside modron still applies (pair the device with
-`modron pair`). Without Access, the device token is the only gate.
+Clients connect to `wss://modron.example.com` with their device token.
+For defense in depth, also put a Cloudflare Access application in front
+of the hostname; Access authenticates the person, the device token
+authenticates the client to modron.
+
+### Share links (/remote-control)
+
+`/remote-control <bridge-url>` opens an outbound tunnel to the relay and
+prints a share URL containing a random key. Anyone holding that URL can
+watch the shared session and submit, interrupt, and answer approvals on
+it - treat the URL like a password and share it only over a private
+channel. A share link cannot change configuration, set API keys, manage
+automations, delete or list other sessions, or open further tunnels.
+
+The bridge URL must be `wss://` (or `https://` for publishing) for any
+host. Plaintext `ws://` (or `http://`) is accepted only when the host is
+loopback (`localhost`, `127.0.0.0/8`, `[::1]`); any other host is refused,
+because the share key, publish token and transcript would cross the
+network in clear.
 
 ## Notes and limits
 
@@ -156,7 +183,7 @@ token gate inside modron still applies (pair the device with
 - Attach snapshots carry the full persisted log plus the live view
   (streaming buffers, grouped tool activity, pending approval, cumulative
   usage, model/provider/goal labels).
-- Sticky approve-rest: answering one request with `allow_all` auto-approves
+- Approve-rest: answering one request with `allow_all` auto-approves
   every later mutating call in that session (the TUI's `a`).
 - A run whose task panics would leave the run slot occupied until restart;
   engine failures are reported as `turn_failed` frames, never slots.

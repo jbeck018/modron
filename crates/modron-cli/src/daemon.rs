@@ -17,13 +17,18 @@
 //! Methods: ping | send_task | resume_task | list_sessions | stop
 
 use modron_core::{Engine, EngineConfig, RunSummary, SessionId, StreamDelta, ToolActivity};
+use modron_server::unix::{bind_private_socket, read_line_capped, LineRead, MAX_LINE_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, Semaphore};
+
+/// Most requests one client connection may have in flight at once. A further
+/// line waits on the socket until an earlier request finishes.
+const MAX_IN_FLIGHT_PER_CONN: usize = 64;
 
 /// The daemon's socket path.
 pub fn socket_path() -> anyhow::Result<PathBuf> {
@@ -91,12 +96,9 @@ impl Daemon {
     /// its own task. Writes the PID file; removes the socket on shutdown.
     pub async fn run(&self) -> anyhow::Result<()> {
         let sock = socket_path()?;
-        if let Some(parent) = sock.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let _ = std::fs::remove_file(&sock); // stale socket from a crash
-
-        let listener = UnixListener::bind(&sock)?;
+        // Owner-only socket (0600) in an owner-only directory; refuses a
+        // symlinked socket path. See modron_server::unix::bind_private_socket.
+        let listener = bind_private_socket(&sock)?;
         std::fs::write(pid_file()?, std::process::id().to_string())?;
         println!(
             "modron daemon listening on {} (pid {})",
@@ -129,7 +131,7 @@ impl Daemon {
 
 async fn handle_connection(stream: UnixStream, engine: Arc<Engine>) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
     let (tx, mut rx) = mpsc::unbounded_channel::<Response>();
 
     // Writer task: drains the channel to the socket.
@@ -144,13 +146,30 @@ async fn handle_connection(stream: UnixStream, engine: Arc<Engine>) -> anyhow::R
         Ok::<(), anyhow::Error>(())
     });
 
-    while let Some(line) = lines.next_line().await? {
+    // Lines are capped at MAX_LINE_BYTES while reading (an oversized line is
+    // skipped, the stream resyncs at its newline), and each accepted request
+    // holds one permit until it finishes, so a client cannot pile up tasks.
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_CONN));
+    loop {
+        let line = match read_line_capped(&mut reader, MAX_LINE_BYTES).await? {
+            Some(LineRead::Line(bytes)) => bytes,
+            Some(LineRead::Oversized) => {
+                eprintln!("daemon: oversized request line skipped");
+                continue;
+            }
+            None => break,
+        };
+        let Ok(line) = String::from_utf8(line) else {
+            continue;
+        };
         let Ok(request) = serde_json::from_str::<Request>(&line) else {
             continue;
         };
+        let permit = Arc::clone(&in_flight).acquire_owned().await?;
         let engine = Arc::clone(&engine);
         let tx = tx.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             handle_request(request, engine, tx).await;
         });
     }
@@ -330,7 +349,7 @@ async fn run_task(
                 }
                 maybe_tool = tool_rx.recv() => {
                     match maybe_tool {
-                        Some(ToolActivity::Start { name }) => {
+                        Some(ToolActivity::Start { name, .. }) => {
                             notify("tool", None, Some(name), Some("start".to_string()));
                         }
                         Some(ToolActivity::Done { name, is_error, .. }) => {

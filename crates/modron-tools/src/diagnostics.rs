@@ -108,17 +108,20 @@ impl Tool for DiagnosticsTool {
             )
         };
 
+        // D6/D9: the checker runs under the session's sandbox policy (it
+        // executes repo code: build scripts, test harnesses), with provider
+        // secrets scrubbed.
+        let mut prepared =
+            match modron_core::sandbox::shell_command(ctx.sandbox, &command, &ctx.working_dir) {
+                Ok(prepared) => prepared,
+                Err(err) => return Ok(tool_err(NAME, err.to_string(), REDUCE_CAP)),
+            };
         let output = match tokio::time::timeout(
             // A hanging checker (file-lock waits, interactive prompts) must
             // not hang the agent; kill_on_drop makes the elapsed-timeout
             // drop actually kill the child.
             Duration::from_millis(TIMEOUT_MS),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&ctx.working_dir)
-                .kill_on_drop(true)
-                .output(),
+            prepared.command.stdin(std::process::Stdio::null()).output(),
         )
         .await
         {

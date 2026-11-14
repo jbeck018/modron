@@ -12,7 +12,7 @@
 //! apply against the skeleton (they go through the gated `edit` tool on
 //! real content), so a mis-counted brace can cost a token, never a file.
 
-use crate::common::{arg_str, resolve_path, tool_err};
+use crate::common::{arg_str, open_regular_file, resolve_path, tool_err, MAX_INPUT_BYTES};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
@@ -60,7 +60,48 @@ impl Tool for ReadMinifiedTool {
             return Ok(tool_err(NAME, "missing `path`", MAX_BYTES));
         };
         let path = resolve_path(&ctx.working_dir, raw_path);
-        let content = match tokio::fs::read_to_string(&path).await {
+        let file = match open_regular_file(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                return Ok(tool_err(
+                    NAME,
+                    format!("cannot read {}: {e}", path.display()),
+                    MAX_BYTES,
+                ))
+            }
+        };
+        let too_large = |bytes: u64| {
+            tool_err(
+                NAME,
+                format!(
+                    "file too large to minify ({bytes} bytes, limit {} MiB): {}",
+                    MAX_INPUT_BYTES >> 20,
+                    path.display()
+                ),
+                MAX_BYTES,
+            )
+        };
+        let declared = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if declared > MAX_INPUT_BYTES {
+            return Ok(too_large(declared));
+        }
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        if let Err(e) = tokio::fs::File::from_std(file)
+            .take(MAX_INPUT_BYTES + 1)
+            .read_to_end(&mut buf)
+            .await
+        {
+            return Ok(tool_err(
+                NAME,
+                format!("cannot read {}: {e}", path.display()),
+                MAX_BYTES,
+            ));
+        }
+        if buf.len() as u64 > MAX_INPUT_BYTES {
+            return Ok(too_large(buf.len() as u64));
+        }
+        let content = match String::from_utf8(buf) {
             Ok(content) => content,
             Err(e) => {
                 return Ok(tool_err(
@@ -72,7 +113,7 @@ impl Tool for ReadMinifiedTool {
         };
         // The gate treats a minified read as a read: it unlocks edit/write.
         if let Some(engine) = &ctx.engine {
-            engine.tools.read_gate.mark(&path);
+            engine.tools.read_gate.mark_in(ctx.session_id, &path);
         }
 
         // Prefer the exact syntax-aware skeleton when a grammar is bundled
@@ -259,11 +300,13 @@ fn minify_treesitter(content: &str, path: &str) -> Option<String> {
     let mut prev_kept: Option<usize> = None; // last emitted real row
     for &row in rows.iter().filter(|r| **r < lines.len()) {
         let trimmed = lines[row].trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || prev_kept == Some(row) {
+            // Blank, or a second definition on a line already emitted.
             continue;
         }
         if let Some(prev) = prev_kept {
-            let gap = row - prev - 1;
+            // Saturating: two definitions on one row give `row == prev`.
+            let gap = row.saturating_sub(prev + 1);
             if gap > 0 {
                 out.push_str(&format!("… [+{gap} lines elided]\n"));
             }
@@ -272,7 +315,7 @@ fn minify_treesitter(content: &str, path: &str) -> Option<String> {
         prev_kept = Some(row);
     }
     if let Some(prev) = prev_kept {
-        let gap = lines.len() - prev - 1;
+        let gap = lines.len().saturating_sub(prev + 1);
         if gap > 0 {
             out.push_str(&format!("… [+{gap} lines elided]\n"));
         }
@@ -485,9 +528,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_definitions_on_one_line_have_no_gap_marker() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("one.rs"), "fn a() {} fn b() {}\n").unwrap();
+        let out = run(json!({"path": "one.rs"}), dir.path()).await;
+        assert!(!out.is_error, "{out:?}");
+        assert!(!out.content.contains("lines elided"), "{}", out.content);
+        assert_eq!(out.content.matches("[L1]").count(), 1, "{}", out.content);
+    }
+
+    #[tokio::test]
     async fn missing_file_is_error() {
         let dir = tempdir().unwrap();
         let out = run(json!({"path": "nope.rs"}), dir.path()).await;
         assert!(out.is_error, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn device_file_is_refused_quickly() {
+        let dir = tempdir().unwrap();
+        let out = run(json!({"path": "/dev/zero"}), dir.path()).await;
+        assert!(out.is_error, "{out:?}");
+        assert!(out.content.contains("not a regular file"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn oversize_file_is_refused() {
+        let dir = tempdir().unwrap();
+        let body = "fn a() {}\n".repeat(11 * 1024 * 1024 / 10 + 1);
+        std::fs::write(dir.path().join("huge.rs"), body).unwrap();
+        let out = run(json!({"path": "huge.rs"}), dir.path()).await;
+        assert!(out.is_error, "{out:?}");
+        assert!(out.content.contains("file too large to minify"), "{out:?}");
     }
 }

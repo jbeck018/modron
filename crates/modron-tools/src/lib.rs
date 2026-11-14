@@ -64,6 +64,8 @@ use std::sync::Arc;
 /// `bash`, `write`, `edit`.
 pub fn default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+    // A user interrupt must also stop detached background delegates.
+    modron_core::interrupt::on_interrupt(crate::delegate::abort_background_delegates);
     registry.register(Arc::new(ReadTool));
     registry.register(Arc::new(GlobTool));
     registry.register(Arc::new(GrepTool));

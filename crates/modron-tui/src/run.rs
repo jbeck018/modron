@@ -9,12 +9,12 @@
 //! park the engine task via `tokio::task::block_in_place` until the user
 //! decides.
 
-use crate::{App, AuthFlow, PendingApproval, PendingCommand};
+use crate::{App, ApprovalVerdict, AuthFlow, PendingApproval, PendingCommand};
 use modron_core::{
     ApprovalMode, Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
     ToolActivitySink, ToolCall,
 };
-use modron_protocol::{ConfigPatch, Decision, Frame, Payload, WireRunSummary};
+use modron_protocol::{ConfigPatch, Frame, Payload, WireRunSummary};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -125,6 +125,11 @@ enum UiFrame {
     /// New transcript entries folded from a live persisted Event frame
     /// (the driver's ReplayFolder; parity with a fresh attach replay).
     Entries(Vec<modron_view::TranscriptEntry>),
+    /// The server settled an approval (any client's decision): clear the
+    /// matching prompt.
+    ApprovalResolved {
+        request_id: String,
+    },
     Disconnected,
 }
 
@@ -225,12 +230,28 @@ impl Drop for TerminalGuard {
 /// closures clone the call they were handed; the remote driver carries the
 /// wire's call verbatim); the render loop drains it into the App; the
 /// response channel carries the decision.
-type ApprovalSlot = Arc<Mutex<Option<(ToolCall, mpsc::Sender<bool>)>>>;
+type ApprovalSlot = Arc<Mutex<Option<(ToolCall, mpsc::Sender<ApprovalVerdict>)>>>;
 
 #[derive(Clone)]
 struct ApprovalBus {
     slot: ApprovalSlot,
     rest_approved: Arc<std::sync::atomic::AtomicBool>,
+    /// Remote mode: the wire request id of the prompt in `slot` (set by the
+    /// driver before it fills the slot). Local approvals leave it empty.
+    request_id: Arc<Mutex<Option<String>>>,
+}
+
+/// The decision a remote approval waiter sends. `None` means the waiter
+/// was released without a verdict (the prompt was dropped locally, or the
+/// request was already resolved elsewhere): send nothing, because the
+/// server rejects a decision for an unknown request id.
+fn remote_decision(received: Option<ApprovalVerdict>) -> Option<modron_protocol::Decision> {
+    use modron_protocol::Decision;
+    match received? {
+        ApprovalVerdict::Deny => Some(Decision::Deny),
+        ApprovalVerdict::AllowOnce => Some(Decision::AllowOnce),
+        ApprovalVerdict::AllowAll => Some(Decision::AllowAll),
+    }
 }
 
 /// Run the TUI. `build` receives the wired sinks and returns the engine plus
@@ -265,6 +286,7 @@ pub async fn run_with(
     let approval = ApprovalBus {
         slot: Arc::new(Mutex::new(None)),
         rest_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        request_id: Arc::new(Mutex::new(None)),
     };
 
     // Remote-control connect happens BEFORE the terminal goes raw: a bad
@@ -441,7 +463,11 @@ fn build_local_engine(
             *approval_for_builder.slot.lock().unwrap() = Some((call.clone(), respond));
             // Park the engine task until the render loop delivers the
             // decision. block_in_place keeps other runtime workers alive.
-            tokio::task::block_in_place(|| receiver.recv().unwrap_or(false))
+            tokio::task::block_in_place(|| {
+                receiver
+                    .recv()
+                    .is_ok_and(|verdict| verdict != ApprovalVerdict::Deny)
+            })
         }),
     })
 }
@@ -613,6 +639,10 @@ struct RunState {
     engine_task: Option<tokio::task::JoinHandle<()>>,
     // Remote mode's one-at-a-time flag (no JoinHandle exists to check).
     remote_busy: bool,
+    // Remote mode: the wire request id of the prompt the App is showing
+    // (matched against ApprovalResolved so a decision made elsewhere
+    // clears it).
+    approval_request: Option<String>,
     oauth_task: Option<tokio::task::JoinHandle<()>>,
     oauth_generation: u64,
     slow_command_task: Option<tokio::task::JoinHandle<()>>,
@@ -624,6 +654,28 @@ struct RunState {
     // Which session's log the scrollback currently mirrors; a different
     // session's snapshot (e.g. after /new) resets it first.
     backfill_session: Option<SessionId>,
+    // Remote mode: this connection's copy of the allow/deny lists. The
+    // server replaces a list on SetConfig, so /allow and /deny send the
+    // whole list from here.
+    remote_lists: RemoteLists,
+}
+
+/// Client-side mirror of the server's allow and deny lists for one
+/// connection (starts empty; C5 will carry the real lists in the snapshot).
+#[derive(Default)]
+struct RemoteLists {
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+/// What a parked slash command becomes while connected.
+enum RemoteSlash {
+    /// Send this SetConfig patch; the optional label updates the status strip.
+    Patch(ConfigPatch, Option<String>),
+    /// Nothing is sent; show this note to the user.
+    Note(String),
+    /// No remote equivalent: the command needs the machine that owns the engine.
+    Unsupported,
 }
 
 impl RunState {
@@ -685,6 +737,7 @@ impl RunState {
             loop_cmd_tx,
             engine_task: None,
             remote_busy: false,
+            approval_request: None,
             oauth_task: None,
             oauth_generation: 0,
             slow_command_task: None,
@@ -692,6 +745,7 @@ impl RunState {
             harvest_task: None,
             shell_task: None,
             backfill_session,
+            remote_lists: RemoteLists::default(),
         }
     }
 
@@ -714,9 +768,30 @@ impl RunState {
     fn drain_approval_slot(&mut self, app: &mut App) {
         if app.pending_approval.is_none() {
             if let Some((call, respond)) = self.approval.slot.lock().unwrap().take() {
-                app.pending_approval = Some(PendingApproval { call, respond });
+                self.approval_request = self.approval.request_id.lock().unwrap().take();
+                app.pending_approval = Some(PendingApproval {
+                    call,
+                    respond,
+                    shown_at: std::time::Instant::now(),
+                });
             }
         }
+    }
+
+    /// D6 run boundary: "allow all" and the pending prompt (App and the
+    /// approver bus, including a queued slot entry) are cleared together.
+    /// Called when a run starts, settles, is aborted locally, or when the
+    /// connection drops or /mode and /new change the session's approvals.
+    fn reset_run_approvals(&mut self, app: &mut App) {
+        app.clear_run_approvals();
+        self.approval
+            .rest_approved
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Dropping a queued (slot) or shown respond releases the engine
+        // with no decision (local: denied; remote: nothing is sent).
+        self.approval.slot.lock().unwrap().take();
+        self.approval.request_id.lock().unwrap().take();
+        self.approval_request = None;
     }
 
     /// Phase 3: poll the keyboard (raw mode). Returns [`IterationFlow`] so
@@ -838,6 +913,9 @@ impl RunState {
                             app.toast("a turn is already running — Esc aborts it");
                             return Ok(IterationFlow::Skip);
                         }
+                        // D6: a new run starts with no allow-all and no
+                        // prompt carried over from the last one.
+                        self.reset_run_approvals(app);
                         let task = app.task_with_goal(&task);
                         app.begin_task(&task);
                         let attachments = app.take_attachments();
@@ -891,9 +969,18 @@ impl RunState {
                             match (self.engine_task.take(), self.slow_command_task.take()) {
                                 (Some(task), _) => {
                                     task.abort();
+                                    // Detached work the run started (background
+                                    // delegates) stops with it.
+                                    let stopped = modron_core::interrupt::fire();
+                                    if stopped > 0 {
+                                        app.toast(format!(
+                                            "stopped {stopped} background subagent(s)"
+                                        ));
+                                    }
                                     // Give the runtime a beat to cancel.
                                     tokio::time::sleep(Duration::from_millis(30)).await;
                                     app.finish_interrupted();
+                                    self.reset_run_approvals(app);
                                 }
                                 // No engine running: Esc cancels a slow
                                 // command instead. Bumping the generation
@@ -919,6 +1006,7 @@ impl RunState {
                         if let Some(task) = self.engine_task.take() {
                             task.abort();
                         }
+                        modron_core::interrupt::fire();
                         if let Some(task) = self.slow_command_task.take() {
                             self.slow_command_generation += 1;
                             task.abort();
@@ -940,6 +1028,14 @@ impl RunState {
     async fn dispatch_pending_commands(&mut self, app: &mut App) {
         // NOTE: peek with matches! before take() — an `if let` over
         // `.take()` drops the value when the pattern fails.
+        // D6: changing the approval mode or starting a new session ends the
+        // current allow-all and any open prompt (local and remote alike).
+        if matches!(
+            app.pending_command,
+            Some(PendingCommand::Mode(_)) | Some(PendingCommand::NewSession)
+        ) {
+            self.reset_run_approvals(app);
+        }
         if self.is_remote {
             // Connected: config slash commands become SetConfig patches;
             // anything needing the local engine is refused EXPLICITLY
@@ -977,14 +1073,15 @@ impl RunState {
                     PendingCommand::NewSession => {
                         let _ = self.loop_cmd_tx.send(LoopCmd::NewSession { title: None });
                     }
-                    other => match remote_slash_command(&other) {
-                        Some((patch, mode_label)) => {
+                    other => match remote_slash_command(&other, &mut self.remote_lists) {
+                        RemoteSlash::Patch(patch, mode_label) => {
                             if let Some(label) = mode_label {
                                 app.approval_mode = label;
                             }
                             let _ = self.loop_cmd_tx.send(LoopCmd::SetConfig(patch));
                         }
-                        None => {
+                        RemoteSlash::Note(text) => app.toast(text),
+                        RemoteSlash::Unsupported => {
                             app.toast(
                                 "needs the machine that owns the engine — run it there                                  (restart without --connect)",
                             );
@@ -1240,11 +1337,7 @@ impl RunState {
                 UiFrame::Note(text) => app.note(text),
                 UiFrame::ConfigChanged(patch) => {
                     if let Some(mode) = patch.approval_mode {
-                        app.approval_mode = match mode {
-                            modron_protocol::ApprovalModeWire::ApproveAll => "yolo".into(),
-                            modron_protocol::ApprovalModeWire::Deny => "deny".into(),
-                            modron_protocol::ApprovalModeWire::Ask => "ask".into(),
-                        };
+                        app.approval_mode = approval_label(mode).into();
                     }
                     if let Some(model) = patch.model {
                         app.model_label = model.clone();
@@ -1253,6 +1346,16 @@ impl RunState {
                 }
                 UiFrame::Snapshot(snap) => {
                     app.session_id = Some(snap.session_id);
+                    // C5: the server's real mode label, and this
+                    // connection's allow/deny copy seeded from the server
+                    // (a later /allow or /deny sends the full list).
+                    if let Some(mode) = snap.live.approval_mode {
+                        app.approval_mode = approval_label(mode).into();
+                    }
+                    self.remote_lists = RemoteLists {
+                        allow: snap.live.allow.clone(),
+                        deny: snap.live.deny.clone(),
+                    };
                     if self.backfill_session != Some(snap.session_id) {
                         self.backfill_session = Some(snap.session_id);
                         app.reset_transcript();
@@ -1268,8 +1371,21 @@ impl RunState {
                 UiFrame::Entries(entries) => {
                     app.backfill_transcript(entries);
                 }
+                UiFrame::ApprovalResolved { request_id } => {
+                    if self.approval_request.as_deref() == Some(request_id.as_str()) {
+                        self.approval_request = None;
+                        app.pending_approval = None;
+                    }
+                    // Not drained yet: drop the queued prompt for it too.
+                    let mut queued_id = self.approval.request_id.lock().unwrap();
+                    if queued_id.as_deref() == Some(request_id.as_str()) {
+                        *queued_id = None;
+                        self.approval.slot.lock().unwrap().take();
+                    }
+                }
                 UiFrame::Disconnected => {
                     self.remote_busy = false;
+                    self.reset_run_approvals(app);
                     app.toast("server disconnected — restart with --connect to reattach");
                 }
             }
@@ -1280,12 +1396,15 @@ impl RunState {
     /// approvals short-circuit in the approver; drain any queued one so an
     /// approval parked BEFORE the `a` press is answered, not re-prompted.
     fn mirror_approve_rest(&mut self, app: &mut App) {
+        // Mirror both ways: the App is the source of truth for the run's
+        // allow-all, and a cleared App flag must clear the approver's too.
+        self.approval
+            .rest_approved
+            .store(app.approve_rest, std::sync::atomic::Ordering::Relaxed);
         if app.approve_rest {
-            self.approval
-                .rest_approved
-                .store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some((_, respond)) = self.approval.slot.lock().unwrap().take() {
-                let _ = respond.send(true);
+                self.approval.request_id.lock().unwrap().take();
+                let _ = respond.send(ApprovalVerdict::AllowAll);
             }
         }
     }
@@ -1297,6 +1416,8 @@ impl RunState {
             self.engine_task = None;
             self.remote_busy = false;
             self.drain_engine_events(app);
+            // The run settled: its allow-all and any open prompt end with it.
+            self.reset_run_approvals(app);
             match outcome {
                 Outcome::Done(summary) => {
                     let swarm = app.swarm_summary();
@@ -1483,21 +1604,21 @@ async fn run_pending_command(engine: &mut Engine, cmd: PendingCommand) -> Vec<St
         // Z.ai sign-in never reaches this queue (the OAuth spawn arm
         // consumes it), but the match must stay exhaustive.
         PendingCommand::ZaiLogin { .. } => Vec::new(),
-        PendingCommand::Sandbox(mode) => match mode.as_str() {
-            "off" => {
-                engine.config.sandbox = modron_core::SandboxPolicy::Off;
-                vec!["sandbox: off (approval gates only)".into()]
+        PendingCommand::Sandbox(mode) => match parse_sandbox_policy(&mode) {
+            Some(policy) => {
+                engine.config.sandbox = policy;
+                vec![match policy {
+                    modron_core::SandboxPolicy::Off => "sandbox: off (approval gates only)".into(),
+                    modron_core::SandboxPolicy::Seatbelt => {
+                        "sandbox: seatbelt — applies to future tool calls".into()
+                    }
+                    modron_core::SandboxPolicy::Bubblewrap => {
+                        "sandbox: bubblewrap — applies to future tool calls".into()
+                    }
+                }]
             }
-            "seatbelt" => {
-                engine.config.sandbox = modron_core::SandboxPolicy::Seatbelt;
-                vec!["sandbox: seatbelt — applies to future tool calls".into()]
-            }
-            "bubblewrap" => {
-                engine.config.sandbox = modron_core::SandboxPolicy::Bubblewrap;
-                vec!["sandbox: bubblewrap — applies to future tool calls".into()]
-            }
-            other => vec![format!(
-                "usage: /sandbox off|seatbelt|bubblewrap (got {other:?})"
+            None => vec![format!(
+                "usage: /sandbox off|seatbelt|bubblewrap (got {mode:?})"
             )],
         },
         PendingCommand::Agent(name) => {
@@ -1940,6 +2061,7 @@ enum LoopInput {
     Note(String),
     ConfigChanged(ConfigPatch),
     Snapshot(Box<crate::remote::AttachSnapshot>),
+    ApprovalResolved { request_id: String },
 }
 
 fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
@@ -1949,14 +2071,29 @@ fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
             last_seq,
             events,
             live,
-        } => vec![LoopInput::Snapshot(Box::new(
-            crate::remote::AttachSnapshot {
-                session_id,
-                last_seq,
-                events,
-                live,
-            },
-        ))],
+        } => {
+            // A snapshot taken while an approval awaits a decision adopts
+            // that prompt (same path as a live ApprovalRequested).
+            let adopt = live.pending_approval.clone();
+            let mut inputs = vec![LoopInput::Snapshot(Box::new(
+                crate::remote::AttachSnapshot {
+                    session_id,
+                    last_seq,
+                    events,
+                    live,
+                },
+            ))];
+            if let Some(p) = adopt {
+                inputs.push(LoopInput::Approval {
+                    request_id: p.request_id,
+                    call: p.call,
+                });
+            }
+            inputs
+        }
+        Payload::ApprovalResolved { request_id, .. } => {
+            vec![LoopInput::ApprovalResolved { request_id }]
+        }
         Payload::Delta { delta } => vec![LoopInput::Delta(delta.to_core())],
         Payload::Tool { activity } => vec![LoopInput::Tool(activity.into())],
         Payload::ApprovalRequested { request_id, call } => {
@@ -2071,6 +2208,14 @@ fn spawn_remote_driver(
         // the next attach; the folder matches a fresh replay exactly.
         let mut folder = modron_view::ReplayFolder::new();
         let mut folder_session: Option<uuid::Uuid> = None;
+        // The last approval request queued for the loop (dedupes a prompt
+        // that arrives both live and in an attach snapshot).
+        let mut seen_approval: Option<String> = None;
+        // Undecodable frames seen while connecting (the attach snapshot
+        // wait skips them) are announced here, once.
+        if client.take_undecodable_notice() {
+            let _ = ui_tx.send(UiFrame::Note(crate::remote::UNDECODABLE_NOTICE.into()));
+        }
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
@@ -2094,13 +2239,14 @@ fn spawn_remote_driver(
                         let _ = client.send(Payload::SetConfig { patch });
                     }
                     Some(LoopCmd::RemoteControl { bridge_url }) => {
-                        let Some(session_id) = driver_session else {
-                            break;
-                        };
-                        let _ = client.send(Payload::RemoteControl {
-                            session_id,
-                            bridge_url,
-                        });
+                        match remote_control_payload(driver_session, bridge_url) {
+                            Ok(payload) => {
+                                let _ = client.send(payload);
+                            }
+                            Err(note) => {
+                                let _ = ui_tx.send(UiFrame::Note(note));
+                            }
+                        }
                     }
                     Some(LoopCmd::Fork { session }) => {
                         if let Some(session_id) = session.or(driver_session) {
@@ -2149,7 +2295,14 @@ fn spawn_remote_driver(
                         let _ = ui_tx.send(UiFrame::Disconnected);
                         break;
                     }
-                    Some(frame) => {
+                    Some(crate::remote::Inbound::Undecodable) => {
+                        if client.take_undecodable_notice() {
+                            let _ = ui_tx.send(UiFrame::Note(
+                                crate::remote::UNDECODABLE_NOTICE.into(),
+                            ));
+                        }
+                    }
+                    Some(crate::remote::Inbound::Frame(frame)) => {
                         // /new adoption (stateful): the correlated reply
                         // names the fresh session; attach so its snapshot
                         // and live fold take over.
@@ -2173,7 +2326,7 @@ fn spawn_remote_driver(
                                 let _ = ui_tx.send(UiFrame::Entries(new));
                             }
                         }
-                        for input in frame_to_inputs(frame) {
+                        for input in frame_to_inputs(*frame) {
                             match input {
                                 LoopInput::Delta(d) => {
                                     let _ = delta_tx.send(DeltaOrTool::Delta(d));
@@ -2207,23 +2360,29 @@ fn spawn_remote_driver(
                                     }
                                     let _ = ui_tx.send(UiFrame::Snapshot(snap));
                                 }
+                                LoopInput::ApprovalResolved { request_id } => {
+                                    let _ = ui_tx.send(UiFrame::ApprovalResolved { request_id });
+                                }
                                 LoopInput::Approval { request_id, call } => {
+                                    // A live prompt and the snapshot's copy of
+                                    // the same request must not queue twice.
+                                    if seen_approval.as_deref() == Some(request_id.as_str()) {
+                                        continue;
+                                    }
+                                    seen_approval = Some(request_id.clone());
                                     let (respond, receiver) = mpsc::channel();
+                                    *approval.request_id.lock().unwrap() = Some(request_id.clone());
                                     *approval.slot.lock().unwrap() = Some((call, respond));
                                     let cmd_tx = cmd_tx.clone();
-                                    let rest = approval.rest_approved.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        let allow = receiver.recv().unwrap_or(false);
-                                        let decision = if allow {
-                                            if rest.load(Ordering::Relaxed) {
-                                                Decision::AllowAll
-                                            } else {
-                                                Decision::AllowOnce
-                                            }
-                                        } else {
-                                            Decision::Deny
-                                        };
-                                        let _ = cmd_tx.send(LoopCmd::Approve { request_id, decision });
+                                        // Released without a verdict (dropped
+                                        // locally, or resolved elsewhere): send
+                                        // nothing; the server rejects unknown ids.
+                                        let received = receiver.recv().ok();
+                                        if let Some(decision) = remote_decision(received) {
+                                            let _ = cmd_tx
+                                                .send(LoopCmd::Approve { request_id, decision });
+                                        }
                                     });
                                 }
                             }
@@ -2235,11 +2394,22 @@ fn spawn_remote_driver(
     })
 }
 
+/// The status-strip words for a wire approval mode (ConfigChanged and the
+/// attach snapshot both use this).
+fn approval_label(mode: modron_protocol::ApprovalModeWire) -> &'static str {
+    use modron_protocol::ApprovalModeWire;
+    match mode {
+        ApprovalModeWire::ApproveAll => "yolo",
+        ApprovalModeWire::Deny => "deny",
+        ApprovalModeWire::Ask => "ask",
+    }
+}
+
 /// Translate a parked slash command into a server SetConfig patch while
 /// connected. `None` = no remote equivalent (the loop refuses it with an
 /// explicit toast). The optional label mirrors the local /mode arm's
 /// status-strip update.
-fn remote_slash_command(cmd: &PendingCommand) -> Option<(ConfigPatch, Option<String>)> {
+fn remote_slash_command(cmd: &PendingCommand, lists: &mut RemoteLists) -> RemoteSlash {
     use modron_protocol::ApprovalModeWire;
     let patch = match cmd {
         PendingCommand::Model { name, .. } => ConfigPatch {
@@ -2252,35 +2422,475 @@ fn remote_slash_command(cmd: &PendingCommand) -> Option<(ConfigPatch, Option<Str
                 "deny" => (ApprovalModeWire::Deny, "deny"),
                 _ => (ApprovalModeWire::Ask, "ask"),
             };
-            return Some((
+            return RemoteSlash::Patch(
                 ConfigPatch {
                     approval_mode: Some(wire),
                     ..ConfigPatch::default()
                 },
                 Some(label.to_string()),
-            ));
+            );
         }
-        PendingCommand::Sandbox(s) => ConfigPatch {
-            sandbox: Some(match s.trim() {
-                "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
-                "bubblewrap" | "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
-                _ => modron_core::SandboxPolicy::Off,
-            }),
-            ..ConfigPatch::default()
+        // An unknown value must never reach the server: the old mapping
+        // turned any typo into Off.
+        PendingCommand::Sandbox(s) => match parse_sandbox_policy(s) {
+            Some(policy) => ConfigPatch {
+                sandbox: Some(policy),
+                ..ConfigPatch::default()
+            },
+            None => {
+                return RemoteSlash::Note(format!(
+                    "unknown sandbox `{}` (off | seatbelt | bubblewrap)",
+                    s.trim()
+                ))
+            }
         },
         PendingCommand::Agent(name) => ConfigPatch {
             persona: Some(name.clone()),
             ..ConfigPatch::default()
         },
-        PendingCommand::Allow(tool) => ConfigPatch {
-            allow: Some(vec![tool.clone()]),
-            ..ConfigPatch::default()
-        },
-        PendingCommand::Deny(tool) => ConfigPatch {
-            deny: Some(vec![tool.clone()]),
-            ..ConfigPatch::default()
-        },
-        _ => return None,
+        // The server replaces its list on SetConfig, so send the whole
+        // list (this connection's copy plus the new entry), as the local
+        // path appends to its own list.
+        PendingCommand::Allow(tool) => {
+            let tool = tool.trim();
+            if tool.is_empty() {
+                return RemoteSlash::Note("usage: /allow <tool>".into());
+            }
+            lists.allow.push(tool.to_string());
+            ConfigPatch {
+                allow: Some(lists.allow.clone()),
+                ..ConfigPatch::default()
+            }
+        }
+        PendingCommand::Deny(tool) => {
+            let tool = tool.trim();
+            if tool.is_empty() {
+                return RemoteSlash::Note("usage: /deny <tool>".into());
+            }
+            lists.deny.push(tool.to_string());
+            ConfigPatch {
+                deny: Some(lists.deny.clone()),
+                ..ConfigPatch::default()
+            }
+        }
+        _ => return RemoteSlash::Unsupported,
     };
-    Some((patch, None))
+    RemoteSlash::Patch(patch, None)
+}
+
+/// The /sandbox values, local and remote alike: exactly off, seatbelt,
+/// bubblewrap (bwrap is its alias). Anything else is unknown, not off.
+fn parse_sandbox_policy(mode: &str) -> Option<modron_core::SandboxPolicy> {
+    match mode.trim() {
+        "off" => Some(modron_core::SandboxPolicy::Off),
+        "seatbelt" => Some(modron_core::SandboxPolicy::Seatbelt),
+        "bubblewrap" | "bwrap" => Some(modron_core::SandboxPolicy::Bubblewrap),
+        _ => None,
+    }
+}
+
+/// The frame for `/remote-control`: it needs a session the driver has
+/// adopted. `Err` is the user-visible note (the loop keeps running).
+fn remote_control_payload(
+    driver_session: Option<uuid::Uuid>,
+    bridge_url: String,
+) -> Result<Payload, String> {
+    match driver_session {
+        Some(session_id) => Ok(Payload::RemoteControl {
+            session_id,
+            bridge_url,
+        }),
+        None => Err("no session yet - send a task first, then /remote-control".into()),
+    }
+}
+
+#[cfg(test)]
+mod approval_state_tests {
+    //! C2 (D6): per-run approval state in the run loop. Pure mapping and
+    //! the RunState reset are exercised here; the terminal loop itself is
+    //! not (it needs a TTY).
+    use super::*;
+    use modron_core::ToolCall;
+    use modron_protocol::{Decision, LiveState, PendingApproval as WirePending};
+    use uuid::Uuid;
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }
+    }
+
+    fn state_with_bus() -> (RunState, App, ApprovalBus) {
+        let (delta_tx, delta_rx) = mpsc::channel::<DeltaOrTool>();
+        let approval = ApprovalBus {
+            slot: Arc::new(Mutex::new(None)),
+            rest_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_id: Arc::new(Mutex::new(None)),
+        };
+        let state = RunState::new(
+            inert_engine(),
+            true,
+            delta_tx,
+            delta_rx,
+            approval.clone(),
+            None,
+            None,
+        );
+        (state, App::default(), approval)
+    }
+
+    #[test]
+    fn snapshot_shows_the_server_mode_and_seeds_the_lists() {
+        // C5: attach to a yolo session with server-side allow/deny entries.
+        // The label follows the server, and a following /deny sends the
+        // server's existing denies plus the new one (never a bare list).
+        let (mut state, mut app, _approval) = state_with_bus();
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
+        state.ui_rx = ui_rx;
+        let session = Uuid::new_v4();
+        ui_tx
+            .send(UiFrame::Snapshot(Box::new(crate::remote::AttachSnapshot {
+                session_id: session,
+                last_seq: 0,
+                events: Vec::new(),
+                live: LiveState {
+                    approval_mode: Some(modron_protocol::ApprovalModeWire::ApproveAll),
+                    allow: vec!["diagnostics".into()],
+                    deny: vec!["bash".into()],
+                    ..LiveState::default()
+                },
+            })))
+            .unwrap();
+        state.drain_ui_frames(&mut app);
+        assert_eq!(app.approval_mode, "yolo");
+
+        match remote_slash_command(
+            &PendingCommand::Deny("write".into()),
+            &mut state.remote_lists,
+        ) {
+            RemoteSlash::Patch(patch, _) => {
+                assert_eq!(
+                    patch.deny,
+                    Some(vec!["bash".to_string(), "write".to_string()])
+                );
+                assert_eq!(patch.allow, None);
+            }
+            _ => panic!("expected a config patch"),
+        }
+    }
+
+    #[test]
+    fn snapshot_with_a_pending_approval_adopts_the_prompt() {
+        let session = Uuid::new_v4();
+        let live = LiveState {
+            pending_approval: Some(WirePending {
+                request_id: "req-1".into(),
+                call: call("c1"),
+            }),
+            ..LiveState::default()
+        };
+        let frame = Frame::event(
+            Some(session),
+            3,
+            Payload::Snapshot {
+                session_id: session,
+                last_seq: 3,
+                events: Vec::new(),
+                live,
+            },
+        );
+        let inputs = frame_to_inputs(frame);
+        assert_eq!(inputs.len(), 2, "snapshot, then the adopted prompt");
+        assert!(matches!(inputs[0], LoopInput::Snapshot(_)));
+        match &inputs[1] {
+            LoopInput::Approval { request_id, call } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(call.id, "c1");
+            }
+            _ => panic!("expected the snapshot's pending approval"),
+        }
+    }
+
+    #[test]
+    fn snapshot_without_a_pending_approval_adopts_nothing() {
+        let session = Uuid::new_v4();
+        let frame = Frame::event(
+            Some(session),
+            0,
+            Payload::Snapshot {
+                session_id: session,
+                last_seq: 0,
+                events: Vec::new(),
+                live: LiveState::default(),
+            },
+        );
+        let inputs = frame_to_inputs(frame);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(inputs[0], LoopInput::Snapshot(_)));
+    }
+
+    #[test]
+    fn approval_resolved_frame_maps_to_a_loop_input() {
+        let frame = Frame::event(
+            None,
+            0,
+            Payload::ApprovalResolved {
+                request_id: "req-9".into(),
+                decision: Decision::AllowOnce,
+            },
+        );
+        let inputs = frame_to_inputs(frame);
+        assert!(matches!(
+            &inputs[..],
+            [LoopInput::ApprovalResolved { request_id }] if request_id == "req-9"
+        ));
+    }
+
+    #[test]
+    fn a_released_remote_waiter_sends_nothing() {
+        // Dropped locally (or resolved elsewhere): no verdict, no send.
+        assert_eq!(remote_decision(None), None);
+        assert_eq!(
+            remote_decision(Some(ApprovalVerdict::Deny)),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            remote_decision(Some(ApprovalVerdict::AllowOnce)),
+            Some(Decision::AllowOnce)
+        );
+        assert_eq!(
+            remote_decision(Some(ApprovalVerdict::AllowAll)),
+            Some(Decision::AllowAll)
+        );
+    }
+
+    #[test]
+    fn allow_all_key_sends_allow_all_even_before_the_flag_is_mirrored() {
+        // The race: the `a` key is handled, the waiter wakes, and the
+        // shared rest flag has NOT been mirrored yet. The decision must
+        // still be AllowAll, carried from the key handler itself.
+        let (_state, mut app, approval) = state_with_bus();
+        let (respond, receiver) = mpsc::channel::<ApprovalVerdict>();
+        app.pending_approval = Some(PendingApproval {
+            call: call("a-key"),
+            respond,
+            shown_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        });
+        let key = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('a'));
+        app.on_key(key);
+        assert!(
+            !approval.rest_approved.load(Ordering::Relaxed),
+            "the mirror has not run yet"
+        );
+        assert_eq!(
+            remote_decision(receiver.recv().ok()),
+            Some(Decision::AllowAll)
+        );
+    }
+
+    #[test]
+    fn a_run_boundary_clears_the_app_and_the_approver_bus() {
+        let (mut state, mut app, approval) = state_with_bus();
+        let (respond, receiver) = mpsc::channel::<ApprovalVerdict>();
+        app.approve_rest = true;
+        app.pending_approval = Some(PendingApproval {
+            call: call("shown"),
+            respond,
+            shown_at: std::time::Instant::now(),
+        });
+        approval.rest_approved.store(true, Ordering::Relaxed);
+        *approval.request_id.lock().unwrap() = Some("req-q".into());
+        let (queued, _queued_rx) = mpsc::channel::<ApprovalVerdict>();
+        *approval.slot.lock().unwrap() = Some((call("queued"), queued));
+        state.approval_request = Some("req-shown".into());
+
+        state.reset_run_approvals(&mut app);
+
+        assert!(!app.approve_rest);
+        assert!(app.pending_approval.is_none());
+        assert!(!approval.rest_approved.load(Ordering::Relaxed));
+        assert!(approval.slot.lock().unwrap().is_none());
+        assert!(approval.request_id.lock().unwrap().is_none());
+        assert!(state.approval_request.is_none());
+        // The shown prompt's sender was dropped: its engine is released.
+        assert!(receiver.recv().is_err());
+    }
+
+    #[test]
+    fn the_approver_flag_follows_the_app_each_tick() {
+        let (mut state, mut app, approval) = state_with_bus();
+        app.approve_rest = true;
+        state.mirror_approve_rest(&mut app);
+        assert!(approval.rest_approved.load(Ordering::Relaxed));
+        app.approve_rest = false;
+        state.mirror_approve_rest(&mut app);
+        assert!(!approval.rest_approved.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn resolved_frame_clears_only_the_matching_prompt() {
+        let (mut state, mut app, _approval) = state_with_bus();
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
+        state.ui_rx = ui_rx;
+        let (respond, _rx) = mpsc::channel::<ApprovalVerdict>();
+        app.pending_approval = Some(PendingApproval {
+            call: call("shown"),
+            respond,
+            shown_at: std::time::Instant::now(),
+        });
+        state.approval_request = Some("req-shown".into());
+
+        ui_tx
+            .send(UiFrame::ApprovalResolved {
+                request_id: "req-other".into(),
+            })
+            .unwrap();
+        state.drain_ui_frames(&mut app);
+        assert!(app.pending_approval.is_some(), "another request leaves it");
+
+        ui_tx
+            .send(UiFrame::ApprovalResolved {
+                request_id: "req-shown".into(),
+            })
+            .unwrap();
+        state.drain_ui_frames(&mut app);
+        assert!(app.pending_approval.is_none(), "the matching one clears");
+        assert!(state.approval_request.is_none());
+    }
+}
+
+#[cfg(test)]
+mod remote_command_tests {
+    //! C3: remote-mode slash commands. The pure mapping is tested here;
+    //! the driver loop itself needs a live socket.
+    use super::*;
+    use modron_core::SandboxPolicy;
+    use modron_protocol::Payload;
+    use uuid::Uuid;
+
+    fn note_of(slash: RemoteSlash) -> String {
+        match slash {
+            RemoteSlash::Note(text) => text,
+            _ => panic!("expected a note"),
+        }
+    }
+
+    fn patch_of(slash: RemoteSlash) -> ConfigPatch {
+        match slash {
+            RemoteSlash::Patch(patch, _) => patch,
+            _ => panic!("expected a config patch"),
+        }
+    }
+
+    #[test]
+    fn sandbox_typo_sends_no_patch_and_says_so() {
+        let mut lists = RemoteLists::default();
+        let slash = remote_slash_command(&PendingCommand::Sandbox("bubblwrap".into()), &mut lists);
+        assert_eq!(
+            note_of(slash),
+            "unknown sandbox `bubblwrap` (off | seatbelt | bubblewrap)"
+        );
+    }
+
+    #[test]
+    fn sandbox_on_is_unknown_not_off() {
+        let mut lists = RemoteLists::default();
+        let slash = remote_slash_command(&PendingCommand::Sandbox("on".into()), &mut lists);
+        assert_eq!(
+            note_of(slash),
+            "unknown sandbox `on` (off | seatbelt | bubblewrap)"
+        );
+    }
+
+    #[test]
+    fn sandbox_known_values_map_to_their_policy() {
+        assert!(matches!(
+            parse_sandbox_policy("off"),
+            Some(SandboxPolicy::Off)
+        ));
+        assert!(matches!(
+            parse_sandbox_policy("seatbelt"),
+            Some(SandboxPolicy::Seatbelt)
+        ));
+        assert!(matches!(
+            parse_sandbox_policy("bubblewrap"),
+            Some(SandboxPolicy::Bubblewrap)
+        ));
+        assert!(matches!(
+            parse_sandbox_policy("bwrap"),
+            Some(SandboxPolicy::Bubblewrap)
+        ));
+        assert!(parse_sandbox_policy("bubblwrap").is_none());
+        assert!(parse_sandbox_policy("").is_none());
+    }
+
+    #[tokio::test]
+    async fn local_sandbox_arm_accepts_the_same_set_as_remote() {
+        // C5: the local /sandbox arm takes bwrap too, through the same
+        // parser the remote arm uses.
+        let mut engine = inert_engine();
+        let note = run_pending_command(&mut engine, PendingCommand::Sandbox("bwrap".into())).await;
+        assert_eq!(engine.config.sandbox, SandboxPolicy::Bubblewrap);
+        assert!(note
+            .iter()
+            .any(|line| line.starts_with("sandbox: bubblewrap")));
+        let _ = run_pending_command(&mut engine, PendingCommand::Sandbox("off".into())).await;
+        assert_eq!(engine.config.sandbox, SandboxPolicy::Off);
+        let _ = run_pending_command(&mut engine, PendingCommand::Sandbox("bubblwrap".into())).await;
+        assert_eq!(
+            engine.config.sandbox,
+            SandboxPolicy::Off,
+            "a typo changes nothing"
+        );
+    }
+
+    #[test]
+    fn remote_allow_sends_the_whole_list_not_one_entry() {
+        let mut lists = RemoteLists::default();
+        let _ = remote_slash_command(&PendingCommand::Allow("bash".into()), &mut lists);
+        let patch = patch_of(remote_slash_command(
+            &PendingCommand::Allow("write".into()),
+            &mut lists,
+        ));
+        assert_eq!(
+            patch.allow,
+            Some(vec!["bash".to_string(), "write".to_string()])
+        );
+        assert!(patch.deny.is_none());
+    }
+
+    #[test]
+    fn remote_deny_keeps_earlier_denials() {
+        let mut lists = RemoteLists::default();
+        let _ = remote_slash_command(&PendingCommand::Deny("bash".into()), &mut lists);
+        let patch = patch_of(remote_slash_command(
+            &PendingCommand::Deny("write".into()),
+            &mut lists,
+        ));
+        assert_eq!(
+            patch.deny,
+            Some(vec!["bash".to_string(), "write".to_string()])
+        );
+        assert!(patch.allow.is_none());
+    }
+
+    #[test]
+    fn remote_control_without_a_session_is_a_note_not_a_stop() {
+        let err = remote_control_payload(None, "wss://bridge".into())
+            .expect_err("no session means a note");
+        assert!(err.contains("no session"), "got: {err}");
+    }
+
+    #[test]
+    fn remote_control_with_a_session_builds_the_payload() {
+        let id = Uuid::new_v4();
+        let payload =
+            remote_control_payload(Some(id), "wss://bridge".into()).expect("session adopted");
+        assert!(matches!(
+            payload,
+            Payload::RemoteControl { session_id, .. } if session_id == id
+        ));
+    }
 }

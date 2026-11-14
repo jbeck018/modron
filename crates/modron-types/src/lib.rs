@@ -109,16 +109,29 @@ pub enum StopReason {
 
 /// Provider-reported usage is ground truth for all accounting. Never replace
 /// it with estimates in recorded data; estimates are pre-flight only.
+///
+/// One meaning for every provider (E3):
+/// - `input_tokens` is ALL prompt tokens billed for the request, INCLUDING
+///   cache reads and cache writes. Providers whose wire format reports
+///   cache counts separately (Anthropic: `input_tokens` +
+///   `cache_read_input_tokens` + `cache_creation_input_tokens`) sum them
+///   before filling this field.
+/// - `cached_input_tokens` is the cache-READ portion of `input_tokens`
+///   (always `<= input_tokens` for well-formed provider data).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// All prompt tokens for the request, including cache reads and writes.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// The cache-read subset of `input_tokens`.
     pub cached_input_tokens: u64,
 }
 
 impl Usage {
+    /// Budget-facing total: prompt (including cache) plus output tokens.
+    /// Saturates instead of overflowing on hostile or corrupt counts.
     pub fn total(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 }
 
@@ -296,13 +309,22 @@ pub enum SessionEvent {
         items: Vec<PlanItem>,
     },
     /// Pre-mutation file snapshot (Phase-1b C1, additive): captured before
-    /// `write`/`edit` execute. `prior_content_b64: None` means the file was
-    /// new (rewind deletes it) or exceeded the 256KB snapshot cap. Bash
-    /// mutations are a documented v1 limitation — use git.
+    /// `write`/`edit` execute. Three states (D8):
+    /// - `prior_content_b64: None, uncaptured: false` = the file did not
+    ///   exist; rewind deletes it.
+    /// - `prior_content_b64: Some(b64)` = the prior bytes; rewind restores.
+    /// - `prior_content_b64: None, uncaptured: true` = the original was not
+    ///   a regular file, exceeded the 256KB snapshot cap, or was unreadable;
+    ///   rewind refuses and changes nothing.
+    ///
+    /// Bash mutations are a documented v1 limitation — use git.
     Checkpoint {
         path: String,
         prior_content_b64: Option<String>,
         event_index: u64,
+        /// Absent in older logs: `#[serde(default)]` reads them as `false`.
+        #[serde(default)]
+        uncaptured: bool,
     },
 }
 
@@ -326,13 +348,20 @@ fn default_plan_status() -> String {
 /// tool execution so UIs can render `● Bash …` lines live.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolActivity {
-    /// A tool call is about to execute.
-    Start { name: String },
+    /// A tool call is about to execute. `call_id` is the model's tool-call
+    /// id (`ToolCall.id`), `None` when the peer or provider supplied none;
+    /// consumers pair a `Done` with its `Start` by `call_id` when present.
+    Start {
+        name: String,
+        call_id: Option<String>,
+    },
     /// The tool finished; `bytes` is the (already reduced) result size.
+    /// `call_id` mirrors the matching `Start` (see above).
     Done {
         name: String,
         is_error: bool,
         bytes: usize,
+        call_id: Option<String>,
     },
     /// A subagent began (Phase 5h): `label` is the persona or "explore".
     SubagentStarted { id: String, label: String },
@@ -394,5 +423,21 @@ mod tests {
             .total(),
             5
         );
+    }
+
+    #[test]
+    fn usage_total_saturates_instead_of_overflowing() {
+        let usage = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+        };
+        assert_eq!(usage.total(), u64::MAX);
+        let normal = Usage {
+            input_tokens: 3,
+            output_tokens: 4,
+            cached_input_tokens: 1,
+        };
+        assert_eq!(normal.total(), 7);
     }
 }

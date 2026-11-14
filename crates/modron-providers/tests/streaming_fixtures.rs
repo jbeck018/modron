@@ -92,7 +92,7 @@ fn drain(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> Vec<StreamDelta> {
 /// [`anthropic_equivalent_body`].
 const ANTHROPIC_TOOL_STREAM: &[&str] = &[
     "event: message_start",
-    r#"data: {"type":"message_start","message":{"id":"msg_01STREAM","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":2095,"output_tokens":1,"cache_read_input_tokens":1024}}}"#,
+    r#"data: {"type":"message_start","message":{"id":"msg_01STREAM","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":2095,"output_tokens":1,"cache_read_input_tokens":1024,"cache_creation_input_tokens":512}}}"#,
     "",
     "event: content_block_start",
     r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
@@ -167,6 +167,89 @@ const ANTHROPIC_TRUNCATED_STREAM: &[&str] = &[
     r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
 ];
 
+/// A stream whose message_delta repeats the cumulative input and cache
+/// counts (a shape newer API revisions may send). Usage must not be
+/// double counted: input comes from message_start only (E3).
+const ANTHROPIC_DELTA_USAGE_STREAM: &[&str] = &[
+    "event: message_start",
+    r#"data: {"type":"message_start","message":{"id":"msg_01DELTA","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":40,"cache_creation_input_tokens":60}}}"#,
+    "",
+    "event: content_block_start",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+    "",
+    "event: content_block_stop",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "",
+    "event: message_delta",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":100,"output_tokens":7,"cache_read_input_tokens":40,"cache_creation_input_tokens":60}}"#,
+    "",
+    "event: message_stop",
+    r#"data: {"type":"message_stop"}"#,
+    "",
+];
+
+/// Some OpenAI-compatible servers report a mid-stream failure as a top-level
+/// `error` chunk instead of closing with an HTTP error.
+const OPENAI_MIDSTREAM_ERROR: &[&str] = &[
+    r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Par"},"finish_reason":null}]}"#,
+    "",
+    r#"data: {"error":{"message":"upstream model overloaded","type":"server_error"}}"#,
+    "",
+];
+
+#[tokio::test]
+async fn openai_midstream_error_chunk_fails_as_a_stream_error() {
+    let body = sse_body(OPENAI_MIDSTREAM_ERROR);
+    let (addr, server) = spawn_sse_server(vec![(sse_response(&body), 0)]).await;
+    let provider = OpenAiCompatProvider::new("sk-test-key")
+        .expect("provider")
+        .with_base_url(format!("http://{addr}/v1"));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let err = provider
+        .turn_streaming(Arc::new(simple_request("gpt-test")), tx)
+        .await
+        .expect_err("an error chunk must fail the turn");
+    server.await.expect("server task");
+    match &err {
+        Error::Provider { message, .. } => {
+            assert_eq!(message, "stream error: upstream model overloaded");
+        }
+        other => panic!("expected a provider error, got {other:?}"),
+    }
+    assert!(
+        !is_retryable(&err),
+        "a server-reported stream error is not replayed"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_streaming_usage_is_not_double_counted_from_message_delta() {
+    let body = sse_body(ANTHROPIC_DELTA_USAGE_STREAM);
+    let (addr, server) = spawn_sse_server(vec![(sse_response(&body), 0)]).await;
+    let provider = AnthropicProvider::new("sk-test-key")
+        .expect("provider")
+        .with_base_url(format!("http://{addr}"));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let response = provider
+        .turn_streaming(Arc::new(simple_request("claude-sonnet-4-5")), tx)
+        .await
+        .expect("streaming turn succeeds");
+    server.await.expect("server task");
+
+    assert_eq!(
+        response.usage,
+        Usage {
+            // 100 uncached + 40 read + 60 write; the delta repeat is ignored.
+            input_tokens: 200,
+            output_tokens: 7,
+            cached_input_tokens: 40,
+        }
+    );
+}
+
 fn anthropic_equivalent_body() -> Value {
     json!({
         "content": [
@@ -174,7 +257,7 @@ fn anthropic_equivalent_body() -> Value {
             {"type": "tool_use", "id": "toolu_01XYZ", "name": "glob", "input": {"pattern": "*.rs"}}
         ],
         "stop_reason": "tool_use",
-        "usage": {"input_tokens": 2095, "output_tokens": 121, "cache_read_input_tokens": 1024}
+        "usage": {"input_tokens": 2095, "output_tokens": 121, "cache_read_input_tokens": 1024, "cache_creation_input_tokens": 512}
     })
 }
 
@@ -241,7 +324,9 @@ async fn anthropic_streaming_fixture_matches_non_streaming_contract() {
     assert_eq!(
         response.usage,
         Usage {
-            input_tokens: 2095,
+            // Anthropic input_tokens excludes cache; Usage.input includes
+            // cache reads and writes (E3).
+            input_tokens: 2095 + 1024 + 512,
             output_tokens: 121,
             cached_input_tokens: 1024
         }

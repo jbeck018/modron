@@ -524,10 +524,25 @@ pub struct MenuOption {
     pub command: SlashCommand,
 }
 
+/// The user's answer to an approval prompt. Carried explicitly from the key
+/// that chose it to whoever sends the decision on (never re-derived later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalVerdict {
+    Deny,
+    AllowOnce,
+    AllowAll,
+}
+
+/// Decision keys (y / a / n / Esc) are ignored this long after a prompt
+/// becomes visible, so type-ahead cannot approve a call the user never read.
+pub const APPROVAL_KEY_GUARD: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// A tool call awaiting the user's y/n/a decision.
 pub struct PendingApproval {
     pub call: ToolCall,
-    pub respond: Sender<bool>,
+    pub respond: Sender<ApprovalVerdict>,
+    /// When the prompt became visible (drives [`APPROVAL_KEY_GUARD`]).
+    pub shown_at: std::time::Instant,
 }
 
 /// The live region's state machine. Pure: events in, [`Action`] out.
@@ -945,18 +960,29 @@ impl App {
 
         // Approval modal: keys route to the decision, not the input line.
         if let Some(pending) = self.pending_approval.take() {
+            // Type-ahead guard: a decision key that arrives right as the
+            // prompt appears was typed before the user could read it. Keep
+            // the prompt and ignore the key; the user presses again.
+            let decision_key = matches!(
+                key.code,
+                KeyCode::Char('y' | 'Y' | 'a' | 'A' | 'n' | 'N') | KeyCode::Esc
+            );
+            if decision_key && pending.shown_at.elapsed() < APPROVAL_KEY_GUARD {
+                self.pending_approval = Some(pending);
+                return Action::None;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let _ = pending.respond.send(true);
+                    let _ = pending.respond.send(ApprovalVerdict::AllowOnce);
                     return Action::None;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     self.approve_rest = true;
-                    let _ = pending.respond.send(true);
+                    let _ = pending.respond.send(ApprovalVerdict::AllowAll);
                     return Action::None;
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    let _ = pending.respond.send(false);
+                    let _ = pending.respond.send(ApprovalVerdict::Deny);
                     return Action::None;
                 }
                 KeyCode::Char('c')
@@ -964,7 +990,7 @@ impl App {
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
-                    let _ = pending.respond.send(false);
+                    let _ = pending.respond.send(ApprovalVerdict::Deny);
                     return Action::Quit;
                 }
                 _ => {
@@ -2157,7 +2183,9 @@ impl App {
             .chars()
             .take_while(|ch| !ch.is_whitespace())
             .collect();
-        Some((at, frag))
+        // CHAR offset, like `cursor`: `complete_at` splices by char index.
+        let at_char = self.input[..at].chars().count();
+        Some((at_char, frag))
     }
 
     /// The `@`-completion candidates: the cached workspace walk filtered
@@ -2327,14 +2355,9 @@ impl App {
                     self.note(format!("model {model} ({reason})"));
                 }
                 TranscriptEntry::Usage { model, usage } => {
-                    let denom = usage.input_tokens + usage.cached_input_tokens;
-                    let cache = if denom > 0 {
-                        format!(
-                            " · cache {:.0}%",
-                            100.0 * usage.cached_input_tokens as f64 / denom as f64
-                        )
-                    } else {
-                        String::new()
+                    let cache = match modron_view::cache_hit_pct(&usage) {
+                        Some(pct) => format!(" · cache {pct:.0}%"),
+                        None => String::new(),
                     };
                     self.note(format!("{} · {} tok{}", model, usage.total(), cache));
                 }
@@ -2710,7 +2733,7 @@ impl App {
     pub fn on_tool(&mut self, activity: ToolActivity) {
         // The in-flight tool name for the status strip is TUI-only; the
         // grouping itself is the shared tracker (desktop/mobile parity).
-        if let ToolActivity::Start { name } = &activity {
+        if let ToolActivity::Start { name, .. } = &activity {
             self.current_tool = Some(name.clone());
         }
         if matches!(activity, ToolActivity::Done { .. }) {
@@ -2810,6 +2833,7 @@ impl App {
     ) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
         self.running = false;
+        self.clear_run_approvals();
         // The /share source (desktop parity: the last assistant answer).
         if !answer.is_empty() {
             self.last_answer = Some(answer.clone());
@@ -2861,32 +2885,18 @@ impl App {
         // Cache discipline: per-turn ratio plus the SESSION cumulative —
         // a falling cache hit rate is the cheapest early warning that
         // request prefixes went unstable (cost multiplies silently).
-        let session_cache = {
-            let all = self.cumulative.input_tokens + self.cumulative.cached_input_tokens;
-            if all > 0 {
-                format!(
-                    " (session {:.0}%)",
-                    100.0 * self.cumulative.cached_input_tokens as f64 / all as f64
-                )
-            } else {
-                String::new()
-            }
+        let session_cache = match modron_view::cache_hit_pct(&self.cumulative) {
+            Some(pct) => format!(" (session {pct:.0}%)"),
+            None => String::new(),
         };
         lines.push(
             Line::from(format!(
                 "  {} tok · {} turns · {} cache{session_cache}",
                 usage.total(),
                 turns,
-                {
-                    let all = usage.input_tokens + usage.cached_input_tokens;
-                    if all > 0 {
-                        format!(
-                            "{:.0}%",
-                            100.0 * usage.cached_input_tokens as f64 / all as f64
-                        )
-                    } else {
-                        "—".to_string()
-                    }
+                match modron_view::cache_hit_pct(&usage) {
+                    Some(pct) => format!("{pct:.0}%"),
+                    None => "—".to_string(),
                 }
             ))
             .style(Style::default().fg(t.dim)),
@@ -2900,6 +2910,7 @@ impl App {
     pub fn finish_interrupted(&mut self) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
         self.running = false;
+        self.clear_run_approvals();
         self.commit_tool_summary();
         self.streaming.clear();
         self.current_tool = None;
@@ -2913,8 +2924,17 @@ impl App {
         lines
     }
 
+    /// D6: "allow all" and the pending prompt belong to ONE run. Cleared at
+    /// run start and run end. Dropping a pending prompt drops its respond
+    /// sender, so a parked local engine receives no decision and is denied.
+    pub fn clear_run_approvals(&mut self) {
+        self.approve_rest = false;
+        self.pending_approval = None;
+    }
+
     /// Begin a submitted task.
     pub fn begin_task(&mut self, task: &str) {
+        self.clear_run_approvals();
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
@@ -3016,15 +3036,8 @@ impl App {
         // Session-cumulative cache hit rate — a falling number is the
         // cheapest early warning that request prefixes went unstable
         // (same arithmetic as finish_turn's summary line).
-        let cache_denom = self.cumulative.input_tokens + self.cumulative.cached_input_tokens;
-        if cache_denom > 0 {
-            spans.push(Span::styled(
-                format!(
-                    " · cache {:.0}%",
-                    100.0 * self.cumulative.cached_input_tokens as f64 / cache_denom as f64
-                ),
-                dim,
-            ));
+        if let Some(pct) = modron_view::cache_hit_pct(&self.cumulative) {
+            spans.push(Span::styled(format!(" · cache {pct:.0}%"), dim));
         }
         // Estimated context pressure; at the 80% compaction trigger the
         // segment flips to the warning color and shouts `!`.
@@ -3108,7 +3121,11 @@ impl App {
             return format!(
                 "⚠ allow {} {}? [y/N/a]",
                 pending.call.name,
-                short(&pending.call.arguments.to_string(), 80)
+                modron_view::approval_summary(
+                    &pending.call.name,
+                    &pending.call.arguments,
+                    modron_view::APPROVAL_SUMMARY_MAX
+                )
             );
         }
         self.status_spans()
@@ -3931,15 +3948,6 @@ fn slugish(text: &str) -> String {
 /// String::insert/remove speak bytes, the cursor speaks chars.
 fn char_byte_idx(s: &str, ci: usize) -> usize {
     s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
-}
-
-fn short(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max_chars).collect();
-        format!("{cut}…")
-    }
 }
 
 /// Lines to commit to scrollback via `Terminal::insert_before`.

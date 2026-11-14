@@ -9,9 +9,8 @@
 //! are pure functions so tests assert the exact wire shape from recorded-JSON
 //! fixtures — no network.
 
-use crate::stream::{parse_sse_stream, StreamDelta};
+use crate::stream::StreamDelta;
 use async_trait::async_trait;
-use futures::StreamExt;
 use modron_core::{
     Error, ModelProvider, Result, Role, StopReason, ToolCall, TurnRequest, TurnResponse, Usage,
 };
@@ -25,7 +24,10 @@ pub const PROVIDER_ID: &str = "anthropic";
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-use crate::http::{build_client, check_status, finish_json, with_401_retry};
+use crate::http::{
+    build_client, check_status, drain_sse, finish_json, with_401_retry, within_idle,
+    REQUEST_TIMEOUT, STREAM_IDLE_TIMEOUT,
+};
 
 /// Anthropic Messages API client.
 pub struct AnthropicProvider {
@@ -112,15 +114,25 @@ impl AnthropicProvider {
     /// rotate — the new pair is persisted before the retry). The cycle is
     /// the shared [`with_401_retry`] helper (the openai-responses provider
     /// shipped the same twin; 2026-11-12 audit DRY fix).
-    async fn post_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+    async fn post_messages(
+        &self,
+        url: &str,
+        body: &Value,
+        streaming: bool,
+    ) -> Result<reqwest::Response> {
         with_401_retry(
-            || self.send_messages(url, body),
+            || self.send_messages(url, body, streaming),
             || self.refresh_if_possible(),
         )
         .await
     }
 
-    async fn send_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+    async fn send_messages(
+        &self,
+        url: &str,
+        body: &Value,
+        streaming: bool,
+    ) -> Result<reqwest::Response> {
         // Header values are extracted under a scoped guard: the future
         // must be Send, so no guard may live across the await.
         let (bearer, api_key) = {
@@ -130,11 +142,14 @@ impl AnthropicProvider {
                 Auth::Subscription { access_token, .. } => (Some(access_token.clone()), None),
             }
         };
-        let request = self
+        let mut request = self
             .http
             .post(url)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(body);
+        if !streaming {
+            request = request.timeout(REQUEST_TIMEOUT);
+        }
         let request = match (bearer, api_key) {
             (Some(token), _) => request
                 .header("Authorization", format!("Bearer {token}"))
@@ -156,23 +171,53 @@ impl AnthropicProvider {
     /// single-use token onto the wire twice.
     async fn refresh_if_possible(&self) -> Result<bool> {
         use modron_core::auth::oauth;
-        let _guard = self.refresh_lock.lock().await;
-        let refresh_token = {
+        // The access token the failed request used, read BEFORE waiting on
+        // any lock: if it has changed by the time we hold the lock, someone
+        // else already refreshed and the single-use refresh token must not
+        // be spent again.
+        let subscription_tokens = || {
             let auth = self.auth.read().expect("auth lock");
             match &*auth {
                 Auth::Subscription {
-                    refresh_token: Some(token),
-                    ..
-                } => token.clone(),
-                _ => return Ok(false),
+                    access_token,
+                    refresh_token: Some(refresh),
+                } => Some((access_token.clone(), refresh.clone())),
+                _ => None,
             }
         };
+        let Some((stale_access, _)) = subscription_tokens() else {
+            return Ok(false);
+        };
+        let _guard = self.refresh_lock.lock().await;
+        let Some((current_access, refresh_token)) = subscription_tokens() else {
+            return Ok(false);
+        };
+        if current_access != stale_access {
+            return Ok(true); // another task in this process refreshed
+        }
+        // Cross-process (E8): hold the file lock, then re-read the token
+        // file. Another Modron process may have rotated the tokens while we
+        // waited; adopt them instead of replaying a dead refresh token.
+        let _file_lock = match oauth::auth_file() {
+            Ok(path) => Some(modron_core::auth::RefreshFileLock::acquire(&path).await),
+            Err(_) => None,
+        };
+        if let Ok(Some(disk)) = oauth::load_tokens() {
+            if let Some(adopted) = adopt_rotated_tokens(&stale_access, &refresh_token, disk) {
+                *self.auth.write().expect("auth lock") = Auth::Subscription {
+                    access_token: adopted.access_token,
+                    refresh_token: adopted.refresh_token,
+                };
+                return Ok(true);
+            }
+        }
         let tokens = oauth::refresh_tokens_at(oauth::TOKEN_URL, &refresh_token)
             .await
             .map_err(|e| Error::Provider {
                 provider: PROVIDER_ID.into(),
                 message: format!("subscription token refresh failed: {e}"),
             })?;
+        let tokens = keep_previous_refresh_token(&refresh_token, tokens);
         // Persist BEFORE swapping in memory: rotation means a crash must
         // never leave only the dead refresh token on disk.
         oauth::save_tokens(&tokens).map_err(|e| Error::Provider {
@@ -191,6 +236,7 @@ impl AnthropicProvider {
     /// is appended per request.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        crate::http::warn_cleartext_once(PROVIDER_ID, &self.base_url);
         self
     }
 
@@ -247,23 +293,24 @@ impl AnthropicProvider {
             "sending streaming turn request"
         );
 
-        let response = self.post_messages(&url, &body).await?;
+        let response = within_idle(
+            PROVIDER_ID,
+            STREAM_IDLE_TIMEOUT,
+            self.post_messages(&url, &body, true),
+        )
+        .await?;
         // Streaming failures arrive as a plain (non-SSE) error body; the
         // shared status check maps them to the canonical error text.
         let response = check_status(PROVIDER_ID, response).await?;
 
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut byte_stream = response.bytes_stream();
         let mut acc = StreamAccumulator::default();
-        while let Some(item) = byte_stream.next().await {
-            let chunk = item.map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-            buffer.extend_from_slice(&chunk);
-            let (payloads, consumed) = parse_sse_stream(&buffer);
-            buffer.drain(..consumed);
-            for payload in payloads {
-                acc.ingest(&payload, &tx)?;
-            }
-        }
+        drain_sse(
+            PROVIDER_ID,
+            response.bytes_stream(),
+            STREAM_IDLE_TIMEOUT,
+            |payload| acc.ingest(payload, &tx).map(|()| false),
+        )
+        .await?;
         let parsed = acc.finish()?;
         tracing::debug!(
             provider = PROVIDER_ID,
@@ -279,6 +326,36 @@ impl AnthropicProvider {
     }
 }
 
+/// Tokens another process already rotated (E8): the token file holds a
+/// different access token AND a different refresh token than the pair that
+/// just failed. Returns them so the caller adopts them without a network
+/// refresh. `None` when the file still holds our own (stale) pair.
+fn adopt_rotated_tokens(
+    stale_access: &str,
+    our_refresh: &str,
+    disk: modron_core::auth::oauth::TokenSet,
+) -> Option<modron_core::auth::oauth::TokenSet> {
+    let rotated = disk.access_token != stale_access
+        && disk
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| token != our_refresh);
+    rotated.then_some(disk)
+}
+
+/// A refresh response may omit `refresh_token` when the existing one stays
+/// valid. Keep the previous token then, instead of persisting `None` and
+/// losing the ability to refresh again (the ChatGPT path does the same).
+fn keep_previous_refresh_token(
+    previous: &str,
+    mut tokens: modron_core::auth::oauth::TokenSet,
+) -> modron_core::auth::oauth::TokenSet {
+    if tokens.refresh_token.is_none() {
+        tokens.refresh_token = Some(previous.to_string());
+    }
+    tokens
+}
+
 /// Incremental state for one streaming turn. Reconstructs exactly what
 /// [`parse_response`] would produce for the equivalent complete body:
 /// per-content-block accumulators keyed by the protocol's block `index`,
@@ -291,8 +368,12 @@ struct StreamAccumulator {
     /// `(block index, id, name, accumulated partial_json)` for `tool_use`
     /// blocks, in first-appearance order.
     tool_blocks: Vec<(u64, String, String, String)>,
+    /// Anthropic's uncached `input_tokens` (message_start only).
     input_tokens: u64,
-    cached_input_tokens: u64,
+    /// `cache_read_input_tokens` (message_start only).
+    cache_read_input_tokens: u64,
+    /// `cache_creation_input_tokens` (message_start only).
+    cache_creation_input_tokens: u64,
     output_tokens: u64,
     stop_reason: Option<String>,
     saw_message_start: bool,
@@ -317,7 +398,13 @@ impl StreamAccumulator {
                         self.input_tokens = n;
                     }
                     if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-                        self.cached_input_tokens = n;
+                        self.cache_read_input_tokens = n;
+                    }
+                    if let Some(n) = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                    {
+                        self.cache_creation_input_tokens = n;
                     }
                 }
             }
@@ -496,9 +583,13 @@ impl StreamAccumulator {
             text,
             tool_calls,
             usage: Usage {
-                input_tokens: self.input_tokens,
+                input_tokens: billed_input_tokens(
+                    self.input_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
+                ),
                 output_tokens: self.output_tokens,
-                cached_input_tokens: self.cached_input_tokens,
+                cached_input_tokens: self.cache_read_input_tokens,
             },
             stop_reason: map_stop_reason(self.stop_reason.as_deref()),
         })
@@ -703,10 +794,12 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
         }
     }
 
+    let cache_read = resp.usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_creation = resp.usage.cache_creation_input_tokens.unwrap_or(0);
     let usage = Usage {
-        input_tokens: resp.usage.input_tokens,
+        input_tokens: billed_input_tokens(resp.usage.input_tokens, cache_read, cache_creation),
         output_tokens: resp.usage.output_tokens,
-        cached_input_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
+        cached_input_tokens: cache_read,
     };
     Ok(TurnResponse {
         text,
@@ -743,10 +836,22 @@ struct AnthropicResponse {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
+    /// Uncached input only; cache reads and writes are reported separately.
     input_tokens: u64,
     output_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
+/// Modron's `Usage.input_tokens` meaning (E3): every prompt token billed for
+/// the request. Anthropic reports `input_tokens` EXCLUDING cache reads and
+/// writes, so the three counts are summed here (saturating).
+fn billed_input_tokens(input: u64, cache_read: u64, cache_creation: u64) -> u64 {
+    input
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation)
 }
 
 /// Known content-block shapes; anything else (e.g. `thinking`) is ignored.
@@ -795,7 +900,7 @@ impl ModelProvider for AnthropicProvider {
             "sending turn request"
         );
 
-        let response = self.post_messages(&url, &body).await?;
+        let response = self.post_messages(&url, &body, false).await?;
         // Text + status-check + parse tail is the shared [`finish_json`]
         // (the 401 retry already ran inside post_messages).
         let value = finish_json(PROVIDER_ID, response).await?;
@@ -814,6 +919,28 @@ impl ModelProvider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rotated_tokens_on_disk_are_adopted_and_own_tokens_are_not() {
+        use modron_core::auth::oauth::TokenSet;
+        let disk = |access: &str, refresh: Option<&str>| TokenSet {
+            access_token: access.into(),
+            refresh_token: refresh.map(String::from),
+            expires_in: None,
+            id_token: None,
+        };
+        // Another process rotated both tokens: adopt, no network refresh.
+        let adopted = adopt_rotated_tokens("old-access", "rt1", disk("new-access", Some("rt2")));
+        assert_eq!(adopted.unwrap().access_token, "new-access");
+        // The file still holds our own stale pair: refresh normally.
+        assert!(
+            adopt_rotated_tokens("old-access", "rt1", disk("old-access", Some("rt1"))).is_none()
+        );
+        // Same refresh token on disk means nobody rotated yet.
+        assert!(adopt_rotated_tokens("old-access", "rt1", disk("other", Some("rt1"))).is_none());
+        // No refresh token on disk: nothing to adopt.
+        assert!(adopt_rotated_tokens("old-access", "rt1", disk("other", None)).is_none());
+    }
+
     use super::*;
     use modron_core::{Message, ToolOutcome, ToolSpec};
     use serde_json::json;
@@ -1087,7 +1214,7 @@ mod tests {
             ],
             "stop_reason": "tool_use",
             "stop_sequence": null,
-            "usage": {"input_tokens": 2095, "output_tokens": 121, "cache_read_input_tokens": 1024}
+            "usage": {"input_tokens": 2095, "output_tokens": 121, "cache_read_input_tokens": 1024, "cache_creation_input_tokens": 512}
         }"#;
         let parsed = parse_response(serde_json::from_str::<Value>(fixture).unwrap()).unwrap();
 
@@ -1097,9 +1224,11 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "glob");
         assert_eq!(parsed.tool_calls[0].arguments["pattern"], "*.rs");
         assert_eq!(parsed.stop_reason, StopReason::ToolUse);
-        assert_eq!(parsed.usage.input_tokens, 2095);
+        // input = uncached + cache reads + cache writes (E3).
+        assert_eq!(parsed.usage.input_tokens, 2095 + 1024 + 512);
         assert_eq!(parsed.usage.output_tokens, 121);
         assert_eq!(parsed.usage.cached_input_tokens, 1024);
+        assert!(parsed.usage.cached_input_tokens <= parsed.usage.input_tokens);
     }
 
     #[test]
@@ -1157,5 +1286,46 @@ mod tests {
         assert_eq!(provider.base_url(), "https://api.anthropic.com");
         let overridden = provider.with_base_url("http://localhost:8082/");
         assert_eq!(overridden.base_url(), "http://localhost:8082/");
+    }
+
+    /// Serve one canned JSON response; returns the token endpoint URL.
+    fn one_shot_token_endpoint(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/oauth/token")
+    }
+
+    #[tokio::test]
+    async fn refresh_response_without_refresh_token_keeps_the_previous_one() {
+        use modron_core::auth::oauth;
+        let url = one_shot_token_endpoint(r#"{"access_token":"at-new","expires_in":28800}"#);
+        let tokens = oauth::refresh_tokens_at(&url, "rt-old").await.unwrap();
+        assert_eq!(tokens.refresh_token, None, "wire response omits it");
+        let kept = keep_previous_refresh_token("rt-old", tokens);
+        assert_eq!(kept.access_token, "at-new");
+        assert_eq!(kept.refresh_token.as_deref(), Some("rt-old"));
+    }
+
+    #[tokio::test]
+    async fn rotated_refresh_token_replaces_the_previous_one() {
+        use modron_core::auth::oauth;
+        let url = one_shot_token_endpoint(
+            r#"{"access_token":"at-new","refresh_token":"rt-rotated","expires_in":28800}"#,
+        );
+        let tokens = oauth::refresh_tokens_at(&url, "rt-old").await.unwrap();
+        let kept = keep_previous_refresh_token("rt-old", tokens);
+        assert_eq!(kept.refresh_token.as_deref(), Some("rt-rotated"));
     }
 }

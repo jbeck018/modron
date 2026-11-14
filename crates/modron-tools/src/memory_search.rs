@@ -187,14 +187,22 @@ fn tokenize(query: &str) -> Vec<String> {
 fn first_sentence(body: &str) -> String {
     let body = body.trim();
     let sentence_end = body.find(". ").map(|i| i + 1).unwrap_or(body.len());
-    let chars: Vec<char> = body.chars().collect();
-    let take = sentence_end.min(chars.len());
-    let mut out: String = chars[..take].iter().collect();
+    let mut out: String = body[..sentence_end].to_string();
     if out.chars().count() > 160 {
         out = out.chars().take(160).collect();
         out.push('…');
     }
     out.replace('\n', " ")
+}
+
+#[cfg(test)]
+mod snippet_char_tests {
+    use super::first_sentence;
+
+    #[test]
+    fn sentence_cut_is_char_safe_after_multibyte_text() {
+        assert_eq!(first_sentence("ééééé. Second sentence here."), "ééééé.");
+    }
 }
 
 #[cfg(test)]

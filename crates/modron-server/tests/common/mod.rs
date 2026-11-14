@@ -141,6 +141,16 @@ impl TestServer {
 
 /// Spawn a real server on 127.0.0.1:0 with the scripted provider.
 pub async fn spawn_server(script: Vec<TurnResponse>, delay_ms: u64) -> TestServer {
+    spawn_server_with(script, delay_ms, |_| {}).await
+}
+
+/// Like [`spawn_server`], but lets the caller adjust the listener options
+/// (for example `require_token` or `allowed_origins`) before bind.
+pub async fn spawn_server_with(
+    script: Vec<TurnResponse>,
+    delay_ms: u64,
+    tweak: impl FnOnce(&mut ServeOptions),
+) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let socket_dir = tempfile::tempdir().unwrap();
     let clients_dir = tempfile::tempdir().unwrap();
@@ -184,17 +194,15 @@ pub async fn spawn_server(script: Vec<TurnResponse>, delay_ms: u64) -> TestServe
         config,
     };
 
-    let server = modron_server::bind_server(
-        engine,
-        &ServeOptions {
-            listen: Some("127.0.0.1:0".into()),
-            socket: Some(socket_dir.path().join("serve.sock")),
-            clients_dir: Some(clients_dir.path().to_path_buf()),
-            bridge_base: None,
-        },
-    )
-    .await
-    .unwrap();
+    let mut options = ServeOptions {
+        listen: Some("127.0.0.1:0".into()),
+        socket: Some(socket_dir.path().join("serve.sock")),
+        clients_dir: Some(clients_dir.path().to_path_buf()),
+        bridge_base: None,
+        ..ServeOptions::default()
+    };
+    tweak(&mut options);
+    let server = modron_server::bind_server(engine, &options).await.unwrap();
     let addr = server.ws_addr.unwrap();
     TestServer {
         addr,
@@ -212,12 +220,26 @@ pub struct WsClient {
 }
 
 impl WsClient {
+    /// Open the socket without sending hello. `origin` sets the browser
+    /// `Origin` header when given. Returns the handshake error if refused.
+    pub async fn open_ws(
+        addr: std::net::SocketAddr,
+        origin: Option<&str>,
+    ) -> std::result::Result<Self, tokio_tungstenite::tungstenite::Error> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}").into_client_request()?;
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("Origin", origin.parse().expect("origin header value"));
+        }
+        let (ws, _) = tokio_tungstenite::connect_async(request).await?;
+        Ok(Self { ws, next_id: 1 })
+    }
+
     /// Connect and complete the hello/welcome handshake.
     pub async fn connect(addr: std::net::SocketAddr) -> Self {
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
-            .await
-            .expect("connect");
-        let mut client = Self { ws, next_id: 1 };
+        let mut client = Self::open_ws(addr, None).await.expect("connect");
         client
             .send(Payload::Hello {
                 client: "test-client".into(),
@@ -272,5 +294,19 @@ impl WsClient {
 
     pub async fn close(&mut self) {
         let _ = self.ws.close(None).await;
+    }
+
+    /// True when the server ends the connection (close frame, end of
+    /// stream, or transport error) within 5s. Ping/pong are skipped; any
+    /// data frame means the server still answers, so returns false.
+    pub async fn expect_closed(&mut self) -> bool {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), self.ws.next()).await {
+                Err(_) => return false,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return true,
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+                Ok(Some(Ok(_))) => return false,
+            }
+        }
     }
 }

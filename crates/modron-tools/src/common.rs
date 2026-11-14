@@ -10,6 +10,25 @@ use std::path::{Path, PathBuf};
 /// and hidden entries).
 pub(crate) const SKIPPED_DIRS: &[&str] = &["target", "node_modules", "vendor"];
 
+/// Hard cap on bytes read from one model-supplied file by `read`,
+/// `read_minified` and `grep` (grep skips larger files instead of reading them).
+pub(crate) const MAX_INPUT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Opens `path` for a bounded read. `metadata` follows symlinks and must report
+/// a regular file; devices (`/dev/zero`), FIFOs, sockets and directories are
+/// refused before anything is opened, so they can never hang the tool or grow
+/// its memory without bound.
+pub(crate) fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    std::fs::File::open(path)
+}
+
 /// Resolves `raw` against `working_dir` unless it is already absolute.
 pub(crate) fn resolve_path(working_dir: &Path, raw: &str) -> PathBuf {
     let p = Path::new(raw);
@@ -18,6 +37,115 @@ pub(crate) fn resolve_path(working_dir: &Path, raw: &str) -> PathBuf {
     } else {
         working_dir.join(p)
     }
+}
+
+/// A tool path resolved the way the filesystem will resolve it.
+pub(crate) struct ToolPath {
+    /// Absolute path: every existing ancestor is canonicalized (symlinks and
+    /// `..` resolved by the kernel), the not-yet-existing tail re-appended.
+    pub(crate) path: PathBuf,
+    /// True when some component of the raw path (below the working dir's own
+    /// location) is a symlink.
+    pub(crate) via_symlink: bool,
+}
+
+/// Resolves `raw` against `working_dir` as the filesystem will see it. The
+/// longest existing prefix is canonicalized; a `..` in the non-existing tail
+/// is an error because it cannot be resolved safely.
+pub(crate) fn resolve_tool_path(working_dir: &Path, raw: &str) -> std::io::Result<ToolPath> {
+    use std::path::Component;
+    let joined = resolve_path(working_dir, raw);
+    let comps: Vec<Component<'_>> = joined.components().collect();
+    let prefix = |n: usize| -> PathBuf { comps[..n].iter().collect() };
+
+    // lstat-based existence: a dangling symlink still counts as existing, so
+    // it is never silently treated as a plain missing name.
+    let mut k = comps.len();
+    while k > 0 && std::fs::symlink_metadata(prefix(k)).is_err() {
+        k -= 1;
+    }
+    if k == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no existing ancestor",
+        ));
+    }
+    let mut resolved = std::fs::canonicalize(prefix(k))?;
+    for comp in &comps[k..] {
+        match comp {
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "`..` in a path whose parent does not exist",
+                ))
+            }
+        }
+    }
+
+    let mut via_symlink = false;
+    for j in 1..=k {
+        let p = prefix(j);
+        if working_dir.starts_with(&p) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            via_symlink = true;
+            break;
+        }
+    }
+    Ok(ToolPath {
+        path: resolved,
+        via_symlink,
+    })
+}
+
+/// True when a resolved path is write-protected: its file name is an
+/// instruction source (`AGENTS.md`, `CLAUDE.md`), or a path component below
+/// the working dir is `.modron`, `.claude` or `.git`. ASCII case-insensitive.
+pub(crate) fn is_protected_path(resolved: &Path, canonical_working_dir: &Path) -> bool {
+    let name = resolved
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.eq_ignore_ascii_case("AGENTS.md") || name.eq_ignore_ascii_case("CLAUDE.md") {
+        return true;
+    }
+    let rel = resolved
+        .strip_prefix(canonical_working_dir)
+        .unwrap_or(resolved);
+    rel.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        [".modron", ".claude", ".git"]
+            .iter()
+            .any(|p| s.eq_ignore_ascii_case(p))
+    })
+}
+
+/// Gate for `write` and `edit`: returns the resolved path to write, or the
+/// message to report. Refuses symlink-mediated escapes out of the workspace
+/// and protected targets; plain absolute paths outside it are not refused.
+pub(crate) fn check_write_path(
+    working_dir: &Path,
+    raw: &str,
+) -> std::result::Result<PathBuf, String> {
+    let tool_path =
+        resolve_tool_path(working_dir, raw).map_err(|e| format!("cannot resolve `{raw}`: {e}"))?;
+    let canonical_wd =
+        std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    if tool_path.via_symlink && !tool_path.path.starts_with(&canonical_wd) {
+        return Err(format!(
+            "path resolves outside the workspace through a symlink: {raw}"
+        ));
+    }
+    if is_protected_path(&tool_path.path, &canonical_wd) {
+        return Err(format!(
+            "`{raw}` is write-protected (instruction/memory source); \
+             edit it yourself outside the agent"
+        ));
+    }
+    Ok(tool_path.path)
 }
 
 /// Extracts an optional non-negative integer argument. Accepts integral
@@ -106,7 +234,181 @@ pub(crate) fn internal_tool_error(tool: &str, message: impl std::fmt::Display) -
 /// or error mid-write can never truncate the target file (the old content
 /// survives until the rename lands).
 pub(crate) async fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("modron-tmp");
-    tokio::fs::write(&tmp, contents).await?;
-    tokio::fs::rename(&tmp, path).await
+    let target = write_atomic_target(path).await?;
+    let (tmp, mut file) = create_unique_temp(&target).await?;
+    let result = async {
+        use tokio::io::AsyncWriteExt;
+        file.write_all(contents).await?;
+        file.flush().await?;
+        drop(file);
+        if let Ok(meta) = tokio::fs::metadata(&target).await {
+            tokio::fs::set_permissions(&tmp, meta.permissions()).await?;
+        }
+        tokio::fs::rename(&tmp, &target).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+/// Follows a symlink chain so the write lands on the real file and the link
+/// itself survives. A missing final component is returned as-is (new file).
+async fn write_atomic_target(path: &Path) -> std::io::Result<PathBuf> {
+    const MAX_LINKS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = tokio::fs::read_link(&current).await?;
+                current = if link.is_absolute() {
+                    link
+                } else {
+                    parent_dir(&current).join(link)
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("too many levels of symbolic links"))
+}
+
+/// Parent directory for a path, using `.` when the path has no directory part.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Creates a temp file next to `target` with `create_new`, so an existing
+/// path (planted symlink, stale temp file) is never opened or followed. The
+/// name mixes pid and a nanosecond clock and retries on collision.
+async fn create_unique_temp(target: &Path) -> std::io::Result<(PathBuf, tokio::fs::File)> {
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let dir = parent_dir(target);
+    let pid = std::process::id();
+    let mut attempt: u32 = 0;
+    loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = dir.join(format!(".{file_name}.modron-tmp-{pid}-{nanos}-{attempt}"));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 32 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_regular_tests {
+    use super::open_regular_file;
+    use tempfile::tempdir;
+
+    #[test]
+    fn accepts_regular_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hi").unwrap();
+        assert!(open_regular_file(&file).is_ok());
+    }
+
+    #[test]
+    fn refuses_directory() {
+        let dir = tempdir().unwrap();
+        let err = open_regular_file(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_device_without_opening_it() {
+        let err = open_regular_file(std::path::Path::new("/dev/zero")).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod write_atomic_tests {
+    use super::write_atomic;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn write_atomic_does_not_follow_planted_tmp_symlink() {
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        let target = dir.path().join("x.rs");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, dir.path().join("x.modron-tmp")).unwrap();
+
+        write_atomic(&target, b"new").await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_preserves_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_atomic(&script, b"#!/bin/sh\necho hi\n")
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_writes_through_symlink() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "old").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink("real.txt", &link).unwrap();
+
+        write_atomic(&link, b"new").await.unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "link must stay a symlink");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn write_atomic_leaves_no_temp_files_behind() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("a.txt");
+        write_atomic(&target, b"one").await.unwrap();
+        write_atomic(&target, b"two").await.unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.txt".to_string()]);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "two");
+    }
 }

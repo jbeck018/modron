@@ -11,22 +11,162 @@
 //! `request failed: …`, `HTTP <status>: <snippet>`), so a wording change
 //! would silently break the retry policy.
 
+use crate::stream::parse_sse_stream;
+use futures::StreamExt;
 use modron_core::{Error, Result};
 use reqwest::Client;
+use std::future::Future;
 use std::time::Duration;
 
-/// Per-request timeout shared by every provider.
+/// Total deadline for non-streaming requests, applied per request. It is
+/// never set on the shared client: a total deadline would also cut off a
+/// stream.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Connect timeout shared by every provider.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest silence tolerated on a streaming response: before its headers
+/// arrive and between body chunks. Streams have no total deadline.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Cap on bytes buffered while waiting for an SSE event to complete.
+pub const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
-/// The shared reqwest client: same timeouts, same construction everywhere.
+/// The shared reqwest client: same connect timeout, same construction
+/// everywhere. Deliberately has no total timeout (see [`REQUEST_TIMEOUT`]).
+/// Redirects are never followed: reqwest strips `Authorization` on a
+/// cross-origin hop but forwards custom credential headers such as
+/// `x-api-key`, so a 3xx surfaces as an `HTTP <status>` error instead.
 pub fn build_client() -> Result<Client> {
     Client::builder()
-        .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| Error::Other(anyhow::anyhow!("failed to build HTTP client: {err}")))
+}
+
+/// Whether a URL host is loopback (`localhost`, `127.0.0.0/8`, `::1`).
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The host a cleartext `http://` URL would send credentials to, when that
+/// host is not loopback. `None` for `https://`, loopback and unparseable
+/// URLs.
+pub(crate) fn cleartext_remote_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    (!is_loopback_host(host)).then(|| host.to_string())
+}
+
+/// Records one cleartext warning per distinct URL. Returns the host to warn
+/// about the first time a remote cleartext URL is seen, `None` otherwise.
+pub(crate) fn claim_cleartext_warning(
+    registry: &std::sync::Mutex<std::collections::HashSet<String>>,
+    base_url: &str,
+) -> Option<String> {
+    let host = cleartext_remote_host(base_url)?;
+    let mut seen = registry.lock().ok()?;
+    seen.insert(base_url.to_string()).then_some(host)
+}
+
+/// Warn (once per distinct URL per process) that an `http://` endpoint off
+/// the loopback interface will receive credentials in clear text. Does not
+/// block the request.
+pub(crate) fn warn_cleartext_once(provider_id: &str, base_url: &str) {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let registry = REGISTRY.get_or_init(Default::default);
+    if let Some(host) = claim_cleartext_warning(registry, base_url) {
+        tracing::warn!(
+            provider = provider_id,
+            "API key will be sent in clear text to {host}"
+        );
+    }
+}
+
+/// The `timeout: …` error the retry policy classifies as transient.
+fn timeout_error(provider_id: &str, what: &str) -> Error {
+    Error::Provider {
+        provider: provider_id.to_string(),
+        message: format!("timeout: {what}"),
+    }
+}
+
+/// Bound a streaming response's wait for its headers by the idle budget.
+pub(crate) async fn within_idle<T>(
+    provider_id: &str,
+    idle: Duration,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(idle, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(timeout_error(
+            provider_id,
+            &format!("no response headers for {idle:?}"),
+        )),
+    }
+}
+
+/// Drive a streaming body to completion: every chunk read is bounded by
+/// `idle`, the SSE line buffer is capped at [`MAX_SSE_BUFFER`], and each
+/// complete `data:` payload goes to `on_payload`. The callback returns
+/// `true` to stop early (an end-of-stream sentinel). The three streaming
+/// providers share this so the idle and cap policy lives in one place.
+pub(crate) async fn drain_sse<S, B>(
+    provider_id: &str,
+    stream: S,
+    idle: Duration,
+    mut on_payload: impl FnMut(&str) -> Result<bool>,
+) -> Result<()>
+where
+    S: futures::Stream<Item = reqwest::Result<B>>,
+    B: AsRef<[u8]>,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        let next = match tokio::time::timeout(idle, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return Err(timeout_error(
+                    provider_id,
+                    &format!("stream idle for {idle:?}"),
+                ))
+            }
+        };
+        let Some(item) = next else {
+            return Ok(());
+        };
+        let chunk = item.map_err(|err| crate::transport_error(provider_id, err))?;
+        buffer.extend_from_slice(chunk.as_ref());
+        // Deliberately not a retryable prefix: an oversized event is a
+        // protocol violation, not a transient failure.
+        if buffer.len() > MAX_SSE_BUFFER {
+            return Err(Error::Provider {
+                provider: provider_id.to_string(),
+                message: format!(
+                    "malformed stream: SSE event exceeds {MAX_SSE_BUFFER} bytes without a terminator"
+                ),
+            });
+        }
+        let (payloads, consumed) = parse_sse_stream(&buffer);
+        buffer.drain(..consumed);
+        for payload in payloads {
+            if on_payload(&payload)? {
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Send a POST with fully caller-supplied headers and JSON body. Headers
@@ -40,7 +180,9 @@ async fn post(
     headers: &[(&str, String)],
     body: &serde_json::Value,
 ) -> Result<reqwest::Response> {
-    let mut request = client.post(url);
+    // Non-streaming only: this path reads the whole body, so a total
+    // deadline is correct here and wrong for streams.
+    let mut request = client.post(url).timeout(REQUEST_TIMEOUT);
     for (name, value) in headers {
         request = request.header(*name, value);
     }
@@ -62,11 +204,22 @@ pub(crate) async fn check_status(
 ) -> Result<reqwest::Response> {
     let status = response.status();
     if !status.is_success() {
+        // Read the header before `text()` consumes the response. Only the
+        // delay-seconds form is honored; HTTP-dates are ignored.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
         let text = response
             .text()
             .await
             .map_err(|err| crate::transport_error(provider_id, err))?;
-        return Err(crate::http_error(provider_id, status, &text));
+        let mut err = crate::http_error(provider_id, status, &text);
+        if let (Some(seconds), Error::Provider { message, .. }) = (retry_after, &mut err) {
+            message.push_str(&crate::retry::retry_after_tag(seconds));
+        }
+        return Err(err);
     }
     Ok(response)
 }
@@ -300,5 +453,212 @@ mod tests {
             .await
             .expect_err("garbage body");
         assert!(err.to_string().contains("malformed response:"), "{err}");
+    }
+
+    fn provider_message(err: Error) -> String {
+        match err {
+            Error::Provider { message, .. } => message,
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+    }
+
+    /// A stream that goes silent must fail with the `timeout:` prefix the
+    /// retry policy keys on, instead of hanging forever.
+    #[tokio::test]
+    async fn stalled_stream_fails_with_timeout_prefix() {
+        use futures::StreamExt;
+        let first =
+            futures::stream::iter(vec![Ok::<Vec<u8>, reqwest::Error>(b"data: x\n\n".to_vec())]);
+        let stalled = first.chain(futures::stream::pending());
+        let mut seen = Vec::new();
+        let err = drain_sse("test", stalled, Duration::from_millis(50), |payload| {
+            seen.push(payload.to_string());
+            Ok(false)
+        })
+        .await
+        .expect_err("a silent stream must not hang");
+        assert_eq!(
+            seen,
+            vec!["x".to_string()],
+            "the payload before the stall arrives"
+        );
+        let message = provider_message(err);
+        assert!(message.starts_with("timeout: "), "{message}");
+    }
+
+    /// Gaps shorter than the idle budget never trip it, however long the
+    /// whole stream runs: there is no total deadline on streams.
+    #[tokio::test]
+    async fn trickling_stream_completes_past_the_idle_budget_in_total() {
+        use futures::StreamExt;
+        let trickle = futures::stream::iter(0..10).then(|i| async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok::<Vec<u8>, reqwest::Error>(format!("data: {i}\n\n").into_bytes())
+        });
+        let mut seen = 0usize;
+        drain_sse("test", trickle, Duration::from_millis(100), |_| {
+            seen += 1;
+            Ok(false)
+        })
+        .await
+        .expect("each gap is under the idle budget");
+        assert_eq!(seen, 10);
+    }
+
+    /// An event that never terminates is refused at the buffer cap rather
+    /// than growing without bound. The error is not retryable.
+    #[tokio::test]
+    async fn endless_line_fails_at_buffer_cap() {
+        let chunk = vec![b'a'; 1024 * 1024];
+        let chunks = (0..10).map(|_| Ok::<Vec<u8>, reqwest::Error>(chunk.clone()));
+        let err = drain_sse(
+            "test",
+            futures::stream::iter(chunks),
+            STREAM_IDLE_TIMEOUT,
+            |_| Ok(false),
+        )
+        .await
+        .expect_err("no newline ever arrives");
+        let message = provider_message(err);
+        assert!(message.contains("exceeds"), "{message}");
+        assert!(!crate::retry::is_retryable(&Error::Provider {
+            provider: "test".into(),
+            message,
+        }));
+    }
+
+    /// A 429 carrying `Retry-After: <seconds>` keeps the canonical
+    /// `HTTP 429 …` prefix and gains a parseable `[retry-after=Ns]` tag.
+    #[tokio::test]
+    async fn retry_after_seconds_are_carried_into_the_error() {
+        let client = build_client().unwrap();
+        let raw = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 12\r\ncontent-length: 4\r\nconnection: close\r\n\r\nslow";
+        let addr = serve_once(vec![raw.to_string()]).await;
+        let url = format!("http://{addr}/");
+        let err = post_json(&client, "test", &url, &[], &serde_json::json!({}))
+            .await
+            .expect_err("429 is an error");
+        assert_eq!(
+            crate::retry::retry_after(&err),
+            Some(Duration::from_secs(12))
+        );
+        assert!(crate::retry::is_retryable(&err));
+        let message = provider_message(err);
+        assert!(
+            message.starts_with("HTTP 429 Too Many Requests: slow"),
+            "{message}"
+        );
+        assert!(message.ends_with(" [retry-after=12s]"), "{message}");
+    }
+
+    /// Only the seconds form is honored; an HTTP-date is ignored rather
+    /// than misparsed.
+    #[tokio::test]
+    async fn http_date_retry_after_is_ignored() {
+        let client = build_client().unwrap();
+        let raw = "HTTP/1.1 429 Too Many Requests\r\nretry-after: Wed, 21 Oct 2015 07:28:00 GMT\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let addr = serve_once(vec![raw.to_string()]).await;
+        let url = format!("http://{addr}/");
+        let err = post_json(&client, "test", &url, &[], &serde_json::json!({}))
+            .await
+            .expect_err("429 is an error");
+        assert_eq!(crate::retry::retry_after(&err), None);
+    }
+
+    /// Response headers that never arrive are bounded by the same idle
+    /// budget and carry the `timeout:` prefix.
+    #[tokio::test]
+    async fn silent_response_headers_fail_with_timeout_prefix() {
+        let err = within_idle(
+            "test",
+            Duration::from_millis(20),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("pending forever");
+        let message = provider_message(err);
+        assert!(message.starts_with("timeout: "), "{message}");
+    }
+
+    /// Model endpoints never need a redirect, so a 3xx is an error and is
+    /// never followed: custom auth headers (`x-api-key`) must not reach the
+    /// `Location` target, which is recorded here.
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind target");
+        let target_addr = target.local_addr().expect("target addr");
+        let contacted = tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_millis(500), target.accept()).await {
+                Ok(Ok((mut socket, _))) => {
+                    let mut scratch = [0u8; 4096];
+                    let _ = socket.read(&mut scratch).await;
+                    let _ = socket
+                        .write_all(response("HTTP/1.1 200 OK", "{}").as_bytes())
+                        .await;
+                    true
+                }
+                _ => false,
+            }
+        });
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://{target_addr}/collect\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        let addr = serve_once(vec![redirect]).await;
+        let client = build_client().unwrap();
+        let headers = vec![("x-api-key", "sk-test".to_string())];
+        let err = post_json(
+            &client,
+            "test",
+            &format!("http://{addr}/"),
+            &headers,
+            &serde_json::json!({}),
+        )
+        .await
+        .expect_err("a 3xx is an error, not a followed redirect");
+        assert!(err.to_string().contains("HTTP 302"), "{err}");
+        assert!(
+            !contacted.await.expect("target task"),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    #[test]
+    fn cleartext_host_classification() {
+        assert_eq!(
+            cleartext_remote_host("http://api.example.com/v1"),
+            Some("api.example.com".into())
+        );
+        assert_eq!(
+            cleartext_remote_host("http://10.0.0.5:8000/v1"),
+            Some("10.0.0.5".into())
+        );
+        assert_eq!(cleartext_remote_host("https://api.example.com/v1"), None);
+        assert_eq!(cleartext_remote_host("http://localhost:11434/v1"), None);
+        assert_eq!(cleartext_remote_host("http://LOCALHOST./v1"), None);
+        assert_eq!(cleartext_remote_host("http://127.0.0.1:8080/"), None);
+        assert_eq!(cleartext_remote_host("http://127.8.9.10/"), None);
+        assert_eq!(cleartext_remote_host("http://[::1]:8000/"), None);
+        assert_eq!(cleartext_remote_host("not a url"), None);
+    }
+
+    #[test]
+    fn cleartext_warning_is_claimed_once_per_url() {
+        let registry = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert_eq!(
+            claim_cleartext_warning(&registry, "http://gw.example.com/v1"),
+            Some("gw.example.com".to_string())
+        );
+        assert_eq!(
+            claim_cleartext_warning(&registry, "http://gw.example.com/v1"),
+            None,
+            "second use of the same URL stays silent"
+        );
+        assert_eq!(
+            claim_cleartext_warning(&registry, "http://localhost:11434/v1"),
+            None,
+            "loopback never warns"
+        );
     }
 }

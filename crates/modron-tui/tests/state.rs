@@ -3,9 +3,18 @@
 //! real TTY and is intentionally thin.
 
 use modron_core::{StreamDelta, ToolActivity, ToolCall, Usage};
-use modron_tui::{Action, App, AuthFlow, PendingApproval, PendingCommand, SlashCommand};
+use modron_tui::{
+    Action, App, ApprovalVerdict, AuthFlow, PendingApproval, PendingCommand, SlashCommand,
+};
 use serde_json::json;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// A prompt that has been on screen longer than the approval key guard, so
+/// decision keys act at once (the guard itself has its own tests).
+fn settled() -> Instant {
+    Instant::now() - Duration::from_secs(1)
+}
 
 fn history_text(app: &App) -> Vec<String> {
     app.history
@@ -43,6 +52,7 @@ fn pending() -> PendingApproval {
             arguments: json!({"command": "rm -rf /"}),
         },
         respond: tx,
+        shown_at: settled(),
     }
 }
 
@@ -121,7 +131,7 @@ fn ctrl_o_toggles_transcript_mode_in_any_state() {
 
 #[test]
 fn approval_keys_respond_and_the_sticky_a_is_recorded() {
-    let (tx, rx) = mpsc::channel::<bool>();
+    let (tx, rx) = mpsc::channel::<ApprovalVerdict>();
     let mut app = App {
         pending_approval: Some(PendingApproval {
             call: ToolCall {
@@ -130,6 +140,7 @@ fn approval_keys_respond_and_the_sticky_a_is_recorded() {
                 arguments: json!({"command": "ls"}),
             },
             respond: tx,
+            shown_at: settled(),
         }),
         ..App::default()
     };
@@ -137,7 +148,7 @@ fn approval_keys_respond_and_the_sticky_a_is_recorded() {
         app.on_key(key(crossterm::event::KeyCode::Char('a'))),
         Action::None
     );
-    assert!(rx.recv().unwrap(), "`a` allows");
+    assert_eq!(rx.recv().unwrap(), ApprovalVerdict::AllowAll, "`a` allows");
     assert!(app.approve_rest, "sticky approve-rest recorded");
     assert!(app.pending_approval.is_none());
 
@@ -149,17 +160,18 @@ fn approval_keys_respond_and_the_sticky_a_is_recorded() {
             arguments: json!({"path": "x"}),
         },
         respond: tx2,
+        shown_at: settled(),
     });
     assert_eq!(
         app.on_key(key(crossterm::event::KeyCode::Esc)),
         Action::None
     );
-    assert!(!rx2.recv().unwrap(), "Esc denies");
+    assert_eq!(rx2.recv().unwrap(), ApprovalVerdict::Deny, "Esc denies");
 }
 
 #[test]
 fn non_decision_keys_do_not_swallow_a_pending_approval() {
-    let (_tx, rx) = mpsc::channel::<bool>();
+    let (_tx, rx) = mpsc::channel::<ApprovalVerdict>();
     let mut app = App {
         pending_approval: Some(pending()),
         ..App::default()
@@ -179,9 +191,11 @@ fn non_decision_keys_do_not_swallow_a_pending_approval() {
 fn tool_lines_render_start_and_done() {
     let mut app = App::default();
     app.on_tool(ToolActivity::Start {
+        call_id: None,
         name: "bash".into(),
     });
     app.on_tool(ToolActivity::Done {
+        call_id: None,
         name: "bash".into(),
         is_error: false,
         bytes: 42,
@@ -199,6 +213,7 @@ fn tool_lines_render_start_and_done() {
 fn finish_turn_flushes_tools_and_answer_and_updates_totals() {
     let mut app = App::default();
     app.on_tool(ToolActivity::Done {
+        call_id: None,
         name: "bash".into(),
         is_error: false,
         bytes: 10,
@@ -1802,8 +1817,12 @@ fn tool_summary_counts_and_panel_expand_flow() {
     let mut app = App::default();
     app.begin_task("do things");
     for name in ["glob", "glob", "glob", "read", "read", "grep"] {
-        app.on_tool(ToolActivity::Start { name: name.into() });
+        app.on_tool(ToolActivity::Start {
+            name: name.into(),
+            call_id: None,
+        });
         app.on_tool(ToolActivity::Done {
+            call_id: None,
             name: name.into(),
             is_error: false,
             bytes: 100,
@@ -1933,7 +1952,7 @@ fn status_strip_consolidates_the_dense_line() {
     let line = app.status_line();
     assert!(line.contains("glm-5.3"), "model first: {line}");
     assert!(line.contains("300 tok"), "cumulative tokens: {line}");
-    assert!(line.contains("cache 25%"), "session cache hit: {line}");
+    assert!(line.contains("cache 33%"), "session cache hit: {line}");
     assert!(line.contains("ctx 30%"), "estimated context: {line}");
     assert!(line.contains("ask (shift+tab)"), "mode + key hint: {line}");
     assert!(line.contains("? shortcuts"), "help hint: {line}");
@@ -2278,11 +2297,188 @@ fn backfill_transcript_rebuilds_scrollback_from_a_replay() {
         "grouped tool summary: {history:?}"
     );
     assert!(
-        history.iter().any(|l| l == "m1 · 110 tok · cache 29%"),
+        history.iter().any(|l| l == "m1 · 110 tok · cache 40%"),
         "usage note (TUI meta arithmetic): {history:?}"
     );
     // The tool summary's events land in tool_log so ctrl+t re-opens them.
     assert_eq!(app.tool_log.len(), 1);
     assert_eq!(app.tool_log[0].1.len(), 1);
     assert_eq!(app.tool_log[0].1[0].name, "read");
+}
+
+#[test]
+fn approval_prompt_shows_the_shared_summary_with_truncation_marker() {
+    // Long bash command: the head is shown and the hidden tail is counted.
+    let long = format!("echo {}", "a".repeat(120));
+    let (tx, _rx) = mpsc::channel();
+    let app = App {
+        pending_approval: Some(PendingApproval {
+            call: ToolCall {
+                id: "c2".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": long.clone() }),
+            },
+            respond: tx,
+            shown_at: settled(),
+        }),
+        ..App::default()
+    };
+    let expected = modron_view::approval_summary("bash", &json!({ "command": long }), 80);
+    let line = app.status_line();
+    assert!(line.contains(&expected), "{line}");
+    assert!(line.contains(" [+45 chars]"), "{line}");
+    assert!(line.starts_with("⚠ allow bash echo "), "{line}");
+}
+
+#[test]
+fn approval_prompt_for_write_leads_with_the_path() {
+    let (tx, _rx) = mpsc::channel();
+    let app = App {
+        pending_approval: Some(PendingApproval {
+            call: ToolCall {
+                id: "c3".into(),
+                name: "write".into(),
+                arguments: json!({ "path": "src/lib.rs", "content": "fn main() {}" }),
+            },
+            respond: tx,
+            shown_at: settled(),
+        }),
+        ..App::default()
+    };
+    assert_eq!(app.status_line(), "⚠ allow write src/lib.rs? [y/N/a]");
+}
+
+// ---------------------------------------------------------------------------
+// C2: approval state is per run (D6). "Allow all" and the pending prompt are
+// cleared when a run starts and when it settles (done / failed / aborted).
+// ---------------------------------------------------------------------------
+
+fn pending_with_rx() -> (PendingApproval, mpsc::Receiver<ApprovalVerdict>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        PendingApproval {
+            call: ToolCall {
+                id: "c-live".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "make"}),
+            },
+            respond: tx,
+            shown_at: settled(),
+        },
+        rx,
+    )
+}
+
+#[test]
+fn allow_all_does_not_carry_into_the_next_task() {
+    let mut app = App {
+        approve_rest: true,
+        ..App::default()
+    };
+    app.begin_task("task two");
+    assert!(
+        !app.approve_rest,
+        "`a` in task one must not auto-approve task two"
+    );
+}
+
+#[test]
+fn aborting_clears_the_modal_and_the_sticky_allow_all() {
+    let (pending, rx) = pending_with_rx();
+    let mut app = App {
+        running: true,
+        approve_rest: true,
+        pending_approval: Some(pending),
+        ..App::default()
+    };
+    app.finish_interrupted();
+    assert!(app.pending_approval.is_none(), "abort clears the modal");
+    assert!(!app.approve_rest, "abort clears allow-all");
+    // The dropped respond sender tells a parked engine: no decision.
+    assert!(rx.recv().is_err(), "the parked approval is released");
+}
+
+#[test]
+fn a_finished_turn_clears_the_stale_approval_state() {
+    let (pending, _rx) = pending_with_rx();
+    let mut app = App {
+        running: true,
+        approve_rest: true,
+        pending_approval: Some(pending),
+        ..App::default()
+    };
+    app.finish_turn("done".into(), Usage::default(), 1, 0, uuid::Uuid::new_v4());
+    assert!(app.pending_approval.is_none(), "done clears the modal");
+    assert!(!app.approve_rest, "done clears allow-all");
+}
+
+#[test]
+fn at_completion_splices_at_the_right_place_after_multibyte_text() {
+    use crossterm::event::KeyCode;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hi").unwrap();
+    let mut app = App {
+        working_dir: dir.path().to_path_buf(),
+        ..App::default()
+    };
+    // e-acute is two bytes but one char: the @ is char 2 and byte 3.
+    app.input = "\u{e9} @read".into();
+    let (at, frag) = app.at_token().unwrap();
+    assert_eq!(at, 2, "at_token reports a CHAR offset, like the cursor");
+    assert_eq!(frag, "read");
+    app.cursor = app.input.chars().count();
+    assert_eq!(app.on_key(key(KeyCode::Tab)), Action::None);
+    assert_eq!(app.input, "\u{e9} @README.md ", "token spliced in place");
+    assert_eq!(app.cursor, "\u{e9} @README.md ".chars().count());
+}
+
+#[test]
+fn decision_keys_typed_inside_the_guard_window_do_nothing() {
+    use crossterm::event::KeyCode;
+    // Type-ahead: the user was already typing when the prompt appeared.
+    for code in [
+        KeyCode::Char('y'),
+        KeyCode::Char('a'),
+        KeyCode::Char('n'),
+        KeyCode::Esc,
+    ] {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App {
+            pending_approval: Some(PendingApproval {
+                call: ToolCall {
+                    id: "g".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "rm -rf build"}),
+                },
+                respond: tx,
+                shown_at: Instant::now() - Duration::from_millis(50),
+            }),
+            ..App::default()
+        };
+        assert_eq!(app.on_key(key(code)), Action::None);
+        assert!(app.pending_approval.is_some(), "{code:?}: prompt stays up");
+        assert!(rx.try_recv().is_err(), "{code:?}: no decision sent");
+        assert!(!app.approve_rest, "{code:?}: no allow-all either");
+    }
+}
+
+#[test]
+fn the_same_key_after_the_guard_window_approves() {
+    use crossterm::event::KeyCode;
+    let (tx, rx) = mpsc::channel();
+    let mut app = App {
+        pending_approval: Some(PendingApproval {
+            call: ToolCall {
+                id: "g2".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls"}),
+            },
+            respond: tx,
+            shown_at: Instant::now() - Duration::from_millis(400),
+        }),
+        ..App::default()
+    };
+    assert_eq!(app.on_key(key(KeyCode::Char('y'))), Action::None);
+    assert_eq!(rx.recv().unwrap(), ApprovalVerdict::AllowOnce);
+    assert!(app.pending_approval.is_none());
 }

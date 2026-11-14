@@ -106,25 +106,75 @@ pub trait Tool: Send + Sync {
 /// engine handle) shares one set.
 #[derive(Clone, Default)]
 pub struct ReadGate {
-    read: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    #[allow(clippy::type_complexity)]
+    read: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashSet<(Option<SessionId>, std::path::PathBuf)>>,
+    >,
 }
 
 impl ReadGate {
-    /// Record a path as read (best-effort canonicalization).
-    pub fn mark(&self, path: &std::path::Path) {
+    fn key(session: Option<SessionId>, path: &std::path::Path) -> (Option<SessionId>, PathBuf) {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.read.lock().unwrap().insert(canonical);
+        (session, canonical)
     }
-    /// Has this exact file been read this session?
+    /// Record a path as read by `session` (best-effort canonicalization).
+    /// The ledger is per session: under `serve` and ACP one registry backs
+    /// many sessions, and a read in one must not unlock a blind edit in
+    /// another.
+    pub fn mark_in(&self, session: Option<SessionId>, path: &std::path::Path) {
+        self.read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Self::key(session, path));
+    }
+    /// Has `session` read this exact file?
+    pub fn seen_in(&self, session: Option<SessionId>, path: &std::path::Path) -> bool {
+        self.read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&Self::key(session, path))
+    }
+    /// [`Self::mark_in`] for the session-less context.
+    pub fn mark(&self, path: &std::path::Path) {
+        self.mark_in(None, path);
+    }
+    /// [`Self::seen_in`] for the session-less context.
     pub fn seen(&self, path: &std::path::Path) -> bool {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.read.lock().unwrap().contains(&canonical)
+        self.seen_in(None, path)
     }
     pub fn len(&self) -> usize {
-        self.read.lock().unwrap().len()
+        self.read.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
     pub fn is_empty(&self) -> bool {
-        self.read.lock().unwrap().is_empty()
+        self.read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+}
+
+/// Process-wide interrupt hooks: cleanup that must run when the user
+/// interrupts a run (for example aborting detached background delegates).
+/// Lower crates register here so UI crates that do not depend on them can
+/// still trigger the cleanup.
+pub mod interrupt {
+    use std::sync::Mutex;
+
+    static HOOKS: Mutex<Vec<fn() -> usize>> = Mutex::new(Vec::new());
+
+    /// Register `hook` (idempotent per function). It returns how many
+    /// things it stopped.
+    pub fn on_interrupt(hook: fn() -> usize) {
+        let mut hooks = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        if !hooks.iter().any(|h| std::ptr::fn_addr_eq(*h, hook)) {
+            hooks.push(hook);
+        }
+    }
+
+    /// Run every registered hook; returns the total they report.
+    pub fn fire() -> usize {
+        let hooks: Vec<fn() -> usize> = HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        hooks.iter().map(|hook| hook()).sum()
     }
 }
 
@@ -550,6 +600,16 @@ pub struct EngineConfig {
     /// are history, events after it stay in the append-only log but never
     /// re-enter context. `None` = full-log resume.
     pub resume_from_event: Option<u64>,
+    /// End (exclusive) of the range a rewind abandoned, paired with
+    /// `resume_from_event` as its start: events in `[cut, end)` never
+    /// re-enter context, while events appended AFTER the rewind (index
+    /// `>= end`) do. `None` with a cut set keeps the old meaning (everything
+    /// from the cut onward is dropped).
+    pub resume_skip_end: Option<u64>,
+    /// Ranges `[start, end)` abandoned by EARLIER rewinds of this session.
+    /// They stay out of context when a later rewind is recorded, so a
+    /// second rewind cannot let the first abandoned range back in.
+    pub resume_skip_ranges: Vec<(u64, u64)>,
     /// Force one self-check turn before ending when no verify tool exists.
     pub self_check_on_finish: bool,
     /// Verify-failure escalation (additive, `None` by default): when the
@@ -646,6 +706,8 @@ impl Default for EngineConfig {
             price_lookup: None,
             hooks: hooks::HookConfig::default(),
             resume_from_event: None,
+            resume_skip_end: None,
+            resume_skip_ranges: Vec::new(),
             self_check_on_finish: false,
             escalate_on_check_failure: None,
             sandbox: SandboxPolicy::Off,
@@ -678,6 +740,8 @@ impl std::fmt::Debug for EngineConfig {
             .field("price_lookup", &self.price_lookup.is_some())
             .field("hooks", &self.hooks)
             .field("resume_from_event", &self.resume_from_event)
+            .field("resume_skip_end", &self.resume_skip_end)
+            .field("resume_skip_ranges", &self.resume_skip_ranges)
             .field("escalate_on_check_failure", &self.escalate_on_check_failure)
             .field("sandbox", &self.sandbox)
             .field("approver", &self.approver.is_some())
@@ -724,6 +788,33 @@ pub fn estimate_tokens(s: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_gate_is_per_session() {
+        let gate = super::ReadGate::default();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let a = Some(uuid::Uuid::new_v4());
+        let b = Some(uuid::Uuid::new_v4());
+        gate.mark_in(a, &file);
+        assert!(gate.seen_in(a, &file));
+        assert!(
+            !gate.seen_in(b, &file),
+            "a read in one session must not unlock another"
+        );
+        assert!(!gate.seen(&file));
+    }
+
+    #[test]
+    fn interrupt_hooks_run_once_each_and_sum() {
+        fn two() -> usize {
+            2
+        }
+        super::interrupt::on_interrupt(two);
+        super::interrupt::on_interrupt(two); // idempotent
+        assert!(super::interrupt::fire() >= 2);
+    }
+
     use super::*;
 
     #[test]

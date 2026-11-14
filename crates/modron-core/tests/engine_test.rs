@@ -5,8 +5,8 @@
 use async_trait::async_trait;
 use modron_core::testing::{InMemoryStore, MockProvider, StaticSelector};
 use modron_core::{
-    Engine, EngineConfig, Error, ModelProvider, Result, Role, SessionEvent, StopReason, Tool,
-    ToolCall, ToolCtx, ToolOutcome, ToolRegistry, ToolSpec, TurnResponse, Usage,
+    Engine, EngineConfig, Error, ModelProvider, Result, Role, SessionEvent, SessionStore,
+    StopReason, Tool, ToolCall, ToolCtx, ToolOutcome, ToolRegistry, ToolSpec, TurnResponse, Usage,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -422,4 +422,223 @@ async fn resume_with_empty_task_is_config_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Config(_, _)), "got: {err}");
+}
+
+/// Assert that no provider-bound message carries a tool call without its
+/// result, and no tool result lacks the assistant call that produced it.
+fn assert_tool_pairs_balanced(messages: &[modron_core::Message]) {
+    let mut called: Vec<&str> = Vec::new();
+    let mut answered: Vec<&str> = Vec::new();
+    for m in messages {
+        for c in &m.tool_calls {
+            called.push(c.id.as_str());
+        }
+        if let Some(id) = m.tool_call_id.as_deref() {
+            answered.push(id);
+        }
+    }
+    for id in &called {
+        assert!(
+            answered.contains(id),
+            "tool call {id} has no result in transcript: {messages:?}"
+        );
+    }
+    for id in &answered {
+        assert!(
+            called.contains(id),
+            "tool result {id} has no call in transcript: {messages:?}"
+        );
+    }
+}
+
+fn resume_engine(provider: Arc<dyn ModelProvider>, store: Arc<InMemoryStore>) -> Engine {
+    let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+    providers.insert("mock".to_string(), provider);
+    Engine {
+        selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+        providers,
+        tools: registry(false),
+        store,
+        config: base_config(),
+    }
+}
+
+#[tokio::test]
+async fn normal_resume_prunes_unanswered_tool_call_from_interrupted_run() {
+    // Interrupt mid-tool: the log ends with an assistant tool call that has
+    // no ToolResult. A plain resume (no rewind cut) must not replay it.
+    let store = Arc::new(InMemoryStore::new());
+    let meta = store.create_session("interrupted").await.unwrap();
+    store
+        .append(
+            meta.id,
+            &SessionEvent::Task {
+                text: "start work".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut assistant = modron_core::Message::assistant("");
+    assistant.tool_calls = vec![ToolCall {
+        id: "r1".into(),
+        name: "echo_tool".into(),
+        arguments: json!({}),
+    }];
+    store
+        .append(
+            meta.id,
+            &SessionEvent::Message {
+                parent_id: None,
+                message: assistant,
+            },
+        )
+        .await
+        .unwrap();
+
+    let provider = Arc::new(MockProvider::new().then_text("resumed answer"));
+    let engine = resume_engine(provider.clone(), Arc::clone(&store));
+    engine
+        .run_task_resuming(meta.id, "keep going")
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    assert_tool_pairs_balanced(messages);
+    assert!(
+        messages.iter().all(|m| m.tool_calls.is_empty()),
+        "unanswered call r1 must not reach the provider: {messages:?}"
+    );
+    assert_eq!(messages.last().unwrap().content, "keep going");
+}
+
+#[tokio::test]
+async fn normal_resume_prunes_only_the_unanswered_call_of_a_partial_turn() {
+    // One assistant turn with two calls; only c1 has a persisted result
+    // when the run was interrupted. The transcript must keep c1 + its
+    // result and drop c2 entirely.
+    let store = Arc::new(InMemoryStore::new());
+    let meta = store.create_session("partial").await.unwrap();
+    store
+        .append(
+            meta.id,
+            &SessionEvent::Task {
+                text: "start work".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut assistant = modron_core::Message::assistant("reading two files");
+    assistant.tool_calls = vec![
+        ToolCall {
+            id: "c1".into(),
+            name: "echo_tool".into(),
+            arguments: json!({}),
+        },
+        ToolCall {
+            id: "c2".into(),
+            name: "echo_tool".into(),
+            arguments: json!({}),
+        },
+    ];
+    store
+        .append(
+            meta.id,
+            &SessionEvent::Message {
+                parent_id: None,
+                message: assistant,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            meta.id,
+            &SessionEvent::ToolResult {
+                call_id: "c1".into(),
+                outcome: ToolOutcome::ok("first file"),
+            },
+        )
+        .await
+        .unwrap();
+
+    let provider = Arc::new(MockProvider::new().then_text("resumed answer"));
+    let engine = resume_engine(provider.clone(), Arc::clone(&store));
+    engine
+        .run_task_resuming(meta.id, "keep going")
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    assert_tool_pairs_balanced(messages);
+    let kept_calls: Vec<&str> = messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|c| c.id.as_str()))
+        .collect();
+    assert_eq!(kept_calls, vec!["c1"], "only the answered call survives");
+}
+
+#[tokio::test]
+async fn rewound_range_stays_out_but_later_work_survives_every_resume() {
+    // F1: after a rewind at cut C made when the log had E events, a resume
+    // sees [0, C) plus everything appended at >= E, on every later resume.
+    let store = Arc::new(InMemoryStore::new());
+    let meta = store.create_session("rewound").await.unwrap();
+    for text in ["kept task", "abandoned task"] {
+        store
+            .append(meta.id, &SessionEvent::Task { text: text.into() })
+            .await
+            .unwrap();
+        store
+            .append(
+                meta.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: modron_core::Message::assistant(format!("answer to {text}")),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // Rewind abandons events [2, 4): the second task and its answer.
+    let rewound = |provider: Arc<MockProvider>| {
+        let mut engine = resume_engine(provider, Arc::clone(&store));
+        engine.config.resume_from_event = Some(2);
+        engine.config.resume_skip_end = Some(4);
+        engine
+    };
+    let contents = |provider: &MockProvider| -> Vec<String> {
+        provider.requests()[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect()
+    };
+
+    let first = Arc::new(MockProvider::new().then_text("first resumed answer"));
+    rewound(first.clone())
+        .run_task_resuming(meta.id, "after rewind")
+        .await
+        .unwrap();
+    let seen = contents(&first);
+    assert!(seen.iter().any(|c| c == "kept task"), "{seen:?}");
+    assert!(!seen.iter().any(|c| c.contains("abandoned")), "{seen:?}");
+
+    // The second resume must still see the first resumed run's work.
+    let second = Arc::new(MockProvider::new().then_text("second resumed answer"));
+    rewound(second.clone())
+        .run_task_resuming(meta.id, "and again")
+        .await
+        .unwrap();
+    let seen = contents(&second);
+    assert!(seen.iter().any(|c| c == "kept task"), "{seen:?}");
+    assert!(seen.iter().any(|c| c == "after rewind"), "{seen:?}");
+    assert!(
+        seen.iter().any(|c| c == "first resumed answer"),
+        "work done after the rewind must survive: {seen:?}"
+    );
+    assert!(!seen.iter().any(|c| c.contains("abandoned")), "{seen:?}");
 }

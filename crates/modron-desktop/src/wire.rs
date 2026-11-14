@@ -22,6 +22,60 @@ use tokio_tungstenite::{tungstenite::Message as WsMessage, MaybeTlsStream, WebSo
 /// The client name sent in `hello`.
 pub const CLIENT_NAME: &str = "modron-desktop";
 
+/// How long the connect handshake waits for the server's `welcome`.
+const WELCOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The one note a connection shows when a frame fails to decode.
+const UNREADABLE_FRAME_NOTE: &str = modron_view::UNDECODABLE_FRAME_NOTICE;
+
+/// Query parameter that carries a paired device token on a ws(s) URL
+/// (`ws://host:7699/?token=...`). Stripped before the URL is dialed or shown.
+const TOKEN_PARAM: &str = "token";
+
+/// Environment fallback for the device token when the URL carries none.
+const TOKEN_ENV: &str = "MODRON_DEVICE_TOKEN";
+
+/// Split a `token` query parameter off a ws(s) URL. Returns the URL without
+/// that parameter (safe to log or show) and the token, if any. Non-ws
+/// input passes through untouched.
+fn split_token_param(url: &str) -> (String, Option<String>) {
+    let is_ws = url.starts_with("ws://") || url.starts_with("wss://");
+    let Some((base, query)) = url.split_once('?').filter(|_| is_ws) else {
+        return (url.to_string(), None);
+    };
+    let mut token = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| match pair.split_once('=') {
+            Some((TOKEN_PARAM, value)) => {
+                if !value.is_empty() {
+                    token = Some(value.to_string());
+                }
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    let stripped = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (stripped, token)
+}
+
+/// Resolve the device token and the URL to dial: a `token` URL parameter
+/// wins, then the `MODRON_DEVICE_TOKEN` env var (read through `env` so tests
+/// never touch the process environment), else no token.
+fn resolve_device_token(
+    url: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> (String, Option<String>) {
+    let (stripped, from_url) = split_token_param(url);
+    let token = from_url.or_else(|| env(TOKEN_ENV).filter(|t| !t.is_empty()));
+    (stripped, token)
+}
+
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// A client-side protocol connection. Not `Clone`: one owner drives it
@@ -39,6 +93,10 @@ impl WireClient {
     /// fail unless the server speaks [`PROTOCOL_VERSION`]. Returns the
     /// client and the server's version string.
     pub async fn connect(url: &str) -> anyhow::Result<(Self, String)> {
+        // The token leaves the URL here: dial and handshake errors show the
+        // clean URL only.
+        let (url, token) = resolve_device_token(url, |key| std::env::var(key).ok());
+        let url = url.as_str();
         // non_exhaustive: default-then-mutate.
         let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(256 * 1024 * 1024);
@@ -48,34 +106,57 @@ impl WireClient {
             .with_context(|| format!("dial {url}"))?;
         let (mut sink, mut stream) = ws.split();
 
-        let hello = modron_protocol::client::hello_frame(CLIENT_NAME, None);
+        let hello = modron_protocol::client::hello_frame(CLIENT_NAME, token);
         sink.send(WsMessage::text(serde_json::to_string(&hello)?))
             .await
             .context("send hello")?;
 
         // The first frame must be the welcome (skip nothing: a misbehaving
-        // server that streams before the handshake fails loudly here).
-        let msg = stream
-            .next()
+        // server that streams before the handshake fails loudly here). A
+        // silent server times out instead of hanging the connect forever.
+        let msg = tokio::time::timeout(WELCOME_TIMEOUT, stream.next())
             .await
+            .map_err(|_| anyhow!("no welcome from the server within 15s"))?
             .ok_or_else(|| anyhow!("connection closed before welcome"))?;
         let frame = decode(msg?).ok_or_else(|| anyhow!("non-text frame during handshake"))?;
         let server_version =
             modron_protocol::client::check_welcome(Some(frame), url).map_err(anyhow::Error::msg)?;
 
         // Reader task: every subsequent inbound frame lands in the channel.
+        // A text frame this build cannot decode is dropped and counted; the
+        // first one also queues ONE note for this connection (a Note frame,
+        // the same path server notes take).
         let (tx, inbound) = mpsc::channel::<Frame>(256);
         tokio::spawn(async move {
+            let mut undecodable = 0usize;
             while let Some(msg) = stream.next().await {
                 match msg {
-                    Ok(m) => match decode(m) {
-                        Some(frame) => {
-                            if tx.send(frame).await.is_err() {
-                                break;
+                    Ok(m) => {
+                        let is_text = matches!(m, WsMessage::Text(_));
+                        match decode(m) {
+                            Some(frame) => {
+                                if tx.send(frame).await.is_err() {
+                                    break;
+                                }
                             }
+                            None if is_text => {
+                                undecodable += 1;
+                                if undecodable == 1 {
+                                    let note = Frame::event(
+                                        None,
+                                        0,
+                                        Payload::Note {
+                                            text: UNREADABLE_FRAME_NOTE.into(),
+                                        },
+                                    );
+                                    if tx.send(note).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            None => continue,
                         }
-                        None => continue,
-                    },
+                    }
                     Err(_) => break,
                 }
             }
@@ -730,5 +811,70 @@ mod tests {
             cfg,
             Payload::SetConfig { patch } if patch.model.as_deref() == Some("m")
         ));
+    }
+
+    #[test]
+    fn token_param_is_stripped_from_the_url() {
+        let (url, token) = split_token_param("ws://127.0.0.1:7699/?token=abc");
+        assert_eq!(url, "ws://127.0.0.1:7699/");
+        assert_eq!(token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn token_param_keeps_other_query_params() {
+        let (url, token) = split_token_param("wss://h.example/x?a=1&token=abc&b=2");
+        assert_eq!(url, "wss://h.example/x?a=1&b=2");
+        assert_eq!(token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn empty_token_param_is_stripped_but_yields_no_token() {
+        let (url, token) = split_token_param("ws://h:7699/?token=");
+        assert_eq!(url, "ws://h:7699/");
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn url_token_beats_env_and_env_is_the_fallback() {
+        let env = |key: &str| {
+            assert_eq!(key, TOKEN_ENV);
+            Some("from-env".to_string())
+        };
+        let (url, token) = resolve_device_token("ws://h:7699/?token=from-url", env);
+        assert_eq!(url, "ws://h:7699/");
+        assert_eq!(token.as_deref(), Some("from-url"));
+
+        let (url, token) = resolve_device_token("ws://h:7699", env);
+        assert_eq!(url, "ws://h:7699");
+        assert_eq!(token.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn no_url_token_and_no_env_means_no_token() {
+        let (_, token) = resolve_device_token("ws://h:7699", |_| None);
+        assert_eq!(token, None);
+        let (_, token) = resolve_device_token("ws://h:7699", |_| Some(String::new()));
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn connect_sends_the_url_token_in_hello_and_dials_the_clean_url() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        let server = TestServer::start(move |mut sink, mut stream| async move {
+            let hello = read_frame(&mut stream).await;
+            let token = match hello.payload {
+                Payload::Hello { token, .. } => token,
+                other => panic!("expected hello, got {other:?}"),
+            };
+            let _ = tx.send(token);
+            welcome(&mut sink).await;
+            // Hold the socket open until the client drops.
+            let _ = stream.next().await;
+        })
+        .await;
+        let url = format!("{}/?token=abc-123", server.url);
+        let (_client, version) = WireClient::connect(&url).await.expect("connect");
+        assert_eq!(version, "test/1");
+        assert_eq!(rx.await.expect("hello seen").as_deref(), Some("abc-123"));
     }
 }
