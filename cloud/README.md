@@ -25,8 +25,10 @@ Open the printed URL on any device - the bridge's built-in viewer at
 (approvals and a composer still belong to the full client; roadmap
 phase 3). Trust model: the share key IS the credential
 (Claude Code share-link semantics); treat the URL as the secret.
-Published `/pages` POSTs additionally require `Authorization: Bearer
-<key>` (the agent sends it - see cloud/bridge/README.md).
+Publishing a `/pages` page additionally requires `Authorization: Bearer
+<PUBLISH_TOKEN>`, a deploy-time secret set with `npx wrangler secret put
+PUBLISH_TOKEN`; clients read it from `MODRON_PUBLISH_TOKEN` (see
+cloud/bridge/README.md).
 
 ## Roadmap
 
