@@ -1321,11 +1321,7 @@ impl RunState {
                 UiFrame::Note(text) => app.note(text),
                 UiFrame::ConfigChanged(patch) => {
                     if let Some(mode) = patch.approval_mode {
-                        app.approval_mode = match mode {
-                            modron_protocol::ApprovalModeWire::ApproveAll => "yolo".into(),
-                            modron_protocol::ApprovalModeWire::Deny => "deny".into(),
-                            modron_protocol::ApprovalModeWire::Ask => "ask".into(),
-                        };
+                        app.approval_mode = approval_label(mode).into();
                     }
                     if let Some(model) = patch.model {
                         app.model_label = model.clone();
@@ -1334,6 +1330,16 @@ impl RunState {
                 }
                 UiFrame::Snapshot(snap) => {
                     app.session_id = Some(snap.session_id);
+                    // C5: the server's real mode label, and this
+                    // connection's allow/deny copy seeded from the server
+                    // (a later /allow or /deny sends the full list).
+                    if let Some(mode) = snap.live.approval_mode {
+                        app.approval_mode = approval_label(mode).into();
+                    }
+                    self.remote_lists = RemoteLists {
+                        allow: snap.live.allow.clone(),
+                        deny: snap.live.deny.clone(),
+                    };
                     if self.backfill_session != Some(snap.session_id) {
                         self.backfill_session = Some(snap.session_id);
                         app.reset_transcript();
@@ -1582,21 +1588,21 @@ async fn run_pending_command(engine: &mut Engine, cmd: PendingCommand) -> Vec<St
         // Z.ai sign-in never reaches this queue (the OAuth spawn arm
         // consumes it), but the match must stay exhaustive.
         PendingCommand::ZaiLogin { .. } => Vec::new(),
-        PendingCommand::Sandbox(mode) => match mode.as_str() {
-            "off" => {
-                engine.config.sandbox = modron_core::SandboxPolicy::Off;
-                vec!["sandbox: off (approval gates only)".into()]
+        PendingCommand::Sandbox(mode) => match parse_sandbox_policy(&mode) {
+            Some(policy) => {
+                engine.config.sandbox = policy;
+                vec![match policy {
+                    modron_core::SandboxPolicy::Off => "sandbox: off (approval gates only)".into(),
+                    modron_core::SandboxPolicy::Seatbelt => {
+                        "sandbox: seatbelt — applies to future tool calls".into()
+                    }
+                    modron_core::SandboxPolicy::Bubblewrap => {
+                        "sandbox: bubblewrap — applies to future tool calls".into()
+                    }
+                }]
             }
-            "seatbelt" => {
-                engine.config.sandbox = modron_core::SandboxPolicy::Seatbelt;
-                vec!["sandbox: seatbelt — applies to future tool calls".into()]
-            }
-            "bubblewrap" => {
-                engine.config.sandbox = modron_core::SandboxPolicy::Bubblewrap;
-                vec!["sandbox: bubblewrap — applies to future tool calls".into()]
-            }
-            other => vec![format!(
-                "usage: /sandbox off|seatbelt|bubblewrap (got {other:?})"
+            None => vec![format!(
+                "usage: /sandbox off|seatbelt|bubblewrap (got {mode:?})"
             )],
         },
         PendingCommand::Agent(name) => {
@@ -2364,6 +2370,17 @@ fn spawn_remote_driver(
     })
 }
 
+/// The status-strip words for a wire approval mode (ConfigChanged and the
+/// attach snapshot both use this).
+fn approval_label(mode: modron_protocol::ApprovalModeWire) -> &'static str {
+    use modron_protocol::ApprovalModeWire;
+    match mode {
+        ApprovalModeWire::ApproveAll => "yolo",
+        ApprovalModeWire::Deny => "deny",
+        ApprovalModeWire::Ask => "ask",
+    }
+}
+
 /// Translate a parked slash command into a server SetConfig patch while
 /// connected. `None` = no remote equivalent (the loop refuses it with an
 /// explicit toast). The optional label mirrors the local /mode arm's
@@ -2391,7 +2408,7 @@ fn remote_slash_command(cmd: &PendingCommand, lists: &mut RemoteLists) -> Remote
         }
         // An unknown value must never reach the server: the old mapping
         // turned any typo into Off.
-        PendingCommand::Sandbox(s) => match remote_sandbox_policy(s) {
+        PendingCommand::Sandbox(s) => match parse_sandbox_policy(s) {
             Some(policy) => ConfigPatch {
                 sandbox: Some(policy),
                 ..ConfigPatch::default()
@@ -2437,9 +2454,9 @@ fn remote_slash_command(cmd: &PendingCommand, lists: &mut RemoteLists) -> Remote
     RemoteSlash::Patch(patch, None)
 }
 
-/// The remote /sandbox values: exactly off, seatbelt, bubblewrap (bwrap is
-/// its alias). Anything else is unknown, not off.
-fn remote_sandbox_policy(mode: &str) -> Option<modron_core::SandboxPolicy> {
+/// The /sandbox values, local and remote alike: exactly off, seatbelt,
+/// bubblewrap (bwrap is its alias). Anything else is unknown, not off.
+fn parse_sandbox_policy(mode: &str) -> Option<modron_core::SandboxPolicy> {
     match mode.trim() {
         "off" => Some(modron_core::SandboxPolicy::Off),
         "seatbelt" => Some(modron_core::SandboxPolicy::Seatbelt),
@@ -2498,6 +2515,46 @@ mod approval_state_tests {
             None,
         );
         (state, App::default(), approval)
+    }
+
+    #[test]
+    fn snapshot_shows_the_server_mode_and_seeds_the_lists() {
+        // C5: attach to a yolo session with server-side allow/deny entries.
+        // The label follows the server, and a following /deny sends the
+        // server's existing denies plus the new one (never a bare list).
+        let (mut state, mut app, _approval) = state_with_bus();
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
+        state.ui_rx = ui_rx;
+        let session = Uuid::new_v4();
+        ui_tx
+            .send(UiFrame::Snapshot(Box::new(crate::remote::AttachSnapshot {
+                session_id: session,
+                last_seq: 0,
+                events: Vec::new(),
+                live: LiveState {
+                    approval_mode: Some(modron_protocol::ApprovalModeWire::ApproveAll),
+                    allow: vec!["diagnostics".into()],
+                    deny: vec!["bash".into()],
+                    ..LiveState::default()
+                },
+            })))
+            .unwrap();
+        state.drain_ui_frames(&mut app);
+        assert_eq!(app.approval_mode, "yolo");
+
+        match remote_slash_command(
+            &PendingCommand::Deny("write".into()),
+            &mut state.remote_lists,
+        ) {
+            RemoteSlash::Patch(patch, _) => {
+                assert_eq!(
+                    patch.deny,
+                    Some(vec!["bash".to_string(), "write".to_string()])
+                );
+                assert_eq!(patch.allow, None);
+            }
+            _ => panic!("expected a config patch"),
+        }
     }
 
     #[test]
@@ -2695,23 +2752,43 @@ mod remote_command_tests {
     #[test]
     fn sandbox_known_values_map_to_their_policy() {
         assert!(matches!(
-            remote_sandbox_policy("off"),
+            parse_sandbox_policy("off"),
             Some(SandboxPolicy::Off)
         ));
         assert!(matches!(
-            remote_sandbox_policy("seatbelt"),
+            parse_sandbox_policy("seatbelt"),
             Some(SandboxPolicy::Seatbelt)
         ));
         assert!(matches!(
-            remote_sandbox_policy("bubblewrap"),
+            parse_sandbox_policy("bubblewrap"),
             Some(SandboxPolicy::Bubblewrap)
         ));
         assert!(matches!(
-            remote_sandbox_policy("bwrap"),
+            parse_sandbox_policy("bwrap"),
             Some(SandboxPolicy::Bubblewrap)
         ));
-        assert!(remote_sandbox_policy("bubblwrap").is_none());
-        assert!(remote_sandbox_policy("").is_none());
+        assert!(parse_sandbox_policy("bubblwrap").is_none());
+        assert!(parse_sandbox_policy("").is_none());
+    }
+
+    #[tokio::test]
+    async fn local_sandbox_arm_accepts_the_same_set_as_remote() {
+        // C5: the local /sandbox arm takes bwrap too, through the same
+        // parser the remote arm uses.
+        let mut engine = inert_engine();
+        let note = run_pending_command(&mut engine, PendingCommand::Sandbox("bwrap".into())).await;
+        assert_eq!(engine.config.sandbox, SandboxPolicy::Bubblewrap);
+        assert!(note
+            .iter()
+            .any(|line| line.starts_with("sandbox: bubblewrap")));
+        let _ = run_pending_command(&mut engine, PendingCommand::Sandbox("off".into())).await;
+        assert_eq!(engine.config.sandbox, SandboxPolicy::Off);
+        let _ = run_pending_command(&mut engine, PendingCommand::Sandbox("bubblwrap".into())).await;
+        assert_eq!(
+            engine.config.sandbox,
+            SandboxPolicy::Off,
+            "a typo changes nothing"
+        );
     }
 
     #[test]

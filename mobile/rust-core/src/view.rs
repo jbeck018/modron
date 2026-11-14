@@ -622,6 +622,17 @@ pub(crate) fn fold_snapshot(
     vm.model = live.model.clone();
     vm.provider = live.provider.clone();
     vm.goal = live.goal.clone();
+    // C5: the server's real approval mode and sandbox (an absent field
+    // keeps the client's default), and the server's allow/deny lists, so
+    // the tool editor starts from what the server holds.
+    if let Some(mode) = live.approval_mode {
+        vm.approval_mode = Some(mode);
+    }
+    if let Some(policy) = live.sandbox {
+        vm.sandbox = policy;
+    }
+    vm.allow_tools = live.allow.clone();
+    vm.deny_tools = live.deny.clone();
     vm.cumulative_usage = live.cumulative_usage;
     vm.pending_approval = live
         .pending_approval
@@ -775,6 +786,47 @@ mod tests {
             approval_mode_label(Some(ApprovalModeWire::ApproveAll)),
             "yolo"
         );
+    }
+
+    #[test]
+    fn snapshot_carries_mode_sandbox_and_lists() {
+        // C5: attach to a yolo session: the label is yolo, the sandbox and
+        // the allow/deny copy come from the server.
+        let live = LiveState {
+            approval_mode: Some(ApprovalModeWire::ApproveAll),
+            sandbox: Some(modron_types::SandboxPolicy::Bubblewrap),
+            allow: vec!["diagnostics".into()],
+            deny: vec!["bash".into()],
+            ..LiveState::default()
+        };
+        let mut vm = SessionViewModel::default();
+        let mut fold = FoldState::default();
+        fold_snapshot(&mut vm, &mut fold, Uuid::nil(), 1, &[], &live);
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(snap.approval_mode_label, "yolo");
+        assert_eq!(snap.sandbox, "bwrap");
+        assert_eq!(snap.allow_tools, vec!["diagnostics".to_string()]);
+        assert_eq!(snap.deny_tools, vec!["bash".to_string()]);
+        assert!(
+            snap.status_line.ends_with(" · yolo"),
+            "{}",
+            snap.status_line
+        );
+
+        // An old snapshot without the fields: the label stays at its
+        // default (ask) and the lists are empty.
+        let mut fresh = SessionViewModel::default();
+        fold_snapshot(
+            &mut fresh,
+            &mut fold,
+            Uuid::nil(),
+            1,
+            &[],
+            &LiveState::default(),
+        );
+        let snap = ViewModelSnapshot::from_vm(&fresh);
+        assert_eq!(snap.approval_mode_label, "ask");
+        assert!(snap.allow_tools.is_empty() && snap.deny_tools.is_empty());
     }
 
     #[test]
