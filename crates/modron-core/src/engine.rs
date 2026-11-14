@@ -46,6 +46,28 @@ const MUTATING_TOOLS: [&str; 7] = [
 /// widening the approval gate must not change their behavior.
 const FILE_MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
 
+/// Accumulate provider-reported usage into a run total. Counts come from
+/// the provider (possibly hostile or buggy), so every field saturates
+/// instead of wrapping (release) or panicking (debug).
+fn add_usage(total: &mut Usage, delta: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(delta.cached_input_tokens);
+}
+
+/// True when `message` starts with the canonical HTTP-layer status prefix
+/// `HTTP <code>` followed by a space or `:` (the shape
+/// `modron-providers` produces as `HTTP <status>: <snippet>`). Anything else,
+/// including a provider body that merely mentions the code, is not a match.
+fn has_http_status_prefix(message: &str, code: &str) -> bool {
+    message
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.strip_prefix(code))
+        .is_some_and(|tail| tail.starts_with(' ') || tail.starts_with(':'))
+}
+
 /// Whether a tool call needs approval before it runs (A1, D1): any name in
 /// [`MUTATING_TOOLS`] or any `mcp__`-prefixed tool.
 fn is_gated(name: &str) -> bool {
@@ -485,9 +507,7 @@ impl Engine {
 
             // Usage: provider-reported ground truth, never estimates.
             state.governor.feed_turn(turn.response.usage);
-            state.total.input_tokens += turn.response.usage.input_tokens;
-            state.total.output_tokens += turn.response.usage.output_tokens;
-            state.total.cached_input_tokens += turn.response.usage.cached_input_tokens;
+            add_usage(&mut state.total, &turn.response.usage);
             self.store
                 .append(
                     session_id,
@@ -530,6 +550,9 @@ impl Engine {
                         cap = format!("${cap:.4}"),
                         "stopping: USD spend cap exceeded"
                     );
+                    // The capped turn's own text is the run's final answer;
+                    // keep it (not the previous turn's) ahead of the note.
+                    state.answer = turn.response.text.clone();
                     state.answer = format!(
                         "{}\n\n[stopped: USD spend cap exceeded — spent ~${:.4} of ${cap:.4} cap]",
                         state.answer, state.spend_usd
@@ -687,9 +710,7 @@ impl Engine {
             if let Some(outcome) = self.run_compaction(session_id, task, &choice.model).await? {
                 state.governor.feed_turn(outcome.usage);
                 state.spend_usd += self.turn_cost_usd(&outcome.model, &outcome.usage);
-                state.total.input_tokens += outcome.usage.input_tokens;
-                state.total.output_tokens += outcome.usage.output_tokens;
-                state.total.cached_input_tokens += outcome.usage.cached_input_tokens;
+                add_usage(&mut state.total, &outcome.usage);
                 if !state.models_used.contains(&outcome.model) {
                     state.models_used.push(outcome.model);
                 }
@@ -972,16 +993,31 @@ impl Engine {
         let all_read_only = tool_calls
             .iter()
             .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(&c.name));
+        // A speculative result was computed mid-stream, before this turn's
+        // calls ran. It is only valid for a call when no file-mutating call
+        // precedes it in this turn; otherwise `[edit X, read X]` would reuse
+        // the pre-edit content of X.
+        let mut mutated_earlier_in_turn = false;
+        let speculation_ok: Vec<bool> = tool_calls
+            .iter()
+            .map(|call| {
+                let ok = !mutated_earlier_in_turn;
+                if FILE_MUTATING_TOOLS.contains(&call.name.as_str()) {
+                    mutated_earlier_in_turn = true;
+                }
+                ok
+            })
+            .collect();
         let dispatched: Vec<(ToolOutcome, bool)> = if all_read_only && tool_calls.len() > 1 {
-            let futures = tool_calls
-                .iter()
-                .map(|call| self.dispatch_tool_call(session_id, call, &ctx, speculative));
+            let futures = tool_calls.iter().zip(&speculation_ok).map(|(call, ok)| {
+                self.dispatch_tool_call(session_id, call, &ctx, speculative, *ok)
+            });
             futures::future::join_all(futures).await
         } else {
             let mut dispatched = Vec::with_capacity(tool_calls.len());
-            for call in tool_calls {
+            for (call, ok) in tool_calls.iter().zip(&speculation_ok) {
                 let result = self
-                    .dispatch_tool_call(session_id, call, &ctx, speculative)
+                    .dispatch_tool_call(session_id, call, &ctx, speculative, *ok)
                     .await;
                 dispatched.push(result);
             }
@@ -1029,9 +1065,7 @@ impl Engine {
             if let Some(usage) = outcome.usage {
                 state.governor.feed_turn(usage);
                 state.spend_usd += self.turn_cost_usd(model, &usage);
-                state.total.input_tokens += usage.input_tokens;
-                state.total.output_tokens += usage.output_tokens;
-                state.total.cached_input_tokens += usage.cached_input_tokens;
+                add_usage(&mut state.total, &usage);
                 self.store
                     .append(
                         session_id,
@@ -1178,10 +1212,12 @@ impl Engine {
     fn is_auth_failure(error: &Error) -> bool {
         match error {
             Error::Provider { message, .. } => {
+                if has_http_status_prefix(message, "401") || has_http_status_prefix(message, "403")
+                {
+                    return true;
+                }
                 let m = message.to_ascii_lowercase();
                 [
-                    "401",
-                    "403",
                     "unauthorized",
                     "revoked",
                     "invalid_grant",
@@ -1787,9 +1823,7 @@ impl Engine {
         // like a main-loop turn (compaction precedent).
         state.turns += 1;
         state.governor.feed_turn(response.usage);
-        state.total.input_tokens += response.usage.input_tokens;
-        state.total.output_tokens += response.usage.output_tokens;
-        state.total.cached_input_tokens += response.usage.cached_input_tokens;
+        add_usage(&mut state.total, &response.usage);
         self.store
             .append(
                 session_id,
@@ -1866,8 +1900,12 @@ impl Engine {
         call: &ToolCall,
         ctx: &ToolCtx,
         speculative: &std::collections::HashMap<String, ToolOutcome>,
+        speculation_ok: bool,
     ) -> (ToolOutcome, bool) {
-        if speculative::SPECULATIVE_TOOLS.contains(&call.name.as_str())
+        // `speculation_ok` is false when a file-mutating call precedes this
+        // one in the same turn: the mid-stream result may be stale.
+        if speculation_ok
+            && speculative::SPECULATIVE_TOOLS.contains(&call.name.as_str())
             && !self.config.approvals.deny.iter().any(|d| d == &call.name)
         {
             if let Some(outcome) = speculative.get(&speculative::speculative_key(call)) {
@@ -2793,6 +2831,237 @@ mod tests {
             1,
             "glob executed exactly once (speculated mid-stream, reused at dispatch)"
         );
+    }
+
+    /// Streams one glob `ToolCallReady` mid-stream (speculated), then ends
+    /// its first turn with `final_calls`; turn 2+ finishes with text.
+    struct StreamThenCalls {
+        turns: Arc<std::sync::atomic::AtomicUsize>,
+        final_calls: Vec<ToolCall>,
+    }
+    #[async_trait]
+    impl ModelProvider for StreamThenCalls {
+        fn id(&self) -> &str {
+            "spec-stream"
+        }
+        async fn turn(&self, _req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
+            unreachable!("streaming path under test")
+        }
+        async fn turn_streaming(
+            &self,
+            _req: std::sync::Arc<TurnRequest>,
+            tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        ) -> Result<TurnResponse> {
+            if self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Ok(text("done"));
+            }
+            let speculated = ToolCall {
+                id: "spec-glob".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            };
+            let _ = tx.send(StreamDelta::ToolCallReady(speculated));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(TurnResponse {
+                text: String::new(),
+                tool_calls: self.final_calls.clone(),
+                usage: Default::default(),
+                stop_reason: StopReason::ToolUse,
+            })
+        }
+    }
+
+    /// Run one streamed turn whose final calls are `final_calls`; returns
+    /// how many times glob actually executed.
+    async fn glob_executions_for_turn(final_calls: Vec<ToolCall>) -> usize {
+        use std::collections::HashMap;
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(CountingGlob(Arc::clone(&executions))));
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "spec-stream".into(),
+            Arc::new(StreamThenCalls {
+                turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                final_calls,
+            }),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "spec-stream")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                on_delta: Some(Arc::new(|_delta| {})),
+                approvals: crate::ApprovalPolicy {
+                    mode: ApprovalMode::ApproveAll,
+                    ..crate::ApprovalPolicy::default()
+                },
+                ..EngineConfig::default()
+            },
+        };
+        engine.run_task("edit then read").await.unwrap();
+        executions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn speculative_read_after_a_mutation_in_the_same_turn_is_reexecuted() {
+        // [edit X, read X]: the mid-stream glob ran before the write, so the
+        // dispatch must run glob again rather than reuse the stale result.
+        let executions = glob_executions_for_turn(vec![
+            ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "g1".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+        ])
+        .await;
+        assert_eq!(
+            executions, 2,
+            "speculated glob + a real re-execution after the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_read_before_a_mutation_is_still_reused() {
+        // [read X, edit X]: nothing mutated before the read, so the
+        // speculated result is still valid and reused (one execution).
+        let executions = glob_executions_for_turn(vec![
+            ToolCall {
+                id: "g1".into(),
+                name: "glob".into(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: json!({}),
+            },
+        ])
+        .await;
+        assert_eq!(
+            executions, 1,
+            "read before any mutation reuses the speculation"
+        );
+    }
+
+    #[test]
+    fn auth_failure_matches_the_http_status_prefix_only() {
+        let provider_err = |message: &str| Error::Provider {
+            provider: "p".into(),
+            message: message.into(),
+        };
+        assert!(Engine::is_auth_failure(&provider_err(
+            "HTTP 401 Unauthorized: bad key"
+        )));
+        assert!(Engine::is_auth_failure(&provider_err(
+            "HTTP 403 Forbidden: no access"
+        )));
+        // A 429 whose body mentions "40300 tokens" is not an auth failure.
+        assert!(!Engine::is_auth_failure(&provider_err(
+            "HTTP 429 Too Many Requests: request asks for 40300 tokens"
+        )));
+        // A non-auth status whose body quotes 401 is not an auth failure.
+        assert!(!Engine::is_auth_failure(&provider_err(
+            "HTTP 500 Internal Server Error: upstream said 401"
+        )));
+    }
+
+    #[tokio::test]
+    async fn spend_cap_stop_keeps_the_capped_turn_text() {
+        use std::collections::HashMap;
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(crate::testing::MockProvider::with_script(vec![
+                TurnResponse {
+                    text: "final words".into(),
+                    tool_calls: Vec::new(),
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                    },
+                    stop_reason: StopReason::EndTurn,
+                },
+            ])),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                max_cost_usd: Some(0.5),
+                // $1 per million input tokens: the single turn costs $1 > $0.50.
+                price_lookup: Some(Arc::new(|_: &str| Some((1.0, 1.0)))),
+                ..EngineConfig::default()
+            },
+        };
+        let summary = engine.run_task("big task").await.unwrap();
+        assert!(
+            summary.answer.starts_with("final words"),
+            "the capped turn's text is kept: {:?}",
+            summary.answer
+        );
+        assert!(
+            summary.answer.contains("spend cap"),
+            "the cap note is still appended: {:?}",
+            summary.answer
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_totals_saturate_instead_of_wrapping() {
+        // Hostile counts: turn 1 reports u64::MAX, turn 2 adds more. Plain
+        // `+=` would wrap (release) or panic (debug) on the second add.
+        use std::collections::HashMap;
+        let huge = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+        };
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(crate::testing::MockProvider::with_script(vec![
+                TurnResponse {
+                    usage: huge,
+                    ..call("write")
+                },
+                TurnResponse {
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_input_tokens: 1,
+                    },
+                    ..text("done")
+                },
+            ])),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                max_total_tokens: u64::MAX,
+                ..EngineConfig::default()
+            },
+        };
+        let summary = engine.run_task("overflow me").await.unwrap();
+        assert_eq!(summary.usage.input_tokens, u64::MAX);
+        assert_eq!(summary.usage.output_tokens, u64::MAX);
+        assert_eq!(summary.usage.cached_input_tokens, u64::MAX);
+        assert_eq!(summary.turns, 2);
     }
 
     #[tokio::test]
