@@ -3,14 +3,50 @@
 //! `.modron/skills/*/SKILL.md` both work). The system prompt carries only
 //! the index (name + description); bodies enter context only when called.
 
-use crate::common::tool_err;
+use crate::common::{open_regular_file, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use modron_core::{Tool, ToolCtx, ToolOutcome, ToolSpec};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const NAME: &str = "skill";
 const MAX_BYTES: usize = 8 * 1024;
+/// Hard cap on one SKILL.md read (index and body alike).
+const MAX_SKILL_BYTES: usize = 256 * 1024;
+/// Appended to a body cut at `MAX_SKILL_BYTES`.
+const SKILL_TRUNCATED_MARKER: &str = "\n[skill truncated]";
+
+/// Reads one SKILL.md through the bounded regular-file gate: symlinks are
+/// followed, but devices, FIFOs and directories are refused before opening,
+/// and at most `MAX_SKILL_BYTES` are read. A cut body is cut on a UTF-8 char
+/// boundary and carries `SKILL_TRUNCATED_MARKER`.
+fn read_skill_text(path: &Path) -> Option<String> {
+    let file = open_regular_file(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(MAX_SKILL_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let truncated = buf.len() > MAX_SKILL_BYTES;
+    if truncated {
+        buf.truncate(MAX_SKILL_BYTES);
+    }
+    let mut text = match String::from_utf8(buf) {
+        Ok(text) => text,
+        // A cut can split a multi-byte character: keep the valid prefix.
+        Err(e) if truncated && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()?
+        }
+        Err(_) => return None,
+    };
+    if truncated {
+        text.push_str(SKILL_TRUNCATED_MARKER);
+    }
+    Some(text)
+}
 
 pub struct SkillTool {
     /// Roots to scan: `<working_dir>/.modron/skills` and
@@ -39,7 +75,7 @@ impl SkillTool {
             };
             for entry in read_dir.flatten() {
                 let skill_md = entry.path().join("SKILL.md");
-                let Ok(text) = std::fs::read_to_string(&skill_md) else {
+                let Some(text) = read_skill_text(&skill_md) else {
                     continue;
                 };
                 let (name, description) = parse_frontmatter(&text);
@@ -70,7 +106,7 @@ impl SkillTool {
         for root in &self.roots {
             // Fast path: the name IS the directory name.
             let path = root.join(name).join("SKILL.md");
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(text) = read_skill_text(&path) {
                 let (_, body) = split_frontmatter(&text);
                 return Some(body);
             }
@@ -82,7 +118,7 @@ impl SkillTool {
             };
             for entry in read_dir.flatten() {
                 let skill_md = entry.path().join("SKILL.md");
-                let Ok(text) = std::fs::read_to_string(&skill_md) else {
+                let Some(text) = read_skill_text(&skill_md) else {
                     continue;
                 };
                 if parse_frontmatter(&text).0.as_deref() == Some(name) {
@@ -179,7 +215,7 @@ impl Tool for SkillTool {
             .next()
             .or_else(|| self.load_body(name));
         match body {
-            Some(body) => Ok(ToolOutcome::ok(reduce_output(body, MAX_BYTES))),
+            Some(body) => Ok(ToolOutcome::ok(finish_body(body))),
             None => {
                 let available = self.index();
                 Ok(tool_err(
@@ -192,10 +228,23 @@ impl Tool for SkillTool {
     }
 }
 
+/// Model-facing body: reduced to `MAX_BYTES`, but a body cut at the read cap
+/// keeps its `[skill truncated]` marker visible (the reduction budget leaves
+/// room for it).
+fn finish_body(body: String) -> String {
+    match body.strip_suffix(SKILL_TRUNCATED_MARKER) {
+        Some(head) => format!(
+            "{}{SKILL_TRUNCATED_MARKER}",
+            reduce_output(head, MAX_BYTES - SKILL_TRUNCATED_MARKER.len())
+        ),
+        None => reduce_output(body, MAX_BYTES),
+    }
+}
+
 /// Read one skill body from a single root (frontmatter stripped), if the
 /// directory exists there.
 fn read_skill_body(root: &Path, name: &str) -> Option<String> {
-    let text = std::fs::read_to_string(root.join(name).join("SKILL.md")).ok()?;
+    let text = read_skill_text(&root.join(name).join("SKILL.md"))?;
     let (_, body) = split_frontmatter(&text);
     Some(body)
 }
@@ -450,5 +499,76 @@ mod builtin_tests {
             "builtin body replaced"
         );
         assert_eq!(tool.index().matches("brainstorming").count(), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_read_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Runs `execute` on a worker thread so a hang fails the test instead of
+    /// blocking the whole test binary.
+    fn execute_or_hang(root: std::path::PathBuf, name: &'static str) -> ToolOutcome {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let tool = SkillTool::for_working_dir(&root);
+            let outcome = rt
+                .block_on(tool.execute(serde_json::json!({ "name": name }), &ToolCtx::new(&root)));
+            let _ = tx.send(outcome.unwrap());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("skill tool hung on a non-regular SKILL.md")
+    }
+
+    #[test]
+    fn skill_md_symlinked_to_dev_zero_is_refused_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join(".claude").join("skills").join("devnull");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", skill.join("SKILL.md")).unwrap();
+        let outcome = execute_or_hang(dir.path().to_path_buf(), "devnull");
+        assert!(outcome.is_error, "{outcome:?}");
+    }
+
+    #[test]
+    fn oversized_skill_body_is_truncated_on_a_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join(".claude").join("skills").join("big");
+        std::fs::create_dir_all(&skill).unwrap();
+        // 11 ASCII bytes then 2-byte chars: the 256 KiB cut lands mid-character.
+        let body = format!("{}{}", "x".repeat(11), "é".repeat(200_000));
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: big\ndescription: big\n---\n{body}"),
+        )
+        .unwrap();
+        let outcome = execute_or_hang(dir.path().to_path_buf(), "big");
+        assert!(!outcome.is_error, "{outcome:?}");
+        assert!(
+            outcome.content.ends_with("[skill truncated]"),
+            "tail: {}",
+            &outcome.content[outcome.content.len().saturating_sub(120)..]
+        );
+    }
+
+    #[test]
+    fn normal_skill_is_not_marked_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join(".claude").join("skills").join("small");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: small\ndescription: small\n---\nstep one\n",
+        )
+        .unwrap();
+        let outcome = execute_or_hang(dir.path().to_path_buf(), "small");
+        assert!(!outcome.is_error, "{outcome:?}");
+        assert!(outcome.content.contains("step one"), "{outcome:?}");
+        assert!(!outcome.content.contains("truncated"), "{outcome:?}");
     }
 }
