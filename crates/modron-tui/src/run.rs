@@ -969,6 +969,14 @@ impl RunState {
                             match (self.engine_task.take(), self.slow_command_task.take()) {
                                 (Some(task), _) => {
                                     task.abort();
+                                    // Detached work the run started (background
+                                    // delegates) stops with it.
+                                    let stopped = modron_core::interrupt::fire();
+                                    if stopped > 0 {
+                                        app.toast(format!(
+                                            "stopped {stopped} background subagent(s)"
+                                        ));
+                                    }
                                     // Give the runtime a beat to cancel.
                                     tokio::time::sleep(Duration::from_millis(30)).await;
                                     app.finish_interrupted();
@@ -998,6 +1006,7 @@ impl RunState {
                         if let Some(task) = self.engine_task.take() {
                             task.abort();
                         }
+                        modron_core::interrupt::fire();
                         if let Some(task) = self.slow_command_task.take() {
                             self.slow_command_generation += 1;
                             task.abort();
