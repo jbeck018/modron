@@ -104,6 +104,46 @@ pub struct AttachSnapshot {
 // Link: one duplex frame channel per transport
 // ---------------------------------------------------------------------------
 
+/// Shown once per connection when the server sends a frame this client
+/// cannot decode (a newer server; some updates may be missing).
+pub const UNDECODABLE_NOTICE: &str = "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+
+/// One inbound item from the server: a decoded frame, or a frame this
+/// client could not decode.
+#[derive(Debug)]
+pub enum Inbound {
+    Frame(Box<Frame>),
+    Undecodable,
+}
+
+/// Undecodable-frame bookkeeping for one connection. The user-visible
+/// notice is raised at most once per connection, however many arrive.
+#[derive(Debug, Default)]
+pub struct UndecodableFrames {
+    count: u64,
+    announced: bool,
+}
+
+impl UndecodableFrames {
+    pub fn record(&mut self) {
+        self.count += 1;
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// True exactly once: the first time any frame has been undecodable.
+    pub fn take_notice(&mut self) -> bool {
+        if self.count > 0 && !self.announced {
+            self.announced = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 enum Link {
     Unix {
         write: OwnedWriteHalf,
@@ -167,17 +207,17 @@ impl Link {
         Ok(())
     }
 
-    /// Next frame, or None when the peer closed.
-    async fn recv(&mut self) -> Option<Frame> {
+    /// Next inbound item, or None when the peer closed.
+    async fn recv(&mut self) -> Option<Inbound> {
         match self {
             Self::Unix { lines, .. } => loop {
                 match lines.next_line().await {
                     Ok(Some(line)) if line.trim().is_empty() => continue,
                     Ok(Some(line)) => match serde_json::from_str(&line) {
-                        Ok(frame) => return Some(frame),
+                        Ok(frame) => return Some(Inbound::Frame(Box::new(frame))),
                         Err(e) => {
-                            tracing::warn!(error = %e, "dropping undecodable line from server");
-                            continue;
+                            tracing::warn!(error = %e, "undecodable line from server");
+                            return Some(Inbound::Undecodable);
                         }
                     },
                     _ => return None,
@@ -186,10 +226,10 @@ impl Link {
             Self::Ws { stream } => loop {
                 match stream.next().await {
                     Some(Ok(WsMessage::Text(text))) => match serde_json::from_str(&text) {
-                        Ok(frame) => return Some(frame),
+                        Ok(frame) => return Some(Inbound::Frame(Box::new(frame))),
                         Err(e) => {
-                            tracing::warn!(error = %e, "dropping undecodable frame from server");
-                            continue;
+                            tracing::warn!(error = %e, "undecodable frame from server");
+                            return Some(Inbound::Undecodable);
                         }
                     },
                     Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
@@ -211,8 +251,9 @@ impl Link {
 #[derive(Debug)]
 pub struct RemoteClient {
     cmd_tx: mpsc::UnboundedSender<Frame>,
-    frames: mpsc::UnboundedReceiver<Frame>,
+    frames: mpsc::UnboundedReceiver<Inbound>,
     next_id: u64,
+    undecodable: UndecodableFrames,
 }
 
 impl RemoteClient {
@@ -225,15 +266,24 @@ impl RemoteClient {
         let target = target.as_str();
         let mut link = Link::open(target).await?;
         link.send(&client_hello(token)).await?;
-        let welcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, link.recv())
-            .await
-            .map_err(|_| anyhow!("handshake timeout ({target})"))?;
+        // Undecodable frames before the welcome are skipped, as before.
+        let welcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            loop {
+                match link.recv().await {
+                    Some(Inbound::Frame(frame)) => break Some(*frame),
+                    Some(Inbound::Undecodable) => continue,
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("handshake timeout ({target})"))?;
         modron_protocol::client::check_welcome(welcome, target).map_err(anyhow::Error::msg)?;
 
         // Pump: owns the link, forwards both directions. The run loop
         // drains `frames` on its 50ms tick; send is sync/unbounded.
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Frame>();
-        let (frame_tx, frames) = mpsc::unbounded_channel::<Frame>();
+        let (frame_tx, frames) = mpsc::unbounded_channel::<Inbound>();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -247,10 +297,10 @@ impl RemoteClient {
                             None => break,
                         }
                     }
-                    frame = link.recv() => {
-                        match frame {
-                            Some(frame) => {
-                                if frame_tx.send(frame).is_err() {
+                    inbound = link.recv() => {
+                        match inbound {
+                            Some(inbound) => {
+                                if frame_tx.send(inbound).is_err() {
                                     break;
                                 }
                             }
@@ -265,6 +315,7 @@ impl RemoteClient {
             cmd_tx,
             frames,
             next_id: 2,
+            undecodable: UndecodableFrames::default(),
         })
     }
 
@@ -276,14 +327,42 @@ impl RemoteClient {
         id
     }
 
-    /// Next server frame (awaiting).
-    pub async fn next_frame(&mut self) -> Option<Frame> {
-        self.frames.recv().await
+    /// Next server item (awaiting). `Undecodable` is returned as it arrives
+    /// so the caller can surface it; it is also counted on this connection.
+    pub async fn next_frame(&mut self) -> Option<Inbound> {
+        let inbound = self.frames.recv().await?;
+        Some(self.observe(inbound))
     }
 
-    /// Next server frame if one arrived since the last tick.
-    pub fn try_next_frame(&mut self) -> Option<Frame> {
-        self.frames.try_recv().ok()
+    /// Next server item if one arrived since the last tick.
+    pub fn try_next_frame(&mut self) -> Option<Inbound> {
+        let inbound = self.frames.try_recv().ok()?;
+        Some(self.observe(inbound))
+    }
+
+    /// True exactly once per connection, the first time the server sent a
+    /// frame this client could not decode. The run loop shows
+    /// [`UNDECODABLE_NOTICE`] when it returns true.
+    pub fn take_undecodable_notice(&mut self) -> bool {
+        self.undecodable.take_notice()
+    }
+
+    /// Next decoded frame for the request loops below; undecodable items
+    /// are counted and skipped (they have no UI of their own here).
+    async fn recv_frame(&mut self) -> Option<Frame> {
+        loop {
+            match self.frames.recv().await? {
+                Inbound::Frame(frame) => return Some(*frame),
+                Inbound::Undecodable => self.undecodable.record(),
+            }
+        }
+    }
+
+    fn observe(&mut self, inbound: Inbound) -> Inbound {
+        if matches!(inbound, Inbound::Undecodable) {
+            self.undecodable.record();
+        }
+        inbound
     }
 
     /// List sessions on the server (`--resume` bare resolves newest).
@@ -294,7 +373,7 @@ impl RemoteClient {
         loop {
             tokio::select! {
                 _ = &mut deadline => bail!("list_sessions timeout"),
-                frame = self.frames.recv() => match frame {
+                frame = self.recv_frame() => match frame {
                     Some(Frame {
                         payload: Payload::Sessions { sessions },
                         ..
@@ -329,7 +408,7 @@ impl RemoteClient {
         loop {
             tokio::select! {
                 _ = &mut deadline => bail!("attach timeout waiting for snapshot"),
-                frame = self.frames.recv() => match frame {
+                frame = self.recv_frame() => match frame {
                     // Correlate by REQUEST id and session: two overlapping
                     // attaches (session switch mid-snapshot) must not adopt
                     // each other's snapshot (cycle-2 audit L6).
@@ -507,12 +586,80 @@ mod tests {
         let mut client = RemoteClient::connect(&url).await.unwrap();
         let id = client.send(Payload::Ping {});
         loop {
-            let frame = client.next_frame().await.unwrap();
+            let Inbound::Frame(frame) = client.next_frame().await.unwrap() else {
+                panic!("the ws fixture sends only decodable frames");
+            };
             if frame.id == Some(id) {
                 assert!(matches!(frame.payload, Payload::Pong {}));
                 break;
             }
         }
+    }
+
+    #[test]
+    fn undecodable_notice_is_raised_once_per_connection() {
+        let mut counter = UndecodableFrames::default();
+        assert!(!counter.take_notice(), "nothing undecodable yet");
+        counter.record();
+        assert_eq!(counter.count(), 1);
+        assert!(counter.take_notice(), "the first one is announced");
+        counter.record();
+        counter.record();
+        assert_eq!(counter.count(), 3, "every undecodable frame is counted");
+        assert!(!counter.take_notice(), "later ones do not re-announce");
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_frame_is_surfaced_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("junk.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let hello = lines.next_line().await.unwrap().unwrap();
+            let hello: Frame = serde_json::from_str(&hello).unwrap();
+            let welcome = Frame::request(
+                hello.id.unwrap(),
+                Payload::Welcome {
+                    server_version: "test".into(),
+                    protocol: PROTOCOL_VERSION,
+                },
+            );
+            let note = Frame::request(
+                9,
+                Payload::Note {
+                    text: "after junk".into(),
+                },
+            );
+            let script = format!(
+                "{}\n{{\"from_the_future\": true}}\nnot json at all\n{}\n",
+                serde_json::to_string(&welcome).unwrap(),
+                serde_json::to_string(&note).unwrap(),
+            );
+            write.write_all(script.as_bytes()).await.unwrap();
+            let _ = lines.next_line().await;
+        });
+        let mut client = RemoteClient::connect(&format!("unix:{}", path.display()))
+            .await
+            .unwrap();
+        assert!(!client.take_undecodable_notice(), "nothing seen yet");
+        assert!(matches!(
+            client.next_frame().await.unwrap(),
+            Inbound::Undecodable
+        ));
+        assert!(client.take_undecodable_notice(), "announced on first sight");
+        assert!(matches!(
+            client.next_frame().await.unwrap(),
+            Inbound::Undecodable
+        ));
+        let Inbound::Frame(frame) = client.next_frame().await.unwrap() else {
+            panic!("the valid frame after the junk arrives");
+        };
+        assert!(matches!(frame.payload, Payload::Note { .. }));
+        assert_eq!(client.undecodable.count(), 2);
+        assert!(!client.take_undecodable_notice(), "once per connection");
     }
 
     #[tokio::test]
