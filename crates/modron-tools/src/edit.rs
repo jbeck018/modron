@@ -141,8 +141,9 @@ impl Tool for EditTool {
         if matches!(ctx.sandbox, modron_core::SandboxPolicy::Off) {
             let updated_owned = updated.clone();
             let lsp_path = path.clone();
+            let lsp_root = ctx.working_dir.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::lsp::did_write(&lsp_path, &updated_owned)
+                crate::lsp::did_write(&lsp_path, &updated_owned, &lsp_root)
             })
             .await;
         }

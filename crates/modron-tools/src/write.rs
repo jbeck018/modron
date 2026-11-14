@@ -150,9 +150,11 @@ impl Tool for WriteTool {
         if matches!(ctx.sandbox, modron_core::SandboxPolicy::Off) {
             let lsp_path = path.clone();
             let lsp_content = content.to_string();
-            let _ =
-                tokio::task::spawn_blocking(move || crate::lsp::did_write(&lsp_path, &lsp_content))
-                    .await;
+            let lsp_root = ctx.working_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::lsp::did_write(&lsp_path, &lsp_content, &lsp_root)
+            })
+            .await;
         }
         Ok(ToolOutcome::ok(reduce_output(
             format!("wrote {} bytes to {}", content.len(), path.display()),
