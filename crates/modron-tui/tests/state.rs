@@ -2286,3 +2286,43 @@ fn backfill_transcript_rebuilds_scrollback_from_a_replay() {
     assert_eq!(app.tool_log[0].1.len(), 1);
     assert_eq!(app.tool_log[0].1[0].name, "read");
 }
+
+#[test]
+fn approval_prompt_shows_the_shared_summary_with_truncation_marker() {
+    // Long bash command: the head is shown and the hidden tail is counted.
+    let long = format!("echo {}", "a".repeat(120));
+    let (tx, _rx) = mpsc::channel();
+    let app = App {
+        pending_approval: Some(PendingApproval {
+            call: ToolCall {
+                id: "c2".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": long.clone() }),
+            },
+            respond: tx,
+        }),
+        ..App::default()
+    };
+    let expected = modron_view::approval_summary("bash", &json!({ "command": long }), 80);
+    let line = app.status_line();
+    assert!(line.contains(&expected), "{line}");
+    assert!(line.contains(" [+45 chars]"), "{line}");
+    assert!(line.starts_with("⚠ allow bash echo "), "{line}");
+}
+
+#[test]
+fn approval_prompt_for_write_leads_with_the_path() {
+    let (tx, _rx) = mpsc::channel();
+    let app = App {
+        pending_approval: Some(PendingApproval {
+            call: ToolCall {
+                id: "c3".into(),
+                name: "write".into(),
+                arguments: json!({ "path": "src/lib.rs", "content": "fn main() {}" }),
+            },
+            respond: tx,
+        }),
+        ..App::default()
+    };
+    assert_eq!(app.status_line(), "⚠ allow write src/lib.rs? [y/N/a]");
+}

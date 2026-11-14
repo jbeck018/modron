@@ -129,10 +129,15 @@ pub struct PendingApprovalView {
     pub request_id: String,
     /// Tool name.
     pub tool: String,
-    /// One-line arguments summary (truncated JSON).
+    /// One-line summary: `modron_view::approval_summary` (essential
+    /// argument first, `[+N chars]` when truncated), shared with the TUI
+    /// and desktop.
     pub args_summary: String,
     /// Full parsed arguments for the detail sheet.
     pub arguments: serde_json::Value,
+    /// The full call as sanitized compact JSON, for the sheet's expandable
+    /// block (never truncated; bidi/control characters replaced).
+    pub arguments_text: String,
     /// The three decisions with their shared labels, protocol order.
     pub options: Vec<DecisionOption>,
 }
@@ -145,21 +150,19 @@ pub struct DecisionOption {
     pub label: String,
 }
 
-/// Arguments summary cap (chars); keeps the sheet to one line.
-const ARGS_SUMMARY_MAX: usize = 120;
-
 impl PendingApprovalView {
     pub fn new(request_id: String, call: &ToolCall) -> Self {
         let full = serde_json::to_string(&call.arguments).unwrap_or_default();
-        let mut args_summary: String = full.chars().take(ARGS_SUMMARY_MAX).collect();
-        if full.chars().count() > ARGS_SUMMARY_MAX {
-            args_summary.push('…');
-        }
         Self {
             request_id,
             tool: call.name.clone(),
-            args_summary,
+            args_summary: modron_view::approval_summary(
+                &call.name,
+                &call.arguments,
+                modron_view::APPROVAL_SUMMARY_MAX,
+            ),
             arguments: call.arguments.clone(),
+            arguments_text: modron_view::sanitize_display(&full),
             options: DECISION_LABELS
                 .iter()
                 .map(|(d, label)| DecisionOption {
@@ -724,6 +727,42 @@ mod tests {
             parent_id: None,
             message,
         }
+    }
+
+    #[test]
+    fn pending_approval_summary_is_the_shared_string() {
+        let long = "p".repeat(200);
+        let call = ToolCall {
+            id: "c".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": long.clone() }),
+        };
+        let view = PendingApprovalView::new("r".into(), &call);
+        assert_eq!(
+            view.args_summary,
+            modron_view::approval_summary(
+                "bash",
+                &call.arguments,
+                modron_view::APPROVAL_SUMMARY_MAX
+            )
+        );
+        assert!(
+            view.args_summary.ends_with(" [+120 chars]"),
+            "{}",
+            view.args_summary
+        );
+        // The sheet's expandable block carries the whole call, untruncated.
+        assert!(view.arguments_text.contains(&long));
+
+        // Bidi overrides cannot reorder the full-call text either.
+        let call = ToolCall {
+            id: "c".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": "a\u{202e}b" }),
+        };
+        let view = PendingApprovalView::new("r".into(), &call);
+        assert_eq!(view.args_summary, r#"a?b"#);
+        assert_eq!(view.arguments_text, r#"{"path":"a?b"}"#);
     }
 
     #[test]
