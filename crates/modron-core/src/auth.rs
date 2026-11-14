@@ -260,6 +260,94 @@ pub fn remove_key_from_env_file(path: &std::path::Path, env_var: &str) -> std::i
     Ok(true)
 }
 
+/// Cross-process lock around an OAuth token refresh (E8). Refresh tokens
+/// are single-use: two Modron processes (a TUI and a daemon, two terminals)
+/// that both hit a 401 must not both spend the same refresh token, or the
+/// loser is signed out and, with reuse detection, so is the winner.
+///
+/// The lock is a file next to the token file, created exclusively. It is
+/// advisory and fail-open by design: a holder that crashed leaves a lock
+/// that is treated as stale after [`RefreshFileLock::STALE_AFTER`], and a
+/// waiter that cannot get the lock within [`RefreshFileLock::MAX_WAIT`]
+/// proceeds without it (the pre-E8 behavior) rather than failing the turn.
+/// Callers MUST re-read the token file after acquiring: the previous
+/// holder has usually just written fresh tokens.
+pub struct RefreshFileLock {
+    path: Option<std::path::PathBuf>,
+}
+
+impl RefreshFileLock {
+    /// A refresh request is bounded by the HTTP timeout (120 s); anything
+    /// older than this was left behind by a dead process.
+    pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(150);
+    /// Longest a caller waits for another process to finish its refresh.
+    pub const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Acquire the lock for the token file at `token_file`.
+    pub async fn acquire(token_file: &std::path::Path) -> Self {
+        Self::acquire_with(token_file, Self::MAX_WAIT, Self::STALE_AFTER).await
+    }
+
+    /// [`Self::acquire`] with injectable bounds (tests).
+    pub async fn acquire_with(
+        token_file: &std::path::Path,
+        max_wait: std::time::Duration,
+        stale_after: std::time::Duration,
+    ) -> Self {
+        let mut name = token_file.as_os_str().to_os_string();
+        name.push(".refresh-lock");
+        let path = std::path::PathBuf::from(name);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path: Some(path) },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age >= stale_after);
+                    if stale {
+                        // Left by a dead process: clear it and retry at once.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if started.elapsed() >= max_wait {
+                        tracing::warn!(
+                            lock = %path.display(),
+                            "token refresh lock not acquired in time; refreshing without it"
+                        );
+                        return Self { path: None };
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                // Unwritable directory etc.: proceed without a lock.
+                Err(_) => return Self { path: None },
+            }
+        }
+    }
+
+    /// Whether the lock file is actually held (false = fail-open path).
+    pub fn is_held(&self) -> bool {
+        self.path.is_some()
+    }
+}
+
+impl Drop for RefreshFileLock {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Replace a file holding credentials ATOMICALLY and privately: the new
 /// contents go to a uniquely named temp file in the same directory, created
 /// 0600 from the start (`create_new`, so a stale or planted name is never
@@ -638,6 +726,76 @@ pub mod discovery {
 
     #[cfg(test)]
     mod tests {
+        #[tokio::test]
+        async fn refresh_lock_is_exclusive_and_released_on_drop() {
+            use crate::auth::RefreshFileLock;
+            use std::time::Duration;
+            let dir = tempfile::tempdir().unwrap();
+            let token_file = dir.path().join("auth").join("anthropic.json");
+            let first = RefreshFileLock::acquire(&token_file).await;
+            assert!(first.is_held());
+            // A second taker waits, then proceeds WITHOUT the lock (fail-open).
+            let second = RefreshFileLock::acquire_with(
+                &token_file,
+                Duration::from_millis(120),
+                Duration::from_secs(60),
+            )
+            .await;
+            assert!(!second.is_held(), "the lock is exclusive while held");
+            drop(second);
+            // Dropping an unheld guard must not remove the holder's file.
+            let third = RefreshFileLock::acquire_with(
+                &token_file,
+                Duration::from_millis(60),
+                Duration::from_secs(60),
+            )
+            .await;
+            assert!(!third.is_held());
+            drop(first);
+            let fourth = RefreshFileLock::acquire(&token_file).await;
+            assert!(fourth.is_held(), "released on drop");
+        }
+
+        #[tokio::test]
+        async fn refresh_lock_waiter_gets_it_when_the_holder_finishes() {
+            use crate::auth::RefreshFileLock;
+            use std::time::Duration;
+            let dir = tempfile::tempdir().unwrap();
+            let token_file = dir.path().join("t.json");
+            let holder = RefreshFileLock::acquire(&token_file).await;
+            let waiter_path = token_file.clone();
+            let waiter = tokio::spawn(async move {
+                RefreshFileLock::acquire_with(
+                    &waiter_path,
+                    Duration::from_secs(5),
+                    Duration::from_secs(60),
+                )
+                .await
+                .is_held()
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(holder);
+            assert!(waiter.await.unwrap(), "the waiter takes over the lock");
+        }
+
+        #[tokio::test]
+        async fn stale_refresh_lock_from_a_dead_process_is_cleared() {
+            use crate::auth::RefreshFileLock;
+            use std::time::Duration;
+            let dir = tempfile::tempdir().unwrap();
+            let token_file = dir.path().join("t.json");
+            // A lock file nobody will ever release.
+            std::fs::write(dir.path().join("t.json.refresh-lock"), b"").unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let lock = RefreshFileLock::acquire_with(
+                &token_file,
+                Duration::from_secs(5),
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(lock.is_held(), "a stale lock is cleared, not waited out");
+        }
+
         use super::*;
 
         fn codex_fixture(account: Option<&str>) -> String {

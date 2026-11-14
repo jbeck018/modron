@@ -165,11 +165,42 @@ impl OpenAiResponsesProvider {
     /// concurrent winner's rotation is picked up instead of replaying the
     /// now-dead token.
     async fn refresh_if_possible(&self) -> Result<bool> {
+        // The access token the failed request used, read BEFORE waiting on
+        // any lock (see the Anthropic provider: same single-use refresh
+        // token hazard, same fix).
+        let stale_access = self.auth.read().expect("auth lock").access_token.clone();
         let _guard = self.refresh_lock.lock().await;
-        let refresh_token = self.auth.read().expect("auth lock").refresh_token.clone();
+        let (current_access, refresh_token) = {
+            let auth = self.auth.read().expect("auth lock");
+            (auth.access_token.clone(), auth.refresh_token.clone())
+        };
         let Some(refresh_token) = refresh_token else {
             return Ok(false);
         };
+        if current_access != stale_access {
+            return Ok(true); // another task in this process refreshed
+        }
+        // Cross-process (E8): file lock, then re-read the token file and
+        // adopt tokens another Modron process already rotated.
+        let _file_lock = match chatgpt::token_file() {
+            Ok(path) => Some(modron_core::auth::RefreshFileLock::acquire(&path).await),
+            Err(_) => None,
+        };
+        if let Ok(Some(disk)) = chatgpt::load() {
+            let rotated = disk.access_token != stale_access
+                && disk
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|token| token != refresh_token);
+            if rotated {
+                *self.auth.write().expect("auth lock") = StoredAuth {
+                    access_token: disk.access_token,
+                    refresh_token: disk.refresh_token,
+                    account_id: disk.account_id,
+                };
+                return Ok(true);
+            }
+        }
         let response = self
             .http
             .post(chatgpt::TOKEN_URL)

@@ -171,17 +171,46 @@ impl AnthropicProvider {
     /// single-use token onto the wire twice.
     async fn refresh_if_possible(&self) -> Result<bool> {
         use modron_core::auth::oauth;
-        let _guard = self.refresh_lock.lock().await;
-        let refresh_token = {
+        // The access token the failed request used, read BEFORE waiting on
+        // any lock: if it has changed by the time we hold the lock, someone
+        // else already refreshed and the single-use refresh token must not
+        // be spent again.
+        let subscription_tokens = || {
             let auth = self.auth.read().expect("auth lock");
             match &*auth {
                 Auth::Subscription {
-                    refresh_token: Some(token),
-                    ..
-                } => token.clone(),
-                _ => return Ok(false),
+                    access_token,
+                    refresh_token: Some(refresh),
+                } => Some((access_token.clone(), refresh.clone())),
+                _ => None,
             }
         };
+        let Some((stale_access, _)) = subscription_tokens() else {
+            return Ok(false);
+        };
+        let _guard = self.refresh_lock.lock().await;
+        let Some((current_access, refresh_token)) = subscription_tokens() else {
+            return Ok(false);
+        };
+        if current_access != stale_access {
+            return Ok(true); // another task in this process refreshed
+        }
+        // Cross-process (E8): hold the file lock, then re-read the token
+        // file. Another Modron process may have rotated the tokens while we
+        // waited; adopt them instead of replaying a dead refresh token.
+        let _file_lock = match oauth::auth_file() {
+            Ok(path) => Some(modron_core::auth::RefreshFileLock::acquire(&path).await),
+            Err(_) => None,
+        };
+        if let Ok(Some(disk)) = oauth::load_tokens() {
+            if let Some(adopted) = adopt_rotated_tokens(&stale_access, &refresh_token, disk) {
+                *self.auth.write().expect("auth lock") = Auth::Subscription {
+                    access_token: adopted.access_token,
+                    refresh_token: adopted.refresh_token,
+                };
+                return Ok(true);
+            }
+        }
         let tokens = oauth::refresh_tokens_at(oauth::TOKEN_URL, &refresh_token)
             .await
             .map_err(|e| Error::Provider {
@@ -294,6 +323,23 @@ impl AnthropicProvider {
         let _ = tx.send(StreamDelta::Done);
         Ok(parsed)
     }
+}
+
+/// Tokens another process already rotated (E8): the token file holds a
+/// different access token AND a different refresh token than the pair that
+/// just failed. Returns them so the caller adopts them without a network
+/// refresh. `None` when the file still holds our own (stale) pair.
+fn adopt_rotated_tokens(
+    stale_access: &str,
+    our_refresh: &str,
+    disk: modron_core::auth::oauth::TokenSet,
+) -> Option<modron_core::auth::oauth::TokenSet> {
+    let rotated = disk.access_token != stale_access
+        && disk
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| token != our_refresh);
+    rotated.then_some(disk)
 }
 
 /// A refresh response may omit `refresh_token` when the existing one stays
@@ -872,6 +918,28 @@ impl ModelProvider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rotated_tokens_on_disk_are_adopted_and_own_tokens_are_not() {
+        use modron_core::auth::oauth::TokenSet;
+        let disk = |access: &str, refresh: Option<&str>| TokenSet {
+            access_token: access.into(),
+            refresh_token: refresh.map(String::from),
+            expires_in: None,
+            id_token: None,
+        };
+        // Another process rotated both tokens: adopt, no network refresh.
+        let adopted = adopt_rotated_tokens("old-access", "rt1", disk("new-access", Some("rt2")));
+        assert_eq!(adopted.unwrap().access_token, "new-access");
+        // The file still holds our own stale pair: refresh normally.
+        assert!(
+            adopt_rotated_tokens("old-access", "rt1", disk("old-access", Some("rt1"))).is_none()
+        );
+        // Same refresh token on disk means nobody rotated yet.
+        assert!(adopt_rotated_tokens("old-access", "rt1", disk("other", Some("rt1"))).is_none());
+        // No refresh token on disk: nothing to adopt.
+        assert!(adopt_rotated_tokens("old-access", "rt1", disk("other", None)).is_none());
+    }
+
     use super::*;
     use modron_core::{Message, ToolOutcome, ToolSpec};
     use serde_json::json;
