@@ -696,43 +696,43 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 | A1 | H+ | critical | DONE | | a34ca85 | Haiku. Leader follow-up: gated calls stay concurrent when they would not prompt. 3 new tests. |
 | A2 | H+ | high | DONE | | 8af1cb9 | Haiku. 3 new tests. |
 | A3 | H+ | high | DONE | | 59d380c | Haiku. Checkpoint recorded in execute_tool after the gates, every mode; fails closed if it cannot be stored. 7 new tests. |
-| A4 | H | high | TODO | | | |
-| A5 | H | medium | TODO | | | |
-| A6 | H | medium | TODO | | | |
+| A4 | H | high | DONE | | 33d6ec2 | Haiku. Also drops orphan results. 2 new tests. |
+| A5 | H | medium | DONE | | bf68f35 | Haiku (with A6). Admission enum shared by execute_tool and the finish gate. |
+| A6 | H | medium | DONE | | 0717656 | Haiku (with A5). 5 new tests across A5/A6. |
 | A7 | L | medium | TODO | | | |
 | B1 | H+ | critical | DONE | | bebc4b3 | Haiku, one BLOCKED round (scope widened to tests/common/mod.rs). Leader follow-up: --allow-origin flag. 5 new tests. |
 | B2 | H+ | high | DONE | | 4805603 | Haiku, one BLOCKED round (leader added ErrorKind::Forbidden to scope). Leader follow-up: Detach allowed on scoped ctx. 8 new tests. |
 | B3 | H | high | DONE | | a0e7f27 | Leader. allow_rest cleared in start_run; hub test extended. |
-| B4 | H | medium | TODO | | | |
-| B5 | H | medium | TODO | | | |
-| B6 | H | medium | TODO | | | |
-| B7 | H | low | TODO | | | |
+| B4 | H | medium | DONE | | 23bca6b | Haiku. Outbound channel still unbounded; 30 s write timeout is the cutoff. 7 new tests. |
+| B5 | H | medium | DONE | | bdfc7b4 | Haiku. Registry path derives from the clients dir parent. 5 new tests. |
+| B6 | H | medium | DONE | | 75a5df6 | Haiku (with F5). tsc clean in a scratch copy (leader); npm ci in cloud/bridge fails ERESOLVE (pre-existing). |
+| B7 | H | low | DONE | | 870b1ee | Haiku. 4 new tests on a real temp git repo. |
 | B8 | H | critical | DONE | | d6a5337 | Leader. |
 | C1 | H+ | high | DONE | | 4d0ea46 | Haiku. Desktop and App.tsx edits NOT compiled (needs-macos, no node_modules). 7 new tests on Linux crates. |
 | C2 | H | high | DONE | | d1c1f43 | Haiku. Remote end-to-end driver untested; 10 new tests. Known: remote `a` can race to AllowOnce (re-prompt, not a bypass). |
-| C3 | H | medium | TODO | | | |
-| C4 | H | medium | TODO | | | |
-| C5 | H+ | medium | TODO | | | after B3; needs-macos |
-| C6 | H | high | TODO | | | needs-macos; cargo-deny |
+| C3 | H | medium | DONE | | d9a88e6 | Haiku. 7 new tests. |
+| C4 | H | medium | DONE | | 6c20208 | Haiku. App.tsx NOT compiled. 5 new tests (3 Rust). |
+| C5 | H+ | medium | DONE | | d32e19b | Haiku. Desktop NOT compiled. TUI has no sandbox label to set. 9 new tests. |
+| C6 | H | high | DONE | | acd215b | Haiku. Desktop and App.tsx NOT compiled; cargo-deny NOT run (not installed). No mobile allow-insecure toggle. |
 | D1 | H+ | medium | DONE | | 4e4b6cc | Haiku. 4 new tests. Follow-up added to D4 (write-through symlink outside workspace). |
 | D2 | H | medium | DONE | | 1a279c2 | Haiku, PARTIAL: sandboxed path deferred to D6 (needs modron-core sandbox.rs). 4 new tests. |
-| D3 | H+ | medium | TODO | | | |
-| D4 | H | medium | TODO | | | |
-| D5 | H | low | TODO | | | |
-| D6 | L | medium | TODO | | | |
+| D3 | H+ | medium | DONE | | bde1226 | Haiku. Leader narrowed the list to model-provider credentials (D9). delegate.rs git spawns not scrubbed. |
+| D4 | H | medium | DONE | | 61a813c | Haiku. 8 new tests. |
+| D5 | H | low | DONE | | 9d12dbc | Haiku. skill.rs SKILL.md body read still unbounded (backlog). 21 new tests. |
+| D6 | L | medium | DONE | | 2030029 | Leader. Tested on real bubblewrap 0.9; Seatbelt changes NOT run (no macOS). |
 | E1 | H | medium | DONE | | 8bb9ea5 | Haiku. Idle tests use real short timers, not paused time. 4 new tests. |
 | E2 | H | medium | DONE | | 357dfab | Haiku. Streams retry 429/500/502/503/529 only; turn() retries all 5xx. 10 new tests. |
-| E3 | H | medium | TODO | | | |
-| E4 | H | medium | TODO | | | |
-| E5 | H | low | TODO | | | |
-| E6 | H | medium | TODO | | | |
-| E7 | H | medium | TODO | | | |
+| E3 | H | medium | DONE | | a2c03b7 | Haiku, one BLOCKED round (scope widened to TUI/mobile/desktop cache % sites). Desktop NOT compiled. |
+| E4 | H | medium | DONE | | 87d8e1b | Haiku (with E5). DeviceLogin still derives Debug (backlog). |
+| E5 | H | low | DONE | | 9e47488 | Haiku (with E4). write_private now atomic for every caller. 13 new tests across E4/E5. |
+| E6 | H | medium | DONE | | aa69c81 | Haiku (with E7). |
+| E7 | H | medium | DONE | | 96855e1 | Haiku (with E6). Batch append is one write for the whole batch. 4 new tests. |
 | E8 | L | medium | TODO | | | |
-| F1 | H | high | TODO | | | may escalate |
-| F2 | H | medium | TODO | | | |
-| F3 | H | low | TODO | | | |
-| F4 | H | medium | TODO | | | |
-| F5 | H | low | TODO | | | after B6 |
+| F1 | H | high | DONE | | 1fa7242 + 428a1da | Haiku did the CLI marker half and reported BLOCKED; leader added EngineConfig.resume_skip_end. One rewind range per session. |
+| F2 | H | medium | DONE | | 3c0b05c | Haiku (with F4). |
+| F3 | H | low | DONE | | 25d5fb4 | Haiku. Items c, d, e, g untested (need the full binary / live MCP). |
+| F4 | H | medium | DONE | | d29e71e | Haiku (with F2). Tool-call ids paired by name FIFO (ToolActivity has no call id). |
+| F5 | H | low | DONE | | 75a5df6 | Haiku (with B6). |
 | G1 | H | medium | DONE | | db6b845 | Leader. bash -n ok; not run in a container. |
 | G2 | H | low | DONE | | db6b845 | Leader. NOT built (no docker daemon). |
 | G3 | H | medium | DONE | | 2e475c9 | Leader. Good and bad checksum paths tested against a local fake release. |
@@ -744,6 +744,12 @@ tests pass on `cargo test --workspace --exclude modron-desktop` after a
 full rebuild.
 
 Wave 2 gate evidence (leader): fmt clean, clippy clean, 700 tests pass.
+
+Final Haiku-wave gate evidence (leader): fmt clean, clippy clean, 834
+tests pass on Linux (`--workspace --exclude modron-desktop`). Not verified
+anywhere: crates/modron-desktop (needs macOS), mobile/app/App.tsx (no JS
+toolchain), `cargo deny check`, the GitHub workflows, the container
+image, the Seatbelt profile changes.
 
 Lesson from wave 1: workers must NOT share one CARGO_TARGET_DIR across
 worktrees - it produced a stale modron-core artifact and a false test
@@ -777,6 +783,13 @@ Cross-lane file overlaps the leader must sequence by hand:
 Accepted risk (owner decision): `remember` is ungated, so an injected
 instruction can persist a global memory into future system prompts.
 Revisit if memory poisoning is observed.
+
+New from the remediation work: delegate.rs git spawns are not env-scrubbed;
+skill.rs reads SKILL.md bodies unbounded; DeviceLogin derives Debug; ACP
+tool-call ids are paired by name (ToolActivity needs a call id); only one
+rewind range is recorded per session; the WS outbound queue is unbounded
+(30 s write timeout is the only cutoff); mobile has no allow-insecure
+toggle; `npm ci` in cloud/bridge fails with a peer-dependency conflict.
 
 Low severity: speculative-read staleness within a mixed turn; auth-failure substring
 match on "401"/"403"; memory store locking; process-wide ReadGate; LSP
