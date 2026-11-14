@@ -580,3 +580,65 @@ async fn normal_resume_prunes_only_the_unanswered_call_of_a_partial_turn() {
         .collect();
     assert_eq!(kept_calls, vec!["c1"], "only the answered call survives");
 }
+
+#[tokio::test]
+async fn rewound_range_stays_out_but_later_work_survives_every_resume() {
+    // F1: after a rewind at cut C made when the log had E events, a resume
+    // sees [0, C) plus everything appended at >= E, on every later resume.
+    let store = Arc::new(InMemoryStore::new());
+    let meta = store.create_session("rewound").await.unwrap();
+    for text in ["kept task", "abandoned task"] {
+        store
+            .append(meta.id, &SessionEvent::Task { text: text.into() })
+            .await
+            .unwrap();
+        store
+            .append(
+                meta.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: modron_core::Message::assistant(format!("answer to {text}")),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // Rewind abandons events [2, 4): the second task and its answer.
+    let rewound = |provider: Arc<MockProvider>| {
+        let mut engine = resume_engine(provider, Arc::clone(&store));
+        engine.config.resume_from_event = Some(2);
+        engine.config.resume_skip_end = Some(4);
+        engine
+    };
+    let contents = |provider: &MockProvider| -> Vec<String> {
+        provider.requests()[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect()
+    };
+
+    let first = Arc::new(MockProvider::new().then_text("first resumed answer"));
+    rewound(first.clone())
+        .run_task_resuming(meta.id, "after rewind")
+        .await
+        .unwrap();
+    let seen = contents(&first);
+    assert!(seen.iter().any(|c| c == "kept task"), "{seen:?}");
+    assert!(!seen.iter().any(|c| c.contains("abandoned")), "{seen:?}");
+
+    // The second resume must still see the first resumed run's work.
+    let second = Arc::new(MockProvider::new().then_text("second resumed answer"));
+    rewound(second.clone())
+        .run_task_resuming(meta.id, "and again")
+        .await
+        .unwrap();
+    let seen = contents(&second);
+    assert!(seen.iter().any(|c| c == "kept task"), "{seen:?}");
+    assert!(seen.iter().any(|c| c == "after rewind"), "{seen:?}");
+    assert!(
+        seen.iter().any(|c| c == "first resumed answer"),
+        "work done after the rewind must survive: {seen:?}"
+    );
+    assert!(!seen.iter().any(|c| c.contains("abandoned")), "{seen:?}");
+}

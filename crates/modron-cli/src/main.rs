@@ -1172,6 +1172,10 @@ fn build_agent_with(
         })
         .transpose()?;
 
+    let rewind_marker = cli
+        .resume
+        .flatten()
+        .and_then(|id| read_rewind_marker(&sessions_dir, id));
     let mut engine_config = EngineConfig {
         working_dir: working_dir.clone(),
         system: persona
@@ -1213,14 +1217,11 @@ fn build_agent_with(
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),
-        // Honors a prior `modron rewind` of this session (C2): abandoned
-        // events stay in the log but never re-enter context. The engine only
-        // takes the cut; the `end` half of the marker is recorded for the
-        // range-skip engine change (see `RewindMarker`).
-        resume_from_event: cli
-            .resume
-            .flatten()
-            .and_then(|id| read_rewind_cut(&sessions_dir, id)),
+        // Honors a prior `modron rewind` of this session (C2): the
+        // abandoned range `[cut, end)` stays in the log but never re-enters
+        // context; events appended after the rewind (index >= end) do.
+        resume_from_event: rewind_marker.map(|m| m.cut),
+        resume_skip_end: rewind_marker.and_then(|m| m.end),
         hooks: cfg
             .hooks
             .clone()
@@ -2987,10 +2988,17 @@ fn format_rewind_marker(cut: u64, end: u64) -> String {
 
 /// Engine cut for a session's marker, read synchronously while building
 /// the agent. Both marker forms yield the same cut.
+#[cfg(test)]
 fn read_rewind_cut(sessions_dir: &Path, id: SessionId) -> Option<u64> {
+    read_rewind_marker(sessions_dir, id).map(|m| m.cut)
+}
+
+/// A session's rewind marker (cut and, when recorded, the end of the
+/// abandoned range), read synchronously while building the agent.
+fn read_rewind_marker(sessions_dir: &Path, id: SessionId) -> Option<RewindMarker> {
     let marker = sessions_dir.join(format!("{id}.rewind"));
     let text = std::fs::read_to_string(marker).ok()?;
-    parse_rewind_marker(&text).map(|m| m.cut)
+    parse_rewind_marker(&text)
 }
 
 /// Rewrites an old one-number marker as `"<cut> <end>"`, with `end` = the

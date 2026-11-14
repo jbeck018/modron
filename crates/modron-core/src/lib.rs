@@ -550,6 +550,12 @@ pub struct EngineConfig {
     /// are history, events after it stay in the append-only log but never
     /// re-enter context. `None` = full-log resume.
     pub resume_from_event: Option<u64>,
+    /// End (exclusive) of the range a rewind abandoned, paired with
+    /// `resume_from_event` as its start: events in `[cut, end)` never
+    /// re-enter context, while events appended AFTER the rewind (index
+    /// `>= end`) do. `None` with a cut set keeps the old meaning (everything
+    /// from the cut onward is dropped).
+    pub resume_skip_end: Option<u64>,
     /// Force one self-check turn before ending when no verify tool exists.
     pub self_check_on_finish: bool,
     /// Verify-failure escalation (additive, `None` by default): when the
@@ -646,6 +652,7 @@ impl Default for EngineConfig {
             price_lookup: None,
             hooks: hooks::HookConfig::default(),
             resume_from_event: None,
+            resume_skip_end: None,
             self_check_on_finish: false,
             escalate_on_check_failure: None,
             sandbox: SandboxPolicy::Off,
@@ -678,6 +685,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("price_lookup", &self.price_lookup.is_some())
             .field("hooks", &self.hooks)
             .field("resume_from_event", &self.resume_from_event)
+            .field("resume_skip_end", &self.resume_skip_end)
             .field("escalate_on_check_failure", &self.escalate_on_check_failure)
             .field("sandbox", &self.sandbox)
             .field("approver", &self.approver.is_some())

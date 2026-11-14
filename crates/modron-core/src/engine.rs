@@ -158,6 +158,35 @@ fn resolve_inside(working_dir: &std::path::Path, path: &str) -> Option<std::path
     resolved.starts_with(&base).then_some(resolved)
 }
 
+/// The events a resumed run may see after a rewind. No cut: everything.
+/// Cut only: `events[..cut]`. Cut and end: `events[..cut]` followed by
+/// `events[end..]`, i.e. only the abandoned range `[cut, end)` is skipped.
+fn rewind_view(
+    events: &[SessionEvent],
+    cut: Option<u64>,
+    end: Option<u64>,
+) -> std::borrow::Cow<'_, [SessionEvent]> {
+    use std::borrow::Cow;
+    let Some(cut) = cut else {
+        return Cow::Borrowed(events);
+    };
+    let cut = usize::try_from(cut).unwrap_or(usize::MAX).min(events.len());
+    match end {
+        Some(end) => {
+            let end = usize::try_from(end)
+                .unwrap_or(usize::MAX)
+                .clamp(cut, events.len());
+            if end == events.len() {
+                return Cow::Borrowed(&events[..cut]);
+            }
+            let mut kept = events[..cut].to_vec();
+            kept.extend_from_slice(&events[end..]);
+            Cow::Owned(kept)
+        }
+        None => Cow::Borrowed(&events[..cut]),
+    }
+}
+
 /// Finish-gate bound: verification feedback rounds before the run may end
 /// without passing verification (StaminaBench: gains plateau after 3-5
 /// retries; 2 keeps the worst case tight).
@@ -374,10 +403,14 @@ impl Engine {
         }
         // Rewind support (C2): when `resume_from_event` is set, events after
         // that index stay in the append-only log but never re-enter context.
-        let sliced: &[SessionEvent] = match self.config.resume_from_event {
-            Some(cut) => &events[..(cut as usize).min(events.len())],
-            None => &events[..],
-        };
+        // With `resume_skip_end` only the abandoned range `[cut, end)` is
+        // dropped, so work appended after the rewind survives later resumes.
+        let kept = rewind_view(
+            &events,
+            self.config.resume_from_event,
+            self.config.resume_skip_end,
+        );
+        let sliced: &[SessionEvent] = &kept;
         // Every resume goes through the prune, not only rewind resumes: an
         // interrupt mid-tool leaves an assistant tool_use with no result in
         // the log, and both provider APIs reject that (cycle-2 audit H1).
@@ -1881,6 +1914,14 @@ impl Engine {
         next_model: &str,
     ) -> Result<Option<CompactionOutcome>> {
         let events = self.store.load(session_id).await?;
+        // Same view as a resume: a rewound range must not be summarized
+        // back into context by a later compaction.
+        let events = rewind_view(
+            &events,
+            self.config.resume_from_event,
+            self.config.resume_skip_end,
+        )
+        .into_owned();
         let (older, tail) =
             compact::split_older_tail(&events, self.config.compaction.tail_messages);
         let summarized_count = older
@@ -2269,6 +2310,39 @@ fn json_serialized_len(value: &serde_json::Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rewind_view_skips_only_the_abandoned_range() {
+        use super::rewind_view;
+        let ev = |t: &str| crate::SessionEvent::Task { text: t.into() };
+        let events = vec![ev("a"), ev("b"), ev("c"), ev("d"), ev("e")];
+        let texts = |v: &[crate::SessionEvent]| -> Vec<String> {
+            v.iter()
+                .map(|e| match e {
+                    crate::SessionEvent::Task { text } => text.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        };
+        // No cut: everything.
+        assert_eq!(texts(&rewind_view(&events, None, Some(3))).len(), 5);
+        // Cut only: the old meaning, everything from the cut is dropped.
+        assert_eq!(texts(&rewind_view(&events, Some(2), None)), ["a", "b"]);
+        // Cut and end: [2, 4) abandoned, later work kept.
+        assert_eq!(
+            texts(&rewind_view(&events, Some(2), Some(4))),
+            ["a", "b", "e"]
+        );
+        // Restart (cut 0) keeps only post-restart work.
+        assert_eq!(texts(&rewind_view(&events, Some(0), Some(3))), ["d", "e"]);
+        // End at or past the log end, or below the cut, never panics.
+        assert_eq!(texts(&rewind_view(&events, Some(2), Some(99))), ["a", "b"]);
+        assert_eq!(
+            texts(&rewind_view(&events, Some(4), Some(1))),
+            ["a", "b", "c", "d", "e"]
+        );
+        assert_eq!(texts(&rewind_view(&events, Some(99), None)).len(), 5);
+    }
+
     use super::*;
     use crate::{EngineConfig, Tool, ToolOutcome, ToolRegistry, TurnResponse};
     use async_trait::async_trait;
