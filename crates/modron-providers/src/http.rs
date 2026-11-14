@@ -11,22 +11,107 @@
 //! `request failed: …`, `HTTP <status>: <snippet>`), so a wording change
 //! would silently break the retry policy.
 
+use crate::stream::parse_sse_stream;
+use futures::StreamExt;
 use modron_core::{Error, Result};
 use reqwest::Client;
+use std::future::Future;
 use std::time::Duration;
 
-/// Per-request timeout shared by every provider.
+/// Total deadline for non-streaming requests, applied per request. It is
+/// never set on the shared client: a total deadline would also cut off a
+/// stream.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Connect timeout shared by every provider.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest silence tolerated on a streaming response: before its headers
+/// arrive and between body chunks. Streams have no total deadline.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Cap on bytes buffered while waiting for an SSE event to complete.
+pub const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
-/// The shared reqwest client: same timeouts, same construction everywhere.
+/// The shared reqwest client: same connect timeout, same construction
+/// everywhere. Deliberately has no total timeout (see [`REQUEST_TIMEOUT`]).
 pub fn build_client() -> Result<Client> {
     Client::builder()
-        .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|err| Error::Other(anyhow::anyhow!("failed to build HTTP client: {err}")))
+}
+
+/// The `timeout: …` error the retry policy classifies as transient.
+fn timeout_error(provider_id: &str, what: &str) -> Error {
+    Error::Provider {
+        provider: provider_id.to_string(),
+        message: format!("timeout: {what}"),
+    }
+}
+
+/// Bound a streaming response's wait for its headers by the idle budget.
+pub(crate) async fn within_idle<T>(
+    provider_id: &str,
+    idle: Duration,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(idle, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(timeout_error(
+            provider_id,
+            &format!("no response headers for {idle:?}"),
+        )),
+    }
+}
+
+/// Drive a streaming body to completion: every chunk read is bounded by
+/// `idle`, the SSE line buffer is capped at [`MAX_SSE_BUFFER`], and each
+/// complete `data:` payload goes to `on_payload`. The callback returns
+/// `true` to stop early (an end-of-stream sentinel). The three streaming
+/// providers share this so the idle and cap policy lives in one place.
+pub(crate) async fn drain_sse<S, B>(
+    provider_id: &str,
+    stream: S,
+    idle: Duration,
+    mut on_payload: impl FnMut(&str) -> Result<bool>,
+) -> Result<()>
+where
+    S: futures::Stream<Item = reqwest::Result<B>>,
+    B: AsRef<[u8]>,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        let next = match tokio::time::timeout(idle, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return Err(timeout_error(
+                    provider_id,
+                    &format!("stream idle for {idle:?}"),
+                ))
+            }
+        };
+        let Some(item) = next else {
+            return Ok(());
+        };
+        let chunk = item.map_err(|err| crate::transport_error(provider_id, err))?;
+        buffer.extend_from_slice(chunk.as_ref());
+        // Deliberately not a retryable prefix: an oversized event is a
+        // protocol violation, not a transient failure.
+        if buffer.len() > MAX_SSE_BUFFER {
+            return Err(Error::Provider {
+                provider: provider_id.to_string(),
+                message: format!(
+                    "malformed stream: SSE event exceeds {MAX_SSE_BUFFER} bytes without a terminator"
+                ),
+            });
+        }
+        let (payloads, consumed) = parse_sse_stream(&buffer);
+        buffer.drain(..consumed);
+        for payload in payloads {
+            if on_payload(&payload)? {
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Send a POST with fully caller-supplied headers and JSON body. Headers
@@ -40,7 +125,9 @@ async fn post(
     headers: &[(&str, String)],
     body: &serde_json::Value,
 ) -> Result<reqwest::Response> {
-    let mut request = client.post(url);
+    // Non-streaming only: this path reads the whole body, so a total
+    // deadline is correct here and wrong for streams.
+    let mut request = client.post(url).timeout(REQUEST_TIMEOUT);
     for (name, value) in headers {
         request = request.header(*name, value);
     }
@@ -300,5 +387,92 @@ mod tests {
             .await
             .expect_err("garbage body");
         assert!(err.to_string().contains("malformed response:"), "{err}");
+    }
+
+    fn provider_message(err: Error) -> String {
+        match err {
+            Error::Provider { message, .. } => message,
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+    }
+
+    /// A stream that goes silent must fail with the `timeout:` prefix the
+    /// retry policy keys on, instead of hanging forever.
+    #[tokio::test]
+    async fn stalled_stream_fails_with_timeout_prefix() {
+        use futures::StreamExt;
+        let first =
+            futures::stream::iter(vec![Ok::<Vec<u8>, reqwest::Error>(b"data: x\n\n".to_vec())]);
+        let stalled = first.chain(futures::stream::pending());
+        let mut seen = Vec::new();
+        let err = drain_sse("test", stalled, Duration::from_millis(50), |payload| {
+            seen.push(payload.to_string());
+            Ok(false)
+        })
+        .await
+        .expect_err("a silent stream must not hang");
+        assert_eq!(
+            seen,
+            vec!["x".to_string()],
+            "the payload before the stall arrives"
+        );
+        let message = provider_message(err);
+        assert!(message.starts_with("timeout: "), "{message}");
+    }
+
+    /// Gaps shorter than the idle budget never trip it, however long the
+    /// whole stream runs: there is no total deadline on streams.
+    #[tokio::test]
+    async fn trickling_stream_completes_past_the_idle_budget_in_total() {
+        use futures::StreamExt;
+        let trickle = futures::stream::iter(0..10).then(|i| async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok::<Vec<u8>, reqwest::Error>(format!("data: {i}\n\n").into_bytes())
+        });
+        let mut seen = 0usize;
+        drain_sse("test", trickle, Duration::from_millis(100), |_| {
+            seen += 1;
+            Ok(false)
+        })
+        .await
+        .expect("each gap is under the idle budget");
+        assert_eq!(seen, 10);
+    }
+
+    /// An event that never terminates is refused at the buffer cap rather
+    /// than growing without bound. The error is not retryable.
+    #[tokio::test]
+    async fn endless_line_fails_at_buffer_cap() {
+        let chunk = vec![b'a'; 1024 * 1024];
+        let chunks = (0..10).map(|_| Ok::<Vec<u8>, reqwest::Error>(chunk.clone()));
+        let err = drain_sse(
+            "test",
+            futures::stream::iter(chunks),
+            STREAM_IDLE_TIMEOUT,
+            |_| Ok(false),
+        )
+        .await
+        .expect_err("no newline ever arrives");
+        let message = provider_message(err);
+        assert!(message.contains("exceeds"), "{message}");
+        assert!(!crate::retry::is_retryable(&Error::Provider {
+            provider: "test".into(),
+            message,
+        }));
+    }
+
+    /// Response headers that never arrive are bounded by the same idle
+    /// budget and carry the `timeout:` prefix.
+    #[tokio::test]
+    async fn silent_response_headers_fail_with_timeout_prefix() {
+        let err = within_idle(
+            "test",
+            Duration::from_millis(20),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("pending forever");
+        let message = provider_message(err);
+        assert!(message.starts_with("timeout: "), "{message}");
     }
 }
