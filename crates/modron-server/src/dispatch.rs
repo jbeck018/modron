@@ -105,7 +105,10 @@ impl ConnCtx {
 /// until someone decides otherwise here.
 fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> {
     match payload {
-        Payload::Hello { .. } | Payload::Ping {} | Payload::Approve { .. } => Ok(()),
+        // Detach only drops this connection's own subscription.
+        Payload::Hello { .. } | Payload::Ping {} | Payload::Approve { .. } | Payload::Detach {} => {
+            Ok(())
+        }
         Payload::Attach { session_id, .. } | Payload::Interrupt { session_id } => {
             if *session_id == scope {
                 Ok(())

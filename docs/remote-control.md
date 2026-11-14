@@ -177,7 +177,7 @@ automations, delete or list other sessions, or open further tunnels.
 - Attach snapshots carry the full persisted log plus the live view
   (streaming buffers, grouped tool activity, pending approval, cumulative
   usage, model/provider/goal labels).
-- Sticky approve-rest: answering one request with `allow_all` auto-approves
+- Approve-rest: answering one request with `allow_all` auto-approves
   every later mutating call in that session (the TUI's `a`).
 - A run whose task panics would leave the run slot occupied until restart;
   engine failures are reported as `turn_failed` frames, never slots.

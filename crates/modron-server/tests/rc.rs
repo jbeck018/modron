@@ -108,7 +108,6 @@ async fn scoped_ctx_forbids_server_wide_frames() {
         payload(serde_json::json!({"type": "list_sessions"})),
         payload(serde_json::json!({"type": "fork", "session_id": session})),
         payload(serde_json::json!({"type": "new_session"})),
-        payload(serde_json::json!({"type": "detach"})),
         payload(serde_json::json!({"type": "automations_list"})),
     ];
     for (i, frame_payload) in denied.into_iter().enumerate() {
