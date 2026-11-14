@@ -52,6 +52,9 @@ impl OpenAiCompatProvider {
     /// `/chat/completions` suffix is appended per request.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        if !self.api_key.is_empty() {
+            crate::http::warn_cleartext_once(PROVIDER_ID, &self.base_url);
+        }
         self
     }
 
@@ -180,6 +183,20 @@ impl OaiStreamAccumulator {
             provider: PROVIDER_ID.into(),
             message: format!("malformed stream chunk: {err}"),
         })?;
+        // Some servers report a mid-stream failure as a top-level error
+        // object instead of closing with an HTTP error. Surface the server's
+        // message. The `stream error:` prefix is deliberately not a retry
+        // class: the server already decided this failure.
+        if let Some(error) = chunk.get("error").filter(|error| error.is_object()) {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| error.to_string(), str::to_string);
+            return Err(Error::Provider {
+                provider: PROVIDER_ID.into(),
+                message: format!("stream error: {}", crate::snippet(&message, 300)),
+            });
+        }
         if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
             let parsed: OaiUsage =
                 serde_json::from_value(usage.clone()).map_err(|err| Error::Provider {

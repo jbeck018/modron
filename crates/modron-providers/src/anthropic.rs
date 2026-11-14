@@ -236,6 +236,7 @@ impl AnthropicProvider {
     /// is appended per request.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        crate::http::warn_cleartext_once(PROVIDER_ID, &self.base_url);
         self
     }
 

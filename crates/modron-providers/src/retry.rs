@@ -7,9 +7,10 @@
 //! (`HTTP <status>: …`, `timeout: …`, `connection error: …`,
 //! `request failed: …`) and decoded by [`is_retryable`].
 //!
-//! Backoff is exponential with factor 4: 200ms after the first failure,
-//! 800ms after the second (max 3 attempts by default). The delay is
-//! injectable so tests run instantly.
+//! Backoff is exponential with factor 4 from a 500ms base: 500ms after the
+//! first failure, 2s after the second, 8s after the third, and so on (max 5
+//! attempts by default). Retry-After is honored up to 60s and jitter scales
+//! each wait by +/-20%. The delay is injectable so tests run instantly.
 
 use async_trait::async_trait;
 use modron_core::{Error, ModelProvider, Result, TurnRequest, TurnResponse};
@@ -68,13 +69,13 @@ pub fn tokio_sleep() -> DelayFn {
 }
 
 /// Retry policy: at most [`RetryConfig::max_attempts`] attempts (minimum one),
-/// waiting [`RetryConfig::backoff_for`] between attempts — 200ms then 800ms
+/// waiting [`RetryConfig::backoff_for`] between attempts - 500ms then 2s
 /// with the defaults.
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
-    /// Total attempts including the first (default 3).
+    /// Total attempts including the first (default 5).
     pub max_attempts: u32,
-    /// Backoff base for the exponential schedule (default 200ms).
+    /// Backoff base for the exponential schedule (default 500ms).
     pub base_backoff: Duration,
 }
 
@@ -93,7 +94,7 @@ impl Default for RetryConfig {
 
 impl RetryConfig {
     /// Backoff before the retry following `failed_attempt` (0-based):
-    /// `base_backoff * 4^failed_attempt` → 200ms, 800ms, …
+    /// `base_backoff * 4^failed_attempt` -> 500ms, 2s, 8s, ...
     pub fn backoff_for(&self, failed_attempt: u32) -> Duration {
         self.base_backoff
             .saturating_mul(4u32.saturating_pow(failed_attempt))
@@ -138,10 +139,13 @@ fn is_retryable_message(message: &str) -> bool {
     if message.starts_with("timeout:") {
         return true;
     }
-    match http_status(message) {
-        Some(status) => status == 429 || (500..600).contains(&status),
-        None => false,
-    }
+    http_status(message).is_some_and(is_retryable_status)
+}
+
+/// The one HTTP-status predicate both the streaming and non-streaming paths
+/// use: 429 and any 5xx are transient.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
 }
 
 /// The status code of an `HTTP <status>: …` message.
@@ -151,13 +155,11 @@ fn http_status(message: &str) -> Option<u16> {
     digits.parse::<u16>().ok()
 }
 
-/// Statuses replayed on a stream that has emitted nothing yet: rate limit,
-/// the common 5xx, and Anthropic's 529 overload.
+/// HTTP statuses replayed on a stream that has emitted nothing yet. Same
+/// predicate as [`is_retryable`], so replay does not depend on transport mode.
 fn is_stream_replayable_status(err: &Error) -> bool {
     match err {
-        Error::Provider { message, .. } => {
-            matches!(http_status(message), Some(429 | 500 | 502 | 503 | 529))
-        }
+        Error::Provider { message, .. } => http_status(message).is_some_and(is_retryable_status),
         _ => false,
     }
 }
@@ -527,6 +529,8 @@ mod tests {
             "HTTP 502 Bad Gateway: upstream",
             "HTTP 503 Service Unavailable: overloaded",
             "HTTP 529 Overloaded: busy",
+            "HTTP 504 Gateway Timeout: slow upstream",
+            "HTTP 599 Unknown: x",
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let provider = RetryingProvider::new(Arc::new(ErrThenOkStream {
@@ -541,6 +545,20 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{status} should replay: {e}"));
             assert_eq!(response.text, "replayed", "{status}");
             assert_eq!(calls.load(Ordering::SeqCst), 2, "{status}: one replay");
+        }
+    }
+
+    /// The streaming replay predicate and the non-streaming one agree on
+    /// every status: 429 and any 5xx replay, everything else fails fast.
+    #[test]
+    fn streaming_and_non_streaming_replay_predicates_agree() {
+        for status in 400u16..600 {
+            let err = provider_err(&format!("HTTP {status} Status: x"));
+            assert_eq!(
+                is_stream_replayable_status(&err),
+                is_retryable(&err),
+                "status {status}"
+            );
         }
     }
 
