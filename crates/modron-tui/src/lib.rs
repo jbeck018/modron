@@ -524,10 +524,25 @@ pub struct MenuOption {
     pub command: SlashCommand,
 }
 
+/// The user's answer to an approval prompt. Carried explicitly from the key
+/// that chose it to whoever sends the decision on (never re-derived later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalVerdict {
+    Deny,
+    AllowOnce,
+    AllowAll,
+}
+
+/// Decision keys (y / a / n / Esc) are ignored this long after a prompt
+/// becomes visible, so type-ahead cannot approve a call the user never read.
+pub const APPROVAL_KEY_GUARD: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// A tool call awaiting the user's y/n/a decision.
 pub struct PendingApproval {
     pub call: ToolCall,
-    pub respond: Sender<bool>,
+    pub respond: Sender<ApprovalVerdict>,
+    /// When the prompt became visible (drives [`APPROVAL_KEY_GUARD`]).
+    pub shown_at: std::time::Instant,
 }
 
 /// The live region's state machine. Pure: events in, [`Action`] out.
@@ -945,18 +960,29 @@ impl App {
 
         // Approval modal: keys route to the decision, not the input line.
         if let Some(pending) = self.pending_approval.take() {
+            // Type-ahead guard: a decision key that arrives right as the
+            // prompt appears was typed before the user could read it. Keep
+            // the prompt and ignore the key; the user presses again.
+            let decision_key = matches!(
+                key.code,
+                KeyCode::Char('y' | 'Y' | 'a' | 'A' | 'n' | 'N') | KeyCode::Esc
+            );
+            if decision_key && pending.shown_at.elapsed() < APPROVAL_KEY_GUARD {
+                self.pending_approval = Some(pending);
+                return Action::None;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let _ = pending.respond.send(true);
+                    let _ = pending.respond.send(ApprovalVerdict::AllowOnce);
                     return Action::None;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     self.approve_rest = true;
-                    let _ = pending.respond.send(true);
+                    let _ = pending.respond.send(ApprovalVerdict::AllowAll);
                     return Action::None;
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    let _ = pending.respond.send(false);
+                    let _ = pending.respond.send(ApprovalVerdict::Deny);
                     return Action::None;
                 }
                 KeyCode::Char('c')
@@ -964,7 +990,7 @@ impl App {
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
-                    let _ = pending.respond.send(false);
+                    let _ = pending.respond.send(ApprovalVerdict::Deny);
                     return Action::Quit;
                 }
                 _ => {
@@ -2157,7 +2183,9 @@ impl App {
             .chars()
             .take_while(|ch| !ch.is_whitespace())
             .collect();
-        Some((at, frag))
+        // CHAR offset, like `cursor`: `complete_at` splices by char index.
+        let at_char = self.input[..at].chars().count();
+        Some((at_char, frag))
     }
 
     /// The `@`-completion candidates: the cached workspace walk filtered

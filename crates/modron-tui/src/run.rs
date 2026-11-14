@@ -9,7 +9,7 @@
 //! park the engine task via `tokio::task::block_in_place` until the user
 //! decides.
 
-use crate::{App, AuthFlow, PendingApproval, PendingCommand};
+use crate::{App, ApprovalVerdict, AuthFlow, PendingApproval, PendingCommand};
 use modron_core::{
     ApprovalMode, Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
     ToolActivitySink, ToolCall,
@@ -230,7 +230,7 @@ impl Drop for TerminalGuard {
 /// closures clone the call they were handed; the remote driver carries the
 /// wire's call verbatim); the render loop drains it into the App; the
 /// response channel carries the decision.
-type ApprovalSlot = Arc<Mutex<Option<(ToolCall, mpsc::Sender<bool>)>>>;
+type ApprovalSlot = Arc<Mutex<Option<(ToolCall, mpsc::Sender<ApprovalVerdict>)>>>;
 
 #[derive(Clone)]
 struct ApprovalBus {
@@ -245,13 +245,12 @@ struct ApprovalBus {
 /// was released without a verdict (the prompt was dropped locally, or the
 /// request was already resolved elsewhere): send nothing, because the
 /// server rejects a decision for an unknown request id.
-fn remote_decision(received: Option<bool>, allow_rest: bool) -> Option<modron_protocol::Decision> {
+fn remote_decision(received: Option<ApprovalVerdict>) -> Option<modron_protocol::Decision> {
     use modron_protocol::Decision;
-    match received {
-        None => None,
-        Some(false) => Some(Decision::Deny),
-        Some(true) if allow_rest => Some(Decision::AllowAll),
-        Some(true) => Some(Decision::AllowOnce),
+    match received? {
+        ApprovalVerdict::Deny => Some(Decision::Deny),
+        ApprovalVerdict::AllowOnce => Some(Decision::AllowOnce),
+        ApprovalVerdict::AllowAll => Some(Decision::AllowAll),
     }
 }
 
@@ -464,7 +463,11 @@ fn build_local_engine(
             *approval_for_builder.slot.lock().unwrap() = Some((call.clone(), respond));
             // Park the engine task until the render loop delivers the
             // decision. block_in_place keeps other runtime workers alive.
-            tokio::task::block_in_place(|| receiver.recv().unwrap_or(false))
+            tokio::task::block_in_place(|| {
+                receiver
+                    .recv()
+                    .is_ok_and(|verdict| verdict != ApprovalVerdict::Deny)
+            })
         }),
     })
 }
@@ -766,7 +769,11 @@ impl RunState {
         if app.pending_approval.is_none() {
             if let Some((call, respond)) = self.approval.slot.lock().unwrap().take() {
                 self.approval_request = self.approval.request_id.lock().unwrap().take();
-                app.pending_approval = Some(PendingApproval { call, respond });
+                app.pending_approval = Some(PendingApproval {
+                    call,
+                    respond,
+                    shown_at: std::time::Instant::now(),
+                });
             }
         }
     }
@@ -1388,7 +1395,7 @@ impl RunState {
         if app.approve_rest {
             if let Some((_, respond)) = self.approval.slot.lock().unwrap().take() {
                 self.approval.request_id.lock().unwrap().take();
-                let _ = respond.send(true);
+                let _ = respond.send(ApprovalVerdict::AllowAll);
             }
         }
     }
@@ -2195,6 +2202,11 @@ fn spawn_remote_driver(
         // The last approval request queued for the loop (dedupes a prompt
         // that arrives both live and in an attach snapshot).
         let mut seen_approval: Option<String> = None;
+        // Undecodable frames seen while connecting (the attach snapshot
+        // wait skips them) are announced here, once.
+        if client.take_undecodable_notice() {
+            let _ = ui_tx.send(UiFrame::Note(crate::remote::UNDECODABLE_NOTICE.into()));
+        }
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
@@ -2274,7 +2286,14 @@ fn spawn_remote_driver(
                         let _ = ui_tx.send(UiFrame::Disconnected);
                         break;
                     }
-                    Some(frame) => {
+                    Some(crate::remote::Inbound::Undecodable) => {
+                        if client.take_undecodable_notice() {
+                            let _ = ui_tx.send(UiFrame::Note(
+                                crate::remote::UNDECODABLE_NOTICE.into(),
+                            ));
+                        }
+                    }
+                    Some(crate::remote::Inbound::Frame(frame)) => {
                         // /new adoption (stateful): the correlated reply
                         // names the fresh session; attach so its snapshot
                         // and live fold take over.
@@ -2298,7 +2317,7 @@ fn spawn_remote_driver(
                                 let _ = ui_tx.send(UiFrame::Entries(new));
                             }
                         }
-                        for input in frame_to_inputs(frame) {
+                        for input in frame_to_inputs(*frame) {
                             match input {
                                 LoopInput::Delta(d) => {
                                     let _ = delta_tx.send(DeltaOrTool::Delta(d));
@@ -2346,16 +2365,12 @@ fn spawn_remote_driver(
                                     *approval.request_id.lock().unwrap() = Some(request_id.clone());
                                     *approval.slot.lock().unwrap() = Some((call, respond));
                                     let cmd_tx = cmd_tx.clone();
-                                    let rest = approval.rest_approved.clone();
                                     tokio::task::spawn_blocking(move || {
                                         // Released without a verdict (dropped
                                         // locally, or resolved elsewhere): send
                                         // nothing; the server rejects unknown ids.
                                         let received = receiver.recv().ok();
-                                        if let Some(decision) = remote_decision(
-                                            received,
-                                            rest.load(Ordering::Relaxed),
-                                        ) {
+                                        if let Some(decision) = remote_decision(received) {
                                             let _ = cmd_tx
                                                 .send(LoopCmd::Approve { request_id, decision });
                                         }
@@ -2627,28 +2642,58 @@ mod approval_state_tests {
     #[test]
     fn a_released_remote_waiter_sends_nothing() {
         // Dropped locally (or resolved elsewhere): no verdict, no send.
-        assert_eq!(remote_decision(None, true), None);
-        assert_eq!(remote_decision(None, false), None);
-        assert_eq!(remote_decision(Some(false), true), Some(Decision::Deny));
+        assert_eq!(remote_decision(None), None);
         assert_eq!(
-            remote_decision(Some(true), false),
+            remote_decision(Some(ApprovalVerdict::Deny)),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            remote_decision(Some(ApprovalVerdict::AllowOnce)),
             Some(Decision::AllowOnce)
         );
-        assert_eq!(remote_decision(Some(true), true), Some(Decision::AllowAll));
+        assert_eq!(
+            remote_decision(Some(ApprovalVerdict::AllowAll)),
+            Some(Decision::AllowAll)
+        );
+    }
+
+    #[test]
+    fn allow_all_key_sends_allow_all_even_before_the_flag_is_mirrored() {
+        // The race: the `a` key is handled, the waiter wakes, and the
+        // shared rest flag has NOT been mirrored yet. The decision must
+        // still be AllowAll, carried from the key handler itself.
+        let (_state, mut app, approval) = state_with_bus();
+        let (respond, receiver) = mpsc::channel::<ApprovalVerdict>();
+        app.pending_approval = Some(PendingApproval {
+            call: call("a-key"),
+            respond,
+            shown_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        });
+        let key = crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('a'));
+        app.on_key(key);
+        assert!(
+            !approval.rest_approved.load(Ordering::Relaxed),
+            "the mirror has not run yet"
+        );
+        assert_eq!(
+            remote_decision(receiver.recv().ok()),
+            Some(Decision::AllowAll)
+        );
     }
 
     #[test]
     fn a_run_boundary_clears_the_app_and_the_approver_bus() {
         let (mut state, mut app, approval) = state_with_bus();
-        let (respond, receiver) = mpsc::channel::<bool>();
+        let (respond, receiver) = mpsc::channel::<ApprovalVerdict>();
         app.approve_rest = true;
         app.pending_approval = Some(PendingApproval {
             call: call("shown"),
             respond,
+            shown_at: std::time::Instant::now(),
         });
         approval.rest_approved.store(true, Ordering::Relaxed);
         *approval.request_id.lock().unwrap() = Some("req-q".into());
-        let (queued, _queued_rx) = mpsc::channel::<bool>();
+        let (queued, _queued_rx) = mpsc::channel::<ApprovalVerdict>();
         *approval.slot.lock().unwrap() = Some((call("queued"), queued));
         state.approval_request = Some("req-shown".into());
 
@@ -2680,10 +2725,11 @@ mod approval_state_tests {
         let (mut state, mut app, _approval) = state_with_bus();
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
         state.ui_rx = ui_rx;
-        let (respond, _rx) = mpsc::channel::<bool>();
+        let (respond, _rx) = mpsc::channel::<ApprovalVerdict>();
         app.pending_approval = Some(PendingApproval {
             call: call("shown"),
             respond,
+            shown_at: std::time::Instant::now(),
         });
         state.approval_request = Some("req-shown".into());
 
