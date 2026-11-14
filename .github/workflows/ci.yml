@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -25,26 +28,31 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
+          toolchain: 1.99.1
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Format check
         run: cargo fmt --all --check
       # modron-desktop (gpui) needs Linux GUI system libs the runner does
       # not ship; the macOS job covers the desktop crate, Linux covers the
       # headless workspace (server/protocol/view/TUI/mobile-core).
       - name: Clippy
+        env:
+          MATRIX_OS: ${{ matrix.os }}
         run: |
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          if [ "$MATRIX_OS" = "ubuntu-latest" ]; then
             cargo clippy --workspace --exclude modron-desktop --all-targets -- -D warnings
           else
             cargo clippy --workspace --all-targets -- -D warnings
           fi
       - name: Tests (offline — the mock provider is the acceptance harness)
+        env:
+          MATRIX_OS: ${{ matrix.os }}
         run: |
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          if [ "$MATRIX_OS" = "ubuntu-latest" ]; then
             cargo test --workspace --exclude modron-desktop
           else
             cargo test --workspace
@@ -75,10 +83,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-deny
       - name: cargo-deny check (advisories, licenses, bans, sources)
@@ -96,18 +106,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p modron-cli
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET" -p modron-cli
       - name: Binary size (keep it honest — PLAN §"lightweight")
-        run: ls -lh target/${{ matrix.target }}/release/modron
-      - uses: actions/upload-artifact@v4
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ls -lh "target/$TARGET/release/modron"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: modron-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/modron
