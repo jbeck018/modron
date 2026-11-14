@@ -789,6 +789,15 @@ async fn handle_fork(
     }
 }
 
+/// The hub handle for a session that already exists in the store, created
+/// on demand. A worktree task's session runs its engine INSIDE the task's
+/// worktree: after a server restart the handle is gone, and re-creating it
+/// without the recorded worktree would run the task in the base checkout.
+fn ensure_session_for(state: &ServerState, id: SessionId) -> Arc<crate::hub::SessionHandle> {
+    let worktree = state.tasks.get(&id).map(|record| record.worktree);
+    state.hub.ensure_session_in(id, Some(id), worktree)
+}
+
 async fn handle_delete_session(
     state: &Arc<ServerState>,
     ctx: &mut ConnCtx,
@@ -1174,7 +1183,7 @@ async fn submit(
                     return;
                 }
             };
-            let handle = state.hub.ensure_session(meta.id, Some(meta.id));
+            let handle = ensure_session_for(state, meta.id);
             let engine = handle.engine_cell().clone();
             let run =
                 Box::pin(async move { engine.run_task_with_attachments(&task, attachments).await });
@@ -1201,7 +1210,7 @@ async fn submit(
                     return;
                 }
             };
-            let handle = state.hub.ensure_session(id, Some(id));
+            let handle = ensure_session_for(state, id);
             // Re-arm the adoption pin: a known session always runs in
             // itself, even when an earlier run already consumed the pin
             // without writing an event (LG-e).
@@ -1270,7 +1279,7 @@ async fn attach(
                     return;
                 }
             }
-            state.hub.ensure_session(session_id, Some(session_id))
+            ensure_session_for(state, session_id)
         }
     };
 
@@ -1575,6 +1584,33 @@ mod tests {
     }
 
     /// LG-b: a running session is refused, and nothing is removed.
+    /// After a restart the hub has no handle for a task session; the one
+    /// re-created on attach/submit must run in the task's worktree, not in
+    /// the served repo.
+    #[tokio::test]
+    async fn a_recreated_task_session_runs_in_its_worktree() {
+        let (state, _dir) = test_state();
+        let worktree = tempfile::tempdir().unwrap();
+        let task = state.store.create_session("task").await.unwrap().id;
+        let plain = state.store.create_session("plain").await.unwrap().id;
+        state.tasks.insert(TaskRecord {
+            session_id: task,
+            worktree: worktree.path().to_path_buf(),
+            branch: "task-branch".into(),
+            base: "main".into(),
+            title: "task".into(),
+        });
+        assert!(state.hub.handle(&task).is_none(), "no live handle yet");
+        let handle = ensure_session_for(&state, task);
+        assert_eq!(handle.working_dir(), worktree.path());
+        let handle = ensure_session_for(&state, plain);
+        assert_ne!(
+            handle.working_dir(),
+            worktree.path(),
+            "a non-task session keeps the engine's own working dir"
+        );
+    }
+
     #[tokio::test]
     async fn delete_session_refuses_a_running_session_and_keeps_its_state() {
         let (state, _dir) = test_state();
