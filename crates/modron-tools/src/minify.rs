@@ -300,11 +300,13 @@ fn minify_treesitter(content: &str, path: &str) -> Option<String> {
     let mut prev_kept: Option<usize> = None; // last emitted real row
     for &row in rows.iter().filter(|r| **r < lines.len()) {
         let trimmed = lines[row].trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || prev_kept == Some(row) {
+            // Blank, or a second definition on a line already emitted.
             continue;
         }
         if let Some(prev) = prev_kept {
-            let gap = row - prev - 1;
+            // Saturating: two definitions on one row give `row == prev`.
+            let gap = row.saturating_sub(prev + 1);
             if gap > 0 {
                 out.push_str(&format!("… [+{gap} lines elided]\n"));
             }
@@ -313,7 +315,7 @@ fn minify_treesitter(content: &str, path: &str) -> Option<String> {
         prev_kept = Some(row);
     }
     if let Some(prev) = prev_kept {
-        let gap = lines.len() - prev - 1;
+        let gap = lines.len().saturating_sub(prev + 1);
         if gap > 0 {
             out.push_str(&format!("… [+{gap} lines elided]\n"));
         }
@@ -523,6 +525,16 @@ mod tests {
         );
         assert!(c.contains("helper"), "{c}");
         assert!(!c.contains("Println"), "body elided: {c}");
+    }
+
+    #[tokio::test]
+    async fn two_definitions_on_one_line_have_no_gap_marker() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("one.rs"), "fn a() {} fn b() {}\n").unwrap();
+        let out = run(json!({"path": "one.rs"}), dir.path()).await;
+        assert!(!out.is_error, "{out:?}");
+        assert!(!out.content.contains("lines elided"), "{}", out.content);
+        assert_eq!(out.content.matches("[L1]").count(), 1, "{}", out.content);
     }
 
     #[tokio::test]

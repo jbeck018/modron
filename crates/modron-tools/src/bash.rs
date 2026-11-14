@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use modron_core::hooks::scrub_tokio_command;
 use modron_core::{Result, Tool, ToolCtx, ToolOutcome, ToolSpec};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -239,22 +240,134 @@ fn relay_oversized(text: &str) -> String {
     if text.len() <= RELAY_THRESHOLD_BYTES {
         return text.to_string();
     }
-    let dir = std::env::temp_dir().join("modron-relay");
-    // 0700: the relay dir holds command output and its name is guessable —
-    // other local users must not be able to pre-create or write inside it
-    // (symlink attacks on the predictable file name).
-    let _ = std::fs::create_dir_all(&dir);
+    match relay_to_dir(&relay_dir(), text) {
+        Some(path) => summarize_relayed(text, &path),
+        // Relay is best-effort: fall back to the old hard cap.
+        None => text.to_string(),
+    }
+}
+
+/// Relay directory for this user. `$XDG_RUNTIME_DIR` is already private to
+/// the user; otherwise a per-user name under the temp dir, so another local
+/// user cannot pre-create the directory the relay writes into.
+fn relay_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(base) => PathBuf::from(base).join("modron-relay"),
+        None => std::env::temp_dir().join(format!("modron-relay-{}", owner_tag())),
+    }
+}
+
+#[cfg(unix)]
+fn owner_tag() -> String {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }.to_string()
+}
+#[cfg(not(unix))]
+fn owner_tag() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".into())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+/// Relay files older than this are pruned when a new one is written.
+const RELAY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Writes `text` as a new 0600 file in the private relay directory `dir`,
+/// pruning old relay files first. `None` when the directory fails
+/// verification or the write fails.
+fn relay_to_dir(dir: &Path, text: &str) -> Option<PathBuf> {
+    if !prepare_private_dir(dir) {
+        return None;
+    }
+    prune_old_relays(dir, RELAY_RETENTION);
+    let name = format!("{}-{}.txt", chrono_now_compact(), fnv8(text.as_bytes()));
+    let path = dir.join(name);
+    write_private_file(&path, text).ok()?;
+    Some(path)
+}
+
+/// Creates `dir` with mode 0700 and verifies it: a real directory (not a
+/// symlink), owned by the current uid. A loose mode is tightened only on a
+/// directory we own; anything else is refused.
+fn prepare_private_dir(dir: &Path) -> bool {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        // AlreadyExists is expected; the verification below decides.
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return false;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return false;
+        }
+        // SAFETY: getuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::getuid() } {
+            return false;
+        }
+        if meta.mode() & 0o077 != 0 {
+            if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+                return false;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(dir) else {
+                return false;
+            };
+            if meta.mode() & 0o077 != 0 {
+                return false;
+            }
+        }
+        true
     }
-    let name = format!("{}-{}.txt", chrono_now_compact(), fnv8(text.as_bytes()),);
-    let path = dir.join(name);
-    if std::fs::write(&path, text).is_err() {
-        // Relay is best-effort: fall back to the old hard cap.
-        return text.to_string();
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::create_dir_all(dir);
+        dir.is_dir()
     }
+}
+
+/// Creates a new file that is readable and writable by the owner only.
+/// `create_new` never opens or follows an existing path.
+fn write_private_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(text.as_bytes())
+}
+
+/// Best effort: removes regular files in `dir` last modified more than
+/// `max_age` ago. Symlinks and directories are left alone.
+fn prune_old_relays(dir: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if now.duration_since(modified).is_ok_and(|age| age > max_age) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Head + tail of the relayed text, with the path the full output lives at.
+fn summarize_relayed(text: &str, path: &Path) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let head: Vec<&str> = lines.iter().take(RELAY_HEAD_LINES).copied().collect();
     let tail: Vec<&str> = lines
@@ -492,16 +605,80 @@ mod tests {
             out.content.len()
         );
         // The relay file exists and holds the full output.
-        let path_start = out.content.find("modron-relay/").expect("relay path");
-        let rel: String = out.content[path_start..]
-            .chars()
-            .take_while(|c| *c != ' ' && *c != '\n')
-            .collect();
-        let file_name = rel.strip_prefix("modron-relay/").unwrap_or(&rel);
-        let full =
-            std::fs::read_to_string(std::env::temp_dir().join("modron-relay").join(file_name))
-                .unwrap_or_default();
+        let marker = "relayed to ";
+        let start = out.content.find(marker).expect("relay path") + marker.len();
+        let end = out.content[start..].find(" —").expect("relay path end");
+        let full = std::fs::read_to_string(&out.content[start..start + end]).unwrap_or_default();
         assert!(full.lines().count() == 100_000, "full output relayed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_directory_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempdir().unwrap();
+        let dir = base.path().join("relay");
+        let file = relay_to_dir(&dir, &"line\n".repeat(3000)).expect("relayed");
+        let dir_mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "dir mode");
+        assert_eq!(file_mode & 0o777, 0o600, "file mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_directory_we_own_is_tightened_before_use() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempdir().unwrap();
+        let dir = base.path().join("relay");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let file = relay_to_dir(&dir, &"x\n".repeat(5000)).expect("relayed");
+        let dir_mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o077, 0, "group/other bits must be cleared");
+        assert!(file.starts_with(&dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_relay_directory_is_refused() {
+        let base = tempdir().unwrap();
+        let target = base.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.path().join("relay");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(relay_to_dir(&link, &"x\n".repeat(5000)).is_none());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_relay_files_are_pruned() {
+        let base = tempdir().unwrap();
+        let dir = base.path().join("relay");
+        std::fs::create_dir(&dir).unwrap();
+        let old = dir.join("old.txt");
+        std::fs::write(&old, "stale").unwrap();
+        let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+        let fresh = dir.join("fresh.txt");
+        std::fs::write(&fresh, "recent").unwrap();
+
+        let made = relay_to_dir(&dir, &"x\n".repeat(5000)).expect("relayed");
+        assert!(!old.exists(), "stale relay file removed");
+        assert!(fresh.exists(), "recent relay file kept");
+        assert!(made.exists());
     }
 
     #[tokio::test]
