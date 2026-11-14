@@ -130,6 +130,10 @@ enum Command {
         /// Remote-control bridge base (wss://host) used by /publish.
         #[arg(long)]
         bridge: Option<String>,
+        /// Require a paired device token on every hello, even when listening
+        /// on loopback. Use this behind tailscale-serve or cloudflared.
+        #[arg(long)]
+        require_token: bool,
     },
     /// Manage paired remote devices (Phase 3): mint, list, revoke the
     /// bearer tokens remote clients send in their hello frame.
@@ -561,7 +565,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // `modron serve` — the remote-control session server (Phase 2). Built
     // exactly like `daemon start`: same agent path, long-lived process.
-    if let Some(Command::Serve { listen, bridge }) = &cli.command {
+    if let Some(Command::Serve {
+        listen,
+        bridge,
+        require_token,
+    }) = &cli.command
+    {
         let mcp = spawn_mcp_servers(&cfg).await?;
         let agent = build_agent_with(
             &cli,
@@ -575,6 +584,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             &modron_server::ServeOptions {
                 listen: Some(listen.clone()),
                 bridge_base: bridge.clone(),
+                require_token: *require_token,
                 ..modron_server::ServeOptions::default()
             },
         )

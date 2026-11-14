@@ -33,6 +33,12 @@ pub struct ServeOptions {
     /// Remote-control bridge base (scheme + host) used by /publish; the
     /// `/remote-control` command takes its own URL.
     pub bridge_base: Option<String>,
+    /// Force untrusted handling on the WS listener even when it is bound to
+    /// loopback: every hello must present a paired device token (D3).
+    pub require_token: bool,
+    /// Exact `Origin` header values a browser upgrade may present. Empty by
+    /// default: any upgrade that carries an `Origin` header is refused (D3).
+    pub allowed_origins: Vec<String>,
 }
 
 /// The addresses a server actually bound (returned by [`bind_server`]).
@@ -116,11 +122,13 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
                 .await
                 .with_context(|| format!("cannot bind WS listener on {addr}"))?;
             let bound = listener.local_addr()?;
-            let trusted = bound.ip().is_loopback();
+            // Loopback is trusted unless the operator forces tokens (D3).
+            let trusted = bound.ip().is_loopback() && !options.require_token;
             tasks.push(tokio::spawn(ws::run_ws_listener(
                 listener,
                 Arc::clone(&state),
                 trusted,
+                Arc::new(options.allowed_origins.clone()),
             )));
             Some(bound)
         }

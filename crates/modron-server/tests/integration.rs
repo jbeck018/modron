@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{bash_call, read_call, spawn_server, text_turn, WsClient};
+use common::{bash_call, read_call, spawn_server, spawn_server_with, text_turn, WsClient};
 use modron_protocol::{Decision, Payload};
 use std::time::Duration;
 
@@ -663,5 +663,109 @@ async fn sequential_runs_reuse_the_session_and_seq_rises() {
         Payload::TurnDone { summary } => assert_eq!(summary.answer, "two"),
         other => panic!("expected turn_done, got {other:?}"),
     }
+    server.server.shutdown();
+}
+
+/// B1 (D3): a browser sends an `Origin` header on the WS upgrade. A foreign
+/// origin is refused at the HTTP handshake, before any frame is read.
+#[tokio::test]
+async fn ws_upgrade_with_foreign_origin_is_refused() {
+    let server = spawn_server(vec![text_turn("unused")], 0).await;
+    let result = WsClient::open_ws(server.addr, Some("https://evil.example")).await;
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 403);
+        }
+        Err(other) => panic!("expected an HTTP 403 refusal, got {other:?}"),
+        Ok(_) => panic!("upgrade with foreign Origin must be refused"),
+    }
+    server.server.shutdown();
+}
+
+/// B1 (D3): a loopback upgrade with no `Origin` header (native clients,
+/// the TUI, the CLI) keeps working and is trusted without a token.
+#[tokio::test]
+async fn ws_upgrade_without_origin_on_loopback_still_works() {
+    let server = spawn_server(vec![text_turn("unused")], 0).await;
+    let mut client = WsClient::connect(server.addr).await;
+    client.close().await;
+    server.server.shutdown();
+}
+
+/// B1 (D3): an explicitly allowlisted origin is accepted; the allowlist is
+/// exact-match, so a different origin is still refused.
+#[tokio::test]
+async fn ws_upgrade_allowlisted_origin_is_accepted() {
+    let server = spawn_server_with(vec![text_turn("unused")], 0, |options| {
+        options.allowed_origins = vec!["https://app.example".into()];
+    })
+    .await;
+
+    let mut client = WsClient::open_ws(server.addr, Some("https://app.example"))
+        .await
+        .expect("allowlisted origin upgrades");
+    client
+        .send(Payload::Hello {
+            client: "test-client".into(),
+            protocol: modron_protocol::PROTOCOL_VERSION,
+            token: None,
+        })
+        .await;
+    let welcome = client.recv().await;
+    assert!(matches!(welcome.payload, Payload::Welcome { .. }));
+    client.close().await;
+
+    let refused = WsClient::open_ws(server.addr, Some("https://app.example.evil")).await;
+    assert!(refused.is_err(), "non-allowlisted origin must be refused");
+    server.server.shutdown();
+}
+
+/// B1 (D3): `--require-token` forces untrusted handling even on loopback:
+/// a hello without a token is rejected with an auth error and closed.
+#[tokio::test]
+async fn require_token_rejects_loopback_hello_without_token() {
+    let server = spawn_server_with(vec![text_turn("unused")], 0, |options| {
+        options.require_token = true;
+    })
+    .await;
+    let mut client = WsClient::open_ws(server.addr, None)
+        .await
+        .expect("loopback upgrade without Origin still succeeds");
+    client
+        .send(Payload::Hello {
+            client: "test-client".into(),
+            protocol: modron_protocol::PROTOCOL_VERSION,
+            token: None,
+        })
+        .await;
+    let reply = client.recv().await;
+    match reply.payload {
+        Payload::Error { kind, .. } => {
+            assert_eq!(kind, Some(modron_protocol::ErrorKind::Auth));
+        }
+        other => panic!("expected auth error, got {other:?}"),
+    }
+    server.server.shutdown();
+}
+
+/// B1 (D3): with `--require-token`, a hello carrying a paired device token
+/// is still accepted.
+#[tokio::test]
+async fn require_token_accepts_paired_device_token() {
+    let server = spawn_server_with(vec![text_turn("unused")], 0, |options| {
+        options.require_token = true;
+    })
+    .await;
+    let record = modron_server::grant(&server.clients_dir_path(), "tablet").unwrap();
+    let mut client = WsClient::open_ws(server.addr, None).await.unwrap();
+    client
+        .send(Payload::Hello {
+            client: "test-client".into(),
+            protocol: modron_protocol::PROTOCOL_VERSION,
+            token: Some(record.token),
+        })
+        .await;
+    let reply = client.recv().await;
+    assert!(matches!(reply.payload, Payload::Welcome { .. }));
     server.server.shutdown();
 }
