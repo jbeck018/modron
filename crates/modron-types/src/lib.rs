@@ -109,16 +109,29 @@ pub enum StopReason {
 
 /// Provider-reported usage is ground truth for all accounting. Never replace
 /// it with estimates in recorded data; estimates are pre-flight only.
+///
+/// One meaning for every provider (E3):
+/// - `input_tokens` is ALL prompt tokens billed for the request, INCLUDING
+///   cache reads and cache writes. Providers whose wire format reports
+///   cache counts separately (Anthropic: `input_tokens` +
+///   `cache_read_input_tokens` + `cache_creation_input_tokens`) sum them
+///   before filling this field.
+/// - `cached_input_tokens` is the cache-READ portion of `input_tokens`
+///   (always `<= input_tokens` for well-formed provider data).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// All prompt tokens for the request, including cache reads and writes.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// The cache-read subset of `input_tokens`.
     pub cached_input_tokens: u64,
 }
 
 impl Usage {
+    /// Budget-facing total: prompt (including cache) plus output tokens.
+    /// Saturates instead of overflowing on hostile or corrupt counts.
     pub fn total(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 }
 
@@ -403,5 +416,21 @@ mod tests {
             .total(),
             5
         );
+    }
+
+    #[test]
+    fn usage_total_saturates_instead_of_overflowing() {
+        let usage = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+        };
+        assert_eq!(usage.total(), u64::MAX);
+        let normal = Usage {
+            input_tokens: 3,
+            output_tokens: 4,
+            cached_input_tokens: 1,
+        };
+        assert_eq!(normal.total(), 7);
     }
 }

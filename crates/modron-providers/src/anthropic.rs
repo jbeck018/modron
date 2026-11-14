@@ -307,8 +307,12 @@ struct StreamAccumulator {
     /// `(block index, id, name, accumulated partial_json)` for `tool_use`
     /// blocks, in first-appearance order.
     tool_blocks: Vec<(u64, String, String, String)>,
+    /// Anthropic's uncached `input_tokens` (message_start only).
     input_tokens: u64,
-    cached_input_tokens: u64,
+    /// `cache_read_input_tokens` (message_start only).
+    cache_read_input_tokens: u64,
+    /// `cache_creation_input_tokens` (message_start only).
+    cache_creation_input_tokens: u64,
     output_tokens: u64,
     stop_reason: Option<String>,
     saw_message_start: bool,
@@ -333,7 +337,13 @@ impl StreamAccumulator {
                         self.input_tokens = n;
                     }
                     if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-                        self.cached_input_tokens = n;
+                        self.cache_read_input_tokens = n;
+                    }
+                    if let Some(n) = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                    {
+                        self.cache_creation_input_tokens = n;
                     }
                 }
             }
@@ -512,9 +522,13 @@ impl StreamAccumulator {
             text,
             tool_calls,
             usage: Usage {
-                input_tokens: self.input_tokens,
+                input_tokens: billed_input_tokens(
+                    self.input_tokens,
+                    self.cache_read_input_tokens,
+                    self.cache_creation_input_tokens,
+                ),
                 output_tokens: self.output_tokens,
-                cached_input_tokens: self.cached_input_tokens,
+                cached_input_tokens: self.cache_read_input_tokens,
             },
             stop_reason: map_stop_reason(self.stop_reason.as_deref()),
         })
@@ -719,10 +733,12 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
         }
     }
 
+    let cache_read = resp.usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_creation = resp.usage.cache_creation_input_tokens.unwrap_or(0);
     let usage = Usage {
-        input_tokens: resp.usage.input_tokens,
+        input_tokens: billed_input_tokens(resp.usage.input_tokens, cache_read, cache_creation),
         output_tokens: resp.usage.output_tokens,
-        cached_input_tokens: resp.usage.cache_read_input_tokens.unwrap_or(0),
+        cached_input_tokens: cache_read,
     };
     Ok(TurnResponse {
         text,
@@ -759,10 +775,22 @@ struct AnthropicResponse {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
+    /// Uncached input only; cache reads and writes are reported separately.
     input_tokens: u64,
     output_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
+/// Modron's `Usage.input_tokens` meaning (E3): every prompt token billed for
+/// the request. Anthropic reports `input_tokens` EXCLUDING cache reads and
+/// writes, so the three counts are summed here (saturating).
+fn billed_input_tokens(input: u64, cache_read: u64, cache_creation: u64) -> u64 {
+    input
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation)
 }
 
 /// Known content-block shapes; anything else (e.g. `thinking`) is ignored.
@@ -1103,7 +1131,7 @@ mod tests {
             ],
             "stop_reason": "tool_use",
             "stop_sequence": null,
-            "usage": {"input_tokens": 2095, "output_tokens": 121, "cache_read_input_tokens": 1024}
+            "usage": {"input_tokens": 2095, "output_tokens": 121, "cache_read_input_tokens": 1024, "cache_creation_input_tokens": 512}
         }"#;
         let parsed = parse_response(serde_json::from_str::<Value>(fixture).unwrap()).unwrap();
 
@@ -1113,9 +1141,11 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "glob");
         assert_eq!(parsed.tool_calls[0].arguments["pattern"], "*.rs");
         assert_eq!(parsed.stop_reason, StopReason::ToolUse);
-        assert_eq!(parsed.usage.input_tokens, 2095);
+        // input = uncached + cache reads + cache writes (E3).
+        assert_eq!(parsed.usage.input_tokens, 2095 + 1024 + 512);
         assert_eq!(parsed.usage.output_tokens, 121);
         assert_eq!(parsed.usage.cached_input_tokens, 1024);
+        assert!(parsed.usage.cached_input_tokens <= parsed.usage.input_tokens);
     }
 
     #[test]

@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(s.model, "claude-haiku-5-5");
         assert_eq!(s.provider, "anthropic");
         assert!(s.status_line().contains("110 tok"));
-        assert!(s.status_line().contains("cache 29%"), "{}", s.status_line());
+        assert!(s.status_line().contains("cache 40%"), "{}", s.status_line());
         assert_eq!(s.last_seq, 5);
     }
 
@@ -1357,7 +1357,7 @@ mod tests {
             "glm-5.3",
             "zai",
             "900 tok",
-            "cache 20%",
+            "cache 25%",
             "ask",
             "turns 3",
             "tools 21",

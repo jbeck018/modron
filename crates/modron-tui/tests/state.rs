@@ -1933,7 +1933,7 @@ fn status_strip_consolidates_the_dense_line() {
     let line = app.status_line();
     assert!(line.contains("glm-5.3"), "model first: {line}");
     assert!(line.contains("300 tok"), "cumulative tokens: {line}");
-    assert!(line.contains("cache 25%"), "session cache hit: {line}");
+    assert!(line.contains("cache 33%"), "session cache hit: {line}");
     assert!(line.contains("ctx 30%"), "estimated context: {line}");
     assert!(line.contains("ask (shift+tab)"), "mode + key hint: {line}");
     assert!(line.contains("? shortcuts"), "help hint: {line}");
@@ -2278,7 +2278,7 @@ fn backfill_transcript_rebuilds_scrollback_from_a_replay() {
         "grouped tool summary: {history:?}"
     );
     assert!(
-        history.iter().any(|l| l == "m1 · 110 tok · cache 29%"),
+        history.iter().any(|l| l == "m1 · 110 tok · cache 40%"),
         "usage note (TUI meta arithmetic): {history:?}"
     );
     // The tool summary's events land in tool_log so ctrl+t re-opens them.

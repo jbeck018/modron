@@ -142,15 +142,17 @@ pub fn approval_summary(name: &str, args: &serde_json::Value, max: usize) -> Str
     }
 }
 
-/// Cache-hit percentage for one turn's usage: `100 * cached / (input +
-/// cached)`, `None` when the denominator is zero (the "-" case every
-/// client hand-rolled; six copies collapsed 2026-11-12 cycle-2 audit).
+/// Cache-hit percentage for usage: `100 * cached / input`, clamped to
+/// `0..=100`. `Usage.input_tokens` already includes cache reads and writes
+/// (E3), so `cached` is a subset of it and no addition is needed. `None`
+/// when `input` is zero, so clients keep omitting the figure before any
+/// tokens exist (the "absent before any tokens" contract).
 pub fn cache_hit_pct(usage: &modron_types::Usage) -> Option<f64> {
-    let denom = usage.input_tokens + usage.cached_input_tokens;
-    if denom == 0 {
+    if usage.input_tokens == 0 {
         return None;
     }
-    Some(100.0 * usage.cached_input_tokens as f64 / denom as f64)
+    let pct = 100.0 * usage.cached_input_tokens as f64 / usage.input_tokens as f64;
+    Some(pct.clamp(0.0, 100.0))
 }
 
 /// One subagent row of the swarm view (serde-safe: epoch millis instead
@@ -586,6 +588,29 @@ mod tests {
     use super::*;
     use modron_types::{Message, ToolCall, ToolOutcome};
     use serde_json::json;
+
+    #[test]
+    fn cache_hit_pct_is_cached_over_input() {
+        let usage = modron_types::Usage {
+            input_tokens: 1000,
+            output_tokens: 10,
+            cached_input_tokens: 250,
+        };
+        assert_eq!(cache_hit_pct(&usage), Some(25.0));
+    }
+
+    #[test]
+    fn cache_hit_pct_is_absent_without_input_and_clamped() {
+        let empty = modron_types::Usage::default();
+        assert_eq!(cache_hit_pct(&empty), None);
+        // Corrupt data (cached > input) must not report more than 100%.
+        let corrupt = modron_types::Usage {
+            input_tokens: 10,
+            output_tokens: 0,
+            cached_input_tokens: 40,
+        };
+        assert_eq!(cache_hit_pct(&corrupt), Some(100.0));
+    }
 
     fn done(name: &str, bytes: u64, is_error: bool) -> ToolActivity {
         ToolActivity::Done {

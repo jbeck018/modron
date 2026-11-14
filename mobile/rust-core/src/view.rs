@@ -941,7 +941,7 @@ mod tests {
             ..SessionViewModel::default()
         };
         let snap = ViewModelSnapshot::from_vm(&vm);
-        assert_eq!(snap.status_line, "gpt-5.6-sol · 400 tok · cache 25% · yolo");
+        assert_eq!(snap.status_line, "gpt-5.6-sol · 400 tok · cache 33% · yolo");
         assert_eq!(snap.running_label, "idle");
     }
 
@@ -964,6 +964,6 @@ mod tests {
                 cached_input_tokens: 25,
             },
         });
-        assert_eq!(rows, vec!["100 tok · cache 25%"]);
+        assert_eq!(rows, vec!["100 tok · cache 33%"]);
     }
 }
