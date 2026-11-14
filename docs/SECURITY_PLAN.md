@@ -699,7 +699,7 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 | A4 | H | high | DONE | | 33d6ec2 | Haiku. Also drops orphan results. 2 new tests. |
 | A5 | H | medium | DONE | | bf68f35 | Haiku (with A6). Admission enum shared by execute_tool and the finish gate. |
 | A6 | H | medium | DONE | | 0717656 | Haiku (with A5). 5 new tests across A5/A6. |
-| A7 | L | medium | TODO | | | |
+| A7 | L | medium | DONE | | 3c3ade7 | Leader. Incremental summarizer input + 400 KB cap. 4 new tests. |
 | B1 | H+ | critical | DONE | | bebc4b3 | Haiku, one BLOCKED round (scope widened to tests/common/mod.rs). Leader follow-up: --allow-origin flag. 5 new tests. |
 | B2 | H+ | high | DONE | | 4805603 | Haiku, one BLOCKED round (leader added ErrorKind::Forbidden to scope). Leader follow-up: Detach allowed on scoped ctx. 8 new tests. |
 | B3 | H | high | DONE | | a0e7f27 | Leader. allow_rest cleared in start_run; hub test extended. |
@@ -727,7 +727,7 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 | E5 | H | low | DONE | | 9e47488 | Haiku (with E4). write_private now atomic for every caller. 13 new tests across E4/E5. |
 | E6 | H | medium | DONE | | aa69c81 | Haiku (with E7). |
 | E7 | H | medium | DONE | | 96855e1 | Haiku (with E6). Batch append is one write for the whole batch. 4 new tests. |
-| E8 | L | medium | TODO | | | |
+| E8 | L | medium | DONE | | 8d2f0c2 | Leader. Advisory fail-open lock file; adopts tokens another process rotated. 4 new tests. |
 | F1 | H | high | DONE | | 1fa7242 + 428a1da | Haiku did the CLI marker half and reported BLOCKED; leader added EngineConfig.resume_skip_end. One rewind range per session. |
 | F2 | H | medium | DONE | | 3c0b05c | Haiku (with F4). |
 | F3 | H | low | DONE | | 25d5fb4 | Haiku. Items c, d, e, g untested (need the full binary / live MCP). |
@@ -745,7 +745,7 @@ full rebuild.
 
 Wave 2 gate evidence (leader): fmt clean, clippy clean, 700 tests pass.
 
-Final Haiku-wave gate evidence (leader): fmt clean, clippy clean, 834
+Final gate evidence, all 45 packets (leader): fmt clean, clippy clean, 842
 tests pass on Linux (`--workspace --exclude modron-desktop`). Not verified
 anywhere: crates/modron-desktop (needs macOS), mobile/app/App.tsx (no JS
 toolchain), `cargo deny check`, the GitHub workflows, the container

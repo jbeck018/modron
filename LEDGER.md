@@ -1354,3 +1354,19 @@ is written — the user tests it in their editor. Remaining: the Linux
 sandbox implementation (bubblewrap — the Docker test proves the codebase
 compiles and runs on Linux; the bwrap wrapper is the one missing piece) and
 TUI polish.
+
+## Security and correctness remediation (2026-11-14)
+
+A whole-repo review produced 45 work packets; all 45 are DONE on branch
+`claude/repo-security-review-udrusy`. The plan, design decisions, the
+per-packet ledger with commits and evidence, and the remaining backlog
+live in `docs/SECURITY_PLAN.md`.
+
+Gate evidence on Linux (`--workspace --exclude modron-desktop`): fmt
+clean, clippy clean, 842 tests pass.
+
+NOT verified, needs a macOS / mobile / CI pass before release:
+`crates/modron-desktop` edits (C1, C5, C6, E3), `mobile/app/App.tsx`
+edits (C1, C4, C6), the Seatbelt profile changes (D6), `cargo deny check`
+after the tokio-tungstenite rustls feature (C6), the GitHub workflows
+(G4), and the cloud container image (G1, G2).
