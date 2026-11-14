@@ -1215,7 +1215,7 @@ mod tests {
         // TUI's exact prompt wording.
         assert_eq!(
             s.approval_prompt().as_deref(),
-            Some(r#"⚠ allow edit {"path":"src/lib.rs"}?"#)
+            Some("⚠ allow edit src/lib.rs?")
         );
         // The decision labels are the shared copy.
         assert_eq!(decision_label(Decision::AllowOnce), "allow once");

@@ -100,6 +100,10 @@ pub enum ErrorKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// A Snapshot carries the whole live state by value. Payloads are
+// short-lived (built, serialized, dropped) and boxing one variant would
+// change every construction site in four clients for no real saving.
+#[allow(clippy::large_enum_variant)]
 pub enum Payload {
     // ---- client -> server ----
     /// First frame on a connection. `token` authenticates remote
