@@ -117,22 +117,59 @@ test("settings renders the providers card", async () => {
   expect(app.texts()).toContain("save");
 });
 
+const settle = () => new Promise((resolve) => setTimeout(resolve, 100));
+
 // Editable session config (parity P3): the cycles walk the same orders
-// the TUI uses, and demo echoes the patch locally.
+// the TUI uses, and demo echoes the patch locally. The demo echo only
+// accepts the server's WIRE names (approve_all, bubblewrap), so a label
+// changing here proves the right wire value was sent.
 test("settings cycles approval mode and sandbox", async () => {
   const app = await open("./App.tsx");
   await app.press("settings");
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await settle();
   expect(app.texts()).toContain("approval mode: ask");
   expect(app.texts()).toContain("sandbox: off");
   await app.press("cycle mode");
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await settle();
   expect(app.texts()).toContain("approval mode: yolo");
   await app.press("cycle sandbox");
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await settle();
   expect(app.texts()).toContain("sandbox: seatbelt");
   expect(app.texts()).toContain("save tools");
   expect(app.texts()).toContain("save goal");
+});
+
+// Approval cycle: ask -> approve_all (label yolo) -> deny -> ask. Each
+// step must land, which pins approve_all as the wire value for yolo.
+test("approval cycle sends wire names and wraps", async () => {
+  const app = await open("./App.tsx");
+  await app.press("settings");
+  await settle();
+  await app.press("cycle mode");
+  await settle();
+  expect(app.texts()).toContain("approval mode: yolo");
+  await app.press("cycle mode");
+  await settle();
+  expect(app.texts()).toContain("approval mode: deny");
+  await app.press("cycle mode");
+  await settle();
+  expect(app.texts()).toContain("approval mode: ask");
+});
+
+// Sandbox cycle: off -> seatbelt -> bubblewrap (label bwrap) -> off.
+test("sandbox cycle sends wire names and wraps", async () => {
+  const app = await open("./App.tsx");
+  await app.press("settings");
+  await settle();
+  await app.press("cycle sandbox");
+  await settle();
+  expect(app.texts()).toContain("sandbox: seatbelt");
+  await app.press("cycle sandbox");
+  await settle();
+  expect(app.texts()).toContain("sandbox: bwrap");
+  await app.press("cycle sandbox");
+  await settle();
+  expect(app.texts()).toContain("sandbox: off");
 });
 
 // Router defaults + tasks cards (parity P4): the desktop's microcopy

@@ -35,7 +35,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 /// The `client` string sent in the hello frame.
@@ -161,8 +161,10 @@ pub(crate) fn spawn_task(fut: impl Future<Output = ()> + 'static) {
 struct Shared {
     /// View model + fold bookkeeping.
     state: Mutex<CoreState>,
-    /// Current connection's outgoing frame channel; `None` when down.
-    cmd: Mutex<Option<mpsc::UnboundedSender<Frame>>>,
+    /// The current connection's command side; `None` when down. Lock
+    /// order: `live` before `state` (every path that takes both follows
+    /// it), so the generation checks and the installs are serialized.
+    live: Mutex<Option<Live>>,
     /// Flips to true once the connection dies (`wait_closed`).
     closed_tx: watch::Sender<bool>,
     closed_rx: watch::Receiver<bool>,
@@ -180,12 +182,29 @@ struct CoreState {
     fold: FoldState,
 }
 
+/// One installed connection: the outgoing frame channel the UI-facing
+/// methods write to, and the signal that makes its run loop send a close
+/// frame and exit. Holding `tx` here (not in `establish`) is what lets the
+/// run loop see the channel close.
+struct Live {
+    tx: mpsc::UnboundedSender<Frame>,
+    close: oneshot::Sender<()>,
+}
+
+/// Retire the installed connection, if any: ask its run loop to close the
+/// socket and drop the outgoing channel. Caller holds the `live` lock.
+fn retire(slot: &mut Option<Live>) {
+    if let Some(old) = slot.take() {
+        let _ = old.close.send(());
+    }
+}
+
 impl Shared {
     fn new() -> Self {
         let (closed_tx, closed_rx) = watch::channel(false);
         Self {
             state: Mutex::new(CoreState::default()),
-            cmd: Mutex::new(None),
+            live: Mutex::new(None),
             closed_tx,
             closed_rx,
             gen: AtomicU64::new(0),
@@ -257,13 +276,21 @@ impl RemoteClient {
     /// Bumps the generation so a still-draining old loop cannot clobber
     /// state. `resume` is the reconnect's post-handshake attach.
     fn spin_up(&self, url: &str, token: Option<&str>, resume: Option<(Uuid, u64)>) {
+        // Tear down any previous live connection first, and supersede any
+        // handshake still in flight: its late welcome is then ignored.
+        let gen = {
+            let mut slot = self.shared.live.lock().unwrap();
+            let gen = self.shared.gen.fetch_add(1, Ordering::SeqCst) + 1;
+            retire(&mut slot);
+            gen
+        };
         {
             let mut st = self.shared.state.lock().unwrap();
             st.vm.connection = crate::view::ConnectionState::Connecting;
             st.vm.last_error = None;
             st.vm.sessions.clear();
         }
-        let gen = self.shared.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.shared.closed_tx.send(false);
         let shared = self.shared.clone();
         let url = url.to_string();
         let token = token.map(str::to_string);
@@ -611,10 +638,22 @@ impl RemoteClient {
         ))
     }
 
-    /// Close the connection (the run loop drains, sends a close frame,
-    /// and marks the state disconnected).
+    /// Close the connection: the live run loop sends a close frame and
+    /// exits (the server sees the socket close), any handshake still in
+    /// flight is superseded, and the state goes `Disconnected`. Resolves
+    /// [`Self::wait_closed`] immediately; the close frame itself goes out
+    /// on the run loop's next poll.
     pub fn disconnect(&self) {
-        *self.shared.cmd.lock().unwrap() = None;
+        let mut slot = self.shared.live.lock().unwrap();
+        self.shared.gen.fetch_add(1, Ordering::SeqCst);
+        retire(&mut slot);
+        {
+            let mut st = self.shared.state.lock().unwrap();
+            st.vm.connection = crate::view::ConnectionState::Disconnected;
+            st.vm.last_error = None;
+        }
+        drop(slot);
+        let _ = self.shared.closed_tx.send(true);
     }
 
     // -- internals --------------------------------------------------------
@@ -624,9 +663,9 @@ impl RemoteClient {
     }
 
     fn send_frame(&self, frame: Frame) -> Result<(), ClientError> {
-        let guard = self.shared.cmd.lock().unwrap();
+        let guard = self.shared.live.lock().unwrap();
         match &*guard {
-            Some(tx) => tx.send(frame).map_err(|_| ClientError::Closed),
+            Some(live) => live.tx.send(frame).map_err(|_| ClientError::Closed),
             None => Err(ClientError::Closed),
         }
     }
@@ -647,23 +686,38 @@ async fn establish(
 ) {
     match transport::handshake(&url, token.as_deref()).await {
         Ok((mut conn, server_version)) => {
-            {
-                let mut st = shared.state.lock().unwrap();
-                st.vm.connection = crate::view::ConnectionState::Connected;
-                st.vm.server_version = server_version;
-            }
             let (tx, rx) = mpsc::unbounded_channel();
-            *shared.cmd.lock().unwrap() = Some(tx.clone());
-            if let Some((session_id, last_seq)) = resume {
-                let _ = tx.send(Frame::request(
-                    shared.next_request_id(),
-                    Payload::Attach {
-                        session_id,
-                        last_seq,
-                    },
-                ));
+            let (close, close_rx) = oneshot::channel();
+            // The generation check and the install happen under one lock,
+            // so a handshake superseded by connect/disconnect cannot replace
+            // the newer connection's state.
+            let installed = {
+                let mut slot = shared.live.lock().unwrap();
+                if shared.gen.load(Ordering::SeqCst) != gen {
+                    false
+                } else {
+                    if let Some((session_id, last_seq)) = resume {
+                        // Queued before any caller frame can interleave.
+                        let _ = tx.send(Frame::request(
+                            shared.next_request_id(),
+                            Payload::Attach {
+                                session_id,
+                                last_seq,
+                            },
+                        ));
+                    }
+                    *slot = Some(Live { tx, close });
+                    let mut st = shared.state.lock().unwrap();
+                    st.vm.connection = crate::view::ConnectionState::Connected;
+                    st.vm.server_version = server_version;
+                    true
+                }
+            };
+            if !installed {
+                conn.close().await;
+                return;
             }
-            run_loop(&mut conn, shared, gen, rx).await;
+            run_loop(&mut conn, shared, gen, rx, close_rx).await;
         }
         Err(e) => {
             // A stale establish task (reconnect superseded it) must not
@@ -682,9 +736,15 @@ async fn run_loop(
     shared: Arc<Shared>,
     gen: u64,
     mut rx: mpsc::UnboundedReceiver<Frame>,
+    mut close_rx: oneshot::Receiver<()>,
 ) {
     let reason: Option<String> = loop {
         tokio::select! {
+            // Retired by disconnect() or a newer connect(): close the socket.
+            _ = &mut close_rx => {
+                conn.close().await;
+                break None;
+            }
             cmd = rx.recv() => match cmd {
                 Some(frame) => {
                     let json = match serde_json::to_string(&frame) {
@@ -724,15 +784,17 @@ async fn run_loop(
 /// connection's state alone. `None` = clean close (no error surface);
 /// `Some` = the cause string.
 fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
+    let mut slot = shared.live.lock().unwrap();
     if shared.gen.load(Ordering::SeqCst) != gen {
         return;
     }
+    *slot = None;
     {
         let mut st = shared.state.lock().unwrap();
         st.vm.connection = crate::view::ConnectionState::Disconnected;
-        st.vm.last_error = reason.clone();
+        st.vm.last_error = reason;
     }
-    *shared.cmd.lock().unwrap() = None;
+    drop(slot);
     let _ = shared.closed_tx.send(true);
 }
 
