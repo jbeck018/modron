@@ -149,11 +149,22 @@ pub(crate) async fn check_status(
 ) -> Result<reqwest::Response> {
     let status = response.status();
     if !status.is_success() {
+        // Read the header before `text()` consumes the response. Only the
+        // delay-seconds form is honored; HTTP-dates are ignored.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
         let text = response
             .text()
             .await
             .map_err(|err| crate::transport_error(provider_id, err))?;
-        return Err(crate::http_error(provider_id, status, &text));
+        let mut err = crate::http_error(provider_id, status, &text);
+        if let (Some(seconds), Error::Provider { message, .. }) = (retry_after, &mut err) {
+            message.push_str(&crate::retry::retry_after_tag(seconds));
+        }
+        return Err(err);
     }
     Ok(response)
 }
@@ -459,6 +470,44 @@ mod tests {
             provider: "test".into(),
             message,
         }));
+    }
+
+    /// A 429 carrying `Retry-After: <seconds>` keeps the canonical
+    /// `HTTP 429 …` prefix and gains a parseable `[retry-after=Ns]` tag.
+    #[tokio::test]
+    async fn retry_after_seconds_are_carried_into_the_error() {
+        let client = build_client().unwrap();
+        let raw = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 12\r\ncontent-length: 4\r\nconnection: close\r\n\r\nslow";
+        let addr = serve_once(vec![raw.to_string()]).await;
+        let url = format!("http://{addr}/");
+        let err = post_json(&client, "test", &url, &[], &serde_json::json!({}))
+            .await
+            .expect_err("429 is an error");
+        assert_eq!(
+            crate::retry::retry_after(&err),
+            Some(Duration::from_secs(12))
+        );
+        assert!(crate::retry::is_retryable(&err));
+        let message = provider_message(err);
+        assert!(
+            message.starts_with("HTTP 429 Too Many Requests: slow"),
+            "{message}"
+        );
+        assert!(message.ends_with(" [retry-after=12s]"), "{message}");
+    }
+
+    /// Only the seconds form is honored; an HTTP-date is ignored rather
+    /// than misparsed.
+    #[tokio::test]
+    async fn http_date_retry_after_is_ignored() {
+        let client = build_client().unwrap();
+        let raw = "HTTP/1.1 429 Too Many Requests\r\nretry-after: Wed, 21 Oct 2015 07:28:00 GMT\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let addr = serve_once(vec![raw.to_string()]).await;
+        let url = format!("http://{addr}/");
+        let err = post_json(&client, "test", &url, &[], &serde_json::json!({}))
+            .await
+            .expect_err("429 is an error");
+        assert_eq!(crate::retry::retry_after(&err), None);
     }
 
     /// Response headers that never arrive are bounded by the same idle
