@@ -414,6 +414,11 @@ Serial: C1 -> C2 -> C3 -> C4 -> C5 -> C6.
   serde defaults + doc comment per AGENTS.md process rule 4),
   `crates/modron-server/src/hub.rs` (populate), desktop `app_state.rs`,
   TUI `run.rs`, mobile `view.rs`.
+- Also (from C3): the TUI's `RemoteLists` (run.rs) starts empty per
+  connection; seed it from the snapshot's allow/deny so the first remote
+  `/allow` or `/deny` does not drop entries set elsewhere. Same for the
+  mobile tool editor. The local TUI `/sandbox` arm should accept `bwrap`
+  like the remote one.
 - Acceptance: tests in each client - snapshot with
   `approval_mode = approve_all` renders "yolo"; old snapshots without the
   field still parse.
