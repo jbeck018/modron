@@ -69,6 +69,11 @@ pub struct ConnCtx {
     /// Set by the `hello` handshake.
     pub authed: bool,
     pub subscription: Option<Subscription>,
+    /// `Some(id)` pins the connection to one session (a remote-control
+    /// tunnel, decision D5): only the allowlisted frames are served, and
+    /// every session-addressed frame must name `id`. `None` is an ordinary
+    /// connection, unchanged.
+    pub scope: Option<SessionId>,
 }
 
 impl ConnCtx {
@@ -77,7 +82,47 @@ impl ConnCtx {
             out,
             authed: false,
             subscription: None,
+            scope: None,
         }
+    }
+
+    /// A connection already authenticated by construction (the tunnel's
+    /// key was minted by this server) and scoped to one session.
+    pub fn scoped(out: mpsc::UnboundedSender<Outbound>, session: SessionId) -> Self {
+        Self {
+            out,
+            authed: true,
+            subscription: None,
+            scope: Some(session),
+        }
+    }
+}
+
+/// Scope gate for a pinned connection (D5). Allowed: hello, ping, and
+/// attach / interrupt / submit that name the pinned session. Approve is
+/// checked per request in its own arm (it names no session). Every other
+/// payload is refused by default, so a variant added later is denied
+/// until someone decides otherwise here.
+fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> {
+    match payload {
+        Payload::Hello { .. } | Payload::Ping {} | Payload::Approve { .. } => Ok(()),
+        Payload::Attach { session_id, .. } | Payload::Interrupt { session_id } => {
+            if *session_id == scope {
+                Ok(())
+            } else {
+                Err("this connection is scoped to another session")
+            }
+        }
+        Payload::Submit { session_id, .. } => {
+            // Submit may only continue the pinned session; a new session
+            // (None) or a different id is refused.
+            if *session_id == Some(scope) {
+                Ok(())
+            } else {
+                Err("this connection can only submit to its own session")
+            }
+        }
+        _ => Err("this request is not allowed on a share link"),
     }
 }
 
@@ -142,6 +187,15 @@ pub async fn handle_frame(
     frame: Frame,
 ) -> Flow {
     let request_id = frame.id;
+    if let Some(scope) = ctx.scope {
+        if let Err(message) = scoped_gate(scope, &frame.payload) {
+            send(
+                ctx,
+                error_kind(request_id, message, modron_protocol::ErrorKind::Forbidden),
+            );
+            return Flow::Continue;
+        }
+    }
     match frame.payload {
         Payload::Hello {
             protocol, token, ..
@@ -496,10 +550,26 @@ pub async fn handle_frame(
         Payload::Approve {
             request_id: req,
             decision,
-        } => match state.hub.resolve_any(&req, decision) {
-            Ok(_) => {}
-            Err(message) => send(ctx, error(request_id, message)),
-        },
+        } => {
+            // A pinned connection resolves only inside its own session;
+            // another session's request reads as unknown (never resolved).
+            let outcome = match ctx.scope {
+                Some(scope) => match state.hub.handle(&scope) {
+                    Some(handle) => handle.resolve(&req, decision).map(|_| ()),
+                    None => Err(format!("unknown or already-resolved request id {req}")),
+                },
+                None => state.hub.resolve_any(&req, decision).map(|_| ()),
+            };
+            match (outcome, ctx.scope) {
+                (Ok(()), _) => {}
+                // A pinned connection sees a foreign request as not found.
+                (Err(message), Some(_)) => send(
+                    ctx,
+                    error_kind(request_id, message, modron_protocol::ErrorKind::NotFound),
+                ),
+                (Err(message), None) => send(ctx, error(request_id, message)),
+            }
+        }
         Payload::SetConfig { patch } => {
             let Some(sub) = &ctx.subscription else {
                 send(

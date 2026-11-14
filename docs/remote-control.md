@@ -65,7 +65,7 @@ turns), `fork`, `new_session`, `list_sessions`, `delete_session`,
 `remote_control` (open a tunnel), `publish_page` (share an answer),
 `auth_providers_req` (provider status rows), `persist_router` (write
 router defaults), `ping`. Every failure answers `error` with a
-machine-readable `kind` (auth / not_found / conflict / other).
+machine-readable `kind` (auth / not_found / conflict / forbidden / other).
 
 ## Pairing (remote auth)
 

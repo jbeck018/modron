@@ -90,6 +90,10 @@ pub enum ErrorKind {
     NotFound,
     /// The request conflicts with live state (busy session, read-only).
     Conflict,
+    /// The connection is not allowed to perform this request, e.g. a
+    /// share-link tunnel asking for a server-wide action; re-auth does not
+    /// help.
+    Forbidden,
     /// Everything else (config errors, transport, internal).
     Other,
 }
@@ -690,6 +694,32 @@ mod tests {
     fn roundtrip(frame: &Frame) -> Frame {
         let json = serde_json::to_string(frame).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    /// `forbidden` is a wire name clients can branch on: it serializes as
+    /// the bare string and round-trips inside an error frame.
+    #[test]
+    fn forbidden_error_kind_roundtrips_as_forbidden() {
+        assert_eq!(
+            serde_json::to_string(&ErrorKind::Forbidden).unwrap(),
+            "\"forbidden\""
+        );
+        let frame = Frame {
+            id: Some(9),
+            session: None,
+            seq: 0,
+            payload: Payload::Error {
+                message: "not allowed on a share link".into(),
+                kind: Some(ErrorKind::Forbidden),
+            },
+        };
+        let json = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["kind"], "forbidden");
+        let back: Frame = serde_json::from_value(json).unwrap();
+        match back.payload {
+            Payload::Error { kind, .. } => assert_eq!(kind, Some(ErrorKind::Forbidden)),
+            other => panic!("expected an error frame, got {other:?}"),
+        }
     }
 
     /// Equality via the wire: core payload types do not implement
