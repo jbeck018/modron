@@ -17,6 +17,7 @@ use crate::common::{arg_str, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
+use modron_core::hooks::scrub_tokio_command;
 use modron_core::{Result, Tool, ToolCtx, ToolOutcome, ToolSpec};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -108,12 +109,15 @@ impl Tool for DiagnosticsTool {
             )
         };
 
+        // D9: provider secrets never reach the checker's environment.
+        let mut shell = tokio::process::Command::new("sh");
+        scrub_tokio_command(&mut shell);
         let output = match tokio::time::timeout(
             // A hanging checker (file-lock waits, interactive prompts) must
             // not hang the agent; kill_on_drop makes the elapsed-timeout
             // drop actually kill the child.
             Duration::from_millis(TIMEOUT_MS),
-            tokio::process::Command::new("sh")
+            shell
                 .arg("-c")
                 .arg(&command)
                 .current_dir(&ctx.working_dir)
