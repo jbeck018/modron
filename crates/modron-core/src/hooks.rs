@@ -39,6 +39,69 @@ pub struct HookOutcome {
     pub message: String,
 }
 
+/// Exact variable names that are never treated as secrets (compared
+/// case-insensitively). Decision D9.
+const SCRUB_EXEMPT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "SSH_AUTH_SOCK",
+];
+
+/// Prefix of the Modron hook/tool contract variables; never treated as
+/// secrets, whatever follows the prefix.
+const TOOL_CONTRACT_PREFIX: &str = "MODRON_TOOL_";
+
+/// Name suffixes that mark a credential (matched case-insensitively).
+const SECRET_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
+
+/// Name prefixes that mark a provider credential or config (matched
+/// case-insensitively).
+const SECRET_PREFIXES: &[&str] = &["ANTHROPIC_", "OPENAI_", "ZAI_"];
+
+/// Decides whether the environment variable `name` must not be inherited by
+/// a child process that Modron spawns for a tool or hook (decision D9).
+/// Matching is case-insensitive.
+pub fn is_secret_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with(TOOL_CONTRACT_PREFIX) || SCRUB_EXEMPT.contains(&upper.as_str()) {
+        return false;
+    }
+    SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
+        || SECRET_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
+
+/// Names of the variables in the current process environment that
+/// [`is_secret_env`] matches. Names that are not UTF-8 are judged lossily and
+/// returned as the original `OsString`, so they can still be removed.
+fn secret_env_names() -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .filter(|(name, _)| is_secret_env(&name.to_string_lossy()))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Removes every secret variable (see [`is_secret_env`]) from the child
+/// environment of a `std::process::Command`. Call it before other env
+/// configuration: a later explicit `env`/`envs` for the same name still wins.
+pub fn scrub_std_command(cmd: &mut std::process::Command) {
+    for name in secret_env_names() {
+        cmd.env_remove(name);
+    }
+}
+
+/// `tokio::process::Command` counterpart of [`scrub_std_command`].
+pub fn scrub_tokio_command(cmd: &mut tokio::process::Command) {
+    for name in secret_env_names() {
+        cmd.env_remove(name);
+    }
+}
+
 /// Run `cmd` through `sh -c` with the given env vars. Non-zero exit or a
 /// timeout counts as a veto (for pre-tool hooks; post-tool callers ignore
 /// `blocked` and just log).
@@ -48,6 +111,7 @@ pub async fn run_hook(
     timeout: Duration,
 ) -> Result<HookOutcome> {
     let mut command = tokio::process::Command::new("sh");
+    scrub_tokio_command(&mut command);
     command
         .arg("-c")
         .arg(cmd)
@@ -170,6 +234,99 @@ mod tests {
         assert!(!out.blocked);
         let captured = std::fs::read_to_string(&env_out).unwrap();
         assert_eq!(captured, "write|sess-123|{\"path\":\"a.txt\"}");
+    }
+
+    #[test]
+    fn secret_env_predicate_table() {
+        let secret = [
+            "ANTHROPIC_API_KEY",
+            "anthropic_api_key",
+            "OPENAI_API_KEY",
+            "ZAI_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "OPENAI_BASE_URL",
+            "zai_model",
+            "GITHUB_TOKEN",
+            "CARGO_REGISTRY_TOKEN",
+            "my_secret",
+            "DB_PASSWORD",
+            "Stripe_Api_Key",
+        ];
+        for name in secret {
+            assert!(is_secret_env(name), "{name} should be scrubbed");
+        }
+        let kept = [
+            "PATH",
+            "HOME",
+            "USER",
+            "SHELL",
+            "TERM",
+            "LANG",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "SSH_AUTH_SOCK",
+            "path",
+            "MODRON_TOOL_NAME",
+            "MODRON_TOOL_ARGS",
+            "MODRON_TOOL_API_KEY",
+            "MODRON_SESSION_ID",
+            "TOKENIZER_DIR",
+            "MY_TOKEN_DIR",
+            "SECRETARY",
+            "",
+        ];
+        for name in kept {
+            assert!(!is_secret_env(name), "{name} should be kept");
+        }
+    }
+
+    #[test]
+    fn scrub_std_command_removes_secret_vars_only() {
+        // Unique name: no other test reads or sets it.
+        std::env::set_var("MODRON_TEST_STD_TOKEN", "sekrit-std");
+        let mut cmd = std::process::Command::new("sh");
+        scrub_std_command(&mut cmd);
+        let out = cmd
+            .arg("-c")
+            .arg("printf '%s|%s' \"${MODRON_TEST_STD_TOKEN-unset}\" \"${PATH:+path}\"")
+            .output()
+            .unwrap();
+        std::env::remove_var("MODRON_TEST_STD_TOKEN");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|path");
+    }
+
+    #[tokio::test]
+    async fn scrub_tokio_command_removes_secret_vars_only() {
+        // Unique name: no other test reads or sets it.
+        std::env::set_var("MODRON_TEST_TOKIO_SECRET", "sekrit-tokio");
+        let mut cmd = tokio::process::Command::new("sh");
+        scrub_tokio_command(&mut cmd);
+        let out = cmd
+            .arg("-c")
+            .arg("printf '%s|%s' \"${MODRON_TEST_TOKIO_SECRET-unset}\" \"${PATH:+path}\"")
+            .output()
+            .await
+            .unwrap();
+        std::env::remove_var("MODRON_TEST_TOKIO_SECRET");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|path");
+    }
+
+    #[tokio::test]
+    async fn hook_env_does_not_leak_provider_secret() {
+        // Unique name: no other test reads or sets it.
+        std::env::set_var("MODRON_TEST_HOOK_PASSWORD", "sekrit-hook");
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen.txt");
+        let script = format!(
+            "printf '%s' \"${{MODRON_TEST_HOOK_PASSWORD-unset}}\" > {}",
+            seen.display()
+        );
+        let out = run_hook(&script, &[], Duration::from_secs(5))
+            .await
+            .unwrap();
+        std::env::remove_var("MODRON_TEST_HOOK_PASSWORD");
+        assert!(!out.blocked, "{}", out.message);
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "unset");
     }
 
     #[test]

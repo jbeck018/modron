@@ -12,6 +12,7 @@
 use crate::common::{internal_tool_error, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
+use modron_core::hooks::scrub_tokio_command;
 use modron_core::{Tool, ToolCtx, ToolOutcome, ToolSpec};
 use std::process::Stdio;
 use std::time::Duration;
@@ -61,9 +62,12 @@ impl Tool for VerifyTool {
             ));
         }
 
+        // D9: provider secrets never reach the verify command's environment.
+        let mut shell = tokio::process::Command::new("sh");
+        scrub_tokio_command(&mut shell);
         let output = tokio::time::timeout(
             TIMEOUT,
-            tokio::process::Command::new("sh")
+            shell
                 .arg("-c")
                 .arg(&self.command)
                 .current_dir(&ctx.working_dir)

@@ -4,6 +4,7 @@ use crate::common::{arg_str, internal_tool_error, opt_u64, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
+use modron_core::hooks::scrub_tokio_command;
 use modron_core::{Result, Tool, ToolCtx, ToolOutcome, ToolSpec};
 use serde_json::{json, Value};
 use std::process::Stdio;
@@ -121,6 +122,9 @@ impl Tool for BashTool {
         }
 
         let mut cmd = Command::new(shell());
+        // D9: provider secrets never reach the child environment. The
+        // sandboxed path above is not scrubbed yet (sandbox.rs is outside D3).
+        scrub_tokio_command(&mut cmd);
         cmd.args(shell_args(command))
             .current_dir(&ctx.working_dir)
             .stdin(Stdio::null())
@@ -676,5 +680,24 @@ mod tests {
             out.is_error && out.content.contains("missing required argument `command`"),
             "{out:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn child_env_never_carries_provider_secrets() {
+        // Unique name: no other test reads or sets it.
+        std::env::set_var("MODRON_TEST_FAKE_API_KEY", "sekrit");
+        let dir = tempdir().unwrap();
+        // `env` filtered to the two names under test: the full environment
+        // is long and the tool's output relay may cut the middle, which
+        // would hide a leak. The filter keeps the check deterministic.
+        let out = run(
+            json!({"command": "env | grep -E '^(PATH|MODRON_TEST_FAKE_API_KEY)='"}),
+            dir.path(),
+        )
+        .await;
+        std::env::remove_var("MODRON_TEST_FAKE_API_KEY");
+        assert!(out.content.contains("PATH="), "{out:?}");
+        assert!(!out.content.contains("sekrit"), "{out:?}");
+        assert!(!out.content.contains("MODRON_TEST_FAKE_API_KEY"), "{out:?}");
     }
 }

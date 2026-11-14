@@ -19,6 +19,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use modron_core::hooks::scrub_std_command;
+
 /// One diagnostic line, LSP severity 1..=4 (error..hint).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diag {
@@ -103,7 +105,10 @@ fn on_path(bin: &str) -> bool {
     // A file on PATH is not enough: rustup SHIMS exist for binaries whose
     // toolchain component is not installed and die instantly. Probe that
     // the binary actually runs (bounded).
-    let Ok(output) = std::process::Command::new(bin)
+    // D9: provider secrets never reach a language server's environment.
+    let mut probe = std::process::Command::new(bin);
+    scrub_std_command(&mut probe);
+    let Ok(output) = probe
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -145,7 +150,10 @@ impl LspServer {
     /// Spawn + initialize. Synchronous by design: called from spawn_blocking
     /// (edit tools run it inline; the write is local and fast).
     pub fn spawn(lang: &'static str, bin: &str, args: &[&str], root: &Path) -> Option<LspServer> {
-        let mut child = std::process::Command::new(bin)
+        // D9: provider secrets never reach the language server's environment.
+        let mut command = std::process::Command::new(bin);
+        scrub_std_command(&mut command);
+        let mut child = command
             .args(args)
             .current_dir(root)
             .stdin(std::process::Stdio::piped())
