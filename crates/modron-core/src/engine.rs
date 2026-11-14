@@ -240,9 +240,13 @@ struct RunLoopState {
     /// run, and how many verification rounds have been spent.
     mutated_this_run: bool,
     verify_rounds: u32,
-    /// Whether the finish gate already injected its self-check turn —
-    /// a provider failure ON THAT TURN is non-fatal (keep the answer).
+    /// Whether the finish gate already injected its self-check turn. The
+    /// self-check runs at most once per run.
     self_check_sent: bool,
+    /// Set when the self-check message is injected, cleared by the next
+    /// provider turn. Only that turn is non-fatal on a provider error (keep
+    /// the answer); a provider error on any later turn propagates (A6).
+    self_check_turn_pending: bool,
     /// Tier fallback (remote-control hardening): once an auth failure
     /// promotes the run to a tier's fallback model, every later turn
     /// uses the fallback directly (the dead primary would 401 again
@@ -272,6 +276,7 @@ impl RunLoopState {
             mutated_this_run: false,
             verify_rounds: 0,
             self_check_sent: false,
+            self_check_turn_pending: false,
             run_tier_override: None,
             last_dispatch_ended_with_passing_verify: false,
             stop_label: "end_turn",
@@ -737,6 +742,9 @@ impl Engine {
             _ => None,
         };
         let mut attempted_fallback = fallback.is_some();
+        // Consume the self-check marker: only THIS provider turn may swallow
+        // a failure (A6). Set by the finish gate just before this turn.
+        let self_check_turn = std::mem::take(&mut state.self_check_turn_pending);
         // Loop-external turn state: None = self-check short-circuit
         // (the outer run loop ends with the preserved answer).
         let mut turn_outcome: Option<(TurnResponse, String, String)> = None;
@@ -822,10 +830,11 @@ impl Engine {
                 }
                 Err(e) => {
                     // The self-check turn is an ENHANCEMENT: if the
-                    // provider fails on it, keep the pre-check answer and
-                    // end the run — never destroy completed work for the
-                    // bonus turn.
-                    if state.self_check_sent && !state.answer.is_empty() {
+                    // provider fails on the turn right after the self-check
+                    // message, keep the pre-check answer and end the run —
+                    // never destroy completed work for the bonus turn. A
+                    // failure on any later turn is a real error (A6).
+                    if self_check_turn && !state.answer.is_empty() {
                         tracing::warn!(
                             error = %e,
                             "self-check turn failed; keeping the pre-check answer"
@@ -1494,16 +1503,7 @@ impl Engine {
         session_id: SessionId,
         state: &mut RunLoopState,
     ) -> Result<bool> {
-        if !state.mutated_this_run || state.verify_rounds >= MAX_VERIFY_ROUNDS {
-            if state.mutated_this_run && state.verify_rounds >= MAX_VERIFY_ROUNDS {
-                // Bound exhausted: let the run end, but never silently.
-                state.answer = format!(
-                    "{}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]",
-                    state.answer
-                )
-                .trim()
-                .to_string();
-            }
+        if !state.mutated_this_run {
             return Ok(false);
         }
         let Some(verify_tool) = self.tools.get("verify") else {
@@ -1512,11 +1512,15 @@ impl Engine {
             // and verifies each concrete detail against the environment
             // before ending. Targets the lucky-pass class (config formats,
             // exact names/passwords/ports) without needing a test command.
-            if !self.config.self_check_on_finish || state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            // At most one self-check per run (A6). No verification runs on
+            // this path, so the gate disarms here: nothing can "still fail",
+            // and the failure note and escalation (both verify-only) stay off.
+            if !self.config.self_check_on_finish || state.self_check_sent {
                 return Ok(false);
             }
-            state.verify_rounds += 1;
             state.self_check_sent = true;
+            state.self_check_turn_pending = true;
+            state.mutated_this_run = false;
             let feedback = Message::user(
                 "Before finishing: re-read the ORIGINAL task instruction and list every \
                  concrete requirement it names — file paths, exact names, passwords, \
@@ -1537,6 +1541,16 @@ impl Engine {
             state.transcript.push(feedback);
             return Ok(true);
         };
+        if state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            // Bound exhausted: let the run end, but never silently.
+            state.answer = format!(
+                "{}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]",
+                state.answer
+            )
+            .trim()
+            .to_string();
+            return Ok(false);
+        }
         // Skip when the previous dispatch already ended with a passing
         // verify (the model showed its evidence — no duplicate suite run).
         if state.last_dispatch_ended_with_passing_verify {
@@ -2998,5 +3012,77 @@ mod tests {
             "done\n\n[verification skipped: verify is not permitted in this approval mode]"
         );
         assert_eq!(summary.turns, 2, "the skip ends the run, no feedback turn");
+    }
+
+    /// A tool-call turn that also carries non-empty assistant text.
+    fn call_with_text(text: &str, name: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            ..call(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn no_verify_tool_runs_exactly_one_self_check() {
+        // Self-check on, no verify tool, escalation configured: the first
+        // finish earns ONE self-check turn; the second finish ends the run.
+        // No failure note and no escalation turn.
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            escalate_on_check_failure: Some("claude-opus-escalated".into()),
+            ..approve_all_config()
+        };
+        let (engine, _verify, mock) = finish_engine(
+            vec![call("write"), text("attempt 1"), text("attempt 2")],
+            config,
+            false,
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "attempt 2");
+        assert_eq!(
+            mock.requests().len(),
+            3,
+            "edit, first answer, exactly one self-check reply"
+        );
+        assert!(mock.requests().iter().all(|r| r.model == "m"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_on_the_self_check_turn_keeps_the_answer() {
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            ..approve_all_config()
+        };
+        // The self-check reply hits the exhausted script: the pre-check
+        // answer survives and the run stays Ok.
+        let (engine, _verify, _mock) =
+            finish_engine(vec![call("write"), text("attempt 1")], config, false);
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "attempt 1");
+    }
+
+    #[tokio::test]
+    async fn provider_error_after_the_self_check_turn_propagates() {
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            ..approve_all_config()
+        };
+        // The self-check reply is a tool turn with text; the turn after it
+        // errors (script exhausted). Only the immediate self-check turn may
+        // be swallowed, so the error must reach the caller.
+        let (engine, _verify, _mock) = finish_engine(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                call_with_text("checking", "write"),
+            ],
+            config,
+            false,
+        );
+        let result = engine.run_task("ship it").await;
+        assert!(
+            result.is_err(),
+            "a provider error on a later turn must propagate, got {result:?}"
+        );
     }
 }
