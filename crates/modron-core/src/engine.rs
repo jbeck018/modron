@@ -1404,9 +1404,13 @@ impl Engine {
             }
         }
 
+        // An empty provider id cannot pair start and completion, so it is
+        // reported as `None` and consumers fall back to name pairing.
+        let call_id = (!call.id.is_empty()).then(|| call.id.clone());
         if let Some(sink) = self.config.on_tool_event.as_ref() {
             sink(ToolActivity::Start {
                 name: call.name.clone(),
+                call_id: call_id.clone(),
             });
         }
         let (executed, ran) = self.execute_tool(session_id, call, ctx).await;
@@ -1415,6 +1419,7 @@ impl Engine {
                 name: call.name.clone(),
                 is_error: executed.is_error,
                 bytes: executed.content.len(),
+                call_id,
             });
         }
 

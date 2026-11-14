@@ -1009,6 +1009,7 @@ mod tests {
             1,
             Payload::Tool {
                 activity: WireToolActivity::Start {
+                    call_id: None,
                     name: "read".into(),
                 },
             },
@@ -1017,6 +1018,7 @@ mod tests {
             2,
             Payload::Tool {
                 activity: WireToolActivity::Start {
+                    call_id: None,
                     name: "bash".into(),
                 },
             },
@@ -1025,6 +1027,7 @@ mod tests {
             3,
             Payload::Tool {
                 activity: WireToolActivity::Done {
+                    call_id: None,
                     name: "read".into(),
                     is_error: false,
                     bytes: 2150,

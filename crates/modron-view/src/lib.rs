@@ -220,7 +220,7 @@ impl ActivityTracker {
     /// swarm-row updates).
     pub fn on_tool(&mut self, activity: &ToolActivity) {
         match activity {
-            ToolActivity::Start { name } => {
+            ToolActivity::Start { name, .. } => {
                 self.turn_tools.push(ToolEvent {
                     name: name.clone(),
                     bytes: None,
@@ -232,6 +232,7 @@ impl ActivityTracker {
                 name,
                 is_error,
                 bytes,
+                ..
             } => {
                 if let Some(event) = self
                     .turn_tools
@@ -614,6 +615,7 @@ mod tests {
 
     fn done(name: &str, bytes: u64, is_error: bool) -> ToolActivity {
         ToolActivity::Done {
+            call_id: None,
             name: name.to_string(),
             is_error,
             bytes: bytes as usize,
@@ -624,9 +626,11 @@ mod tests {
     fn groups_start_then_done_in_place() {
         let mut t = ActivityTracker::new();
         t.on_tool(&ToolActivity::Start {
+            call_id: None,
             name: "read".into(),
         });
         t.on_tool(&ToolActivity::Start {
+            call_id: None,
             name: "bash".into(),
         });
         t.on_tool(&done("read", 2150, false));
@@ -653,12 +657,14 @@ mod tests {
         let mut t = ActivityTracker::new();
         for _ in 0..9 {
             t.on_tool(&ToolActivity::Start {
+                call_id: None,
                 name: "glob".into(),
             });
             t.on_tool(&done("glob", 1, false));
         }
         for _ in 0..8 {
             t.on_tool(&ToolActivity::Start {
+                call_id: None,
                 name: "read".into(),
             });
             t.on_tool(&done("read", 1, false));

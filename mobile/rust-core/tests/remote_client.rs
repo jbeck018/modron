@@ -317,6 +317,7 @@ async fn live_streaming_commits_on_turn_done() {
                 Payload::Tool {
                     activity: WireToolActivity::Start {
                         name: "glob".into(),
+                        call_id: None,
                     },
                 },
             ),
@@ -334,6 +335,7 @@ async fn live_streaming_commits_on_turn_done() {
                         name: "glob".into(),
                         is_error: false,
                         bytes: 2150,
+                        call_id: None,
                     },
                 },
             ),

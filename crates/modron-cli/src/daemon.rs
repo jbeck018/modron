@@ -349,7 +349,7 @@ async fn run_task(
                 }
                 maybe_tool = tool_rx.recv() => {
                     match maybe_tool {
-                        Some(ToolActivity::Start { name }) => {
+                        Some(ToolActivity::Start { name, .. }) => {
                             notify("tool", None, Some(name), Some("start".to_string()));
                         }
                         Some(ToolActivity::Done { name, is_error, .. }) => {

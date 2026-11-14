@@ -348,13 +348,20 @@ fn default_plan_status() -> String {
 /// tool execution so UIs can render `● Bash …` lines live.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolActivity {
-    /// A tool call is about to execute.
-    Start { name: String },
+    /// A tool call is about to execute. `call_id` is the model's tool-call
+    /// id (`ToolCall.id`), `None` when the peer or provider supplied none;
+    /// consumers pair a `Done` with its `Start` by `call_id` when present.
+    Start {
+        name: String,
+        call_id: Option<String>,
+    },
     /// The tool finished; `bytes` is the (already reduced) result size.
+    /// `call_id` mirrors the matching `Start` (see above).
     Done {
         name: String,
         is_error: bool,
         bytes: usize,
+        call_id: Option<String>,
     },
     /// A subagent began (Phase 5h): `label` is the persona or "explore".
     SubagentStarted { id: String, label: String },
