@@ -125,11 +125,20 @@ interface Snapshot {
 // Demo mode renders the scripted snapshot with no server; toggle off to
 // talk to a real one (ws://127.0.0.1:7699 by default).
 const demo = signal(true);
+// The device token for a connect call: empty means no token (null).
+function tokenArg(): string | null {
+  const t = deviceToken().trim();
+  return t === "" ? null : t;
+}
+
 // Once a connect starts, real server state must flow into the snapshot
 // even while demo is technically still on (it flips off on success).
 const live = signal(false);
 const snap = signal<Snapshot>(JSON.parse(Remote.demoSnapshotJson()) as Snapshot);
 const url = signal(Remote.defaultUrl());
+// Optional paired device token for servers that require one. Held in
+// memory only: never logged, never written to notes or storage.
+const deviceToken = signal("");
 const draft = signal("");
 const connectError = signal<string | null>(null);
 const busy = signal(false);
@@ -216,7 +225,7 @@ async function connectAndOpen(): Promise<void> {
   busy.set(true);
   live.set(true);
   try {
-    Remote.connect(url(), null);
+    Remote.connect(url(), tokenArg());
     let connected = false;
     for (let i = 0; i < 40; i++) {
       const s = JSON.parse(Remote.snapshotJson()) as Snapshot;
@@ -728,7 +737,7 @@ function reconnectSession(): void {
   const session = snap().session_id;
   if (!session || demo()) return;
   try {
-    Remote.reconnect(url(), session, null);
+    Remote.reconnect(url(), session, tokenArg());
   } catch (e) {
     connectError.set(e instanceof Error ? e.message : String(e));
   }
@@ -1081,6 +1090,16 @@ function SessionsScreen() {
             </Text>
           </View>
         </View>
+        <Input
+          class="rounded-(--radius) border border-border bg-card px-3 py-2 text-foreground"
+          value={deviceToken()}
+          placeholder="device token (optional)"
+          secureTextEntry
+          autoCorrect={false}
+          autoCapitalize="none"
+          onChange={(e) => deviceToken.set(e.value)}
+          onSubmit={() => void connectAndOpen()}
+        />
         {editMode() ? (
           <View class="flex-row items-center gap-2">
             <Text class="text-muted-foreground text-xs">
@@ -1260,6 +1279,16 @@ function SettingsScreen() {
               </Text>
             </View>
           </View>
+          <Input
+            class="rounded-(--radius) border border-border bg-background px-3 py-2 text-foreground"
+            value={deviceToken()}
+            placeholder="device token (optional)"
+            secureTextEntry
+            autoCorrect={false}
+            autoCapitalize="none"
+            onChange={(e) => deviceToken.set(e.value)}
+            onSubmit={() => void connectAndOpen()}
+          />
           <View class="flex-row gap-2 items-center">
             <Text class="text-muted-foreground text-xs flex-1">
               {snap().connection_label}

@@ -63,16 +63,51 @@ pub(crate) enum In {
 
 /// Reject URLs a browser `WebSocket` constructor would throw on
 /// (a JS exception inside wasm aborts the whole module — validate first).
-fn validate_ws_url(url: &str) -> Result<(), ClientError> {
-    let after_scheme = url
-        .strip_prefix("ws://")
-        .or_else(|| url.strip_prefix("wss://"))
-        .ok_or_else(|| ClientError::Connect("url must start with ws:// or wss://".into()))?;
-    let host = after_scheme.split(['/', '?']).next().unwrap_or("");
+///
+/// Plain `ws://` is only accepted for loopback hosts (`localhost`,
+/// `127.0.0.0/8`, `::1`) unless `allow_insecure` is set: a non-loopback
+/// device must be reached over `wss://`, or the device token travels in clear.
+fn validate_ws_url(url: &str, allow_insecure: bool) -> Result<(), ClientError> {
+    let (secure, after_scheme) = match url.strip_prefix("wss://") {
+        Some(rest) => (true, rest),
+        None => (
+            false,
+            url.strip_prefix("ws://").ok_or_else(|| {
+                ClientError::Connect("url must start with ws:// or wss://".into())
+            })?,
+        ),
+    };
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Userinfo ends at the last '@'; anything before it is not the host.
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = url_host(host_port);
     if host.is_empty() {
         return Err(ClientError::Connect("url has no host".into()));
     }
+    if !secure && !allow_insecure && !is_loopback_host(host) {
+        return Err(ClientError::Connect(
+            "ws:// is only allowed to loopback hosts; use wss:// for this device".into(),
+        ));
+    }
     Ok(())
+}
+
+/// The host part of a `host[:port]` or `[v6][:port]` authority.
+fn url_host(host_port: &str) -> &str {
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        return bracketed.split(']').next().unwrap_or("");
+    }
+    host_port.split(':').next().unwrap_or("")
+}
+
+/// True for `localhost` and any IPv4 `127.0.0.0/8` or IPv6 `::1` address.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Runtime-agnostic deadline wrapper. Native: futures-timer polls a
@@ -245,7 +280,7 @@ impl RemoteClient {
     /// (and `connection` goes `Disconnected`); only a malformed URL
     /// fails synchronously.
     pub fn connect(url: &str, token: Option<&str>) -> Result<Self, ClientError> {
-        validate_ws_url(url)?;
+        validate_ws_url(url, false)?;
         let client = Self {
             shared: Arc::new(Shared::new()),
         };
@@ -263,7 +298,7 @@ impl RemoteClient {
         session_id: Uuid,
         token: Option<&str>,
     ) -> Result<(), ClientError> {
-        validate_ws_url(url)?;
+        validate_ws_url(url, false)?;
         let last_seq = {
             let st = self.shared.state.lock().unwrap();
             st.vm.last_seq
@@ -991,11 +1026,11 @@ mod tests {
 
     #[test]
     fn url_validation() {
-        assert!(validate_ws_url("ws://127.0.0.1:7699").is_ok());
-        assert!(validate_ws_url("wss://modron.example.com").is_ok());
-        assert!(validate_ws_url("http://127.0.0.1:7699").is_err());
-        assert!(validate_ws_url("ws://").is_err());
-        assert!(validate_ws_url("ws:///path").is_err());
+        assert!(validate_ws_url("ws://127.0.0.1:7699", false).is_ok());
+        assert!(validate_ws_url("wss://modron.example.com", false).is_ok());
+        assert!(validate_ws_url("http://127.0.0.1:7699", false).is_err());
+        assert!(validate_ws_url("ws://", false).is_err());
+        assert!(validate_ws_url("ws:///path", false).is_err());
     }
 
     /// Fold one frame into a fresh shared state and return the snapshot.
@@ -1071,5 +1106,35 @@ mod tests {
         assert_eq!(client.state().streaming_reasoning, "");
         fold_frame(&client.shared, delta("gone", 4));
         assert_eq!(client.state().streaming_reasoning, "");
+    }
+
+    #[test]
+    fn plain_ws_is_only_accepted_for_loopback_hosts() {
+        assert!(validate_ws_url("ws://127.0.0.1:7699", false).is_ok());
+        assert!(validate_ws_url("ws://127.8.9.10:7699/", false).is_ok());
+        assert!(validate_ws_url("ws://localhost:7699", false).is_ok());
+        assert!(validate_ws_url("ws://LOCALHOST:7699", false).is_ok());
+        assert!(validate_ws_url("ws://[::1]:7699", false).is_ok());
+        assert!(validate_ws_url("ws://example.com", false).is_err());
+        assert!(validate_ws_url("ws://example.com:7699/path", false).is_err());
+        assert!(validate_ws_url("ws://192.168.1.20:7699", false).is_err());
+        assert!(validate_ws_url("ws://[2001:db8::1]:7699", false).is_err());
+        // Userinfo cannot make a remote host look loopback.
+        assert!(validate_ws_url("ws://127.0.0.1@example.com", false).is_err());
+        assert!(validate_ws_url("ws://localhost.example.com", false).is_err());
+    }
+
+    #[test]
+    fn wss_is_accepted_for_any_host() {
+        assert!(validate_ws_url("wss://example.com", false).is_ok());
+        assert!(validate_ws_url("wss://192.168.1.20:7699", false).is_ok());
+    }
+
+    #[test]
+    fn allow_insecure_lets_plain_ws_reach_a_remote_host() {
+        assert!(validate_ws_url("ws://example.com", true).is_ok());
+        // The flag only relaxes ws://; a malformed URL is still refused.
+        assert!(validate_ws_url("ws://", true).is_err());
+        assert!(validate_ws_url("http://example.com", true).is_err());
     }
 }
