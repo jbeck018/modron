@@ -922,7 +922,12 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         outcome.summary
     } else {
         match resume_session_id {
-            Some(session_id) => agent.engine.run_task_resuming(session_id, &task).await?,
+            Some(session_id) => {
+                agent
+                    .engine
+                    .run_task_resuming_with_attachments(session_id, &task, attachments)
+                    .await?
+            }
             None => {
                 agent
                     .engine
@@ -946,7 +951,9 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         println!("{}", summary.answer);
     }
 
-    print_usage_table(&events[usage_baseline..])?;
+    // The log can shrink below the cached baseline (corruption, concurrent
+    // vacuum); an out-of-range slice must not panic the run summary.
+    print_usage_table(events.get(usage_baseline..).unwrap_or(&[]))?;
     println!();
     println!(
         "session: {}  (turns: {}, tool calls: {})",
@@ -1075,9 +1082,7 @@ fn build_agent_with(
         .unwrap_or_else(|| engine_defaults.default_model.clone());
 
     if let Some(threshold) = cli.compact_threshold {
-        if !(threshold > 0.0 && threshold < 1.0) {
-            anyhow::bail!("--compact-threshold must be strictly between 0 and 1, got {threshold}");
-        }
+        validate_compact_threshold(threshold, "--compact-threshold")?;
     }
     // Precedence: engine default < [compaction] in config.toml < CLI flags.
     let mut compaction = CompactionPolicy::default();
@@ -1086,7 +1091,8 @@ fn build_agent_with(
             compaction.enabled = v;
         }
         if let Some(v) = section.threshold_frac {
-            compaction.threshold_frac = v;
+            compaction.threshold_frac =
+                validate_compact_threshold(v, "[compaction].threshold_frac")?;
         }
         if let Some(v) = section.min_interval_turns {
             compaction.min_interval_turns = v;
@@ -1352,14 +1358,15 @@ fn build_agent_with(
     // read_minified) are on-demand and discoverable via tool_search.
     modron_tools::tier_default_tools(&mut registry);
     for reg in mcp {
-        registry.register(Arc::new(modron_mcp::McpTool::new(
-            Arc::clone(&reg.handle),
-            &reg.server,
-            reg.info.clone(),
-        )));
+        let tool = modron_mcp::McpTool::new(Arc::clone(&reg.handle), &reg.server, reg.info.clone());
+        // The registry keys tools by their spec name, which for MCP tools is
+        // `mcp__<server>__<tool>`. Demote using that same key; the bare tool
+        // name could collide with a built-in and demote the wrong tool.
+        let registered = tool.qualified_name();
+        registry.register(Arc::new(tool));
         // Phase 13 dynamic discovery: MCP tools stay callable but leave the
         // system prompt — the model finds them via tool_search.
-        registry.mark_on_demand(&reg.info.name);
+        registry.mark_on_demand(&registered);
     }
     // Personas (Phase 5c A2): catalog-resolve providers so delegates can
     // force (model, provider) pairs without a catalog dependency in core.
@@ -2006,7 +2013,7 @@ async fn run_sessions_vacuum(
     older_than_days: u64,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(clamp_vacuum_days(older_than_days));
     let store = JsonlSessionStore::new(sessions_dir);
     let sessions = store
         .list()
@@ -2243,7 +2250,7 @@ async fn run_traces(sessions_dir: &std::path::Path, session: &str) -> anyhow::Re
             stop.as_deref().unwrap_or("-")
         );
         if let Some(h) = hash {
-            println!("      prompt_hash: {}", &h[..h.len().min(16)]);
+            println!("      prompt_hash: {}", short_hash(h));
         }
     }
     println!("{} turn(s) · total cost ${:.4}", rows.len(), total_cost);
@@ -2257,6 +2264,31 @@ fn truncate(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
     }
+}
+
+/// Upper bound for session-age inputs (`--older-than-days`, `ttl_days`).
+/// 100 years is far beyond any retention window and keeps
+/// `chrono::Duration::days` well inside its range (it panics when too large).
+const MAX_VACUUM_DAYS: u64 = 36_500;
+
+/// Clamp a user-supplied session age so `chrono::Duration::days` cannot panic.
+fn clamp_vacuum_days(days: u64) -> i64 {
+    days.min(MAX_VACUUM_DAYS) as i64
+}
+
+/// First 16 characters of a prompt hash for display. Char-based, so a
+/// corrupt or non-ASCII log value cannot panic on a byte boundary.
+fn short_hash(h: &str) -> String {
+    h.chars().take(16).collect()
+}
+
+/// Validate a compaction threshold fraction. Shared by the `--compact-threshold`
+/// flag and `[compaction].threshold_frac` so both reject the same values.
+fn validate_compact_threshold(threshold: f64, source: &str) -> anyhow::Result<f64> {
+    if !(threshold > 0.0 && threshold < 1.0) {
+        anyhow::bail!("{source} must be strictly between 0 and 1, got {threshold}");
+    }
+    Ok(threshold)
 }
 
 /// The curated FREE model list (Phase 5f, OpenCode-style comparison):
@@ -2327,6 +2359,9 @@ async fn run_bench(
         }
         return Ok(());
     }
+    // Record before any run so the end-of-bench cleanup knows whether the
+    // file was ours to delete.
+    let marker_preexisted = cli.working_dir.join("bench-marker.txt").exists();
     let models: Vec<String> = match models_arg {
         // Empty CSV segments (`"a,,b"`, `","`) must not become empty-string
         // model names that only fail later inside provider calls.
@@ -2603,9 +2638,11 @@ async fn run_bench(
     // Bench hygiene: the suite's mutation tasks create files in the working
     // dir (bench-marker.txt) — remove the known artifacts so benches never
     // pollute the target repo.
+    // Only remove the marker when this bench run created it: a user's own
+    // bench-marker.txt that predates the run must survive.
     let mut artifact = cli.working_dir.clone();
     artifact.push("bench-marker.txt");
-    if std::fs::remove_file(&artifact).is_ok() {
+    if !marker_preexisted && std::fs::remove_file(&artifact).is_ok() {
         tracing::debug!(path = %artifact.display(), "removed bench artifact");
     }
     Ok(())
@@ -3503,5 +3540,30 @@ mod tests {
             },
         ];
         print_compaction_lines(&tiny, 0, 6);
+    }
+
+    #[test]
+    fn vacuum_days_are_clamped_so_duration_cannot_panic() {
+        assert_eq!(clamp_vacuum_days(7), 7);
+        assert_eq!(clamp_vacuum_days(u64::MAX), 36_500);
+        // Would panic inside chrono before the clamp (value past i64 range).
+        let _ = chrono::Utc::now() - chrono::Duration::days(clamp_vacuum_days(u64::MAX));
+    }
+
+    #[test]
+    fn short_hash_is_char_safe() {
+        assert_eq!(short_hash("abc"), "abc");
+        assert_eq!(short_hash(&"é".repeat(40)).chars().count(), 16);
+        assert_eq!(short_hash("0123456789abcdef9999"), "0123456789abcdef");
+    }
+
+    #[test]
+    fn compact_threshold_range_is_shared_by_flag_and_config() {
+        assert!(validate_compact_threshold(0.5, "x").is_ok());
+        for bad in [0.0, 1.0, -0.1, 1.5, f64::NAN] {
+            let err = validate_compact_threshold(bad, "[compaction].threshold_frac")
+                .expect_err("out-of-range threshold must be rejected");
+            assert!(err.to_string().starts_with("[compaction].threshold_frac"));
+        }
     }
 }
