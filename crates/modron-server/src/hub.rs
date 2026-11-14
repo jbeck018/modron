@@ -126,7 +126,13 @@ impl SessionStore for BroadcastingStore {
     }
 
     async fn delete(&self, id: SessionId) -> modron_core::Result<bool> {
-        self.inner.delete(id).await
+        // Serialize the delete with appends, then drop the per-session lock
+        // entry: the map must not keep one lock per deleted session forever.
+        let lock = self.write_lock(id).await;
+        let _guard = lock.lock().await;
+        let removed = self.inner.delete(id).await?;
+        self.locks.lock().await.remove(&id);
+        Ok(removed)
     }
 
     async fn event_count(&self, id: SessionId) -> modron_core::Result<u64> {
@@ -249,6 +255,12 @@ pub struct LiveFrame {
 /// Field locking discipline: every mutex is short-lived and never held
 /// across an await. `seq` guards publish ordering; `run` doubles as the
 /// busy flag AND the terminal-frame lock (see [`SessionHandle::complete`]).
+///
+/// Lock order (outermost first): `run` -> `gate_order` -> `seq` -> every
+/// state mutex (`engine`, `tracker`, `text`, `reasoning`, `live_approval`,
+/// `usage`, `pending`, labels). Every sink mutates its state and publishes
+/// under `seq` in one scope, so a snapshot read under `seq` is consistent
+/// with the watermark it reports (LG-d). Nothing takes `run` below `seq`.
 pub struct SessionHandle {
     pub id: SessionId,
     tx: broadcast::Sender<LiveFrame>,
@@ -269,8 +281,20 @@ pub struct SessionHandle {
     /// between the gate's insert and its publish).
     gate_order: Mutex<()>,
     /// Set by interrupt (under gate_order): gates that arrive afterwards
-    /// decline silently instead of publishing into a dead run.
+    /// decline silently instead of publishing into a dead run. Written only
+    /// with the run slot held, so an interrupt and a new run's start cannot
+    /// interleave their writes (LG-c).
     aborted: AtomicBool,
+    /// Mirror of the run slot's occupancy, written under the slot lock, so
+    /// [`live_state`](Self::live_state) reads it without taking the slot
+    /// (the snapshot holds the seq lock and must not nest under the slot).
+    busy: AtomicBool,
+    /// Set by [`SessionHub::begin_delete`]: no run may start until the
+    /// delete settles. Written and read under the run-slot lock.
+    deleting: AtomicBool,
+    /// The shared broadcasting store, kept so a submit can re-arm the
+    /// adoption pin ([`rearm_adoption`](Self::rearm_adoption)).
+    shared_store: Arc<dyn SessionStore>,
     /// Approval wait before an auto-deny (injectable for tests; prod = 30s).
     approval_timeout: Mutex<std::time::Duration>,
     /// Sticky approve-rest (the TUI's `a` answer): every later mutating
@@ -301,10 +325,27 @@ impl SessionHandle {
         lock(&self.engine)
     }
 
+    /// Re-arm the adoption pin so the next engine `create_session` on this
+    /// handle adopts this session. The pin is single-use: after a first run
+    /// that wrote no event, a later submit on the still-empty session would
+    /// otherwise open a second session id with no live handle (LG-e).
+    /// Called before each submit to a known session; clones already taken
+    /// by running engines keep their own store.
+    pub fn rearm_adoption(&self) {
+        let mut engine = self.engine_cell();
+        engine.store = PinnedCreateStore::new(Arc::clone(&self.shared_store), Some(self.id));
+    }
+
     /// Assign the next seq and broadcast. The seq lock spans the send so
     /// concurrent publishers cannot reorder frames.
     pub fn publish(&self, payload: Payload) {
         let mut seq = lock(&self.seq);
+        self.publish_locked(&mut seq, payload);
+    }
+
+    /// Publish while the caller holds the seq lock (and has already applied
+    /// the state change the frame reports, under that same lock).
+    fn publish_locked(&self, seq: &mut u64, payload: Payload) {
         *seq += 1;
         // Serialize ONCE for all viewers (2026-11-12 audit: the broadcast
         // used to deep-clone the Frame per subscriber and every connection
@@ -325,6 +366,18 @@ impl SessionHandle {
     /// The seq watermark a Snapshot should carry.
     pub fn current_seq(&self) -> u64 {
         *lock(&self.seq)
+    }
+
+    /// The seq watermark and the live state, read under ONE seq-lock scope.
+    /// Every sink applies its state change and publishes under the seq lock,
+    /// so the live state here includes exactly the frames at or below the
+    /// returned watermark: a client that applies the snapshot and then only
+    /// frames with `seq > watermark` neither loses nor repeats a delta.
+    pub fn snapshot_point(&self) -> (u64, LiveState) {
+        let seq = lock(&self.seq);
+        let watermark = *seq;
+        let live = self.live_state();
+        (watermark, live)
     }
 
     /// Subscribe to this session's frame stream (attach step 1: subscribe
@@ -371,7 +424,7 @@ impl SessionHandle {
             sandbox,
             allow,
             deny,
-            running: self.is_busy(),
+            running: self.busy.load(Ordering::Relaxed),
             streaming_text: lock(&self.text).clone(),
             streaming_reasoning: lock(&self.reasoning).clone(),
             turn_tools: tracker.turn_tools.clone(),
@@ -398,26 +451,39 @@ impl SessionHandle {
     /// Delta sink: convert to the wire form, buffer the streaming state,
     /// clear buffers on `Done` (the per-turn boundary), publish.
     pub fn on_stream_delta(&self, delta: StreamDelta) {
+        // Buffer mutation and publish share one seq scope (see snapshot_point).
         match WireDelta::from_core(&delta) {
             Some(WireDelta::Text { text }) => {
+                let mut seq = lock(&self.seq);
                 lock(&self.text).push_str(&text);
-                self.publish(Payload::Delta {
-                    delta: WireDelta::Text { text },
-                });
+                self.publish_locked(
+                    &mut seq,
+                    Payload::Delta {
+                        delta: WireDelta::Text { text },
+                    },
+                );
             }
             Some(WireDelta::Reasoning { text }) => {
+                let mut seq = lock(&self.seq);
                 lock(&self.reasoning).push_str(&text);
-                self.publish(Payload::Delta {
-                    delta: WireDelta::Reasoning { text },
-                });
+                self.publish_locked(
+                    &mut seq,
+                    Payload::Delta {
+                        delta: WireDelta::Reasoning { text },
+                    },
+                );
             }
             Some(WireDelta::Done) => {
+                let mut seq = lock(&self.seq);
                 *lock(&self.text) = String::new();
                 *lock(&self.reasoning) = String::new();
                 lock(&self.tracker).clear_turn();
-                self.publish(Payload::Delta {
-                    delta: WireDelta::Done,
-                });
+                self.publish_locked(
+                    &mut seq,
+                    Payload::Delta {
+                        delta: WireDelta::Done,
+                    },
+                );
             }
             // `ToolCallReady` never reaches sinks (engine intercepts it).
             None => {}
@@ -426,10 +492,14 @@ impl SessionHandle {
 
     /// Tool-activity sink: feed the session's tracker, publish.
     pub fn on_tool_activity(&self, activity: ToolActivity) {
+        let mut seq = lock(&self.seq);
         lock(&self.tracker).on_tool(&activity);
-        self.publish(Payload::Tool {
-            activity: WireToolActivity::from(&activity),
-        });
+        self.publish_locked(
+            &mut seq,
+            Payload::Tool {
+                activity: WireToolActivity::from(&activity),
+            },
+        );
     }
 
     /// The session approver (Ask mode). Sticky allow-rest short-circuits;
@@ -466,15 +536,21 @@ impl SessionHandle {
             // gate must not re-open the strip (cycle-3 F3).
             return false;
         }
-        lock(&self.pending).insert(request_id.clone(), respond);
-        *lock(&self.live_approval) = Some(PendingApproval {
-            request_id: request_id.clone(),
-            call: call.clone(),
-        });
-        self.publish(Payload::ApprovalRequested {
-            request_id: request_id.clone(),
-            call: call.clone(),
-        });
+        {
+            let mut seq = lock(&self.seq);
+            lock(&self.pending).insert(request_id.clone(), respond);
+            *lock(&self.live_approval) = Some(PendingApproval {
+                request_id: request_id.clone(),
+                call: call.clone(),
+            });
+            self.publish_locked(
+                &mut seq,
+                Payload::ApprovalRequested {
+                    request_id: request_id.clone(),
+                    call: call.clone(),
+                },
+            );
+        }
         drop(order_guard);
         // The whole round-trip is blocking inside an async context:
         // block_in_place frees the runtime's other workers while this task
@@ -490,13 +566,19 @@ impl SessionHandle {
                 Err(RecvTimeoutError::Timeout) => (false, true),
                 Err(RecvTimeoutError::Disconnected) => (false, false),
             };
-        let was_resolved = lock(&self.pending).remove(&request_id).is_none();
-        *lock(&self.live_approval) = None;
-        if timed_out && !was_resolved {
-            self.publish(Payload::ApprovalResolved {
-                request_id: request_id.clone(),
-                decision: modron_protocol::Decision::Deny,
-            });
+        {
+            let mut seq = lock(&self.seq);
+            let was_resolved = lock(&self.pending).remove(&request_id).is_none();
+            *lock(&self.live_approval) = None;
+            if timed_out && !was_resolved {
+                self.publish_locked(
+                    &mut seq,
+                    Payload::ApprovalResolved {
+                        request_id: request_id.clone(),
+                        decision: modron_protocol::Decision::Deny,
+                    },
+                );
+            }
         }
         allowed
     }
@@ -505,6 +587,7 @@ impl SessionHandle {
     /// sets the sticky allow-rest flag. Broadcasts the resolution so every
     /// attached client sees it.
     pub fn resolve(&self, request_id: &str, decision: Decision) -> Result<(), String> {
+        let mut seq = lock(&self.seq);
         let respond = lock(&self.pending)
             .remove(request_id)
             .ok_or_else(|| format!("unknown or already-resolved request id {request_id}"))?;
@@ -513,10 +596,13 @@ impl SessionHandle {
         }
         *lock(&self.live_approval) = None;
         let _ = respond.send(decision != Decision::Deny);
-        self.publish(Payload::ApprovalResolved {
-            request_id: request_id.to_string(),
-            decision,
-        });
+        self.publish_locked(
+            &mut seq,
+            Payload::ApprovalResolved {
+                request_id: request_id.to_string(),
+                decision,
+            },
+        );
         Ok(())
     }
 
@@ -526,12 +612,16 @@ impl SessionHandle {
     /// — even in the degenerate no-run case, which must not leave a
     /// blocking approver wedged. Returns whether a run was aborted.
     pub fn interrupt(&self) -> bool {
-        let task = lock(&self.run).take();
+        // The run slot stays locked for the whole interrupt, including the
+        // `aborted` store: start_run takes the same lock, so a new run can
+        // never start between taking the slot and marking it aborted (LG-c;
+        // the old ordering let the new run inherit aborted = true).
+        let mut slot = lock(&self.run);
+        let task = slot.take();
         let had_run = task.is_some();
-        if had_run {
-            if let Some(task) = task {
-                task.abort();
-            }
+        self.busy.store(false, Ordering::Relaxed);
+        if let Some(task) = task {
+            task.abort();
         }
         // Publish each drained gate's resolution BEFORE TurnAborted so a
         // client never renders a phantom approval for an already-dead run
@@ -542,19 +632,25 @@ impl SessionHandle {
         // sees the empty run slot and publishes nothing (cycle-3 F3).
         let order_guard = lock(&self.gate_order);
         self.aborted.store(true, Ordering::Relaxed);
+        let mut seq = lock(&self.seq);
         let pending = lock(&self.pending).drain().collect::<Vec<_>>();
         for (request_id, respond) in pending {
             let _ = respond.send(false);
-            self.publish(Payload::ApprovalResolved {
-                request_id,
-                decision: modron_protocol::Decision::Deny,
-            });
+            self.publish_locked(
+                &mut seq,
+                Payload::ApprovalResolved {
+                    request_id,
+                    decision: modron_protocol::Decision::Deny,
+                },
+            );
         }
         *lock(&self.live_approval) = None;
         if had_run {
-            self.publish(Payload::TurnAborted {});
+            self.publish_locked(&mut seq, Payload::TurnAborted {});
         }
+        drop(seq);
         drop(order_guard);
+        drop(slot);
         had_run
     }
 
@@ -567,35 +663,48 @@ impl SessionHandle {
         if slot.take().is_none() {
             return; // interrupted: the slot (and the terminal frame) went to it
         }
-        drop(slot);
+        self.busy.store(false, Ordering::Relaxed);
+        // The slot stays locked through the terminal frame, so a run that
+        // starts next cannot publish ahead of this turn's end.
         // Clear the live buffers on the terminal frame: a provider error
         // after text deltas otherwise leaves the stale prefix glued to the
         // NEXT turn's stream for every late attacher (cycle-2 audit L1).
+        let mut seq = lock(&self.seq);
         lock(&self.text).clear();
         lock(&self.reasoning).clear();
         lock(&self.tracker).clear_turn();
         match result {
-            Ok(summary) => self.publish(Payload::TurnDone {
-                summary: WireRunSummary::from(&summary),
-            }),
-            Err(error) => self.publish(Payload::TurnFailed {
-                error: error.to_string(),
-            }),
+            Ok(summary) => self.publish_locked(
+                &mut seq,
+                Payload::TurnDone {
+                    summary: WireRunSummary::from(&summary),
+                },
+            ),
+            Err(error) => self.publish_locked(
+                &mut seq,
+                Payload::TurnFailed {
+                    error: error.to_string(),
+                },
+            ),
         }
     }
 
     /// Fold one persisted event into the live view (usage accounting) and
     /// broadcast it as a seq'd `Event` frame.
     pub fn on_persisted(&self, event: &SessionEvent) {
+        let mut seq = lock(&self.seq);
         if let SessionEvent::Usage { usage, .. } = event {
             let mut total = lock(&self.usage);
             total.input_tokens += usage.input_tokens;
             total.output_tokens += usage.output_tokens;
             total.cached_input_tokens += usage.cached_input_tokens;
         }
-        self.publish(Payload::Event {
-            event: event.clone(),
-        });
+        self.publish_locked(
+            &mut seq,
+            Payload::Event {
+                event: event.clone(),
+            },
+        );
     }
 
     /// Mutate the session's engine config for future turns (the wire's
@@ -604,8 +713,16 @@ impl SessionHandle {
     /// selector is pinned so the router cannot route elsewhere. Returns a
     /// human note (published as `ConfigChanged` by the caller).
     pub fn apply_config(&self, patch: &ConfigPatch) -> anyhow::Result<()> {
-        let mut engine = self.engine_cell().clone();
+        // Validate and compute everything first, then commit the config, the
+        // selector and the status labels together (LG-a): a rejected patch
+        // leaves all three exactly as they were. The engine lock spans the
+        // whole read-modify-write so two SetConfigs cannot interleave.
+        let mut slot = self.engine_cell();
+        let mut engine = slot.clone();
         let mut config = engine.config.clone();
+        // Label values this patch would set; committed only on success.
+        let mut model_label: Option<String> = None;
+        let mut provider_label: Option<String> = None;
 
         if let Some(model) = &patch.model {
             config.default_model = model.clone();
@@ -624,11 +741,11 @@ impl SessionHandle {
                 model,
                 config.default_provider.clone(),
             ));
-            *lock(&self.model) = model.clone();
-            *lock(&self.provider) = config.default_provider.clone();
+            model_label = Some(model.clone());
+            provider_label = Some(config.default_provider.clone());
         } else if let Some(provider) = &patch.provider {
             config.default_provider = provider.clone();
-            *lock(&self.provider) = provider.clone();
+            provider_label = Some(provider.clone());
         }
         if let Some(sandbox) = patch.sandbox {
             if !modron_core::sandbox::is_supported(sandbox) {
@@ -676,21 +793,30 @@ impl SessionHandle {
             }
             if let Some(model) = spec.model {
                 config.default_model = model.clone();
-                *lock(&self.model) = model;
+                model_label = Some(model);
             }
             if let Some(provider) = spec.provider {
                 config.default_provider = provider.clone();
-                *lock(&self.provider) = provider;
+                provider_label = Some(provider);
             }
             config.approvals.allow.extend(spec.allow);
             config.approvals.deny.extend(spec.deny);
         }
-        if let Some(goal) = &patch.goal {
-            *lock(&self.goal) = goal.clone();
-        }
+        let goal_label = patch.goal.clone();
 
+        // Everything validated: commit the config, the selector and the
+        // labels in one step.
         engine.config = config;
-        *self.engine_cell() = engine;
+        *slot = engine;
+        if let Some(model) = model_label {
+            *lock(&self.model) = model;
+        }
+        if let Some(provider) = provider_label {
+            *lock(&self.provider) = provider;
+        }
+        if let Some(goal) = goal_label {
+            *lock(&self.goal) = goal;
+        }
         Ok(())
     }
 }
@@ -824,7 +950,7 @@ impl SessionHub {
         });
         let shared_store = Arc::clone(&template.store);
         let mut engine = template;
-        engine.store = PinnedCreateStore::new(shared_store, pinned);
+        engine.store = PinnedCreateStore::new(Arc::clone(&shared_store), pinned);
 
         // Wire this session's sinks onto the config clone: every delta,
         // tool event, and approval routes back here by session id.
@@ -862,6 +988,9 @@ impl SessionHub {
             pending: Mutex::new(HashMap::new()),
             gate_order: Mutex::new(()),
             aborted: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            deleting: AtomicBool::new(false),
+            shared_store,
             approval_timeout: Mutex::new(std::time::Duration::from_secs(30)),
             allow_rest: AtomicBool::new(false),
             tracker: Mutex::new(ActivityTracker::new()),
@@ -893,11 +1022,19 @@ impl SessionHub {
         let handle = self
             .handle(&id)
             .ok_or_else(|| format!("no such session {id}"))?;
+        // The run slot lock orders this against interrupt (which holds it
+        // across its `aborted` store) and against begin_delete's fence.
         let mut slot = lock(&handle.run);
         if slot.is_some() {
             return Err("session busy (a run is active)".to_string());
         }
-        handle.aborted.store(false, Ordering::Relaxed);
+        if handle.deleting.load(Ordering::Relaxed) {
+            return Err(format!("session {id} is being deleted"));
+        }
+        {
+            let _order = lock(&handle.gate_order);
+            handle.aborted.store(false, Ordering::Relaxed);
+        }
         // "Allow all" is sticky for the rest of the RUN only (AGENTS.md
         // interaction semantics): a new run starts un-approved.
         handle.allow_rest.store(false, Ordering::Relaxed);
@@ -907,7 +1044,37 @@ impl SessionHub {
             owner.complete(result);
         });
         *slot = Some(task);
+        handle.busy.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Start deleting a session. Fails while a run holds its slot. Until
+    /// [`finish_delete`](Self::finish_delete) or
+    /// [`cancel_delete`](Self::cancel_delete), no run may start: the busy
+    /// check and the fence happen under one run-slot lock, so a submit
+    /// cannot begin a run between the check and the removal.
+    pub fn begin_delete(&self, id: SessionId) -> Result<(), String> {
+        let handle = self.ensure_session(id, None);
+        let slot = lock(&handle.run);
+        if slot.is_some() {
+            return Err("session is running - interrupt it before deleting".to_string());
+        }
+        handle.deleting.store(true, Ordering::Relaxed);
+        drop(slot);
+        Ok(())
+    }
+
+    /// The delete failed: lift the fence, keep the session.
+    pub fn cancel_delete(&self, id: SessionId) {
+        if let Some(handle) = self.handle(&id) {
+            let _slot = lock(&handle.run);
+            handle.deleting.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// The session is gone from the store: drop its live handle.
+    pub fn finish_delete(&self, id: SessionId) {
+        self.remove(&id);
     }
 
     /// Apply an approval decision wherever the request lives (first
