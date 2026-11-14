@@ -2326,3 +2326,66 @@ fn approval_prompt_for_write_leads_with_the_path() {
     };
     assert_eq!(app.status_line(), "⚠ allow write src/lib.rs? [y/N/a]");
 }
+
+// ---------------------------------------------------------------------------
+// C2: approval state is per run (D6). "Allow all" and the pending prompt are
+// cleared when a run starts and when it settles (done / failed / aborted).
+// ---------------------------------------------------------------------------
+
+fn pending_with_rx() -> (PendingApproval, mpsc::Receiver<bool>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        PendingApproval {
+            call: ToolCall {
+                id: "c-live".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "make"}),
+            },
+            respond: tx,
+        },
+        rx,
+    )
+}
+
+#[test]
+fn allow_all_does_not_carry_into_the_next_task() {
+    let mut app = App {
+        approve_rest: true,
+        ..App::default()
+    };
+    app.begin_task("task two");
+    assert!(
+        !app.approve_rest,
+        "`a` in task one must not auto-approve task two"
+    );
+}
+
+#[test]
+fn aborting_clears_the_modal_and_the_sticky_allow_all() {
+    let (pending, rx) = pending_with_rx();
+    let mut app = App {
+        running: true,
+        approve_rest: true,
+        pending_approval: Some(pending),
+        ..App::default()
+    };
+    app.finish_interrupted();
+    assert!(app.pending_approval.is_none(), "abort clears the modal");
+    assert!(!app.approve_rest, "abort clears allow-all");
+    // The dropped respond sender tells a parked engine: no decision.
+    assert!(rx.recv().is_err(), "the parked approval is released");
+}
+
+#[test]
+fn a_finished_turn_clears_the_stale_approval_state() {
+    let (pending, _rx) = pending_with_rx();
+    let mut app = App {
+        running: true,
+        approve_rest: true,
+        pending_approval: Some(pending),
+        ..App::default()
+    };
+    app.finish_turn("done".into(), Usage::default(), 1, 0, uuid::Uuid::new_v4());
+    assert!(app.pending_approval.is_none(), "done clears the modal");
+    assert!(!app.approve_rest, "done clears allow-all");
+}

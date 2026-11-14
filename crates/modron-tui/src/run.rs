@@ -14,7 +14,7 @@ use modron_core::{
     ApprovalMode, Approver, DeltaSink, Engine, RunSummary, SessionId, StreamDelta, ToolActivity,
     ToolActivitySink, ToolCall,
 };
-use modron_protocol::{ConfigPatch, Decision, Frame, Payload, WireRunSummary};
+use modron_protocol::{ConfigPatch, Frame, Payload, WireRunSummary};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -125,6 +125,11 @@ enum UiFrame {
     /// New transcript entries folded from a live persisted Event frame
     /// (the driver's ReplayFolder; parity with a fresh attach replay).
     Entries(Vec<modron_view::TranscriptEntry>),
+    /// The server settled an approval (any client's decision): clear the
+    /// matching prompt.
+    ApprovalResolved {
+        request_id: String,
+    },
     Disconnected,
 }
 
@@ -231,6 +236,23 @@ type ApprovalSlot = Arc<Mutex<Option<(ToolCall, mpsc::Sender<bool>)>>>;
 struct ApprovalBus {
     slot: ApprovalSlot,
     rest_approved: Arc<std::sync::atomic::AtomicBool>,
+    /// Remote mode: the wire request id of the prompt in `slot` (set by the
+    /// driver before it fills the slot). Local approvals leave it empty.
+    request_id: Arc<Mutex<Option<String>>>,
+}
+
+/// The decision a remote approval waiter sends. `None` means the waiter
+/// was released without a verdict (the prompt was dropped locally, or the
+/// request was already resolved elsewhere): send nothing, because the
+/// server rejects a decision for an unknown request id.
+fn remote_decision(received: Option<bool>, allow_rest: bool) -> Option<modron_protocol::Decision> {
+    use modron_protocol::Decision;
+    match received {
+        None => None,
+        Some(false) => Some(Decision::Deny),
+        Some(true) if allow_rest => Some(Decision::AllowAll),
+        Some(true) => Some(Decision::AllowOnce),
+    }
 }
 
 /// Run the TUI. `build` receives the wired sinks and returns the engine plus
@@ -265,6 +287,7 @@ pub async fn run_with(
     let approval = ApprovalBus {
         slot: Arc::new(Mutex::new(None)),
         rest_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        request_id: Arc::new(Mutex::new(None)),
     };
 
     // Remote-control connect happens BEFORE the terminal goes raw: a bad
@@ -613,6 +636,10 @@ struct RunState {
     engine_task: Option<tokio::task::JoinHandle<()>>,
     // Remote mode's one-at-a-time flag (no JoinHandle exists to check).
     remote_busy: bool,
+    // Remote mode: the wire request id of the prompt the App is showing
+    // (matched against ApprovalResolved so a decision made elsewhere
+    // clears it).
+    approval_request: Option<String>,
     oauth_task: Option<tokio::task::JoinHandle<()>>,
     oauth_generation: u64,
     slow_command_task: Option<tokio::task::JoinHandle<()>>,
@@ -685,6 +712,7 @@ impl RunState {
             loop_cmd_tx,
             engine_task: None,
             remote_busy: false,
+            approval_request: None,
             oauth_task: None,
             oauth_generation: 0,
             slow_command_task: None,
@@ -714,9 +742,26 @@ impl RunState {
     fn drain_approval_slot(&mut self, app: &mut App) {
         if app.pending_approval.is_none() {
             if let Some((call, respond)) = self.approval.slot.lock().unwrap().take() {
+                self.approval_request = self.approval.request_id.lock().unwrap().take();
                 app.pending_approval = Some(PendingApproval { call, respond });
             }
         }
+    }
+
+    /// D6 run boundary: "allow all" and the pending prompt (App and the
+    /// approver bus, including a queued slot entry) are cleared together.
+    /// Called when a run starts, settles, is aborted locally, or when the
+    /// connection drops or /mode and /new change the session's approvals.
+    fn reset_run_approvals(&mut self, app: &mut App) {
+        app.clear_run_approvals();
+        self.approval
+            .rest_approved
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Dropping a queued (slot) or shown respond releases the engine
+        // with no decision (local: denied; remote: nothing is sent).
+        self.approval.slot.lock().unwrap().take();
+        self.approval.request_id.lock().unwrap().take();
+        self.approval_request = None;
     }
 
     /// Phase 3: poll the keyboard (raw mode). Returns [`IterationFlow`] so
@@ -838,6 +883,9 @@ impl RunState {
                             app.toast("a turn is already running — Esc aborts it");
                             return Ok(IterationFlow::Skip);
                         }
+                        // D6: a new run starts with no allow-all and no
+                        // prompt carried over from the last one.
+                        self.reset_run_approvals(app);
                         let task = app.task_with_goal(&task);
                         app.begin_task(&task);
                         let attachments = app.take_attachments();
@@ -894,6 +942,7 @@ impl RunState {
                                     // Give the runtime a beat to cancel.
                                     tokio::time::sleep(Duration::from_millis(30)).await;
                                     app.finish_interrupted();
+                                    self.reset_run_approvals(app);
                                 }
                                 // No engine running: Esc cancels a slow
                                 // command instead. Bumping the generation
@@ -940,6 +989,14 @@ impl RunState {
     async fn dispatch_pending_commands(&mut self, app: &mut App) {
         // NOTE: peek with matches! before take() — an `if let` over
         // `.take()` drops the value when the pattern fails.
+        // D6: changing the approval mode or starting a new session ends the
+        // current allow-all and any open prompt (local and remote alike).
+        if matches!(
+            app.pending_command,
+            Some(PendingCommand::Mode(_)) | Some(PendingCommand::NewSession)
+        ) {
+            self.reset_run_approvals(app);
+        }
         if self.is_remote {
             // Connected: config slash commands become SetConfig patches;
             // anything needing the local engine is refused EXPLICITLY
@@ -1268,8 +1325,21 @@ impl RunState {
                 UiFrame::Entries(entries) => {
                     app.backfill_transcript(entries);
                 }
+                UiFrame::ApprovalResolved { request_id } => {
+                    if self.approval_request.as_deref() == Some(request_id.as_str()) {
+                        self.approval_request = None;
+                        app.pending_approval = None;
+                    }
+                    // Not drained yet: drop the queued prompt for it too.
+                    let mut queued_id = self.approval.request_id.lock().unwrap();
+                    if queued_id.as_deref() == Some(request_id.as_str()) {
+                        *queued_id = None;
+                        self.approval.slot.lock().unwrap().take();
+                    }
+                }
                 UiFrame::Disconnected => {
                     self.remote_busy = false;
+                    self.reset_run_approvals(app);
                     app.toast("server disconnected — restart with --connect to reattach");
                 }
             }
@@ -1280,11 +1350,14 @@ impl RunState {
     /// approvals short-circuit in the approver; drain any queued one so an
     /// approval parked BEFORE the `a` press is answered, not re-prompted.
     fn mirror_approve_rest(&mut self, app: &mut App) {
+        // Mirror both ways: the App is the source of truth for the run's
+        // allow-all, and a cleared App flag must clear the approver's too.
+        self.approval
+            .rest_approved
+            .store(app.approve_rest, std::sync::atomic::Ordering::Relaxed);
         if app.approve_rest {
-            self.approval
-                .rest_approved
-                .store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some((_, respond)) = self.approval.slot.lock().unwrap().take() {
+                self.approval.request_id.lock().unwrap().take();
                 let _ = respond.send(true);
             }
         }
@@ -1297,6 +1370,8 @@ impl RunState {
             self.engine_task = None;
             self.remote_busy = false;
             self.drain_engine_events(app);
+            // The run settled: its allow-all and any open prompt end with it.
+            self.reset_run_approvals(app);
             match outcome {
                 Outcome::Done(summary) => {
                     let swarm = app.swarm_summary();
@@ -1940,6 +2015,7 @@ enum LoopInput {
     Note(String),
     ConfigChanged(ConfigPatch),
     Snapshot(Box<crate::remote::AttachSnapshot>),
+    ApprovalResolved { request_id: String },
 }
 
 fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
@@ -1949,14 +2025,29 @@ fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
             last_seq,
             events,
             live,
-        } => vec![LoopInput::Snapshot(Box::new(
-            crate::remote::AttachSnapshot {
-                session_id,
-                last_seq,
-                events,
-                live,
-            },
-        ))],
+        } => {
+            // A snapshot taken while an approval awaits a decision adopts
+            // that prompt (same path as a live ApprovalRequested).
+            let adopt = live.pending_approval.clone();
+            let mut inputs = vec![LoopInput::Snapshot(Box::new(
+                crate::remote::AttachSnapshot {
+                    session_id,
+                    last_seq,
+                    events,
+                    live,
+                },
+            ))];
+            if let Some(p) = adopt {
+                inputs.push(LoopInput::Approval {
+                    request_id: p.request_id,
+                    call: p.call,
+                });
+            }
+            inputs
+        }
+        Payload::ApprovalResolved { request_id, .. } => {
+            vec![LoopInput::ApprovalResolved { request_id }]
+        }
         Payload::Delta { delta } => vec![LoopInput::Delta(delta.to_core())],
         Payload::Tool { activity } => vec![LoopInput::Tool(activity.into())],
         Payload::ApprovalRequested { request_id, call } => {
@@ -2071,6 +2162,9 @@ fn spawn_remote_driver(
         // the next attach; the folder matches a fresh replay exactly.
         let mut folder = modron_view::ReplayFolder::new();
         let mut folder_session: Option<uuid::Uuid> = None;
+        // The last approval request queued for the loop (dedupes a prompt
+        // that arrives both live and in an attach snapshot).
+        let mut seen_approval: Option<String> = None;
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
@@ -2207,23 +2301,33 @@ fn spawn_remote_driver(
                                     }
                                     let _ = ui_tx.send(UiFrame::Snapshot(snap));
                                 }
+                                LoopInput::ApprovalResolved { request_id } => {
+                                    let _ = ui_tx.send(UiFrame::ApprovalResolved { request_id });
+                                }
                                 LoopInput::Approval { request_id, call } => {
+                                    // A live prompt and the snapshot's copy of
+                                    // the same request must not queue twice.
+                                    if seen_approval.as_deref() == Some(request_id.as_str()) {
+                                        continue;
+                                    }
+                                    seen_approval = Some(request_id.clone());
                                     let (respond, receiver) = mpsc::channel();
+                                    *approval.request_id.lock().unwrap() = Some(request_id.clone());
                                     *approval.slot.lock().unwrap() = Some((call, respond));
                                     let cmd_tx = cmd_tx.clone();
                                     let rest = approval.rest_approved.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        let allow = receiver.recv().unwrap_or(false);
-                                        let decision = if allow {
-                                            if rest.load(Ordering::Relaxed) {
-                                                Decision::AllowAll
-                                            } else {
-                                                Decision::AllowOnce
-                                            }
-                                        } else {
-                                            Decision::Deny
-                                        };
-                                        let _ = cmd_tx.send(LoopCmd::Approve { request_id, decision });
+                                        // Released without a verdict (dropped
+                                        // locally, or resolved elsewhere): send
+                                        // nothing; the server rejects unknown ids.
+                                        let received = receiver.recv().ok();
+                                        if let Some(decision) = remote_decision(
+                                            received,
+                                            rest.load(Ordering::Relaxed),
+                                        ) {
+                                            let _ = cmd_tx
+                                                .send(LoopCmd::Approve { request_id, decision });
+                                        }
                                     });
                                 }
                             }
@@ -2283,4 +2387,190 @@ fn remote_slash_command(cmd: &PendingCommand) -> Option<(ConfigPatch, Option<Str
         _ => return None,
     };
     Some((patch, None))
+}
+
+#[cfg(test)]
+mod approval_state_tests {
+    //! C2 (D6): per-run approval state in the run loop. Pure mapping and
+    //! the RunState reset are exercised here; the terminal loop itself is
+    //! not (it needs a TTY).
+    use super::*;
+    use modron_core::ToolCall;
+    use modron_protocol::{Decision, LiveState, PendingApproval as WirePending};
+    use uuid::Uuid;
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }
+    }
+
+    fn state_with_bus() -> (RunState, App, ApprovalBus) {
+        let (delta_tx, delta_rx) = mpsc::channel::<DeltaOrTool>();
+        let approval = ApprovalBus {
+            slot: Arc::new(Mutex::new(None)),
+            rest_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_id: Arc::new(Mutex::new(None)),
+        };
+        let state = RunState::new(
+            inert_engine(),
+            true,
+            delta_tx,
+            delta_rx,
+            approval.clone(),
+            None,
+            None,
+        );
+        (state, App::default(), approval)
+    }
+
+    #[test]
+    fn snapshot_with_a_pending_approval_adopts_the_prompt() {
+        let session = Uuid::new_v4();
+        let live = LiveState {
+            pending_approval: Some(WirePending {
+                request_id: "req-1".into(),
+                call: call("c1"),
+            }),
+            ..LiveState::default()
+        };
+        let frame = Frame::event(
+            Some(session),
+            3,
+            Payload::Snapshot {
+                session_id: session,
+                last_seq: 3,
+                events: Vec::new(),
+                live,
+            },
+        );
+        let inputs = frame_to_inputs(frame);
+        assert_eq!(inputs.len(), 2, "snapshot, then the adopted prompt");
+        assert!(matches!(inputs[0], LoopInput::Snapshot(_)));
+        match &inputs[1] {
+            LoopInput::Approval { request_id, call } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(call.id, "c1");
+            }
+            _ => panic!("expected the snapshot's pending approval"),
+        }
+    }
+
+    #[test]
+    fn snapshot_without_a_pending_approval_adopts_nothing() {
+        let session = Uuid::new_v4();
+        let frame = Frame::event(
+            Some(session),
+            0,
+            Payload::Snapshot {
+                session_id: session,
+                last_seq: 0,
+                events: Vec::new(),
+                live: LiveState::default(),
+            },
+        );
+        let inputs = frame_to_inputs(frame);
+        assert_eq!(inputs.len(), 1);
+        assert!(matches!(inputs[0], LoopInput::Snapshot(_)));
+    }
+
+    #[test]
+    fn approval_resolved_frame_maps_to_a_loop_input() {
+        let frame = Frame::event(
+            None,
+            0,
+            Payload::ApprovalResolved {
+                request_id: "req-9".into(),
+                decision: Decision::AllowOnce,
+            },
+        );
+        let inputs = frame_to_inputs(frame);
+        assert!(matches!(
+            &inputs[..],
+            [LoopInput::ApprovalResolved { request_id }] if request_id == "req-9"
+        ));
+    }
+
+    #[test]
+    fn a_released_remote_waiter_sends_nothing() {
+        // Dropped locally (or resolved elsewhere): no verdict, no send.
+        assert_eq!(remote_decision(None, true), None);
+        assert_eq!(remote_decision(None, false), None);
+        assert_eq!(remote_decision(Some(false), true), Some(Decision::Deny));
+        assert_eq!(
+            remote_decision(Some(true), false),
+            Some(Decision::AllowOnce)
+        );
+        assert_eq!(remote_decision(Some(true), true), Some(Decision::AllowAll));
+    }
+
+    #[test]
+    fn a_run_boundary_clears_the_app_and_the_approver_bus() {
+        let (mut state, mut app, approval) = state_with_bus();
+        let (respond, receiver) = mpsc::channel::<bool>();
+        app.approve_rest = true;
+        app.pending_approval = Some(PendingApproval {
+            call: call("shown"),
+            respond,
+        });
+        approval.rest_approved.store(true, Ordering::Relaxed);
+        *approval.request_id.lock().unwrap() = Some("req-q".into());
+        let (queued, _queued_rx) = mpsc::channel::<bool>();
+        *approval.slot.lock().unwrap() = Some((call("queued"), queued));
+        state.approval_request = Some("req-shown".into());
+
+        state.reset_run_approvals(&mut app);
+
+        assert!(!app.approve_rest);
+        assert!(app.pending_approval.is_none());
+        assert!(!approval.rest_approved.load(Ordering::Relaxed));
+        assert!(approval.slot.lock().unwrap().is_none());
+        assert!(approval.request_id.lock().unwrap().is_none());
+        assert!(state.approval_request.is_none());
+        // The shown prompt's sender was dropped: its engine is released.
+        assert!(receiver.recv().is_err());
+    }
+
+    #[test]
+    fn the_approver_flag_follows_the_app_each_tick() {
+        let (mut state, mut app, approval) = state_with_bus();
+        app.approve_rest = true;
+        state.mirror_approve_rest(&mut app);
+        assert!(approval.rest_approved.load(Ordering::Relaxed));
+        app.approve_rest = false;
+        state.mirror_approve_rest(&mut app);
+        assert!(!approval.rest_approved.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn resolved_frame_clears_only_the_matching_prompt() {
+        let (mut state, mut app, _approval) = state_with_bus();
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<UiFrame>();
+        state.ui_rx = ui_rx;
+        let (respond, _rx) = mpsc::channel::<bool>();
+        app.pending_approval = Some(PendingApproval {
+            call: call("shown"),
+            respond,
+        });
+        state.approval_request = Some("req-shown".into());
+
+        ui_tx
+            .send(UiFrame::ApprovalResolved {
+                request_id: "req-other".into(),
+            })
+            .unwrap();
+        state.drain_ui_frames(&mut app);
+        assert!(app.pending_approval.is_some(), "another request leaves it");
+
+        ui_tx
+            .send(UiFrame::ApprovalResolved {
+                request_id: "req-shown".into(),
+            })
+            .unwrap();
+        state.drain_ui_frames(&mut app);
+        assert!(app.pending_approval.is_none(), "the matching one clears");
+        assert!(state.approval_request.is_none());
+    }
 }
