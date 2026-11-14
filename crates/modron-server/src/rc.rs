@@ -29,8 +29,20 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::dispatch::{handle_frame, ConnCtx, Flow, ServerState};
 use modron_core::SessionId;
 
-/// Build the relay URLs for a bridge base + share key: the agent tunnel
-/// `ws(s)://host/agent/{key}` and the viewer page `base/s/{key}`.
+/// The key that goes into a share link: a one-way hash of the agent's
+/// secret key. The bridge derives the same value from the agent's
+/// connection, so both sides meet in one relay session, but someone holding
+/// a share link cannot recover the agent key and connect as the agent.
+/// Must match `viewerKeyOf` in cloud/bridge/src/index.ts.
+pub fn viewer_key(agent_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("modron-viewer:{agent_key}").as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Build the relay URLs for a bridge base + agent key: the agent tunnel
+/// `ws(s)://host/agent/{key}` and the viewer page `base/s/{viewer key}`
+/// (see [`viewer_key`]; the share link never contains the agent key).
 pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
     let base = bridge_base.trim_end_matches('/');
     let ws_scheme = if base.starts_with("wss://") || base.starts_with("https://") {
@@ -46,7 +58,7 @@ pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
         .unwrap_or(base);
     (
         format!("{ws_scheme}://{host}/agent/{key}"),
-        format!("{base}/s/{key}"),
+        format!("{base}/s/{}", viewer_key(key)),
     )
 }
 
@@ -416,6 +428,34 @@ mod publish_tests {
         assert!(
             !head.contains(&format!("bearer {key}")),
             "share key used as bearer: {head}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{tunnel_urls, viewer_key};
+
+    /// The same vector is produced by `viewerKeyOf` in the bridge
+    /// (sha256("modron-viewer:" + key), first 16 bytes, hex). If this
+    /// changes, share links stop meeting their agent on the relay.
+    #[test]
+    fn viewer_key_matches_the_bridge_derivation() {
+        assert_eq!(
+            viewer_key("0123456789abcdef0123456789abcdef"),
+            "1e14cd6450e5f6e627a9c619807f506c"
+        );
+    }
+
+    #[test]
+    fn share_link_never_contains_the_agent_key() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let (agent_url, share_url) = tunnel_urls("wss://bridge.example", key);
+        assert_eq!(agent_url, format!("wss://bridge.example/agent/{key}"));
+        assert!(!share_url.contains(key), "{share_url}");
+        assert_eq!(
+            share_url,
+            format!("wss://bridge.example/s/{}", viewer_key(key))
         );
     }
 }

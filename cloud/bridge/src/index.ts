@@ -16,6 +16,34 @@
 
 const MAX_BUFFER = 200;
 const MAX_FRAME = 96 * 1024; // per-frame cap (DO storage values cap at 128 KiB)
+// Agent frames above MAX_FRAME are still relayed live (never stored) up to
+// this size, so a long session's attach snapshot reaches its viewers.
+const MAX_FORWARD = 4 * 1024 * 1024;
+
+// A bare keepalive reply from the agent ({"type":"pong", ...}).
+function isKeepalive(message: string): boolean {
+  if (message.length > 256) return false;
+  try {
+    const parsed = JSON.parse(message) as { type?: unknown };
+    return parsed !== null && typeof parsed === "object" && parsed.type === "pong";
+  } catch {
+    return false;
+  }
+}
+
+// Viewers and the agent use DIFFERENT keys for the same session. The agent
+// connects with its secret key; the share link carries only the viewer key,
+// a one-way hash of it. Both resolve to the same Durable Object (named by
+// the viewer key), but someone holding a share link cannot derive the agent
+// key and so cannot connect as the agent and impersonate it to other
+// viewers. Must match `viewer_key` in crates/modron-server/src/rc.rs.
+async function viewerKeyOf(agentKey: string): Promise<string> {
+  const bytes = new TextEncoder().encode("modron-viewer:" + agentKey);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let hex = "";
+  for (let i = 0; i < 16; i++) hex += digest[i].toString(16).padStart(2, "0");
+  return hex;
+}
 // Durable Object storage rejects values above 128 KiB - caps stay under
 // it (cycle-3 F4: the 256KB/1MB caps passed validation then blew up at
 // storage.put with an opaque 500 / silently-missing replay frame).
@@ -329,7 +357,9 @@ export class SessionBridge extends DurableObject {
       await this.state.storage.put("seen:" + role, now);
       await this.ensureAlarmAt(now + BUFFER_IDLE_MS);
       const pair = new WebSocketPair();
-      this.state.acceptWebSocket(pair[1], ["role:" + role, "key:" + key]);
+      // The tag only marks the socket as keyed; the agent's secret key is
+      // never stored.
+      this.state.acceptWebSocket(pair[1], ["role:" + role, "key:" + (role === "agent" ? "agent" : key)]);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     return new Response("modron bridge - see cloud/bridge/README.md", { status: 404 });
@@ -345,8 +375,16 @@ export class SessionBridge extends DurableObject {
       try { ws.send(JSON.stringify({ type: "note", text: "binary frames are not supported - dropped" })); } catch { /* gone */ }
       return;
     }
-    if (message.length > MAX_FRAME) {
-      try { ws.send(JSON.stringify({ type: "note", text: "frame too large (96KB limit) - dropped" })); } catch { /* gone */ }
+    // Viewer frames are small commands; agent frames can be large (an
+    // attach snapshot carries the whole transcript), so they are forwarded
+    // live up to MAX_FORWARD and only STORED for replay when they fit a
+    // Durable Object value (MAX_FRAME).
+    const limit = role === "agent" ? MAX_FORWARD : MAX_FRAME;
+    if (message.length > limit) {
+      const text = role === "agent"
+        ? "frame too large (4MB limit) - dropped"
+        : "frame too large (96KB limit) - dropped";
+      try { ws.send(JSON.stringify({ type: "note", text })); } catch { /* gone */ }
       return;
     }
     if (role !== "agent") {
@@ -365,7 +403,15 @@ export class SessionBridge extends DurableObject {
       try { agent?.send(message); } catch { /* gone */ }
       return;
     }
-    await this.appendAgentFrame(message).catch(() => { /* storage hiccup - still fan out live */ });
+    // Keepalive pongs are not history: storing one every 30 s would evict
+    // the whole replay buffer after about 100 idle minutes.
+    if (isKeepalive(message)) {
+      await this.state.storage.put("seen:agent", Date.now());
+      return;
+    }
+    if (message.length <= MAX_FRAME) {
+      await this.appendAgentFrame(message).catch(() => { /* storage hiccup - still fan out live */ });
+    }
     for (const viewer of this.viewers()) { try { viewer.send(message); } catch { /* gone */ } }
   }
 
@@ -438,7 +484,15 @@ const router: ExportedHandler<Env> = {
       return env.BRIDGE.get(env.BRIDGE.idFromName(REGISTRY_DO)).fetch(request);
     }
     if (path === "/") return new Response("modron remote-control bridge - open a /s/<key> share link from modron");
-    if ((m = path.match(/^\/s\/([^/]+)$/)) || (m = path.match(/^\/(?:agent|ws)\/([^/]+)$/))) {
+    // The agent tunnel: /agent/<agent key>, routed to the DO named by the
+    // derived viewer key (see viewerKeyOf).
+    if ((m = path.match(/^\/agent\/([^/]+)$/))) {
+      if (!validKey(m[1])) return new Response("invalid key", { status: 400 });
+      const viewerKey = await viewerKeyOf(m[1]);
+      return env.BRIDGE.get(env.BRIDGE.idFromName(viewerKey)).fetch(request);
+    }
+    // Viewers: /s/<viewer key> (page) and /ws/<viewer key> (socket).
+    if ((m = path.match(/^\/s\/([^/]+)$/)) || (m = path.match(/^\/ws\/([^/]+)$/))) {
       if (!validKey(m[1])) return new Response("invalid key", { status: 400 });
       return env.BRIDGE.get(env.BRIDGE.idFromName(m[1])).fetch(request);
     }

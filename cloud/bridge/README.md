@@ -6,7 +6,7 @@ deployed on Cloudflare Workers with a Durable Object per share key.
 - `modron serve` (any machine - laptop, home server, cloud box) runs
   `/remote-control <bridge url>`; it dials ONE outbound WebSocket to this
   relay (no ports opened).
-- Any browser opens `https://<your-bridge>/s/<key>` and gets the minimal
+- Any browser opens `https://<your-bridge>/s/<viewer key>` and gets the minimal
   built-in viewer: transcript and streaming as a chat log (no build step,
   no dependencies).
 - Frames relay verbatim - the bridge never interprets contents.
@@ -61,9 +61,21 @@ Then from the machine running `modron serve`:
 ```
 
 Open the printed URL on any device. Trust model: possession of the share
-key is the credential for watching a session (same as Claude Code share
-links) - treat the URL as the secret. Publishing pages needs the separate
-`PUBLISH_TOKEN` secret (see Publishing above).
+link is the credential for watching and driving that one session - treat
+the URL as the secret. Publishing pages needs the separate `PUBLISH_TOKEN`
+secret (see Publishing above).
+
+Two keys per session: the agent connects to `/agent/<agent key>` with a
+secret key that never leaves the machine running modron; the share link
+carries only the viewer key, a one-way hash of it (`/s/<viewer key>`).
+Someone holding a share link therefore cannot connect as the agent. The
+derivation is shared by `viewerKeyOf` (src/index.ts) and `viewer_key`
+(crates/modron-server/src/rc.rs); deploy the bridge and upgrade modron
+together, or share links will not meet their agent.
+
+Limits: viewer frames up to 96KB; agent frames are relayed live up to
+4MB (so a long session's snapshot reaches viewers) but only frames up to
+96KB are kept in the replay buffer. Keepalive replies are not stored.
 
 ## Local dev
 
