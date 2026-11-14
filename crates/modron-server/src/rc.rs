@@ -48,10 +48,10 @@ pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
     )
 }
 
-/// Generate a share key: short, lowercase, URL-safe (uuid-derived, no new
-/// dependencies).
+/// Generate a share key: the full 32 lowercase hex chars of a v4 UUID
+/// (122 random bits, D4). Uuid-derived, so no new dependencies.
 pub fn share_key() -> String {
-    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Run the tunnel for one session until the socket closes or the server
@@ -64,16 +64,21 @@ pub async fn run_tunnel(
     bridge_base: String,
     key: String,
 ) -> Result<()> {
+    // The agent URL carries the share key: never put it in an error
+    // message or a log line, only the bridge base.
     let (agent_url, _open_url) = tunnel_urls(&bridge_base, &key);
-    let (socket, _) = connect_async(agent_url.clone())
+    let (socket, _) = connect_async(agent_url)
         .await
-        .with_context(|| format!("connecting to the remote-control bridge at {agent_url}"))?;
+        .with_context(|| format!("connecting to the remote-control bridge at {bridge_base}"))?;
     let (mut sink, mut stream) = socket.split();
 
     // Server->relay writer: drains the connection's outbound frames (the
     // dispatch pipeline pushes every reply here via ConnCtx).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    let mut ctx = ConnCtx::new(out_tx);
+    // The tunnel is authenticated by construction (its key was minted by
+    // this server) and pinned to its one session (D5): the relay's frames
+    // get the scoped allowlist, never the server-wide one.
+    let mut ctx = ConnCtx::scoped(out_tx, session);
 
     // Handshake + eager subscribe before handing the sink to the writer.
     let hello = modron_protocol::Frame::request(
@@ -113,8 +118,7 @@ pub async fn run_tunnel(
     });
 
     // Relay loop: every frame from the bridge goes through the SAME
-    // dispatch as local clients (loopback-trusted: the tunnel key was
-    // minted by this server).
+    // dispatch as local clients, under the tunnel's scope (see ConnCtx::scoped).
     loop {
         let frame = tokio::select! {
             frame = stream.next() => match frame {
@@ -228,8 +232,8 @@ pub fn start_remote_control(
     let state_moved = Arc::clone(state);
     let bridge = bridge_base.to_string();
     let tunnel_task = tokio::spawn(async move {
-        if let Err(e) = run_tunnel(state_moved, session, bridge, key.clone()).await {
-            tracing::warn!(key = %key, error = %e, "remote-control tunnel ended");
+        if let Err(e) = run_tunnel(state_moved, session, bridge, key).await {
+            tracing::warn!(%session, error = %e, "remote-control tunnel ended");
         }
     });
     // Abort the previous tunnel for this session, if any: a re-registration
