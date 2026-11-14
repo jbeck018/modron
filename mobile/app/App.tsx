@@ -390,11 +390,17 @@ function setConfig(patch: Record<string, unknown>): void {
     // mapping by hand: modron_mobile_core::approval_mode_label
     // (mobile/rust-core/src/view.rs: ApproveAll -> "yolo", Ask/None ->
     // "ask", Deny -> "deny"). Keep the two in sync.
+    // Wire values are the server's serde names (ApprovalModeWire,
+    // SandboxPolicy); an unknown wire value leaves the label alone, so a
+    // wrong name shows up in the demo as a change that never lands.
     if (typeof patch.approval_mode === "string") {
-      next.approval_mode_label =
-        patch.approval_mode === "approve_all" ? "yolo" : patch.approval_mode;
+      const label = APPROVAL_LABEL_BY_WIRE[patch.approval_mode];
+      if (label !== undefined) next.approval_mode_label = label;
     }
-    if (typeof patch.sandbox === "string") next.sandbox = patch.sandbox;
+    if (typeof patch.sandbox === "string") {
+      const label = SANDBOX_LABEL_BY_WIRE[patch.sandbox];
+      if (label !== undefined) next.sandbox = label;
+    }
     if (Array.isArray(patch.allow)) next.allow_tools = patch.allow as string[];
     if (Array.isArray(patch.deny)) next.deny_tools = patch.deny as string[];
     if (typeof patch.goal === "string") next.goal = patch.goal;
@@ -408,27 +414,47 @@ function setConfig(patch: Record<string, unknown>): void {
   }
 }
 
-// Cycles match the TUI's shift+tab order for approval mode; sandbox
-// walks off -> seatbelt -> bwrap.
+// The server's wire names (serde of ApprovalModeWire and SandboxPolicy):
+// approval `ask` / `approve_all` / `deny`, sandbox `off` / `seatbelt` /
+// `bubblewrap`. The labels the snapshot shows differ ("yolo" for
+// approve_all, "bwrap" for bubblewrap), so the mapping is explicit.
+const APPROVAL_LABEL_BY_WIRE: Record<string, string> = {
+  ask: "ask",
+  approve_all: "yolo",
+  deny: "deny",
+};
+const SANDBOX_LABEL_BY_WIRE: Record<string, string> = {
+  off: "off",
+  seatbelt: "seatbelt",
+  bubblewrap: "bwrap",
+};
+
+// Cycles follow the TUI's shift+tab order, keyed on the label the
+// snapshot shows, and send the WIRE name of the next value.
+// Approval: ask -> yolo -> deny -> ask. An unknown current label falls
+// back to `ask`, never to approve_all.
 const APPROVAL_CYCLE: Record<string, string> = {
-  ask: "yolo",
+  ask: "approve_all",
   yolo: "deny",
   deny: "ask",
 };
+// Sandbox: off -> seatbelt -> bwrap -> off. An unknown current label
+// sends nothing, so the current value is kept.
 const SANDBOX_CYCLE: Record<string, string> = {
   off: "seatbelt",
-  seatbelt: "bwrap",
+  seatbelt: "bubblewrap",
   bwrap: "off",
 };
 
 function cycleApproval(): void {
   const label = snap().approval_mode_label;
-  setConfig({ approval_mode: APPROVAL_CYCLE[label] ?? "yolo" });
+  setConfig({ approval_mode: APPROVAL_CYCLE[label] ?? "ask" });
 }
 
 function cycleSandbox(): void {
-  const label = snap().sandbox;
-  setConfig({ sandbox: SANDBOX_CYCLE[label] ?? "off" });
+  const next = SANDBOX_CYCLE[snap().sandbox];
+  if (next === undefined) return;
+  setConfig({ sandbox: next });
 }
 
 function splitList(raw: string): string[] {
@@ -438,15 +464,30 @@ function splitList(raw: string): string[] {
     .filter(Boolean);
 }
 
+function sameList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, i) => item === b[i]);
+}
+
 function saveTools(): void {
-  // `??` falls back only when untouched (null): a cleared field ("")
-  // sends the empty list so the server clears the tools.
-  setConfig({
-    allow: splitList(allowDraft() ?? snap().allow_tools.join(", ")),
-    deny: splitList(denyDraft() ?? snap().deny_tools.join(", ")),
-  });
+  // Send only the list(s) the user edited (a null draft is untouched) and
+  // actually changed. Sending both would wipe the list the user did not
+  // touch: an allow-only edit must not clear the server's deny list.
+  // A cleared field ("") is an edit to the empty list, so it still sends
+  // [] and the server clears those tools.
+  const patch: Record<string, string[]> = {};
+  const allowNext = allowDraft();
+  if (allowNext !== null) {
+    const list = splitList(allowNext);
+    if (!sameList(list, snap().allow_tools)) patch.allow = list;
+  }
+  const denyNext = denyDraft();
+  if (denyNext !== null) {
+    const list = splitList(denyNext);
+    if (!sameList(list, snap().deny_tools)) patch.deny = list;
+  }
   allowDraft.set(null);
   denyDraft.set(null);
+  if (Object.keys(patch).length > 0) setConfig(patch);
 }
 
 function saveGoal(): void {

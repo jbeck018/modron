@@ -52,6 +52,11 @@ async fn send_frame(ws: &mut Ws, frame: &Frame) {
 
 /// Server-side handshake: read hello, verify protocol, send welcome.
 async fn greet(ws: &mut Ws) {
+    greet_with_version(ws, "0.1.2").await;
+}
+
+/// [`greet`] with a chosen server version in the welcome.
+async fn greet_with_version(ws: &mut Ws, version: &str) {
     let hello = read_frame(ws).await;
     match hello.payload {
         Payload::Hello {
@@ -71,7 +76,7 @@ async fn greet(ws: &mut Ws) {
             None,
             0,
             Payload::Welcome {
-                server_version: "0.1.2".into(),
+                server_version: version.into(),
                 protocol: PROTOCOL_VERSION,
             },
         ),
@@ -1073,4 +1078,121 @@ async fn reasoning_deltas_stream_only_when_opted_in() {
     assert!(client.state().show_reasoning);
 
     server.abort();
+}
+
+/// Wait up to 2s for the server side of a socket to observe the client's
+/// close (a close frame, end of stream, or a reset). Text frames sent
+/// before the close are skipped.
+async fn expect_closed(ws: &mut Ws, who: &str) {
+    let deadline = std::time::Duration::from_secs(2);
+    let observed = tokio::time::timeout(deadline, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(_) | WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                _ => return,
+            }
+        }
+    })
+    .await;
+    assert!(observed.is_ok(), "{who}: socket still open after 2s");
+}
+
+#[tokio::test]
+async fn disconnect_closes_the_socket_on_the_server() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        expect_closed(&mut ws, "after disconnect").await;
+    });
+
+    let client = connect_client(&url).await;
+    client.disconnect();
+    client.wait_closed().await;
+    assert_eq!(client.state().connection_label, "disconnected");
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn connecting_again_tears_down_the_previous_connection() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut first = accept_ws(&listener).await;
+        greet(&mut first).await;
+        // The second connect must retire the first socket by itself.
+        let mut second = accept_ws(&listener).await;
+        greet(&mut second).await;
+        expect_closed(&mut first, "superseded connection").await;
+        // Exactly one live connection: the second carries the attach.
+        let attach = read_frame(&mut second).await;
+        assert!(matches!(attach.payload, Payload::Attach { .. }));
+        // Keep the second socket open until the client has checked.
+        let _ = done_rx.await;
+    });
+
+    let client = connect_client(&url).await;
+    client
+        .reconnect(&url, session, None)
+        .expect("second connect");
+    wait_connected(&client).await;
+    assert_eq!(client.state().connection_label, "connected");
+    let _ = done_tx.send(());
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn stale_handshake_cannot_replace_the_newer_connection() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (stale_go_tx, stale_go_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        // Stale socket: accepted, but its welcome is held back.
+        let mut stale = accept_ws(&listener).await;
+        let _ = ready_tx.send(());
+        // Fresh socket: greeted straight away.
+        let mut fresh = accept_ws(&listener).await;
+        greet_with_version(&mut fresh, "fresh").await;
+        // Once the client is connected on the fresh socket, the late
+        // welcome lands on the stale one.
+        stale_go_rx.await.expect("client signal");
+        send_frame(
+            &mut stale,
+            &Frame::event(
+                None,
+                0,
+                Payload::Welcome {
+                    server_version: "stale".into(),
+                    protocol: PROTOCOL_VERSION,
+                },
+            ),
+        )
+        .await;
+        expect_closed(&mut stale, "stale handshake").await;
+        // Keep the fresh socket open until the client has checked.
+        let _ = done_rx.await;
+    });
+
+    let client = RemoteClient::connect(&url, None).expect("connect accepted");
+    ready_rx.await.expect("stale socket accepted");
+    client
+        .reconnect(&url, session, None)
+        .expect("reconnect supersedes the stale handshake");
+    wait_connected(&client).await;
+    assert_eq!(client.state().server_version, "fresh");
+    stale_go_tx.send(()).expect("server signal");
+
+    // Give the stale handshake time to complete; it must change nothing.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let snap = client.state();
+    assert_eq!(snap.connection_label, "connected");
+    assert_eq!(snap.server_version, "fresh");
+    let _ = done_tx.send(());
+    server.await.expect("server task");
 }
