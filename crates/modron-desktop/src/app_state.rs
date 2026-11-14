@@ -13,6 +13,8 @@
 //! allow all / deny", mode names "ask / yolo / deny", the status strip's
 //! `* N tok * cache N%`, the `warn: allow <tool> <args>?` prompt).
 
+use std::collections::VecDeque;
+
 use modron_core::{SessionEvent, ToolActivity, Usage};
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval,
@@ -136,7 +138,11 @@ pub struct AppState {
     pub show_reasoning: bool,
 
     pub tracker: ActivityTracker,
+    /// The approval the strip shows (the FRONT of the queue).
     pub pending_approval: Option<PendingApproval>,
+    /// Approvals waiting behind the front, FIFO. Invariant: empty while
+    /// `pending_approval` is `None`.
+    pub queued_approvals: VecDeque<PendingApproval>,
 
     pub model: String,
     pub provider: String,
@@ -225,11 +231,11 @@ impl AppState {
                 self.tracker.on_tool(&core);
             }
             Payload::ApprovalRequested { request_id, call } => {
-                self.pending_approval = Some(PendingApproval { request_id, call });
+                self.enqueue_approval(PendingApproval { request_id, call });
             }
-            Payload::ApprovalResolved { .. } => {
-                // First responder wins; the echo clears the strip everywhere.
-                self.pending_approval = None;
+            Payload::ApprovalResolved { request_id, .. } => {
+                // First responder wins; the echo clears that request everywhere.
+                self.resolve_approval(&request_id);
             }
             Payload::ConfigChanged { patch } => self.apply_config_patch(&patch),
             Payload::Sessions { sessions } => {
@@ -251,6 +257,7 @@ impl AppState {
                 // replayed); the live buffers and the per-turn strip land
                 // as replay rows, the swarm block commits here.
                 self.clear_buffers();
+                self.clear_approvals();
                 let swarm = self.tracker.take_swarm_summary();
                 if !swarm.is_empty() {
                     let entry = TranscriptEntry::Swarm { lines: swarm };
@@ -261,6 +268,7 @@ impl AppState {
             Payload::TurnFailed { error } => {
                 self.running = false;
                 self.clear_buffers();
+                self.clear_approvals();
                 self.tracker.clear_turn();
                 self.last_note = Some(error);
             }
@@ -269,8 +277,8 @@ impl AppState {
                 // persisted (the replay already shows them).
                 self.running = false;
                 self.clear_buffers();
+                self.clear_approvals();
                 self.tracker.clear_turn();
-                self.pending_approval = None;
             }
             // The client's own delete request echoes back; ignore it.
             Payload::DeleteSession { .. } => {}
@@ -373,6 +381,7 @@ impl AppState {
         self.tracker.turn_tools = live.turn_tools;
         self.tracker.subagents = live.subagents.iter().map(swarm_row_from_wire).collect();
         self.pending_approval = live.pending_approval;
+        self.queued_approvals.clear();
         self.cumulative = live.cumulative_usage;
         self.model = live.model;
         self.provider = live.provider;
@@ -450,6 +459,66 @@ impl AppState {
         self.stream_chars = 0;
         self.displayed_cache.clear();
         self.streaming_reasoning.clear();
+    }
+
+    /// Whether a request id is already the front or queued (dedupe key).
+    fn approval_held(&self, request_id: &str) -> bool {
+        self.pending_approval
+            .as_ref()
+            .is_some_and(|p| p.request_id == request_id)
+            || self
+                .queued_approvals
+                .iter()
+                .any(|p| p.request_id == request_id)
+    }
+
+    /// A new approval request: the front slot when it is free, else FIFO
+    /// behind it. A request id already held is ignored.
+    fn enqueue_approval(&mut self, pending: PendingApproval) {
+        if self.approval_held(&pending.request_id) {
+            return;
+        }
+        if self.pending_approval.is_none() {
+            self.pending_approval = Some(pending);
+        } else {
+            self.queued_approvals.push_back(pending);
+        }
+    }
+
+    /// Resolve one request by id (the server echo, or the local clear after
+    /// a click). The front matching promotes the next queued request; a
+    /// queued match is removed; anything else is a no-op.
+    pub fn resolve_approval(&mut self, request_id: &str) {
+        if self
+            .pending_approval
+            .as_ref()
+            .is_some_and(|p| p.request_id == request_id)
+        {
+            self.pending_approval = self.queued_approvals.pop_front();
+        } else if let Some(ix) = self
+            .queued_approvals
+            .iter()
+            .position(|p| p.request_id == request_id)
+        {
+            self.queued_approvals.remove(ix);
+        }
+    }
+
+    /// Drop every approval (the run ended, so none can be answered).
+    fn clear_approvals(&mut self) {
+        self.pending_approval = None;
+        self.queued_approvals.clear();
+    }
+
+    /// The socket dropped or never came up: nothing runs, no approval can
+    /// be answered, and the in-flight buffers can no longer complete
+    /// (AGENTS.md invariant 5: buffers clear on abort).
+    pub fn on_disconnected(&mut self) {
+        self.conn = ConnState::Offline;
+        self.running = false;
+        self.clear_approvals();
+        self.clear_buffers();
+        self.tracker.clear_turn();
     }
 
     fn apply_config_patch(&mut self, patch: &ConfigPatch) {
@@ -1441,6 +1510,144 @@ mod tests {
         );
         assert_eq!(s.approval_prompt().as_deref(), Some(expected.as_str()));
         assert!(expected.ends_with(" [+45 chars]?"), "{expected}");
+    }
+
+    fn approval_request(id: &str) -> PendingApproval {
+        PendingApproval {
+            request_id: id.into(),
+            call: ToolCall {
+                id: format!("call-{id}"),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": "ls" }),
+            },
+        }
+    }
+
+    fn requested_frame(seq: u64, id: &str) -> Frame {
+        let call = approval_request(id).call;
+        event_frame(
+            seq,
+            Payload::ApprovalRequested {
+                request_id: id.into(),
+                call,
+            },
+        )
+    }
+
+    fn resolved_frame(seq: u64, id: &str) -> Frame {
+        event_frame(
+            seq,
+            Payload::ApprovalResolved {
+                request_id: id.into(),
+                decision: Decision::AllowOnce,
+            },
+        )
+    }
+
+    fn front_id(s: &AppState) -> Option<&str> {
+        s.pending_approval.as_ref().map(|p| p.request_id.as_str())
+    }
+
+    fn queued_ids(s: &AppState) -> Vec<&str> {
+        s.queued_approvals
+            .iter()
+            .map(|p| p.request_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn approvals_queue_fifo_behind_the_front() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(requested_frame(3, "c"));
+        assert_eq!(front_id(&s), Some("a"));
+        assert_eq!(queued_ids(&s), vec!["b", "c"]);
+        // The front resolves: the next queued request is promoted.
+        s.apply_frame(resolved_frame(4, "a"));
+        assert_eq!(front_id(&s), Some("b"));
+        assert_eq!(queued_ids(&s), vec!["c"]);
+        // A queued request resolves elsewhere: removed, front untouched.
+        s.apply_frame(resolved_frame(5, "c"));
+        assert_eq!(front_id(&s), Some("b"));
+        assert!(queued_ids(&s).is_empty());
+        s.apply_frame(resolved_frame(6, "b"));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+    }
+
+    #[test]
+    fn duplicate_approval_request_ids_are_ignored() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "a"));
+        s.apply_frame(requested_frame(3, "b"));
+        s.apply_frame(requested_frame(4, "b"));
+        assert_eq!(front_id(&s), Some("a"));
+        assert_eq!(queued_ids(&s), vec!["b"]);
+    }
+
+    #[test]
+    fn resolving_an_unknown_approval_is_a_noop() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(resolved_frame(3, "zzz"));
+        assert_eq!(front_id(&s), Some("a"));
+        assert_eq!(queued_ids(&s), vec!["b"]);
+    }
+
+    #[test]
+    fn turn_failure_and_abort_clear_every_approval() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(event_frame(
+            3,
+            Payload::TurnFailed {
+                error: "boom".into(),
+            },
+        ));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+
+        s.apply_frame(requested_frame(4, "c"));
+        s.apply_frame(event_frame(5, Payload::TurnAborted {}));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+    }
+
+    #[test]
+    fn snapshot_reset_drops_the_queue() {
+        let mut s = AppState::new();
+        s.apply_frame(requested_frame(1, "a"));
+        s.apply_frame(requested_frame(2, "b"));
+        s.apply_frame(snapshot_frame(Vec::new(), LiveState::default()));
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+    }
+
+    #[test]
+    fn disconnect_clears_approvals_and_in_flight_buffers() {
+        let mut s = AppState::new();
+        s.apply_frame(event_frame(
+            1,
+            Payload::Delta {
+                delta: WireDelta::Text {
+                    text: "partial".into(),
+                },
+            },
+        ));
+        s.apply_frame(requested_frame(2, "a"));
+        s.apply_frame(requested_frame(3, "b"));
+        s.running = true;
+        s.on_disconnected();
+        assert_eq!(s.conn, ConnState::Offline);
+        assert!(!s.running);
+        assert!(s.pending_approval.is_none());
+        assert!(s.queued_approvals.is_empty());
+        assert!(s.streaming_text.is_empty());
+        assert!(s.displayed_streaming().is_empty());
     }
 
     #[test]

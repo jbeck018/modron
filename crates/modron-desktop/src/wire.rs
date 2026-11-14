@@ -22,6 +22,13 @@ use tokio_tungstenite::{tungstenite::Message as WsMessage, MaybeTlsStream, WebSo
 /// The client name sent in `hello`.
 pub const CLIENT_NAME: &str = "modron-desktop";
 
+/// How long the connect handshake waits for the server's `welcome`.
+const WELCOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The one note a connection shows when a frame fails to decode.
+const UNREADABLE_FRAME_NOTE: &str =
+    "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+
 /// Query parameter that carries a paired device token on a ws(s) URL
 /// (`ws://host:7699/?token=...`). Stripped before the URL is dialed or shown.
 const TOKEN_PARAM: &str = "token";
@@ -106,28 +113,51 @@ impl WireClient {
             .context("send hello")?;
 
         // The first frame must be the welcome (skip nothing: a misbehaving
-        // server that streams before the handshake fails loudly here).
-        let msg = stream
-            .next()
+        // server that streams before the handshake fails loudly here). A
+        // silent server times out instead of hanging the connect forever.
+        let msg = tokio::time::timeout(WELCOME_TIMEOUT, stream.next())
             .await
+            .map_err(|_| anyhow!("no welcome from the server within 15s"))?
             .ok_or_else(|| anyhow!("connection closed before welcome"))?;
         let frame = decode(msg?).ok_or_else(|| anyhow!("non-text frame during handshake"))?;
         let server_version =
             modron_protocol::client::check_welcome(Some(frame), url).map_err(anyhow::Error::msg)?;
 
         // Reader task: every subsequent inbound frame lands in the channel.
+        // A text frame this build cannot decode is dropped and counted; the
+        // first one also queues ONE note for this connection (a Note frame,
+        // the same path server notes take).
         let (tx, inbound) = mpsc::channel::<Frame>(256);
         tokio::spawn(async move {
+            let mut undecodable = 0usize;
             while let Some(msg) = stream.next().await {
                 match msg {
-                    Ok(m) => match decode(m) {
-                        Some(frame) => {
-                            if tx.send(frame).await.is_err() {
-                                break;
+                    Ok(m) => {
+                        let is_text = matches!(m, WsMessage::Text(_));
+                        match decode(m) {
+                            Some(frame) => {
+                                if tx.send(frame).await.is_err() {
+                                    break;
+                                }
                             }
+                            None if is_text => {
+                                undecodable += 1;
+                                if undecodable == 1 {
+                                    let note = Frame::event(
+                                        None,
+                                        0,
+                                        Payload::Note {
+                                            text: UNREADABLE_FRAME_NOTE.into(),
+                                        },
+                                    );
+                                    if tx.send(note).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            None => continue,
                         }
-                        None => continue,
-                    },
+                    }
                     Err(_) => break,
                 }
             }
