@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use modron_core::Engine;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::hub::{BroadcastingStore, SessionHub};
@@ -89,13 +89,22 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
     template.store = Arc::clone(&broadcasting) as Arc<dyn modron_core::SessionStore>;
     hub.set_engine(template);
 
+    // Task records persist under the server's data dir (the parent of the
+    // device-token directory, `~/.modron` by default) so a restart keeps
+    // each task's worktree. Records whose worktree is gone are dropped.
+    let data_dir = match clients_dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => pairing::default_modron_dir()?,
+    };
+    let task_registry = crate::tasks::TaskRegistry::load(data_dir.join(crate::tasks::TASKS_FILE));
+
     let state = Arc::new(ServerState {
         hub,
         store: broadcasting,
         devices_dir: clients_dir,
         version: env!("CARGO_PKG_VERSION").to_string(),
         working_dir,
-        tasks: crate::tasks::TaskRegistry::new(),
+        tasks: task_registry,
         bridge_base: options.bridge_base.clone(),
         rc_keys: std::sync::Mutex::new(HashMap::new()),
         rc_tunnels: std::sync::Mutex::new(HashMap::new()),
@@ -140,13 +149,7 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
         None => Some(pairing::default_modron_dir()?.join("serve.sock")),
     };
     if let Some(path) = &unix_path {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        let _ = std::fs::remove_file(path); // stale socket from a crash
-        let listener = UnixListener::bind(path)
-            .with_context(|| format!("cannot bind unix socket {}", path.display()))?;
+        let listener = unix::bind_private_socket(path)?;
         tasks.push(tokio::spawn(unix::run_unix_listener(
             listener,
             Arc::clone(&state),
@@ -164,7 +167,7 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
 /// `modron serve`: bind, print, run until ctrl+c, clean up.
 pub async fn run_serve(engine: Engine, options: &ServeOptions) -> anyhow::Result<()> {
     let modron_dir = pairing::default_modron_dir()?;
-    std::fs::create_dir_all(&modron_dir)?;
+    pairing::create_private_dir(&modron_dir)?;
     let pid_path = modron_dir.join("serve.pid");
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
