@@ -11,13 +11,5 @@
       "max_instances": 5,
       "instance_type": "standard"
     }
-  ],
-  "durable_objects": {
-    "bindings": [
-      { "name": "BRIDGE", "class_name": "SessionBridge" }
-    ]
-  },
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["SessionBridge"] }
   ]
 }
