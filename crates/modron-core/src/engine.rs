@@ -346,20 +346,17 @@ impl Engine {
         }
         // Rewind support (C2): when `resume_from_event` is set, events after
         // that index stay in the append-only log but never re-enter context.
-        let pruned;
-        let reconstruct_from = match self.config.resume_from_event {
-            Some(cut) => {
-                let sliced = &events[..(cut as usize).min(events.len())];
-                // The cut lands before the abandoned tool results; every
-                // kept assistant tool_use must have its tool_result in the
-                // slice or the provider 400s (cycle-2 audit H1).
-                pruned = prune_unanswered_tool_calls(sliced);
-                pruned.as_ref()
-            }
+        let sliced: &[SessionEvent] = match self.config.resume_from_event {
+            Some(cut) => &events[..(cut as usize).min(events.len())],
             None => &events[..],
         };
-        let mut transcript =
-            reconstruct_transcript(reconstruct_from, self.config.compaction.tail_messages);
+        // Every resume goes through the prune, not only rewind resumes: an
+        // interrupt mid-tool leaves an assistant tool_use with no result in
+        // the log, and both provider APIs reject that (cycle-2 audit H1).
+        // The cut (if any) lands before abandoned results, so the same
+        // rewrite also trims a rewind tail.
+        let pruned = prune_unanswered_tool_calls(sliced);
+        let mut transcript = reconstruct_transcript(&pruned, self.config.compaction.tail_messages);
         self.store
             .append(
                 session_id,
@@ -1946,16 +1943,28 @@ fn prune_unanswered_tool_calls(events: &[SessionEvent]) -> std::borrow::Cow<'_, 
             _ => None,
         })
         .collect();
-    let needs_rewrite = events.iter().any(|e| {
-        matches!(
-            e,
-            SessionEvent::Message { message, .. }
-                if message.role == Role::Assistant
-                    && message
-                        .tool_calls
-                        .iter()
-                        .any(|c| !answered.contains(c.id.as_str()))
-        )
+    // Calls actually present in the slice; a result whose call is missing
+    // is an orphan and would 400 the provider just like an unanswered call.
+    let called: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Message { message, .. } if message.role == Role::Assistant => {
+                Some(message.tool_calls.iter().map(|c| c.id.as_str()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let needs_rewrite = events.iter().any(|e| match e {
+        SessionEvent::Message { message, .. } => {
+            message.role == Role::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|c| !answered.contains(c.id.as_str()))
+        }
+        SessionEvent::ToolResult { call_id, .. } => !called.contains(call_id.as_str()),
+        _ => false,
     });
     if !needs_rewrite {
         return std::borrow::Cow::Borrowed(events);
@@ -1981,6 +1990,8 @@ fn prune_unanswered_tool_calls(events: &[SessionEvent]) -> std::borrow::Cow<'_, 
             }
             // Checkpoints around the cut carry no context.
             SessionEvent::Checkpoint { .. } => {}
+            // A result whose call is gone would be an orphan tool message.
+            SessionEvent::ToolResult { call_id, .. } if !called.contains(call_id.as_str()) => {}
             other => out.push(other.clone()),
         }
     }
@@ -2254,6 +2265,25 @@ mod tests {
 
         // An answered run (full log) is untouched.
         assert_eq!(prune_unanswered_tool_calls(&events).len(), events.len());
+
+        // Orphan result (its call is not in the slice): dropped, so no
+        // tool message reaches the provider without an assistant call.
+        let orphan = vec![
+            SessionEvent::Task { text: "t".into() },
+            SessionEvent::ToolResult {
+                call_id: "gone".into(),
+                outcome: ToolOutcome::ok("stray"),
+            },
+            SessionEvent::Message {
+                parent_id: None,
+                message: Message::assistant("next"),
+            },
+        ];
+        let pruned = prune_unanswered_tool_calls(&orphan);
+        assert_eq!(pruned.len(), 2, "orphan result removed");
+        assert!(!pruned
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ToolResult { .. })));
 
         // A text-only trailing assistant stays.
         let text_only = vec![
