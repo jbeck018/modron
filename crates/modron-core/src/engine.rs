@@ -52,6 +52,29 @@ fn is_gated(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name) || name.starts_with("mcp__")
 }
 
+/// The approval policy's verdict on one tool name, before any prompt (A5).
+/// Model-issued calls and harness-initiated calls (the finish gate's verify)
+/// both go through [`Engine::admission`], so the rules live in one place.
+enum Admission {
+    /// Runs without asking: ungated, allow-listed, or ApproveAll.
+    Run,
+    /// Needs an interactive decision: Ask mode with an approver installed.
+    Ask,
+    /// Refused outright; the payload is the error the model (or the gate)
+    /// sees.
+    Refused(String),
+}
+
+/// The block message for an approval mode that will not run a gated call.
+fn approval_block_hint(mode: ApprovalMode) -> String {
+    match mode {
+        ApprovalMode::Deny => "blocked by approval mode: deny".to_string(),
+        _ => "blocked by approval mode: ask (non-interactive run — rerun with \
+              --approve-all to allow mutating tools)"
+            .to_string(),
+    }
+}
+
 /// Largest file whose prior bytes a checkpoint captures (D8).
 const SNAPSHOT_CAP: u64 = 256 * 1024;
 
@@ -217,9 +240,13 @@ struct RunLoopState {
     /// run, and how many verification rounds have been spent.
     mutated_this_run: bool,
     verify_rounds: u32,
-    /// Whether the finish gate already injected its self-check turn —
-    /// a provider failure ON THAT TURN is non-fatal (keep the answer).
+    /// Whether the finish gate already injected its self-check turn. The
+    /// self-check runs at most once per run.
     self_check_sent: bool,
+    /// Set when the self-check message is injected, cleared by the next
+    /// provider turn. Only that turn is non-fatal on a provider error (keep
+    /// the answer); a provider error on any later turn propagates (A6).
+    self_check_turn_pending: bool,
     /// Tier fallback (remote-control hardening): once an auth failure
     /// promotes the run to a tier's fallback model, every later turn
     /// uses the fallback directly (the dead primary would 401 again
@@ -249,6 +276,7 @@ impl RunLoopState {
             mutated_this_run: false,
             verify_rounds: 0,
             self_check_sent: false,
+            self_check_turn_pending: false,
             run_tier_override: None,
             last_dispatch_ended_with_passing_verify: false,
             stop_label: "end_turn",
@@ -714,6 +742,9 @@ impl Engine {
             _ => None,
         };
         let mut attempted_fallback = fallback.is_some();
+        // Consume the self-check marker: only THIS provider turn may swallow
+        // a failure (A6). Set by the finish gate just before this turn.
+        let self_check_turn = std::mem::take(&mut state.self_check_turn_pending);
         // Loop-external turn state: None = self-check short-circuit
         // (the outer run loop ends with the preserved answer).
         let mut turn_outcome: Option<(TurnResponse, String, String)> = None;
@@ -799,10 +830,11 @@ impl Engine {
                 }
                 Err(e) => {
                     // The self-check turn is an ENHANCEMENT: if the
-                    // provider fails on it, keep the pre-check answer and
-                    // end the run — never destroy completed work for the
-                    // bonus turn.
-                    if state.self_check_sent && !state.answer.is_empty() {
+                    // provider fails on the turn right after the self-check
+                    // message, keep the pre-check answer and end the run —
+                    // never destroy completed work for the bonus turn. A
+                    // failure on any later turn is a real error (A6).
+                    if self_check_turn && !state.answer.is_empty() {
                         tracing::warn!(
                             error = %e,
                             "self-check turn failed; keeping the pre-check answer"
@@ -876,16 +908,6 @@ impl Engine {
         speculative: &std::collections::HashMap<String, ToolOutcome>,
         state: &mut RunLoopState,
     ) -> Result<()> {
-        // A requested mutating call arms the finish gate (conservative:
-        // a vetoed or failed call still counts — the model ATTEMPTED a
-        // mutation, so unverified finishes stay blocked).
-        if tool_calls
-            .iter()
-            .any(|c| FILE_MUTATING_TOOLS.contains(&c.name.as_str()))
-        {
-            state.mutated_this_run = true;
-        }
-
         // Dispatch tool calls; each result enters the transcript. Hooks
         // (H1) wrap execution: pre_tool may veto before the tool runs,
         // post_tool observes after. Hook-spawn errors fail closed.
@@ -917,21 +939,34 @@ impl Engine {
         let all_read_only = tool_calls
             .iter()
             .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(&c.name));
-        let outcomes: Vec<ToolOutcome> = if all_read_only && tool_calls.len() > 1 {
+        let dispatched: Vec<(ToolOutcome, bool)> = if all_read_only && tool_calls.len() > 1 {
             let futures = tool_calls
                 .iter()
                 .map(|call| self.dispatch_tool_call(session_id, call, &ctx, speculative));
             futures::future::join_all(futures).await
         } else {
-            let mut outcomes = Vec::with_capacity(tool_calls.len());
+            let mut dispatched = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
-                let outcome = self
+                let result = self
                     .dispatch_tool_call(session_id, call, &ctx, speculative)
                     .await;
-                outcomes.push(outcome);
+                dispatched.push(result);
             }
-            outcomes
+            dispatched
         };
+        // A mutating call arms the finish gate only once it actually ran
+        // (A5): a call refused by deny/approval, vetoed by a hook, or
+        // stopped at the checkpoint never touched the workspace, so it
+        // must not make the run owe verification.
+        if tool_calls
+            .iter()
+            .zip(&dispatched)
+            .any(|(c, (_, ran))| *ran && FILE_MUTATING_TOOLS.contains(&c.name.as_str()))
+        {
+            state.mutated_this_run = true;
+        }
+        let outcomes: Vec<ToolOutcome> =
+            dispatched.into_iter().map(|(outcome, _)| outcome).collect();
         state.last_dispatch_ended_with_passing_verify = tool_calls
             .last()
             .map(|c| c.name == "verify")
@@ -1264,7 +1299,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
         ctx: &ToolCtx,
-    ) -> Result<ToolOutcome> {
+    ) -> Result<(ToolOutcome, bool)> {
         let hook_envs = |exit: Option<u8>| {
             let mut envs: Vec<(String, String)> = vec![
                 ("MODRON_TOOL_NAME".to_string(), call.name.clone()),
@@ -1283,10 +1318,10 @@ impl Engine {
         if let Some(pre) = self.config.hooks.pre_tool.clone() {
             let outcome = hooks::run_hook(&pre, &hook_envs(None), hooks::HOOK_TIMEOUT).await?;
             if outcome.blocked {
-                return Ok(ToolOutcome::err(format!(
-                    "blocked by pre_tool hook: {}",
-                    outcome.message
-                )));
+                return Ok((
+                    ToolOutcome::err(format!("blocked by pre_tool hook: {}", outcome.message)),
+                    false,
+                ));
             }
         }
 
@@ -1295,7 +1330,7 @@ impl Engine {
                 name: call.name.clone(),
             });
         }
-        let executed = self.execute_tool(session_id, call, ctx).await;
+        let (executed, ran) = self.execute_tool(session_id, call, ctx).await;
         if let Some(sink) = self.config.on_tool_event.as_ref() {
             sink(ToolActivity::Done {
                 name: call.name.clone(),
@@ -1312,15 +1347,66 @@ impl Engine {
                 tracing::warn!(tool = %call.name, error = %err, "post_tool hook failed (non-blocking)");
             }
         }
-        Ok(executed)
+        Ok((executed, ran))
     }
 
+    /// The approval policy's verdict for a tool name (A1, A5): the deny list
+    /// first (any mode), then the ungated / allow-listed / ApproveAll fast
+    /// path, then Ask-with-approver (a prompt), otherwise refused. Pure rules:
+    /// model-issued calls and the finish gate both route through here.
+    fn admission(&self, name: &str) -> Admission {
+        if self.config.approvals.deny.iter().any(|d| d == name) {
+            return Admission::Refused(format!("tool `{name}` denied by configuration (--deny)"));
+        }
+        let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == name);
+        if !is_gated(name)
+            || explicitly_allowed
+            || self.config.approvals.mode == ApprovalMode::ApproveAll
+        {
+            return Admission::Run;
+        }
+        if self.config.approvals.mode == ApprovalMode::Ask && self.config.approver.is_some() {
+            return Admission::Ask;
+        }
+        let mode = self.config.approvals.mode;
+        tracing::warn!(
+            tool = %name,
+            mode = ?mode,
+            "tool blocked by approval mode — run with --approve-all to allow mutating tools"
+        );
+        Admission::Refused(approval_block_hint(mode))
+    }
+
+    /// Whether the finish gate may run `verify` right now (A5). Uses the
+    /// same admission rules as a model-issued call: an Ask decision goes to
+    /// the approver, and a refusal or a missing approver skips verification.
+    fn finish_gate_may_verify(&self) -> bool {
+        match self.admission("verify") {
+            Admission::Run => true,
+            Admission::Ask => {
+                let call = ToolCall {
+                    id: "finish-gate-verify".into(),
+                    name: "verify".into(),
+                    arguments: serde_json::json!({}),
+                };
+                self.config
+                    .approver
+                    .as_ref()
+                    .is_some_and(|approver| approver(&call))
+            }
+            Admission::Refused(_) => false,
+        }
+    }
+
+    /// Execute one call through the approval gate and the pre-mutation
+    /// checkpoint. The flag is `true` only when the tool itself ran (A5), so
+    /// a refused, unknown or checkpoint-blocked call never arms the finish gate.
     async fn execute_tool(
         &self,
         session_id: SessionId,
         call: &ToolCall,
         ctx: &ToolCtx,
-    ) -> ToolOutcome {
+    ) -> (ToolOutcome, bool) {
         let Some(tool) = self.tools.get(&call.name).cloned() else {
             let available = self
                 .tools
@@ -1329,65 +1415,55 @@ impl Engine {
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return ToolOutcome::err(format!(
-                "unknown tool `{}` — available tools: {available}",
-                call.name
-            ));
+            return (
+                ToolOutcome::err(format!(
+                    "unknown tool `{}` — available tools: {available}",
+                    call.name
+                )),
+                false,
+            );
         };
 
-        // Approval gate (A1): mutating tools never execute unless approved.
-        // Deny list: any tool, any mode, always wins.
-        if self.config.approvals.deny.iter().any(|d| d == &call.name) {
-            return ToolOutcome::err(format!(
-                "tool `{}` denied by configuration (--deny)",
-                call.name
-            ));
-        }
-        // Allow list bypasses Ask mode (deny already checked).
-        let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == &call.name);
-        if is_gated(&call.name)
-            && !explicitly_allowed
-            && self.config.approvals.mode != ApprovalMode::ApproveAll
-        {
-            // Ask mode with an interactive approver (Phase-1c I2): offer the
-            // call to the callback; a denial falls through to the block.
-            let approved = self.config.approvals.mode == ApprovalMode::Ask
-                && self
+        match self.admission(&call.name) {
+            Admission::Run => {}
+            Admission::Ask => {
+                // Ask mode with an interactive approver (Phase-1c I2): a
+                // denial falls through to the block.
+                let approved = self
                     .config
                     .approver
                     .as_ref()
                     .is_some_and(|approver| approver(call));
-            if !approved {
-                let mode = self.config.approvals.mode;
-                tracing::warn!(
-                    tool = %call.name,
-                    mode = ?mode,
-                    "tool blocked by approval mode — run with --approve-all to allow mutating tools"
-                );
-                let hint = match mode {
-                    ApprovalMode::Deny => "blocked by approval mode: deny".to_string(),
-                    _ => "blocked by approval mode: ask (non-interactive run — rerun with \
-                          --approve-all to allow mutating tools)"
-                        .to_string(),
-                };
-                return ToolOutcome::err(hint);
+                if !approved {
+                    return (
+                        ToolOutcome::err(approval_block_hint(self.config.approvals.mode)),
+                        false,
+                    );
+                }
             }
+            Admission::Refused(message) => return (ToolOutcome::err(message), false),
         }
 
         // Pre-mutation checkpoint (D8, A3): taken only now, after the gates
         // allowed the call, in every approval mode. If it cannot be recorded
         // the call fails closed: a write rewind cannot undo must not run.
         if let Err(err) = self.record_checkpoint(session_id, call).await {
-            return ToolOutcome::err(format!(
-                "checkpoint not recorded; `{}` did not run: {err}",
-                call.name
-            ));
+            return (
+                ToolOutcome::err(format!(
+                    "checkpoint not recorded; `{}` did not run: {err}",
+                    call.name
+                )),
+                false,
+            );
         }
 
-        match tool.execute(call.arguments.clone(), ctx).await {
+        // From here the tool runs, whatever it returns: a bash call that
+        // wrote before failing has still mutated the workspace.
+        let outcome = match tool.execute(call.arguments.clone(), ctx).await {
             Ok(outcome) => outcome,
             Err(err) => ToolOutcome::err(format!("tool `{}` failed to run: {err}", call.name)),
-        }
+        };
+        (outcome, true)
     }
 
     /// Whether the autocompaction trigger fires before this turn (X1): never
@@ -1427,16 +1503,7 @@ impl Engine {
         session_id: SessionId,
         state: &mut RunLoopState,
     ) -> Result<bool> {
-        if !state.mutated_this_run || state.verify_rounds >= MAX_VERIFY_ROUNDS {
-            if state.mutated_this_run && state.verify_rounds >= MAX_VERIFY_ROUNDS {
-                // Bound exhausted: let the run end, but never silently.
-                state.answer = format!(
-                    "{}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]",
-                    state.answer
-                )
-                .trim()
-                .to_string();
-            }
+        if !state.mutated_this_run {
             return Ok(false);
         }
         let Some(verify_tool) = self.tools.get("verify") else {
@@ -1445,11 +1512,15 @@ impl Engine {
             // and verifies each concrete detail against the environment
             // before ending. Targets the lucky-pass class (config formats,
             // exact names/passwords/ports) without needing a test command.
-            if !self.config.self_check_on_finish || state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            // At most one self-check per run (A6). No verification runs on
+            // this path, so the gate disarms here: nothing can "still fail",
+            // and the failure note and escalation (both verify-only) stay off.
+            if !self.config.self_check_on_finish || state.self_check_sent {
                 return Ok(false);
             }
-            state.verify_rounds += 1;
             state.self_check_sent = true;
+            state.self_check_turn_pending = true;
+            state.mutated_this_run = false;
             let feedback = Message::user(
                 "Before finishing: re-read the ORIGINAL task instruction and list every \
                  concrete requirement it names — file paths, exact names, passwords, \
@@ -1470,10 +1541,34 @@ impl Engine {
             state.transcript.push(feedback);
             return Ok(true);
         };
+        if state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            // Bound exhausted: let the run end, but never silently.
+            state.answer = format!(
+                "{}\n\n[verification still failing after {MAX_VERIFY_ROUNDS} rounds — see transcript]",
+                state.answer
+            )
+            .trim()
+            .to_string();
+            return Ok(false);
+        }
         // Skip when the previous dispatch already ended with a passing
         // verify (the model showed its evidence — no duplicate suite run).
         if state.last_dispatch_ended_with_passing_verify {
             state.mutated_this_run = false;
+            return Ok(false);
+        }
+        // A5: the harness runs verify only where the approval policy would
+        // let the model run it (same admission rules as a model-issued call).
+        // Otherwise the gate stands down, the skip is stated, and the run ends.
+        if !self.finish_gate_may_verify() {
+            tracing::warn!("finish gate skipped verification: verify is not permitted");
+            state.mutated_this_run = false;
+            state.answer = format!(
+                "{}\n\n[verification skipped: verify is not permitted in this approval mode]",
+                state.answer
+            )
+            .trim()
+            .to_string();
             return Ok(false);
         }
         state.verify_rounds += 1;
@@ -1738,7 +1833,7 @@ impl Engine {
         call: &ToolCall,
         ctx: &ToolCtx,
         speculative: &std::collections::HashMap<String, ToolOutcome>,
-    ) -> ToolOutcome {
+    ) -> (ToolOutcome, bool) {
         if speculative::SPECULATIVE_TOOLS.contains(&call.name.as_str())
             && !self.config.approvals.deny.iter().any(|d| d == &call.name)
         {
@@ -1749,14 +1844,16 @@ impl Engine {
                 // (cycle-2 audit M6).
                 if !(outcome.is_error && outcome.content.is_empty()) {
                     tracing::info!(tool = %call.name, "speculative hit: reuse mid-stream result");
-                    return outcome.clone();
+                    // Speculation only covers read-only tools, so nothing
+                    // mutated here.
+                    return (outcome.clone(), false);
                 }
                 tracing::warn!(tool = %call.name, "speculative placeholder left by a panicked task - re-executing");
             }
         }
         self.execute_tool_with_hooks(session_id, call, ctx)
             .await
-            .unwrap_or_else(|err| ToolOutcome::err(err.to_string()))
+            .unwrap_or_else(|err| (ToolOutcome::err(err.to_string()), false))
     }
 
     /// One compaction pass (X1, PLAN.md §4.10): load the session's events,
@@ -2413,7 +2510,7 @@ mod tests {
             providers,
             tools: std::sync::Arc::new(registry),
             store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
-            config: EngineConfig::default(),
+            config: approve_all_config(),
         };
         (engine, verify)
     }
@@ -2669,7 +2766,7 @@ mod tests {
             providers,
             tools: std::sync::Arc::new(registry),
             store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
-            config: EngineConfig::default(),
+            config: approve_all_config(),
         };
         let summary = engine.run_task("ship it").await.unwrap();
         assert_eq!(
@@ -2704,6 +2801,7 @@ mod tests {
             store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
             config: EngineConfig {
                 escalate_on_check_failure: escalate.map(str::to_string),
+                approvals: approve_all(),
                 ..EngineConfig::default()
             },
         };
@@ -2819,6 +2917,172 @@ mod tests {
         assert_eq!(
             requests.last().map(|r| r.model.as_str()),
             Some("claude-opus-escalated")
+        );
+    }
+
+    /// Mutating tools execute without prompting. The default policy is Ask
+    /// with no approver, which blocks every edit, so finish-gate fixtures
+    /// that expect a real edit must opt in.
+    fn approve_all() -> crate::ApprovalPolicy {
+        crate::ApprovalPolicy {
+            mode: crate::ApprovalMode::ApproveAll,
+            ..crate::ApprovalPolicy::default()
+        }
+    }
+
+    fn approve_all_config() -> EngineConfig {
+        EngineConfig {
+            approvals: approve_all(),
+            ..EngineConfig::default()
+        }
+    }
+
+    /// Engine over the write tool (plus the counting verify tool when
+    /// `with_verify`) with an explicit config. Returns the verify handle and
+    /// the mock for request inspection.
+    fn finish_engine(
+        script: Vec<TurnResponse>,
+        config: EngineConfig,
+        with_verify: bool,
+    ) -> (
+        Engine,
+        std::sync::Arc<GateVerifyTool>,
+        std::sync::Arc<crate::testing::MockProvider>,
+    ) {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        let verify = std::sync::Arc::new(GateVerifyTool(std::sync::atomic::AtomicUsize::new(0)));
+        if with_verify {
+            registry.register(std::sync::Arc::clone(&verify) as std::sync::Arc<dyn Tool>);
+        }
+        let mock = std::sync::Arc::new(crate::testing::MockProvider::with_script(script));
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::clone(&mock) as std::sync::Arc<dyn ModelProvider>,
+        );
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config,
+        };
+        (engine, verify, mock)
+    }
+
+    #[tokio::test]
+    async fn blocked_edit_does_not_arm_the_finish_gate() {
+        // Default policy (Ask, no approver): the write is refused and never
+        // executes, so the finish gate must not run verify on the user's behalf.
+        let (engine, verify, _mock) = finish_engine(
+            vec![call("write"), text("done")],
+            EngineConfig::default(),
+            true,
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(
+            verify.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked edit must not arm verify"
+        );
+        assert_eq!(summary.answer, "done", "no verification note either");
+        assert_eq!(summary.turns, 2);
+    }
+
+    #[tokio::test]
+    async fn denied_verify_is_never_run_by_the_finish_gate() {
+        // A real edit arms the gate, but `verify` is on the deny list: the
+        // gate skips verification and the run ends with a visible note.
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: crate::ApprovalMode::ApproveAll,
+                deny: vec!["verify".into()],
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let (engine, verify, _mock) =
+            finish_engine(vec![call("write"), text("done")], config, true);
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(verify.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            summary.answer,
+            "done\n\n[verification skipped: verify is not permitted in this approval mode]"
+        );
+        assert_eq!(summary.turns, 2, "the skip ends the run, no feedback turn");
+    }
+
+    /// A tool-call turn that also carries non-empty assistant text.
+    fn call_with_text(text: &str, name: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            ..call(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn no_verify_tool_runs_exactly_one_self_check() {
+        // Self-check on, no verify tool, escalation configured: the first
+        // finish earns ONE self-check turn; the second finish ends the run.
+        // No failure note and no escalation turn.
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            escalate_on_check_failure: Some("claude-opus-escalated".into()),
+            ..approve_all_config()
+        };
+        let (engine, _verify, mock) = finish_engine(
+            vec![call("write"), text("attempt 1"), text("attempt 2")],
+            config,
+            false,
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "attempt 2");
+        assert_eq!(
+            mock.requests().len(),
+            3,
+            "edit, first answer, exactly one self-check reply"
+        );
+        assert!(mock.requests().iter().all(|r| r.model == "m"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_on_the_self_check_turn_keeps_the_answer() {
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            ..approve_all_config()
+        };
+        // The self-check reply hits the exhausted script: the pre-check
+        // answer survives and the run stays Ok.
+        let (engine, _verify, _mock) =
+            finish_engine(vec![call("write"), text("attempt 1")], config, false);
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "attempt 1");
+    }
+
+    #[tokio::test]
+    async fn provider_error_after_the_self_check_turn_propagates() {
+        let config = EngineConfig {
+            self_check_on_finish: true,
+            ..approve_all_config()
+        };
+        // The self-check reply is a tool turn with text; the turn after it
+        // errors (script exhausted). Only the immediate self-check turn may
+        // be swallowed, so the error must reach the caller.
+        let (engine, _verify, _mock) = finish_engine(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                call_with_text("checking", "write"),
+            ],
+            config,
+            false,
+        );
+        let result = engine.run_task("ship it").await;
+        assert!(
+            result.is_err(),
+            "a provider error on a later turn must propagate, got {result:?}"
         );
     }
 }
