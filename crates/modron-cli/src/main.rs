@@ -481,7 +481,7 @@ fn init_tracing(verbose: bool, tui: bool) {
         .init();
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(mut cli: Cli) -> anyhow::Result<()> {
     // `modron --upgrade` — flag alias for the upgrade subcommand.
     if cli.upgrade {
         return crate::upgrade::run_upgrade().await;
@@ -556,6 +556,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // `modron upgrade` — self-update from the latest release (Phase 6e).
     if let Some(Command::Upgrade) = cli.command {
         return crate::upgrade::run_upgrade().await;
+    }
+
+    // Bare `--resume` resolves to the latest session here, before any mode
+    // builds its agent, so every mode honors that session's rewind marker
+    // exactly like `--resume=<id>` (F1). With no sessions it stays bare and
+    // the one-shot path reports that itself.
+    if matches!(cli.resume, Some(None)) {
+        let store = JsonlSessionStore::new(&sessions_dir);
+        if let Some(meta) = latest_session(&store).await? {
+            eprintln!("resuming: {} ({})", meta.id, meta.title);
+            cli.resume = Some(Some(meta.id));
+        }
+    }
+    if let Some(Some(id)) = cli.resume {
+        let store = JsonlSessionStore::new(&sessions_dir);
+        upgrade_rewind_marker(&store, &sessions_dir, id).await?;
     }
 
     // `modron doctor` — setup diagnostics (Phase 8).
@@ -1198,13 +1214,13 @@ fn build_agent_with(
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),
         // Honors a prior `modron rewind` of this session (C2): abandoned
-        // events stay in the log but never re-enter context.
-        resume_from_event: cli.resume.flatten().and_then(|id| {
-            let marker = sessions_dir.join(format!("{id}.rewind"));
-            std::fs::read_to_string(&marker)
-                .ok()
-                .and_then(|text| text.trim().parse::<u64>().ok())
-        }),
+        // events stay in the log but never re-enter context. The engine only
+        // takes the cut; the `end` half of the marker is recorded for the
+        // range-skip engine change (see `RewindMarker`).
+        resume_from_event: cli
+            .resume
+            .flatten()
+            .and_then(|id| read_rewind_cut(&sessions_dir, id)),
         hooks: cfg
             .hooks
             .clone()
@@ -2052,7 +2068,7 @@ async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Res
     // abandoned - context is events[..cut]. `0` therefore means "fresh
     // context, full history on disk" - writing events.len() here made
     // restart a semantic no-op (cycle-2 audit H2).
-    std::fs::write(&marker, "0")
+    std::fs::write(&marker, format_rewind_marker(0, events.len() as u64))
         .map_err(|err| anyhow::anyhow!("cannot write restart marker: {err}"))?;
     println!(
         "session {id} restarted: {} events kept on disk, context starts fresh on the next --resume",
@@ -2920,12 +2936,100 @@ async fn run_rewind(
         "session {} resumes from event {} ({} later events stay in the log, unused)",
         session_id, outcome.truncated_at_event, outcome.abandoned_events
     );
-    // Persist the truncation point: the next `--resume <id>` picks it up
-    // (a later rewind overwrites it; delete the marker to resume fully).
+    // Persist the abandoned range `[cut, end)`: the next `--resume` picks up
+    // the cut (a later rewind overwrites the marker). `end` is the event
+    // count now, so events appended after this point are not in the range.
+    let end = store
+        .event_count(session_id)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot count session events: {err}"))?;
     let marker = sessions_dir.join(format!("{}.rewind", session_id));
-    std::fs::write(&marker, outcome.truncated_at_event.to_string())
-        .map_err(|err| anyhow::anyhow!("cannot write rewind marker {}: {err}", marker.display()))?;
+    std::fs::write(
+        &marker,
+        format_rewind_marker(outcome.truncated_at_event, end),
+    )
+    .map_err(|err| anyhow::anyhow!("cannot write rewind marker {}: {err}", marker.display()))?;
     Ok(())
+}
+
+/// A parsed `<id>.rewind` marker. `cut` is the first abandoned event index.
+/// `end` is the event count when the range was recorded (`[cut, end)` is
+/// abandoned). `None` marks the old one-number form, which
+/// [`upgrade_rewind_marker`] rewrites in the two-number form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RewindMarker {
+    cut: u64,
+    end: Option<u64>,
+}
+
+/// Parses `"<cut>"` (old form) or `"<cut> <end>"`. Anything else, including
+/// an `end` below `cut`, is treated as no marker.
+fn parse_rewind_marker(text: &str) -> Option<RewindMarker> {
+    let mut parts = text.split_whitespace();
+    let cut: u64 = parts.next()?.parse().ok()?;
+    let end = match parts.next() {
+        None => None,
+        Some(raw) => Some(raw.parse::<u64>().ok()?),
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    if matches!(end, Some(end) if end < cut) {
+        return None;
+    }
+    Some(RewindMarker { cut, end })
+}
+
+/// The two-number marker text: `"<cut> <end>"`.
+fn format_rewind_marker(cut: u64, end: u64) -> String {
+    format!("{cut} {end}")
+}
+
+/// Engine cut for a session's marker, read synchronously while building
+/// the agent. Both marker forms yield the same cut.
+fn read_rewind_cut(sessions_dir: &Path, id: SessionId) -> Option<u64> {
+    let marker = sessions_dir.join(format!("{id}.rewind"));
+    let text = std::fs::read_to_string(marker).ok()?;
+    parse_rewind_marker(&text).map(|m| m.cut)
+}
+
+/// Rewrites an old one-number marker as `"<cut> <end>"`, with `end` = the
+/// event count at this moment. Already-upgraded and missing markers are left
+/// alone.
+async fn upgrade_rewind_marker(
+    store: &JsonlSessionStore,
+    sessions_dir: &Path,
+    id: SessionId,
+) -> anyhow::Result<()> {
+    let marker = sessions_dir.join(format!("{id}.rewind"));
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return Ok(());
+    };
+    let Some(parsed) = parse_rewind_marker(&text) else {
+        return Ok(());
+    };
+    if parsed.end.is_some() {
+        return Ok(());
+    }
+    let end = store
+        .event_count(id)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot count session events: {err}"))?;
+    std::fs::write(&marker, format_rewind_marker(parsed.cut, end))
+        .map_err(|err| anyhow::anyhow!("cannot rewrite rewind marker: {err}"))?;
+    Ok(())
+}
+
+/// The most recently updated session, if any (`list` sorts newest first).
+async fn latest_session(
+    store: &JsonlSessionStore,
+) -> anyhow::Result<Option<modron_core::SessionMeta>> {
+    use modron_core::SessionStore as _;
+    let sessions = store
+        .list()
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot list sessions: {e}"))?;
+    Ok(sessions.into_iter().next())
 }
 
 /// `modron sessions` (DX1): newest first.
@@ -3191,10 +3295,126 @@ mod tests {
             .await
             .unwrap();
 
+        let count = store.event_count(meta.id).await.unwrap();
         run_sessions_restart(dir.path(), meta.id).await.unwrap();
         let marker = dir.path().join(format!("{}.rewind", meta.id));
         let contents = std::fs::read_to_string(&marker).unwrap();
-        assert_eq!(contents.trim(), "0", "fresh context = cut at 0");
+        assert_eq!(
+            parse_rewind_marker(&contents),
+            Some(RewindMarker {
+                cut: 0,
+                end: Some(count)
+            }),
+            "fresh context = cut at 0, abandoning everything up to the log end"
+        );
+    }
+
+    #[test]
+    fn rewind_marker_parses_both_forms_and_rejects_junk() {
+        use super::{parse_rewind_marker, RewindMarker};
+        assert_eq!(
+            parse_rewind_marker("3 7\n"),
+            Some(RewindMarker {
+                cut: 3,
+                end: Some(7)
+            })
+        );
+        assert_eq!(
+            parse_rewind_marker("3"),
+            Some(RewindMarker { cut: 3, end: None })
+        );
+        assert_eq!(parse_rewind_marker(""), None);
+        assert_eq!(parse_rewind_marker("a b"), None);
+        assert_eq!(parse_rewind_marker("1 2 3"), None);
+        assert_eq!(parse_rewind_marker("5 2"), None, "end below cut is invalid");
+        assert_eq!(super::format_rewind_marker(3, 7), "3 7");
+    }
+
+    #[tokio::test]
+    async fn old_one_number_marker_is_upgraded_with_current_event_count() {
+        use modron_store::JsonlSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let meta = store.create_session("upgrade me").await.unwrap();
+        for text in ["one", "two", "three"] {
+            store
+                .append(
+                    meta.id,
+                    &SessionEvent::Message {
+                        parent_id: None,
+                        message: modron_core::Message::user(text),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let count = store.event_count(meta.id).await.unwrap();
+        let marker = dir.path().join(format!("{}.rewind", meta.id));
+        std::fs::write(&marker, "1").unwrap();
+
+        upgrade_rewind_marker(&store, dir.path(), meta.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("1 {count}")
+        );
+        assert_eq!(read_rewind_cut(dir.path(), meta.id), Some(1));
+
+        // Already two-number: left untouched even if the log has grown.
+        store
+            .append(
+                meta.id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: modron_core::Message::user("later"),
+                },
+            )
+            .await
+            .unwrap();
+        upgrade_rewind_marker(&store, dir.path(), meta.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("1 {count}")
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_resume_resolves_latest_session_and_its_marker_cut() {
+        use modron_store::JsonlSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let older = store.create_session("older").await.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let latest = store.create_session("latest").await.unwrap();
+        std::fs::write(dir.path().join(format!("{}.rewind", latest.id)), "2 4").unwrap();
+        std::fs::write(dir.path().join(format!("{}.rewind", older.id)), "9 9").unwrap();
+
+        let picked = latest_session(&store).await.unwrap().expect("a session");
+        assert_eq!(picked.id, latest.id);
+        assert_eq!(read_rewind_cut(dir.path(), picked.id), Some(2));
+    }
+
+    #[tokio::test]
+    async fn bare_resume_with_no_sessions_resolves_to_nothing() {
+        use modron_store::JsonlSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path().join("missing"));
+        assert!(latest_session(&store).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn read_rewind_cut_handles_missing_and_both_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let id: SessionId = uuid::Uuid::new_v4();
+        assert_eq!(read_rewind_cut(dir.path(), id), None);
+        let marker = dir.path().join(format!("{id}.rewind"));
+        std::fs::write(&marker, "4 9").unwrap();
+        assert_eq!(read_rewind_cut(dir.path(), id), Some(4));
+        std::fs::write(&marker, "4").unwrap();
+        assert_eq!(read_rewind_cut(dir.path(), id), Some(4));
     }
     use super::*;
 
