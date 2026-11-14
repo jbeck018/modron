@@ -35,7 +35,16 @@ pub async fn rewind_last_checkpoint(
             path,
             prior_content_b64,
             event_index,
-        } => Some((i, (path.clone(), prior_content_b64.clone(), *event_index))),
+            uncaptured,
+        } => Some((
+            i,
+            (
+                path.clone(),
+                prior_content_b64.clone(),
+                *event_index,
+                *uncaptured,
+            ),
+        )),
         _ => None,
     }) else {
         return Err(crate::Error::Session(format!(
@@ -43,7 +52,16 @@ pub async fn rewind_last_checkpoint(
              checkpoints are captured before write/edit tools run"
         )));
     };
-    let (path, prior_b64, event_index) = checkpoint;
+    let (path, prior_b64, event_index, uncaptured) = checkpoint;
+
+    // D8: an uncaptured original is neither restorable nor known to be new.
+    // Refuse before touching the disk so nothing is lost.
+    if uncaptured && prior_b64.is_none() {
+        return Err(crate::Error::Session(format!(
+            "cannot rewind {path}: the original was not captured (too large or \
+             unreadable); restore it from git"
+        )));
+    }
 
     let target = resolve_under(working_dir, &path)?;
     let deleted = match prior_b64.as_deref() {
@@ -106,6 +124,73 @@ mod tests {
             path: path.to_string(),
             prior_content_b64: prior.map(b64::encode),
             event_index,
+            uncaptured: false,
+        }
+    }
+
+    fn uncaptured_checkpoint(path: &str, event_index: u64) -> SessionEvent {
+        SessionEvent::Checkpoint {
+            path: path.to_string(),
+            prior_content_b64: None,
+            event_index,
+            uncaptured: true,
+        }
+    }
+
+    /// D8: an uncaptured original (too large or unreadable) must never be
+    /// deleted or overwritten by rewind. Rewind refuses and touches nothing.
+    #[tokio::test]
+    async fn uncaptured_checkpoint_refuses_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.bin");
+        std::fs::write(&file, b"agent-mutated bytes").unwrap();
+
+        let store = InMemoryStore::default();
+        let meta = store.create_session("t").await.unwrap();
+        store
+            .append(meta.id, &SessionEvent::Task { text: "t".into() })
+            .await
+            .unwrap();
+        store
+            .append(meta.id, &uncaptured_checkpoint("big.bin", 1))
+            .await
+            .unwrap();
+
+        let err = rewind_last_checkpoint(&store, meta.id, dir.path())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not captured"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("big.bin"),
+            "error must name the file: {err}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"agent-mutated bytes");
+    }
+
+    /// Old session logs predate the `uncaptured` field: they must still
+    /// parse, and a `None` checkpoint without the field keeps its original
+    /// meaning (the file was new, so rewind deletes it).
+    #[test]
+    fn old_format_checkpoint_parses_and_means_absent() {
+        let raw =
+            r#"{"type":"checkpoint","path":"new.txt","prior_content_b64":null,"event_index":7}"#;
+        let event: SessionEvent = serde_json::from_str(raw).expect("old log line must parse");
+        match event {
+            SessionEvent::Checkpoint {
+                path,
+                prior_content_b64,
+                event_index,
+                uncaptured,
+            } => {
+                assert_eq!(path, "new.txt");
+                assert_eq!(prior_content_b64, None);
+                assert_eq!(event_index, 7);
+                assert!(!uncaptured, "absent default must not read as uncaptured");
+            }
+            other => panic!("expected checkpoint, got {other:?}"),
         }
     }
 

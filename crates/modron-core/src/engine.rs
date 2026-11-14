@@ -52,6 +52,89 @@ fn is_gated(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name) || name.starts_with("mcp__")
 }
 
+/// Largest file whose prior bytes a checkpoint captures (D8).
+const SNAPSHOT_CAP: u64 = 256 * 1024;
+
+/// The state of a file before a checkpointed mutation (D8).
+#[derive(Debug, PartialEq, Eq)]
+enum PriorState {
+    /// The file did not exist: rewind deletes what the tool creates.
+    Absent,
+    /// The file's bytes, base64-encoded: rewind restores them.
+    Captured(String),
+    /// The file exists but cannot be captured (not a regular file, over the
+    /// cap, or unreadable): rewind refuses and changes nothing.
+    Uncaptured,
+}
+
+/// Decide a file's prior state. The file type and size are checked with
+/// `symlink_metadata` BEFORE any read, so a FIFO, device or huge file is
+/// never opened for content.
+fn prior_state(path: &std::path::Path) -> PriorState {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PriorState::Absent,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot stat file for checkpoint");
+            return PriorState::Uncaptured;
+        }
+    };
+    if !meta.file_type().is_file() {
+        tracing::warn!(path = %path.display(), "checkpoint skipped: not a regular file");
+        return PriorState::Uncaptured;
+    }
+    if meta.len() > SNAPSHOT_CAP {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = meta.len(),
+            "file exceeds 256KB checkpoint cap — rewind cannot restore it"
+        );
+        return PriorState::Uncaptured;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() as u64 <= SNAPSHOT_CAP => {
+            PriorState::Captured(crate::b64::encode(&bytes))
+        }
+        Ok(_) => PriorState::Uncaptured,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot read file for checkpoint");
+            PriorState::Uncaptured
+        }
+    }
+}
+
+/// Resolve a tool's `path` argument to the real location it would touch,
+/// following symlinks on the part that exists. Returns `None` unless that
+/// location is inside `working_dir` (A3). The `..` components are resolved
+/// by the kernel through the existing prefix, never folded lexically, so a
+/// symlink followed by `..` cannot make a path look inside.
+fn resolve_inside(working_dir: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+    let base = std::fs::canonicalize(working_dir).ok()?;
+    let raw = Path::new(path);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        base.join(raw)
+    };
+    // Walk up to the longest existing ancestor. Components that do not
+    // exist yet must be plain names: a `..` in that tail is refused.
+    let mut existing: &Path = joined.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while std::fs::symlink_metadata(existing).is_err() {
+        match existing.components().next_back() {
+            Some(Component::Normal(name)) => tail.push(name.to_os_string()),
+            _ => return None,
+        }
+        existing = existing.parent()?;
+    }
+    let mut resolved: PathBuf = std::fs::canonicalize(existing).ok()?;
+    for name in tail.iter().rev() {
+        resolved.push(name);
+    }
+    resolved.starts_with(&base).then_some(resolved)
+}
+
 /// Finish-gate bound: verification feedback rounds before the run may end
 /// without passing verification (StaminaBench: gains plateau after 3-5
 /// retries; 2 keeps the worst case tight).
@@ -809,9 +892,10 @@ impl Engine {
         // Dispatch tool calls; each result enters the transcript. Hooks
         // (H1) wrap execution: pre_tool may veto before the tool runs,
         // post_tool observes after. Hook-spawn errors fail closed.
-        // Checkpoints (C1) capture the prior content of files that
-        // write/edit are about to mutate — only in ApproveAll mode, since
-        // any other mode blocks these tools before they can mutate.
+        // Checkpoints (C1, A3) capture the prior content of files that
+        // write/edit are about to mutate; they are recorded inside
+        // `execute_tool` after the approval gate allows the call, in every
+        // approval mode, so a refused call records nothing.
         let ctx = ToolCtx {
             sandbox: self.config.sandbox,
             working_dir: self.config.working_dir.clone(),
@@ -844,11 +928,6 @@ impl Engine {
         } else {
             let mut outcomes = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
-                if self.config.approvals.mode == ApprovalMode::ApproveAll {
-                    if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
-                        self.store.append(session_id, &checkpoint).await?;
-                    }
-                }
                 let outcome = self
                     .dispatch_tool_call(session_id, call, &ctx, speculative)
                     .await;
@@ -1137,44 +1216,43 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
     ) -> Result<Option<SessionEvent>> {
-        const SNAPSHOT_CAP: usize = 256 * 1024;
         if !matches!(call.name.as_str(), "write" | "edit") {
             return Ok(None);
         }
         let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
             return Ok(None);
         };
-        let absolute = if std::path::Path::new(path).is_absolute() {
-            std::path::PathBuf::from(path)
-        } else {
-            self.config.working_dir.join(path)
+        // Only paths that resolve inside the working dir are checkpointed
+        // (A3): anything else records nothing.
+        let Some(resolved) = resolve_inside(&self.config.working_dir, path) else {
+            tracing::warn!(path = %path, "checkpoint skipped: path resolves outside the working dir");
+            return Ok(None);
         };
-        let (prior, warned) = match std::fs::read(&absolute) {
-            Ok(bytes) if bytes.len() <= SNAPSHOT_CAP => (Some(crate::b64::encode(&bytes)), false),
-            Ok(bytes) => {
-                tracing::warn!(
-                    path = %path,
-                    bytes = bytes.len(),
-                    "file exceeds 256KB checkpoint cap — rewind cannot restore it"
-                );
-                (None, true)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false),
-            Err(e) => {
-                tracing::warn!(path = %path, error = %e, "cannot read file for checkpoint");
-                (None, true)
-            }
+        let (prior_content_b64, uncaptured) = match prior_state(&resolved) {
+            PriorState::Absent => (None, false),
+            PriorState::Captured(encoded) => (Some(encoded), false),
+            PriorState::Uncaptured => (None, true),
         };
-        let _ = warned;
-        // event_count, not load: this runs per mutating tool call in
-        // ApproveAll mode, and a full log parse per call compounds over a
-        // write-heavy run (2026-11-12 audit perf fix).
+        // event_count, not load: this runs per mutating tool call, and a
+        // full log parse per call compounds over a write-heavy run (2026-11-12
+        // audit perf fix).
         let event_index = self.store.event_count(session_id).await? + 1;
         Ok(Some(SessionEvent::Checkpoint {
             path: path.to_string(),
-            prior_content_b64: prior,
+            prior_content_b64,
             event_index,
+            uncaptured,
         }))
+    }
+
+    /// Record the pre-mutation checkpoint for an allowed call (A3). Called
+    /// from `execute_tool` only after the deny and approval gates pass, so a
+    /// refused call records nothing.
+    async fn record_checkpoint(&self, session_id: SessionId, call: &ToolCall) -> Result<()> {
+        if let Some(checkpoint) = self.checkpoint_for(session_id, call).await? {
+            self.store.append(session_id, &checkpoint).await?;
+        }
+        Ok(())
     }
 
     /// Dispatch one tool call through the hook pipeline (H1): a `pre_tool`
@@ -1220,7 +1298,7 @@ impl Engine {
                 name: call.name.clone(),
             });
         }
-        let executed = self.execute_tool(call, ctx).await;
+        let executed = self.execute_tool(session_id, call, ctx).await;
         if let Some(sink) = self.config.on_tool_event.as_ref() {
             sink(ToolActivity::Done {
                 name: call.name.clone(),
@@ -1240,7 +1318,12 @@ impl Engine {
         Ok(executed)
     }
 
-    async fn execute_tool(&self, call: &ToolCall, ctx: &ToolCtx) -> ToolOutcome {
+    async fn execute_tool(
+        &self,
+        session_id: SessionId,
+        call: &ToolCall,
+        ctx: &ToolCtx,
+    ) -> ToolOutcome {
         let Some(tool) = self.tools.get(&call.name).cloned() else {
             let available = self
                 .tools
@@ -1292,6 +1375,16 @@ impl Engine {
                 };
                 return ToolOutcome::err(hint);
             }
+        }
+
+        // Pre-mutation checkpoint (D8, A3): taken only now, after the gates
+        // allowed the call, in every approval mode. If it cannot be recorded
+        // the call fails closed: a write rewind cannot undo must not run.
+        if let Err(err) = self.record_checkpoint(session_id, call).await {
+            return ToolOutcome::err(format!(
+                "checkpoint not recorded; `{}` did not run: {err}",
+                call.name
+            ));
         }
 
         match tool.execute(call.arguments.clone(), ctx).await {
@@ -2092,6 +2185,7 @@ mod tests {
                 path: "f".into(),
                 prior_content_b64: None,
                 event_index: 3,
+                uncaptured: false,
             },
             SessionEvent::ToolResult {
                 call_id: "c1".into(),
@@ -2140,6 +2234,7 @@ mod tests {
                 path: "b.rs".into(),
                 prior_content_b64: None,
                 event_index: 4,
+                uncaptured: false,
             },
             SessionEvent::ToolResult {
                 call_id: "c2".into(),
