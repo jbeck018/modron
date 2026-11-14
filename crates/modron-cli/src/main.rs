@@ -134,6 +134,11 @@ enum Command {
         /// on loopback. Use this behind tailscale-serve or cloudflared.
         #[arg(long)]
         require_token: bool,
+        /// Browser origin allowed to open the WebSocket (repeatable, exact
+        /// match, e.g. https://app.example.com). Default: none - every
+        /// upgrade that carries an Origin header is refused.
+        #[arg(long = "allow-origin")]
+        allow_origin: Vec<String>,
     },
     /// Manage paired remote devices (Phase 3): mint, list, revoke the
     /// bearer tokens remote clients send in their hello frame.
@@ -569,6 +574,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         listen,
         bridge,
         require_token,
+        allow_origin,
     }) = &cli.command
     {
         let mcp = spawn_mcp_servers(&cfg).await?;
@@ -585,6 +591,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 listen: Some(listen.clone()),
                 bridge_base: bridge.clone(),
                 require_token: *require_token,
+                allowed_origins: allow_origin.clone(),
                 ..modron_server::ServeOptions::default()
             },
         )
