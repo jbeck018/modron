@@ -491,7 +491,12 @@ Serial: D1 -> D2 -> D3 -> D4 -> D5 -> D6.
 **D6 | L | medium - Sandbox covers verify/diagnostics/interact/lsp; harden profiles**
 - bubblewrap: add `--new-session`, `--die-with-parent`, `--unshare-pid`,
   make `/lib64` bind conditional. Seatbelt: escape the workspace path, put
-  the profile outside the writable temp dir. Leader-owned (needs macOS and
+  the profile outside the writable temp dir. Carried over from D2: the
+  sandboxed bash path still uses `.output()` inside
+  `modron-core/src/sandbox.rs` (`run_seatbelt` / `run_bubblewrap`), so it
+  has no output cap, no truncation marker and no kill-on-interrupt; make
+  those return a spawned child that bash.rs drains with `spawn_capture` /
+  `settle_readers`. Leader-owned (needs macOS and
   a bwrap host to test).
 
 ### Lane E - providers, auth, store
