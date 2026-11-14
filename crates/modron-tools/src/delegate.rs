@@ -11,12 +11,90 @@
 use crate::common::{internal_tool_error, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
+use modron_core::hooks::scrub_tokio_command;
 use modron_core::{Tool, ToolCtx, ToolOutcome, ToolSpec};
+use std::sync::Mutex;
 
 const NAME: &str = "delegate";
+const MERGE_NAME: &str = "merge_worktree";
 const MAX_BYTES: usize = 10 * 1024;
 const DEFAULT_BUDGET_TOKENS: u64 = 30_000;
 const MAX_BUDGET_TOKENS: u64 = 200_000;
+/// Process-wide cap on background delegates that are running at once.
+const MAX_BACKGROUND_DELEGATES: usize = 4;
+
+/// Builds a `git` command rooted at `dir` with provider credentials removed
+/// from its environment. Every git spawn in this module goes through here so
+/// no call site can forget the scrub.
+fn git_command(dir: &std::path::Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("git");
+    scrub_tokio_command(&mut cmd);
+    cmd.current_dir(dir);
+    cmd
+}
+
+/// A running background delegate's join handle, kept so the engine can abort
+/// it on interrupt. `registry` and `id` let an abort mark the status entry.
+struct BackgroundTask {
+    id: String,
+    registry:
+        std::sync::Arc<Mutex<std::collections::HashMap<String, modron_core::BackgroundDelegate>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+static BACKGROUND_TASKS: Mutex<Vec<BackgroundTask>> = Mutex::new(Vec::new());
+
+fn background_tasks() -> std::sync::MutexGuard<'static, Vec<BackgroundTask>> {
+    BACKGROUND_TASKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drops finished tasks and returns how many are still running.
+fn running_background_count(tasks: &mut Vec<BackgroundTask>) -> usize {
+    tasks.retain(|t| !t.handle.is_finished());
+    tasks.len()
+}
+
+fn background_cap_error() -> ToolOutcome {
+    tool_err(
+        NAME,
+        format!(
+            "{MAX_BACKGROUND_DELEGATES} background subagents are already running; wait for one \
+             to finish (check with delegate_status), then retry"
+        ),
+        MAX_BYTES,
+    )
+}
+
+/// Aborts every background delegate that is still running and marks its
+/// status entry as failed. Returns how many were aborted. The engine or TUI
+/// interrupt path should call this; that call site is not wired yet.
+#[allow(dead_code)] // call site (engine interrupt path) is not wired yet
+pub fn abort_background_delegates() -> usize {
+    let tasks = std::mem::take(&mut *background_tasks());
+    let mut aborted = 0;
+    for task in tasks {
+        if task.handle.is_finished() {
+            continue;
+        }
+        task.handle.abort();
+        aborted += 1;
+        if let Ok(mut guard) = task.registry.lock() {
+            if let Some(entry) = guard.get_mut(&task.id) {
+                if matches!(entry.status, modron_core::BackgroundStatus::Running) {
+                    entry.status = modron_core::BackgroundStatus::Done {
+                        brief: "aborted before it finished".to_string(),
+                        tokens: 0,
+                        turns: 0,
+                        is_error: true,
+                    };
+                }
+            }
+        }
+    }
+    aborted
+}
 
 pub struct DelegateTool;
 
@@ -121,13 +199,25 @@ impl Tool for DelegateTool {
             .get("isolate")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Background mode (Phase 5i I2): detached child, state in the
+        // engine registry, `delegate_status` reads it later.
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Fast refusal before any worktree is created; the authoritative
+        // check happens under the lock at spawn time below.
+        if background
+            && running_background_count(&mut background_tasks()) >= MAX_BACKGROUND_DELEGATES
+        {
+            return Ok(background_cap_error());
+        }
         if isolate {
             let id = modron_core::subagent::new_worktree_id();
             let worktree = ctx.working_dir.join(".modron").join("worktrees").join(&id);
-            let output = tokio::process::Command::new("git")
+            let output = git_command(&ctx.working_dir)
                 .args(["worktree", "add"])
                 .arg(&worktree)
-                .current_dir(&ctx.working_dir)
                 .output()
                 .await;
             match output {
@@ -153,12 +243,6 @@ impl Tool for DelegateTool {
         // via delegate's working_dir parameter) — results are reported,
         // never auto-merged.
 
-        // Background mode (Phase 5i I2): detached child, state in the
-        // engine registry, `delegate_status` reads it later.
-        let background = args
-            .get("background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         if background {
             let bg = engine.config.background_subagents.clone();
             let id = modron_core::subagent::new_worktree_id();
@@ -168,8 +252,14 @@ impl Tool for DelegateTool {
             let tool_filter = tool_filter.clone();
             let engine = std::sync::Arc::clone(engine);
             let child_dir = child_working_dir.clone();
-            let mut registry_guard = bg.lock().unwrap();
-            registry_guard.insert(
+            // Hold the task registry across the cap check, the status insert
+            // and the spawn so concurrent requests cannot both take the last
+            // slot. The spawned body never takes this lock.
+            let mut tasks = background_tasks();
+            if running_background_count(&mut tasks) >= MAX_BACKGROUND_DELEGATES {
+                return Ok(background_cap_error());
+            }
+            bg.lock().unwrap().insert(
                 id.clone(),
                 modron_core::BackgroundDelegate {
                     label: persona_for_task
@@ -179,9 +269,9 @@ impl Tool for DelegateTool {
                     status: modron_core::BackgroundStatus::Running,
                 },
             );
-            drop(registry_guard);
             let registry = bg.clone();
-            tokio::spawn(async move {
+            let task_id = id.clone();
+            let handle = tokio::spawn(async move {
                 let report = modron_core::subagent::delegate(
                     &engine,
                     &task,
@@ -192,7 +282,7 @@ impl Tool for DelegateTool {
                 )
                 .await;
                 let mut guard = registry.lock().unwrap();
-                if let Some(entry) = guard.get_mut(&id) {
+                if let Some(entry) = guard.get_mut(&task_id) {
                     entry.status = match report {
                         Ok(report) => modron_core::BackgroundStatus::Done {
                             brief: report.brief,
@@ -209,6 +299,12 @@ impl Tool for DelegateTool {
                     };
                 }
             });
+            tasks.push(BackgroundTask {
+                id,
+                registry: bg,
+                handle,
+            });
+            drop(tasks);
             return Ok(ToolOutcome::ok(format!(
                 "subagent {id_for_msg} started in the background — check with delegate_status {{\"id\": \"{id_for_msg}\"}}"
             )));
@@ -388,6 +484,10 @@ mod phase5i_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    /// Background tests share the process-wide task registry, so they run
+    /// one at a time.
+    static BG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn engine_with(
         script: MockProvider,
         personas: Option<modron_core::PersonaSpec>,
@@ -421,6 +521,7 @@ mod phase5i_tests {
 
     #[tokio::test]
     async fn background_delegate_reports_started_then_done() {
+        let _guard = BG_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let engine = engine_with(
             MockProvider::new().then_text("background brief result"),
@@ -463,6 +564,68 @@ mod phase5i_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(saw_done, "background child must complete: {status:?}");
+    }
+
+    #[tokio::test]
+    async fn background_cap_refuses_fifth_and_abort_marks_status() {
+        let _guard = BG_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_with(MockProvider::new().then_text("ok"), None);
+        let ctx = ctx_with(&engine, dir.path());
+        // Fill the cap with tasks that never finish on their own.
+        let bg = engine.config.background_subagents.clone();
+        for n in 0..MAX_BACKGROUND_DELEGATES {
+            let id = format!("pending-{n}");
+            bg.lock().unwrap().insert(
+                id.clone(),
+                modron_core::BackgroundDelegate {
+                    label: "delegate".into(),
+                    status: modron_core::BackgroundStatus::Running,
+                },
+            );
+            let handle = tokio::spawn(std::future::pending::<()>());
+            background_tasks().push(BackgroundTask {
+                id,
+                registry: bg.clone(),
+                handle,
+            });
+        }
+        let refused = DelegateTool
+            .execute(serde_json::json!({"task": "x", "background": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(refused.is_error, "{refused:?}");
+        assert!(
+            refused.content.contains("wait for one"),
+            "{}",
+            refused.content
+        );
+
+        // Abort stops the four and marks their status entries failed.
+        assert_eq!(abort_background_delegates(), MAX_BACKGROUND_DELEGATES);
+        assert_eq!(
+            abort_background_delegates(),
+            0,
+            "second abort finds nothing"
+        );
+        let status = DelegateStatusTool
+            .execute(serde_json::json!({"id": "pending-0"}), &ctx)
+            .await
+            .unwrap();
+        assert!(status.content.contains("FAILED"), "{}", status.content);
+        assert!(
+            status.content.contains("aborted before it finished"),
+            "{}",
+            status.content
+        );
+
+        // With slots free again, a new background delegate is accepted.
+        let started = DelegateTool
+            .execute(serde_json::json!({"task": "x", "background": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(!started.is_error, "{started:?}");
+        abort_background_delegates();
     }
 
     #[tokio::test]
@@ -551,7 +714,7 @@ impl Default for MergeWorktreeTool {
 impl Tool for MergeWorktreeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "merge_worktree".to_string(),
+            name: MERGE_NAME.to_string(),
             description: "Merge an isolated delegate's worktree (path from a delegate result) \
                           back into the current branch. Conflicts abort with an error — resolve \
                           them yourself; never force."
@@ -575,23 +738,30 @@ impl Tool for MergeWorktreeTool {
         let spec = self.spec();
         if let Err(message) = validate_args(&spec, &args) {
             return Ok(tool_err(
-                NAME,
+                MERGE_NAME,
                 format!("invalid arguments: {message}"),
                 MAX_BYTES,
             ));
         }
         let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
-            return Ok(tool_err(NAME, "missing `path`", MAX_BYTES));
+            return Ok(tool_err(MERGE_NAME, "missing `path`", MAX_BYTES));
+        };
+        // A relative path is relative to the run's working dir, not the
+        // process cwd.
+        let raw = std::path::Path::new(path);
+        let joined = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            ctx.working_dir.join(raw)
         };
         // The worktree must live under the repo's .modron/worktrees —
         // merging arbitrary paths is not this tool's contract.
-        let canonical =
-            std::path::Path::new(path)
-                .canonicalize()
-                .map_err(|e| modron_core::Error::Tool {
-                    tool: NAME.into(),
-                    message: format!("worktree path unreadable: {e}"),
-                })?;
+        let canonical = joined
+            .canonicalize()
+            .map_err(|e| modron_core::Error::Tool {
+                tool: MERGE_NAME.into(),
+                message: format!("worktree path unreadable: {e}"),
+            })?;
         let allowed_root = ctx
             .working_dir
             .join(".modron")
@@ -600,7 +770,7 @@ impl Tool for MergeWorktreeTool {
             .unwrap_or_else(|_| ctx.working_dir.join(".modron").join("worktrees"));
         if !canonical.starts_with(&allowed_root) {
             return Ok(tool_err(
-                NAME,
+                MERGE_NAME,
                 "path is not under .modron/worktrees — only isolated delegate worktrees can be merged",
                 MAX_BYTES,
             ));
@@ -612,11 +782,7 @@ impl Tool for MergeWorktreeTool {
             dir: &std::path::Path,
             args: &[&str],
         ) -> std::io::Result<std::process::Output> {
-            tokio::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .await
+            git_command(dir).args(args).output().await
         }
         let status = run_in(&canonical, &["status", "--porcelain"])
             .await
@@ -626,14 +792,22 @@ impl Tool for MergeWorktreeTool {
                 .await
                 .map_err(internal_err)?;
             if !add.status.success() {
-                return Ok(tool_err(NAME, "cannot stage worktree changes", MAX_BYTES));
+                return Ok(tool_err(
+                    MERGE_NAME,
+                    "cannot stage worktree changes",
+                    MAX_BYTES,
+                ));
             }
             let commit = run_in(&canonical, &["commit", "-qm", "delegate work"]).await;
             if let Ok(c) = &commit {
                 if !c.status.success()
                     && !String::from_utf8_lossy(&c.stdout).contains("nothing to commit")
                 {
-                    return Ok(tool_err(NAME, "cannot commit worktree changes", MAX_BYTES));
+                    return Ok(tool_err(
+                        MERGE_NAME,
+                        "cannot commit worktree changes",
+                        MAX_BYTES,
+                    ));
                 }
             }
         }
@@ -641,7 +815,7 @@ impl Tool for MergeWorktreeTool {
             .await
             .map_err(internal_err)?;
         if !head.status.success() {
-            return Ok(tool_err(NAME, "worktree has no commits", MAX_BYTES));
+            return Ok(tool_err(MERGE_NAME, "worktree has no commits", MAX_BYTES));
         }
         let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
         let message = args
@@ -659,7 +833,7 @@ impl Tool for MergeWorktreeTool {
             // Abort the in-progress conflicted merge, then report.
             let _ = run_in(&ctx.working_dir, &["merge", "--abort"]).await;
             return Ok(tool_err(
-                NAME,
+                MERGE_NAME,
                 format!(
                     "merge conflicted and was aborted — resolve manually: {}",
                     String::from_utf8_lossy(&merge.stdout).trim()
@@ -676,7 +850,7 @@ impl Tool for MergeWorktreeTool {
 
 fn internal_err(e: std::io::Error) -> modron_core::Error {
     modron_core::Error::Tool {
-        tool: "merge_worktree".into(),
+        tool: MERGE_NAME.into(),
         message: e.to_string(),
     }
 }
@@ -684,6 +858,28 @@ fn internal_err(e: std::io::Error) -> modron_core::Error {
 #[cfg(test)]
 mod merge_tests {
     use super::*;
+
+    #[test]
+    fn git_helper_scrubs_provider_keys_but_keeps_path() {
+        // Unique name: no other test reads or sets it.
+        let key = "MODRON_LD_TEST_API_KEY";
+        std::env::set_var(key, "sekrit");
+        let cmd = git_command(std::path::Path::new("."));
+        std::env::remove_var(key);
+        let envs: Vec<(String, bool)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.is_some()))
+            .collect();
+        assert!(
+            envs.iter().any(|(k, set)| k == key && !set),
+            "secret removed from child env: {envs:?}"
+        );
+        assert!(
+            !envs.iter().any(|(k, _)| k == "PATH"),
+            "PATH is inherited, not overridden: {envs:?}"
+        );
+    }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -757,6 +953,58 @@ mod merge_tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("not under .modron/worktrees"));
+    }
+
+    #[tokio::test]
+    async fn relative_worktree_path_resolves_against_working_dir() {
+        let (dir, _wt) = repo_with_worktree();
+        // Relative to ctx.working_dir, not the process cwd (the test binary
+        // runs from the crate directory, where this path does not exist).
+        let ctx = ToolCtx::new(dir.path());
+        let out = MergeWorktreeTool
+            .execute(
+                serde_json::json!({"path": ".modron/worktrees/abc12345"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{out:?}");
+        assert!(
+            dir.path().join("feature.txt").exists(),
+            "relative path merged the worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_tool_errors_are_labelled_merge_worktree() {
+        let (dir, _wt) = repo_with_worktree();
+        let ctx = ToolCtx::new(dir.path());
+        // Outcome error from the path guard.
+        let out = MergeWorktreeTool
+            .execute(
+                serde_json::json!({"path": dir.path().join("..").to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.starts_with("merge_worktree:"),
+            "{}",
+            out.content
+        );
+        // Hard error from an unreadable path.
+        let err = MergeWorktreeTool
+            .execute(
+                serde_json::json!({"path": dir.path().join("no-such-dir").to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            modron_core::Error::Tool { tool, .. } => assert_eq!(tool, "merge_worktree"),
+            other => panic!("expected a tool error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
