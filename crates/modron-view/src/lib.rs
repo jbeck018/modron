@@ -96,6 +96,12 @@ pub fn short(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Shown once per connection when a client receives a frame it cannot
+/// decode (a newer server speaking to an older client). Shared so every
+/// client says the same words.
+pub const UNDECODABLE_FRAME_NOTICE: &str =
+    "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+
 /// Character cap for the one-line approval summary. Every client calls
 /// [`approval_summary`] with this value so the prompt reads the same.
 pub const APPROVAL_SUMMARY_MAX: usize = 80;

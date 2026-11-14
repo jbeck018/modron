@@ -106,7 +106,7 @@ pub struct AttachSnapshot {
 
 /// Shown once per connection when the server sends a frame this client
 /// cannot decode (a newer server; some updates may be missing).
-pub const UNDECODABLE_NOTICE: &str = "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+pub const UNDECODABLE_NOTICE: &str = modron_view::UNDECODABLE_FRAME_NOTICE;
 
 /// One inbound item from the server: a decoded frame, or a frame this
 /// client could not decode.

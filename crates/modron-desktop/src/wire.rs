@@ -26,8 +26,7 @@ pub const CLIENT_NAME: &str = "modron-desktop";
 const WELCOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The one note a connection shows when a frame fails to decode.
-const UNREADABLE_FRAME_NOTE: &str =
-    "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+const UNREADABLE_FRAME_NOTE: &str = modron_view::UNDECODABLE_FRAME_NOTICE;
 
 /// Query parameter that carries a paired device token on a ws(s) URL
 /// (`ws://host:7699/?token=...`). Stripped before the URL is dialed or shown.

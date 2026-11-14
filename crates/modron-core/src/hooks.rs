@@ -153,6 +153,25 @@ pub fn scrub_tokio_command(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Kills the hook's process group on drop unless disarmed.
+struct HookGroup(Option<u32>);
+
+impl HookGroup {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for HookGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take() {
+            // Negative pid = the whole group (spawned with process_group(0)).
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+    }
+}
+
 /// Run `cmd` through `sh -c` with the given env vars. Non-zero exit or a
 /// timeout counts as a veto (for pre-tool hooks; post-tool callers ignore
 /// `blocked` and just log).
@@ -192,10 +211,17 @@ pub async fn run_hook(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Own process group, so a timeout or an interrupt can kill everything
+    // the hook started (a backgrounded grandchild included), not just `sh`.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().map_err(|e| Error::Tool {
         tool: "hook".into(),
         message: format!("cannot spawn hook: {e}"),
     })?;
+    // Armed until the hook exits on its own; dropped armed (timeout, or
+    // this future dropped on interrupt) it kills the whole group.
+    let mut group = HookGroup(child.id());
     let stdin = child.stdin.take();
     let mut stderr = child.stderr.take();
 
@@ -221,6 +247,7 @@ pub async fn run_hook(
 
     let (stderr_bytes, status) = match tokio::time::timeout(timeout, run).await {
         Ok((stderr_bytes, status)) => {
+            group.disarm();
             let status = status.map_err(|e| Error::Tool {
                 tool: "hook".into(),
                 message: format!("hook failed to run: {e}"),
@@ -272,6 +299,24 @@ fn tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_hook_takes_its_background_children_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild-ran");
+        // The grandchild outlives `sh` unless the whole group is killed.
+        let cmd = format!("(sleep 1; touch {}) & sleep 30", marker.display());
+        let outcome = run_hook(&cmd, &[], Duration::from_millis(150))
+            .await
+            .unwrap();
+        assert!(outcome.blocked, "{outcome:?}");
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        assert!(
+            !marker.exists(),
+            "the backgrounded child must be killed too"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

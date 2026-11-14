@@ -94,8 +94,7 @@ impl Default for ConnectOptions {
 
 /// The one notice a connection shows when it receives a frame this client
 /// cannot decode (shared copy: the same words in every client).
-pub const UNDECODABLE_NOTE: &str =
-    "received a frame this client version cannot read - some updates may be missing; upgrade modron";
+pub const UNDECODABLE_NOTE: &str = modron_view::UNDECODABLE_FRAME_NOTICE;
 
 /// Inbound events after the handshake; the transport-specific shapes
 /// (tungstenite messages / browser events) normalize to these.

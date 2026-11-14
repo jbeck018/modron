@@ -96,7 +96,6 @@ pub struct AppState {
     pub router_defaults: Option<modron_protocol::RouterDefaults>,
     /// Scheduled automations (wire rows).
     pub automations: Vec<modron_protocol::AutomationWire>,
-    /// Provider auth status rows (onboarding wizard/settings).pub auth_providers: Vec<modron_protocol::AuthProviderWire>,
     pub conn: ConnState,
     pub sessions: Vec<SessionRow>,
     /// The attached session, if any.
