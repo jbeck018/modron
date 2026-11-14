@@ -10,6 +10,25 @@ use std::path::{Path, PathBuf};
 /// and hidden entries).
 pub(crate) const SKIPPED_DIRS: &[&str] = &["target", "node_modules", "vendor"];
 
+/// Hard cap on bytes read from one model-supplied file by `read`,
+/// `read_minified` and `grep` (grep skips larger files instead of reading them).
+pub(crate) const MAX_INPUT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Opens `path` for a bounded read. `metadata` follows symlinks and must report
+/// a regular file; devices (`/dev/zero`), FIFOs, sockets and directories are
+/// refused before anything is opened, so they can never hang the tool or grow
+/// its memory without bound.
+pub(crate) fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    std::fs::File::open(path)
+}
+
 /// Resolves `raw` against `working_dir` unless it is already absolute.
 pub(crate) fn resolve_path(working_dir: &Path, raw: &str) -> PathBuf {
     let p = Path::new(raw);
@@ -294,6 +313,34 @@ async fn create_unique_temp(target: &Path) -> std::io::Result<(PathBuf, tokio::f
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod open_regular_tests {
+    use super::open_regular_file;
+    use tempfile::tempdir;
+
+    #[test]
+    fn accepts_regular_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hi").unwrap();
+        assert!(open_regular_file(&file).is_ok());
+    }
+
+    #[test]
+    fn refuses_directory() {
+        let dir = tempdir().unwrap();
+        let err = open_regular_file(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_device_without_opening_it() {
+        let err = open_regular_file(std::path::Path::new("/dev/zero")).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 }
 

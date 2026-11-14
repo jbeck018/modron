@@ -1,6 +1,8 @@
 //! `grep` tool (LEDGER T1) — case-insensitive regex search over text files.
 
-use crate::common::{arg_str, internal_tool_error, resolve_path, tool_err, walk_builder};
+use crate::common::{
+    arg_str, internal_tool_error, resolve_path, tool_err, walk_builder, MAX_INPUT_BYTES,
+};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
@@ -69,22 +71,39 @@ impl Tool for GrepTool {
             }
         };
         let root = resolve_path(&ctx.working_dir, arg_str(&args, "path").unwrap_or("."));
-        if !root.exists() {
-            return Ok(tool_err(
-                NAME,
-                format!("path not found: {}", root.display()),
-                MAX_BYTES,
-            ));
+        match std::fs::metadata(&root) {
+            Err(_) => {
+                return Ok(tool_err(
+                    NAME,
+                    format!("path not found: {}", root.display()),
+                    MAX_BYTES,
+                ))
+            }
+            Ok(meta) if !meta.is_dir() && !meta.is_file() => {
+                return Ok(tool_err(
+                    NAME,
+                    format!("not a regular file: {}", root.display()),
+                    MAX_BYTES,
+                ))
+            }
+            Ok(_) => {}
         }
 
         // Display paths relative to the working dir, not the search root.
         let display_root = ctx.working_dir.clone();
-        let matches = tokio::task::spawn_blocking(move || collect_matches(root, display_root, re))
-            .await
-            .map_err(|e| internal_tool_error(NAME, format!("walk failed: {e}")))?;
+        let (matches, skipped) =
+            tokio::task::spawn_blocking(move || collect_matches(root, display_root, re))
+                .await
+                .map_err(|e| internal_tool_error(NAME, format!("walk failed: {e}")))?;
+        let skipped_note = format!("{skipped} files skipped (too large or not regular)");
 
         if matches.is_empty() {
-            return Ok(tool_err(NAME, "no matches", MAX_BYTES));
+            let message = if skipped > 0 {
+                format!("no matches\n{skipped_note}")
+            } else {
+                "no matches".to_string()
+            };
+            return Ok(tool_err(NAME, message, MAX_BYTES));
         }
         let truncated = matches.len() > MAX_MATCHES;
         let mut body = matches
@@ -95,21 +114,47 @@ impl Tool for GrepTool {
         if truncated {
             body.push_str("\n… [more matches elided]");
         }
+        if skipped > 0 {
+            body.push_str(&format!("\n{skipped_note}"));
+        }
         Ok(ToolOutcome::ok(reduce_output(body, MAX_BYTES)))
     }
 }
 
-fn collect_matches(root: PathBuf, display_root: PathBuf, re: Regex) -> Vec<String> {
+/// Walks `root` and returns the matching lines plus the number of files that
+/// were skipped because they were not regular files, were over
+/// [`MAX_INPUT_BYTES`], or could not be read. Devices and FIFOs are never
+/// opened, so a stray `/dev/zero` in the tree cannot stall the search.
+fn collect_matches(root: PathBuf, display_root: PathBuf, re: Regex) -> (Vec<String>, usize) {
+    use std::io::Read;
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     'outer: for entry in walk_builder(&root).build() {
         let Ok(entry) = entry else { continue };
         if entry.file_type().is_none_or(|ft| ft.is_dir()) {
             continue;
         }
         let path = entry.path().to_path_buf();
-        let Ok(bytes) = std::fs::read(&path) else {
+        // metadata follows symlinks: a link to a device or a FIFO is not regular.
+        let is_small_regular =
+            std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= MAX_INPUT_BYTES);
+        if !is_small_regular {
+            skipped += 1;
+            continue;
+        }
+        let read = crate::common::open_regular_file(&path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        let Ok(bytes) = read else {
+            skipped += 1;
             continue;
         };
+        if bytes.len() as u64 > MAX_INPUT_BYTES {
+            skipped += 1; // grew past the cap between stat and read
+            continue;
+        }
         if bytes.contains(&0) {
             continue; // binary — skip entirely
         }
@@ -129,7 +174,7 @@ fn collect_matches(root: PathBuf, display_root: PathBuf, re: Regex) -> Vec<Strin
             }
         }
     }
-    out
+    (out, skipped)
 }
 
 fn truncate_line(line: &str) -> String {
@@ -240,5 +285,49 @@ mod tests {
         let expected = "long.txt:1: ".chars().count() + MAX_LINE_CHARS + 1;
         assert_eq!(line.chars().count(), expected, "{line}");
         assert!(line.ends_with('…'), "{line}");
+    }
+
+    #[tokio::test]
+    async fn skips_oversize_file_and_reports_the_skip() {
+        let dir = tempdir().unwrap();
+        // 11 MiB file that would match: it must be skipped, not read.
+        let big = "needle\n".repeat(11 * 1024 * 1024 / 7 + 1);
+        std::fs::write(dir.path().join("big.log"), big).unwrap();
+        std::fs::write(dir.path().join("small.txt"), "needle here\n").unwrap();
+        let out = run("needle", None, &dir).await;
+        assert!(!out.is_error, "{out:?}");
+        assert!(out.content.contains("small.txt:1: needle here"), "{out:?}");
+        assert!(!out.content.contains("big.log"), "{out:?}");
+        assert!(
+            out.content
+                .contains("1 files skipped (too large or not regular)"),
+            "{out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skips_device_symlink_inside_tree() {
+        let dir = tempdir().unwrap();
+        // A committed link to an endless device must not stall the walk.
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join("zero")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let out = run("needle", None, &dir).await;
+        assert!(!out.is_error, "{out:?}");
+        assert!(out.content.contains("a.txt:1: needle"), "{out:?}");
+        assert!(
+            out.content
+                .contains("1 files skipped (too large or not regular)"),
+            "{out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_device_path_is_an_error() {
+        let dir = tempdir().unwrap();
+        let out = run("x", Some("/dev/zero"), &dir).await;
+        assert!(out.is_error, "{out:?}");
+        assert!(out.content.contains("not a regular file"), "{out:?}");
     }
 }
