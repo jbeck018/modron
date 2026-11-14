@@ -683,34 +683,34 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 | ID | Tier | Sev | Status | Worker | Commit | Evidence / notes |
 |----|------|-----|--------|--------|--------|------------------|
 | A1 | H+ | critical | DONE | | a34ca85 | Haiku. Leader follow-up: gated calls stay concurrent when they would not prompt. 3 new tests. |
-| A2 | H+ | high | TODO | | | |
-| A3 | H+ | high | TODO | | | |
+| A2 | H+ | high | DONE | | 8af1cb9 | Haiku. 3 new tests. |
+| A3 | H+ | high | DONE | | 59d380c | Haiku. Checkpoint recorded in execute_tool after the gates, every mode; fails closed if it cannot be stored. 7 new tests. |
 | A4 | H | high | TODO | | | |
 | A5 | H | medium | TODO | | | |
 | A6 | H | medium | TODO | | | |
 | A7 | L | medium | TODO | | | |
 | B1 | H+ | critical | DONE | | bebc4b3 | Haiku, one BLOCKED round (scope widened to tests/common/mod.rs). Leader follow-up: --allow-origin flag. 5 new tests. |
-| B2 | H+ | high | TODO | | | |
-| B3 | H | high | TODO | | | |
+| B2 | H+ | high | DONE | | 4805603 | Haiku, one BLOCKED round (leader added ErrorKind::Forbidden to scope). Leader follow-up: Detach allowed on scoped ctx. 8 new tests. |
+| B3 | H | high | DONE | | a0e7f27 | Leader. allow_rest cleared in start_run; hub test extended. |
 | B4 | H | medium | TODO | | | |
 | B5 | H | medium | TODO | | | |
 | B6 | H | medium | TODO | | | |
 | B7 | H | low | TODO | | | |
-| B8 | H | critical | TODO | | | after B1 |
+| B8 | H | critical | DONE | | d6a5337 | Leader. |
 | C1 | H+ | high | DONE | | 4d0ea46 | Haiku. Desktop and App.tsx edits NOT compiled (needs-macos, no node_modules). 7 new tests on Linux crates. |
-| C2 | H | high | TODO | | | |
+| C2 | H | high | DONE | | d1c1f43 | Haiku. Remote end-to-end driver untested; 10 new tests. Known: remote `a` can race to AllowOnce (re-prompt, not a bypass). |
 | C3 | H | medium | TODO | | | |
 | C4 | H | medium | TODO | | | |
 | C5 | H+ | medium | TODO | | | after B3; needs-macos |
 | C6 | H | high | TODO | | | needs-macos; cargo-deny |
 | D1 | H+ | medium | DONE | | 4e4b6cc | Haiku. 4 new tests. Follow-up added to D4 (write-through symlink outside workspace). |
-| D2 | H | medium | TODO | | | |
+| D2 | H | medium | DONE | | 1a279c2 | Haiku, PARTIAL: sandboxed path deferred to D6 (needs modron-core sandbox.rs). 4 new tests. |
 | D3 | H+ | medium | TODO | | | |
 | D4 | H | medium | TODO | | | |
 | D5 | H | low | TODO | | | |
 | D6 | L | medium | TODO | | | |
 | E1 | H | medium | DONE | | 8bb9ea5 | Haiku. Idle tests use real short timers, not paused time. 4 new tests. |
-| E2 | H | medium | TODO | | | |
+| E2 | H | medium | DONE | | 357dfab | Haiku. Streams retry 429/500/502/503/529 only; turn() retries all 5xx. 10 new tests. |
 | E3 | H | medium | TODO | | | |
 | E4 | H | medium | TODO | | | |
 | E5 | H | low | TODO | | | |
@@ -731,6 +731,8 @@ Statuses: TODO -> IN_PROGRESS -> REVIEW -> DONE | BLOCKED | ESCALATED.
 Wave 1 gate evidence (leader, 2026-11-14): fmt clean, clippy clean, 658
 tests pass on `cargo test --workspace --exclude modron-desktop` after a
 full rebuild.
+
+Wave 2 gate evidence (leader): fmt clean, clippy clean, 700 tests pass.
 
 Lesson from wave 1: workers must NOT share one CARGO_TARGET_DIR across
 worktrees - it produced a stale modron-core artifact and a false test
