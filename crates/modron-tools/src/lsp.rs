@@ -2,10 +2,10 @@
 //! client so edits surface *live* compiler insight in tool output, per file,
 //! before any project-wide checker runs.
 //!
-//! Scope, deliberately small: one client per language process, spawned
-//! lazily the first time that language's file is written; `textDocument/
-//! didOpen`/`didChange` after every successful edit/write; the server's
-//! `publishDiagnostics` notifications land in a shared table the
+//! Scope, deliberately small: one client per (language, workspace root),
+//! spawned lazily the first time that language's file is written under that
+//! root; `textDocument/didOpen`/`didChange` after every successful edit/write;
+//! the server's `publishDiagnostics` notifications land in a shared table the
 //! `diagnostics` tool merges ahead of the project checker. Only stdio,
 //! only the four methods above — no completion/hover/renames (yet).
 //!
@@ -15,11 +15,19 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use modron_core::hooks::scrub_std_command;
+
+/// How long the `initialize` response may take before the server counts as
+/// failed to start.
+const INIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a `<bin> --version` probe may run before the binary counts as
+/// broken.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One diagnostic line, LSP severity 1..=4 (error..hint).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +49,9 @@ impl Diag {
     }
 }
 
+/// Responses to requests we sent, keyed by request id; filled by the reader.
+type Pending = Arc<Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>>;
+
 /// A running language server.
 pub struct LspServer {
     lang: &'static str,
@@ -51,8 +62,12 @@ pub struct LspServer {
     next_id: AtomicU64,
     /// Diagnostics published by the server, keyed by file URI.
     diagnostics: Arc<Mutex<HashMap<String, Vec<Diag>>>>,
-    /// Files we didOpen (so didChange is used after the first write).
-    opened: Mutex<std::collections::HashSet<String>>,
+    /// Requests awaiting a response (the `initialize` handshake).
+    pending: Pending,
+    /// Last version sent per document URI. The first sighting is `didOpen`
+    /// (version 1); every later change sends the next integer. The lock is
+    /// held across the send so versions reach the server in order.
+    versions: Mutex<HashMap<String, i64>>,
 }
 
 impl Drop for LspServer {
@@ -67,10 +82,20 @@ impl Drop for LspServer {
     }
 }
 
-/// Process-wide server table (one per language), shared by every tool.
-fn servers() -> &'static Mutex<HashMap<&'static str, Arc<LspServer>>> {
-    static SERVERS: OnceLock<Mutex<HashMap<&'static str, Arc<LspServer>>>> = OnceLock::new();
+/// Registry key: one server per (language, workspace root).
+type ServerKey = (&'static str, PathBuf);
+
+/// Process-wide server table, shared by every tool. A `None` entry records a
+/// failed spawn or handshake for that key, so it is not retried on every edit.
+fn servers() -> &'static Mutex<HashMap<ServerKey, Option<Arc<LspServer>>>> {
+    static SERVERS: OnceLock<Mutex<HashMap<ServerKey, Option<Arc<LspServer>>>>> = OnceLock::new();
     SERVERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-binary probe results for the lifetime of the process.
+fn probe_results() -> &'static Mutex<HashMap<String, bool>> {
+    static PROBES: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The default server command for a language, when it is on PATH.
@@ -101,28 +126,134 @@ pub fn language_for(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn on_path(bin: &str) -> bool {
-    // A file on PATH is not enough: rustup SHIMS exist for binaries whose
-    // toolchain component is not installed and die instantly. Probe that
-    // the binary actually runs (bounded).
+/// `file://` URI for `path`. Every byte outside the unreserved set
+/// (`A-Z a-z 0-9 - . _ ~ /`) is percent-encoded as UTF-8 `%XX`, so spaces,
+/// `#`, `%`, `?` and non-ASCII characters yield a valid URI.
+pub fn file_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut s = if cfg!(windows) {
+        raw.replace('\\', "/")
+    } else {
+        raw.into_owned()
+    };
+    if !s.starts_with('/') {
+        s.insert(0, '/');
+    }
+    let mut uri = String::with_capacity("file://".len() + s.len());
+    uri.push_str("file://");
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(char::from(b));
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
+}
+
+/// Local path for a URI reported by a server: strips `file://` and decodes
+/// percent-escapes so diagnostics show real paths.
+fn path_from_uri(uri: &str) -> String {
+    percent_decode(uri.strip_prefix("file://").unwrap_or(uri))
+}
+
+fn percent_decode(s: &str) -> String {
+    fn hex_digit(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Version bookkeeping: returns the next version for `uri`. The first call
+/// yields 1 (the `didOpen` version); each later call increases by one.
+fn bump_version(versions: &mut HashMap<String, i64>, uri: &str) -> i64 {
+    let version = versions.entry(uri.to_string()).or_insert(0);
+    *version += 1;
+    *version
+}
+
+/// Runs `bin --version` and reports whether it exits 0 within `timeout`.
+/// An overrunning probe is killed, so a hung binary cannot stall the caller.
+fn probe_within(bin: &str, timeout: Duration) -> bool {
     // D9: provider secrets never reach a language server's environment.
     let mut probe = std::process::Command::new(bin);
     scrub_std_command(&mut probe);
-    let Ok(output) = probe
+    let Ok(mut child) = probe
         .arg("--version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
     else {
         return false;
     };
-    // rust-analyzer/pyright et al. exit 0; gopls prints and exits 0.
-    output.status.success()
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
-/// The server for `lang`, spawning it on first use. None when the language
-/// is unsupported or its server binary is not installed.
-pub fn server_for(lang: &str) -> Option<Arc<LspServer>> {
+/// Whether `bin` runs. Probed once per process: a missing or broken binary
+/// is remembered and never probed again. The cache lock is not held during
+/// the probe.
+fn bin_usable(bin: &str) -> bool {
+    let cached = probe_results().lock().unwrap().get(bin).copied();
+    if let Some(known) = cached {
+        return known;
+    }
+    let usable = probe_within(bin, PROBE_TIMEOUT);
+    probe_results()
+        .lock()
+        .unwrap()
+        .insert(bin.to_string(), usable);
+    usable
+}
+
+/// Returns the registry entry for `key`, building it with `make` on first
+/// use. `make` runs without the registry lock held (spawning waits for the
+/// handshake). Its failure (`None`) is cached like a success.
+fn registry_get_or_make(
+    key: ServerKey,
+    make: impl FnOnce() -> Option<LspServer>,
+) -> Option<Arc<LspServer>> {
+    let cached = servers().lock().unwrap().get(&key).cloned();
+    if let Some(entry) = cached {
+        return entry;
+    }
+    let made = make().map(Arc::new);
+    servers().lock().unwrap().entry(key).or_insert(made).clone()
+}
+
+/// The server for `lang` under workspace `root`, spawning it on first use.
+/// None when the language is unsupported or its server binary is not usable.
+pub fn server_for(lang: &str, root: &Path) -> Option<Arc<LspServer>> {
     let lang: &'static str = match lang {
         "rust" => "rust",
         "go" => "go",
@@ -130,26 +261,30 @@ pub fn server_for(lang: &str) -> Option<Arc<LspServer>> {
         "typescript" | "javascript" => "typescript",
         _ => return None,
     };
-    let mut servers = servers().lock().unwrap();
-    if let Some(server) = servers.get(lang) {
-        return Some(Arc::clone(server));
-    }
     let (bin, args) = server_command(lang)?;
-    if !on_path(bin) {
-        tracing::debug!(bin, "LSP server not on PATH");
-        return None;
-    }
-    let root = std::env::current_dir().ok()?;
-    let server = LspServer::spawn(lang, bin, &args, &root)?;
-    let server = Arc::new(server);
-    servers.insert(lang, Arc::clone(&server));
-    Some(server)
+    registry_get_or_make((lang, root.to_path_buf()), || {
+        if !bin_usable(bin) {
+            tracing::debug!(bin, "LSP server not usable (missing or broken)");
+            return None;
+        }
+        LspServer::spawn(lang, bin, &args, root)
+    })
 }
 
 impl LspServer {
     /// Spawn + initialize. Synchronous by design: called from spawn_blocking
     /// (edit tools run it inline; the write is local and fast).
     pub fn spawn(lang: &'static str, bin: &str, args: &[&str], root: &Path) -> Option<LspServer> {
+        Self::spawn_with_timeout(lang, bin, args, root, INIT_TIMEOUT)
+    }
+
+    fn spawn_with_timeout(
+        lang: &'static str,
+        bin: &str,
+        args: &[&str],
+        root: &Path,
+        init_timeout: Duration,
+    ) -> Option<LspServer> {
         // D9: provider secrets never reach the language server's environment.
         let mut command = std::process::Command::new(bin);
         scrub_std_command(&mut command);
@@ -165,29 +300,53 @@ impl LspServer {
         let stdout = child.stdout.take()?;
         let diagnostics: Arc<Mutex<HashMap<String, Vec<Diag>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let server = LspServer {
             lang,
             stdin: Mutex::new(Some(stdin)),
             child: Mutex::new(Some(child)),
             next_id: AtomicU64::new(1),
             diagnostics: Arc::clone(&diagnostics),
-            opened: Mutex::new(std::collections::HashSet::new()),
+            pending: Arc::clone(&pending),
+            versions: Mutex::new(HashMap::new()),
         };
-        // Reader task: owns stdout, fills the diagnostics table, answers
-        // nothing (server->client requests are ignored).
-        std::thread::spawn(move || reader_loop(stdout, diagnostics));
-        server.initialize(root).then_some(server)
+        // Reader task: owns stdout, fills the diagnostics table and routes
+        // responses to waiting requests. Server->client requests are ignored.
+        std::thread::spawn(move || reader_loop(stdout, diagnostics, pending));
+        server.initialize(root, init_timeout).then_some(server)
     }
 
-    fn initialize(&self, root: &Path) -> bool {
-        let root_uri = format!("file://{}", root.display());
+    /// Sends `initialize`, waits (bounded) for its response, then sends
+    /// `initialized`. A timeout, a closed pipe or an error response means
+    /// the server failed to start.
+    fn initialize(&self, root: &Path, timeout: Duration) -> bool {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let params = serde_json::json!({
             "processId": std::process::id(),
-            "rootUri": root_uri,
+            "rootUri": file_uri(root),
             "capabilities": {},
         });
-        if self.request_raw(id, "initialize", params).is_none() {
+        let (tx, rx) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": params,
+        });
+        let sent = self.write_body(&body).is_some();
+        let response = if sent {
+            rx.recv_timeout(timeout).ok()
+        } else {
+            None
+        };
+        self.pending.lock().unwrap().remove(&id);
+        let Some(response) = response else {
+            tracing::warn!(lang = self.lang, "LSP server did not answer initialize");
+            return false;
+        };
+        if response.get("error").is_some() {
+            tracing::warn!(lang = self.lang, "LSP server rejected initialize");
             return false;
         }
         self.notify("initialized", serde_json::json!({}));
@@ -199,18 +358,6 @@ impl LspServer {
         );
         tracing::info!(lang = self.lang, "LSP server initialized");
         true
-    }
-
-    /// Send a request and wait (bounded) for its response. Only
-    /// `initialize` uses this; other calls are notifications.
-    fn request_raw(&self, id: u64, method: &str, params: serde_json::Value) -> Option<()> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        self.write_body(&body)
     }
 
     fn notify(&self, method: &str, params: serde_json::Value) -> Option<()> {
@@ -232,25 +379,25 @@ impl LspServer {
         stdin.flush().ok()
     }
 
-    /// didOpen on first sight of a file, didChange after.
+    /// didOpen on first sight of a file, didChange with the next version after.
     pub fn did_write(&self, path: &Path, text: &str) {
-        let uri = format!("file://{}", path.display());
+        let uri = file_uri(path);
         let language_id = self.lang;
-        let first = self.opened.lock().unwrap().insert(uri.clone());
-        if first {
+        let mut versions = self.versions.lock().unwrap();
+        let version = bump_version(&mut versions, &uri);
+        if version == 1 {
             let _ = self.notify(
                 "textDocument/didOpen",
                 serde_json::json!({
                     "textDocument": {
                         "uri": uri,
                         "languageId": language_id,
-                        "version": 1,
+                        "version": version,
                         "text": text,
                     }
                 }),
             );
         } else {
-            let version = 2; // good enough: servers re-lint on any change
             let _ = self.notify(
                 "textDocument/didChange",
                 serde_json::json!({
@@ -273,11 +420,12 @@ impl LspServer {
     }
 }
 
-/// Notify the right server (if any) that `path` now contains `text`.
-/// Called by edit/write after a successful write. Cheap: local pipe write.
-pub fn did_write(path: &Path, text: &str) {
+/// Notify the right server (if any) for workspace `root` that `path` now
+/// contains `text`. Called by edit/write after a successful write. Cheap:
+/// local pipe write.
+pub fn did_write(path: &Path, text: &str, root: &Path) {
     if let Some(lang) = language_for(path) {
-        if let Some(server) = server_for(lang) {
+        if let Some(server) = server_for(lang, root) {
             server.did_write(path, text);
         }
     }
@@ -289,6 +437,7 @@ pub fn collect() -> Vec<Diag> {
         .lock()
         .unwrap()
         .values()
+        .flatten()
         .flat_map(|s| s.all_diagnostics())
         .collect()
 }
@@ -309,8 +458,13 @@ pub fn wait_diagnostics(ms: u64, uri_contains: &str) -> Vec<Diag> {
     }
 }
 
-/// Reader: parse framed messages; store publishDiagnostics payloads.
-fn reader_loop(stdout: std::process::ChildStdout, table: Arc<Mutex<HashMap<String, Vec<Diag>>>>) {
+/// Reader: parse framed messages; hand responses to waiting requests; store
+/// publishDiagnostics payloads.
+fn reader_loop(
+    stdout: std::process::ChildStdout,
+    table: Arc<Mutex<HashMap<String, Vec<Diag>>>>,
+    pending: Pending,
+) {
     let mut reader = std::io::BufReader::new(stdout);
     loop {
         // Header lines until an empty line.
@@ -355,6 +509,16 @@ fn reader_loop(stdout: std::process::ChildStdout, table: Arc<Mutex<HashMap<Strin
         let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&body) else {
             continue;
         };
+        // A response (id, no method) goes to whichever request awaits it.
+        if msg.get("method").is_none() {
+            if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
+                let waiter = pending.lock().unwrap().remove(&id);
+                if let Some(tx) = waiter {
+                    let _ = tx.send(msg);
+                }
+            }
+            continue;
+        }
         if msg.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
             let params = msg
                 .get("params")
@@ -365,7 +529,7 @@ fn reader_loop(stdout: std::process::ChildStdout, table: Arc<Mutex<HashMap<Strin
                 .and_then(|u| u.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let file = uri.strip_prefix("file://").unwrap_or(&uri).to_string();
+            let file = path_from_uri(&uri);
             let diags: Vec<Diag> = params
                 .get("diagnostics")
                 .and_then(|d| d.as_array())
@@ -400,6 +564,7 @@ fn reader_loop(stdout: std::process::ChildStdout, table: Arc<Mutex<HashMap<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn language_detection_covers_the_supported_set() {
@@ -410,11 +575,100 @@ mod tests {
         assert_eq!(language_for(Path::new("t.txt")), None);
     }
 
-    /// A fake LSP server in python: answers initialize, publishes one
-    /// diagnostic per didOpen. Proves framing + handshake + collection.
     #[test]
-    fn fake_server_roundtrip() {
+    fn file_uri_percent_encodes_unsafe_bytes() {
+        assert_eq!(
+            file_uri(Path::new("/a b/c#d%e?f/x.rs")),
+            "file:///a%20b/c%23d%25e%3Ff/x.rs"
+        );
+        assert_eq!(
+            file_uri(Path::new("/proj/caf\u{e9}/\u{65e5}.rs")),
+            "file:///proj/caf%C3%A9/%E6%97%A5.rs"
+        );
+        // The unreserved set passes through untouched.
+        assert_eq!(
+            file_uri(Path::new("/tmp/x-y_z.~a/b.rs")),
+            "file:///tmp/x-y_z.~a/b.rs"
+        );
+    }
+
+    #[test]
+    fn file_uri_decodes_back_to_the_same_path() {
+        let p = "/a b/c#d%e?f/caf\u{e9}.rs";
+        assert_eq!(path_from_uri(&file_uri(Path::new(p))), p);
+    }
+
+    #[test]
+    fn document_versions_increase_per_uri() {
+        let mut versions = HashMap::new();
+        assert_eq!(bump_version(&mut versions, "file:///a.rs"), 1, "didOpen");
+        assert_eq!(bump_version(&mut versions, "file:///a.rs"), 2);
+        assert_eq!(bump_version(&mut versions, "file:///a.rs"), 3);
+        assert_eq!(
+            bump_version(&mut versions, "file:///b.rs"),
+            1,
+            "per document"
+        );
+        assert_eq!(bump_version(&mut versions, "file:///a.rs"), 4);
+    }
+
+    /// A shell script that is a fake binary: `body` runs as `sh`.
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_accepts_a_binary_that_runs() {
         let dir = tempfile::tempdir().unwrap();
+        let bin = write_script(dir.path(), "ok-lsp", "exit 0");
+        assert!(probe_within(bin.to_str().unwrap(), Duration::from_secs(3)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_is_bounded_and_kills_a_hung_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        // `exec` so the kill lands on the sleeping process itself.
+        let bin = write_script(dir.path(), "hung-lsp", "exec /bin/sleep 30");
+        let started = Instant::now();
+        assert!(!probe_within(
+            bin.to_str().unwrap(),
+            Duration::from_millis(400)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "probe overran its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_binary_is_probed_once_then_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("probes.txt");
+        let bin = write_script(
+            dir.path(),
+            "broken-lsp",
+            &format!("echo probe >> '{}'\nexit 1", counter.display()),
+        );
+        let bin = bin.to_str().unwrap();
+        assert!(!bin_usable(bin));
+        assert!(!bin_usable(bin));
+        assert!(!bin_usable(bin));
+        let runs = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(runs.lines().count(), 1, "probed exactly once: {runs:?}");
+    }
+
+    /// Python fake server: answers initialize, publishes one diagnostic per
+    /// didOpen. Proves framing + handshake + collection.
+    fn write_fake_server(dir: &Path) -> PathBuf {
         let script = r#"
 import json, sys
 def read_msg():
@@ -450,8 +704,15 @@ while True:
     elif method == "exit":
         break
 "#;
-        let script_path = dir.path().join("fake_lsp.py");
+        let script_path = dir.join("fake_lsp.py");
         std::fs::write(&script_path, script).unwrap();
+        script_path
+    }
+
+    #[test]
+    fn fake_server_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = write_fake_server(dir.path());
 
         let server = LspServer::spawn(
             "rust",
@@ -481,6 +742,56 @@ while True:
         assert_eq!(d.severity, 1);
         assert_eq!(d.message, "fake error", "first line only: {d:?}");
         assert!(d.file.ends_with("lib.rs"), "{d:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_that_never_answers_initialize_fails_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        // Runs forever, never reads stdin, never answers.
+        let started = Instant::now();
+        let server = LspServer::spawn_with_timeout(
+            "rust",
+            "/bin/sleep",
+            &["30"],
+            dir.path(),
+            Duration::from_millis(300),
+        );
+        assert!(server.is_none(), "no initialize response means no server");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn registry_keys_servers_by_root_and_caches_failures() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let script = write_fake_server(a.path());
+        let script = script.to_str().unwrap();
+        let spawns = AtomicUsize::new(0);
+        let spawn_fake = |root: &Path| {
+            spawns.fetch_add(1, Ordering::SeqCst);
+            LspServer::spawn("rust", "python3", &[script], root)
+        };
+
+        let first = registry_get_or_make(("rust", a.path().to_path_buf()), || spawn_fake(a.path()))
+            .expect("spawns for root a");
+        let again = registry_get_or_make(("rust", a.path().to_path_buf()), || spawn_fake(a.path()))
+            .expect("cached for root a");
+        assert!(Arc::ptr_eq(&first, &again), "same root shares one server");
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+
+        let other = registry_get_or_make(("rust", b.path().to_path_buf()), || spawn_fake(b.path()))
+            .expect("spawns for root b");
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "distinct roots get distinct servers"
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
+
+        // A failed spawn is cached too: the builder is not run again.
+        let missing = ("rust", PathBuf::from("/no/such/workspace/for/lsp-test"));
+        assert!(registry_get_or_make(missing.clone(), || None).is_none());
+        assert!(registry_get_or_make(missing, || panic!("failure must be cached")).is_none());
     }
 }
 
