@@ -4,6 +4,8 @@
   // /s/<key> to watch and drive it. One command deploys it:
   //   npx wrangler deploy
   // (from this directory, after `npx wrangler login`).
+  // Secret, not in this file: PUBLISH_TOKEN (required for /pages publish).
+  //   npx wrangler secret put PUBLISH_TOKEN
   "name": "modron-bridge",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",

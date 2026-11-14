@@ -1,14 +1,18 @@
 // modron remote-control bridge - a transport-only relay.
 // One Durable Object instance per share key. Agent connects to
 // /agent/<key>; viewers open /s/<key> then /ws/<key>.
-// Pages: POST /pages/<key> with `Authorization: Bearer <key>` stores,
-// GET /p/<id> renders. The POST is dispatched to the DO named by <key>
-// and authenticated INSIDE that DO (Bearer token must equal the key that
-// names the DO), so an unauthenticated request never reaches storage.
-// Page bodies live in the session DO's own storage; only the validated
-// publish path writes id->key entries into the dedicated __pages__
-// registry DO (via RPC, which has no externally routable surface).
-// Trust model: possession of the share key is the credential.
+// Pages: POST /pages/<key> with `Authorization: Bearer <PUBLISH_TOKEN>`
+// stores, GET /p/<id> renders. PUBLISH_TOKEN is a deploy-time Wrangler
+// secret; the router checks it BEFORE any Durable Object is created, so
+// an unauthenticated request never reaches storage. The POST is then
+// dispatched to the DO named by <key> (the key only selects storage; it
+// is not a credential). Page bodies live in the session DO's own
+// storage; only the validated publish path writes id->key entries into
+// the dedicated __pages__ registry DO (via RPC, which has no externally
+// routable surface).
+// Trust model: the share key is the credential for watching a session
+// (treat the URL as the secret). Publishing pages additionally requires
+// the PUBLISH_TOKEN secret; the share key alone cannot publish.
 
 const MAX_BUFFER = 200;
 const MAX_FRAME = 96 * 1024; // per-frame cap (DO storage values cap at 128 KiB)
@@ -28,6 +32,42 @@ const frameKey = (seq: number) => "frame:" + String(seq).padStart(12, "0");
 
 interface Env {
   BRIDGE: DurableObjectNamespace<SessionBridge>;
+  // Wrangler secret (`npx wrangler secret put PUBLISH_TOKEN`). Unset means
+  // publishing is disabled (503). Never put its value in wrangler.jsonc.
+  PUBLISH_TOKEN?: string;
+}
+
+// Constant-time string equality for the publish token. Compares UTF-8
+// bytes and always walks the longer input, so the timing does not reveal
+// the position of the first mismatch.
+function constantTimeEquals(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const x = enc.encode(a);
+  const y = enc.encode(b);
+  let diff = x.length ^ y.length;
+  const n = Math.max(x.length, y.length);
+  for (let i = 0; i < n; i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
+  return diff === 0;
+}
+
+// Top-level publish gate, run by the router before any DO is touched.
+// Returns a Response to send back, or null when the request may proceed.
+function publishGate(request: Request, env: Env): Response | null {
+  if (!env.PUBLISH_TOKEN) {
+    return new Response("publishing is disabled: this bridge has no PUBLISH_TOKEN secret", { status: 503 });
+  }
+  const auth = request.headers.get("authorization") ?? "";
+  const presented = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+  if (!constantTimeEquals(presented, env.PUBLISH_TOKEN)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const len = Number(declared);
+    if (!Number.isInteger(len) || len < 0) return new Response("bad content-length", { status: 400 });
+    if (len > PAGE_MAX_BYTES) return new Response("page too large (max 96KB)", { status: 413 });
+  }
+  return null;
 }
 
 interface StoredFrame {
@@ -133,18 +173,17 @@ export class SessionBridge extends DurableObject {
 
   // --- pages ---
 
-  // POST /pages/<key>. Runs inside the DO named <key> (the router
-  // dispatches by idFromName(key)), so matching the Bearer token against
-  // the path key IS the whole auth boundary: a forged token lands in the
-  // same DO but fails this check before any storage call.
+  // POST /pages/<key>. Reached only through the router, which has already
+  // checked PUBLISH_TOKEN (publishGate) before dispatching to this DO.
+  // The DO itself only validates the path key and the body size.
   async handlePagePublish(request: Request, key: string): Promise<Response> {
     if (!KEY_RE.test(key)) return new Response("invalid key", { status: 400 });
-    const auth = request.headers.get("authorization") ?? "";
-    // Plain equality is fine here: the token travels over TLS and is
-    // 128-bit random, so a timing side channel is not exploitable.
-    if (auth !== "Bearer " + key) return new Response("unauthorized", { status: 401 });
     const raw = await request.text();
-    if (raw.length > PAGE_MAX_BYTES) return new Response("page too large (max 96KB)", { status: 413 });
+    // Measure bytes, not UTF-16 code units: a multi-byte page can be
+    // under the limit by length and over it on the wire.
+    if (new TextEncoder().encode(raw).length > PAGE_MAX_BYTES) {
+      return new Response("page too large (max 96KB)", { status: 413 });
+    }
     let body: { title?: string; content_md?: string };
     try { body = JSON.parse(raw) as { title?: string; content_md?: string }; }
     catch { return new Response("bad json", { status: 400 }); }
@@ -307,7 +346,7 @@ export class SessionBridge extends DurableObject {
       return;
     }
     if (message.length > MAX_FRAME) {
-      try { ws.send(JSON.stringify({ type: "note", text: "frame too large (1MB limit) - dropped" })); } catch { /* gone */ }
+      try { ws.send(JSON.stringify({ type: "note", text: "frame too large (96KB limit) - dropped" })); } catch { /* gone */ }
       return;
     }
     if (role !== "agent") {
@@ -384,9 +423,12 @@ const router: ExportedHandler<Env> = {
     const path = new URL(request.url).pathname;
     const validKey = (k: string) => KEY_RE.test(k);
     let m: RegExpMatchArray | null;
-    // Page publish goes to the DO named by the key; the DO itself checks
-    // the Bearer token against that key before touching storage.
+    // Page publish: the PUBLISH_TOKEN gate runs here, before any DO is
+    // created or any storage is touched. Only then is the request sent
+    // to the DO named by the path key (which selects storage, not auth).
     if ((m = path.match(/^\/pages\/([^/]+)$/)) && request.method === "POST") {
+      const denied = publishGate(request, env);
+      if (denied) return denied;
       if (!validKey(m[1])) return new Response("invalid key", { status: 400 });
       return env.BRIDGE.get(env.BRIDGE.idFromName(m[1])).fetch(request);
     }

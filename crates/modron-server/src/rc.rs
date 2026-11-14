@@ -1,7 +1,9 @@
 //! rc.rs — remote-control tunnels (the `/remote-control` flow): one
 //! outbound WebSocket from this server to a relay bridge (a deployed
 //! cloud/bridge worker), keyed by a share code. The relay is
-//! transport-only: it stores nothing, it relays Frames.
+//! transport-only for live traffic: it relays Frames and keeps only a
+//! bounded replay buffer per session. Published pages are kept by the
+//! relay for a limited time (see cloud/bridge/README.md).
 //!
 //! Over the tunnel this server acts as a normal protocol connection: the
 //! web/phone page on the other side of the relay sends ClientMsg frames
@@ -152,9 +154,29 @@ pub fn share_key_for(state: &ServerState, session: &SessionId) -> Option<String>
     state.rc_keys.lock().unwrap().get(session).cloned()
 }
 
+/// Environment variable holding the bridge's `PUBLISH_TOKEN` secret.
+pub const PUBLISH_TOKEN_ENV: &str = "MODRON_PUBLISH_TOKEN";
+
+/// Read the publish token through `lookup` (the process environment in
+/// production, a closure in tests). Empty counts as unset.
+fn publish_token_from(lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
+    lookup(PUBLISH_TOKEN_ENV)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow!("publishing needs MODRON_PUBLISH_TOKEN (the bridge's PUBLISH_TOKEN secret)")
+        })
+}
+
+/// The `Authorization` header value the bridge expects for publishing.
+pub fn publish_auth_header(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
 /// Publish an assistant answer as a shareable web page on the bridge.
-/// `key` authenticates the agent; the bridge stores the page and serves
-/// it at /p/<id> with no auth (public share, paradev "pages" grammar).
+/// The request is authorized by the deploy-time `PUBLISH_TOKEN` (read from
+/// `MODRON_PUBLISH_TOKEN`), never by the share key. `key` only selects the
+/// bridge's storage object. Pages are served at /p/<id> with no auth.
+/// Fails before sending anything if the token is unset or empty.
 pub async fn publish_page(
     bridge_base: &str,
     key: &str,
@@ -162,6 +184,28 @@ pub async fn publish_page(
     title: &str,
     content_md: &str,
 ) -> Result<String> {
+    publish_page_with_lookup(
+        |name| std::env::var(name).ok(),
+        bridge_base,
+        key,
+        session,
+        title,
+        content_md,
+    )
+    .await
+}
+
+/// `publish_page` with the environment lookup injected (tests use this so
+/// they never mutate process env).
+async fn publish_page_with_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+    bridge_base: &str,
+    key: &str,
+    session: SessionId,
+    title: &str,
+    content_md: &str,
+) -> Result<String> {
+    let token = publish_token_from(lookup)?;
     let base = bridge_base.trim_end_matches('/');
     let host = base
         .strip_prefix("wss://")
@@ -183,7 +227,7 @@ pub async fn publish_page(
     let response = client
         .post(format!("{http}://{host}/pages/{key}"))
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {key}"))
+        .header("authorization", publish_auth_header(&token))
         .body(body.to_string())
         .send()
         .await
@@ -203,7 +247,7 @@ pub async fn publish_page(
     Ok(format!("{http}://{host}/p/{id}"))
 }
 
-/// Register a remote-control tunnel for `session`:/// Register a remote-control tunnel for `session`: validates the session,
+/// Register a remote-control tunnel for `session`: validates the session,
 /// mints the share key, spawns the tunnel task. Returns the open URL.
 pub fn start_remote_control(
     state: &Arc<ServerState>,
@@ -249,4 +293,129 @@ pub fn start_remote_control(
     }
     let _ = tunnel_url;
     Ok(open_url)
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve one HTTP request on a local port. Returns the base URL and a
+    /// receiver that yields the request head (lowercased) once it arrives.
+    fn one_shot_bridge() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let head_end = loop {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while buf.len() < head_end + length {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body = r#"{"id":"page-1"}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(reply.as_bytes()).unwrap();
+            let _ = tx.send(head.to_lowercase());
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[test]
+    fn auth_header_is_bearer_token() {
+        assert_eq!(publish_auth_header("s3cret"), "Bearer s3cret");
+    }
+
+    #[test]
+    fn unset_or_empty_token_is_an_error() {
+        assert_eq!(
+            publish_token_from(|_| Some("t".into())).unwrap(),
+            "t".to_string()
+        );
+        assert!(publish_token_from(|_| Some(String::new())).is_err());
+        let message = publish_token_from(|_| None).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            "publishing needs MODRON_PUBLISH_TOKEN (the bridge's PUBLISH_TOKEN secret)"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_without_token_makes_no_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let err = publish_page_with_lookup(
+            |_| None,
+            &base,
+            "0123456789abcdef0123456789abcdef",
+            uuid::Uuid::new_v4(),
+            "title",
+            "body",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("MODRON_PUBLISH_TOKEN"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no connection may reach the bridge without a token"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_header_carries_publish_token_not_share_key() {
+        let (base, head_rx) = one_shot_bridge();
+        let key = "0123456789abcdef0123456789abcdef";
+        let url = publish_page_with_lookup(
+            |name| (name == PUBLISH_TOKEN_ENV).then(|| "pub-token-xyz".to_string()),
+            &base,
+            key,
+            uuid::Uuid::new_v4(),
+            "title",
+            "# body",
+        )
+        .await
+        .unwrap();
+        assert!(url.ends_with("/p/page-1"), "unexpected url {url}");
+        let head = head_rx.recv().unwrap();
+        assert!(head.starts_with(&format!("post /pages/{key} ")), "{head}");
+        assert!(
+            head.contains("authorization: bearer pub-token-xyz"),
+            "{head}"
+        );
+        assert!(
+            !head.contains(&format!("bearer {key}")),
+            "share key used as bearer: {head}"
+        );
+    }
 }
