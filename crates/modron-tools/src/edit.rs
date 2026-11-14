@@ -136,11 +136,16 @@ impl Tool for EditTool {
         }
         // Live LSP (Phase 14): push the new content so language servers
         // re-lint; the `diagnostics` tool collects the result.
-        let updated_owned = updated.clone();
-        let lsp_path = path.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || crate::lsp::did_write(&lsp_path, &updated_owned))
-                .await;
+        // D6: language servers run repo code (build scripts, proc macros)
+        // outside the sandbox, so they are not started while one is active.
+        if matches!(ctx.sandbox, modron_core::SandboxPolicy::Off) {
+            let updated_owned = updated.clone();
+            let lsp_path = path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::lsp::did_write(&lsp_path, &updated_owned)
+            })
+            .await;
+        }
         // Diff rail (Phase 14, jcode pattern): the change surfaced in the
         // tool result itself, so the next turn (and the human) sees what
         // moved where without a re-read.

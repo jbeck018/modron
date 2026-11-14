@@ -80,6 +80,16 @@ impl Tool for InteractTool {
             .and_then(|v| v.as_str())
             .unwrap_or(DEFAULT_SESSION);
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        // D6: a tmux session runs under the tmux server, outside any OS
+        // sandbox, so it is not offered while a sandbox policy is active.
+        if !matches!(ctx.sandbox, modron_core::SandboxPolicy::Off) {
+            return Ok(tool_err(
+                NAME,
+                "interact is unavailable while the sandbox is on (tmux sessions cannot be \
+                 sandboxed); use bash, or run with --sandbox off",
+                MAX_BYTES,
+            ));
+        }
         let run = |cmd: Vec<&str>| {
             // D9: scrub the tmux client too. The user command runs under the
             // tmux server, which takes its environment from the client that

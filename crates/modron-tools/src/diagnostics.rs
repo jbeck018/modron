@@ -17,7 +17,6 @@ use crate::common::{arg_str, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
-use modron_core::hooks::scrub_tokio_command;
 use modron_core::{Result, Tool, ToolCtx, ToolOutcome, ToolSpec};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -109,20 +108,20 @@ impl Tool for DiagnosticsTool {
             )
         };
 
-        // D9: provider secrets never reach the checker's environment.
-        let mut shell = tokio::process::Command::new("sh");
-        scrub_tokio_command(&mut shell);
+        // D6/D9: the checker runs under the session's sandbox policy (it
+        // executes repo code: build scripts, test harnesses), with provider
+        // secrets scrubbed.
+        let mut prepared =
+            match modron_core::sandbox::shell_command(ctx.sandbox, &command, &ctx.working_dir) {
+                Ok(prepared) => prepared,
+                Err(err) => return Ok(tool_err(NAME, err.to_string(), REDUCE_CAP)),
+            };
         let output = match tokio::time::timeout(
             // A hanging checker (file-lock waits, interactive prompts) must
             // not hang the agent; kill_on_drop makes the elapsed-timeout
             // drop actually kill the child.
             Duration::from_millis(TIMEOUT_MS),
-            shell
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&ctx.working_dir)
-                .kill_on_drop(true)
-                .output(),
+            prepared.command.stdin(std::process::Stdio::null()).output(),
         )
         .await
         {

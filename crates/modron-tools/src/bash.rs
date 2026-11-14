@@ -70,64 +70,34 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(1, MAX_TIMEOUT_MS);
 
-        // Sandbox routing (A2): under Seatbelt (macOS) or Bubblewrap (Linux)
-        // the whole shell runs inside the OS sandbox (network denied, writes
-        // fenced to the workspace + temp dirs). The sandboxed path cannot
-        // stream-pipe the same way, so it uses one buffered capture; caps and
-        // exit-code reporting are identical. Timeout handling is shared below.
-        if matches!(
-            ctx.sandbox,
-            modron_core::SandboxPolicy::Seatbelt | modron_core::SandboxPolicy::Bubblewrap
-        ) {
-            let started = std::time::Instant::now();
-            return match tokio::time::timeout(
-                Duration::from_millis(timeout_ms),
-                modron_core::sandbox::run_sandboxed(ctx.sandbox, command, &ctx.working_dir),
+        // Sandbox routing (A2, D6): under Seatbelt (macOS) or Bubblewrap
+        // (Linux) the whole shell runs inside the OS sandbox (network denied,
+        // writes fenced to the workspace + temp dirs). Both paths share the
+        // spawn, capped capture, timeout and interrupt handling below.
+        let sandboxed = !matches!(ctx.sandbox, modron_core::SandboxPolicy::Off);
+        // Holds the Seatbelt profile file until the child has exited.
+        let mut prepared = if sandboxed {
+            Some(
+                modron_core::sandbox::shell_command(ctx.sandbox, command, &ctx.working_dir)
+                    .map_err(|err| internal_tool_error(NAME, err.to_string()))?,
             )
-            .await
-            {
-                Ok(Ok(output)) => {
-                    // stdout then stderr — same merge order as the piped path.
-                    let so = String::from_utf8_lossy(&output.stdout).into_owned();
-                    let se = String::from_utf8_lossy(&output.stderr).into_owned();
-                    let text = match (so.is_empty(), se.is_empty()) {
-                        (false, false) => format!("{so}\n{se}"),
-                        (true, false) => se,
-                        _ => so,
-                    };
-                    let code_line = match output.status.code() {
-                        Some(code) => format!("exit code: {code}"),
-                        None => "exit code: terminated by signal".to_string(),
-                    };
-                    let body = reduce_output(relay_oversized(&text), MAX_BYTES);
-                    let content = if body.is_empty() {
-                        code_line
-                    } else {
-                        format!("{body}\n{code_line}")
-                    };
-                    Ok(ToolOutcome {
-                        content,
-                        is_error: output.status.code().is_none_or(|c| c != 0),
-                        usage: None,
-                        meta: None,
-                    })
-                }
-                Ok(Err(err)) => Err(internal_tool_error(NAME, err.to_string())),
-                Err(_) => Ok(ToolOutcome::err(format!(
-                    "command timed out after {} ms under the sandbox (ran {} ms); killed",
-                    timeout_ms,
-                    started.elapsed().as_millis()
-                ))),
-            };
-        }
-
-        let mut cmd = Command::new(shell());
-        // D9: provider secrets never reach the child environment. The
-        // sandboxed path above is not scrubbed yet (sandbox.rs is outside D3).
-        scrub_tokio_command(&mut cmd);
-        cmd.args(shell_args(command))
-            .current_dir(&ctx.working_dir)
-            .stdin(Stdio::null())
+        } else {
+            None
+        };
+        let mut plain;
+        let cmd: &mut Command = match prepared.as_mut() {
+            Some(prepared) => &mut prepared.command,
+            None => {
+                plain = Command::new(shell());
+                // D9: provider secrets never reach the child environment.
+                scrub_tokio_command(&mut plain);
+                plain
+                    .args(shell_args(command))
+                    .current_dir(&ctx.working_dir);
+                &mut plain
+            }
+        };
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -137,9 +107,16 @@ impl Tool for BashTool {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| internal_tool_error(NAME, format!("failed to spawn `{command}`: {e}")))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            if sandboxed {
+                internal_tool_error(
+                    NAME,
+                    modron_core::sandbox::spawn_error(ctx.sandbox, &e).to_string(),
+                )
+            } else {
+                internal_tool_error(NAME, format!("failed to spawn `{command}`: {e}"))
+            }
+        })?;
         // Armed until the child is reaped normally. If this future is dropped
         // mid-command (user interrupt), the guard kills the group on the way out.
         let mut group = GroupGuard::armed(&child);
@@ -637,6 +614,69 @@ mod tests {
         assert!(
             alive.is_empty(),
             "processes survived the interrupt: {alive:?}"
+        );
+    }
+
+    /// D6: the sandboxed path shares the capped capture, the exit-code
+    /// reporting and the write fence. Skipped where bwrap cannot run.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandboxed_bash_is_fenced_capped_and_reports_exit_codes() {
+        // Not under /tmp: the sandbox mounts a private tmpfs there.
+        let Ok(dir) = tempfile::tempdir_in(std::env::var("HOME").unwrap_or("/var/tmp".into()))
+        else {
+            return;
+        };
+        let ctx = ToolCtx {
+            engine: None,
+            sandbox: modron_core::SandboxPolicy::Bubblewrap,
+            working_dir: dir.path().to_path_buf(),
+            session_id: None,
+        };
+        let run = |command: &'static str| {
+            let ctx = &ctx;
+            async move { BashTool.execute(json!({ "command": command }), ctx).await }
+        };
+        match run("true").await {
+            Ok(out) if !out.is_error => {}
+            other => {
+                eprintln!("skipping: bwrap not usable here ({other:?})");
+                return;
+            }
+        }
+        let out = run("echo hi > ok.txt && cat ok.txt").await.unwrap();
+        assert!(out.content.starts_with("hi"), "{out:?}");
+        assert!(dir.path().join("ok.txt").exists());
+
+        let out = run("echo x > /usr/modron-sbx-bash-test").await.unwrap();
+        assert!(
+            out.is_error,
+            "write outside the workspace must fail: {out:?}"
+        );
+
+        let out = run("yes | head -c 5000000; exit 3").await.unwrap();
+        assert!(
+            out.content.contains("[output truncated at 1 MB]"),
+            "{out:?}"
+        );
+        assert!(out.content.ends_with("exit code: 3"), "{out:?}");
+
+        // Provider secrets are scrubbed inside the sandbox too (D9).
+        std::env::set_var("MODRON_TEST_SBX_API_KEY", "sekrit-sbx");
+        let out = run("echo \"[${MODRON_TEST_SBX_API_KEY-unset}]\"")
+            .await
+            .unwrap();
+        std::env::remove_var("MODRON_TEST_SBX_API_KEY");
+        assert!(out.content.contains("[unset]"), "{out:?}");
+
+        // A backgrounded child cannot hold the tool open or outlive it.
+        let started = std::time::Instant::now();
+        let out = run("sleep 300 & echo started").await.unwrap();
+        assert!(out.content.contains("started"), "{out:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
         );
     }
 

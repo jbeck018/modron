@@ -145,10 +145,15 @@ impl Tool for WriteTool {
         }
         // Live LSP (Phase 14): full overwrites re-lint like edits — without
         // this push, diagnostics go stale after a `write`.
-        let lsp_path = path.clone();
-        let lsp_content = content.to_string();
-        let _ = tokio::task::spawn_blocking(move || crate::lsp::did_write(&lsp_path, &lsp_content))
-            .await;
+        // D6: language servers run repo code outside the sandbox, so they
+        // are not started while one is active.
+        if matches!(ctx.sandbox, modron_core::SandboxPolicy::Off) {
+            let lsp_path = path.clone();
+            let lsp_content = content.to_string();
+            let _ =
+                tokio::task::spawn_blocking(move || crate::lsp::did_write(&lsp_path, &lsp_content))
+                    .await;
+        }
         Ok(ToolOutcome::ok(reduce_output(
             format!("wrote {} bytes to {}", content.len(), path.display()),
             MAX_BYTES,
