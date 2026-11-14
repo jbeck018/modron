@@ -10,9 +10,8 @@
 //! are pure functions; tests assert wire shape and parse recorded-JSON
 //! fixtures — no network.
 
-use crate::stream::{parse_sse_stream, StreamDelta};
+use crate::stream::StreamDelta;
 use async_trait::async_trait;
-use futures::StreamExt;
 use modron_core::{
     Error, ModelProvider, Result, Role, StopReason, ToolCall, TurnRequest, TurnResponse, Usage,
 };
@@ -25,7 +24,9 @@ use tokio::sync::mpsc::UnboundedSender;
 pub const PROVIDER_ID: &str = "openai-compat";
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-use crate::http::{build_client, check_status, post_json};
+use crate::http::{
+    build_client, check_status, drain_sse, post_json, within_idle, STREAM_IDLE_TIMEOUT,
+};
 
 /// Any OpenAI-compatible chat-completions endpoint.
 pub struct OpenAiCompatProvider {
@@ -117,30 +118,31 @@ impl OpenAiCompatProvider {
         if !self.api_key.is_empty() {
             request = request.header("Authorization", format!("Bearer {}", self.api_key));
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
+        let response = within_idle(PROVIDER_ID, STREAM_IDLE_TIMEOUT, async {
+            request
+                .send()
+                .await
+                .map_err(|err| crate::transport_error(PROVIDER_ID, err))
+        })
+        .await?;
         // Streaming failures arrive as a plain (non-SSE) error body; the
         // shared status check maps them to the canonical error text.
         let response = check_status(PROVIDER_ID, response).await?;
 
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut byte_stream = response.bytes_stream();
         let mut acc = OaiStreamAccumulator::default();
-        'read: while let Some(item) = byte_stream.next().await {
-            let chunk = item.map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-            buffer.extend_from_slice(&chunk);
-            let (payloads, consumed) = parse_sse_stream(&buffer);
-            buffer.drain(..consumed);
-            for payload in payloads {
+        drain_sse(
+            PROVIDER_ID,
+            response.bytes_stream(),
+            STREAM_IDLE_TIMEOUT,
+            |payload| {
                 if payload == DONE_SENTINEL {
                     acc.done = true;
-                    break 'read;
+                    return Ok(true);
                 }
-                acc.ingest(&payload, &tx)?;
-            }
-        }
+                acc.ingest(payload, &tx).map(|()| false)
+            },
+        )
+        .await?;
         let parsed = acc.finish()?;
         tracing::debug!(
             provider = PROVIDER_ID,
@@ -156,7 +158,7 @@ impl OpenAiCompatProvider {
     }
 }
 
-/// OpenAI's stream terminator, passed through [`parse_sse_stream`] verbatim.
+/// OpenAI's stream terminator, passed through [`crate::stream::parse_sse_stream`] verbatim.
 const DONE_SENTINEL: &str = "[DONE]";
 
 /// Incremental state for one streaming turn. Reconstructs exactly what

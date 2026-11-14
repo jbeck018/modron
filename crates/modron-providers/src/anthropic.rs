@@ -9,9 +9,8 @@
 //! are pure functions so tests assert the exact wire shape from recorded-JSON
 //! fixtures — no network.
 
-use crate::stream::{parse_sse_stream, StreamDelta};
+use crate::stream::StreamDelta;
 use async_trait::async_trait;
-use futures::StreamExt;
 use modron_core::{
     Error, ModelProvider, Result, Role, StopReason, ToolCall, TurnRequest, TurnResponse, Usage,
 };
@@ -25,7 +24,10 @@ pub const PROVIDER_ID: &str = "anthropic";
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-use crate::http::{build_client, check_status, finish_json, with_401_retry};
+use crate::http::{
+    build_client, check_status, drain_sse, finish_json, with_401_retry, within_idle,
+    REQUEST_TIMEOUT, STREAM_IDLE_TIMEOUT,
+};
 
 /// Anthropic Messages API client.
 pub struct AnthropicProvider {
@@ -112,15 +114,25 @@ impl AnthropicProvider {
     /// rotate — the new pair is persisted before the retry). The cycle is
     /// the shared [`with_401_retry`] helper (the openai-responses provider
     /// shipped the same twin; 2026-11-12 audit DRY fix).
-    async fn post_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+    async fn post_messages(
+        &self,
+        url: &str,
+        body: &Value,
+        streaming: bool,
+    ) -> Result<reqwest::Response> {
         with_401_retry(
-            || self.send_messages(url, body),
+            || self.send_messages(url, body, streaming),
             || self.refresh_if_possible(),
         )
         .await
     }
 
-    async fn send_messages(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+    async fn send_messages(
+        &self,
+        url: &str,
+        body: &Value,
+        streaming: bool,
+    ) -> Result<reqwest::Response> {
         // Header values are extracted under a scoped guard: the future
         // must be Send, so no guard may live across the await.
         let (bearer, api_key) = {
@@ -130,11 +142,14 @@ impl AnthropicProvider {
                 Auth::Subscription { access_token, .. } => (Some(access_token.clone()), None),
             }
         };
-        let request = self
+        let mut request = self
             .http
             .post(url)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(body);
+        if !streaming {
+            request = request.timeout(REQUEST_TIMEOUT);
+        }
         let request = match (bearer, api_key) {
             (Some(token), _) => request
                 .header("Authorization", format!("Bearer {token}"))
@@ -247,23 +262,24 @@ impl AnthropicProvider {
             "sending streaming turn request"
         );
 
-        let response = self.post_messages(&url, &body).await?;
+        let response = within_idle(
+            PROVIDER_ID,
+            STREAM_IDLE_TIMEOUT,
+            self.post_messages(&url, &body, true),
+        )
+        .await?;
         // Streaming failures arrive as a plain (non-SSE) error body; the
         // shared status check maps them to the canonical error text.
         let response = check_status(PROVIDER_ID, response).await?;
 
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut byte_stream = response.bytes_stream();
         let mut acc = StreamAccumulator::default();
-        while let Some(item) = byte_stream.next().await {
-            let chunk = item.map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-            buffer.extend_from_slice(&chunk);
-            let (payloads, consumed) = parse_sse_stream(&buffer);
-            buffer.drain(..consumed);
-            for payload in payloads {
-                acc.ingest(&payload, &tx)?;
-            }
-        }
+        drain_sse(
+            PROVIDER_ID,
+            response.bytes_stream(),
+            STREAM_IDLE_TIMEOUT,
+            |payload| acc.ingest(payload, &tx).map(|()| false),
+        )
+        .await?;
         let parsed = acc.finish()?;
         tracing::debug!(
             provider = PROVIDER_ID,
@@ -795,7 +811,7 @@ impl ModelProvider for AnthropicProvider {
             "sending turn request"
         );
 
-        let response = self.post_messages(&url, &body).await?;
+        let response = self.post_messages(&url, &body, false).await?;
         // Text + status-check + parse tail is the shared [`finish_json`]
         // (the 401 retry already ran inside post_messages).
         let value = finish_json(PROVIDER_ID, response).await?;

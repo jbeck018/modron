@@ -12,9 +12,7 @@
 //! scripted SSE fixtures — no network. Live verification needs a real
 //! ChatGPT sign-in (the user's browser round-trip).
 
-use crate::stream::parse_sse_stream;
 use async_trait::async_trait;
-use futures::StreamExt;
 use modron_core::auth::oauth::chatgpt;
 use modron_core::{
     Error, ModelProvider, Result, Role, StopReason, ToolCall, TurnRequest, TurnResponse, Usage,
@@ -26,7 +24,10 @@ use tokio::sync::mpsc::UnboundedSender;
 /// ChatGPT (subscription) provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "chatgpt";
 
-use crate::http::{build_client, check_status, with_401_retry};
+use crate::http::{
+    build_client, check_status, drain_sse, with_401_retry, within_idle, REQUEST_TIMEOUT,
+    STREAM_IDLE_TIMEOUT,
+};
 const DONE_SENTINEL: &str = "[DONE]";
 
 /// Live credentials behind a lock: a successful refresh swaps them in
@@ -106,27 +107,26 @@ impl OpenAiResponsesProvider {
         // (double-appending /responses 404s with {"detail":"Not Found"}).
         let url = self.base_url.trim_end_matches('/').to_string();
         let body = build_body(req);
-        let response = self.post(&url, &body).await?;
+        let response =
+            within_idle(PROVIDER_ID, STREAM_IDLE_TIMEOUT, self.post(&url, &body)).await?;
         // Streaming failures arrive as a plain (non-SSE) error body; the
         // shared status check maps them to the canonical error text.
         let response = check_status(PROVIDER_ID, response).await?;
 
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut byte_stream = response.bytes_stream();
         let mut acc = ResponsesAccumulator::default();
-        'read: while let Some(item) = byte_stream.next().await {
-            let chunk = item.map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-            buffer.extend_from_slice(&chunk);
-            let (payloads, consumed) = parse_sse_stream(&buffer);
-            buffer.drain(..consumed);
-            for payload in payloads {
+        drain_sse(
+            PROVIDER_ID,
+            response.bytes_stream(),
+            STREAM_IDLE_TIMEOUT,
+            |payload| {
                 if payload == DONE_SENTINEL {
                     acc.done = true;
-                    break 'read;
+                    return Ok(true);
                 }
-                acc.ingest(&payload, &tx)?;
-            }
-        }
+                acc.ingest(payload, &tx).map(|()| false)
+            },
+        )
+        .await?;
         let parsed = acc.finish()?;
         let _ = tx.send(modron_core::StreamDelta::Done);
         Ok(parsed)
@@ -173,6 +173,7 @@ impl OpenAiResponsesProvider {
         let response = self
             .http
             .post(chatgpt::TOKEN_URL)
+            .timeout(REQUEST_TIMEOUT)
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("client_id", chatgpt::CLIENT_ID),
