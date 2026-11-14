@@ -31,6 +31,59 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reply deadline for a correlated request (attach).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Query parameter that carries a paired device token on a ws(s) target
+/// (`ws://host:7699/?token=...`). Stripped before the URL is dialed or shown.
+const TOKEN_PARAM: &str = "token";
+
+/// Environment fallback for the device token when the URL carries none.
+const TOKEN_ENV: &str = "MODRON_DEVICE_TOKEN";
+
+/// Split a `token` query parameter off a ws(s) target. Returns the target
+/// without that parameter (safe to log or show) and the token, if any.
+/// Non-ws targets (unix sockets) pass through untouched.
+fn split_token_param(target: &str) -> (String, Option<String>) {
+    let is_ws = target.starts_with("ws://") || target.starts_with("wss://");
+    let Some((base, query)) = target.split_once('?').filter(|_| is_ws) else {
+        return (target.to_string(), None);
+    };
+    let mut token = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| match pair.split_once('=') {
+            Some((TOKEN_PARAM, value)) => {
+                if !value.is_empty() {
+                    token = Some(value.to_string());
+                }
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    let stripped = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (stripped, token)
+}
+
+/// Resolve the device token and the target to dial: a `token` URL parameter
+/// wins, then the `MODRON_DEVICE_TOKEN` env var (read through `env` so tests
+/// never touch the process environment), else no token.
+fn resolve_device_token(
+    target: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> (String, Option<String>) {
+    let (stripped, from_url) = split_token_param(target);
+    let token = from_url.or_else(|| env(TOKEN_ENV).filter(|t| !t.is_empty()));
+    (stripped, token)
+}
+
+/// The `hello` frame for this client, carrying the device token when set.
+fn client_hello(token: Option<String>) -> Frame {
+    modron_protocol::client::hello_frame("modron-tui", token)
+}
+
 /// The default Unix socket path (`~/.modron/serve.sock`).
 pub fn default_socket_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -166,9 +219,12 @@ impl RemoteClient {
     /// Connect and handshake. Target: `"unix"` (the default socket),
     /// `"unix:<path>"`, or `"ws://host:port"`.
     pub async fn connect(target: &str) -> Result<Self> {
+        // The token is stripped from the target here, so every message
+        // below (dial errors, handshake errors) shows the clean URL only.
+        let (target, token) = resolve_device_token(target, |key| std::env::var(key).ok());
+        let target = target.as_str();
         let mut link = Link::open(target).await?;
-        link.send(&modron_protocol::client::hello_frame("modron-tui", None))
-            .await?;
+        link.send(&client_hello(token)).await?;
         let welcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, link.recv())
             .await
             .map_err(|_| anyhow!("handshake timeout ({target})"))?;
@@ -498,5 +554,138 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("no server at"), "{err}");
+    }
+
+    #[test]
+    fn token_param_is_stripped_from_the_target() {
+        let (target, token) = split_token_param("ws://127.0.0.1:7699/?token=abc");
+        assert_eq!(target, "ws://127.0.0.1:7699/");
+        assert_eq!(token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn token_param_keeps_other_query_params() {
+        let (target, token) = split_token_param("wss://h.example/x?a=1&token=abc&b=2");
+        assert_eq!(target, "wss://h.example/x?a=1&b=2");
+        assert_eq!(token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn empty_token_param_is_stripped_but_yields_no_token() {
+        let (target, token) = split_token_param("ws://h:7699/?token=");
+        assert_eq!(target, "ws://h:7699/");
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn target_without_token_is_unchanged() {
+        let (target, token) = split_token_param("ws://h:7699");
+        assert_eq!(target, "ws://h:7699");
+        assert_eq!(token, None);
+        // Unix targets are never query-parsed.
+        let (unix, token) = split_token_param("unix:/tmp/a?token=x.sock");
+        assert_eq!(unix, "unix:/tmp/a?token=x.sock");
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn url_token_beats_env_and_env_is_the_fallback() {
+        let env = |key: &str| {
+            assert_eq!(key, TOKEN_ENV);
+            Some("from-env".to_string())
+        };
+        let (target, token) = resolve_device_token("ws://h:7699/?token=from-url", env);
+        assert_eq!(target, "ws://h:7699/");
+        assert_eq!(token.as_deref(), Some("from-url"));
+
+        let (target, token) = resolve_device_token("ws://h:7699", env);
+        assert_eq!(target, "ws://h:7699");
+        assert_eq!(token.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn no_url_token_and_no_env_means_no_token() {
+        let (_, token) = resolve_device_token("ws://h:7699", |_| None);
+        assert_eq!(token, None);
+        let (_, token) = resolve_device_token("ws://h:7699", |_| Some(String::new()));
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn hello_frame_carries_the_token() {
+        let frame = client_hello(Some("tok-123".into()));
+        match frame.payload {
+            Payload::Hello { token, .. } => assert_eq!(token.as_deref(), Some("tok-123")),
+            other => panic!("expected hello, got {other:?}"),
+        }
+        let frame = client_hello(None);
+        assert!(matches!(frame.payload, Payload::Hello { token: None, .. }));
+    }
+
+    /// A WS server that records the request URI (path + query) and the
+    /// token in the hello frame, then welcomes the client.
+    // The handshake callback's error type (ErrorResponse) is large by
+    // design in tungstenite; the fixture never returns an error.
+    #[allow(clippy::result_large_err)]
+    async fn ws_token_fixture() -> (
+        String,
+        tokio::sync::oneshot::Receiver<(String, Option<String>)>,
+    ) {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (uri_tx, uri_rx) = tokio::sync::oneshot::channel::<String>();
+            let mut uri_tx = Some(uri_tx);
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |req: &Request, resp: Response| {
+                    if let Some(tx) = uri_tx.take() {
+                        let _ = tx.send(req.uri().to_string());
+                    }
+                    Ok(resp)
+                },
+            )
+            .await
+            .unwrap();
+            let hello_text = match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => text,
+                other => panic!("expected a hello text frame, got {other:?}"),
+            };
+            let hello: Frame = serde_json::from_str(hello_text.as_str()).unwrap();
+            let token = match hello.payload {
+                Payload::Hello { token, .. } => token,
+                other => panic!("expected hello, got {other:?}"),
+            };
+            let welcome = Frame::request(
+                hello.id.unwrap(),
+                Payload::Welcome {
+                    server_version: "test".into(),
+                    protocol: PROTOCOL_VERSION,
+                },
+            );
+            ws.send(WsMessage::Text(
+                serde_json::to_string(&welcome).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+            let uri = uri_rx.await.unwrap();
+            let _ = done_tx.send((uri, token));
+            // Hold the socket open until the client drops.
+            let _ = ws.next().await;
+        });
+        (format!("ws://127.0.0.1:{port}"), done_rx)
+    }
+
+    #[tokio::test]
+    async fn ws_token_is_sent_in_hello_and_never_dialed() {
+        let (url, seen) = ws_token_fixture().await;
+        let target = format!("{url}/?token=abc-123");
+        let _client = RemoteClient::connect(&target).await.unwrap();
+        let (uri, token) = seen.await.unwrap();
+        assert_eq!(token.as_deref(), Some("abc-123"));
+        assert!(!uri.contains("token"), "query leaked to the server: {uri}");
     }
 }
