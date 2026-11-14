@@ -129,17 +129,34 @@ fn acp_initialize_session_prompt_and_streaming() {
             > 10),
         "streamed chunks carry the answer: {updates:?}"
     );
-    let tool_calls = updates
+    let kind = |u: &&Value| {
+        u.pointer("/params/update/sessionUpdate")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let starts: Vec<String> = updates
         .iter()
-        .filter(|u| {
-            u.pointer("/params/update/sessionUpdate")
-                .and_then(|v| v.as_str())
-                == Some("tool_call")
+        .filter(|u| kind(u) == "tool_call")
+        .filter_map(|u| {
+            u.pointer("/params/update/toolCallId")?
+                .as_str()
+                .map(String::from)
         })
-        .count();
+        .collect();
+    let finishes: Vec<String> = updates
+        .iter()
+        .filter(|u| kind(u) == "tool_call_update")
+        .filter_map(|u| {
+            u.pointer("/params/update/toolCallId")?
+                .as_str()
+                .map(String::from)
+        })
+        .collect();
+    assert!(!starts.is_empty(), "a tool call started: {updates:?}");
     assert!(
-        tool_calls >= 2,
-        "bash start + completion surfaced: {updates:?}"
+        starts.iter().zip(finishes.iter()).all(|(s, f)| s == f) && !finishes.is_empty(),
+        "each completion reuses its start id: starts={starts:?} finishes={finishes:?}"
     );
     // The session cwd drove every tool: the mock's scripted write landed
     // in the editor's project dir (not the process launch dir).
