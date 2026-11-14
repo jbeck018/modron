@@ -25,6 +25,7 @@ interface PendingApproval {
   request_id: string;
   tool: string;
   args_summary: string;
+  arguments_text: string;
   options: DecisionOption[];
 }
 
@@ -162,6 +163,8 @@ const taskTitle = signal("");
 // the row id whose delete control is armed (two-tap confirm, matching
 // the desktop's trash -> check flow).
 const editMode = signal(false);
+// Approval sheet: the expandable full-call block (parity D7 "view full call").
+const approvalDetail = signal(false);
 const selectedIds = signal<string[]>([]);
 const confirmingId = signal<string | null>(null);
 
@@ -821,9 +824,23 @@ function ApprovalCard(props: { approval: PendingApproval }) {
       <Text class="text-foreground font-semibold">
         approve {approval.tool}?
       </Text>
-      <Text class="text-muted-foreground text-xs line-clamp-2">
+      <Text class="text-muted-foreground text-xs">
         {approval.args_summary}
       </Text>
+      <View
+        role="button"
+        class="self-start active:opacity-80"
+        onPress={() => approvalDetail.set(!approvalDetail())}
+      >
+        <Text class="text-primary text-xs">
+          {approvalDetail() ? "hide full call" : "view full call"}
+        </Text>
+      </View>
+      <If when={approvalDetail() ? approval.arguments_text : null}>
+        {(text) => (
+          <Text class="text-muted-foreground text-xs">{text()}</Text>
+        )}
+      </If>
       <View class="flex-row gap-2">
         {approval.options.map((option) => (
           <View

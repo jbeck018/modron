@@ -580,7 +580,11 @@ impl AppState {
         Some(format!(
             "⚠ allow {} {}?",
             pending.call.name,
-            modron_view::short(&pending.call.arguments.to_string(), 80)
+            modron_view::approval_summary(
+                &pending.call.name,
+                &pending.call.arguments,
+                modron_view::APPROVAL_SUMMARY_MAX
+            )
         ))
     }
 
@@ -1378,10 +1382,27 @@ mod tests {
             ..LiveState::default()
         };
         s.apply_frame(snapshot_frame(Vec::new(), live));
-        assert_eq!(
-            s.approval_prompt().as_deref(),
-            Some(r#"⚠ allow write {"path":"x.txt"}?"#)
+        assert_eq!(s.approval_prompt().as_deref(), Some("⚠ allow write x.txt?"));
+    }
+
+    #[test]
+    fn approval_prompt_uses_the_shared_summary_and_marks_truncation() {
+        let mut s = AppState::new();
+        let command = format!("echo {}", "a".repeat(120));
+        s.pending_approval = Some(PendingApproval {
+            request_id: "req-2".into(),
+            call: ToolCall {
+                id: "c".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": command.clone() }),
+            },
+        });
+        let expected = format!(
+            "⚠ allow bash {}?",
+            modron_view::approval_summary("bash", &serde_json::json!({ "command": command }), 80)
         );
+        assert_eq!(s.approval_prompt().as_deref(), Some(expected.as_str()));
+        assert!(expected.ends_with(" [+45 chars]?"), "{expected}");
     }
 
     #[test]

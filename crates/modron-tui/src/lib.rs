@@ -3108,7 +3108,11 @@ impl App {
             return format!(
                 "⚠ allow {} {}? [y/N/a]",
                 pending.call.name,
-                short(&pending.call.arguments.to_string(), 80)
+                modron_view::approval_summary(
+                    &pending.call.name,
+                    &pending.call.arguments,
+                    modron_view::APPROVAL_SUMMARY_MAX
+                )
             );
         }
         self.status_spans()
@@ -3931,15 +3935,6 @@ fn slugish(text: &str) -> String {
 /// String::insert/remove speak bytes, the cursor speaks chars.
 fn char_byte_idx(s: &str, ci: usize) -> usize {
     s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
-}
-
-fn short(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max_chars).collect();
-        format!("{cut}…")
-    }
 }
 
 /// Lines to commit to scrollback via `Terminal::insert_before`.
