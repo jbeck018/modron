@@ -209,25 +209,13 @@ pub async fn delegate(
             sink
         });
 
-    let config = EngineConfig {
-        working_dir: working_dir
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| parent.config.working_dir.clone()),
-        system: persona.and_then(|p| p.system.clone()).unwrap_or_default(),
-        default_model: String::new(),
-        default_provider: String::new(),
-        max_turns: 24,
-        max_input_tokens: parent.config.max_input_tokens,
-        max_total_tokens: budget_tokens,
-        approvals: crate::ApprovalPolicy {
-            mode: parent.config.approvals.mode,
-            non_interactive: parent.config.approvals.non_interactive,
-            allow: persona.map(|p| p.allow.clone()).unwrap_or_default(),
-            deny: persona.map(|p| p.deny.clone()).unwrap_or_default(),
-        },
-        on_tool_event: progress_sink,
-        ..EngineConfig::default()
-    };
+    let config = child_config(
+        &parent.config,
+        persona,
+        working_dir,
+        budget_tokens,
+        progress_sink,
+    );
     let child = Engine {
         selector,
         providers: parent.providers.clone(),
@@ -260,6 +248,50 @@ pub async fn delegate(
         usage,
         turns,
     })
+}
+
+/// Build the child `EngineConfig` for a subagent (D2: inherit, never widen).
+/// The child copies the parent's sandbox, hooks, cost cap and price lookup,
+/// and its deny list is the UNION of the parent's and the persona's. The
+/// allow list is the persona's only (never inherited from the parent).
+pub(crate) fn child_config(
+    parent: &EngineConfig,
+    persona: Option<&crate::PersonaSpec>,
+    working_dir: Option<&std::path::Path>,
+    budget_tokens: u64,
+    on_tool_event: Option<Arc<crate::ToolActivitySink>>,
+) -> EngineConfig {
+    let mut deny = parent.approvals.deny.clone();
+    if let Some(p) = persona {
+        for entry in &p.deny {
+            if !deny.contains(entry) {
+                deny.push(entry.clone());
+            }
+        }
+    }
+    EngineConfig {
+        working_dir: working_dir
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| parent.working_dir.clone()),
+        system: persona.and_then(|p| p.system.clone()).unwrap_or_default(),
+        default_model: String::new(),
+        default_provider: String::new(),
+        max_turns: 24,
+        max_input_tokens: parent.max_input_tokens,
+        max_total_tokens: budget_tokens,
+        approvals: crate::ApprovalPolicy {
+            mode: parent.approvals.mode,
+            non_interactive: parent.approvals.non_interactive,
+            allow: persona.map(|p| p.allow.clone()).unwrap_or_default(),
+            deny,
+        },
+        sandbox: parent.sandbox,
+        hooks: parent.hooks.clone(),
+        max_cost_usd: parent.max_cost_usd,
+        price_lookup: parent.price_lookup.clone(),
+        on_tool_event,
+        ..EngineConfig::default()
+    }
 }
 
 /// Short unique id for worktrees and background subagents.
@@ -359,5 +391,71 @@ mod tests {
             choice.model, "claude-haiku-4-5",
             "pinned to the Search-tier model"
         );
+    }
+
+    fn strict_parent_config() -> EngineConfig {
+        use crate::hooks::HookConfig;
+        use crate::{ApprovalMode, ApprovalPolicy, SandboxPolicy};
+        EngineConfig {
+            working_dir: std::path::PathBuf::from("/parent/worktree"),
+            sandbox: SandboxPolicy::Bubblewrap,
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::default(),
+                non_interactive: false,
+                allow: vec!["diagnostics".into()],
+                deny: vec!["bash".into()],
+            },
+            hooks: HookConfig {
+                pre_tool: Some("true".into()),
+                post_tool: None,
+            },
+            max_cost_usd: Some(1.0),
+            price_lookup: Some(Arc::new(|_: &str| Some((1.0, 1.0)))),
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn child_config_inherits_sandbox_hooks_and_cost_cap() {
+        let parent = strict_parent_config();
+        let child = child_config(&parent, None, None, 5_000, None);
+        assert_eq!(child.sandbox, crate::SandboxPolicy::Bubblewrap);
+        assert_eq!(child.hooks, parent.hooks);
+        assert_eq!(child.max_cost_usd, Some(1.0));
+        let parent_lookup = parent.price_lookup.as_ref().expect("parent lookup");
+        let child_lookup = child.price_lookup.as_ref().expect("child lookup inherited");
+        assert!(Arc::ptr_eq(parent_lookup, child_lookup));
+        assert_eq!(child.max_total_tokens, 5_000);
+        assert_eq!(child.working_dir, parent.working_dir);
+    }
+
+    #[test]
+    fn child_config_unions_parent_and_persona_deny_lists() {
+        let parent = strict_parent_config();
+        let persona = crate::PersonaSpec {
+            system: Some("be terse".into()),
+            model: None,
+            provider: None,
+            allow: vec!["read".into()],
+            deny: vec!["write".into(), "bash".into()],
+        };
+        let child = child_config(&parent, Some(&persona), None, 1_000, None);
+        assert!(child.approvals.deny.contains(&"bash".to_string()));
+        assert!(child.approvals.deny.contains(&"write".to_string()));
+        assert_eq!(
+            child.approvals.deny.iter().filter(|d| *d == "bash").count(),
+            1,
+            "shared deny entries are not duplicated"
+        );
+        assert_eq!(child.approvals.allow, vec!["read".to_string()]);
+        assert_eq!(child.system, "be terse");
+    }
+
+    #[test]
+    fn child_config_without_persona_keeps_parent_deny_and_clears_allow() {
+        let parent = strict_parent_config();
+        let child = child_config(&parent, None, None, 1_000, None);
+        assert_eq!(child.approvals.deny, vec!["bash".to_string()]);
+        assert!(child.approvals.allow.is_empty());
     }
 }
