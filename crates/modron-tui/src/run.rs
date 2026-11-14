@@ -651,6 +651,28 @@ struct RunState {
     // Which session's log the scrollback currently mirrors; a different
     // session's snapshot (e.g. after /new) resets it first.
     backfill_session: Option<SessionId>,
+    // Remote mode: this connection's copy of the allow/deny lists. The
+    // server replaces a list on SetConfig, so /allow and /deny send the
+    // whole list from here.
+    remote_lists: RemoteLists,
+}
+
+/// Client-side mirror of the server's allow and deny lists for one
+/// connection (starts empty; C5 will carry the real lists in the snapshot).
+#[derive(Default)]
+struct RemoteLists {
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+/// What a parked slash command becomes while connected.
+enum RemoteSlash {
+    /// Send this SetConfig patch; the optional label updates the status strip.
+    Patch(ConfigPatch, Option<String>),
+    /// Nothing is sent; show this note to the user.
+    Note(String),
+    /// No remote equivalent: the command needs the machine that owns the engine.
+    Unsupported,
 }
 
 impl RunState {
@@ -720,6 +742,7 @@ impl RunState {
             harvest_task: None,
             shell_task: None,
             backfill_session,
+            remote_lists: RemoteLists::default(),
         }
     }
 
@@ -1034,14 +1057,15 @@ impl RunState {
                     PendingCommand::NewSession => {
                         let _ = self.loop_cmd_tx.send(LoopCmd::NewSession { title: None });
                     }
-                    other => match remote_slash_command(&other) {
-                        Some((patch, mode_label)) => {
+                    other => match remote_slash_command(&other, &mut self.remote_lists) {
+                        RemoteSlash::Patch(patch, mode_label) => {
                             if let Some(label) = mode_label {
                                 app.approval_mode = label;
                             }
                             let _ = self.loop_cmd_tx.send(LoopCmd::SetConfig(patch));
                         }
-                        None => {
+                        RemoteSlash::Note(text) => app.toast(text),
+                        RemoteSlash::Unsupported => {
                             app.toast(
                                 "needs the machine that owns the engine — run it there                                  (restart without --connect)",
                             );
@@ -2188,13 +2212,14 @@ fn spawn_remote_driver(
                         let _ = client.send(Payload::SetConfig { patch });
                     }
                     Some(LoopCmd::RemoteControl { bridge_url }) => {
-                        let Some(session_id) = driver_session else {
-                            break;
-                        };
-                        let _ = client.send(Payload::RemoteControl {
-                            session_id,
-                            bridge_url,
-                        });
+                        match remote_control_payload(driver_session, bridge_url) {
+                            Ok(payload) => {
+                                let _ = client.send(payload);
+                            }
+                            Err(note) => {
+                                let _ = ui_tx.send(UiFrame::Note(note));
+                            }
+                        }
                     }
                     Some(LoopCmd::Fork { session }) => {
                         if let Some(session_id) = session.or(driver_session) {
@@ -2343,7 +2368,7 @@ fn spawn_remote_driver(
 /// connected. `None` = no remote equivalent (the loop refuses it with an
 /// explicit toast). The optional label mirrors the local /mode arm's
 /// status-strip update.
-fn remote_slash_command(cmd: &PendingCommand) -> Option<(ConfigPatch, Option<String>)> {
+fn remote_slash_command(cmd: &PendingCommand, lists: &mut RemoteLists) -> RemoteSlash {
     use modron_protocol::ApprovalModeWire;
     let patch = match cmd {
         PendingCommand::Model { name, .. } => ConfigPatch {
@@ -2356,37 +2381,86 @@ fn remote_slash_command(cmd: &PendingCommand) -> Option<(ConfigPatch, Option<Str
                 "deny" => (ApprovalModeWire::Deny, "deny"),
                 _ => (ApprovalModeWire::Ask, "ask"),
             };
-            return Some((
+            return RemoteSlash::Patch(
                 ConfigPatch {
                     approval_mode: Some(wire),
                     ..ConfigPatch::default()
                 },
                 Some(label.to_string()),
-            ));
+            );
         }
-        PendingCommand::Sandbox(s) => ConfigPatch {
-            sandbox: Some(match s.trim() {
-                "seatbelt" => modron_core::SandboxPolicy::Seatbelt,
-                "bubblewrap" | "bwrap" => modron_core::SandboxPolicy::Bubblewrap,
-                _ => modron_core::SandboxPolicy::Off,
-            }),
-            ..ConfigPatch::default()
+        // An unknown value must never reach the server: the old mapping
+        // turned any typo into Off.
+        PendingCommand::Sandbox(s) => match remote_sandbox_policy(s) {
+            Some(policy) => ConfigPatch {
+                sandbox: Some(policy),
+                ..ConfigPatch::default()
+            },
+            None => {
+                return RemoteSlash::Note(format!(
+                    "unknown sandbox `{}` (off | seatbelt | bubblewrap)",
+                    s.trim()
+                ))
+            }
         },
         PendingCommand::Agent(name) => ConfigPatch {
             persona: Some(name.clone()),
             ..ConfigPatch::default()
         },
-        PendingCommand::Allow(tool) => ConfigPatch {
-            allow: Some(vec![tool.clone()]),
-            ..ConfigPatch::default()
-        },
-        PendingCommand::Deny(tool) => ConfigPatch {
-            deny: Some(vec![tool.clone()]),
-            ..ConfigPatch::default()
-        },
-        _ => return None,
+        // The server replaces its list on SetConfig, so send the whole
+        // list (this connection's copy plus the new entry), as the local
+        // path appends to its own list.
+        PendingCommand::Allow(tool) => {
+            let tool = tool.trim();
+            if tool.is_empty() {
+                return RemoteSlash::Note("usage: /allow <tool>".into());
+            }
+            lists.allow.push(tool.to_string());
+            ConfigPatch {
+                allow: Some(lists.allow.clone()),
+                ..ConfigPatch::default()
+            }
+        }
+        PendingCommand::Deny(tool) => {
+            let tool = tool.trim();
+            if tool.is_empty() {
+                return RemoteSlash::Note("usage: /deny <tool>".into());
+            }
+            lists.deny.push(tool.to_string());
+            ConfigPatch {
+                deny: Some(lists.deny.clone()),
+                ..ConfigPatch::default()
+            }
+        }
+        _ => return RemoteSlash::Unsupported,
     };
-    Some((patch, None))
+    RemoteSlash::Patch(patch, None)
+}
+
+/// The remote /sandbox values: exactly off, seatbelt, bubblewrap (bwrap is
+/// its alias). Anything else is unknown, not off.
+fn remote_sandbox_policy(mode: &str) -> Option<modron_core::SandboxPolicy> {
+    match mode.trim() {
+        "off" => Some(modron_core::SandboxPolicy::Off),
+        "seatbelt" => Some(modron_core::SandboxPolicy::Seatbelt),
+        "bubblewrap" | "bwrap" => Some(modron_core::SandboxPolicy::Bubblewrap),
+        _ => None,
+    }
+}
+
+/// The frame for `/remote-control`: it needs a session the driver has
+/// adopted. `Err` is the user-visible note (the loop keeps running).
+fn remote_control_payload(
+    driver_session: Option<uuid::Uuid>,
+    bridge_url: String,
+) -> Result<Payload, String> {
+    match driver_session {
+        Some(session_id) => Ok(Payload::RemoteControl {
+            session_id,
+            bridge_url,
+        }),
+        None => Err("no session yet - send a task first, then /remote-control".into()),
+    }
 }
 
 #[cfg(test)]
@@ -2572,5 +2646,119 @@ mod approval_state_tests {
         state.drain_ui_frames(&mut app);
         assert!(app.pending_approval.is_none(), "the matching one clears");
         assert!(state.approval_request.is_none());
+    }
+}
+
+#[cfg(test)]
+mod remote_command_tests {
+    //! C3: remote-mode slash commands. The pure mapping is tested here;
+    //! the driver loop itself needs a live socket.
+    use super::*;
+    use modron_core::SandboxPolicy;
+    use modron_protocol::Payload;
+    use uuid::Uuid;
+
+    fn note_of(slash: RemoteSlash) -> String {
+        match slash {
+            RemoteSlash::Note(text) => text,
+            _ => panic!("expected a note"),
+        }
+    }
+
+    fn patch_of(slash: RemoteSlash) -> ConfigPatch {
+        match slash {
+            RemoteSlash::Patch(patch, _) => patch,
+            _ => panic!("expected a config patch"),
+        }
+    }
+
+    #[test]
+    fn sandbox_typo_sends_no_patch_and_says_so() {
+        let mut lists = RemoteLists::default();
+        let slash = remote_slash_command(&PendingCommand::Sandbox("bubblwrap".into()), &mut lists);
+        assert_eq!(
+            note_of(slash),
+            "unknown sandbox `bubblwrap` (off | seatbelt | bubblewrap)"
+        );
+    }
+
+    #[test]
+    fn sandbox_on_is_unknown_not_off() {
+        let mut lists = RemoteLists::default();
+        let slash = remote_slash_command(&PendingCommand::Sandbox("on".into()), &mut lists);
+        assert_eq!(
+            note_of(slash),
+            "unknown sandbox `on` (off | seatbelt | bubblewrap)"
+        );
+    }
+
+    #[test]
+    fn sandbox_known_values_map_to_their_policy() {
+        assert!(matches!(
+            remote_sandbox_policy("off"),
+            Some(SandboxPolicy::Off)
+        ));
+        assert!(matches!(
+            remote_sandbox_policy("seatbelt"),
+            Some(SandboxPolicy::Seatbelt)
+        ));
+        assert!(matches!(
+            remote_sandbox_policy("bubblewrap"),
+            Some(SandboxPolicy::Bubblewrap)
+        ));
+        assert!(matches!(
+            remote_sandbox_policy("bwrap"),
+            Some(SandboxPolicy::Bubblewrap)
+        ));
+        assert!(remote_sandbox_policy("bubblwrap").is_none());
+        assert!(remote_sandbox_policy("").is_none());
+    }
+
+    #[test]
+    fn remote_allow_sends_the_whole_list_not_one_entry() {
+        let mut lists = RemoteLists::default();
+        let _ = remote_slash_command(&PendingCommand::Allow("bash".into()), &mut lists);
+        let patch = patch_of(remote_slash_command(
+            &PendingCommand::Allow("write".into()),
+            &mut lists,
+        ));
+        assert_eq!(
+            patch.allow,
+            Some(vec!["bash".to_string(), "write".to_string()])
+        );
+        assert!(patch.deny.is_none());
+    }
+
+    #[test]
+    fn remote_deny_keeps_earlier_denials() {
+        let mut lists = RemoteLists::default();
+        let _ = remote_slash_command(&PendingCommand::Deny("bash".into()), &mut lists);
+        let patch = patch_of(remote_slash_command(
+            &PendingCommand::Deny("write".into()),
+            &mut lists,
+        ));
+        assert_eq!(
+            patch.deny,
+            Some(vec!["bash".to_string(), "write".to_string()])
+        );
+        assert!(patch.allow.is_none());
+    }
+
+    #[test]
+    fn remote_control_without_a_session_is_a_note_not_a_stop() {
+        let err = remote_control_payload(None, "wss://bridge".into())
+            .expect_err("no session means a note");
+        assert!(err.contains("no session"), "got: {err}");
+    }
+
+    #[test]
+    fn remote_control_with_a_session_builds_the_payload() {
+        let id = Uuid::new_v4();
+        let payload =
+            remote_control_payload(Some(id), "wss://bridge".into()).expect("session adopted");
+        assert!(matches!(
+            payload,
+            Payload::RemoteControl { session_id, .. } if session_id == id
+        ));
     }
 }
