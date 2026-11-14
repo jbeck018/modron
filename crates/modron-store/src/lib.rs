@@ -22,8 +22,39 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+/// Monotonic suffix for meta temp file names. Together with the pid and the
+/// clock it makes every temp name unique across writers in one process and
+/// across processes sharing the same sessions directory.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Cached event count for one transcript, valid only while the file still has
+/// exactly `len` bytes. Another process appending changes the length, so the
+/// entry is then recounted instead of trusted.
+#[derive(Clone, Copy)]
+struct CountEntry {
+    count: u64,
+    len: u64,
+}
+
+/// Per-session caches. Everything here is an accelerator; every miss falls
+/// back to the on-disk truth, so a cache that silently vanished would only
+/// cost perf, never correctness.
+#[derive(Default)]
+struct Caches {
+    /// Open append handles: no open-per-append.
+    handles: HashMap<SessionId, std::fs::File>,
+    /// In-memory meta mirror (write-through on append).
+    metas: HashMap<SessionId, SessionMeta>,
+    /// Parsed event count per session, seeded lazily from `load` (one full
+    /// parse per session per process, only if something asks) and bumped on
+    /// append. `checkpoint_for` asks per tool call; O(1) after the seed.
+    counts: HashMap<SessionId, CountEntry>,
+}
 
 /// Directory builder for the sessions root: owner-only (0700) from creation.
 #[cfg(unix)]
@@ -70,21 +101,6 @@ fn tighten(path: &Path, mode: u32) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn tighten(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
-}
-
-/// Per-session caches. Everything here is an accelerator; every miss falls
-/// back to the on-disk truth, so a cache that silently vanished would only
-/// cost perf, never correctness.
-#[derive(Default)]
-struct Caches {
-    /// Open append handles: no open-per-append.
-    handles: HashMap<SessionId, std::fs::File>,
-    /// In-memory meta mirror (write-through on append).
-    metas: HashMap<SessionId, SessionMeta>,
-    /// Parsed event count per session, seeded lazily from `load` (one full
-    /// parse per session per process, only if something asks) and bumped on
-    /// append. `checkpoint_for` asks per tool call; O(1) after the seed.
-    counts: HashMap<SessionId, u64>,
 }
 
 struct Inner {
@@ -142,17 +158,36 @@ impl Inner {
             .map_err(|e| Error::Session(format!("could not serialize meta: {e}")))?;
         // Write-then-rename: a truncate-in-place write interrupted by a
         // crash corrupts the meta file and permanently bricks every future
-        // append (read_meta fails forever after).
-        let tmp = self.root.join(format!("{}.meta.json.tmp", meta.id));
-        private_file_options()
+        // append (read_meta fails forever after). The temp name is unique per
+        // writer (pid, clock, sequence), so two writers never share, clobber
+        // or rename each other's temp file. `create_new` makes a collision a
+        // hard error instead of a silent overwrite.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.root.join(format!(
+            "{}.meta.json.{}.{nanos}.{seq}.tmp",
+            meta.id,
+            std::process::id()
+        ));
+        let written = private_file_options()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&tmp)
-            .and_then(|mut file| file.write_all(data.as_bytes()))
-            .map_err(|e| Error::Session(format!("could not write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::Session(format!("could not replace {}: {e}", path.display())))
+            .and_then(|mut file| file.write_all(data.as_bytes()));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Session(format!(
+                "could not write {}: {e}",
+                tmp.display()
+            )));
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::Session(format!("could not replace {}: {e}", path.display()))
+        })
     }
 
     /// The meta for `id`: cache hit, else one disk read that seeds the
@@ -172,51 +207,12 @@ impl Inner {
         let guard = self.session_lock(id);
         let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
 
-        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
-        // FD ceiling: handles accumulate for every session ever appended
-        // to; a long-lived daemon (automations mint a session per fire)
-        // would exhaust the default 256-FD limit (cycle-2 audit H11).
-        // Dropping a handle only costs a reopen on the next append.
-        if !caches.handles.contains_key(&id) && caches.handles.len() >= 64 {
-            caches.handles.clear();
-        }
-        // Reuse the cached handle; opening fresh only on the first append
-        // (or after a delete). NotFound maps to the documented
-        // unknown-session error.
-        if let std::collections::hash_map::Entry::Vacant(entry) = caches.handles.entry(id) {
-            let file = OpenOptions::new()
-                .append(true)
-                .open(self.jsonl_path(id))
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        Error::Session(format!(
-                            "unknown session {id}: no transcript at {}",
-                            self.jsonl_path(id).display()
-                        ))
-                    } else {
-                        Error::Session(format!(
-                            "could not open {}: {e}",
-                            self.jsonl_path(id).display()
-                        ))
-                    }
-                })?;
-            // Tighten a transcript left looser by an older build.
-            tighten(&self.jsonl_path(id), 0o600).map_err(|e| {
-                Error::Session(format!(
-                    "could not tighten {}: {e}",
-                    self.jsonl_path(id).display()
-                ))
-            })?;
-            entry.insert(file);
-        }
-        let file = caches.handles.get_mut(&id).expect("handle inserted above");
-        writeln!(file, "{line}").map_err(|e| {
-            Error::Session(format!(
-                "could not append to {}: {e}",
-                self.jsonl_path(id).display()
-            ))
-        })?;
-        drop(caches);
+        // One buffer, one write_all: `writeln!` would issue two writes (the
+        // line, then the newline), which another appender could split.
+        let mut buffer = String::with_capacity(line.len() + 1);
+        buffer.push_str(line);
+        buffer.push('\n');
+        self.append_bytes_locked(id, &buffer, 1)?;
 
         // Mirror the append into the meta file (updated_at + message count),
         // via the in-memory mirror instead of re-parsing anything big.
@@ -238,10 +234,64 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
             .metas
             .insert(id, meta);
-        // Maintain the seeded event counter if something already seeded it.
+        Ok(())
+    }
+
+    /// Writes `buffer` (complete lines, each ending in `\n`) to the session's
+    /// transcript with ONE `write_all` on the O_APPEND handle, and keeps the
+    /// event counter in step. Callers must hold the session lock.
+    fn append_bytes_locked(&self, id: SessionId, buffer: &str, lines: u64) -> Result<()> {
         let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = caches.counts.get_mut(&id) {
-            *count += 1;
+        // FD ceiling: handles accumulate for every session ever appended
+        // to; a long-lived daemon (automations mint a session per fire)
+        // would exhaust the default 256-FD limit (cycle-2 audit H11).
+        // Dropping a handle only costs a reopen on the next append.
+        if !caches.handles.contains_key(&id) && caches.handles.len() >= 64 {
+            caches.handles.clear();
+        }
+        // Reuse the cached handle; opening fresh only on the first append
+        // (or after a delete). NotFound maps to the documented
+        // unknown-session error.
+        if let std::collections::hash_map::Entry::Vacant(entry) = caches.handles.entry(id) {
+            let path = self.jsonl_path(id);
+            let file = OpenOptions::new().append(true).open(&path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::Session(format!(
+                        "unknown session {id}: no transcript at {}",
+                        path.display()
+                    ))
+                } else {
+                    Error::Session(format!("could not open {}: {e}", path.display()))
+                }
+            })?;
+            // Tighten a transcript left looser by an older build.
+            tighten(&path, 0o600).map_err(|e| {
+                Error::Session(format!("could not tighten {}: {e}", path.display()))
+            })?;
+            entry.insert(file);
+        }
+        let file = caches.handles.get_mut(&id).expect("handle inserted above");
+        // Length before our write. Another process may append between this
+        // read and our write, but then the recorded length below falls
+        // behind the file and the next `event_count` recounts.
+        let len_before = file.metadata().ok().map(|m| m.len());
+        file.write_all(buffer.as_bytes()).map_err(|e| {
+            Error::Session(format!(
+                "could not append to {}: {e}",
+                self.jsonl_path(id).display()
+            ))
+        })?;
+        let written = buffer.len() as u64;
+        match (caches.counts.get_mut(&id), len_before) {
+            (Some(entry), Some(before)) if entry.len == before => {
+                entry.count += lines;
+                entry.len = before + written;
+            }
+            // Cache disagrees with the file (or was never seeded): forget it
+            // so the next `event_count` recounts from disk.
+            _ => {
+                caches.counts.remove(&id);
+            }
         }
         Ok(())
     }
@@ -265,29 +315,36 @@ impl Inner {
         let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
         caches.handles.remove(&id);
         caches.metas.insert(id, meta.clone());
-        caches.counts.insert(id, 0);
         drop(caches);
         self.write_meta(&meta)?;
+        // Truncating create, private from creation. The file is empty here, so
+        // the counter starts at (0 events, 0 bytes).
         private_file_options()
             .write(true)
             .create(true)
             .truncate(true)
             .open(self.jsonl_path(id))
             .map_err(|e| Error::Session(format!("could not create transcript: {e}")))?;
+        self.caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .counts
+            .insert(id, CountEntry { count: 0, len: 0 });
         Ok(meta)
     }
 
     fn load_sync(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
         // Same per-session lock the append holds: a concurrent append's
-        // two-syscall writeln could otherwise be observed mid-line
-        // (cycle-2 audit M4).
+        // write could otherwise be observed mid-line (cycle-2 audit M4).
         let guard = self.session_lock(id);
         let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
-        self.load_unlocked(id)
+        self.read_transcript(id).map(|(events, _)| events)
     }
 
-    /// The parse, without the lock (callers that already hold it).
-    fn load_unlocked(&self, id: SessionId) -> Result<Vec<SessionEvent>> {
+    /// The parse, without the lock (callers that already hold it). Returns the
+    /// events and the byte length of the file they were read from, so a
+    /// caller can key a cache on exactly that content.
+    fn read_transcript(&self, id: SessionId) -> Result<(Vec<SessionEvent>, u64)> {
         let path = self.jsonl_path(id);
         // Read bytes and decode per-line lossily: a torn multibyte write
         // must not fail the whole load — the documented contract is that a
@@ -297,6 +354,7 @@ impl Inner {
         if let Err(e) = tighten(&path, 0o600) {
             tracing::warn!(session = %id, error = %e, "could not tighten transcript permissions");
         }
+        let len = data.len() as u64;
         let text = String::from_utf8_lossy(&data);
         let mut events = Vec::new();
         for (idx, line) in text.lines().enumerate() {
@@ -315,32 +373,39 @@ impl Inner {
                 }
             }
         }
-        Ok(events)
+        Ok((events, len))
     }
 
     fn event_count_sync(&self, id: SessionId) -> Result<u64> {
-        if let Some(count) = self
-            .caches
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .counts
-            .get(&id)
-        {
-            return Ok(*count);
-        }
-        // Seed inside ONE session-lock span (cycle-3 adversarial F5: the
-        // previous read-then-lock let an append land in between - it found
-        // no counter to bump, and the stale seed stuck forever, drifting
-        // every checkpoint index one low). Inline read + parse without
-        // re-entering the lock (load_sync takes it; re-entry = deadlock).
+        // Under the session lock, so a count is never taken mid-append.
         let guard = self.session_lock(id);
         let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
-        let count = self.load_unlocked(id)?.len() as u64;
+        // The cache is trusted only while the file still has the length it
+        // was computed at. Another process may have appended since (the CLI
+        // resuming in a second terminal); then the entry is stale and we
+        // recount from disk.
+        let disk_len = std::fs::metadata(self.jsonl_path(id)).ok().map(|m| m.len());
+        if let Some(len) = disk_len {
+            if let Some(entry) = self
+                .caches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .counts
+                .get(&id)
+                .copied()
+            {
+                if entry.len == len {
+                    return Ok(entry.count);
+                }
+            }
+        }
+        let (events, len) = self.read_transcript(id)?;
+        let count = events.len() as u64;
         self.caches
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .counts
-            .insert(id, count);
+            .insert(id, CountEntry { count, len });
         Ok(count)
     }
 
@@ -349,51 +414,14 @@ impl Inner {
         let guard = self.session_lock(id);
         let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
 
-        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
-        if !caches.handles.contains_key(&id) && caches.handles.len() >= 64 {
-            caches.handles.clear();
+        // The whole batch is one buffer and one write_all on the O_APPEND
+        // handle, so no other appender can land inside it.
+        let mut buffer = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+        for line in lines {
+            buffer.push_str(line);
+            buffer.push('\n');
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = caches.handles.entry(id) {
-            let file = OpenOptions::new()
-                .append(true)
-                .open(self.jsonl_path(id))
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        Error::Session(format!(
-                            "unknown session {id}: no transcript at {}",
-                            self.jsonl_path(id).display()
-                        ))
-                    } else {
-                        Error::Session(format!(
-                            "could not open {}: {e}",
-                            self.jsonl_path(id).display()
-                        ))
-                    }
-                })?;
-            // Tighten a transcript left looser by an older build.
-            tighten(&self.jsonl_path(id), 0o600).map_err(|e| {
-                Error::Session(format!(
-                    "could not tighten {}: {e}",
-                    self.jsonl_path(id).display()
-                ))
-            })?;
-            entry.insert(file);
-        }
-        {
-            let file = caches.handles.get_mut(&id).expect("handle inserted above");
-            let mut buffer = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
-            for line in lines {
-                buffer.push_str(line);
-                buffer.push('\n');
-            }
-            file.write_all(buffer.as_bytes()).map_err(|e| {
-                Error::Session(format!(
-                    "could not append to {}: {e}",
-                    self.jsonl_path(id).display()
-                ))
-            })?;
-        }
-        drop(caches);
+        self.append_bytes_locked(id, &buffer, lines.len() as u64)?;
 
         // ONE meta write for the whole batch (fork of 5k events: was 5k
         // pretty-serializations + ~15k syscalls).
@@ -409,10 +437,6 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
             .metas
             .insert(id, meta);
-        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = caches.counts.get_mut(&id) {
-            *count += lines.len() as u64;
-        }
         Ok(())
     }
 
@@ -942,6 +966,13 @@ mod tests {
         assert!(store.load(meta.id).await.is_err());
     }
 
+    fn user_event(text: impl Into<String>) -> SessionEvent {
+        SessionEvent::Message {
+            parent_id: None,
+            message: Message::user(text),
+        }
+    }
+
     #[cfg(unix)]
     fn mode_of(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
@@ -1001,5 +1032,81 @@ mod tests {
         assert_eq!(mode_of(&root), 0o700, "loose dir tightened");
         assert_eq!(mode_of(&jsonl), 0o600, "loose transcript tightened");
         assert_eq!(mode_of(&meta_path), 0o600, "loose meta tightened");
+    }
+
+    #[tokio::test]
+    async fn leftover_meta_temp_file_does_not_break_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let store = JsonlSessionStore::new(&root);
+        let meta = store.create_session("crashed").await.unwrap();
+        store
+            .append(meta.id, &SessionEvent::Task { text: "t".into() })
+            .await
+            .unwrap();
+        // A writer that died between write and rename leaves its temp behind.
+        std::fs::write(
+            root.join(format!("{}.meta.json.4242.1.0.tmp", meta.id)),
+            "{ truncated",
+        )
+        .unwrap();
+
+        let reopened = JsonlSessionStore::new(&root);
+        assert_eq!(reopened.list().await.unwrap().len(), 1);
+        assert_eq!(reopened.load(meta.id).await.unwrap().len(), 1);
+        reopened
+            .append(meta.id, &user_event("after crash"))
+            .await
+            .unwrap();
+        assert_eq!(reopened.event_count(meta.id).await.unwrap(), 2);
+        let temps = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temps, 1, "successful writes leave no temp file behind");
+    }
+
+    #[tokio::test]
+    async fn two_instances_appending_concurrently_keep_lines_whole_and_counts_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let first = JsonlSessionStore::new(&root);
+        let second = JsonlSessionStore::new(&root);
+        let meta = first.create_session("shared").await.unwrap();
+        let id = meta.id;
+        // Seed both event counters before the race, so the test exercises
+        // staleness: each instance must notice the other's appends.
+        assert_eq!(first.event_count(id).await.unwrap(), 0);
+        assert_eq!(second.event_count(id).await.unwrap(), 0);
+
+        let a = async {
+            for i in 0..200 {
+                first
+                    .append(id, &user_event(format!("a{i}")))
+                    .await
+                    .unwrap();
+            }
+        };
+        let b = async {
+            for i in 0..200 {
+                second
+                    .append(id, &user_event(format!("b{i}")))
+                    .await
+                    .unwrap();
+            }
+        };
+        tokio::join!(a, b);
+
+        let raw = std::fs::read_to_string(root.join(format!("{id}.jsonl"))).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 400, "no line lost or merged");
+        for line in &lines {
+            serde_json::from_str::<SessionEvent>(line)
+                .unwrap_or_else(|e| panic!("torn line {line:?}: {e}"));
+        }
+        assert_eq!(first.load(id).await.unwrap().len(), 400);
+        assert_eq!(first.event_count(id).await.unwrap(), 400);
+        assert_eq!(second.event_count(id).await.unwrap(), 400);
     }
 }
