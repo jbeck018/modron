@@ -23,7 +23,13 @@
 //!
 //! Deliberately durable-simple: std::fs only; the index (and entry files) are
 //! written through a temp-file-then-rename so a crash never leaves a
-//! half-written file. Directories are created lazily by [`MemoryStore::append`]
+//! half-written file. Temp names are unique per write (pid, clock, counter)
+//! and created with `create_new`, so concurrent writers never share one. Every
+//! read-modify-write cycle on a store's index, stats or breadcrumbs runs under
+//! an advisory lock file (`.memory.lock` in the store root; a lock older than
+//! 30 s is stale, and after 5 s of waiting the cycle proceeds unlocked). A
+//! `stats.json` that fails to parse is moved aside to
+//! `stats.json.corrupt-<unix seconds>` before the defaults take over. Directories are created lazily by [`MemoryStore::append`]
 //! — read paths on a fresh workspace return empty without side effects.
 //! The 16 KiB index cap drops the oldest index *lines* (with a warning); the
 //! dropped entries' files stay on disk — the cap protects context size, not
@@ -32,6 +38,8 @@
 use crate::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Name of the index file inside a workspace memory directory.
 const INDEX_FILE: &str = "MEMORY.md";
@@ -50,6 +58,18 @@ const MAX_TITLE_SLUG: usize = 64;
 
 /// Longest path-derived slug prefix before the hash suffix.
 const MAX_SLUG_PREFIX: usize = 48;
+
+/// Advisory lock file guarding read-modify-write cycles within one store root.
+const LOCK_FILE: &str = ".memory.lock";
+/// A lock file older than this is left by a dead process and is removed.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+/// How long a cycle waits for the lock before proceeding without it.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for the lock.
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// Process-wide sequence for unique temp-file names.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A persisted memory entry, as returned by [`MemoryStore::append`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +165,7 @@ impl MemoryStore {
         write_atomic(&path, &file_body)?;
 
         let index_line = format!("- [{date} {}](entries/{file_name})", display_title(title));
+        let _lock = self.lock();
         let mut lines: Vec<String> = self.read_index().lines().map(str::to_string).collect();
         lines.insert(0, index_line);
         write_atomic(&self.root.join(INDEX_FILE), &cap_index_lines(lines))?;
@@ -193,6 +214,7 @@ impl MemoryStore {
         }
         let mut kept: Vec<&str> = Vec::new();
         let mut removed_targets: Vec<String> = Vec::new();
+        let _lock = self.lock();
         let index = self.read_index();
         for line in index.lines() {
             match parse_index_line(line) {
@@ -315,6 +337,7 @@ impl MemoryStore {
             tags: tags.to_vec(),
             created: now.to_rfc3339(),
         };
+        let _lock = self.lock();
         let mut lines: Vec<String> = self
             .breadcrumbs()
             .into_iter()
@@ -371,12 +394,51 @@ impl MemoryStore {
         scored.into_iter().take(limit).map(|(_, c)| c).collect()
     }
 
-    /// The full usefulness ledger (id → stat), sorted by id.
+    /// The full usefulness ledger (id → stat), sorted by id. A corrupt
+    /// `stats.json` is preserved (see [`MemoryStore::load_stats`]) and reads
+    /// as empty.
     pub fn stats(&self) -> std::collections::BTreeMap<String, FactStat> {
-        let Ok(raw) = fs::read_to_string(self.root.join("stats.json")) else {
+        let _lock = self.lock();
+        self.load_stats()
+    }
+
+    /// Parse `stats.json`. Missing or unreadable reads as empty. A file that
+    /// fails to parse is renamed to `stats.json.corrupt-<unix secs>` (best
+    /// effort) so its evidence survives, and the defaults are returned.
+    /// Callers doing read-modify-write must hold the store lock.
+    fn load_stats(&self) -> std::collections::BTreeMap<String, FactStat> {
+        let path = self.root.join("stats.json");
+        let Ok(raw) = fs::read_to_string(&path) else {
             return std::collections::BTreeMap::new();
         };
-        serde_json::from_str(&raw).unwrap_or_default()
+        match serde_json::from_str(&raw) {
+            Ok(stats) => stats,
+            Err(err) => {
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let preserved = path.with_file_name(format!("stats.json.corrupt-{secs}"));
+                match fs::rename(&path, &preserved) {
+                    Ok(()) => tracing::warn!(
+                        error = %err,
+                        preserved = %preserved.display(),
+                        "corrupt memory stats moved aside; continuing with defaults"
+                    ),
+                    Err(rename_err) => tracing::warn!(
+                        error = %err,
+                        rename_error = %rename_err,
+                        "corrupt memory stats could not be preserved; continuing with defaults"
+                    ),
+                }
+                std::collections::BTreeMap::new()
+            }
+        }
+    }
+
+    /// Acquire the cross-process lock for this store (see [`acquire_lock`]).
+    fn lock(&self) -> StoreLock {
+        acquire_lock(&self.root)
     }
 
     fn write_stats(&self, stats: &std::collections::BTreeMap<String, FactStat>) -> Result<()> {
@@ -391,10 +453,11 @@ impl MemoryStore {
     /// Record a `memory_search` hit: `uses += 1`, `last_used = now`.
     /// Creates no directories when the store does not exist yet.
     pub fn record_hit(&self, id: &str) {
-        let mut stats = self.stats();
         if !self.root.exists() {
             return;
         }
+        let _lock = self.lock();
+        let mut stats = self.load_stats();
         let stat = stats.entry(id.to_string()).or_default();
         stat.uses += 1;
         stat.last_used = chrono::Utc::now().to_rfc3339();
@@ -407,7 +470,8 @@ impl MemoryStore {
         if !self.root.exists() || ids.is_empty() {
             return;
         }
-        let mut stats = self.stats();
+        let _lock = self.lock();
+        let mut stats = self.load_stats();
         for id in ids {
             let stat = stats.entry(id.clone()).or_default();
             if ok {
@@ -479,10 +543,11 @@ impl MemoryStore {
     pub fn curate(&self, policy: CuratePolicy) -> Result<CurateReport> {
         let now = chrono::Utc::now();
         let mut report = CurateReport::default();
+        let _lock = self.lock();
         let facts = self.facts_oldest_first();
         report.facts_total = facts.len();
         if !facts.is_empty() {
-            let mut stats = self.stats();
+            let mut stats = self.load_stats();
             for (id, label, _) in &facts {
                 let stat = stats.entry(id.clone()).or_default();
                 let created = entry_created_older(label); // YYYY-MM-DD from the label
@@ -711,15 +776,88 @@ fn short_hash(s: &str) -> String {
 }
 
 /// Write via temp file + rename so a crash never leaves a half-written file.
+/// The temp name is unique to this write (pid, clock, process-wide counter)
+/// and created with `create_new`, so concurrent writers never share one.
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = path.with_file_name(format!(".{name}.tmp"));
-    fs::write(&tmp, contents)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}.{nanos}.{seq}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
         .map_err(|err| io_err(&err, format!("cannot write {}", tmp.display())))?;
+    let written = std::io::Write::write_all(&mut file, contents.as_bytes());
+    drop(file);
+    if let Err(err) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(io_err(&err, format!("cannot write {}", tmp.display())));
+    }
     fs::rename(&tmp, path).map_err(|err| {
         let _ = fs::remove_file(&tmp);
         io_err(&err, format!("cannot finalize {}", path.display()))
     })
+}
+
+/// Held advisory lock on a store root; the lock file is removed on drop.
+/// `path` is `None` when the lock could not be taken (proceeding unlocked).
+struct StoreLock {
+    path: Option<PathBuf>,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Take the store lock by creating `<root>/.memory.lock` exclusively. Polls
+/// every [`LOCK_POLL`] for up to [`LOCK_WAIT`]; a lock file older than
+/// [`LOCK_STALE_AFTER`] is removed as stale. When the lock cannot be had
+/// (busy for the whole wait, or the root does not exist) the caller proceeds
+/// without it rather than failing.
+fn acquire_lock(root: &Path) -> StoreLock {
+    let path = root.join(LOCK_FILE);
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return StoreLock { path: Some(path) },
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&path) && fs::remove_file(&path).is_ok() {
+                    tracing::warn!(lock = %path.display(), "removed stale memory lock");
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    tracing::warn!(
+                        lock = %path.display(),
+                        "memory lock busy; proceeding without it"
+                    );
+                    return StoreLock { path: None };
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            // Root missing or unwritable: nothing to race on, so no lock.
+            Err(_) => return StoreLock { path: None },
+        }
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > LOCK_STALE_AFTER)
 }
 
 /// Slice `s` to at most `max` bytes without splitting a UTF-8 code point.
@@ -1185,5 +1323,57 @@ body second
             6,
             "hash suffix: {slug}"
         );
+    }
+
+    #[test]
+    fn concurrent_handles_on_one_root_lose_no_updates() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let a = store_for(root.path(), work.path());
+        let b = store_for(root.path(), work.path());
+        fs::create_dir_all(a.root()).unwrap();
+        let ids = vec!["fact-shared".to_string()];
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..100 {
+                    a.record_outcome(&ids, true);
+                    a.record_hit("fact-shared");
+                    a.append_breadcrumb(&format!("from a {i}"), &[]).unwrap();
+                }
+            });
+            s.spawn(|| {
+                for i in 0..100 {
+                    b.record_outcome(&ids, true);
+                    b.record_hit("fact-shared");
+                    b.append_breadcrumb(&format!("from b {i}"), &[]).unwrap();
+                }
+            });
+        });
+        let stat = a.stats().remove("fact-shared").expect("stat recorded");
+        assert_eq!(stat.successes, 200, "lost outcome updates");
+        assert_eq!(stat.uses, 200, "lost hit updates");
+        assert_eq!(a.breadcrumbs().len(), 200, "lost breadcrumb appends");
+        assert!(!a.root().join(".stats.json.tmp").exists());
+    }
+
+    #[test]
+    fn corrupt_stats_file_is_preserved_under_corrupt_name() {
+        let root = tempdir().unwrap();
+        let work = tempdir().unwrap();
+        let store = store_for(root.path(), work.path());
+        fs::create_dir_all(store.root()).unwrap();
+        let stats_path = store.root().join("stats.json");
+        fs::write(&stats_path, "{not json").unwrap();
+
+        assert!(store.stats().is_empty(), "corrupt stats read as defaults");
+        assert!(!stats_path.exists(), "corrupt file must be moved aside");
+        let preserved: Vec<String> = fs::read_dir(store.root())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("stats.json.corrupt-"))
+            .collect();
+        assert_eq!(preserved.len(), 1, "one preserved copy: {preserved:?}");
+        let kept = fs::read_to_string(store.root().join(&preserved[0])).unwrap();
+        assert_eq!(kept, "{not json");
     }
 }

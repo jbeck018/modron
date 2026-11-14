@@ -10,6 +10,19 @@
 //! `post_tool` also `MODRON_TOOL_EXIT_CODE` ("0"/"1" — the tool's
 //! `ToolOutcome::is_error`, not the shell's).
 //!
+//! Large arguments: Linux rejects a single environment string over 128 KiB
+//! (E2BIG), which would make every large `write` fail its spawn and, for a
+//! `pre_tool` hook, be vetoed. So `MODRON_TOOL_ARGS` is capped at
+//! [`MAX_ENV_ARGS_BYTES`] (truncated on a char boundary, suffixed with
+//! ` ...[truncated]`) and `MODRON_TOOL_ARGS_TRUNCATED=1` is set when that
+//! happens. The FULL, untruncated arguments JSON is always written to the
+//! hook's stdin, which is then closed. Hooks that need complete arguments
+//! must read stdin.
+//!
+//! Timeouts: a hook that exceeds its timeout, or whose future is dropped
+//! (e.g. on interrupt), is killed (`kill_on_drop` plus an explicit kill on
+//! the timeout path); it never keeps running in the background.
+//!
 //! Blocking-in-async note: like the JSONL store, hook processes run on the
 //! async executor via `tokio::process` with an explicit timeout; acceptable
 //! for the one-shot CLI.
@@ -17,9 +30,34 @@
 use crate::{Error, Result};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Default wall-clock budget for one hook invocation.
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest `MODRON_TOOL_ARGS` value placed in the environment, in bytes.
+/// Above this the value is truncated and the full JSON goes on stdin.
+pub const MAX_ENV_ARGS_BYTES: usize = 32 * 1024;
+
+/// Env var carrying the (possibly truncated) tool arguments JSON.
+const TOOL_ARGS_VAR: &str = "MODRON_TOOL_ARGS";
+/// Env var set to "1" when `MODRON_TOOL_ARGS` was truncated.
+const TOOL_ARGS_TRUNCATED_VAR: &str = "MODRON_TOOL_ARGS_TRUNCATED";
+/// Suffix appended to a truncated env value.
+const TRUNCATION_SUFFIX: &str = " ...[truncated]";
+
+/// `Some(capped)` when `value` exceeds `max` bytes: the prefix cut on a char
+/// boundary plus [`TRUNCATION_SUFFIX`]. `None` when it fits.
+fn cap_env_value(value: &str, max: usize) -> Option<String> {
+    if value.len() <= max {
+        return None;
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}{TRUNCATION_SUFFIX}", &value[..end]))
+}
 
 /// User-configured hook commands (wired from config in a later tranche;
 /// today they arrive via `EngineConfig` in tests and the future config file).
@@ -118,34 +156,80 @@ pub fn scrub_tokio_command(cmd: &mut tokio::process::Command) {
 /// Run `cmd` through `sh -c` with the given env vars. Non-zero exit or a
 /// timeout counts as a veto (for pre-tool hooks; post-tool callers ignore
 /// `blocked` and just log).
+///
+/// `MODRON_TOOL_ARGS` is capped in the environment (see the module docs); the
+/// full value is always written to the hook's stdin, which is then closed.
+/// A timed-out hook is killed, as is one whose future is dropped.
 pub async fn run_hook(
     cmd: &str,
     envs: &[(String, String)],
     timeout: Duration,
 ) -> Result<HookOutcome> {
+    let mut stdin_payload: Vec<u8> = Vec::new();
+    let mut child_envs: Vec<(String, String)> = Vec::with_capacity(envs.len() + 1);
+    for (name, value) in envs {
+        if name == TOOL_ARGS_VAR {
+            stdin_payload = value.as_bytes().to_vec();
+            match cap_env_value(value, MAX_ENV_ARGS_BYTES) {
+                Some(capped) => {
+                    child_envs.push((name.clone(), capped));
+                    child_envs.push((TOOL_ARGS_TRUNCATED_VAR.to_string(), "1".to_string()));
+                }
+                None => child_envs.push((name.clone(), value.clone())),
+            }
+        } else {
+            child_envs.push((name.clone(), value.clone()));
+        }
+    }
+
     let mut command = tokio::process::Command::new("sh");
     scrub_tokio_command(&mut command);
     command
         .arg("-c")
         .arg(cmd)
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = command.spawn().map_err(|e| Error::Tool {
+        .envs(child_envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|e| Error::Tool {
         tool: "hook".into(),
         message: format!("cannot spawn hook: {e}"),
     })?;
+    let stdin = child.stdin.take();
+    let mut stderr = child.stderr.take();
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return Err(Error::Tool {
+    let run = async {
+        let feed = async {
+            if let Some(mut stdin) = stdin {
+                // A hook that exits without reading stdin breaks the pipe;
+                // that is not an error for the hook's verdict.
+                let _ = stdin.write_all(&stdin_payload).await;
+                let _ = stdin.shutdown().await;
+            }
+        };
+        let read_stderr = async {
+            let mut buf = Vec::new();
+            if let Some(stderr) = stderr.as_mut() {
+                let _ = stderr.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let ((), stderr_bytes, status) = tokio::join!(feed, read_stderr, child.wait());
+        (stderr_bytes, status)
+    };
+
+    let (stderr_bytes, status) = match tokio::time::timeout(timeout, run).await {
+        Ok((stderr_bytes, status)) => {
+            let status = status.map_err(|e| Error::Tool {
                 tool: "hook".into(),
                 message: format!("hook failed to run: {e}"),
-            });
+            })?;
+            (stderr_bytes, status)
         }
         Err(_) => {
+            // The run future is gone; make sure the hook process is too.
+            let _ = child.kill().await;
             return Ok(HookOutcome {
                 blocked: true,
                 message: format!("hook timed out after {}s", timeout.as_secs()),
@@ -153,8 +237,8 @@ pub async fn run_hook(
         }
     };
 
-    let stderr_tail = tail(String::from_utf8_lossy(&output.stderr).trim(), 400);
-    if output.status.success() {
+    let stderr_tail = tail(String::from_utf8_lossy(&stderr_bytes).trim(), 400);
+    if status.success() {
         Ok(HookOutcome {
             blocked: false,
             message: String::new(),
@@ -164,7 +248,7 @@ pub async fn run_hook(
             blocked: true,
             message: format!(
                 "hook exited with {} — {}",
-                output.status.code().unwrap_or(-1),
+                status.code().unwrap_or(-1),
                 stderr_tail
             ),
         })
@@ -223,6 +307,68 @@ mod tests {
             .unwrap();
         assert!(out.blocked);
         assert!(out.message.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_hook_is_killed_and_its_marker_never_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("late.txt");
+        let script = format!("sleep 1; touch {}", marker.display());
+        let out = run_hook(&script, &[], Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(out.blocked);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "timed-out hook kept running");
+    }
+
+    #[tokio::test]
+    async fn dropped_hook_future_kills_the_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("late.txt");
+        let script = format!("sleep 1; touch {}", marker.display());
+        // Simulate an interrupt: the outer timeout drops the run_hook future.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_hook(&script, &[], Duration::from_secs(30)),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "dropped hook kept running");
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_args_are_capped_in_env_and_full_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdin_out = dir.path().join("stdin.json");
+        let flag = dir.path().join("flag.txt");
+        let args = format!("{{\"content\":\"{}\"}}", "a".repeat(300 * 1024));
+        let envs = vec![("MODRON_TOOL_ARGS".to_string(), args.clone())];
+        // Env value must be capped (well under the 128 KiB single-string limit).
+        let script = format!(
+            "cat > {stdin}; printf '%s' \"$MODRON_TOOL_ARGS_TRUNCATED\" > {flag}; \
+             test \"${{#MODRON_TOOL_ARGS}}\" -le 40000",
+            stdin = stdin_out.display(),
+            flag = flag.display(),
+        );
+        let out = run_hook(&script, &envs, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(!out.blocked, "hook vetoed: {}", out.message);
+        assert_eq!(std::fs::read_to_string(&stdin_out).unwrap(), args);
+        assert_eq!(std::fs::read_to_string(&flag).unwrap(), "1");
+    }
+
+    #[test]
+    fn tool_args_cap_is_char_boundary_safe() {
+        let small = "{\"a\":1}";
+        assert_eq!(cap_env_value(small, MAX_ENV_ARGS_BYTES), None);
+        let multi = "é".repeat(MAX_ENV_ARGS_BYTES);
+        let capped = cap_env_value(&multi, MAX_ENV_ARGS_BYTES).unwrap();
+        assert!(capped.ends_with(" ...[truncated]"));
+        let body = capped.strip_suffix(" ...[truncated]").unwrap();
+        assert!(body.len() <= MAX_ENV_ARGS_BYTES);
+        assert!(body.chars().all(|c| c == 'é'));
     }
 
     #[tokio::test]
