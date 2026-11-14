@@ -514,3 +514,175 @@ async fn approval_timeout_publishes_a_deny_resolution() {
     );
     assert!(handle.live_state().pending_approval.is_none());
 }
+
+/// Template engine over `store`, shared by the LG regression tests.
+fn engine_over(store: Arc<dyn SessionStore>) -> Engine {
+    Engine {
+        selector: Arc::new(modron_core::testing::StaticSelector::new(
+            "mock-model",
+            "mock",
+        )),
+        providers: Default::default(),
+        tools: Arc::new(modron_core::ToolRegistry::new()),
+        store,
+        config: EngineConfig {
+            default_model: "mock-model".into(),
+            default_provider: "mock".into(),
+            ..EngineConfig::default()
+        },
+    }
+}
+
+/// A run that never completes on its own (it occupies the run slot).
+fn parked_run(id: SessionId) -> modron_server::RunFuture {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(modron_core::RunSummary {
+            session_id: id,
+            answer: "unreachable".into(),
+            turns: 0,
+            tool_calls: 0,
+            usage: Default::default(),
+            models_used: vec![],
+        })
+    })
+}
+
+/// LG-a: a rejected patch applies nothing - the status labels and the
+/// engine config both still describe the session before the patch.
+#[tokio::test]
+async fn rejected_config_patch_applies_nothing() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    let before = handle.live_state();
+    let result = handle.apply_config(&ConfigPatch {
+        model: Some("other-model".into()),
+        persona: Some("nope".into()),
+        ..ConfigPatch::default()
+    });
+    assert!(result.is_err(), "unknown persona must reject the patch");
+    let after = handle.live_state();
+    assert_eq!(after.model, before.model, "model label must not move");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider label must not move"
+    );
+    assert_eq!(handle.engine_cell().config.default_model, "mock-model");
+}
+
+/// LG-e: a known session with no events keeps its id on every submit, even
+/// after the adoption pin was consumed by an earlier (failed) first run.
+#[tokio::test]
+async fn adoption_pin_is_rearmed_for_a_later_submit_on_an_empty_session() {
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::new());
+    let hub = SessionHub::empty();
+    hub.set_engine(engine_over(Arc::clone(&store)));
+    let meta = store.create_session("new").await.unwrap();
+    let handle = hub.ensure_session(meta.id, Some(meta.id));
+
+    // First run adopts the reserved session and consumes the pin.
+    let first = handle.engine_cell().clone();
+    assert_eq!(first.store.create_session("t").await.unwrap().id, meta.id);
+
+    // A later submit on the still-empty session must land in that session.
+    handle.rearm_adoption();
+    let second = handle.engine_cell().clone();
+    assert_eq!(second.store.create_session("t").await.unwrap().id, meta.id);
+}
+
+/// LG-c (sequential form): a run started right after an interrupt must
+/// prompt for approval. The bad interleaving itself needs a seam; this
+/// pins the observable contract the fix protects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_started_after_an_interrupt_still_prompts_for_approval() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    let mut rx = handle.subscribe();
+    hub.start_run(id, parked_run(id)).unwrap();
+    assert!(handle.interrupt());
+
+    hub.start_run(id, parked_run(id)).unwrap();
+    let call = ToolCall {
+        id: "c2".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({}),
+    };
+    let gate_handle = Arc::clone(&handle);
+    let gate = tokio::spawn(async move { gate_handle.approve_gate(&call) });
+
+    let request_id = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the new run's approval must be published")
+            .map(parse_live)
+            .unwrap();
+        if let Payload::ApprovalRequested { request_id, .. } = frame.payload {
+            break request_id;
+        }
+    };
+    handle.resolve(&request_id, Decision::AllowOnce).unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(2), gate)
+        .await
+        .unwrap()
+        .unwrap());
+    handle.interrupt();
+}
+
+/// LG-d: the watermark and the live buffers come from one read. A snapshot
+/// taken after N frames reports seq N and carries exactly the buffers those
+/// frames built; the next delta is the first frame above the watermark.
+#[tokio::test]
+async fn snapshot_point_pairs_the_watermark_with_the_live_buffers() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    handle.on_stream_delta(StreamDelta::Text("ab".into()));
+    handle.on_stream_delta(StreamDelta::Text("cd".into()));
+    let mut rx = handle.subscribe();
+
+    let (watermark, live) = handle.snapshot_point();
+    assert_eq!(watermark, 2);
+    assert_eq!(live.streaming_text, "abcd");
+
+    handle.on_stream_delta(StreamDelta::Text("e".into()));
+    let next = parse_live(rx.recv().await.unwrap());
+    assert_eq!(next.seq, watermark + 1, "first frame above the watermark");
+    assert_eq!(handle.snapshot_point().1.streaming_text, "abcde");
+}
+
+/// LG-b: a pending delete fences out runs; a running session cannot be
+/// fenced at all; cancelling the delete lifts the fence.
+#[tokio::test]
+async fn delete_fence_refuses_runs_until_it_settles() {
+    let (hub, id) = test_hub();
+    hub.begin_delete(id).unwrap();
+    assert!(
+        hub.start_run(id, parked_run(id)).is_err(),
+        "no run may start while the delete is pending"
+    );
+    hub.cancel_delete(id);
+
+    hub.start_run(id, parked_run(id)).unwrap();
+    assert!(
+        hub.begin_delete(id).is_err(),
+        "a running session cannot be deleted"
+    );
+    assert!(hub.handle(&id).unwrap().interrupt());
+}
+
+/// LG-a: an accepted patch commits config, selector and labels together.
+#[tokio::test]
+async fn accepted_config_patch_moves_config_and_labels_together() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    handle
+        .apply_config(&ConfigPatch {
+            model: Some("other-model".into()),
+            goal: Some("ship it".into()),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let live = handle.live_state();
+    assert_eq!(live.model, "other-model");
+    assert_eq!(live.goal, "ship it");
+    assert_eq!(handle.engine_cell().config.default_model, "other-model");
+}

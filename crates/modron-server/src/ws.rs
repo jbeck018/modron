@@ -28,7 +28,7 @@ use tokio_tungstenite::tungstenite::http::{Response as HttpResponse, StatusCode}
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::dispatch::{handle_frame, send, ConnCtx, Flow, ServerState};
+use crate::dispatch::{handle_frame, send, Backlog, ConnCtx, Flow, ServerState};
 
 /// Pre-auth and back-pressure bounds for one WebSocket connection.
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +39,9 @@ pub(crate) struct WsLimits {
     pub pre_auth_max_bytes: usize,
     /// Longest a single outbound frame may take to be written.
     pub slow_consumer_timeout: Duration,
+    /// Most frames queued for one client and not yet written; past this the
+    /// connection is closed, whatever the write timeout says (LG-f).
+    pub max_backlog: usize,
 }
 
 impl WsLimits {
@@ -46,6 +49,7 @@ impl WsLimits {
         hello_deadline: Duration::from_secs(10),
         pre_auth_max_bytes: 64 * 1024,
         slow_consumer_timeout: Duration::from_secs(30),
+        max_backlog: 4096,
     };
 }
 
@@ -135,6 +139,10 @@ async fn serve_ws_connection(
     // through this channel in order. A frame that cannot be written within
     // the slow-consumer timeout ends the writer, which ends the connection.
     let slow_consumer_timeout = limits.slow_consumer_timeout;
+    // Queued-but-unwritten accounting: the enqueue side counts up, the
+    // writer below counts down after each write attempt (LG-f).
+    let backlog = Backlog::new(limits.max_backlog);
+    let writer_backlog = Arc::clone(&backlog);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     let mut writer = tokio::spawn(async move {
         while let Some(outbound) = out_rx.recv().await {
@@ -144,26 +152,46 @@ async fn serve_ws_connection(
                 Outbound::Reply(frame) => serde_json::to_string(&frame),
                 Outbound::Live(live) => Ok(live.json.to_string()),
             };
-            let Ok(json) = json else { break };
-            match tokio::time::timeout(slow_consumer_timeout, sink.send(Message::text(json))).await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    tracing::debug!("websocket client too slow; closing connection");
-                    break;
+            let sent = match json {
+                Ok(json) => {
+                    match tokio::time::timeout(
+                        slow_consumer_timeout,
+                        sink.send(Message::text(json)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => true,
+                        Ok(Err(_)) => false,
+                        Err(_) => {
+                            tracing::debug!("websocket client too slow; closing connection");
+                            false
+                        }
+                    }
                 }
+                Err(_) => false,
+            };
+            writer_backlog.written();
+            if !sent {
+                break;
             }
         }
     });
+    // Aborting the writer drops the sink (and with it the socket) even when
+    // the queue still holds frames: an overflowing client is not drained.
+    let writer_abort = writer.abort_handle();
 
-    let mut ctx = ConnCtx::new(out_tx.clone());
+    let mut ctx = ConnCtx::with_backlog(out_tx.clone(), Arc::clone(&backlog));
     let mut flow = Flow::Continue;
     let mut writer_done = false;
     while flow == Flow::Continue {
         let next = tokio::select! {
             biased;
             _ = &mut writer => {
+                writer_done = true;
+                break;
+            }
+            _ = backlog.overflow().notified() => {
+                writer_abort.abort();
                 writer_done = true;
                 break;
             }
@@ -340,6 +368,51 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("server must cut off a client that stops reading")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// LG-f: a client that never reads is cut off by the backlog cap, long
+    /// before the (here 60 s) write timeout would fire.
+    #[tokio::test]
+    async fn unread_client_is_cut_off_at_the_backlog_cap() {
+        let limits = WsLimits {
+            max_backlog: 64,
+            slow_consumer_timeout: Duration::from_secs(60),
+            ..WsLimits::DEFAULT
+        };
+        let (addr, task, _dir) = spawn_one(limits).await;
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let hello = Frame::request(
+            1,
+            Payload::Hello {
+                client: "test".into(),
+                protocol: modron_protocol::PROTOCOL_VERSION,
+                token: None,
+            },
+        );
+        client
+            .send(WsMessage::text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+        // Pings are answered with pongs that nobody reads: once the socket
+        // buffers fill, replies queue on the server until the cap closes it.
+        let ping = serde_json::to_string(&Frame::request(2, Payload::Ping {})).unwrap();
+        let flood = async {
+            loop {
+                if client.send(WsMessage::text(ping.clone())).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), flood)
+            .await
+            .ok();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the backlog cap must close an unread connection")
             .unwrap();
         assert!(result.is_ok());
     }

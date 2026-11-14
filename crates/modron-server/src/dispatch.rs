@@ -12,11 +12,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use modron_core::SessionId;
 use modron_protocol::{Frame, Payload, SessionMetaWire, PROTOCOL_VERSION};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use crate::hub::{session_title, task_with_goal, RunFuture, SessionHub};
@@ -62,10 +63,79 @@ pub enum Outbound {
     Live(Box<crate::hub::LiveFrame>),
 }
 
+/// Queued-but-unwritten frame accounting for one capped connection (the
+/// WebSocket transport). The sender side counts up in [`enqueue_on`]; the
+/// writer task counts down through [`Backlog::written`] after each write
+/// attempt. Past `limit` the connection is closed: the overflow signal fires
+/// and the transport ends the connection (LG-f).
+pub struct Backlog {
+    queued: AtomicUsize,
+    limit: usize,
+    warned: AtomicBool,
+    overflow: Notify,
+}
+
+impl Backlog {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            queued: AtomicUsize::new(0),
+            limit,
+            warned: AtomicBool::new(false),
+            overflow: Notify::new(),
+        })
+    }
+
+    /// Writer side: one queued frame has been written (or given up on).
+    pub fn written(&self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Fires (and stays signalled) once the backlog has overflowed.
+    pub fn overflow(&self) -> &Notify {
+        &self.overflow
+    }
+}
+
+/// Enqueue one outbound frame on a connection's channel, counting it
+/// against `backlog` when the connection is capped. Returns `false` when
+/// the frame was not queued (channel closed, or the backlog overflowed and
+/// the connection is being closed).
+fn enqueue_on(
+    out: &mpsc::UnboundedSender<Outbound>,
+    backlog: Option<&Backlog>,
+    outbound: Outbound,
+) -> bool {
+    if let Some(backlog) = backlog {
+        let queued = backlog.queued.fetch_add(1, Ordering::AcqRel) + 1;
+        if queued > backlog.limit {
+            backlog.queued.fetch_sub(1, Ordering::AcqRel);
+            if !backlog.warned.swap(true, Ordering::AcqRel) {
+                tracing::warn!(
+                    limit = backlog.limit,
+                    "client backlog over the cap; closing the connection"
+                );
+            }
+            backlog.overflow.notify_one();
+            return false;
+        }
+    }
+    if out.send(outbound).is_ok() {
+        true
+    } else {
+        if let Some(backlog) = backlog {
+            backlog.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        false
+    }
+}
+
 /// Per-connection state.
 pub struct ConnCtx {
     /// Server->client frames (the transport's writer task drains it).
     pub out: mpsc::UnboundedSender<Outbound>,
+    /// Backlog accounting when the transport caps its queue (WebSocket);
+    /// `None` for the uncapped transports.
+    pub backlog: Option<Arc<Backlog>>,
     /// Set by the `hello` handshake.
     pub authed: bool,
     pub subscription: Option<Subscription>,
@@ -80,6 +150,19 @@ impl ConnCtx {
     pub fn new(out: mpsc::UnboundedSender<Outbound>) -> Self {
         Self {
             out,
+            backlog: None,
+            authed: false,
+            subscription: None,
+            scope: None,
+        }
+    }
+
+    /// A connection whose queue is capped by `backlog` (the WebSocket
+    /// writer must decrement the same counter).
+    pub fn with_backlog(out: mpsc::UnboundedSender<Outbound>, backlog: Arc<Backlog>) -> Self {
+        Self {
+            out,
+            backlog: Some(backlog),
             authed: false,
             subscription: None,
             scope: None,
@@ -91,10 +174,16 @@ impl ConnCtx {
     pub fn scoped(out: mpsc::UnboundedSender<Outbound>, session: SessionId) -> Self {
         Self {
             out,
+            backlog: None,
             authed: true,
             subscription: None,
             scope: Some(session),
         }
+    }
+
+    /// Queue one outbound frame on this connection.
+    pub fn enqueue(&self, outbound: Outbound) -> bool {
+        enqueue_on(&self.out, self.backlog.as_deref(), outbound)
     }
 }
 
@@ -179,7 +268,7 @@ fn error_kind(
 /// Fire-and-forget send to one connection (a closed transport just drops
 /// the frame).
 pub(crate) fn send(ctx: &ConnCtx, frame: Frame) {
-    let _ = ctx.out.send(Outbound::Reply(Box::new(frame)));
+    let _ = ctx.enqueue(Outbound::Reply(Box::new(frame)));
 }
 
 /// Handle one client frame. Returns [`Flow::Close`] on auth failures.
@@ -706,47 +795,61 @@ async fn handle_delete_session(
     request_id: Option<u64>,
     session_id: SessionId,
 ) {
-    // A running session keeps its history until it settles.
-    if state
-        .hub
-        .handle(&session_id)
-        .is_some_and(|handle| handle.is_busy())
-    {
-        send(
-            ctx,
-            error(
-                request_id,
-                "session is running - interrupt it before deleting",
-            ),
-        );
+    // A running session keeps its history until it settles. The busy check
+    // and the fence against new runs are one step (LG-b): no run can start
+    // between them and the removal below.
+    if let Err(message) = state.hub.begin_delete(session_id) {
+        send(ctx, error(request_id, message));
         return;
     }
     match state.store.delete(session_id).await {
-        Ok(true) => {
-            state.hub.remove(&session_id);
-            send(
-                ctx,
-                reply(
-                    request_id,
-                    Some(session_id),
-                    Payload::Note {
-                        text: format!("session deleted: {session_id}"),
-                    },
-                ),
-            );
+        Ok(removed) => {
+            state.hub.finish_delete(session_id);
+            forget_session_state(state, session_id);
+            if removed {
+                send(
+                    ctx,
+                    reply(
+                        request_id,
+                        Some(session_id),
+                        Payload::Note {
+                            text: format!("session deleted: {session_id}"),
+                        },
+                    ),
+                );
+            } else {
+                send(
+                    ctx,
+                    error_kind(
+                        request_id,
+                        format!("no such session {session_id}"),
+                        modron_protocol::ErrorKind::NotFound,
+                    ),
+                );
+            }
         }
-        Ok(false) => {
-            send(
-                ctx,
-                error_kind(
-                    request_id,
-                    format!("no such session {session_id}"),
-                    modron_protocol::ErrorKind::NotFound,
-                ),
-            );
+        Err(e) => {
+            state.hub.cancel_delete(session_id);
+            send(ctx, error(request_id, format!("delete failed: {e}")));
         }
-        Err(e) => send(ctx, error(request_id, format!("delete failed: {e}"))),
     }
+}
+
+/// Drop the server-side state a deleted session leaves behind (LG-b): its
+/// share key, its live remote-control tunnel (aborted, not just forgotten)
+/// and its worktree-task record. The worktree directory itself is left on
+/// disk.
+fn forget_session_state(state: &Arc<ServerState>, session_id: SessionId) {
+    fn guard<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    guard(&state.rc_keys).remove(&session_id);
+    if let Some(tunnel) = guard(&state.rc_tunnels).remove(&session_id) {
+        tunnel.abort();
+    }
+    state.tasks.remove(&session_id);
 }
 
 async fn handle_publish_page(
@@ -1099,6 +1202,10 @@ async fn submit(
                 }
             };
             let handle = state.hub.ensure_session(id, Some(id));
+            // Re-arm the adoption pin: a known session always runs in
+            // itself, even when an earlier run already consumed the pin
+            // without writing an event (LG-e).
+            handle.rearm_adoption();
             let engine = handle.engine_cell().clone();
             let goal = handle_goal(&handle);
             let full_task = task_with_goal(&goal, &task);
@@ -1217,11 +1324,12 @@ async fn attach(
             return;
         }
     };
-    let persisted_through = handle.current_seq();
+    // The watermark and the live state come from ONE read under the seq
+    // lock (LG-d). Every sink mutates its buffers and publishes under that
+    // lock, so the live state holds exactly the frames at or below the
+    // watermark; the append lock still held makes the persisted log match it.
+    let (watermark, live) = handle.snapshot_point();
     drop(append_guard);
-    // One watermark read: two reads could straddle a publish and put a
-    // frame's seq above the snapshot's last_seq (cycle-2 audit L9).
-    let watermark = handle.current_seq();
     let snapshot = Frame {
         id: request_id,
         session: Some(session_id),
@@ -1230,27 +1338,27 @@ async fn attach(
             session_id,
             last_seq: watermark,
             events,
-            live: handle.live_state(),
+            live,
         },
     };
-    if ctx.out.send(Outbound::Reply(Box::new(snapshot))).is_err() {
+    if !ctx.enqueue(Outbound::Reply(Box::new(snapshot))) {
         forward.abort();
         return;
     }
 
-    // 3. Forward the buffered live frames, dropping the duplicated
-    // prefix: frames at or below persisted_through are already inside
-    // the snapshot (cycle-2 audit M1 - the doc claimed clients deduped
-    // by seq; none ever did).
+    // 3. Forward the buffered live frames strictly after the watermark:
+    // frames at or below it are already inside the snapshot (cycle-2 audit
+    // M1 - the doc claimed clients deduped by seq; none ever did).
     let out = ctx.out.clone();
+    let backlog = ctx.backlog.clone();
     let pump = tokio::spawn(async move {
         while let Some(outbound) = buf_rx.recv().await {
             if let Outbound::Live(live) = &outbound {
-                if live.seq <= persisted_through {
+                if live.seq <= watermark {
                     continue;
                 }
             }
-            if out.send(outbound).is_err() {
+            if !enqueue_on(&out, backlog.as_deref(), outbound) {
                 break;
             }
         }
@@ -1337,5 +1445,201 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::TaskStatus { .. } => "task_status",
         Payload::TaskMerged { .. } => "task_merged",
         Payload::Ping {} => "ping",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::BroadcastingStore;
+    use crate::tasks::TaskRecord;
+    use modron_core::testing::StaticSelector;
+    use modron_core::{Engine, EngineConfig, RunSummary, SessionStore, ToolRegistry};
+    use std::time::Duration;
+
+    /// A served state over an on-disk store (delete needs a real store),
+    /// wired like the real server: the engine's store is the hub's
+    /// broadcasting store. The TempDir must outlive the state.
+    fn test_state() -> (Arc<ServerState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SessionHub::empty();
+        let inner: Arc<dyn SessionStore> = Arc::new(modron_store::JsonlSessionStore::new(
+            dir.path().join("sessions"),
+        ));
+        let store: Arc<dyn SessionStore> = Arc::new(BroadcastingStore::new(inner, hub.clone()));
+        hub.set_engine(Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: Default::default(),
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::clone(&store),
+            config: EngineConfig {
+                default_model: "mock-model".into(),
+                default_provider: "mock".into(),
+                ..EngineConfig::default()
+            },
+        });
+        let state = Arc::new(ServerState {
+            hub,
+            store,
+            devices_dir: dir.path().to_path_buf(),
+            version: "test".into(),
+            working_dir: dir.path().to_path_buf(),
+            tasks: crate::tasks::TaskRegistry::new(),
+            bridge_base: None,
+            rc_keys: std::sync::Mutex::new(HashMap::new()),
+            rc_tunnels: std::sync::Mutex::new(HashMap::new()),
+        });
+        (state, dir)
+    }
+
+    /// An authenticated connection and its outbound receiver.
+    fn authed_ctx() -> (ConnCtx, mpsc::UnboundedReceiver<Outbound>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut ctx = ConnCtx::new(tx);
+        ctx.authed = true;
+        (ctx, rx)
+    }
+
+    async fn next_outbound(rx: &mut mpsc::UnboundedReceiver<Outbound>) -> Outbound {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an outbound frame")
+            .expect("channel open")
+    }
+
+    fn parked_run(id: SessionId) -> RunFuture {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(RunSummary {
+                session_id: id,
+                answer: "unreachable".into(),
+                turns: 0,
+                tool_calls: 0,
+                usage: Default::default(),
+                models_used: vec![],
+            })
+        })
+    }
+
+    /// LG-b: deleting a session removes its share key, its live tunnel and
+    /// its task record, not just the transcript and the live handle.
+    #[tokio::test]
+    async fn delete_session_forgets_its_rc_key_tunnel_and_task_record() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("doomed").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        state.rc_keys.lock().unwrap().insert(id, "key".into());
+        let tunnel = tokio::spawn(std::future::pending::<()>());
+        state
+            .rc_tunnels
+            .lock()
+            .unwrap()
+            .insert(id, tunnel.abort_handle());
+        state.tasks.insert(TaskRecord {
+            session_id: id,
+            worktree: std::env::temp_dir(),
+            branch: "task-branch".into(),
+            base: "main".into(),
+            title: "doomed".into(),
+        });
+
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(1, Payload::DeleteSession { session_id: id }),
+        )
+        .await;
+        let reply = next_outbound(&mut rx).await;
+        assert!(
+            matches!(reply, Outbound::Reply(ref f) if matches!(f.payload, Payload::Note { .. })),
+            "delete succeeds: {reply:?}"
+        );
+
+        assert!(state.rc_keys.lock().unwrap().get(&id).is_none());
+        assert!(state.rc_tunnels.lock().unwrap().get(&id).is_none());
+        assert!(
+            tunnel.await.unwrap_err().is_cancelled(),
+            "the live tunnel task is aborted"
+        );
+        assert!(state.tasks.get(&id).is_none());
+        assert!(state.hub.handle(&id).is_none());
+        assert!(state
+            .store
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|meta| meta.id != id));
+    }
+
+    /// LG-b: a running session is refused, and nothing is removed.
+    #[tokio::test]
+    async fn delete_session_refuses_a_running_session_and_keeps_its_state() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("busy").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        state.hub.start_run(id, parked_run(id)).unwrap();
+        state.rc_keys.lock().unwrap().insert(id, "key".into());
+
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(1, Payload::DeleteSession { session_id: id }),
+        )
+        .await;
+        let reply = next_outbound(&mut rx).await;
+        assert!(
+            matches!(reply, Outbound::Reply(ref f) if matches!(f.payload, Payload::Error { .. })),
+            "a running session is refused: {reply:?}"
+        );
+        assert!(state.hub.handle(&id).is_some());
+        assert!(state.rc_keys.lock().unwrap().get(&id).is_some());
+        assert!(state
+            .store
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|meta| meta.id == id));
+        state.hub.handle(&id).unwrap().interrupt();
+    }
+
+    /// LG-d: the snapshot's watermark is the last seq published before it,
+    /// and the pump forwards only frames strictly after it.
+    #[tokio::test]
+    async fn attach_snapshot_watermark_is_the_seq_the_pump_starts_after() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("attach").await.unwrap().id;
+        let handle = state.hub.ensure_session(id, None);
+        for n in 0..3 {
+            handle.publish(Payload::Note {
+                text: format!("n{n}"),
+            });
+        }
+
+        let (mut ctx, mut rx) = authed_ctx();
+        attach(&state, &mut ctx, Some(9), id).await;
+        let snapshot = match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => *frame,
+            other => panic!("expected the snapshot first, got {other:?}"),
+        };
+        let last_seq = match snapshot.payload {
+            Payload::Snapshot { last_seq, .. } => last_seq,
+            other => panic!("expected a snapshot, got {other:?}"),
+        };
+        assert_eq!(last_seq, 3);
+        assert_eq!(snapshot.seq, 3);
+
+        handle.publish(Payload::Note {
+            text: "live".into(),
+        });
+        match next_outbound(&mut rx).await {
+            Outbound::Live(live) => assert_eq!(live.seq, 4, "first live frame after the watermark"),
+            other => panic!("expected a live frame, got {other:?}"),
+        }
     }
 }
