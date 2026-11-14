@@ -62,13 +62,14 @@ it without needing the rest of the review in context.
 
 ## 2. Design decisions already made (workers do not re-decide these)
 
-D1. **Approval gate is inverted to a read-only allowlist.** Replace
-    `MUTATING_TOOLS` with `READ_ONLY_TOOLS = ["read", "glob", "grep",
-    "read_minified", "tool_search", "memory_search", "plan", "skill",
-    "explore"]`. Every other tool name, including every `mcp__*` tool,
-    `diagnostics`, `interact`, `remember`, `delegate`, `verify`, `bash`,
-    `write`, `edit`, is gated. The existing `allow` list remains the way to
-    pre-approve a tool (e.g. `--allow remember`).
+D1. **Approval gate stays a gated list, extended** (owner decision
+    2026-11-14). `MUTATING_TOOLS` becomes `["bash", "write", "edit",
+    "verify", "diagnostics", "interact", "delegate"]`, and any tool whose
+    name starts with `mcp__` is gated as well. `remember` stays ungated
+    (accepted risk, tracked in the backlog). The existing `allow` list
+    remains the way to pre-approve a tool (e.g. `--allow diagnostics`).
+    Consequence: a tool added later is ungated unless it is added to this
+    list, so every new tool needs an explicit gated/ungated decision.
 
 D2. **Subagents inherit, never widen.** A child engine copies the parent's
     `sandbox`, `hooks`, `max_cost_usd`, `price_lookup`, and the UNION of the
@@ -152,23 +153,24 @@ Format: `ID | tier | severity` then problem, files, change, acceptance.
 
 Strictly serial: A1 -> A2 -> A3 -> A4 -> A5 -> A6 -> A7.
 
-**A1 | H+ | critical - Gate every non-read-only tool (D1)**
+**A1 | H+ | critical - Gate diagnostics, interact, delegate and MCP tools (D1)**
 - Problem: `MUTATING_TOOLS` (engine.rs, near line 30) gates only bash,
   write, edit, verify. `diagnostics` (runs `sh -c` on a model-supplied
-  `command`), `interact` (tmux), `remember`, `delegate`, and all `mcp__*`
-  tools run with no approval in ask and deny mode.
+  `command`), `interact` (tmux), `delegate`, and all `mcp__*` tools run
+  with no approval in ask and deny mode.
 - Files: `crates/modron-core/src/engine.rs`,
   `crates/modron-core/tests/interactivity.rs`.
-- Change: replace the constant with `READ_ONLY_TOOLS` per D1 and flip the
-  check at the approval site (search `MUTATING_TOOLS.contains`) to
-  `!READ_ONLY_TOOLS.contains(..)`. Update every other use of the constant
-  (finish-gate arming, checkpoint) so behavior for bash/write/edit/verify is
-  unchanged there: keep a separate `FILE_MUTATING_TOOLS = ["bash", "write",
-  "edit", "verify"]` for those non-approval uses.
+- Change: add one helper `fn is_gated(name: &str) -> bool` that returns
+  true for the D1 list or a `mcp__` prefix, and use it at the approval
+  site (search `MUTATING_TOOLS.contains`). Every OTHER use of the constant
+  (finish-gate arming, checkpoint) must keep its current behavior: give
+  those a separate `FILE_MUTATING_TOOLS = ["bash", "write", "edit",
+  "verify"]`. Add a doc comment on the list stating that every new tool
+  needs an explicit gated/ungated decision.
 - Acceptance: new tests - in Ask mode with no approver, calls named
-  `diagnostics`, `interact`, `remember`, `delegate`, `mcp__x__y` are each
-  blocked; `read`/`grep`/`glob` are not; `--allow remember` unblocks
-  remember. Existing suite green.
+  `diagnostics`, `interact`, `delegate`, `mcp__x__y` are each blocked;
+  `read`/`grep`/`glob`/`remember` are not; `--allow diagnostics` unblocks
+  diagnostics. Existing suite green.
 
 **A2 | H+ | high - Subagents inherit sandbox, deny, hooks, cost cap (D2)**
 - Problem: `subagent.rs` builds the child `EngineConfig` with
@@ -739,9 +741,13 @@ Cross-lane file overlaps the leader must sequence by hand:
   `modron-core/src/context.rs`: neither is in lane A's file set, no
   conflict, but rebase before merge.
 
-## 7. Not in this plan (backlog, low severity)
+## 7. Not in this plan (backlog)
 
-Speculative-read staleness within a mixed turn; auth-failure substring
+Accepted risk (owner decision): `remember` is ungated, so an injected
+instruction can persist a global memory into future system prompts.
+Revisit if memory poisoning is observed.
+
+Low severity: speculative-read staleness within a mixed turn; auth-failure substring
 match on "401"/"403"; memory store locking; process-wide ReadGate; LSP
 protocol details (didChange version, URI encoding, initialize wait);
 delegate error labels; `@` completion byte/char offset; minify line-count
