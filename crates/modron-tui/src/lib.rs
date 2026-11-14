@@ -2810,6 +2810,7 @@ impl App {
     ) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
         self.running = false;
+        self.clear_run_approvals();
         // The /share source (desktop parity: the last assistant answer).
         if !answer.is_empty() {
             self.last_answer = Some(answer.clone());
@@ -2900,6 +2901,7 @@ impl App {
     pub fn finish_interrupted(&mut self) -> Vec<Line<'static>> {
         let t = self.theme.resolved();
         self.running = false;
+        self.clear_run_approvals();
         self.commit_tool_summary();
         self.streaming.clear();
         self.current_tool = None;
@@ -2913,8 +2915,17 @@ impl App {
         lines
     }
 
+    /// D6: "allow all" and the pending prompt belong to ONE run. Cleared at
+    /// run start and run end. Dropping a pending prompt drops its respond
+    /// sender, so a parked local engine receives no decision and is denied.
+    pub fn clear_run_approvals(&mut self) {
+        self.approve_rest = false;
+        self.pending_approval = None;
+    }
+
     /// Begin a submitted task.
     pub fn begin_task(&mut self, task: &str) {
+        self.clear_run_approvals();
         self.running = true;
         self.streaming.clear();
         self.status_note = None;
