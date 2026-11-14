@@ -1,6 +1,6 @@
 //! `edit` tool (LEDGER T1) — exact string replacement in text files.
 
-use crate::common::{arg_str, opt_bool, resolve_path, tool_err};
+use crate::common::{arg_str, check_write_path, opt_bool, resolve_path, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
@@ -37,22 +37,18 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-        // Protected instruction sources (Phase: competitive review A3) —
-        // the agent must not edit the files that instruct it. bash remains
-        // the documented escape hatch (and is approval-gated).
-        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-            if is_protected_path(path) {
-                return Ok(tool_err(
-                    NAME,
-                    format!(
-                        "`{path}` is write-protected (instruction/memory source); \
-                             edit it yourself outside the agent"
-                    ),
-                    MAX_BYTES,
-                ));
-            }
-        }
         const NAME: &str = "edit";
+        // Protected instruction sources (Phase: competitive review A3) and
+        // workspace containment (D4): the check runs on the resolved path, so
+        // symlinks, `..` and letter case cannot route around it. bash remains
+        // the documented escape hatch (and is approval-gated).
+        let resolved = match args.get("path").and_then(|v| v.as_str()) {
+            Some(raw) => match check_write_path(&ctx.working_dir, raw) {
+                Ok(path) => Some(path),
+                Err(message) => return Ok(tool_err(NAME, message, MAX_BYTES)),
+            },
+            None => None,
+        };
         let spec = self.spec();
         if let Err(message) = validate_args(&spec, &args) {
             return Ok(tool_err(
@@ -61,10 +57,11 @@ impl Tool for EditTool {
                 MAX_BYTES,
             ));
         }
-        let (Some(raw_path), Some(old), Some(new)) = (
+        let (Some(raw_path), Some(old), Some(new), Some(path)) = (
             arg_str(&args, "path"),
             arg_str(&args, "old_string"),
             arg_str(&args, "new_string"),
+            resolved,
         ) else {
             return Ok(tool_err(
                 NAME,
@@ -73,13 +70,14 @@ impl Tool for EditTool {
             ));
         };
         let replace_all = opt_bool(&args, "replace_all").unwrap_or(false);
-        let path = resolve_path(&ctx.working_dir, raw_path);
 
         // Hard read-before-edit gate (Phase 13): an existing file must have
         // been read this session. Blind edits are the top source of
-        // destroyed-work bugs; the fix is one read away.
+        // destroyed-work bugs; the fix is one read away. The gate keys on the
+        // lexical path, the same key `read` records.
         if let Some(engine) = &ctx.engine {
-            if path.is_file() && !engine.tools.read_gate.seen(&path) {
+            let gate_key = resolve_path(&ctx.working_dir, raw_path);
+            if gate_key.is_file() && !engine.tools.read_gate.seen(&gate_key) {
                 return Ok(tool_err(
                     NAME,
                     format!(
@@ -155,22 +153,6 @@ impl Tool for EditTool {
             MAX_BYTES,
         )))
     }
-}
-
-/// Files the agent may not modify: instruction and memory sources.
-fn is_protected_path(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    let name = p
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if name == "AGENTS.md" || name == "CLAUDE.md" {
-        return true;
-    }
-    p.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        s == ".modron" || s == ".claude" || s == ".git"
-    })
 }
 
 /// Compact `file:line` rail of the change: for single replacements the
@@ -297,6 +279,97 @@ mod tests {
         .await;
         assert!(out.is_error, "{out:?}");
         assert!(out.content.contains("cannot read"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn protected_names_match_case_insensitively() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".GIT/hooks")).unwrap();
+        std::fs::write(dir.path().join(".GIT/hooks/x"), "old\n").unwrap();
+        std::fs::write(dir.path().join("agents.md"), "old\n").unwrap();
+        for path in [".GIT/hooks/x", "agents.md"] {
+            let out = run(
+                json!({"path": path, "old_string": "old", "new_string": "new"}),
+                dir.path(),
+            )
+            .await;
+            assert!(out.is_error, "{path} must be refused: {out:?}");
+            assert!(out.content.contains("write-protected"), "{out:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".GIT/hooks/x")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agents.md")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_through_directory_symlink_into_git_is_refused() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        std::fs::write(dir.path().join(".git/hooks/pre-commit"), "old\n").unwrap();
+        std::os::unix::fs::symlink(".git/hooks", dir.path().join("docs")).unwrap();
+
+        let out = run(
+            json!({"path": "docs/pre-commit", "old_string": "old", "new_string": "evil"}),
+            dir.path(),
+        )
+        .await;
+
+        assert!(out.is_error, "{out:?}");
+        assert!(out.content.contains("write-protected"), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git/hooks/pre-commit")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_through_symlink_to_outside_file_is_refused() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("bashrc");
+        std::fs::write(&victim, "export A=old\n").unwrap();
+        std::os::unix::fs::symlink(&victim, ws.path().join("notes")).unwrap();
+
+        let out = run(
+            json!({"path": "notes", "old_string": "old", "new_string": "evil"}),
+            ws.path(),
+        )
+        .await;
+
+        assert!(out.is_error, "{out:?}");
+        assert!(
+            out.content
+                .contains("outside the workspace through a symlink"),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "export A=old\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_through_symlink_inside_workspace_still_works() {
+        let ws = tempdir().unwrap();
+        std::fs::write(ws.path().join("real.txt"), "old\n").unwrap();
+        std::os::unix::fs::symlink("real.txt", ws.path().join("link.txt")).unwrap();
+
+        let out = run(
+            json!({"path": "link.txt", "old_string": "old", "new_string": "new"}),
+            ws.path(),
+        )
+        .await;
+
+        assert!(!out.is_error, "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("real.txt")).unwrap(),
+            "new\n"
+        );
     }
 }
 
