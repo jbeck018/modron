@@ -134,7 +134,9 @@ impl AsyncRouter for KevRouter {
         let url = format!("{}/v1/systemone", self.endpoint.trim_end_matches('/'));
         let mut request = http
             .post(&url)
-            .timeout(crate::http::REQUEST_TIMEOUT)
+            // A routing verdict must be quick: the turn waits on it and
+            // falls back to the local selector when it is late.
+            .timeout(std::time::Duration::from_secs(30))
             .json(&Self::build_body(task));
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
