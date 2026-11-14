@@ -1933,8 +1933,10 @@ impl Engine {
             return Ok(None);
         }
         let summarized_events = u32::try_from(summarized_count).unwrap_or(u32::MAX);
+        // Only what the previous compaction did not already cover (A7),
+        // capped so the summarizer request cannot outgrow its window.
         let older_text =
-            compact::older_transcript_text(&events, self.config.compaction.tail_messages);
+            compact::incremental_transcript_text(&events, self.config.compaction.tail_messages);
 
         // Route the summarization (cheap model for Summarize per PLAN §4.3).
         let choice = self.selector.select(&SelectRequest {

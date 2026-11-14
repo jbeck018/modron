@@ -44,8 +44,81 @@ facts not present in the transcript."
 /// never ends by orphaning a tool result away from its assistant message.
 pub fn older_transcript_text(events: &[SessionEvent], skip_last_messages: usize) -> String {
     let (older, _) = split_older_tail(events, skip_last_messages);
+    render_events(older.into_iter(), false)
+}
+
+/// Cap on the text handed to the summarizer (A7). A single compaction input
+/// larger than this is elided in the middle rather than sent whole: the
+/// summarizer is a cheap model with a finite window, and a request it
+/// rejects fails the run.
+pub const SUMMARIZER_INPUT_MAX_BYTES: usize = 400_000;
+
+/// The text for the NEXT compaction (A7): only what the previous compaction
+/// did not already cover. The previous compact state leads as one
+/// `[COMPACTED]` line, followed by the events that have moved from the
+/// verbatim tail into the older portion since then. Without a previous
+/// compaction this is exactly [`older_transcript_text`].
+///
+/// Re-rendering the whole log on every compaction (the old behavior) made
+/// the summarizer request grow with total session length until the cheap
+/// model rejected it, and cost quadratic tokens on the way there. The result
+/// is capped at [`SUMMARIZER_INPUT_MAX_BYTES`] by eliding the middle.
+pub fn incremental_transcript_text(events: &[SessionEvent], skip_last_messages: usize) -> String {
+    let last = events
+        .iter()
+        .rposition(|event| matches!(event, SessionEvent::Compaction { .. }));
+    let text = match last {
+        None => older_transcript_text(events, skip_last_messages),
+        Some(idx) => {
+            let SessionEvent::Compaction { summary, .. } = &events[idx] else {
+                unreachable!("rposition matched a Compaction event");
+            };
+            // What the previous compaction summarized: the older portion of
+            // the log as it stood when that compaction was appended.
+            let (previously_older, _) = split_older_tail(&events[..idx], skip_last_messages);
+            let start = previously_older.len();
+            let (older, _) = split_older_tail(events, skip_last_messages);
+            let mut out = String::new();
+            push_line(&mut out, &format!("[COMPACTED] {summary}"));
+            // `older` is a prefix of `events`; the new material is the part
+            // of it past the previous boundary. Earlier compaction events in
+            // that range are skipped: their state is in `summary` already.
+            let fresh = render_events(older.into_iter().skip(start), true);
+            out.push_str(&fresh);
+            out
+        }
+    };
+    elide_middle(&text, SUMMARIZER_INPUT_MAX_BYTES)
+}
+
+/// Keep the head and the tail of `text` within `max_bytes`, replacing the
+/// middle with a marker. Cuts land on char boundaries.
+fn elide_middle(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker = "\n[... middle of the transcript elided to fit the summarizer ...]\n";
+    let keep = max_bytes.saturating_sub(marker.len()) / 2;
+    let mut head_end = keep.min(text.len());
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len() - keep.min(text.len());
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{marker}{}", &text[..head_end], &text[tail_start..])
+}
+
+/// Render events with the rules documented on [`older_transcript_text`].
+/// `skip_compactions` drops `Compaction` events (used when their state is
+/// already represented by a leading `[COMPACTED]` line).
+fn render_events<'a>(
+    events: impl Iterator<Item = &'a SessionEvent>,
+    skip_compactions: bool,
+) -> String {
     let mut out = String::new();
-    for event in older {
+    for event in events {
         match event {
             SessionEvent::TurnTrace { .. } => {}
             SessionEvent::Task { text } => {
@@ -90,7 +163,9 @@ pub fn older_transcript_text(events: &[SessionEvent], skip_last_messages: usize)
                 );
             }
             SessionEvent::Compaction { summary, .. } => {
-                push_line(&mut out, &format!("[COMPACTED] {summary}"));
+                if !skip_compactions {
+                    push_line(&mut out, &format!("[COMPACTED] {summary}"));
+                }
             }
             // Checkpoints carry no transcript content the summarizer needs —
             // the file state they protect is reflected in tool results.
@@ -407,5 +482,81 @@ mod tests {
         let capped = cap_summary("é".repeat(50).as_str(), 3);
         assert!(capped.len() <= 3);
         assert!(capped.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn incremental_text_without_a_prior_compaction_is_the_full_older_text() {
+        let events = sample_events();
+        assert_eq!(
+            incremental_transcript_text(&events, 2),
+            older_transcript_text(&events, 2)
+        );
+    }
+
+    #[test]
+    fn incremental_text_covers_only_what_the_last_compaction_did_not() {
+        // Ten user turns, compact (tail 2), then six more turns.
+        let mut events: Vec<SessionEvent> =
+            (0..10).map(|i| user_event(&format!("early-{i}"))).collect();
+        events.push(SessionEvent::Compaction {
+            summary: "STATE-ONE".into(),
+            summarized_events: 8,
+        });
+        events.extend((0..6).map(|i| user_event(&format!("late-{i}"))));
+
+        let text = incremental_transcript_text(&events, 2);
+        // The previous state leads; what it already covered is not re-read.
+        assert!(text.starts_with("[COMPACTED] STATE-ONE\n"), "{text}");
+        for i in 0..8 {
+            assert!(
+                !text.contains(&format!("early-{i}")),
+                "early-{i} re-rendered: {text}"
+            );
+        }
+        // The two turns that were the verbatim tail back then, plus the new
+        // turns that have left the tail since, are the fresh material.
+        for kept in ["early-8", "early-9", "late-0", "late-1", "late-2", "late-3"] {
+            assert!(text.contains(kept), "{kept} missing: {text}");
+        }
+        // The current tail stays verbatim, so it is not summarized.
+        assert!(
+            !text.contains("late-4") && !text.contains("late-5"),
+            "{text}"
+        );
+        // The compaction event itself is not rendered twice.
+        assert_eq!(text.matches("[COMPACTED]").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn incremental_text_stays_bounded_across_many_compactions() {
+        // Simulate a long session: every 20 turns a compaction is appended.
+        let mut events: Vec<SessionEvent> = Vec::new();
+        let mut sizes = Vec::new();
+        for round in 0..12 {
+            events.extend(
+                (0..20).map(|i| user_event(&format!("round-{round}-turn-{i} {}", "x".repeat(200)))),
+            );
+            let text = incremental_transcript_text(&events, 4);
+            sizes.push(text.len());
+            events.push(SessionEvent::Compaction {
+                summary: format!("STATE-{round}"),
+                summarized_events: 0,
+            });
+        }
+        // Old behavior grew linearly with the log; now every round after the
+        // first renders about one round of turns.
+        let first = sizes[1];
+        let last = *sizes.last().unwrap();
+        assert!(last <= first + 64, "summarizer input grew: {sizes:?}");
+    }
+
+    #[test]
+    fn oversized_summarizer_input_is_elided_in_the_middle_on_char_boundaries() {
+        let text = format!("HEAD{}TAIL", "\u{e9}".repeat(300_000));
+        let cut = elide_middle(&text, 10_000);
+        assert!(cut.len() <= 10_000, "{}", cut.len());
+        assert!(cut.starts_with("HEAD") && cut.ends_with("TAIL"));
+        assert!(cut.contains("middle of the transcript elided"));
+        assert_eq!(elide_middle("short", 10_000), "short");
     }
 }
