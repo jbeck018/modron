@@ -66,20 +66,83 @@ pub fn memory_section(memory: &str) -> String {
 pub fn load_memory(dir: &Path) -> String {
     for name in ["AGENTS.md", "CLAUDE.md"] {
         let path = dir.join(name);
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let capped = truncate_bytes(&content, MAX_MEMORY_BYTES);
-                tracing::debug!(path = %path.display(), bytes = capped.len(), "loaded memory file");
-                return capped.trim().to_string();
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "failed reading memory file; ignoring");
-                continue;
-            }
-        }
+        let Some(content) = read_context_file(&path, dir, MAX_MEMORY_BYTES) else {
+            continue;
+        };
+        let capped = truncate_bytes(&content, MAX_MEMORY_BYTES);
+        tracing::debug!(path = %path.display(), bytes = capped.len(), "loaded memory file");
+        return capped.trim().to_string();
     }
     String::new()
+}
+
+/// Reads one instruction or skill file found under `root`, for the context
+/// loaders. Never fails the run: a refused or unreadable file is logged with
+/// `tracing::warn!` and yields `None`, so the caller skips it.
+///
+/// - `metadata` (following symlinks) must report a regular file, so a
+///   committed `AGENTS.md -> /dev/zero` or a FIFO is never read.
+/// - The canonical path must stay inside the canonical `root`, so a symlink to
+///   `~/.aws/credentials` or `/etc/...` is never sent to the model.
+/// - At most `cap` bytes are read (`take(cap + 1)` detects the oversize case);
+///   the text is cut on a UTF-8 boundary at `cap`.
+fn read_context_file(path: &Path, root: &Path, cap: usize) -> Option<String> {
+    use std::io::Read;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "cannot stat context file; ignoring");
+            return None;
+        }
+    };
+    if !meta.is_file() {
+        tracing::warn!(path = %path.display(), "context file is not a regular file; ignoring");
+        return None;
+    }
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical = match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "cannot resolve context file; ignoring");
+            return None;
+        }
+    };
+    if !canonical.starts_with(&canonical_root) {
+        tracing::warn!(
+            path = %path.display(),
+            target = %canonical.display(),
+            "context file resolves outside its directory; ignoring"
+        );
+        return None;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "failed reading context file; ignoring");
+            return None;
+        }
+    };
+    let mut buf = Vec::new();
+    if let Err(err) = file.take(cap as u64 + 1).read_to_end(&mut buf) {
+        tracing::warn!(path = %path.display(), error = %err, "failed reading context file; ignoring");
+        return None;
+    }
+    let truncated = buf.len() > cap;
+    if truncated {
+        buf.truncate(cap);
+    }
+    let valid = match std::str::from_utf8(&buf) {
+        Ok(_) => buf.len(),
+        // The cap may split a trailing character: keep the valid prefix.
+        Err(err) if truncated && err.error_len().is_none() => err.valid_up_to(),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "context file is not UTF-8; ignoring");
+            return None;
+        }
+    };
+    buf.truncate(valid);
+    String::from_utf8(buf).ok()
 }
 
 /// First line of `description`, truncated to [`TOOL_DESC_MAX_CHARS`] chars.
@@ -511,6 +574,9 @@ mod tests {
     }
 }
 
+/// Bytes read from each SKILL.md for the index (frontmatter only).
+const MAX_SKILL_INDEX_BYTES: usize = 64 * 1024;
+
 /// SKILL.md index (Phase 4): `- name: description` per skill found under
 /// `<dir>/.modron/skills/*/SKILL.md` and `<dir>/.claude/skills/*/SKILL.md`.
 /// The system prompt carries only this index; bodies load via the `skill`
@@ -525,7 +591,10 @@ pub fn load_skills_index(working_dir: &std::path::Path) -> String {
             continue;
         };
         for entry in read_dir.flatten() {
-            let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
+            // Only the frontmatter is indexed, so a small cap is enough.
+            let Some(text) =
+                read_context_file(&entry.path().join("SKILL.md"), &root, MAX_SKILL_INDEX_BYTES)
+            else {
                 continue;
             };
             let (name, description) = parse_skill_frontmatter(&text);
@@ -620,5 +689,60 @@ mod skills_tests {
         let index = load_skills_index(dir.path());
         assert_eq!(index.matches("brainstorming").count(), 1, "{index}");
         assert!(index.contains("OURS."), "{index}");
+    }
+
+    #[test]
+    fn normal_agents_md_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Run cargo fmt.\n").unwrap();
+        assert_eq!(load_memory(dir.path()), "Run cargo fmt.");
+    }
+
+    #[test]
+    fn oversize_regular_memory_file_is_capped_while_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "y".repeat(MAX_MEMORY_BYTES * 4);
+        std::fs::write(dir.path().join("AGENTS.md"), body).unwrap();
+        assert_eq!(load_memory(dir.path()).len(), MAX_MEMORY_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_md_symlink_outside_repo_is_not_loaded() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("credentials");
+        std::fs::write(&secret, "aws_secret_access_key = hunter2").unwrap();
+        std::os::unix::fs::symlink(&secret, repo.path().join("AGENTS.md")).unwrap();
+        assert_eq!(load_memory(repo.path()), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_md_symlink_to_dev_zero_is_not_loaded_and_does_not_hang() {
+        let repo = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/zero", repo.path().join("AGENTS.md")).unwrap();
+        assert_eq!(load_memory(repo.path()), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_agents_md_falls_back_to_claude_md() {
+        let repo = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/zero", repo.path().join("AGENTS.md")).unwrap();
+        std::fs::write(repo.path().join("CLAUDE.md"), "claude rules").unwrap();
+        assert_eq!(load_memory(repo.path()), "claude rules");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_index_skips_device_symlink_and_returns_quickly() {
+        let repo = tempfile::tempdir().unwrap();
+        let skill = repo.path().join(".claude").join("skills").join("evil");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", skill.join("SKILL.md")).unwrap();
+        let index = load_skills_index(repo.path());
+        assert!(!index.contains("- evil:"), "{index}");
+        assert!(index.contains("subagent-driven-development"), "{index}");
     }
 }
