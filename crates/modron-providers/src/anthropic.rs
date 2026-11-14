@@ -188,6 +188,7 @@ impl AnthropicProvider {
                 provider: PROVIDER_ID.into(),
                 message: format!("subscription token refresh failed: {e}"),
             })?;
+        let tokens = keep_previous_refresh_token(&refresh_token, tokens);
         // Persist BEFORE swapping in memory: rotation means a crash must
         // never leave only the dead refresh token on disk.
         oauth::save_tokens(&tokens).map_err(|e| Error::Provider {
@@ -293,6 +294,19 @@ impl AnthropicProvider {
         let _ = tx.send(StreamDelta::Done);
         Ok(parsed)
     }
+}
+
+/// A refresh response may omit `refresh_token` when the existing one stays
+/// valid. Keep the previous token then, instead of persisting `None` and
+/// losing the ability to refresh again (the ChatGPT path does the same).
+fn keep_previous_refresh_token(
+    previous: &str,
+    mut tokens: modron_core::auth::oauth::TokenSet,
+) -> modron_core::auth::oauth::TokenSet {
+    if tokens.refresh_token.is_none() {
+        tokens.refresh_token = Some(previous.to_string());
+    }
+    tokens
 }
 
 /// Incremental state for one streaming turn. Reconstructs exactly what
@@ -1203,5 +1217,46 @@ mod tests {
         assert_eq!(provider.base_url(), "https://api.anthropic.com");
         let overridden = provider.with_base_url("http://localhost:8082/");
         assert_eq!(overridden.base_url(), "http://localhost:8082/");
+    }
+
+    /// Serve one canned JSON response; returns the token endpoint URL.
+    fn one_shot_token_endpoint(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/oauth/token")
+    }
+
+    #[tokio::test]
+    async fn refresh_response_without_refresh_token_keeps_the_previous_one() {
+        use modron_core::auth::oauth;
+        let url = one_shot_token_endpoint(r#"{"access_token":"at-new","expires_in":28800}"#);
+        let tokens = oauth::refresh_tokens_at(&url, "rt-old").await.unwrap();
+        assert_eq!(tokens.refresh_token, None, "wire response omits it");
+        let kept = keep_previous_refresh_token("rt-old", tokens);
+        assert_eq!(kept.access_token, "at-new");
+        assert_eq!(kept.refresh_token.as_deref(), Some("rt-old"));
+    }
+
+    #[tokio::test]
+    async fn rotated_refresh_token_replaces_the_previous_one() {
+        use modron_core::auth::oauth;
+        let url = one_shot_token_endpoint(
+            r#"{"access_token":"at-new","refresh_token":"rt-rotated","expires_in":28800}"#,
+        );
+        let tokens = oauth::refresh_tokens_at(&url, "rt-old").await.unwrap();
+        let kept = keep_previous_refresh_token("rt-old", tokens);
+        assert_eq!(kept.refresh_token.as_deref(), Some("rt-rotated"));
     }
 }
