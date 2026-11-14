@@ -68,9 +68,9 @@ fn background_cap_error() -> ToolOutcome {
 }
 
 /// Aborts every background delegate that is still running and marks its
-/// status entry as failed. Returns how many were aborted. The engine or TUI
-/// interrupt path should call this; that call site is not wired yet.
-#[allow(dead_code)] // call site (engine interrupt path) is not wired yet
+/// status entry as failed. Returns how many were aborted. Registered as a
+/// `modron_core::interrupt` hook by the default tool registry, so a user
+/// interrupt (TUI Esc, Ctrl-C) stops detached delegates too.
 pub fn abort_background_delegates() -> usize {
     let tasks = std::mem::take(&mut *background_tasks());
     let mut aborted = 0;

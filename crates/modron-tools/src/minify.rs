@@ -113,7 +113,7 @@ impl Tool for ReadMinifiedTool {
         };
         // The gate treats a minified read as a read: it unlocks edit/write.
         if let Some(engine) = &ctx.engine {
-            engine.tools.read_gate.mark(&path);
+            engine.tools.read_gate.mark_in(ctx.session_id, &path);
         }
 
         // Prefer the exact syntax-aware skeleton when a grammar is bundled

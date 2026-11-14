@@ -62,7 +62,7 @@ impl Tool for WriteTool {
             (&ctx.engine, args.get("path").and_then(|v| v.as_str()))
         {
             let path = resolve_path(&ctx.working_dir, raw_path);
-            if path.is_file() && !engine.tools.read_gate.seen(&path) {
+            if path.is_file() && !engine.tools.read_gate.seen_in(ctx.session_id, &path) {
                 return Ok(tool_err(
                     NAME,
                     format!(

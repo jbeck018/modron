@@ -77,7 +77,7 @@ impl Tool for EditTool {
         // lexical path, the same key `read` records.
         if let Some(engine) = &ctx.engine {
             let gate_key = resolve_path(&ctx.working_dir, raw_path);
-            if gate_key.is_file() && !engine.tools.read_gate.seen(&gate_key) {
+            if gate_key.is_file() && !engine.tools.read_gate.seen_in(ctx.session_id, &gate_key) {
                 return Ok(tool_err(
                     NAME,
                     format!(
