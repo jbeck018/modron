@@ -121,9 +121,22 @@ modron upgrade
 ```
 
 Checks the latest GitHub release, downloads the platform archive and replaces
-the binary. The previous binary is kept as `modron.bak`. The TUI and chat show
+the binary. The previous binary is kept as `modron.bak`. When `modron-app-tui` is
+installed next to `modron` and the archive carries it, it is replaced the same way
+(kept as `modron-app-tui.bak`); older archives do not carry it and leave it alone.
+Limitation: the upgrade does not check the archive against `SHA256SUMS`; it only runs
+the new `modron --version` before replacing anything. The TUI and chat show
 an upgrade notice when a newer release exists. The check runs at most once per
 24h and is cached in `~/.modron/update-check.json`.
+
+## Release archive and install size
+
+Each release archive (`modron-<arch>-<os>.tar.gz`) holds `modron` and
+`modron-app-tui`; `SHA256SUMS` covers the archives. `install.sh` places both in
+`~/.local/bin` when the archive has the app. The terminal app is much larger than
+`modron`: the spike measured a stripped, size-optimised build at 17,081,600 bytes
+(about 17 MB) before any feature trimming (`spikes/nsh-tui/RESULTS.md`, Follow-up
+S2c). That is a measurement, not a promise for the shipped build.
 
 ## Build
 
@@ -401,6 +414,13 @@ protocol they share is in [docs/PROTOCOL_V2.md](docs/PROTOCOL_V2.md).
   modron serve --listen 127.0.0.1:7000          # loopback clients need no token
   cd app && cargo run --bin modron-app-tui -- --url ws://127.0.0.1:7000 [--token T] [--session UUID]
   ```
+
+  `modron app` starts the terminal app from an installed `modron`: it finds
+  `modron-app-tui` through `MODRON_APP_BIN`, then next to the `modron` binary, then on
+  `PATH`, sets `MODRON_BIN` to that `modron` so the app starts this server, and passes
+  every later argument through unchanged (`modron app --model x -- --demo`). Without
+  the app binary it exits with code 2 and says how to get it. Plain `modron` still
+  starts the built-in UI.
 
   In the terminal app, Enter sends (steers while a run is active), Alt+Enter queues, Esc
   interrupts, y/a/n decide approvals, and `/compact` compacts. The web bundle needs the NSH

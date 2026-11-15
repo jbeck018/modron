@@ -67,6 +67,8 @@ if command -v curl >/dev/null 2>&1; then
         || fail "checksum mismatch for $ARCHIVE - refusing to install"
       tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron \
         || fail "release archive could not be unpacked"
+      # The terminal app is in newer archives only; its absence is not an error.
+      tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron-app-tui 2>/dev/null || true
       info "installed release binary (sha256 verified)"
       INSTALLED=1
       ;;

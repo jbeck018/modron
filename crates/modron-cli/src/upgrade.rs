@@ -16,6 +16,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 pub const REPO: &str = "jbeck018/modron";
+/// The terminal app shipped in the same archive as `modron` (release.yml).
+pub const APP_BIN: &str = "modron-app-tui";
 /// Update-check cache lifetime.
 pub const CHECK_TTL_HOURS: i64 = 24;
 
@@ -261,8 +263,32 @@ pub async fn perform_upgrade(asset_url: &str) -> anyhow::Result<PathBuf> {
         let _ = std::fs::rename(&backup, current.join("modron"));
         anyhow!("cannot install the new binary: {e}")
     })?;
+    // The release archive may also carry the terminal app (release.yml). It
+    // is replaced only when one is installed next to modron; an archive
+    // without it (older releases) leaves an installed app untouched.
+    let new_app = staging.join(APP_BIN);
+    if new_app.is_file() && current.join(APP_BIN).is_file() {
+        swap_in(&current, APP_BIN, &new_app)
+            .map_err(|e| anyhow!("modron was upgraded, but {APP_BIN} was not replaced: {e}"))?;
+        println!("replaced {APP_BIN} ({})", current.join(APP_BIN).display());
+    }
     let _ = std::fs::remove_dir_all(&staging);
     Ok(current.join("modron"))
+}
+
+/// Replace `dir/name` with `new_file` (same filesystem: the staging folder
+/// lives under `dir`). The previous file is kept as `name.bak`; a failed
+/// install restores it.
+fn swap_in(dir: &std::path::Path, name: &str, new_file: &std::path::Path) -> anyhow::Result<()> {
+    let installed = dir.join(name);
+    let backup = dir.join(format!("{name}.bak"));
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(&installed, &backup)?;
+    if let Err(e) = std::fs::rename(new_file, &installed) {
+        let _ = std::fs::rename(&backup, &installed);
+        return Err(anyhow!("cannot install the new {name}: {e}"));
+    }
+    Ok(())
 }
 
 /// `modron upgrade` (Phase 6e).
@@ -305,6 +331,36 @@ mod tests {
         assert!(!is_newer("v0.1.0", "0.1.0"));
         assert!(!is_newer("0.0.9", "0.1.0"));
         assert!(is_newer("0.1.1", "0.1.0"));
+    }
+
+    #[test]
+    fn swap_in_keeps_a_backup_and_installs_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staging");
+        std::fs::create_dir_all(&staged).unwrap();
+        let new_file = staged.join(APP_BIN);
+        std::fs::write(&new_file, b"new app").unwrap();
+        std::fs::write(dir.path().join(APP_BIN), b"old app").unwrap();
+
+        swap_in(dir.path(), APP_BIN, &new_file).unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join(APP_BIN)).unwrap(), b"new app");
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("{APP_BIN}.bak"))).unwrap(),
+            b"old app"
+        );
+        assert!(!new_file.exists());
+    }
+
+    #[test]
+    fn swap_in_restores_the_backup_when_the_install_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(APP_BIN), b"old app").unwrap();
+        // The staged file does not exist, so the install step fails.
+        let missing = dir.path().join("staging").join(APP_BIN);
+
+        assert!(swap_in(dir.path(), APP_BIN, &missing).is_err());
+        assert_eq!(std::fs::read(dir.path().join(APP_BIN)).unwrap(), b"old app");
     }
 
     #[test]

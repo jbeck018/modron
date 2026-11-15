@@ -13,6 +13,7 @@
 //! writes; the answer and usage table go to stdout.
 
 pub mod acp;
+pub mod app;
 pub mod daemon;
 pub mod onboarding;
 use daemon as modron_daemon;
@@ -112,6 +113,17 @@ enum Command {
     },
     /// Upgrade the binary from the latest GitHub release.
     Upgrade,
+    /// Start the NSH terminal app (`modron-app-tui`), a client of
+    /// `modron serve`. Every argument after `app` goes to the app unchanged.
+    App {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 0..,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
     /// Diagnose your setup: keys, config, git, PDF support, terminal.
     Doctor,
     /// Manage the background engine daemon (sessions survive terminal close).
@@ -418,7 +430,20 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // `modron app ...` is intercepted before clap: every later argument,
+    // including `--` and flags modron also defines, reaches the app as typed.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(rest) = app::passthrough_args(&argv) {
+        std::process::exit(app::launch(rest));
+    }
     let cli = Cli::parse();
+    if let Some(Command::App { .. }) = &cli.command {
+        eprintln!(
+            "modron app: `app` must be the first argument (`modron app --model x`); \
+             flags before it are modron's, not the app's"
+        );
+        std::process::exit(2);
+    }
     init_tracing(cli.verbose, tui_session(&cli));
     if let Err(err) = run(cli).await {
         eprintln!("error: {err:#}");

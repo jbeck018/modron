@@ -48,6 +48,16 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Window", "Location", "console", "Document", "EventTarget", "KeyboardEvent", "Element", "Node", "HtmlCollection", "Range", "Selection", "Navigator", "Clipboard", "Headers", "RequestInit", "RequestCredentials", "Response", "WheelEvent", "TouchEvent", "TouchList", "Touch", "Event", "File", "FileList", "HtmlElement", "HtmlInputElement"] }
 
+[profile.release]
+# Size-optimised, as measured in spikes/nsh-tui/RESULTS.md (Follow-up S2c).
+# Only the profile is adopted there; its vendored feature patch is not.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+# No panic = "abort": the app stops a server it started and restores the
+# terminal by unwinding. Aborting would skip that and orphan the server.
+strip = true
+
 [dev-dependencies]
 # The scripted server for tests/live.rs: the same crates the core's own
 # tests use (tokio-tungstenite 0.28), plus the protocol types.

@@ -310,6 +310,13 @@ Z.ai Coding Plan keys work only on the coding endpoint. Set
 | `MODRON_GITHUB_TOKEN` | `modron upgrade` | GitHub token for release downloads. Tried before `GITHUB_TOKEN` and the `gh` keyring. |
 | `GITHUB_TOKEN` | `modron upgrade` | Fallback GitHub token for release downloads. |
 
+### Terminal app (`modron app`)
+
+| Variable | Read by | Effect |
+|---|---|---|
+| `MODRON_APP_BIN` | `modron app` | Path to the `modron-app-tui` binary. When set (non-empty) it must be a file; there is no fallback to the other lookup places. |
+| `MODRON_BIN` | `modron-app-tui`, set by `modron app` | The `modron` binary the app starts as its server. `modron app` sets it to the running binary unless it is already set. |
+
 ### Variables set by modron
 
 These are set for hooks and tool-hook children. Do not set them yourself. See
