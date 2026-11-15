@@ -25,7 +25,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use modron_core::memory::MemoryStore;
 use modron_core::{
     estimate_tokens, CompactionPolicy, Engine, EngineConfig, ModelProvider, SessionEvent,
-    SessionId, SessionStore, StreamDelta, ToolCall, Usage,
+    SessionId, SessionStore, StreamDelta, Usage,
 };
 use modron_providers::{provider_from_env, RetryingProvider};
 use modron_store::JsonlSessionStore;
@@ -1467,10 +1467,17 @@ fn tty_approver() -> Option<Arc<modron_core::Approver>> {
     }
     let rest_approved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     use std::sync::atomic::Ordering;
-    Some(Arc::new(move |call: &ToolCall| {
+    Some(Arc::new(move |ask: &modron_core::ApprovalAsk<'_>| {
         if rest_approved.load(Ordering::Relaxed) {
             return true;
         }
+        let call = ask.call;
+        // A delegated child names itself so its ask is not mistaken for the
+        // run's own call (H3b).
+        let who = ask
+            .agent
+            .map(|agent| format!("[{agent}] "))
+            .unwrap_or_default();
         // The whole tty round-trip is blocking I/O inside an async context:
         // block_in_place frees the runtime to keep other workers (streaming
         // deltas, background subagents) alive while the human decides — the
@@ -1485,7 +1492,11 @@ fn tty_approver() -> Option<Arc<modron_core::Approver>> {
             };
             use std::io::Write as _;
             let args = short(&call.arguments.to_string(), 90);
-            let _ = write!(tty, "\r\nmodron: allow {} {}? [y/N/a] ", call.name, args);
+            let _ = write!(
+                tty,
+                "\r\nmodron: allow {who}{} {}? [y/N/a] ",
+                call.name, args
+            );
             let _ = tty.flush();
             let mut line = String::new();
             let ok = std::io::BufRead::read_line(
@@ -1879,11 +1890,7 @@ async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegist
     };
     let mut out = Vec::new();
     for (name, server) in &mcp.servers {
-        let env: Vec<(String, String)> =
-            server.env.clone().unwrap_or_default().into_iter().collect();
-        let args = server.args.clone().unwrap_or_default();
-        let (handle, tools) =
-            modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await?;
+        let (handle, tools) = connect_mcp_server(name, server).await?;
         let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
         let cap = server.max_schema_tokens.unwrap_or(20_000);
         if total > cap {
@@ -2129,10 +2136,7 @@ async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> 
             }
         );
     };
-    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
-    let args = server.args.clone().unwrap_or_default();
-    let (handle, tools) =
-        modron_mcp::McpServerHandle::spawn(&name, &server.command, &args, &env).await?;
+    let (handle, tools) = connect_mcp_server(&name, server).await?;
     let mut handle = handle.lock().await;
 
     let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
@@ -2200,10 +2204,7 @@ async fn mcp_handle(
             }
         );
     };
-    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
-    let args = server.args.clone().unwrap_or_default();
-    let (handle, _tools) =
-        modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await?;
+    let (handle, _tools) = connect_mcp_server(name, server).await?;
     Ok(handle)
 }
 
@@ -2311,6 +2312,30 @@ fn short_hash(h: &str) -> String {
 
 /// Validate a compaction threshold fraction. Shared by the `--compact-threshold`
 /// flag and `[compaction].threshold_frac` so both reject the same values.
+/// Connect one configured MCP server over its transport: `url` selects
+/// Streamable HTTP, otherwise the stdio `command` is spawned.
+async fn connect_mcp_server(
+    name: &str,
+    server: &config::McpServerConfig,
+) -> anyhow::Result<(
+    std::sync::Arc<tokio::sync::Mutex<modron_mcp::McpServerHandle>>,
+    Vec<modron_mcp::McpToolInfo>,
+)> {
+    server.validate(name).map_err(anyhow::Error::msg)?;
+    if let Some(url) = &server.url {
+        let headers: Vec<(String, String)> = server
+            .headers
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        return modron_mcp::McpServerHandle::connect_http(name, url, &headers).await;
+    }
+    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
+    let args = server.args.clone().unwrap_or_default();
+    modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await
+}
+
 fn validate_compact_threshold(threshold: f64, source: &str) -> anyhow::Result<f64> {
     if !(threshold > 0.0 && threshold < 1.0) {
         anyhow::bail!("{source} must be strictly between 0 and 1, got {threshold}");

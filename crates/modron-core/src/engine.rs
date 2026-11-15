@@ -1235,6 +1235,15 @@ impl Engine {
                 Some(RuleEffect::Allow) => return false,
                 Some(RuleEffect::Deny) | None => {}
             }
+            // A delegate prompts only when admission says it must ask; the
+            // Ask-mode un-throttle (H3b) lets several start concurrently.
+            // Refused delegates keep the sequential path, as before.
+            if call.name == "delegate" {
+                return !matches!(
+                    self.admission_for_call(&call.name, &call.arguments),
+                    Admission::Run
+                );
+            }
             is_gated(&call.name)
                 && self.config.approvals.mode != ApprovalMode::ApproveAll
                 && !self.config.approvals.allow.iter().any(|a| a == &call.name)
@@ -1789,6 +1798,13 @@ impl Engine {
             return Admission::Run;
         }
         if self.config.approvals.mode == ApprovalMode::Ask && self.config.approver.is_some() {
+            // `delegate` starts no prompt of its own (H3b): the child's
+            // gated calls are what the approver sees, each tagged with the
+            // child's label. Deny entries, deny rules and ask rules have
+            // already decided above, so this only lifts the start prompt.
+            if name == "delegate" {
+                return Admission::Run;
+            }
             return Admission::Ask;
         }
         let mode = self.config.approvals.mode;
@@ -1812,10 +1828,12 @@ impl Engine {
                     name: "verify".into(),
                     arguments: serde_json::json!({}),
                 };
-                self.config
-                    .approver
-                    .as_ref()
-                    .is_some_and(|approver| approver(&call))
+                self.config.approver.as_ref().is_some_and(|approver| {
+                    approver(&crate::ApprovalAsk {
+                        call: &call,
+                        agent: None,
+                    })
+                })
             }
             Admission::Refused(_) => false,
         }
@@ -1852,11 +1870,10 @@ impl Engine {
             Admission::Ask => {
                 // Ask mode with an interactive approver (Phase-1c I2): a
                 // denial falls through to the block.
-                let approved = self
-                    .config
-                    .approver
-                    .as_ref()
-                    .is_some_and(|approver| approver(call));
+                let approved =
+                    self.config.approver.as_ref().is_some_and(|approver| {
+                        approver(&crate::ApprovalAsk { call, agent: None })
+                    });
                 if !approved {
                     return (
                         ToolOutcome::err(approval_block_hint(self.config.approvals.mode)),
@@ -4280,7 +4297,7 @@ mod tests {
     ) -> (Arc<crate::Approver>, Arc<std::sync::atomic::AtomicUsize>) {
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&asked);
-        let approver: Arc<crate::Approver> = Arc::new(move |_call: &ToolCall| {
+        let approver: Arc<crate::Approver> = Arc::new(move |_ask: &crate::ApprovalAsk<'_>| {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             answer
         });
@@ -5340,6 +5357,182 @@ OPEN ITEMS: write the fix.";
         assert!(
             compacted.used < grown.used,
             "compaction drops the gauge: {compacted:?} vs {grown:?}"
+        );
+    }
+}
+
+/// H3b: `delegate` starts without its own prompt in Ask mode with an
+/// approver (the child's gated calls are the prompts), and several delegate
+/// calls in one turn run concurrently.
+#[cfg(test)]
+mod delegate_approval_tests {
+    use crate::permissions::RuleEffect;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalAsk, ApprovalMode, ApprovalPolicy, Engine, EngineConfig, ModelProvider, Result,
+        StopReason, Tool, ToolCall, ToolCtx, ToolOutcome, ToolRegistry, ToolSpec, TurnResponse,
+        Usage,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Stand-in `delegate` that passes a two-party barrier. Both calls of one
+    /// turn reach it only when they run concurrently; sequential dispatch
+    /// makes the first wait time out and report `sequential`.
+    struct BarrierDelegate {
+        barrier: Arc<tokio::sync::Barrier>,
+        met: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for BarrierDelegate {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "delegate".into(),
+                description: "barrier stand-in".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            let timed =
+                tokio::time::timeout(std::time::Duration::from_secs(2), self.barrier.wait()).await;
+            if timed.is_ok() {
+                self.met.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolOutcome::ok("met"))
+            } else {
+                Ok(ToolOutcome::err("sequential"))
+            }
+        }
+    }
+
+    fn engine_with(
+        config: EngineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+        script: MockProvider,
+    ) -> Engine {
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(tool);
+        }
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("anthropic".into(), Arc::new(script));
+        Engine {
+            selector: Arc::new(StaticSelector::new("claude-haiku-4-5", "anthropic")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config: EngineConfig {
+                default_provider: "anthropic".into(),
+                default_model: "claude-haiku-4-5".into(),
+                ..config
+            },
+        }
+    }
+
+    fn asking_config(mode: ApprovalMode, approver: bool) -> EngineConfig {
+        let counting: Arc<crate::Approver> = Arc::new(|_ask: &ApprovalAsk<'_>| true);
+        EngineConfig {
+            approvals: ApprovalPolicy {
+                mode,
+                ..ApprovalPolicy::default()
+            },
+            approver: approver.then_some(counting),
+            ..EngineConfig::default()
+        }
+    }
+
+    fn tag(admission: super::Admission) -> String {
+        match admission {
+            super::Admission::Run => "run".into(),
+            super::Admission::Ask => "ask".into(),
+            super::Admission::Refused(message) => format!("refused: {message}"),
+        }
+    }
+
+    fn admission_tag(engine: &Engine, name: &str) -> String {
+        tag(engine.admission(name))
+    }
+
+    #[test]
+    fn delegate_starts_without_a_prompt_only_in_ask_mode_with_an_approver() {
+        let script = || MockProvider::new();
+        let ask_with = engine_with(asking_config(ApprovalMode::Ask, true), vec![], script());
+        assert_eq!(admission_tag(&ask_with, "delegate"), "run");
+
+        // Non-interactive Ask (no approver) keeps the old gate.
+        let ask_without = engine_with(asking_config(ApprovalMode::Ask, false), vec![], script());
+        assert!(admission_tag(&ask_without, "delegate").starts_with("refused"));
+
+        // Deny mode stays the ceiling.
+        let deny = engine_with(asking_config(ApprovalMode::Deny, true), vec![], script());
+        assert!(admission_tag(&deny, "delegate").starts_with("refused"));
+
+        // An ask rule still prompts for delegate; a deny entry still refuses.
+        let mut ruled = asking_config(ApprovalMode::Ask, true);
+        ruled.approvals.rules =
+            crate::permissions::RuleSet::new(vec![crate::permissions::Rule::parse(
+                RuleEffect::Ask,
+                "delegate",
+            )
+            .unwrap()]);
+        let ruled = engine_with(ruled, vec![], script());
+        // Rules are evaluated per call (admission_for_call), not by admission().
+        let verdict = ruled.admission_for_call("delegate", &serde_json::json!({}));
+        assert_eq!(tag(verdict), "ask");
+
+        let mut denied = asking_config(ApprovalMode::Ask, true);
+        denied.approvals.deny = vec!["delegate".into()];
+        let denied = engine_with(denied, vec![], script());
+        assert!(admission_tag(&denied, "delegate").starts_with("refused"));
+    }
+
+    #[tokio::test]
+    async fn two_delegates_in_one_turn_run_concurrently_under_ask_with_an_approver() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let met = Arc::new(AtomicUsize::new(0));
+        let tool = Arc::new(BarrierDelegate {
+            barrier,
+            met: Arc::clone(&met),
+        });
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "delegate".into(),
+            arguments: serde_json::json!({"task": id}),
+        };
+        let fan_out = TurnResponse {
+            text: String::new(),
+            tool_calls: vec![call("d1"), call("d2")],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        };
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let approver: Arc<crate::Approver> = Arc::new(move |_ask: &ApprovalAsk<'_>| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let mut config = asking_config(ApprovalMode::Ask, true);
+        config.approver = Some(approver);
+        let engine = engine_with(
+            config,
+            vec![tool as Arc<dyn Tool>],
+            MockProvider::new()
+                .then_response(fan_out)
+                .then_text("both started"),
+        );
+        let summary = engine.run_task("fan out").await.unwrap();
+        assert_eq!(summary.answer, "both started");
+        assert_eq!(
+            met.load(Ordering::SeqCst),
+            2,
+            "both delegate calls reached the barrier (concurrent dispatch)"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "starting a delegate asks nobody; its children do"
         );
     }
 }

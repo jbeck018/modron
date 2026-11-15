@@ -263,7 +263,7 @@ async fn scoped_approve_cannot_resolve_another_sessions_request() {
         arguments: serde_json::json!({"command": "echo hi"}),
     };
     let parked = Arc::clone(&other_handle);
-    let mut gate = tokio::spawn(async move { parked.approve_gate(&call) });
+    let mut gate = tokio::spawn(async move { parked.approve_gate(&call, None) });
     let request_id = loop {
         let live: LiveFrame = events.recv().await.unwrap();
         let frame: Frame = serde_json::from_str(&live.json).unwrap();

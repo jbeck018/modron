@@ -455,10 +455,11 @@ fn build_local_engine(
         on_tool_event: Arc::new(move |activity| {
             let _ = tool_tx.send(DeltaOrTool::Tool(activity));
         }),
-        approver: Arc::new(move |call| {
+        approver: Arc::new(move |ask: &modron_core::ApprovalAsk<'_>| {
             if approval_for_builder.rest_approved.load(Ordering::Relaxed) {
                 return true;
             }
+            let call = ask.call;
             let (respond, receiver) = mpsc::channel();
             *approval_for_builder.slot.lock().unwrap() = Some((call.clone(), respond));
             // Park the engine task until the render loop delivers the
@@ -2096,7 +2097,9 @@ fn frame_to_inputs(frame: Frame) -> Vec<LoopInput> {
         }
         Payload::Delta { delta } => vec![LoopInput::Delta(delta.to_core())],
         Payload::Tool { activity } => vec![LoopInput::Tool(activity.into())],
-        Payload::ApprovalRequested { request_id, call } => {
+        Payload::ApprovalRequested {
+            request_id, call, ..
+        } => {
             vec![LoopInput::Approval { request_id, call }]
         }
         Payload::TurnDone { summary } => vec![LoopInput::Done(summary)],
@@ -2588,6 +2591,7 @@ mod approval_state_tests {
             pending_approval: Some(WirePending {
                 request_id: "req-1".into(),
                 call: call("c1"),
+                agent: None,
             }),
             ..LiveState::default()
         };

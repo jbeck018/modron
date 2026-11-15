@@ -214,7 +214,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     // Park the gate in a background task.
     let parked = Arc::clone(&handle);
     let call_clone = call.clone();
-    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone, None) });
 
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -222,7 +222,9 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
         .map(parse_live)
         .unwrap();
     let request_id = match frame.payload {
-        Payload::ApprovalRequested { request_id, call } => {
+        Payload::ApprovalRequested {
+            request_id, call, ..
+        } => {
             assert_eq!(call.name, "bash");
             request_id
         }
@@ -254,7 +256,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     // AllowAll: approves, arms allow-rest; the next call passes instantly.
     let parked = Arc::clone(&handle);
     let call_clone = call.clone();
-    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone, None) });
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("second request frame")
@@ -283,7 +285,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
             ..
         }
     ));
-    assert!(handle.approve_gate(&call));
+    assert!(handle.approve_gate(&call, None));
     assert!(matches!(
         rx.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
@@ -311,7 +313,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     .unwrap();
     let parked = Arc::clone(&handle);
     let call_clone = call.clone();
-    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone, None) });
     let request_id = loop {
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -345,7 +347,7 @@ async fn approval_request_publishes_one_notify_without_arguments() {
     let gate = {
         let parked = Arc::clone(&handle);
         let call = call.clone();
-        tokio::spawn(async move { parked.approve_gate(&call) })
+        tokio::spawn(async move { parked.approve_gate(&call, None) })
     };
     let request_id = match next_live_frame(&mut rx).await.payload {
         Payload::ApprovalRequested { request_id, .. } => request_id,
@@ -405,7 +407,7 @@ async fn interrupt_unblocks_a_parked_approver_and_aborts_the_run() {
 
     // The engine parks in the gate mid-run.
     let parked = Arc::clone(&handle);
-    let gate = tokio::spawn(async move { parked.approve_gate(&call) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call, None) });
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .unwrap()
@@ -538,7 +540,7 @@ async fn approval_timeout_publishes_a_deny_resolution() {
     let gate = {
         let parked = Arc::clone(&handle);
         let call = call.clone();
-        tokio::spawn(async move { parked.approve_gate(&call) })
+        tokio::spawn(async move { parked.approve_gate(&call, None) })
     };
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -601,6 +603,129 @@ fn parked_run(id: SessionId) -> modron_server::RunFuture {
     })
 }
 
+/// A run the test completes on demand (`done` sends the success path).
+fn completing_run(
+    id: SessionId,
+    done: tokio::sync::oneshot::Receiver<()>,
+) -> modron_server::RunFuture {
+    Box::pin(async move {
+        let _ = done.await;
+        Ok(modron_core::RunSummary {
+            session_id: id,
+            answer: "done".into(),
+            turns: 0,
+            tool_calls: 0,
+            usage: Default::default(),
+            models_used: vec![],
+        })
+    })
+}
+
+fn child_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": "echo"}),
+    }
+}
+
+/// H3b: a child's ask is published with its label, one grant covers the
+/// run's other children (allow-all is the parent's sticky flag), and the
+/// sticky pass publishes nothing new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_asks_carry_the_agent_label_and_share_allow_all() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    let (_done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    hub.start_run(id, completing_run(id, done_rx)).unwrap();
+    let mut rx = handle.subscribe();
+
+    let parked = Arc::clone(&handle);
+    let first = child_call("c1");
+    let gate = tokio::spawn(async move { parked.approve_gate(&first, Some("delegate")) });
+    let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("request frame")
+        .map(parse_live)
+        .unwrap();
+    let request_id = match frame.payload {
+        Payload::ApprovalRequested {
+            request_id,
+            call,
+            agent,
+        } => {
+            assert_eq!(call.name, "bash");
+            assert_eq!(
+                agent.as_deref(),
+                Some("delegate"),
+                "the child label rides the ask"
+            );
+            request_id
+        }
+        other => panic!("expected approval_requested, got {other:?}"),
+    };
+    handle
+        .resolve(&request_id, Decision::AllowAll)
+        .expect("resolve the child's ask");
+    assert!(gate.await.unwrap());
+
+    // Another child of the same run: allowed without a new prompt.
+    assert!(handle.approve_gate(&child_call("c2"), Some("persona")));
+    loop {
+        let live = parse_live(rx.recv().await.unwrap());
+        if matches!(live.payload, Payload::ApprovalResolved { .. }) {
+            break;
+        }
+    }
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+/// H3b: no approver outlives its run. A child asking after the run ended is
+/// refused without a prompt; a child parked when the run ends is denied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_asks_after_the_run_ends_are_refused() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+
+    // Late ask: the run completed first.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    hub.start_run(id, completing_run(id, done_rx)).unwrap();
+    done_tx.send(()).unwrap();
+    for _ in 0..200 {
+        if !handle.is_busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!handle.is_busy(), "the run ended");
+    let mut rx = handle.subscribe();
+    assert!(!handle.approve_gate(&child_call("late"), Some("delegate")));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+
+    // Parked ask: the run completes while the child waits for a decision.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    hub.start_run(id, completing_run(id, done_rx)).unwrap();
+    let mut rx = handle.subscribe();
+    let parked = Arc::clone(&handle);
+    let gate =
+        tokio::spawn(async move { parked.approve_gate(&child_call("parked"), Some("delegate")) });
+    let _request = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("request frame");
+    done_tx.send(()).unwrap();
+    assert!(
+        !gate.await.unwrap(),
+        "a parked child ask is denied at run end"
+    );
+    assert!(handle.live_state().pending_approval.is_none());
+}
+
 /// LG-a: a rejected patch applies nothing - the status labels and the
 /// engine config both still describe the session before the patch.
 #[tokio::test]
@@ -661,7 +786,7 @@ async fn a_run_started_after_an_interrupt_still_prompts_for_approval() {
         arguments: serde_json::json!({}),
     };
     let gate_handle = Arc::clone(&handle);
-    let gate = tokio::spawn(async move { gate_handle.approve_gate(&call) });
+    let gate = tokio::spawn(async move { gate_handle.approve_gate(&call, None) });
 
     let request_id = loop {
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())

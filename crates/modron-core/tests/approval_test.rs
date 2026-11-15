@@ -365,7 +365,7 @@ fn policy(mode: ApprovalMode) -> ApprovalPolicy {
 async fn checkpoint_taken_in_every_allowing_mode() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), b"before").unwrap();
-    let allow: Arc<modron_core::Approver> = Arc::new(|_c: &ToolCall| true);
+    let allow: Arc<modron_core::Approver> = Arc::new(|_c: &modron_core::ApprovalAsk<'_>| true);
     for (mode, approver) in [
         (ApprovalMode::ApproveAll, None),
         (ApprovalMode::Ask, Some(allow)),
@@ -407,7 +407,7 @@ async fn checkpoint_taken_in_every_allowing_mode() {
 async fn refused_write_records_no_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), b"before").unwrap();
-    let deny: Arc<modron_core::Approver> = Arc::new(|_c: &ToolCall| false);
+    let deny: Arc<modron_core::Approver> = Arc::new(|_c: &modron_core::ApprovalAsk<'_>| false);
     for (mode, approver) in [(ApprovalMode::Deny, None), (ApprovalMode::Ask, Some(deny))] {
         let store = Arc::new(InMemoryStore::new());
         let engine = engine_in(

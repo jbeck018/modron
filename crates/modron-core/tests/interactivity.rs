@@ -203,11 +203,11 @@ async fn approver_allows_mutating_tool_in_ask_mode() {
 }
 
 fn always_allow() -> Arc<modron_core::Approver> {
-    Arc::new(|_call: &ToolCall| true)
+    Arc::new(|_ask: &modron_core::ApprovalAsk<'_>| true)
 }
 
 fn always_deny() -> Arc<modron_core::Approver> {
-    Arc::new(|_call: &ToolCall| false)
+    Arc::new(|_ask: &modron_core::ApprovalAsk<'_>| false)
 }
 
 /// I2: a denying approver blocks with the actionable message.

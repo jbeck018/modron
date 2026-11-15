@@ -317,13 +317,27 @@ pub async fn delegate(
             sink
         });
 
-    let config = child_config(
+    let mut config = child_config(
         &parent.config,
         persona,
         working_dir,
         budget_tokens,
         progress_sink,
     );
+    // H3b: the child asks through the parent's approver, tagged with the
+    // child's label. Sharing the parent's closure is what makes allow-all
+    // and the run boundary apply to children exactly as to the parent: the
+    // parent's own stickiness flag and its run-end refusal decide every ask.
+    config.approver = parent.config.approver.as_ref().map(|parent_approver| {
+        let parent_approver = Arc::clone(parent_approver);
+        let agent = label.clone();
+        Arc::new(move |ask: &crate::ApprovalAsk<'_>| {
+            parent_approver(&crate::ApprovalAsk {
+                call: ask.call,
+                agent: Some(agent.as_str()),
+            })
+        }) as Arc<crate::Approver>
+    });
     let child = Engine {
         selector,
         providers: parent.providers.clone(),
@@ -678,5 +692,158 @@ mod tests {
         let child = child_config(&parent, None, None, 1_000, None);
         assert_eq!(child.approvals.deny, vec!["bash".to_string()]);
         assert!(child.approvals.allow.is_empty());
+    }
+}
+
+/// H3b: a child's gated calls ask the parent's approver, tagged with the
+/// child's label; a child is never more permissive than its parent.
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{ApprovalAsk, ApprovalMode, ApprovalPolicy, StopReason, Tool, ToolCall, ToolCtx};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// A gated `write` the child may use; counts the calls that really ran.
+    struct WriteStub {
+        runs: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for WriteStub {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "write".into(),
+                description: "stub".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<crate::ToolOutcome> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ToolOutcome::ok("wrote"))
+        }
+    }
+
+    /// (tool name, asking agent) for every ask the parent's approver saw.
+    type Asks = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    fn recording_approver(allow: bool) -> (Arc<crate::Approver>, Asks) {
+        let asks: Asks = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&asks);
+        let approver: Arc<crate::Approver> = Arc::new(move |ask: &ApprovalAsk<'_>| {
+            log.lock()
+                .unwrap()
+                .push((ask.call.name.clone(), ask.agent.map(str::to_string)));
+            allow
+        });
+        (approver, asks)
+    }
+
+    /// Child script: one `write` call, then a final answer.
+    fn child_script() -> MockProvider {
+        let write = crate::TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({"path": "x"}),
+            }],
+            usage: crate::Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        };
+        MockProvider::new()
+            .then_response(write)
+            .then_text("child done")
+    }
+
+    fn parent(
+        mode: ApprovalMode,
+        approver: Option<Arc<crate::Approver>>,
+        runs: Arc<AtomicUsize>,
+    ) -> Engine {
+        let mut providers: HashMap<String, Arc<dyn crate::ModelProvider>> = HashMap::new();
+        providers.insert("anthropic".into(), Arc::new(child_script()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WriteStub { runs }));
+        Engine {
+            selector: Arc::new(StaticSelector::new("claude-haiku-4-5", "anthropic")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config: EngineConfig {
+                working_dir: std::env::temp_dir(),
+                default_provider: "anthropic".into(),
+                default_model: "claude-haiku-4-5".into(),
+                approvals: ApprovalPolicy {
+                    mode,
+                    ..ApprovalPolicy::default()
+                },
+                approver,
+                ..EngineConfig::default()
+            },
+        }
+    }
+
+    async fn run_child(engine: &Engine) -> ExploreReport {
+        let filter = ["write".to_string()];
+        delegate(engine, "write the file", None, Some(&filter), 100_000, None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn child_ask_carries_its_label_and_a_grant_runs_the_tool() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (approver, asks) = recording_approver(true);
+        let engine = parent(ApprovalMode::Ask, Some(approver), Arc::clone(&runs));
+        let report = run_child(&engine).await;
+        assert_eq!(report.brief, "child done");
+        assert_eq!(
+            *asks.lock().unwrap(),
+            vec![("write".to_string(), Some("delegate".to_string()))],
+            "the child's ask reaches the parent approver with its label"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "approved call ran");
+    }
+
+    #[tokio::test]
+    async fn child_denial_refuses_the_gated_tool() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (approver, asks) = recording_approver(false);
+        let engine = parent(ApprovalMode::Ask, Some(approver), Arc::clone(&runs));
+        run_child(&engine).await;
+        assert_eq!(asks.lock().unwrap().len(), 1, "the child did ask");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "denied call never ran");
+    }
+
+    #[tokio::test]
+    async fn deny_mode_refuses_the_child_without_asking() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (approver, asks) = recording_approver(true);
+        let engine = parent(ApprovalMode::Deny, Some(approver), Arc::clone(&runs));
+        run_child(&engine).await;
+        assert!(
+            asks.lock().unwrap().is_empty(),
+            "deny never reaches the approver"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn without_an_approver_the_child_stays_refused() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let engine = parent(ApprovalMode::Ask, None, Arc::clone(&runs));
+        run_child(&engine).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "no approver, no prompt, no run"
+        );
     }
 }

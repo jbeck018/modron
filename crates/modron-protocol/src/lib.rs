@@ -300,7 +300,15 @@ pub enum Payload {
     /// Tool or subagent activity.
     Tool { activity: WireToolActivity },
     /// A mutating tool call awaits a decision; all attached clients see it.
-    ApprovalRequested { request_id: String, call: ToolCall },
+    /// `agent` names the asking sub-agent (H3b) and is absent for the run's
+    /// own calls. UI effect: append to the approval FIFO; the front shows
+    /// the ask, prefixed `[agent] ` when `agent` is present.
+    ApprovalRequested {
+        request_id: String,
+        call: ToolCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+    },
     /// The decision landed (echoed to every client).
     ApprovalResolved {
         request_id: String,
@@ -741,6 +749,9 @@ pub enum NotifyKind {
 pub struct PendingApproval {
     pub request_id: String,
     pub call: ToolCall,
+    /// The asking sub-agent's label, when a child asked (H3b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,6 +1480,7 @@ mod tests {
                         name: "edit".into(),
                         arguments: serde_json::json!({"path": "a.rs"}),
                     },
+                    agent: None,
                 },
             ),
             Frame::event(
@@ -2006,5 +2018,36 @@ mod tests {
         let live: LiveState =
             serde_json::from_str(r#"{"running":false,"model":"m1","provider":"mock"}"#).unwrap();
         assert!(live.rules.is_empty());
+    }
+
+    /// H3b: `agent` is additive. Old JSON (no field) parses as a top-level
+    /// ask; a child's ask keeps its label through a roundtrip.
+    #[test]
+    fn approval_requested_agent_is_additive() {
+        let old: Payload = serde_json::from_str(
+            r#"{"type":"approval_requested","request_id":"r1",
+                "call":{"id":"c1","name":"edit","arguments":{}}}"#,
+        )
+        .unwrap();
+        match old {
+            Payload::ApprovalRequested { agent, .. } => assert!(agent.is_none()),
+            other => panic!("unexpected payload {other:?}"),
+        }
+        let child = Payload::ApprovalRequested {
+            request_id: "r2".into(),
+            call: ToolCall {
+                id: "c2".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            },
+            agent: Some("delegate".into()),
+        };
+        let json = serde_json::to_value(&child).unwrap();
+        assert_eq!(json["agent"], "delegate");
+        let top = serde_json::json!({"type":"approval_requested","request_id":"r3",
+            "call":{"id":"c3","name":"bash","arguments":{}}});
+        let back: Payload = serde_json::from_value(top).unwrap();
+        let reserialized = serde_json::to_value(&back).unwrap();
+        assert!(reserialized.get("agent").is_none(), "absent when None");
     }
 }

@@ -1,28 +1,43 @@
-//! modron-mcp — Model Context Protocol client (Phase 5a).
+//! modron-mcp — Model Context Protocol client (Phase 5a, HTTP transport H9d).
 //!
-//! Speaks the MCP stdio transport: newline-delimited JSON-RPC 2.0. Surface
-//! implemented: `initialize` handshake, `tools/list`, `tools/call` — the
-//! tool-serving subset Modron consumes. Resources/prompts/sampling land
-//! later; migrating to the official `rmcp` SDK is the documented path if the
-//! full spec surface is ever needed (kept out to keep the binary lean).
+//! Two client transports share one tool surface (`initialize`, `tools/list`,
+//! `tools/call`, resources, prompts):
+//! - **stdio** (`McpServerHandle::spawn`): newline-delimited JSON-RPC 2.0 over a
+//!   child process's stdin/stdout.
+//! - **Streamable HTTP** (`McpServerHandle::connect_http`): one POST per message,
+//!   answered by JSON or SSE, with session and protocol-version headers. See
+//!   the [`http`] module for the details.
+//!
+//! Out of scope: the legacy HTTP+SSE transport, OAuth, and server-initiated
+//! requests (sampling, roots, elicitation). Migrating to the official `rmcp`
+//! SDK is the documented path if the full spec surface is ever needed.
 //!
 //! Token discipline (PLAN §4.8): every server's tool-schema cost is computed
 //! at connect time (`McpToolInfo::schema_tokens`) so opt-in servers pay their
 //! way visibly — no silent prompt fattening.
+
+mod http;
 
 use async_trait::async_trait;
 use modron_core::{estimate_tokens, Tool, ToolCtx, ToolOutcome, ToolSpec};
 use serde_json::{json, Value};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
-const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Hard cap for one JSON-RPC line: a server emitting an enormous
-/// newline-free run must not grow the buffer without bound (OOM).
+/// Protocol version requested over stdio (unchanged since Phase 5a).
+const STDIO_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Protocol version requested over HTTP: the first revision that defines
+/// Streamable HTTP.
+const HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Hard cap for one JSON-RPC line (stdio) or one HTTP response body: a server
+/// emitting an enormous run must not grow the buffer without bound (OOM).
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Read one newline-terminated line into `line` (newline excluded),
@@ -72,6 +87,15 @@ async fn read_capped_line(
     Ok(total + u64::from(hit_newline) as usize)
 }
 
+/// The `initialize` params both transports send.
+fn initialize_params(protocol_version: &str) -> Value {
+    json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {},
+        "clientInfo": {"name": "modron", "version": env!("CARGO_PKG_VERSION")}
+    })
+}
+
 /// Metadata for one tool a server exposes.
 #[derive(Clone, Debug)]
 pub struct McpToolInfo {
@@ -83,118 +107,39 @@ pub struct McpToolInfo {
     pub schema_tokens: u64,
 }
 
-/// A live MCP server process speaking JSON-RPC over stdio.
+/// A live MCP server connection, over whichever transport it was opened with.
 pub struct McpServerHandle {
+    transport: Transport,
+    /// How long to wait for one response.
+    timeout: Duration,
+}
+
+/// The transport variants a handle can sit on.
+enum Transport {
+    Stdio(StdioLink),
+    Http(http::HttpLink),
+}
+
+/// A spawned stdio server process.
+struct StdioLink {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
-    /// How long to wait for one response.
-    timeout: std::time::Duration,
     /// Set when a timeout fired mid-read: the stream may hold a torn line,
     /// so every later call would read garbage frames. Refuse instead of
     /// desyncing; the fix is restarting the MCP server.
     poisoned: bool,
 }
 
-impl McpServerHandle {
-    /// Spawn `command`, run the initialize handshake, and list tools.
-    pub async fn spawn(
-        server_name: &str,
-        command: &str,
-        args: &[String],
-        env: &[(String, String)],
-    ) -> anyhow::Result<(Arc<Mutex<McpServerHandle>>, Vec<McpToolInfo>)> {
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .envs(env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            // Dropping the handle kills the server — no orphaned children
-            // when a registration is dropped at shutdown.
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("MCP server `{server_name}` ({command}) failed to start: {e}")
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("MCP server `{server_name}` has no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("MCP server `{server_name}` has no stdout"))?;
-        let mut handle = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: 0,
-            timeout: CALL_TIMEOUT,
-            poisoned: false,
-        };
-
-        // Initialize handshake.
-        let result = handle
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "modron", "version": env!("CARGO_PKG_VERSION")}
-                }),
-            )
-            .await;
-        if let Err(e) = result {
-            let _ = handle.child.start_kill();
-            return Err(anyhow::anyhow!(
-                "MCP server `{server_name}` initialize failed: {e}"
-            ));
-        }
-        handle.notify("notifications/initialized", json!({})).await;
-
-        // List tools.
-        let listing = handle.request("tools/list", json!({})).await.map_err(|e| {
-            let _ = handle.child.start_kill();
-            anyhow::anyhow!("MCP server `{server_name}` tools/list failed: {e}")
-        })?;
-        let mut tools = Vec::new();
-        for tool in listing
-            .get("tools")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default()
-        {
-            let name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let description = tool
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let input_schema = tool
-                .get("inputSchema")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object"}));
-            let schema_tokens = estimate_tokens(&format!("{name}{description}{}", input_schema));
-            tools.push(McpToolInfo {
-                name,
-                description,
-                input_schema,
-                schema_tokens,
-            });
-        }
-        Ok((Arc::new(Mutex::new(handle)), tools))
-    }
-
+impl StdioLink {
     /// One JSON-RPC request/response round trip (skips notifications).
-    async fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
         if self.poisoned {
             return Err(anyhow::anyhow!(
                 "connection unusable after an earlier timeout — restart the MCP server \
@@ -205,7 +150,7 @@ impl McpServerHandle {
         let id = self.next_id;
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         self.send(&message).await?;
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let mut line = String::new();
             let read = match tokio::time::timeout_at(
@@ -263,6 +208,151 @@ impl McpServerHandle {
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+}
+
+impl Transport {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        match self {
+            Transport::Stdio(link) => link.request(method, params, timeout).await,
+            Transport::Http(link) => link.request(method, params, timeout).await,
+        }
+    }
+
+    async fn notify(&mut self, method: &str, params: Value, timeout: Duration) {
+        match self {
+            Transport::Stdio(link) => link.notify(method, params).await,
+            Transport::Http(link) => link.notify(method, params, timeout).await,
+        }
+    }
+
+    fn adopt_protocol_version(&mut self, initialize_result: &Value) {
+        if let Transport::Http(link) = self {
+            link.adopt_protocol_version(initialize_result);
+        }
+    }
+
+    /// A timeout left this transport's framing unusable (stdio only: HTTP
+    /// exchanges are independent, so nothing is torn).
+    fn mark_unusable(&mut self) {
+        if let Transport::Stdio(link) = self {
+            link.poisoned = true;
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Transport::Stdio(link) = self {
+            let _ = link.child.start_kill();
+        }
+    }
+}
+
+impl McpServerHandle {
+    /// Spawn `command`, run the initialize handshake, and list tools.
+    pub async fn spawn(
+        server_name: &str,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> anyhow::Result<(Arc<Mutex<McpServerHandle>>, Vec<McpToolInfo>)> {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args)
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            // Dropping the handle kills the server — no orphaned children
+            // when a registration is dropped at shutdown.
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("MCP server `{server_name}` ({command}) failed to start: {e}")
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("MCP server `{server_name}` has no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("MCP server `{server_name}` has no stdout"))?;
+        let handle = Self {
+            transport: Transport::Stdio(StdioLink {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 0,
+                poisoned: false,
+            }),
+            timeout: CALL_TIMEOUT,
+        };
+        Self::connect(server_name, handle, STDIO_PROTOCOL_VERSION).await
+    }
+
+    /// Connect to a Streamable HTTP MCP endpoint, run the initialize
+    /// handshake, and list tools. `headers` values may reference `${ENV_VAR}`;
+    /// an unset variable fails here, naming the variable.
+    pub async fn connect_http(
+        server_name: &str,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> anyhow::Result<(Arc<Mutex<McpServerHandle>>, Vec<McpToolInfo>)> {
+        let link = http::HttpLink::new(
+            server_name,
+            url,
+            headers,
+            initialize_params(HTTP_PROTOCOL_VERSION),
+        )?;
+        let handle = Self {
+            transport: Transport::Http(link),
+            timeout: CALL_TIMEOUT,
+        };
+        Self::connect(server_name, handle, HTTP_PROTOCOL_VERSION).await
+    }
+
+    async fn connect(
+        server_name: &str,
+        mut handle: Self,
+        protocol_version: &str,
+    ) -> anyhow::Result<(Arc<Mutex<McpServerHandle>>, Vec<McpToolInfo>)> {
+        match handle.handshake(server_name, protocol_version).await {
+            Ok(tools) => Ok((Arc::new(Mutex::new(handle)), tools)),
+            Err(e) => {
+                handle.transport.shutdown();
+                Err(e)
+            }
+        }
+    }
+
+    async fn handshake(
+        &mut self,
+        server_name: &str,
+        protocol_version: &str,
+    ) -> anyhow::Result<Vec<McpToolInfo>> {
+        let init = self
+            .request("initialize", initialize_params(protocol_version))
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP server `{server_name}` initialize failed: {e}"))?;
+        self.transport.adopt_protocol_version(&init);
+        self.notify("notifications/initialized", json!({})).await;
+        let listing = self
+            .request("tools/list", json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP server `{server_name}` tools/list failed: {e}"))?;
+        Ok(parse_tools(&listing))
+    }
+
+    /// One request/response round trip on whichever transport is live.
+    async fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.transport.request(method, params, self.timeout).await
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) {
+        self.transport.notify(method, params, self.timeout).await;
     }
 
     /// List resources the server exposes (MCP resources surface).
@@ -357,7 +447,7 @@ impl McpServerHandle {
             // the BufReader mid-line. Mark the handle unusable or the next
             // call reads a torn tail (cycle-2 audit M7).
             Err(_) => {
-                self.poisoned = true;
+                self.transport.mark_unusable();
                 return Err(anyhow::anyhow!(
                     "tools/call timed out (connection marked unusable)"
                 ));
@@ -389,6 +479,43 @@ impl McpServerHandle {
     }
 }
 
+/// Parse a `tools/list` result into tool metadata (nameless tools skipped).
+fn parse_tools(listing: &Value) -> Vec<McpToolInfo> {
+    let mut tools = Vec::new();
+    for tool in listing
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let description = tool
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let input_schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"}));
+        let schema_tokens = estimate_tokens(&format!("{name}{description}{}", input_schema));
+        tools.push(McpToolInfo {
+            name,
+            description,
+            input_schema,
+            schema_tokens,
+        });
+    }
+    tools
+}
+
 /// One resource a server exposes.
 #[derive(Clone, Debug)]
 pub struct McpResourceInfo {
@@ -412,7 +539,7 @@ pub struct McpCallResult {
 
 impl Drop for McpServerHandle {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        self.transport.shutdown();
     }
 }
 

@@ -149,17 +149,46 @@ pub struct McpConfig {
     pub servers: std::collections::BTreeMap<String, McpServerConfig>,
 }
 
-/// One MCP stdio server.
+/// One MCP server: a stdio child (`command`) or a Streamable HTTP endpoint
+/// (`url`). Exactly one of the two must be set; see [`McpServerConfig::validate`].
 #[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
+    /// Launch command for a stdio server (empty when `url` is set).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// Streamable HTTP endpoint, e.g. `https://host/mcp` (exclusive with `command`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Request headers for an HTTP server. Values may reference `${ENV_VAR}`,
+    /// expanded at connect time; secrets belong in the environment, not here.
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Refuse the server if its tools' combined schema cost exceeds this
     /// (prompt budget is a product principle; default 20_000 tokens).
     pub max_schema_tokens: Option<u64>,
+}
+
+impl McpServerConfig {
+    /// Startup check: the transport fields must name exactly one transport.
+    /// The error names the server, never a header value.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        match (&self.url, self.command.is_empty()) {
+            (Some(_), false) => Err(format!(
+                "MCP server `{name}` sets both `url` and `command` — pick one transport"
+            )),
+            (None, true) => Err(format!(
+                "MCP server `{name}` needs `command` (stdio) or `url` (Streamable HTTP)"
+            )),
+            (None, false) if self.headers.is_some() => {
+                Err(format!("MCP server `{name}`: `headers` requires `url`"))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// `[judge]` section (Phase-3b M3).
@@ -513,6 +542,56 @@ mod tests {
             .expect("valid config")
             .permissions
             .is_none());
+    }
+
+    #[test]
+    fn mcp_http_server_parses_url_and_headers() {
+        let config = parse_config(
+            "[mcp.servers.web]\nurl = \"https://example.test/mcp\"\n\
+             headers = { Authorization = \"Bearer ${MODRON_MCP_TOKEN}\" }\n",
+        )
+        .expect("valid TOML");
+        let server = &config.mcp.expect("mcp section").servers["web"];
+        assert_eq!(server.url.as_deref(), Some("https://example.test/mcp"));
+        assert!(server.command.is_empty());
+        assert_eq!(
+            server.headers.as_ref().unwrap()["Authorization"],
+            "Bearer ${MODRON_MCP_TOKEN}"
+        );
+        assert!(server.validate("web").is_ok());
+    }
+
+    #[test]
+    fn mcp_server_with_url_and_command_is_a_conflict() {
+        let config = parse_config(
+            "[mcp.servers.both]\ncommand = \"srv\"\nurl = \"https://example.test/mcp\"\n",
+        )
+        .expect("valid TOML");
+        let server = &config.mcp.unwrap().servers["both"];
+        let err = server
+            .validate("both")
+            .expect_err("url + command must conflict");
+        assert!(
+            err.contains("both") && err.contains("url") && err.contains("command"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_needs_command_or_url_and_headers_need_url() {
+        let config = parse_config("[mcp.servers.none]\nargs = []\n").expect("valid TOML");
+        let err = config.mcp.unwrap().servers["none"]
+            .validate("none")
+            .unwrap_err();
+        assert!(err.contains("`command`") && err.contains("`url`"), "{err}");
+
+        let config =
+            parse_config("[mcp.servers.stdio]\ncommand = \"srv\"\nheaders = { A = \"b\" }\n")
+                .expect("valid TOML");
+        let err = config.mcp.unwrap().servers["stdio"]
+            .validate("stdio")
+            .unwrap_err();
+        assert!(err.contains("requires `url`"), "{err}");
     }
 
     #[test]

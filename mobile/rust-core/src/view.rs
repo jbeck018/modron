@@ -208,15 +208,25 @@ pub struct DecisionOption {
 
 impl PendingApprovalView {
     pub fn new(request_id: String, call: &ToolCall) -> Self {
+        Self::for_agent(request_id, call, None)
+    }
+
+    /// H3b: a delegated child's ask shows as `[agent] <summary>`; the
+    /// top-level run's own calls (`agent: None`) keep the bare summary.
+    pub fn for_agent(request_id: String, call: &ToolCall, agent: Option<&str>) -> Self {
         let full = serde_json::to_string(&call.arguments).unwrap_or_default();
+        let summary = modron_view::approval_summary(
+            &call.name,
+            &call.arguments,
+            modron_view::APPROVAL_SUMMARY_MAX,
+        );
         Self {
             request_id,
             tool: call.name.clone(),
-            args_summary: modron_view::approval_summary(
-                &call.name,
-                &call.arguments,
-                modron_view::APPROVAL_SUMMARY_MAX,
-            ),
+            args_summary: match agent {
+                Some(agent) => format!("[{agent}] {summary}"),
+                None => summary,
+            },
             arguments: call.arguments.clone(),
             arguments_text: modron_view::sanitize_display(&full),
             options: DECISION_LABELS
@@ -798,8 +808,13 @@ pub(crate) fn fold_snapshot(
     // The snapshot is the whole truth for approvals: its one pending
     // request (if any) replaces whatever was queued before the reattach.
     vm.pending_approvals.clear();
-    if let Some(PendingApproval { request_id, call }) = &live.pending_approval {
-        enqueue_approval(vm, request_id.clone(), call);
+    if let Some(PendingApproval {
+        request_id,
+        call,
+        agent,
+    }) = &live.pending_approval
+    {
+        enqueue_approval(vm, request_id.clone(), call, agent.as_deref());
     }
     // Counters are re-derived from the log, not accumulated onto the old
     // values (a reattach would otherwise double-count).
@@ -833,8 +848,13 @@ pub(crate) fn count_log(events: &[SessionEvent]) -> (u32, u32) {
 
 /// Queue an approval request. A repeat of an id already queued replaces
 /// that entry in place (no double prompt for one request).
-pub(crate) fn enqueue_approval(vm: &mut SessionViewModel, request_id: String, call: &ToolCall) {
-    let view = PendingApprovalView::new(request_id, call);
+pub(crate) fn enqueue_approval(
+    vm: &mut SessionViewModel,
+    request_id: String,
+    call: &ToolCall,
+    agent: Option<&str>,
+) {
+    let view = PendingApprovalView::for_agent(request_id, call, agent);
     match vm
         .pending_approvals
         .iter()
@@ -986,6 +1006,28 @@ mod tests {
         let view = PendingApprovalView::new("r".into(), &call);
         assert_eq!(view.args_summary, r#"a?b"#);
         assert_eq!(view.arguments_text, r#"{"path":"a?b"}"#);
+    }
+
+    /// H3b: a child's ask reads `[agent] <summary>`; the run's own call
+    /// keeps the shared summary unchanged.
+    #[test]
+    fn child_approval_summary_is_prefixed_with_its_agent() {
+        let call = ToolCall {
+            id: "c".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": "ls" }),
+        };
+        let own = PendingApprovalView::new("r".into(), &call);
+        assert_eq!(
+            own.args_summary,
+            PendingApprovalView::for_agent("r".into(), &call, None).args_summary
+        );
+        let child = PendingApprovalView::for_agent("r".into(), &call, Some("delegate"));
+        assert_eq!(
+            child.args_summary,
+            format!("[delegate] {}", own.args_summary)
+        );
+        assert_eq!(child.tool, "bash");
     }
 
     #[test]

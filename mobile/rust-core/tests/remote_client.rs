@@ -475,6 +475,7 @@ async fn approval_pending_then_resolved() {
                         name: "edit".into(),
                         arguments: serde_json::json!({"path": "a.rs", "change": "fix"}),
                     },
+                    agent: None,
                 },
             ),
         )
@@ -1536,6 +1537,7 @@ async fn approvals_queue_fifo_and_resolve_by_id() {
                     Payload::ApprovalRequested {
                         request_id: id.into(),
                         call: lj_call(id, "edit", "a.rs"),
+                        agent: None,
                     },
                 ),
             )
@@ -1630,6 +1632,7 @@ async fn snapshot_replaces_the_approval_queue_and_disconnect_clears_it() {
                     Payload::ApprovalRequested {
                         request_id: id.into(),
                         call: lj_call(id, "bash", "x"),
+                        agent: None,
                     },
                 ),
             )
@@ -1641,6 +1644,7 @@ async fn snapshot_replaces_the_approval_queue_and_disconnect_clears_it() {
             pending_approval: Some(modron_protocol::PendingApproval {
                 request_id: "from-snapshot".into(),
                 call: lj_call("s", "edit", "b.rs"),
+                agent: None,
             }),
             ..LiveState::default()
         };

@@ -530,10 +530,20 @@ pub enum ApprovalMode {
     ApproveAll,
 }
 
+/// One approval question: the pending call plus WHO is asking. `agent` is
+/// `None` for the top-level run and `Some(label)` for a delegated child (the
+/// same label the swarm rows use, e.g. `delegate` or `persona`). Clients show
+/// it so a child's ask is never mistaken for the parent's own call.
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalAsk<'a> {
+    pub call: &'a ToolCall,
+    pub agent: Option<&'a str>,
+}
+
 /// Interactive approver for Ask-mode mutating tools (Phase-1c I2): given the
-/// pending call, return `true` to execute it. The CLI wires a `/dev/tty`
+/// pending ask, return `true` to execute it. The CLI wires a `/dev/tty`
 /// y/N/a prompt; `None` keeps the block-and-explain behavior.
-pub type Approver = dyn Fn(&ToolCall) -> bool + Send + Sync;
+pub type Approver = dyn Fn(&ApprovalAsk<'_>) -> bool + Send + Sync;
 
 /// Live-delta sink for streaming turns (Phase-1c I1): called for each
 /// [`StreamDelta`] as the provider emits it. Never blocks the engine; the

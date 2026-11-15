@@ -176,7 +176,9 @@ async fn approval_round_trip_deny_reaches_all_clients() {
         .recv_until(|p| matches!(p, Payload::ApprovalRequested { .. }))
         .await;
     let request_id = match requested.payload {
-        Payload::ApprovalRequested { request_id, call } => {
+        Payload::ApprovalRequested {
+            request_id, call, ..
+        } => {
             assert_eq!(call.name, "bash");
             request_id
         }

@@ -1138,8 +1138,12 @@ fn fold_frame(shared: &Shared, frame: Frame) {
             let core: ToolActivity = activity.into();
             fold.fold_tool(vm, &core);
         }
-        Payload::ApprovalRequested { request_id, call } => {
-            crate::view::enqueue_approval(vm, request_id, &call);
+        Payload::ApprovalRequested {
+            request_id,
+            call,
+            agent,
+        } => {
+            crate::view::enqueue_approval(vm, request_id, &call, agent.as_deref());
         }
         Payload::ApprovalResolved { request_id, .. } => {
             crate::view::resolve_approval(vm, &request_id);

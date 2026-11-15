@@ -1467,6 +1467,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "modron-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

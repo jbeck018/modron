@@ -23,8 +23,8 @@ use crate::wake::ArmedWake;
 use async_trait::async_trait;
 use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
-    ContextGauge, Engine, Phase, PlanItem, RunSummary, SessionEvent, SessionId, SessionMeta,
-    SessionStore, SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
+    ApprovalAsk, ContextGauge, Engine, Phase, PlanItem, RunSummary, SessionEvent, SessionId,
+    SessionMeta, SessionStore, SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, LiveState, NotifyKind,
@@ -325,8 +325,10 @@ pub struct SessionHandle {
     /// In-flight streaming buffers (cleared on the `Done` delta).
     text: Mutex<String>,
     reasoning: Mutex<String>,
-    /// The approval awaiting a decision (Snapshot `live.pending_approval`).
-    live_approval: Mutex<Option<PendingApproval>>,
+    /// Approvals awaiting a decision, oldest first (H3b: concurrent child
+    /// asks queue here). The Snapshot shows the front
+    /// (`live.pending_approval`).
+    live_approval: Mutex<VecDeque<PendingApproval>>,
     /// Cumulative provider-reported usage (folded from Usage events).
     usage: Mutex<Usage>,
     /// Status-line labels.
@@ -491,7 +493,7 @@ impl SessionHandle {
                     done: row.done,
                 })
                 .collect(),
-            pending_approval: lock(&self.live_approval).clone(),
+            pending_approval: lock(&self.live_approval).front().cloned(),
             cumulative_usage: *lock(&self.usage),
             model: lock(&self.model).clone(),
             provider: lock(&self.provider).clone(),
@@ -575,8 +577,12 @@ impl SessionHandle {
         *lock(&self.approval_timeout)
     }
 
-    pub fn approve_gate(&self, call: &ToolCall) -> bool {
-        if self.allow_rest.load(Ordering::Relaxed) {
+    /// `agent` is `Some(label)` for a delegated child's ask (H3b). A child
+    /// ask is honoured only while the run is live: a background child that
+    /// outlives its parent run is refused, never parked. Top-level asks come
+    /// from the run itself, so they skip that check.
+    pub fn approve_gate(&self, call: &ToolCall, agent: Option<&str>) -> bool {
+        if agent.is_none() && self.allow_rest.load(Ordering::Relaxed) {
             return true;
         }
         let approval_timeout = self.approval_timeout();
@@ -593,18 +599,30 @@ impl SessionHandle {
             // gate must not re-open the strip (cycle-3 F3).
             return false;
         }
+        if agent.is_some() && !self.busy.load(Ordering::Relaxed) {
+            // The run ended (complete() clears `busy` under gate_order):
+            // no approver may outlive its run.
+            return false;
+        }
+        if self.allow_rest.load(Ordering::Relaxed) {
+            // Sticky allow-all of this run covers its children too: they
+            // all ask through this one gate.
+            return true;
+        }
         {
             let mut seq = lock(&self.seq);
             lock(&self.pending).insert(request_id.clone(), respond);
-            *lock(&self.live_approval) = Some(PendingApproval {
+            lock(&self.live_approval).push_back(PendingApproval {
                 request_id: request_id.clone(),
                 call: call.clone(),
+                agent: agent.map(str::to_string),
             });
             self.publish_locked(
                 &mut seq,
                 Payload::ApprovalRequested {
                     request_id: request_id.clone(),
                     call: call.clone(),
+                    agent: agent.map(str::to_string),
                 },
             );
             self.publish_locked(
@@ -633,7 +651,7 @@ impl SessionHandle {
         {
             let mut seq = lock(&self.seq);
             let was_resolved = lock(&self.pending).remove(&request_id).is_none();
-            *lock(&self.live_approval) = None;
+            lock(&self.live_approval).retain(|p| p.request_id != request_id);
             if timed_out && !was_resolved {
                 self.publish_locked(
                     &mut seq,
@@ -658,7 +676,7 @@ impl SessionHandle {
         if decision == Decision::AllowAll {
             self.allow_rest.store(true, Ordering::Relaxed);
         }
-        *lock(&self.live_approval) = None;
+        lock(&self.live_approval).retain(|p| p.request_id != request_id);
         let _ = respond.send(decision != Decision::Deny);
         self.publish_locked(
             &mut seq,
@@ -711,7 +729,7 @@ impl SessionHandle {
                 },
             );
         }
-        *lock(&self.live_approval) = None;
+        lock(&self.live_approval).clear();
         if had_run {
             self.publish_locked(&mut seq, Payload::TurnAborted {});
         }
@@ -772,13 +790,30 @@ impl SessionHandle {
         let mut slot = lock(&self.run);
         // Interrupted: the slot (and the terminal frame) went to the interrupt.
         slot.take()?;
+        // Run end (H3b): clear `busy` and deny every parked ask under
+        // gate_order, so a background child asking after this point is
+        // refused by approve_gate and none parked here outlives the run.
+        let order_guard = lock(&self.gate_order);
         self.busy.store(false, Ordering::Relaxed);
+        let mut seq = lock(&self.seq);
+        let parked = lock(&self.pending).drain().collect::<Vec<_>>();
+        for (request_id, respond) in parked {
+            let _ = respond.send(false);
+            self.publish_locked(
+                &mut seq,
+                Payload::ApprovalResolved {
+                    request_id,
+                    decision: modron_protocol::Decision::Deny,
+                },
+            );
+        }
+        lock(&self.live_approval).clear();
+        drop(order_guard);
         // The slot stays locked through the terminal frame, so a run that
         // starts next cannot publish ahead of this turn's end.
         // Clear the live buffers on the terminal frame: a provider error
         // after text deltas otherwise leaves the stale prefix glued to the
         // NEXT turn's stream for every late attacher (cycle-2 audit L1).
-        let mut seq = lock(&self.seq);
         lock(&self.text).clear();
         lock(&self.reasoning).clear();
         lock(&self.tracker).clear_turn();
@@ -1371,10 +1406,10 @@ impl SessionHub {
             }
         }));
         let approval_hub = self.clone();
-        config.approver = Some(Arc::new(move |call: &ToolCall| {
+        config.approver = Some(Arc::new(move |ask: &ApprovalAsk<'_>| {
             approval_hub
                 .handle(&id)
-                .map(|handle| handle.approve_gate(call))
+                .map(|handle| handle.approve_gate(ask.call, ask.agent))
                 .unwrap_or(false)
         }));
         if let Some(dir) = working_dir {
@@ -1404,7 +1439,7 @@ impl SessionHub {
             tracker: Mutex::new(ActivityTracker::new()),
             text: Mutex::new(String::new()),
             reasoning: Mutex::new(String::new()),
-            live_approval: Mutex::new(None),
+            live_approval: Mutex::new(VecDeque::new()),
             usage: Mutex::new(Usage::default()),
             model: Mutex::new(engine.config.default_model.clone()),
             provider: Mutex::new(engine.config.default_provider.clone()),
@@ -1456,6 +1491,9 @@ impl SessionHub {
         // "Allow all" is sticky for the rest of the RUN only (AGENTS.md
         // interaction semantics): a new run starts un-approved.
         handle.allow_rest.store(false, Ordering::Relaxed);
+        // Busy before the task can run, so a child ask from its first turn
+        // already sees a live run (approve_gate's run-end check).
+        handle.busy.store(true, Ordering::Relaxed);
         let owner = Arc::clone(&handle);
         let hub = self.clone();
         let task = tokio::spawn(async move {
@@ -1478,7 +1516,6 @@ impl SessionHub {
             }
         });
         *slot = Some(task);
-        handle.busy.store(true, Ordering::Relaxed);
         Ok(())
     }
 

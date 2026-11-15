@@ -1054,7 +1054,7 @@ in a turn concurrently); what was missing was visibility.
 |---|---|---|---|
 | H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | ACTIVE | H1a steer inbox, H1b Steer/Steered, H1c Enqueue/Dequeue/QueueChanged + LiveState.queued DONE. Open: actor on frames, LiveState.steer_pending; a Submit racing a queued start drops that queued message with a Note (fix: requeue at front) |
 | H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | DONE | H2a engine plan phase + per-turn plan tail; H2b ConfigPatch.phase, LiveState.phase/plan_pending, PlanProposed / DecidePlan / PlanDecided, queue held while a plan is pending. Client rendering lands with C3 |
-| H3 | ACP: subagent events surface as tool_call / status notifications to the editor | ACTIVE | H3a DONE: progress heartbeats carry live turns/tokens (MeteredStore). Open: approvals routed to the parent, completion push (AgentFinished), SteerAgent/KillAgent, cap |
+| H3 | ACP: subagent events surface as tool_call / status notifications to the editor | ACTIVE | H3a live counters; H3b DONE: Approver takes ApprovalAsk { call, agent }, children ask through the parent approver (label on ApprovalRequested / PendingApproval, summary prefixed `[agent] `), delegate starts without its own prompt in Ask mode with an approver, so delegates run concurrently. Open: a background child from an earlier run can ask during a later run and inherits that run's allow-all (tag asks with a run epoch); TUI and CLI tty approvers hold one slot, so concurrent child asks there deny the earlier one; SteerAgent / KillAgent / AgentFinished |
 | H4 | Parallel delegates verified: two delegate calls in ONE turn run concurrently (read-only dispatch), results land in transcript in call order, each child under its persona's forced model | ACTIVE | H4a DONE: EngineConfig.reviewer (config `review_model`, `review_max_rounds`), SessionEvent::Review, TranscriptEntry::Review, bounded fix rounds, review errors never fail a run. Open: H4b untracked new files are invisible to `git diff` (review records skipped), non-LLM claim checks, Review over the wire needs no new frame (it is a persisted event) |
 | V21 | Gates | DONE | **337 passed / 0 failed**, clippy clean |
 
@@ -1430,7 +1430,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | DONE | stub and delegate_status descriptions fixed |
 | H9b | Real compact command and true context occupancy over the protocol | DONE | Engine compact_session + context_gauge; Compact frame, ContextChanged, LiveState.context. Known: Compact vs Submit is check-then-act; the gauge is None until the first run or compaction in a server process |
 | H9c | Hooks: turn-end and session-start events | DONE | session_start and turn_end hooks: observe-only, never block; do not disable speculative reads |
-| H9d | MCP over HTTP | TODO | |
+| H9d | MCP over HTTP | DONE | MCP Streamable HTTP client: [mcp.servers.x] url + headers with ${ENV} expansion, JSON or SSE replies, session id, one re-initialize on 404, body cap. stdio unchanged. CLI connects by transport (connect_mcp_server). Out of scope: legacy SSE transport, OAuth, server-initiated requests |
 | H9e | Web fetch tool | DONE | webfetch tool: on-demand, approval-gated, SSRF checks with a pinned resolved address, no redirects, refused under a sandbox, body wrapped in untrusted-content markers. Ignores HTTP proxies by design (a proxy would bypass the address pin) |
 
 ### Client
@@ -1506,3 +1506,6 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 - 2026-11-15: S1 closed: the NSH web target is viable for the portal
   (C4) in Rust. Open questions moved to C4: accessibility roles, real
   device testing, load over a real network (1.4 MB brotli wasm).
+- 2026-11-15: wave 9 (harness half). H3b and H9d landed; the lead
+  wired HTTP servers into the three CLI connect sites. Gates: fmt
+  clean, clippy clean, 1123 tests pass.

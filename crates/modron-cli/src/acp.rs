@@ -409,8 +409,8 @@ impl AcpHub {
         let delta_hub = Arc::clone(self);
         let tool_hub = Arc::clone(self);
         AgentSinks {
-            approver: Some(Arc::new(move |call: &modron_core::ToolCall| {
-                approver_hub.request_permission(call)
+            approver: Some(Arc::new(move |ask: &modron_core::ApprovalAsk<'_>| {
+                approver_hub.request_permission(ask.call, ask.agent)
             })),
             on_delta: Some(Arc::new(move |d: StreamDelta| {
                 delta_hub.emit(AcUpdate::Delta(d));
@@ -448,7 +448,7 @@ impl AcpHub {
 
     /// Engine approver: queue the permission request in the ordered stream,
     /// then park until the editor answers. The session is the run's own.
-    fn request_permission(&self, call: &modron_core::ToolCall) -> bool {
+    fn request_permission(&self, call: &modron_core::ToolCall, agent: Option<&str>) -> bool {
         let active = locked(&self.active).clone();
         let Some(run) = active else {
             return false;
@@ -459,7 +459,12 @@ impl AcpHub {
         let line = permission_request(
             &run.session_id,
             &format!("call-{request_id}"),
-            &format!("{} {}", call.name, short_call_summary(call)),
+            &format!(
+                "{}{} {}",
+                agent.map(|a| format!("[{a}] ")).unwrap_or_default(),
+                call.name,
+                short_call_summary(call)
+            ),
             request_id,
         )
         .to_string();
