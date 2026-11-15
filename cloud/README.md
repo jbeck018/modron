@@ -35,6 +35,25 @@ cloud/bridge/README.md).
 Deploying takes `npx wrangler deploy` from your own Cloudflare login;
 nothing in this repository deploys on your behalf.
 
+## Owner portal (optional, opt-in)
+
+The bridge can also serve an owner portal: sign in with a token, see the
+sessions your hosts registered, and mint invite links with a viewer or
+approver role. It is off until you set two Wrangler secrets, and a bridge
+without them behaves exactly as above (share links work, with no sign-in).
+
+```sh
+npx wrangler secret put OWNER_TOKEN   # owner sign-in and invite signing
+npx wrangler secret put HOST_TOKEN    # hosts register sessions and dial /agent
+```
+
+Setting `OWNER_TOKEN` turns off bare share-key viewer sockets (they need an
+invite or a sign-in), so check existing share links before you set it. Setting
+`HOST_TOKEN` needs an upgraded `modron serve` that sends the bearer. The routes,
+the host registration contract and the compatibility rules are in
+cloud/bridge/README.md ("Portal"). Nothing here deploys anything: `npx wrangler
+deploy` from your own login is still the only way to publish it.
+
 ## Roadmap
 
 - Phase 2: a Cloudflare Sandbox/Containers runtime so `modron serve`

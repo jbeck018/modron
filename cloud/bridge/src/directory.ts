@@ -1,0 +1,202 @@
+// The portal's Directory: one SQLite-backed Durable Object (idFromName
+// "directory") holding the owner's session list, owner sign-in cookies,
+// invite records, one-time connection tickets and sign-in rate counters.
+// Only RPC methods on this class reach it; no HTTP route is wired to it.
+// Each method has no await between its reads and writes, so it is atomic
+// with respect to other RPCs on this instance (the ticket redeem relies on
+// that: read, delete, then decide).
+
+import { DurableObject } from "cloudflare:workers";
+import {
+  AUTH_MAX_ATTEMPTS,
+  AUTH_WINDOW_MS,
+  OWNER_TTL_MS,
+  TICKET_TTL_MS,
+  randomHex,
+} from "./portal";
+
+export type Role = "viewer" | "approver";
+
+export type SessionRow = {
+  id: string;
+  title: string;
+  host_label: string;
+  host_kind: string;
+  viewer_key: string;
+  state: string;
+  updated_at: number;
+};
+
+export type InviteRow = {
+  id: string;
+  session_id: string;
+  role: Role;
+  expires_at: number;
+  revoked: number;
+  created_at: number;
+  uses: number;
+};
+
+export type IssuedTicket = { ticket: string; viewer_key: string; role: Role };
+
+export class Directory extends DurableObject<object> {
+  private readonly sql: SqlStorage;
+
+  constructor(state: DurableObjectState, env: object) {
+    super(state, env);
+    this.sql = state.storage.sql;
+    void state.blockConcurrencyWhile(async () => {
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        host_label TEXT NOT NULL,
+        host_kind TEXT NOT NULL,
+        viewer_key TEXT NOT NULL,
+        state TEXT NOT NULL,
+        updated_at INTEGER NOT NULL)`);
+      // cookie_id is SHA-256 of the cookie value: a leaked row is not a session.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS owner_sessions (
+        cookie_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL)`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS invites (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        uses INTEGER NOT NULL DEFAULT 0)`);
+      this.sql.exec("CREATE INDEX IF NOT EXISTS invites_by_session ON invites(session_id)");
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS tickets (
+        ticket TEXT PRIMARY KEY,
+        viewer_key TEXT NOT NULL,
+        role TEXT NOT NULL,
+        expires_at INTEGER NOT NULL)`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS auth_attempts (
+        ip TEXT PRIMARY KEY,
+        window_start INTEGER NOT NULL,
+        attempts INTEGER NOT NULL)`);
+    });
+  }
+
+  // --- owner sign-in ---
+
+  // Counts one sign-in attempt for `ip`. Returns false once the window
+  // already holds AUTH_MAX_ATTEMPTS attempts.
+  async takeAuthAttempt(ip: string, now: number): Promise<boolean> {
+    this.sql.exec("DELETE FROM auth_attempts WHERE window_start <= ?", now - AUTH_WINDOW_MS);
+    const row = this.sql
+      .exec<{ window_start: number; attempts: number }>("SELECT window_start, attempts FROM auth_attempts WHERE ip = ?", ip)
+      .toArray()[0];
+    if (!row) {
+      this.sql.exec("INSERT INTO auth_attempts (ip, window_start, attempts) VALUES (?, ?, 1)", ip, now);
+      return true;
+    }
+    if (row.attempts >= AUTH_MAX_ATTEMPTS) return false;
+    this.sql.exec("UPDATE auth_attempts SET attempts = attempts + 1 WHERE ip = ?", ip);
+    return true;
+  }
+
+  async createOwnerSession(cookieHash: string, now: number): Promise<void> {
+    this.sql.exec("INSERT INTO owner_sessions (cookie_id, created_at, last_seen) VALUES (?, ?, ?)", cookieHash, now, now);
+  }
+
+  // True when the cookie is live (under 30 days old). Expired rows are removed.
+  async touchOwnerSession(cookieHash: string, now: number): Promise<boolean> {
+    const row = this.sql
+      .exec<{ created_at: number }>("SELECT created_at FROM owner_sessions WHERE cookie_id = ?", cookieHash)
+      .toArray()[0];
+    if (!row) return false;
+    if (now - row.created_at >= OWNER_TTL_MS) {
+      this.sql.exec("DELETE FROM owner_sessions WHERE cookie_id = ?", cookieHash);
+      return false;
+    }
+    this.sql.exec("UPDATE owner_sessions SET last_seen = ? WHERE cookie_id = ?", now, cookieHash);
+    return true;
+  }
+
+  async revokeOwnerSession(cookieHash: string): Promise<void> {
+    this.sql.exec("DELETE FROM owner_sessions WHERE cookie_id = ?", cookieHash);
+  }
+
+  // --- session directory ---
+
+  async upsertSession(row: SessionRow): Promise<void> {
+    this.sql.exec(
+      `INSERT OR REPLACE INTO sessions (id, title, host_label, host_kind, viewer_key, state, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      row.id, row.title, row.host_label, row.host_kind, row.viewer_key, row.state, row.updated_at,
+    );
+  }
+
+  async deleteSession(id: string): Promise<boolean> {
+    const existed = this.sql.exec("SELECT 1 AS one FROM sessions WHERE id = ?", id).toArray().length > 0;
+    this.sql.exec("DELETE FROM sessions WHERE id = ?", id);
+    return existed;
+  }
+
+  async getSession(id: string): Promise<SessionRow | null> {
+    return this.sql.exec<SessionRow>("SELECT * FROM sessions WHERE id = ?", id).toArray()[0] ?? null;
+  }
+
+  async listSessions(): Promise<SessionRow[]> {
+    return this.sql.exec<SessionRow>("SELECT * FROM sessions ORDER BY updated_at DESC, rowid DESC").toArray();
+  }
+
+  // --- invites ---
+
+  async createInvite(row: InviteRow): Promise<void> {
+    this.sql.exec(
+      "INSERT INTO invites (id, session_id, role, expires_at, revoked, created_at, uses) VALUES (?, ?, ?, ?, 0, ?, 0)",
+      row.id, row.session_id, row.role, row.expires_at, row.created_at,
+    );
+  }
+
+  async listInvites(sessionId: string | null): Promise<InviteRow[]> {
+    const rows = sessionId === null
+      ? this.sql.exec<InviteRow>("SELECT * FROM invites ORDER BY created_at DESC").toArray()
+      : this.sql.exec<InviteRow>("SELECT * FROM invites WHERE session_id = ? ORDER BY created_at DESC", sessionId).toArray();
+    return rows;
+  }
+
+  // Returns false when no such invite exists.
+  async revokeInvite(id: string): Promise<boolean> {
+    const existed = this.sql.exec("SELECT 1 AS one FROM invites WHERE id = ?", id).toArray().length > 0;
+    if (existed) this.sql.exec("UPDATE invites SET revoked = 1 WHERE id = ?", id);
+    return existed;
+  }
+
+  // Redeems a valid invite for a one-time ticket (60 s). Returns null when
+  // the invite is unknown, revoked, expired, or its session is no longer
+  // registered. The ticket carries the role and the session's viewer key.
+  async issueTicket(inviteId: string, now: number): Promise<IssuedTicket | null> {
+    const invite = this.sql.exec<InviteRow>("SELECT * FROM invites WHERE id = ?", inviteId).toArray()[0];
+    if (!invite || invite.revoked !== 0 || invite.expires_at <= now) return null;
+    const session = this.sql
+      .exec<SessionRow>("SELECT viewer_key FROM sessions WHERE id = ?", invite.session_id)
+      .toArray()[0];
+    if (!session) return null;
+    this.sql.exec("DELETE FROM tickets WHERE expires_at <= ?", now);
+    const ticket = randomHex(32);
+    this.sql.exec(
+      "INSERT INTO tickets (ticket, viewer_key, role, expires_at) VALUES (?, ?, ?, ?)",
+      ticket, session.viewer_key, invite.role, now + TICKET_TTL_MS,
+    );
+    this.sql.exec("UPDATE invites SET uses = uses + 1 WHERE id = ?", inviteId);
+    return { ticket, viewer_key: session.viewer_key, role: invite.role };
+  }
+
+  // Single use: the row is deleted whether or not the ticket still matches.
+  // Returns the role only when the viewer key matches and the ticket is
+  // unexpired.
+  async redeemTicket(ticket: string, viewerKey: string, now: number): Promise<Role | null> {
+    const row = this.sql
+      .exec<{ viewer_key: string; role: Role; expires_at: number }>(
+        "SELECT viewer_key, role, expires_at FROM tickets WHERE ticket = ?", ticket)
+      .toArray()[0];
+    this.sql.exec("DELETE FROM tickets WHERE ticket = ?", ticket);
+    if (!row || row.viewer_key !== viewerKey || row.expires_at <= now) return null;
+    return row.role;
+  }
+}

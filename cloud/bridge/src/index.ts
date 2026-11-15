@@ -51,7 +51,6 @@ const PAGE_MAX_BYTES = 96 * 1024; // /pages body cap (DO storage values cap at 1
 const PAGE_TTL_MS = 7 * 24 * 3600 * 1000; // pages GC 7 days after publish
 const BUFFER_IDLE_MS = 6 * 3600 * 1000; // buffer GC 6h after both sides leave
 const REGISTRY_DO = "__pages__"; // DO name holding the page-id -> key registry
-const KEY_RE = /^[a-z0-9-]{1,64}$/; // share keys are 8 lowercase hex chars; stay permissive
 const ID_RE = /^[0-9a-f-]{1,64}$/i; // page ids are crypto.randomUUID()
 
 // True exactly once per viewer socket: the first call marks it and returns
@@ -76,20 +75,20 @@ interface Env {
   // Workers Static Assets (wrangler.jsonc `assets`): the web app bundle
   // under public/app/. Requests reach the Worker first (run_worker_first).
   ASSETS: Fetcher;
+  // Portal (cloud/bridge/README.md "Portal"). Wrangler secrets; unset means
+  // the portal routes answer 503 and the share-link flow is unchanged.
+  OWNER_TOKEN?: string;
+  // Host registration and the agent tunnel. Unset leaves /agent open to
+  // anyone holding the agent key, as before.
+  HOST_TOKEN?: string;
+  DIRECTORY: DurableObjectNamespace<Directory>;
+  // Test-only (set by test/portal.mjs, never in a deployment): accepts a
+  // ttl_seconds field on POST /api/invites so expiry can be tested quickly.
+  MODRON_TEST_HOOKS?: string;
 }
 
-// Constant-time string equality for the publish token. Compares UTF-8
-// bytes and always walks the longer input, so the timing does not reveal
-// the position of the first mismatch.
-function constantTimeEquals(a: string, b: string): boolean {
-  const enc = new TextEncoder();
-  const x = enc.encode(a);
-  const y = enc.encode(b);
-  let diff = x.length ^ y.length;
-  const n = Math.max(x.length, y.length);
-  for (let i = 0; i < n; i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
-  return diff === 0;
-}
+// constantTimeEquals (publish token, owner token, invite signatures) lives in
+// ./portal so the Directory checks share it.
 
 // Top-level publish gate, run by the router before any DO is touched.
 // Returns a Response to send back, or null when the request may proceed.
@@ -126,6 +125,34 @@ interface RegistryEntry {
 }
 
 import { DurableObject } from "cloudflare:workers";
+import { Directory } from "./directory";
+import {
+  KEY_RE,
+  OWNER_COOKIE,
+  TICKET_RE,
+  UUID_RE,
+  INVITE_ID_RE,
+  constantTimeEquals,
+  forbiddenFrame,
+  inviteSignature,
+  isLocalDev,
+  judgeViewerFrame,
+  ownerCookieHeader,
+  parseHostSession,
+  parseInvite,
+  parseInviteToken,
+  randomHex,
+  readCookie,
+  readJsonObject,
+  sha256Hex,
+} from "./portal";
+
+export { Directory };
+
+// Router-to-object hand-off of a viewer's grant (owner | viewer | approver).
+// Set only by the router on /ws/ upgrades; any client-sent copy is removed.
+const GRANT_HEADER = "x-modron-grant";
+const GRANTS = new Set(["owner", "viewer", "approver"]);
 
 // --- web app (/app/*, static assets) ---
 
@@ -184,6 +211,12 @@ export class SessionBridge extends DurableObject {
   roleOf(ws: WebSocket) {
     for (const tag of this.state.getTags(ws)) { if (tag.startsWith("role:")) return tag.slice(5); }
     return "";
+  }
+  // "owner" | "viewer" | "approver" for portal-granted viewers, "legacy" for
+  // a share-key-only viewer (portal off). Agent sockets never carry one.
+  grantOf(ws: WebSocket) {
+    for (const tag of this.state.getTags(ws)) { if (tag.startsWith("grant:")) return tag.slice(6); }
+    return "legacy";
   }
   viewers() { return this.state.getWebSockets("role:viewer"); }
   agentSocket() { return this.state.getWebSockets("role:agent").at(-1) ?? null; }
@@ -402,13 +435,23 @@ export class SessionBridge extends DurableObject {
     if ((m = path.match(/^\/(?:agent|ws)\/([^/]+)$/)) && request.headers.get("upgrade") === "websocket") {
       const key = m[1];
       const role = path.startsWith("/agent/") ? "agent" : "viewer";
+      // The router sets the grant (ticket redeemed, or owner cookie checked).
+      // With the portal on, a viewer socket without one is refused here too,
+      // so this object fails closed even if the router is bypassed.
+      const grant = role === "viewer" ? request.headers.get(GRANT_HEADER) : null;
+      if (role === "viewer" && grant === null && this.env.OWNER_TOKEN) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      if (grant !== null && !GRANTS.has(grant)) return new Response("unauthorized", { status: 401 });
       const now = Date.now();
       await this.state.storage.put("seen:" + role, now);
       await this.ensureAlarmAt(now + BUFFER_IDLE_MS);
       const pair = new WebSocketPair();
-      // The tag only marks the socket as keyed; the agent's secret key is
-      // never stored.
-      this.state.acceptWebSocket(pair[1], ["role:" + role, "key:" + (role === "agent" ? "agent" : key)]);
+      // The tags only mark the socket (keyed, and its grant); the agent's
+      // secret key is never stored.
+      const tags = ["role:" + role, "key:" + (role === "agent" ? "agent" : key)];
+      if (role === "viewer") tags.push("grant:" + (grant ?? "legacy"));
+      this.state.acceptWebSocket(pair[1], tags);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     return new Response("modron bridge - see cloud/bridge/README.md", { status: 404 });
@@ -437,6 +480,18 @@ export class SessionBridge extends DurableObject {
       return;
     }
     if (role !== "agent") {
+      // Invite and approver sockets are filtered before anything is
+      // forwarded: malformed frames are dropped, frames outside the role's
+      // list get a forbidden error. Owner and legacy sockets are unchanged.
+      const grant = this.grantOf(ws);
+      if (grant === "viewer" || grant === "approver") {
+        const verdict = judgeViewerFrame(grant, message);
+        if (verdict.verdict === "malformed") return;
+        if (verdict.verdict === "forbidden") {
+          try { ws.send(forbiddenFrame(verdict.id)); } catch { /* gone */ }
+          return;
+        }
+      }
       // Viewer: {"type":"sync"} replays the buffer; anything else is
       // forwarded to the agent verbatim.
       let parsed: { type?: unknown } | null = null;
@@ -520,6 +575,234 @@ export class SessionBridge extends DurableObject {
   }
 }
 
+// --- portal: owner sign-in, host registration, session directory, invites ---
+// Owner routes are gated in order: OWNER_TOKEN set (else 503), then a live
+// owner cookie (requireOwner). Host registration needs HOST_TOKEN. The
+// Directory object is reached only through these handlers, never over HTTP.
+
+const directory = (env: Env) => env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+const iso = (ms: number) => new Date(ms).toISOString();
+
+function plainResponse(status: number, text: string, extra: Record<string, string> = {}): Response {
+  return new Response(text, {
+    status,
+    headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", ...extra },
+  });
+}
+
+function jsonResponse(status: number, value: unknown): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+}
+
+const portalOff = () => plainResponse(503, "portal not configured");
+
+// Client address from Cloudflare's header (set on every proxied request).
+function clientIp(request: Request): string {
+  return (request.headers.get("cf-connecting-ip") ?? "unknown").slice(0, 64);
+}
+
+function bearerMatches(request: Request, expected: string): boolean {
+  const auth = request.headers.get("authorization") ?? "";
+  const presented = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+  return constantTimeEquals(presented, expected);
+}
+
+// True when the request carries a live owner cookie (and refreshes it).
+async function ownerCookieLive(request: Request, env: Env): Promise<boolean> {
+  const cookie = readCookie(request, OWNER_COOKIE);
+  if (cookie === null) return false;
+  return directory(env).touchOwnerSession(await sha256Hex(cookie), Date.now());
+}
+
+// Used by every owner route. Returns null when signed in, else the 401.
+export async function requireOwner(request: Request, env: Env): Promise<Response | null> {
+  if (await ownerCookieLive(request, env)) return null;
+  return plainResponse(401, "unauthorized");
+}
+
+// POST /auth { token }. Five attempts per minute per client IP, counted in
+// the Directory before the token is compared.
+async function handleAuth(request: Request, env: Env): Promise<Response> {
+  const dir = directory(env);
+  if (!(await dir.takeAuthAttempt(clientIp(request), Date.now()))) {
+    return plainResponse(429, "too many attempts, try again in a minute", { "retry-after": "60" });
+  }
+  const parsed = await readJsonObject(request, ["token"]);
+  if (!parsed.ok) return parsed.response;
+  const presented = typeof parsed.body.token === "string" ? parsed.body.token : "";
+  if (!constantTimeEquals(presented, env.OWNER_TOKEN ?? "")) return plainResponse(401, "unauthorized");
+  const cookie = randomHex(32);
+  await dir.createOwnerSession(await sha256Hex(cookie), Date.now());
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "set-cookie": ownerCookieHeader(cookie, !isLocalDev(new URL(request.url))),
+    },
+  });
+}
+
+// POST /auth/logout: revokes the presented cookie (if any) and clears it.
+async function handleLogout(request: Request, env: Env): Promise<Response> {
+  const cookie = readCookie(request, OWNER_COOKIE);
+  if (cookie !== null) await directory(env).revokeOwnerSession(await sha256Hex(cookie));
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "cache-control": "no-store",
+      "set-cookie": ownerCookieHeader(null, !isLocalDev(new URL(request.url))),
+    },
+  });
+}
+
+// PUT | DELETE /api/host/sessions/<id>, bearer HOST_TOKEN.
+async function handleHostSession(request: Request, env: Env, id: string): Promise<Response> {
+  if (!env.HOST_TOKEN) return plainResponse(503, "host registration is disabled: this bridge has no HOST_TOKEN secret");
+  if (!bearerMatches(request, env.HOST_TOKEN)) return plainResponse(401, "unauthorized");
+  const sid = id.toLowerCase();
+  if (!UUID_RE.test(sid)) return plainResponse(400, "invalid session id");
+  if (request.method === "DELETE") {
+    await directory(env).deleteSession(sid);
+    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+  }
+  if (request.method !== "PUT") return plainResponse(405, "method not allowed");
+  const parsed = await readJsonObject(request, ["title", "host_label", "host_kind", "viewer_key", "state"]);
+  if (!parsed.ok) return parsed.response;
+  const input = parseHostSession(parsed.body);
+  if (!input.ok) return plainResponse(400, input.message);
+  await directory(env).upsertSession({ id: sid, ...input.value, updated_at: Date.now() });
+  return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+}
+
+// GET /api/sessions (owner), newest first.
+async function handleOwnerSessions(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return plainResponse(405, "method not allowed");
+  return jsonResponse(200, await directory(env).listSessions());
+}
+
+// POST /api/invites, GET /api/invites[?session_id=], DELETE /api/invites/<id>.
+async function handleInvites(request: Request, env: Env, path: string): Promise<Response> {
+  const dir = directory(env);
+  const url = new URL(request.url);
+  const ownerToken = env.OWNER_TOKEN ?? "";
+  const hooks = Boolean(env.MODRON_TEST_HOOKS);
+  const describe = async (r: { id: string; session_id: string; role: string; expires_at: number; revoked: number; created_at: number; uses: number }) => ({
+    id: r.id,
+    session_id: r.session_id,
+    role: r.role,
+    expires_at: iso(r.expires_at),
+    created_at: iso(r.created_at),
+    revoked: r.revoked === 1,
+    uses: r.uses,
+    url: `${url.origin}/i/${r.id}.${await inviteSignature(ownerToken, r.id)}`,
+  });
+  if (path === "/api/invites") {
+    if (request.method === "POST") {
+      const parsed = await readJsonObject(request, hooks
+        ? ["session_id", "role", "ttl_hours", "ttl_seconds"]
+        : ["session_id", "role", "ttl_hours"]);
+      if (!parsed.ok) return parsed.response;
+      const input = parseInvite(parsed.body, hooks);
+      if (!input.ok) return plainResponse(400, input.message);
+      const now = Date.now();
+      if ((await dir.getSession(input.value.session_id)) === null) return plainResponse(404, "session is not registered");
+      const id = randomHex(16);
+      const expires_at = now + input.value.ttl_ms;
+      await dir.createInvite({
+        id,
+        session_id: input.value.session_id,
+        role: input.value.role,
+        expires_at,
+        revoked: 0,
+        created_at: now,
+        uses: 0,
+      });
+      return jsonResponse(201, {
+        id,
+        url: `${url.origin}/i/${id}.${await inviteSignature(ownerToken, id)}`,
+        expires_at: iso(expires_at),
+      });
+    }
+    if (request.method === "GET") {
+      const sid = url.searchParams.get("session_id");
+      if (sid !== null && !UUID_RE.test(sid)) return plainResponse(400, "invalid session_id");
+      const rows = await dir.listInvites(sid === null ? null : sid.toLowerCase());
+      return jsonResponse(200, await Promise.all(rows.map(describe)));
+    }
+    return plainResponse(405, "method not allowed");
+  }
+  const m = path.match(/^\/api\/invites\/([^/]+)$/);
+  if (m) {
+    if (request.method !== "DELETE") return plainResponse(405, "method not allowed");
+    if (!INVITE_ID_RE.test(m[1])) return plainResponse(400, "invalid invite id");
+    const existed = await dir.revokeInvite(m[1]);
+    return existed
+      ? new Response(null, { status: 204, headers: { "cache-control": "no-store" } })
+      : plainResponse(404, "not found");
+  }
+  return plainResponse(404, "not found");
+}
+
+// GET /i/<id>.<sig>. Every failure is the same short page: 403 for a bad
+// signature, 410 for expired, revoked or unregistered. A valid invite
+// becomes a one-time ticket and a redirect to the app.
+async function handleInviteLink(request: Request, env: Env, token: string): Promise<Response> {
+  const notValid = (status: number) => new Response(
+    "<!doctype html><meta charset=utf-8><title>modron</title><p>invite is not valid</p>",
+    {
+      status,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "default-src 'none'",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    },
+  );
+  const parsed = parseInviteToken(token);
+  if (!parsed) return notValid(403);
+  const expected = await inviteSignature(env.OWNER_TOKEN ?? "", parsed.id);
+  if (!constantTimeEquals(expected, parsed.sig)) return notValid(403);
+  const issued = await directory(env).issueTicket(parsed.id, Date.now());
+  if (!issued) return notValid(410);
+  const url = new URL(request.url);
+  const wsScheme = url.protocol === "https:" ? "wss:" : "ws:";
+  const inner = `${wsScheme}//${url.host}/ws/${issued.viewer_key}?ticket=${issued.ticket}`;
+  return new Response(null, {
+    status: 302,
+    headers: { location: "/app/?url=" + encodeURIComponent(inner), "cache-control": "no-store" },
+  });
+}
+
+// Grant for a viewer socket: a redeemed ticket (role from the invite), the
+// owner cookie, or, with the portal off, nothing (the share key alone, as
+// before). Anything else is 401 when the portal is on.
+type Grant = { role: "owner" | "viewer" | "approver" | null };
+async function viewerGrant(request: Request, env: Env, key: string): Promise<Grant | Response> {
+  const ticket = new URL(request.url).searchParams.get("ticket");
+  if (ticket !== null) {
+    const denied = plainResponse(403, "ticket is not valid");
+    if (!TICKET_RE.test(ticket)) return denied;
+    const role = await directory(env).redeemTicket(ticket, key, Date.now());
+    return role === null ? denied : { role };
+  }
+  if (!env.OWNER_TOKEN) return { role: null };
+  if (await ownerCookieLive(request, env)) return { role: "owner" };
+  return plainResponse(401, "unauthorized");
+}
+
+// Copy of the request with the grant header set to `role` (or none). Any
+// client-supplied copy is removed first.
+function withGrant(request: Request, role: string | null): Request {
+  const headers = new Headers(request.headers);
+  headers.delete(GRANT_HEADER);
+  if (role !== null) headers.set(GRANT_HEADER, role);
+  return new Request(request, { headers });
+}
+
 const router: ExportedHandler<Env> = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -546,9 +829,38 @@ const router: ExportedHandler<Env> = {
       if (path === "/app") return Response.redirect(new URL(request.url).origin + "/app/", 301);
       return serveApp(request, env);
     }
+    // Portal routes. Anything under /api/, /auth, /i/ needs OWNER_TOKEN.
+    if (path === "/auth" || path === "/auth/logout" || path.startsWith("/api/") || path.startsWith("/i/")) {
+      if (!env.OWNER_TOKEN) return portalOff();
+    }
+    if (path === "/auth") {
+      return request.method === "POST" ? handleAuth(request, env) : plainResponse(405, "method not allowed");
+    }
+    if (path === "/auth/logout") {
+      return request.method === "POST" ? handleLogout(request, env) : plainResponse(405, "method not allowed");
+    }
+    if (path === "/api/sessions") {
+      const denied = await requireOwner(request, env);
+      if (denied) return denied;
+      return handleOwnerSessions(request, env);
+    }
+    if ((m = path.match(/^\/api\/host\/sessions\/([^/]+)$/))) {
+      return handleHostSession(request, env, m[1]);
+    }
+    if (path === "/api/invites" || path.startsWith("/api/invites/")) {
+      const denied = await requireOwner(request, env);
+      if (denied) return denied;
+      return handleInvites(request, env, path);
+    }
+    if ((m = path.match(/^\/i\/([^/]+)$/)) && request.method === "GET") {
+      return handleInviteLink(request, env, m[1]);
+    }
+    if (path.startsWith("/api/")) return plainResponse(404, "not found");
     // The agent tunnel: /agent/<agent key>, routed to the DO named by the
-    // derived viewer key (see viewerKeyOf).
+    // derived viewer key (see viewerKeyOf). With HOST_TOKEN set, the bearer
+    // is checked here, before the key or any Durable Object is touched.
     if ((m = path.match(/^\/agent\/([^/]+)$/))) {
+      if (env.HOST_TOKEN && !bearerMatches(request, env.HOST_TOKEN)) return plainResponse(401, "unauthorized");
       if (!validKey(m[1])) return new Response("invalid key", { status: 400 });
       const viewerKey = await viewerKeyOf(m[1]);
       return env.BRIDGE.get(env.BRIDGE.idFromName(viewerKey)).fetch(request);
@@ -568,7 +880,11 @@ const router: ExportedHandler<Env> = {
     }
     if ((m = path.match(/^\/ws\/([^/]+)$/))) {
       if (!validKey(m[1])) return new Response("invalid key", { status: 400 });
-      return env.BRIDGE.get(env.BRIDGE.idFromName(m[1])).fetch(request);
+      // The ticket is redeemed (or the owner cookie checked) here, before any
+      // upgrade, and the grant travels to the object in a header.
+      const grant = await viewerGrant(request, env, m[1]);
+      if (grant instanceof Response) return grant;
+      return env.BRIDGE.get(env.BRIDGE.idFromName(m[1])).fetch(withGrant(request, grant.role));
     }
     return new Response("modron bridge - see cloud/bridge/README.md", { status: 404 });
   },

@@ -114,10 +114,138 @@ npx wrangler dev    # serves on localhost:8787
 node test/local.mjs # starts wrangler dev --local on a free port and checks
                     # the redirect, the classic viewer, /app/ headers and
                     # the viewer hello replay (no Cloudflare account used)
+node test/portal.mjs # portal checks against two local Workers (see Portal)
 ```
 
 If `public/app/index.html` is absent, the test writes a placeholder bundle
 there and removes it afterwards.
+
+## Portal (owner sign-in, session directory, invite links)
+
+Design: `docs/PORTAL.md`. Step 1 of that plan is in this Worker: the
+secrets, the `Directory` object, owner sign-in, host registration,
+`/api/sessions`, invite links and role enforcement on viewer sockets. Still
+to come: the app's sessions screen (C4d), linked GitHub accounts (C4e),
+heartbeat-based removal of stale sessions (C5), and passkeys (v2).
+
+### Secrets
+
+Both are Wrangler secrets, never in `wrangler.jsonc` or the repository:
+
+```sh
+npx wrangler secret put OWNER_TOKEN   # owner sign-in; also keys invite signatures
+npx wrangler secret put HOST_TOKEN    # host registration and the agent tunnel
+```
+
+- `OWNER_TOKEN` unset: every `/auth`, `/api/*` and `/i/*` route answers
+  `503 portal not configured`. Share links work exactly as before.
+- `OWNER_TOKEN` set: invite signatures are HMAC-SHA256 over the invite id,
+  keyed by HKDF-SHA256 of the token (salt `modron-portal-v1`, info
+  `modron-invite-sig-v1`). Rotating the token signs every owner out and
+  voids every invite link.
+- `HOST_TOKEN` unset: `/agent/<key>` behaves as before (the agent key is the
+  credential) and `PUT /api/host/sessions/*` answers 503.
+- `HOST_TOKEN` set: `/agent/<key>` needs `Authorization: Bearer <HOST_TOKEN>`
+  on the WebSocket upgrade request. The router checks it before the key or any
+  Durable Object is touched (401 otherwise).
+
+Tokens are compared in constant time and never logged. Owner cookies are
+stored in the Directory as SHA-256 hashes.
+
+### Routes
+
+| Route | Who | Result |
+|---|---|---|
+| `POST /auth` `{ "token" }` | anyone | 200 + `modron_owner` cookie; 401 wrong; 429 after 5 attempts a minute per client IP (`CF-Connecting-IP`), counted before the token is compared; 400 for unknown fields |
+| `POST /auth/logout` | anyone | 204, revokes the presented cookie and clears it |
+| `GET /api/sessions` | owner cookie | 200, list of sessions, newest first (includes `viewer_key`) |
+| `POST /api/invites` `{ session_id, role, ttl_hours }` | owner | 201 `{ id, url, expires_at }` (`expires_at` ISO 8601) |
+| `GET /api/invites[?session_id=]` | owner | 200, list with `url`, `revoked`, `uses` |
+| `DELETE /api/invites/<id>` | owner | 204 (revoke; repeating it is also 204) |
+| `GET /i/<id>.<sig>` | invite holder | 302 to `/app/?url=<encoded ws url>?ticket=...`; 403 bad signature; 410 expired, revoked or session no longer registered. Body is always just "invite is not valid" |
+| `PUT /api/host/sessions/<session id>` | host (`HOST_TOKEN`) | 204, upsert (a repeat PUT is the heartbeat) |
+| `DELETE /api/host/sessions/<session id>` | host (`HOST_TOKEN`) | 204, idempotent |
+| `GET /ws/<viewer key>?ticket=` | invite holder | ticket redeemed before the upgrade; the socket gets the invite's role |
+| `GET /ws/<viewer key>` | owner cookie | owner socket, not filtered |
+| `GET /ws/<viewer key>` | nobody | 401 when `OWNER_TOKEN` is set; the share key alone, as before, when it is not |
+
+Every JSON body is capped at 16 KB and every field must be on the route's
+list (an unknown field is 400, because a field that could widen access must
+never be silently ignored).
+
+### What a host sends (contract for `modron serve`)
+
+1. Dial `wss://<bridge>/agent/<agent key>` with the header
+   `Authorization: Bearer <HOST_TOKEN>` (the agent key still derives the
+   viewer key, see above). Today `crates/modron-server/src/rc.rs` calls
+   `connect_async` with no headers, so it needs a header-carrying request
+   before a `HOST_TOKEN` bridge accepts it.
+2. Register each session it serves:
+   `PUT /api/host/sessions/<session uuid, lowercase>` with the bearer and
+   `Content-Type: application/json`:
+
+   ```json
+   {
+     "title": "1 to 200 characters, no control characters",
+     "host_label": "1 to 100 characters, e.g. the machine name",
+     "host_kind": "local or cloud",
+     "viewer_key": "the viewer key: 1 to 64 characters of [a-z0-9-]; 32 hex from viewer_key(agent key)",
+     "state": "a lowercase token, [a-z][a-z_]{0,31}, e.g. idle or running"
+   }
+   ```
+
+   Refresh it at least every few minutes while the session lives. Remove it
+   with `DELETE` when the session ends. (Stale-entry removal after 30 days
+   without a heartbeat is not implemented yet.)
+
+### Viewer roles
+
+A socket tagged with a role (invite or owner) is filtered in the
+`SessionBridge` object before anything is forwarded to the agent:
+
+| Role | Frames it may send |
+|---|---|
+| `viewer` | `hello`, `attach`, `detach`, `ping`, `sync` |
+| `approver` | the viewer list plus `approve`, `decide_plan` |
+| `owner` (cookie) | everything |
+
+A frame outside the list is not forwarded. The sender gets
+`{"type":"error","message":"not permitted for this invite","kind":"forbidden"}`
+(with the request's `id` when it had one), which is `Payload::Error` with
+`ErrorKind::Forbidden` in `crates/modron-protocol`. Malformed JSON from a
+tagged socket is dropped with no reply, and oversized frames are dropped
+under the existing size limits.
+
+Ticket: 64 hex characters, 60 seconds, single use, bound to the viewer key.
+Redeeming it deletes it whether or not it matches.
+
+### Compatibility
+
+- Neither secret set: the deployment behaves as before. Share links keep
+  working, the relay does not check bearers, and nothing in `/api` is served
+  beyond the 503 answers.
+- `OWNER_TOKEN` set: a bare `/ws/<key>` (share link) stops opening the viewer
+  socket (401). Share-link holders need an invite or an owner sign-in.
+- `HOST_TOKEN` set: hosts without the bearer are refused at `/agent`. Upgrade
+  `modron serve` before setting it.
+- The schema changes (`Directory`, migration tag `v2`) are additive. Existing
+  `SessionBridge` storage is untouched.
+
+### Tests
+
+`node test/portal.mjs` starts two `wrangler dev --local` instances (no
+Cloudflare account): one with random `OWNER_TOKEN` and `HOST_TOKEN` passed as
+`--var`, and `MODRON_TEST_HOOKS=1`; one with no portal secrets. It checks the
+rate limit, cookie attributes, the 503 answers and legacy relay, host
+registration and ordering, invite signatures, revocation, expiry, ticket
+single use, role filtering fed through a fake agent socket, the owner socket,
+and logout. Each instance uses a fresh persist directory under `.wrangler/`,
+removed afterwards.
+
+Expiry: invites are normally at least one hour (`ttl_hours`). With
+`MODRON_TEST_HOOKS=1` (set only by the test, never in a deployment)
+`POST /api/invites` also accepts `ttl_seconds` (1 to 3600), and the test waits
+about 2.2 seconds for a one-second invite to lapse.
 
 ## Protocol notes
 
