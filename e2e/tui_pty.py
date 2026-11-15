@@ -22,11 +22,23 @@ import time
 
 cfg = json.load(open(sys.argv[1]))
 port = cfg["url"].rsplit(":", 1)[1]
+# Checks read the RENDERED screen, not the byte stream: ratatui writes only the
+# cells that changed, so "connecting" -> "connected" never shows up as one
+# contiguous string in the raw output (FINDINGS F14). pyte is a pure-Python
+# terminal emulator kept outside the repo (see e2e/README.md, Prerequisites).
+PYTE_DIR = cfg.get("pyte") or os.environ.get("E2E_PYTE_DIR") or "/tmp/claude-0/e2e/pyte"
+sys.path.insert(0, PYTE_DIR)
+try:
+    import pyte
+except ImportError:
+    sys.exit("tui_pty.py: pyte is not importable from " + PYTE_DIR + " (see e2e/README.md)")
 buf = b""
+screen = pyte.Screen(120, 40)
+stream = pyte.ByteStream(screen)
 
 
 def text():
-    return buf.decode("utf8", "replace")
+    return "\n".join(screen.display)
 
 
 def strip(s):
@@ -51,6 +63,7 @@ def pump(seconds):
             if not data:
                 return
             buf += data
+            stream.feed(data)
 
 
 def wait_for(pred, timeout):
@@ -84,8 +97,8 @@ res = {
     "serve_left": [], "tail": "",
 }
 
-def recent(n=2500):
-    return squash(strip(buf[-n:].decode("utf8", "replace")))
+def recent():
+    return squash(text())
 
 
 res["connected"] = wait_for(lambda: bool(re.search(r"(?<!dis)connected", squash(text()))), 45)
@@ -105,13 +118,12 @@ if res["connected"]:
     res["sent"].append("task")
     res["approval"] = wait_for(lambda: "allowonce" in squash(text()), 60)
 if res["approval"]:
-    mark = len(buf)
     os.write(fd, b"\x1b")  # Esc denies the pending approval
     res["sent"].append("esc")
     pump(3)
-    after = buf[mark:].decode("utf8", "replace")
+    after = text()
     res["deny_seen"] = bool(re.search(r"deny|denied|refus", squash(after)))
-    res["after_esc_tail"] = strip(after)[-600:]
+    res["after_esc_tail"] = after[-600:]
 # Ctrl+C: interrupts a running turn; a second press within 2 s (or idle) quits.
 os.write(fd, b"\x03")
 res["sent"].append("ctrl-c")
@@ -135,8 +147,8 @@ else:
     os.waitpid(pid, 0)
 pump(1.0)
 
-res["resume_line"] = "--session" in strip(text())
-res["tail"] = strip(text())[-2500:]
+res["resume_line"] = "--session" in text()
+res["tail"] = text()[-2500:]
 
 time.sleep(2.5)  # the app stops its own server child on exit (SIGTERM, then SIGKILL after 2 s)
 ps = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True, text=True).stdout

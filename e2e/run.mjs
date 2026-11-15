@@ -93,8 +93,8 @@ async function dumpEvidence(id, s) {
       label: v.label,
       requested: v.requested,
       finalUrl: v.finalUrl,
-      consoleErrors: v.errors.slice(-15),
-      sockets: v.sockets.map((so) => ({ url: so.url, frames: so.frames.slice(0, 40).map(([d, p]) => [d, p.slice(0, 400)]) })),
+      consoleErrors: v.errors.slice(-40),
+      sockets: v.sockets.map((so) => ({ url: so.url, frames: [...so.frames.filter(([d]) => d === 'out'), ...so.frames.filter(([d]) => d !== 'out').slice(0, 20), ...so.frames.filter(([d]) => d !== 'out').slice(-60)].map(([d, p]) => [d, p.slice(0, 400)]) })),
     })),
   };
   const path = join(SCRATCH, `evidence-${id.split(' ')[0]}.json`);
@@ -648,14 +648,13 @@ await scenario('W6', 'compact: /compact on a session with history shows a before
   await lx.run('e2e w6 history', sid);
   await lx.turnDone(sid);
   await soft(s, waitBody(vw, (t) => t.includes('e2e w6 history'), 30000, 'history'), 'history not shown');
-  const mark = lx.frames.length;
+  // The compact reply is correlated to the browser's request, so the page
+  // (not the local client, which never sees it) is where the note lands.
   await typeAndSend(vw, '/compact');
-  const note = await soft(s, lx.waitFor((f) => f.type === 'note' && /compact/.test(String(f.text)), 30000, 'compact note', mark),
-    'no compact note from the server');
-  if (note) {
-    s.check(/nothing to compact|compacted: \d+ -> \d+ tokens/.test(note.text), `unexpected compact note: ${note.text}`);
-    await soft(s, waitBody(vw, (t) => /nothing to compact|compacted: \d+ -> \d+/.test(t), 20000, 'compact note shown'),
-      'compact note not shown in the browser');
+  const shown = await soft(s, waitBody(vw, (t) => /nothing to compact|compacted: \d+ -> \d+ tokens/.test(t), 30000, 'compact note shown'),
+    'no compact note shown in the browser (the server reply did not arrive)');
+  if (shown) {
+    s.check(wsFrames(vw, 'out', '"type":"compact"').length > 0, 'the browser socket never sent a compact frame');
   }
 });
 

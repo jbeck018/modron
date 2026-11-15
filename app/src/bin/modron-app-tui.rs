@@ -222,6 +222,7 @@ mod terminal {
         );
         install_panic_hook();
         let log = log_path();
+        session::trace(format!("plan {plan:?}"));
         let (live, mut server) = match plan {
             Plan::Demo => (None, None),
             Plan::Connect { url, .. } => (Some(connect(&args, url, token)), None),

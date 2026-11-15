@@ -1230,10 +1230,16 @@ impl RemoteClient {
 
     fn send_frame(&self, frame: Frame) -> Result<(), ClientError> {
         let guard = self.shared.live.lock().unwrap();
-        match &*guard {
+        let result = match &*guard {
             Some(live) => live.tx.send(frame).map_err(|_| ClientError::Closed),
             None => Err(ClientError::Closed),
+        };
+        if let Err(e) = &result {
+            // A refused send says why in the snapshot, not only in the
+            // return value. Lock order: live, then state.
+            self.shared.state.lock().unwrap().vm.last_error = Some(format!("not sent: {e}"));
         }
+        result
     }
 }
 

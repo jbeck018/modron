@@ -26,8 +26,8 @@ Full-suite results are at the end of this file (two runs).
 | W3 settings round trip | PASS | F1 (fixed earlier) |
 | W4 shell passthrough | PASS | F10 |
 | W5 sessions screen over the tunnel | PASS (reframed) | F12 |
-| W6 /compact | FAIL | F13 (open, not in app) |
-| T1 terminal app under a pty | FAIL | F14 (open) |
+| W6 /compact | PASS | F13 (closed: test read the wrong connection) |
+| T1 terminal app under a pty | PASS | F14 (closed: test read raw bytes, not the screen) |
 
 ## Findings
 
@@ -110,37 +110,55 @@ approval, a run, and two queued messages. It passes.
   list, and screens.rs shows it. Multi-session switching stays covered by the
   local terminal app and the portal list (P1, P2).
 
-### F13. /compact typed on the owner page never reaches the socket (W6). OPEN, outside the app
-- Expected: `/compact` sends a `compact` frame; the serve answers with a
-  compaction note.
-- Observed: the composer clears (the line was submitted). The app reaches
-  `UiAction::Compact` and `client.compact()` returns `Ok(())` (checked with
-  a temporary note in session.rs, since removed). The browser socket writes
-  only `hello`, `auth_providers_req`, `list_sessions` for the whole step. The
-  serve receives no compact frame. Keepalive pings also stop on that socket.
-  Inbound events keep arriving. The socket works for W2, W3 and W4 (submit,
-  set_config, shell are sent there).
-- Correlation (unconfirmed): in W5 and W6 the local client starts a run
-  before the owner page sends anything; in W1 to W4 the owner's own submit
-  comes first.
-- Smallest reproduction: owner page through the bridge; a run started by a
-  second client; then `/compact` in the page.
-- Likely location (not edited, per packet rules): mobile/rust-core/src/client.rs
-  `send_frame` (around line 1231) and the connection loop (around lines
-  1330-1400). The lead should instrument the outbound channel.
+### F13. /compact on the owner page (W6). CLOSED: the test read the wrong connection
+- Reported: `/compact` returned Ok but no frame reached the socket, and pings
+  stopped (FINDINGS of the earlier packet).
+- Not reproduced. Native (mobile/rust-core/tests/connection_sends.rs): run
+  frames (task, delta, tool, approval requested and resolved, turn done) before
+  the first command; a snapshot over 260 KB; an `error` frame; a server close
+  and reconnect. In each, `compact`, `send_message` and keepalive pings reach
+  the server. A send on a dead connection returns `ClientError::Closed`.
+- Browser trace (temporary console.error lines in client.rs `send_frame` and
+  the run loop, removed again): `send_frame live=true ok=true`, then the loop
+  writes the frame (`sent`), then the server reply with `"id":3` arrives. The
+  page shows "compacted: 4019 -> 4791 tokens". The keepalive ping fired at 30 s.
+  The writer did not die.
+- Root cause (test, e2e/run.mjs W6): the step waited for the `note` on the
+  LOCAL client's stream (`lx.waitFor`). The compact reply is correlated to the
+  requesting connection (crates/modron-server/src/dispatch.rs `compact`: "The
+  reply is the correlated Note"), so only the browser receives it.
+- Root cause of the "never reached the socket" reading: the evidence was
+  truncated. run.mjs kept the first 40 socket frames and the last 15 console
+  errors, so the compact frame was out of the window.
+- Changes: W6 now waits for the note in the browser page and checks that the
+  browser socket sent a `compact` frame. The evidence keeps every outbound
+  frame plus the first 20 and last 60 inbound, and the last 40 console errors.
+- Hardening (mobile/rust-core/src/client.rs `send_frame`): a refused send now
+  records "not sent: connection closed" in `last_error`, not only in the return
+  value. Tests: connection_sends.rs `a_send_on_a_dead_connection_is_an_error_and_says_why`
+  and `a_send_after_reconnect_reaches_the_new_socket`.
+- Observation (not a client defect): the browser socket saw two welcome and
+  two snapshot frames after the hello. The core ignores the second welcome.
 
-### F14. Terminal app stays on "connecting" under a pty (T1). OPEN
-- Observed: the TUI (`app/target/debug/modron-app-tui --url ws://127.0.0.1:<port>`,
-  fresh HOME) draws one frame, then no output. The header reads
-  `connecting - ws://127.0.0.1:<port>`. Its threads are idle in epoll (not
-  spinning). The serve it started logs "listening"; a plain WebSocket client
-  gets `welcome` from the same serve and a handshake works.
-- Not resolved: no connection to the serve was observed (`ss` shows nothing;
-  tooling limit). The connect path is app/src/session.rs (`connect_stalled`
-  at line 56, retry at lines 60-70, connect at about line 505) and
-  mobile/rust-core/src/transport_native.rs. Next step: strace the TUI, or
-  log `RemoteClient::connect_with_options` from the driver.
-- Also seen: the first-run list was covering the TUI (F10); fixed.
+### F14. Terminal app stays on "connecting" under a pty (T1). CLOSED: the test read raw bytes, not the screen
+- Reported: 1 in 3 runs reached "connected"; the stall retry did not help.
+- Not an app defect. Driver trace (MODRON_APP_TRACE, app/src/session.rs
+  `trace`): every run goes Connecting -> Connected about 20 ms after start, and
+  the snapshot reaches the host (`pump snapshot label="connected ..."`).
+- Root cause (e2e/tui_pty.py): "connected" was searched in the raw byte stream.
+  ratatui writes only the cells that changed, so the header change from
+  "connecting" to "connected" is never a contiguous string in that stream. Raw
+  check: 0 of 10 runs. Rendered-screen check (pyte): 10 of 10 runs connected at
+  about 0.05 s. The "1 in 3" figure was the raw-stream artefact.
+- Fix: tui_pty.py judges every check on the rendered screen (pyte, a pure-Python
+  terminal emulator kept outside the repo: /tmp/claude-0/e2e/pyte, or
+  E2E_PYTE_DIR). A missing pyte fails the step with a clear message.
+- The stall retry (app/src/session.rs CONNECT_STALL) is kept. It never fired
+  in these runs.
+- Hook kept: `MODRON_APP_TRACE=<path>` writes the plan, the driver start, each
+  connection-state change, each snapshot pumped, and reconnects.
+- Not done: a headless app test for the screen state. The regression guard is
+  the T1 screen check.
 
 ### F15. Doc drift: effort levels. OPEN (docs/, outside this packet)
 `docs/PROTOCOL_V2.md` section 7 lists `effort` as low, medium, high. The code
@@ -173,3 +191,13 @@ touched the source after the binary was built; rebuilt, then FAIL).
 Other checks: `cargo test` 190 passed, 0 failed; `cargo clippy --all-targets -D warnings`
 clean; `cargo check --lib --target wasm32-unknown-unknown` clean; web-test.js 26 PASS
 in each of two runs (the 24 earlier cases plus (w) and (l2)).
+
+Packet CONNECT (after W6 and T1 closed), two full runs (`node e2e/run.mjs`):
+run A 22/22 passed, run B 22/22 passed; left-over tracked processes 0 in both.
+All 22 steps (S1-S7d, P1-P4, W1-W6, T1) PASS in both runs; no SKIP.
+web-test.js: 26 PASS, 0 FAIL in each of two runs.
+Core: `cargo test -p modron-mobile-core` 68 + 5 (connection_sends) + 37 passed;
+clippy -D warnings clean; wasm32 check clean. App: `cargo test` 190 passed,
+0 failed; clippy -D warnings clean; wasm32 lib check clean.
+T1 by pty (e2e/tui_pty-equivalent driver, rendered screen): 10 of 10 runs
+connected in about 0.05 s (raw-byte check before the fix: 0 of 10).

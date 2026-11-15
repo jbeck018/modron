@@ -94,3 +94,16 @@ dependencies with it.
 - Each step has a 240 s ceiling; a hung page is reported as a failure
   instead of stalling the run.
 - A full run takes several minutes; use `--only` for a quick check.
+
+## Terminal scenario (T1)
+
+T1 reads the terminal app's rendered screen through pyte, a pure-Python
+terminal emulator, because the app only writes changed cells and its
+text never appears as one string in the raw output. Install it once into
+a directory of your choice and point the suite at it:
+
+    pip install --target /tmp/claude-0/e2e/pyte pyte==0.8.2
+    E2E_PYTE_DIR=/tmp/claude-0/e2e/pyte node e2e/run.mjs --only T1
+
+T1 also needs a terminal binary newer than app/src
+(`cd app && cargo build --bin modron-app-tui`); otherwise it is skipped.

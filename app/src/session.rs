@@ -52,6 +52,22 @@ pub const LIST_WAIT: Duration = Duration::from_secs(2);
 /// so a silent failure would otherwise leave the header on "connecting".
 pub const CONNECT_STALL: Duration = Duration::from_secs(3);
 
+/// Debug trace for the driver (T1, FINDINGS F14): appends one line per call
+/// to the file named by `MODRON_APP_TRACE`. Off unless the variable is set.
+pub fn trace(line: impl AsRef<str>) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("MODRON_APP_TRACE") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{stamp} {}", line.as_ref());
+    }
+}
+
 /// Whether a connect started at `since` has stalled by `now`.
 pub fn connect_stalled(since: Instant, now: Instant) -> bool {
     now >= since + CONNECT_STALL
@@ -230,6 +246,7 @@ impl Live {
     pub fn pump(&mut self, host: &mut Host) -> bool {
         let mut changed = false;
         while let Ok(snapshot) = self.snapshots.try_recv() {
+            trace(format!("pump snapshot label={:?}", snapshot.connection_label));
             host.push(&snapshot);
             changed = true;
         }
@@ -312,6 +329,8 @@ pub struct Driver {
     retry_at: Option<Instant>,
     /// When the current `Connecting` state began (None when not connecting).
     connecting_since: Option<Instant>,
+    /// The last connection label written to the trace (debug only).
+    traced: String,
     attempts: u32,
     last: String,
     /// The startup config went out for the current connection.
@@ -327,12 +346,14 @@ impl Driver {
         actions: UnboundedReceiver<UiAction>,
         out: UnboundedSender<ViewModelSnapshot>,
     ) -> Option<Self> {
+        trace(format!("driver start url={}", options.url));
         match RemoteClient::connect_with_options(
             &options.url,
             options.token.as_deref(),
             connect_options(&options),
         ) {
             Ok(client) => Some(Self {
+                traced: String::new(),
                 client,
                 options,
                 status,
@@ -374,6 +395,13 @@ impl Driver {
             }
         }
         let state = self.client.state();
+        if self.traced != state.connection_label {
+            trace(format!(
+                "state {:?} label={:?} error={:?}",
+                state.connection, state.connection_label, state.last_error
+            ));
+            self.traced = state.connection_label.clone();
+        }
         if state.session_id.is_some() {
             self.resume = state.session_id;
         }
@@ -491,6 +519,7 @@ impl Driver {
     /// One reconnect try: re-attach to the known session, or connect afresh
     /// when no session was ever seen (the post-connect setup runs again).
     fn reconnect(&mut self) {
+        trace(format!("reconnect resume={:?} attempts={}", self.resume, self.attempts));
         let token = self.options.token.as_deref();
         match self.resume {
             Some(session) => {

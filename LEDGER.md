@@ -1632,3 +1632,12 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   answers. The harness now kills its process groups on exit, signal
   and exception. App gates: fmt, clippy, wasm32 check clean; 190
   tests; web-test.js 26 of 26.
+- 2026-11-15: CONNECT closed: neither open e2e failure was a product
+  defect. W6 waited for a correlated reply on the wrong connection and
+  the evidence was truncated (40 frames kept); T1 searched the raw
+  terminal bytes for a string the app never writes whole. Both tests
+  now check what a user would see. Kept from the investigation: a send
+  on a closed connection sets last_error; MODRON_APP_TRACE logs the
+  driver's stages; five client-core tests for send paths. Full e2e:
+  22 of 22 (worker twice, lead once), no leftover processes. Core 110
+  tests, app 190, web-test.js 26 of 26.
