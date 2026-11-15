@@ -46,29 +46,21 @@ use uuid::Uuid;
 /// (`y = allow once · a = allow for this run · n/Esc = deny`) which are
 /// TUI presentation only — keys differ per the divergence table.
 pub const DECISION_LABELS: [(Decision, &str); 3] = [
-    (Decision::AllowOnce, "allow once"),
-    (Decision::AllowAll, "allow all"),
-    (Decision::Deny, "deny"),
+    (Decision::AllowOnce, Decision::AllowOnce.label()),
+    (Decision::AllowAll, Decision::AllowAll.label()),
+    (Decision::Deny, Decision::Deny.label()),
 ];
 
 /// The approval mode label for the status line (`ask`/`yolo`/`deny`,
-/// default `ask`), matching the TUI status strip exactly.
+/// default `ask`), delegating to the shared protocol label.
 pub fn approval_mode_label(mode: Option<ApprovalModeWire>) -> &'static str {
-    match mode {
-        Some(ApprovalModeWire::ApproveAll) => "yolo",
-        Some(ApprovalModeWire::Ask) | None => "ask",
-        Some(ApprovalModeWire::Deny) => "deny",
-    }
+    mode.unwrap_or(ApprovalModeWire::Ask).label()
 }
 
-/// The sandbox label for the settings views, using the desktop's words
-/// (`off` / `seatbelt` / `bwrap`).
+/// The sandbox label for the settings views (`off` / `seatbelt` /
+/// `bwrap`), delegating to the shared modron-view label.
 pub fn sandbox_label(policy: modron_types::SandboxPolicy) -> &'static str {
-    match policy {
-        modron_types::SandboxPolicy::Off => "off",
-        modron_types::SandboxPolicy::Seatbelt => "seatbelt",
-        modron_types::SandboxPolicy::Bubblewrap => "bwrap",
-    }
+    modron_view::sandbox_label(policy)
 }
 
 /// Connection-state words for the mobile header.
@@ -838,6 +830,10 @@ mod tests {
         assert_eq!(DECISION_LABELS[0], (Decision::AllowOnce, "allow once"));
         assert_eq!(DECISION_LABELS[1], (Decision::AllowAll, "allow all"));
         assert_eq!(DECISION_LABELS[2], (Decision::Deny, "deny"));
+        for (i, decision) in Decision::ALL.into_iter().enumerate() {
+            assert_eq!(DECISION_LABELS[i].0, decision);
+            assert_eq!(DECISION_LABELS[i].1, decision.label());
+        }
         assert_eq!(approval_mode_label(None), "ask");
         assert_eq!(
             approval_mode_label(Some(ApprovalModeWire::ApproveAll)),

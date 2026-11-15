@@ -348,6 +348,20 @@ pub enum Decision {
     Deny,
 }
 
+impl Decision {
+    /// Every decision, in protocol order (approval sheet and strip rows).
+    pub const ALL: [Decision; 3] = [Decision::AllowOnce, Decision::AllowAll, Decision::Deny];
+
+    /// The shared approval-decision words (AGENTS.md invariant 1).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Decision::AllowOnce => "allow once",
+            Decision::AllowAll => "allow all",
+            Decision::Deny => "deny",
+        }
+    }
+}
+
 /// Config mutations a client may request (all optional; `None` = leave).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -382,6 +396,17 @@ pub enum ApprovalModeWire {
     Deny,
     Ask,
     ApproveAll,
+}
+
+impl ApprovalModeWire {
+    /// The approval-mode word shown in every client's status surface.
+    pub const fn label(self) -> &'static str {
+        match self {
+            ApprovalModeWire::Deny => "deny",
+            ApprovalModeWire::Ask => "ask",
+            ApprovalModeWire::ApproveAll => "yolo",
+        }
+    }
 }
 
 /// Session list row (mirror of core `SessionMeta`, which is serde-stable —
@@ -739,6 +764,16 @@ mod tests {
     fn roundtrip(frame: &Frame) -> Frame {
         let json = serde_json::to_string(frame).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn shared_label_words_are_stable() {
+        assert_eq!(Decision::AllowOnce.label(), "allow once");
+        assert_eq!(Decision::AllowAll.label(), "allow all");
+        assert_eq!(Decision::Deny.label(), "deny");
+        assert_eq!(ApprovalModeWire::Deny.label(), "deny");
+        assert_eq!(ApprovalModeWire::Ask.label(), "ask");
+        assert_eq!(ApprovalModeWire::ApproveAll.label(), "yolo");
     }
 
     /// `forbidden` is a wire name clients can branch on: it serializes as

@@ -364,7 +364,7 @@ impl Tool for DelegateStatusTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "delegate_status".to_string(),
-            description: "Check background subagents: list all, or fetch one by id (returns                           the result brief when done)."
+            description: "Check background subagents: list all, or fetch one by id (returns the result brief when done)."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

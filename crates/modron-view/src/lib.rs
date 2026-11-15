@@ -85,6 +85,16 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// The sandbox label shown in every client's settings views: `off`,
+/// `seatbelt` (macOS Seatbelt) or `bwrap` (Linux bubblewrap).
+pub fn sandbox_label(policy: modron_types::SandboxPolicy) -> &'static str {
+    match policy {
+        modron_types::SandboxPolicy::Off => "off",
+        modron_types::SandboxPolicy::Seatbelt => "seatbelt",
+        modron_types::SandboxPolicy::Bubblewrap => "bwrap",
+    }
+}
+
 /// Truncate to `max_chars` with an ellipsis (the TUI's historical
 /// `short()`; the desktop and CLI shipped byte-identical copies).
 pub fn short(s: &str, max_chars: usize) -> String {
@@ -917,5 +927,13 @@ mod tests {
     #[test]
     fn approval_max_is_the_one_shared_cap() {
         assert_eq!(APPROVAL_SUMMARY_MAX, 80);
+    }
+
+    #[test]
+    fn sandbox_label_words_are_shared() {
+        use modron_types::SandboxPolicy;
+        assert_eq!(sandbox_label(SandboxPolicy::Off), "off");
+        assert_eq!(sandbox_label(SandboxPolicy::Seatbelt), "seatbelt");
+        assert_eq!(sandbox_label(SandboxPolicy::Bubblewrap), "bwrap");
     }
 }
