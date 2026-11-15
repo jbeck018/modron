@@ -1412,21 +1412,21 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 
 | ID | Packet | Status | Evidence / blocker |
 |---|---|---|---|
-| P1 | docs/PROTOCOL_V2.md: steer/queue, plan approval, sub-agent approvals and counters, reviewer verdict, pause/wake, actor+role | TODO | |
+| P1 | docs/PROTOCOL_V2.md: steer/queue, plan approval, sub-agent approvals and counters, reviewer verdict, pause/wake, actor+role | DONE | docs/PROTOCOL_V2.md (16ac999) |
 
 ### Harness
 
 | ID | Packet | Status | Evidence / blocker |
 |---|---|---|---|
-| H1 | Steer and queue messages during a run (engine, server hub, protocol) | TODO | |
+| H1 | Steer and queue messages during a run (engine, server hub, protocol) | ACTIVE | H1a engine SteerInbox DONE (3 tests). Open: H1b protocol Steer frame + server hub; H1c queue |
 | H2 | Enforced plan phase, approve step, per-turn plan re-injection | TODO | |
 | H3 | Sub-agents: approvals to parent, live counters, completion events, cap | TODO | |
 | H4 | Reviewer role + verdict event + non-LLM claim checks | TODO | |
 | H5 | Scheduled wakeups, pause reasons, completion/block notifications | TODO | |
-| H6 | Hash-anchored line edits, measured with modron bench | TODO | |
+| H6 | Hash-anchored line edits, measured with modron bench | ACTIVE | H6a edit_lines tool + read(line_hashes) DONE, on-demand, approval-gated, edit allow/deny entries cover it. Open: modron bench comparison before any default change |
 | H7 | Reasoning-effort parameter and named model roles | TODO | |
-| H8 | Command and path permission rules + explain command | TODO | |
-| H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | TODO | |
+| H8 | Command and path permission rules + explain command | ACTIVE | H8a core::permissions matcher DONE (17 tests). Open: H8b engine wiring + config + explain command |
+| H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | DONE | stub and delegate_status descriptions fixed |
 | H9b | Real compact command and true context occupancy over the protocol | TODO | |
 | H9c | Hooks: turn-end and session-start events | TODO | |
 | H9d | MCP over HTTP | TODO | |
@@ -1436,7 +1436,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 
 | ID | Packet | Status | Evidence / blocker |
 |---|---|---|---|
-| C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | TODO | |
+| C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | DONE | 16ac999; labels in modron-protocol / modron-view, client core delegates |
 | C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | TODO | |
 | C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | TODO | Depends on S1 |
 | C4 | Portal: Worker serves the web build; owner sign-in; linked GitHub accounts; session directory; invite links | TODO | Deploy needs the owner's Cloudflare login |
@@ -1451,3 +1451,12 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 
 - 2026-11-15: program opened; plan and decisions recorded in PLAN.md
   section 10.
+- 2026-11-15: wave 1 (four workers). C1, P1, H9a done; H1a, H6a, H8a
+  landed. Lead review changed three things in H8a (a lone `&` is a
+  compound operator, a path with `..` never matches an allow pattern,
+  MCP-style tool names parse) and gated `edit_lines` in the engine (the
+  worker could not touch engine.rs). Gates on Linux, excluding
+  modron-desktop: fmt clean, clippy clean, 955 tests pass.
+- NSH crates are published at 0.5.1 on crates.io (nsh-core, nsh-base,
+  nsh-engine, nsh-testing, nsh-platform-tui); this container has glibc
+  2.39, so S2 can run here.

@@ -31,10 +31,11 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 ///
 /// Every new tool needs an explicit gated/ungated decision here: a tool that
 /// is not added to this list runs without approval.
-const MUTATING_TOOLS: [&str; 7] = [
+const MUTATING_TOOLS: [&str; 8] = [
     "bash",
     "write",
     "edit",
+    "edit_lines",
     "verify",
     "diagnostics",
     "interact",
@@ -44,7 +45,7 @@ const MUTATING_TOOLS: [&str; 7] = [
 /// The file-mutating subset of the approval-gated class. Finish-gate arming
 /// and pre-mutation checkpoints key off this list, not [`MUTATING_TOOLS`]:
 /// widening the approval gate must not change their behavior.
-const FILE_MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
+const FILE_MUTATING_TOOLS: [&str; 5] = ["bash", "write", "edit", "edit_lines", "verify"];
 
 /// Accumulate provider-reported usage into a run total. Counts come from
 /// the provider (possibly hostile or buggy), so every field saturates
@@ -497,6 +498,10 @@ impl Engine {
                 break;
             }
 
+            // Steer inbox: messages typed while the run was active become
+            // user messages between model turns, before the next route.
+            self.drain_steer_inbox(session_id, &mut state).await?;
+
             // Route FIRST (Phase 5i): the selected model's context window
             // (from ModelChoice) is the compaction trigger — a 128k-window
             // free model must compact at 0.8×128k even when the global cap
@@ -606,6 +611,13 @@ impl Engine {
                 // continue — StaminaBench's retry-with-test-feedback loop,
                 // bounded to MAX_VERIFY_ROUNDS per run.
                 if !self.run_finish_gate(session_id, &mut state).await? {
+                    // Steer guard: a message typed during this run that is
+                    // still waiting keeps the run going (the next iteration
+                    // drains it and the model answers). Checked before the
+                    // escalation so the escalation's one-shot bound holds.
+                    if self.steer_pending() {
+                        continue;
+                    }
                     // Escalation (ONE per run): the gate just exhausted its
                     // feedback rounds with verification still failing (the
                     // same two conditions its give-up note keys on) and the
@@ -668,6 +680,33 @@ impl Engine {
         }
 
         self.finalize_run(session_id, &mut state).await
+    }
+
+    /// True when a steer message is queued for the active run.
+    fn steer_pending(&self) -> bool {
+        self.config
+            .steer
+            .as_ref()
+            .is_some_and(|inbox| !inbox.is_empty())
+    }
+
+    /// Append every queued steer message, oldest first, as a `Task` event
+    /// and a user message on the run's transcript (see [`SteerInbox`]).
+    async fn drain_steer_inbox(
+        &self,
+        session_id: SessionId,
+        state: &mut RunLoopState,
+    ) -> Result<()> {
+        let Some(inbox) = self.config.steer.as_ref() else {
+            return Ok(());
+        };
+        for text in inbox.drain() {
+            self.store
+                .append(session_id, &SessionEvent::Task { text: text.clone() })
+                .await?;
+            state.transcript.push(Message::user(text));
+        }
+        Ok(())
     }
 
     /// Route/decide phase of one loop iteration (Phase 5i): estimate the
@@ -1327,7 +1366,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
     ) -> Result<Option<SessionEvent>> {
-        if !matches!(call.name.as_str(), "write" | "edit") {
+        if !matches!(call.name.as_str(), "write" | "edit" | "edit_lines") {
             return Ok(None);
         }
         let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
@@ -1439,10 +1478,17 @@ impl Engine {
     /// path, then Ask-with-approver (a prompt), otherwise refused. Pure rules:
     /// model-issued calls and the finish gate both route through here.
     fn admission(&self, name: &str) -> Admission {
-        if self.config.approvals.deny.iter().any(|d| d == name) {
+        // `edit_lines` is the same capability as `edit`: an allow or deny
+        // entry for `edit` covers both, so an existing `--deny edit` is
+        // not bypassed by the anchored variant.
+        let listed = |list: &[String]| {
+            list.iter()
+                .any(|entry| entry == name || (name == "edit_lines" && entry == "edit"))
+        };
+        if listed(&self.config.approvals.deny) {
             return Admission::Refused(format!("tool `{name}` denied by configuration (--deny)"));
         }
-        let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == name);
+        let explicitly_allowed = listed(&self.config.approvals.allow);
         if !is_gated(name)
             || explicitly_allowed
             || self.config.approvals.mode == ApprovalMode::ApproveAll
@@ -2695,6 +2741,134 @@ mod tests {
             "verify ran twice (fail then pass)"
         );
         assert!(summary.turns >= 3, "the gate forced an extra model turn");
+    }
+
+    /// Engine over an arbitrary provider/registry with the steer inbox wired.
+    fn steer_engine(
+        provider: Arc<dyn ModelProvider>,
+        registry: ToolRegistry,
+        inbox: Arc<crate::SteerInbox>,
+    ) -> Engine {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("mock".to_string(), provider);
+        Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                steer: Some(inbox),
+                ..approve_all_config()
+            },
+        }
+    }
+
+    /// Tool that types a steer message while it runs.
+    struct SteerProbeTool(Arc<crate::SteerInbox>);
+    #[async_trait]
+    impl Tool for SteerProbeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "steer_probe".into(),
+                description: "pushes a steer message".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.0.push("also check the logs".into());
+            Ok(ToolOutcome::ok("probed"))
+        }
+    }
+
+    /// Provider wrapper that pushes a steer message during provider call
+    /// number `at_call` (1-based), then answers as the inner mock does.
+    struct SteerOnCallProvider {
+        inner: Arc<crate::testing::MockProvider>,
+        inbox: Arc<crate::SteerInbox>,
+        at_call: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelProvider for SteerOnCallProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn turn(&self, req: Arc<TurnRequest>) -> Result<TurnResponse> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.at_call {
+                self.inbox.push("wait, also check the tests".into());
+            }
+            self.inner.turn(req).await
+        }
+    }
+
+    #[tokio::test]
+    async fn steer_queued_before_the_run_reaches_the_first_turn() {
+        let inbox = Arc::new(crate::SteerInbox::new());
+        inbox.push("use tabs".into());
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![text("ok")]));
+        let engine = steer_engine(mock.clone(), ToolRegistry::new(), Arc::clone(&inbox));
+        let summary = engine.run_task("write it").await.unwrap();
+        let reqs = mock.requests();
+        let first = &reqs[0].messages;
+        assert_eq!(first[0].content, "write it");
+        assert!(matches!(first[1].role, Role::User));
+        assert_eq!(first[1].content, "use tabs");
+        assert!(inbox.is_empty(), "drained by the first iteration");
+        let events = engine.store.load(summary.session_id).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Task { text } if text == "use tabs")));
+    }
+
+    #[tokio::test]
+    async fn steer_sent_during_a_tool_call_reaches_the_next_turn() {
+        let inbox = Arc::new(crate::SteerInbox::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(SteerProbeTool(Arc::clone(&inbox))));
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![
+            call("steer_probe"),
+            text("done"),
+        ]));
+        let engine = steer_engine(mock.clone(), registry, Arc::clone(&inbox));
+        let summary = engine.run_task("investigate").await.unwrap();
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2);
+        let second = &reqs[1].messages;
+        let pos = second
+            .iter()
+            .position(|m| m.content == "also check the logs")
+            .expect("steer message in the second turn");
+        assert!(matches!(second[pos].role, Role::User));
+        assert!(matches!(second[pos - 1].role, Role::Tool));
+        let events = engine.store.load(summary.session_id).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Task { text } if text == "also check the logs")));
+    }
+
+    #[tokio::test]
+    async fn steer_arriving_as_the_model_finishes_adds_one_more_turn() {
+        let inbox = Arc::new(crate::SteerInbox::new());
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![
+            text("first answer"),
+            text("answer to steer"),
+        ]));
+        let wrapped = Arc::new(SteerOnCallProvider {
+            inner: Arc::clone(&mock),
+            inbox: Arc::clone(&inbox),
+            at_call: 1,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let engine = steer_engine(wrapped, ToolRegistry::new(), Arc::clone(&inbox));
+        let summary = engine.run_task("hello").await.unwrap();
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "the waiting steer forced one more turn");
+        assert!(reqs[1]
+            .messages
+            .iter()
+            .any(|m| m.content == "wait, also check the tests"));
+        assert_eq!(summary.answer, "answer to steer");
     }
 
     #[tokio::test]

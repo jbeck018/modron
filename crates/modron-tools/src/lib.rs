@@ -23,6 +23,7 @@ mod common;
 mod delegate;
 mod diagnostics;
 mod edit;
+mod edit_lines;
 mod explore;
 mod glob;
 mod grep;
@@ -43,6 +44,7 @@ mod write;
 pub use bash::BashTool;
 pub use delegate::{DelegateStatusTool, DelegateTool, MergeWorktreeTool};
 pub use edit::EditTool;
+pub use edit_lines::EditLinesTool;
 pub use explore::ExploreTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -60,8 +62,8 @@ use modron_core::ToolRegistry;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Registry containing the six built-in tools: `read`, `glob`, `grep`,
-/// `bash`, `write`, `edit`.
+/// Registry containing the built-in tools: `read`, `glob`, `grep`, `bash`,
+/// `write`, `edit`, and the on-demand `edit_lines` (hidden by tiering).
 pub fn default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     // A user interrupt must also stop detached background delegates.
@@ -72,6 +74,7 @@ pub fn default_registry() -> ToolRegistry {
     registry.register(Arc::new(BashTool));
     registry.register(Arc::new(WriteTool));
     registry.register(Arc::new(EditTool));
+    registry.register(Arc::new(EditLinesTool));
     registry
 }
 
@@ -138,12 +141,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn default_registry_has_six_tools() {
+    fn default_registry_has_seven_tools() {
         let registry = default_registry();
         let names: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
-            vec!["bash", "edit", "glob", "grep", "read", "write"],
+            vec![
+                "bash",
+                "edit",
+                "edit_lines",
+                "glob",
+                "grep",
+                "read",
+                "write"
+            ],
             "sorted spec names"
         );
     }
@@ -167,7 +178,7 @@ mod tests {
                 spec.name
             );
         }
-        for hidden in ["remember", "read_minified"] {
+        for hidden in ["remember", "read_minified", "edit_lines"] {
             assert!(
                 registry.specs().iter().any(|s| s.name == hidden),
                 "{hidden} stays registered"
@@ -187,6 +198,7 @@ mod tests {
                 "bash",
                 "diagnostics",
                 "edit",
+                "edit_lines",
                 "glob",
                 "grep",
                 "interact",

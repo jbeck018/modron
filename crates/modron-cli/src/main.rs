@@ -1220,6 +1220,7 @@ fn build_agent_with(
             approvals
         },
         max_cost_usd: cli.max_cost,
+        steer: None,
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),

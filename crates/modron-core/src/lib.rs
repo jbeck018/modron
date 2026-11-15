@@ -22,6 +22,7 @@ pub mod goal;
 pub mod hooks;
 pub mod judge;
 pub mod memory;
+pub mod permissions;
 pub mod rewind;
 pub mod sandbox;
 /// Speculative mid-stream execution subsystem (private to the crate; the
@@ -214,23 +215,24 @@ impl ToolRegistry {
         // `tool_search`. Dropping them entirely would make them
         // uncallable on strict providers; full schemas would pay their
         // cost on every request.
-        let mut v: Vec<_> = self
-            .tools
-            .values()
-            .map(|t| {
-                let spec = t.spec();
-                if self.on_demand.contains(&spec.name) {
-                    ToolSpec {
-                        description: "on-demand tool — call tool_search for its full                                       schema and usage"
-                            .into(),
-                        parameters: serde_json::json!({"type": "object"}),
-                        ..spec
+        let mut v: Vec<_> =
+            self.tools
+                .values()
+                .map(|t| {
+                    let spec = t.spec();
+                    if self.on_demand.contains(&spec.name) {
+                        ToolSpec {
+                            description:
+                                "on-demand tool — call tool_search for its full schema and usage"
+                                    .into(),
+                            parameters: serde_json::json!({"type": "object"}),
+                            ..spec
+                        }
+                    } else {
+                        spec
                     }
-                } else {
-                    spec
-                }
-            })
-            .collect();
+                })
+                .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -561,6 +563,37 @@ pub struct ApprovalPolicy {
 /// with a warning, never a made-up number.
 pub type PriceLookup = dyn Fn(&str) -> Option<(f64, f64)> + Send + Sync;
 
+/// Messages typed while a run is active. The engine drains this at safe
+/// boundaries (between model turns) and appends each as a user message.
+#[derive(Default)]
+pub struct SteerInbox(std::sync::Mutex<std::collections::VecDeque<String>>);
+
+impl SteerInbox {
+    /// Empty inbox.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue one steer message (FIFO).
+    pub fn push(&self, text: String) {
+        self.lock().push_back(text);
+    }
+
+    /// Take every queued message, oldest first, leaving the inbox empty.
+    pub fn drain(&self) -> Vec<String> {
+        self.lock().drain(..).collect()
+    }
+
+    /// True when no message is waiting.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<String>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[derive(Clone)]
 pub struct EngineConfig {
     pub working_dir: PathBuf,
@@ -659,6 +692,10 @@ pub struct EngineConfig {
     /// reads it. Engine-held so it survives across chat turns.
     pub background_subagents:
         Arc<std::sync::Mutex<std::collections::HashMap<String, BackgroundDelegate>>>,
+    /// Steer inbox (additive): messages pushed here while a run is active
+    /// are drained between model turns and appended as user messages (see
+    /// `Engine::run_loop`). `None` (default) = no steering.
+    pub steer: Option<Arc<SteerInbox>>,
 }
 
 /// Per-tier ordered fallback candidates for [`EngineConfig::tier_fallbacks`].
@@ -718,6 +755,7 @@ impl Default for EngineConfig {
             personas: Default::default(),
             tier_fallbacks: None,
             background_subagents: Arc::new(std::sync::Mutex::new(Default::default())),
+            steer: None,
         }
     }
 }

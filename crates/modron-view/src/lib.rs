@@ -141,7 +141,7 @@ pub fn sanitize_display(s: &str) -> String {
 pub fn approval_summary(name: &str, args: &serde_json::Value, max: usize) -> String {
     let essential = match name {
         "bash" => args.get("command").and_then(serde_json::Value::as_str),
-        "write" | "edit" => args.get("path").and_then(serde_json::Value::as_str),
+        "write" | "edit" | "edit_lines" => args.get("path").and_then(serde_json::Value::as_str),
         _ => None,
     };
     let raw = match essential {
