@@ -1427,6 +1427,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | H5 | Scheduled wakeups, pause reasons, completion/block notifications | ACTIVE | H5a DONE: Wake / CancelWake / WakeChanged, LiveState.wake, persisted and re-armed at start; Notify for done, failed, plan, wake. H5b DONE: Notify for approval requests (tool name only, never arguments), done text uses the session title. Open: SessionEvent::Paused; push delivery is the relay (C5) |
 | H6 | Hash-anchored line edits, measured with modron bench | ACTIVE | H6a edit_lines tool + read(line_hashes) DONE, on-demand, approval-gated, edit allow/deny entries cover it. Open: modron bench comparison before any default change |
 | H7 | Reasoning-effort parameter and named model roles | TODO | |
+| H7b | Anthropic thinking: request summaries when the user opted into reasoning display; decide on replaying thinking blocks | TODO | Finding (Anthropic API reference, 2026-11): the provider drops every thinking block from responses and never replays them. That is valid (removing ALL thinking blocks keeps history consistent) but costs reasoning continuity across tool calls, and on current models thinking display defaults to omitted, so `/reasoning` shows nothing unless the request sets `thinking: {type: "adaptive", display: "summarized"}`. Replaying blocks would require an append-only transcript: the transient per-turn plan tail (H2a) and keep-tail client-side compaction both edit history and would have to change first. Design needed before any worker packet |
 | H8 | Command and path permission rules + explain command | DONE | H8a matcher, H8b engine gate + [permissions] config, H8c rules reach serve/daemon/acp sessions (shared build path), ConfigPatch.rules / LiveState.rules / ExplainRule. Evals stay rule-free |
 | H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | DONE | stub and delegate_status descriptions fixed |
 | H9b | Real compact command and true context occupancy over the protocol | DONE | Engine compact_session + context_gauge; Compact frame, ContextChanged, LiveState.context. Known: Compact vs Submit is check-then-act; the gauge is None until the first run or compaction in a server process |
@@ -1529,3 +1530,6 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 - 2026-11-15: C3e and C4f landed. Root gates: fmt clean, clippy clean,
   1163 tests pass. App gates: fmt, clippy, wasm32 check clean, 44 tests
   pass, web-test.js 8 of 8.
+- 2026-11-15: H7 split. H7a (effort parameter end to end) is with a
+  worker; H7b (thinking display and block replay) is recorded as a
+  design item, see its row.
