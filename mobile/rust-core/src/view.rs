@@ -181,6 +181,28 @@ pub const NO_SESSION_LABEL: &str = "no session attached";
 /// The sessions screen's delete control (Packet C3f).
 pub const DELETE_LABEL: &str = "delete";
 
+/// The app's own server, in the connection line (`started by modron-app`).
+pub const OWN_SERVER_NOTE: &str = "started by modron-app";
+/// Owner sign-in and the portal's session list (Packet C4g).
+pub const SIGN_IN_LABEL: &str = "sign in";
+pub const SIGN_OUT_LABEL: &str = "sign out";
+pub const SIGN_IN_PLACEHOLDER: &str = "owner token";
+pub const WRONG_TOKEN_LABEL: &str = "wrong token";
+pub const TOO_MANY_ATTEMPTS_LABEL: &str = "too many attempts";
+pub const SIGN_IN_FAILED_LABEL: &str = "sign-in failed";
+pub const REFRESH_LABEL: &str = "refresh";
+pub const ONLINE_LABEL: &str = "online";
+pub const OFFLINE_LABEL: &str = "offline";
+pub const UNTITLED_LABEL: &str = "untitled";
+/// Invite links for the connected session (owner only).
+pub const SHARE_LABEL: &str = "share";
+pub const VIEWER_LABEL: &str = "viewer";
+pub const APPROVER_LABEL: &str = "approver";
+pub const COPY_LABEL: &str = "copy";
+pub const COPIED_LABEL: &str = "copied";
+pub const REVOKE_LABEL: &str = "revoke";
+pub const NO_INVITES_LABEL: &str = "no invites";
+
 /// The inline confirmation for deleting a session.
 pub fn delete_confirm_text(title: &str) -> String {
     format!("delete {title}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
@@ -189,6 +211,54 @@ pub fn delete_confirm_text(title: &str) -> String {
 /// The inline confirmation for killing a sub-agent.
 pub fn kill_confirm_text(label: &str) -> String {
     format!("{AGENT_KILL_LABEL} {label}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
+/// The connection line: the state word, the address, and the note (when
+/// set), joined with the middle dot.
+pub fn connection_address_label(state: &str, address: &str, note: &str) -> String {
+    if note.is_empty() {
+        format!("{state} \u{b7} {address}")
+    } else {
+        format!("{state} \u{b7} {address} \u{b7} {note}")
+    }
+}
+
+/// The start-up failure when `--continue` finds no session on the server.
+pub fn no_session_to_continue(address: &str) -> String {
+    format!("no session to continue on {address}: start one with modron-app-tui --new")
+}
+
+/// An ISO 8601 timestamp as `YYYY-MM-DD HH:MM` (UTC as the server sent it);
+/// anything else is returned unchanged.
+pub fn short_time(iso: &str) -> String {
+    match (iso.get(..10), iso.get(11..16)) {
+        (Some(day), Some(time)) if iso.as_bytes().get(10) == Some(&b'T') => {
+            format!("{day} {time}")
+        }
+        _ => iso.to_string(),
+    }
+}
+
+/// One portal sessions row: the title (`untitled` when blank), the host
+/// label, the online or offline word, and the last heartbeat time.
+pub fn portal_session_row(title: &str, host_label: &str, online: bool, updated_at: &str) -> String {
+    let title = if title.trim().is_empty() {
+        UNTITLED_LABEL
+    } else {
+        title
+    };
+    let state = if online { ONLINE_LABEL } else { OFFLINE_LABEL };
+    let mut row = format!("{title} \u{b7} {host_label} \u{b7} {state}");
+    if !updated_at.is_empty() {
+        row.push_str(" \u{b7} ");
+        row.push_str(&short_time(updated_at));
+    }
+    row
+}
+
+/// One invite row: its role and when it expires.
+pub fn invite_row(role: &str, expires_at: &str) -> String {
+    format!("{role} \u{b7} expires {}", short_time(expires_at))
 }
 
 /// One sessions-list row: the title (the short id when untitled), the
@@ -1925,5 +1995,58 @@ mod c3f_tests {
             "delete fix router? y / n"
         );
         assert_eq!(kill_confirm_text("reviewer"), "kill reviewer? y / n");
+    }
+}
+
+#[cfg(test)]
+mod portal_copy_tests {
+    use super::*;
+
+    #[test]
+    fn connection_line_joins_state_address_and_note() {
+        assert_eq!(
+            connection_address_label("connected", "ws://h/ws", ""),
+            "connected \u{b7} ws://h/ws"
+        );
+        assert_eq!(
+            connection_address_label("connected", "ws://h/ws", OWN_SERVER_NOTE),
+            "connected \u{b7} ws://h/ws \u{b7} started by modron-app"
+        );
+    }
+
+    #[test]
+    fn no_session_message_names_the_address_and_the_fix() {
+        assert_eq!(
+            no_session_to_continue("ws://x"),
+            "no session to continue on ws://x: start one with modron-app-tui --new"
+        );
+    }
+
+    #[test]
+    fn iso_times_shorten_to_minutes_and_other_text_passes_through() {
+        assert_eq!(short_time("2026-11-15T10:20:30Z"), "2026-11-15 10:20");
+        assert_eq!(short_time("yesterday"), "yesterday");
+        assert_eq!(short_time(""), "");
+        assert_eq!(short_time("2026-11-15 10:20"), "2026-11-15 10:20");
+    }
+
+    #[test]
+    fn portal_row_shows_title_host_state_and_time() {
+        assert_eq!(
+            portal_session_row("fix router", "laptop", true, "2026-11-15T10:20:30Z"),
+            "fix router \u{b7} laptop \u{b7} online \u{b7} 2026-11-15 10:20"
+        );
+        assert_eq!(
+            portal_session_row("  ", "cloud", false, ""),
+            "untitled \u{b7} cloud \u{b7} offline"
+        );
+    }
+
+    #[test]
+    fn invite_row_names_role_and_expiry() {
+        assert_eq!(
+            invite_row("viewer", "2026-11-16T10:20:30Z"),
+            "viewer \u{b7} expires 2026-11-16 10:20"
+        );
     }
 }

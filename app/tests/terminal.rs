@@ -39,6 +39,14 @@ fn server_bin() -> Option<PathBuf> {
     }
 }
 
+/// The tests share one short HOME (the server's Unix socket path must
+/// stay short), so servers must not overlap: each test holds this lock.
+static SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERVER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A short HOME and a scratch git repo for the server to run in.
 fn scratch() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -96,6 +104,7 @@ fn spec(bin: PathBuf, listen: &str) -> ServerSpec {
 #[test]
 fn owned_server_is_started_connected_and_stopped_on_exit() {
     let Some(bin) = server_bin() else { return };
+    let _serial = serial();
     scratch();
     let listen = format!("127.0.0.1:{}", free_port());
     let url = format!("ws://{listen}");
@@ -133,6 +142,7 @@ fn owned_server_is_started_connected_and_stopped_on_exit() {
 #[test]
 fn a_running_server_is_reused_and_not_stopped() {
     let Some(bin) = server_bin() else { return };
+    let _serial = serial();
     scratch();
     let listen = format!("127.0.0.1:{}", free_port());
     let url = format!("ws://{listen}");

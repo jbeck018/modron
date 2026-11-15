@@ -5,14 +5,16 @@
 //! or the shared table.
 
 use modron_mobile_core::view::{
-    AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, CONFIRM_NO_LABEL, CONFIRM_YES_LABEL,
-    DELETE_LABEL, HELP_COMMANDS_HEADING, HELP_KEYS_HEADING, HELP_TITLE, MODELS_EMPTY_LABEL,
+    AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL, CONFIRM_NO_LABEL,
+    CONFIRM_YES_LABEL, COPIED_LABEL, COPY_LABEL, DELETE_LABEL, HELP_COMMANDS_HEADING,
+    HELP_KEYS_HEADING, HELP_TITLE, MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL,
+    REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL, SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
 };
 use modron_mobile_core::{
     FILTER_LABEL, NEW_SESSION_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL, SESSIONS_NO_MATCH_LABEL,
     SETTINGS_LABEL,
 };
-use nsh_core::element::AdaptiveColor;
+use nsh_core::element::{input, AdaptiveColor};
 use nsh_core::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -25,6 +27,8 @@ use crate::nav::{NavStep, NavView, Screen};
 const SESSION_SLOTS: usize = 12;
 const SETTING_SLOTS: usize = 24;
 const MODEL_SLOTS: usize = 16;
+const PORTAL_SLOTS: usize = 24;
+const INVITE_SLOTS: usize = 8;
 
 /// Terminal hints for the openers. Key names are presentation (the
 /// divergence table); the web shows buttons instead.
@@ -34,9 +38,31 @@ fn muted() -> impl Fn() -> AdaptiveColor + Clone + 'static {
     || token_ink("muted-foreground")
 }
 
-/// The whole app screen: the status surface and navigation on top, the
-/// open screen below it.
+/// The whole app screen: the owner portal (sign-in or the session list)
+/// when it is the root, otherwise the chat frame.
 pub fn frame(
+    model: Signal<Model>,
+    draft: Signal<String>,
+    nav: Signal<NavView>,
+    window_h: Signal<f32>,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    view()
+        .flex_col()
+        .size_full()
+        .child(when(move || nav.with(|n| n.is_portal()), {
+            let actions = actions.clone();
+            move || portal_frame(nav, actions.clone())
+        }))
+        .child(when(
+            move || nav.with(|n| !n.is_portal()),
+            move || chat_frame(model, draft, nav, window_h, actions.clone()),
+        ))
+}
+
+/// The chat frame: the status surface and navigation on top, the open
+/// screen below it.
+fn chat_frame(
     model: Signal<Model>,
     draft: Signal<String>,
     nav: Signal<NavView>,
@@ -211,7 +237,10 @@ fn settings_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> im
             move || setting_row(nav, i, actions.clone()),
         ));
     }
-    column
+    column.child(when(
+        move || nav.with(|n| n.share.is_some()),
+        move || share_section(nav, actions.clone()),
+    ))
 }
 
 /// One settings row: `label: value`. On the web a tap sends the row's
@@ -341,6 +370,216 @@ pub(crate) fn agent_panel(
         .child(text(state).text_color(muted()))
         .child(kill)
         .child(confirm_line(nav, actions))
+}
+
+/// The portal root: the sign-in screen or the session list.
+fn portal_frame(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    view()
+        .flex_col()
+        .size_full()
+        .child(when(move || nav.with(|n| n.screen == Screen::SignIn), {
+            let actions = actions.clone();
+            move || sign_in_body(nav, actions.clone())
+        }))
+        .child(when(
+            move || nav.with(|n| n.screen == Screen::Portal),
+            move || portal_body(nav, actions.clone()),
+        ))
+}
+
+/// The owner sign-in: a masked token input (the page never shows or keeps
+/// the token: the input is cleared on every submit), a sign-in control and
+/// the last attempt's message. Enter and the control send the same action.
+fn sign_in_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let token = signal(String::new());
+    let submit = actions.clone();
+    let press = actions.clone();
+    let field = input()
+        .masked(true)
+        .auto_focus(true)
+        .submit_behavior(SubmitBehavior::Submit)
+        .placeholder(SIGN_IN_PLACEHOLDER)
+        .value(move || token.get())
+        .on_change(move |s: &str| token.set(s.to_string()))
+        .on_submit(move |s: &str| {
+            let value = s.trim().to_string();
+            token.set(String::new());
+            if !value.is_empty() {
+                let _ = submit.send(UiAction::SignIn(value));
+            }
+        });
+    let button = view()
+        .role(AccessibilityRole::Button)
+        .px(px(8.0))
+        .on_press(move || {
+            let value = token.get().trim().to_string();
+            token.set(String::new());
+            if !value.is_empty() {
+                let _ = press.send(UiAction::SignIn(value));
+            }
+        })
+        .child(text(SIGN_IN_LABEL).text_color(move || token_ink(style_token(Style::Bold))));
+    view()
+        .flex_col()
+        .child(text(SIGN_IN_LABEL).font_weight(FontWeight::BOLD))
+        .child(field)
+        .child(button)
+        .child(when(
+            move || nav.with(|n| n.signin_error.is_some()),
+            move || {
+                text(move || nav.with(|n| n.signin_error.clone().unwrap_or_default()))
+                    .text_color(move || token_ink("destructive"))
+            },
+        ))
+}
+
+/// The portal's session list: the header (refresh, sign out), the filter
+/// line, the empty states and one line per row. Offline rows are dim; a
+/// press opens an online row (the navigation decides).
+fn portal_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let header = view()
+        .flex_row()
+        .child(text(SESSIONS_LABEL).font_weight(FontWeight::BOLD))
+        .child(tap(REFRESH_LABEL, actions.clone(), UiAction::RefreshPortal))
+        .child(tap(SIGN_OUT_LABEL, actions.clone(), UiAction::SignOut));
+    let mut column = view().flex_col().child(header);
+    column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.portal_total == 0),
+        move || text(SESSIONS_EMPTY_LABEL).text_color(muted()),
+    ));
+    column = column.child(when(
+        move || nav.with(|n| n.portal_total > 0 && n.portal.is_empty()),
+        move || text(SESSIONS_NO_MATCH_LABEL).text_color(muted()),
+    ));
+    for i in 0..PORTAL_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.portal.len() > i),
+            move || portal_row(nav, i, actions.clone()),
+        ));
+    }
+    column
+}
+
+/// One portal row: its line, marked when selected, and a press that asks
+/// the navigation to open it.
+fn portal_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let selected = move || nav.with(|n| n.selected == i);
+    let online = move || nav.with(|n| n.portal.get(i).is_some_and(|r| r.online));
+    let line = move || {
+        nav.with(|n| {
+            let text = n.portal.get(i).map(|r| r.text.clone()).unwrap_or_default();
+            if n.selected == i {
+                format!("> {text}")
+            } else {
+                text
+            }
+        })
+    };
+    view()
+        .role(AccessibilityRole::Button)
+        .on_press(move || {
+            let _ = actions.send(UiAction::Nav(NavStep::OpenPortal(i)));
+        })
+        .child(text(line).text_color(move || {
+            if online() {
+                token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+            } else {
+                token_ink(style_token(Style::Meta))
+            }
+        }))
+}
+
+/// The Settings share section (owner, a connected session): create a viewer
+/// or approver invite, show the new link with its copy control, list the
+/// invites with a revoke control each.
+fn share_section(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let roles = view()
+        .flex_row()
+        .child(tap(VIEWER_LABEL, actions.clone(), UiAction::CreateInvite(VIEWER_LABEL.into())))
+        .child(tap(APPROVER_LABEL, actions.clone(), UiAction::CreateInvite(APPROVER_LABEL.into())));
+    let mut column =
+        view().flex_col().child(text(SHARE_LABEL).font_weight(FontWeight::BOLD)).child(roles);
+    column = column.child(when(
+        move || nav.with(|n| n.share.as_ref().is_some_and(|s| s.created.is_some())),
+        {
+            let actions = actions.clone();
+            move || created_invite(nav, actions.clone())
+        },
+    ));
+    column = column.child(when(
+        move || nav.with(|n| n.share.as_ref().is_some_and(|s| s.invites.is_empty())),
+        move || text(NO_INVITES_LABEL).text_color(muted()),
+    ));
+    for i in 0..INVITE_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.share.as_ref().is_some_and(|s| s.invites.len() > i)),
+            move || invite_line(nav, i, actions.clone()),
+        ));
+    }
+    column
+}
+
+/// The new invite's URL as selectable text, with the copy control. The
+/// copied word follows a successful copy.
+fn created_invite(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let copy = view()
+        .role(AccessibilityRole::Button)
+        .px(px(8.0))
+        .on_press(move || {
+            if let Some(url) = nav.with(|n| n.share.as_ref().and_then(|s| s.created.clone())) {
+                let _ = actions.send(UiAction::CopyInvite(url));
+            }
+        })
+        .child(text(COPY_LABEL).text_color(move || token_ink(style_token(Style::Plain))));
+    view()
+        .flex_col()
+        .child(
+            text(move || {
+                nav.with(|n| n.share.as_ref().and_then(|s| s.created.clone()).unwrap_or_default())
+            })
+            .text_color(move || token_ink("foreground")),
+        )
+        .child(view().flex_row().child(copy).child(when(
+            move || nav.with(|n| n.share.as_ref().is_some_and(|s| s.note.is_some())),
+            move || text(COPIED_LABEL).text_color(muted()),
+        )))
+}
+
+/// One invite: its line and the revoke control (the id is read at press
+/// time, so the row always revokes the invite it shows).
+fn invite_line(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let line = move || {
+        nav.with(|n| {
+            n.share
+                .as_ref()
+                .and_then(|s| s.invites.get(i))
+                .map(|l| l.text.clone())
+                .unwrap_or_default()
+        })
+    };
+    let revoke = view()
+        .role(AccessibilityRole::Button)
+        .px(px(8.0))
+        .on_press(move || {
+            if let Some(id) =
+                nav.with(|n| n.share.as_ref().and_then(|s| s.invites.get(i)).map(|l| l.id.clone()))
+            {
+                let _ = actions.send(UiAction::RevokeInvite(id));
+            }
+        })
+        .child(text(REVOKE_LABEL).text_color(move || token_ink(style_token(Style::Plain))));
+    view().flex_row().child(text(line).text_color(muted())).child(revoke)
 }
 
 #[cfg(test)]

@@ -33,8 +33,10 @@ use nsh_platform_tui::{Input, Modifiers};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
-use crate::nav::{Nav, NavStep, NavView, Screen};
+use crate::nav::{InviteLine, Nav, NavStep, NavView, Screen};
+use crate::portal::PortalRow;
 use crate::slash;
+use std::collections::VecDeque;
 
 /// What the user asked the client to do. The host or the view sends these;
 /// the session driver (`crate::session`) turns them into core calls.
@@ -98,6 +100,38 @@ pub enum UiAction {
     /// A local message (unknown command, a usage line), shown as the
     /// snapshot's last error, as a refused call is.
     Notice(String),
+    /// Owner portal (web). The token is sent once and never stored; the
+    /// view clears its input on submit.
+    SignIn(String),
+    SignOut,
+    /// The portal list: refresh now (also every 15 s while it shows).
+    RefreshPortal,
+    /// Open a same-origin URL (a portal row: the owner's `open_url`).
+    OpenUrl(String),
+    /// Settings share (owner, connected session): list the invites, create
+    /// one with a role (`viewer` or `approver`), revoke one by id, copy a URL.
+    ListInvites,
+    CreateInvite(String),
+    RevokeInvite(String),
+    CopyInvite(String),
+}
+
+impl UiAction {
+    /// The actions the web host performs itself (the owner portal's calls).
+    /// They never reach the session driver.
+    pub fn is_portal(&self) -> bool {
+        matches!(
+            self,
+            UiAction::SignIn(_)
+                | UiAction::SignOut
+                | UiAction::RefreshPortal
+                | UiAction::OpenUrl(_)
+                | UiAction::ListInvites
+                | UiAction::CreateInvite(_)
+                | UiAction::RevokeInvite(_)
+                | UiAction::CopyInvite(_)
+        )
+    }
 }
 
 /// Key hints for the approval options, in protocol order. Keys are TUI
@@ -323,6 +357,9 @@ pub enum Routed {
 /// without a view.
 pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str) -> Routed {
     let composer = Routed::Composer { queue: false };
+    if matches!(facts.screen, Screen::SignIn | Screen::Portal) {
+        return route_portal_key(key, chord, &facts);
+    }
     if facts.confirming && !chord {
         return match key {
             Key::Char('y') => Routed::Nav(NavStep::Confirm),
@@ -387,6 +424,33 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     composer
 }
 
+/// Keys on the portal screens. The sign-in input is the page's own input, so
+/// its keys (the token, Enter, paste) go to the composer; Esc backs out of
+/// nothing there. The list types a filter, arrows move, Enter opens the
+/// selected row and Esc clears the filter. Chords always reach the page.
+fn route_portal_key(key: Key, chord: bool, facts: &KeyFacts) -> Routed {
+    let composer = Routed::Composer { queue: false };
+    if chord {
+        return composer;
+    }
+    if facts.screen == Screen::SignIn {
+        return match key {
+            Key::Escape => Routed::Ignored,
+            _ => composer,
+        };
+    }
+    match key {
+        Key::Escape if facts.filter_active => Routed::Nav(NavStep::ClearFilter),
+        Key::Escape => Routed::Ignored,
+        Key::Enter => Routed::Nav(NavStep::OpenPortal(facts.selected_index)),
+        Key::Up => Routed::Nav(NavStep::Move(-1)),
+        Key::Down => Routed::Nav(NavStep::Move(1)),
+        Key::Backspace => Routed::Nav(NavStep::FilterBack),
+        Key::Char(c) => Routed::Nav(NavStep::Filter(c)),
+        _ => Routed::Ignored,
+    }
+}
+
 /// Keys on the screens above Chat. Help closes on Esc. Models filters by
 /// typing and picks on Enter. Agent takes the steer text (the composer), and
 /// `k` on an empty draft asks to kill a live agent. Sessions and Settings
@@ -430,7 +494,7 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
                 _ => Routed::Ignored,
             };
         }
-        Screen::Chat | Screen::Sessions | Screen::Settings => {}
+        Screen::Chat | Screen::Sessions | Screen::Settings | Screen::SignIn | Screen::Portal => {}
     }
     let sessions = facts.screen == Screen::Sessions;
     match key {
@@ -621,6 +685,8 @@ pub struct Host {
     /// Messages held for the next run (the queue chips).
     queued: usize,
     nav: Nav,
+    /// The owner portal's actions, taken by the web host (`take_portal`).
+    portal: VecDeque<UiAction>,
 }
 
 /// Creates the two ends of the link. Also resets the composer mirror, so a
@@ -642,6 +708,7 @@ pub fn link() -> (Host, Client) {
             plan_pending: false,
             queued: 0,
             nav: Nav::default(),
+            portal: VecDeque::new(),
         },
         Client { snapshots: snap_rx, actions: act_tx, nav: nav_rx },
     )
@@ -665,9 +732,62 @@ impl Host {
         loop {
             match self.actions.try_recv().ok()? {
                 UiAction::Nav(step) => self.nav_step(step),
+                action if action.is_portal() => self.portal.push_back(action),
                 action => return Some(action),
             }
         }
+    }
+
+    /// The next owner-portal action (web host), if any. Call after
+    /// [`Host::try_action`], which moves them here.
+    pub fn take_portal(&mut self) -> Option<UiAction> {
+        self.portal.pop_front()
+    }
+
+    /// The screen on top (for the portal's timers and the web host).
+    pub fn screen(&self) -> Screen {
+        self.nav.top()
+    }
+
+    /// The session the page is attached to.
+    pub fn session(&self) -> Option<Uuid> {
+        self.nav.session()
+    }
+
+    /// Makes the portal's sign-in or list the app's screen (or Chat).
+    pub fn set_root(&mut self, screen: Screen) {
+        self.nav.set_root(screen);
+        self.notify();
+    }
+
+    pub fn set_portal(&mut self, rows: &[PortalRow]) {
+        self.nav.set_portal(rows);
+        self.notify();
+    }
+
+    pub fn set_signin_error(&mut self, error: Option<String>) {
+        self.nav.set_signin_error(error);
+        self.notify();
+    }
+
+    pub fn set_share_enabled(&mut self, enabled: bool) {
+        self.nav.set_share_enabled(enabled);
+        self.notify();
+    }
+
+    pub fn set_invites(&mut self, invites: Vec<InviteLine>) {
+        self.nav.set_invites(invites);
+        self.notify();
+    }
+
+    pub fn set_created(&mut self, url: Option<String>) {
+        self.nav.set_created(url);
+        self.notify();
+    }
+
+    pub fn set_share_note(&mut self, note: Option<String>) {
+        self.nav.set_share_note(note);
+        self.notify();
     }
 
     /// Routes one terminal key. Returns `Some(input)` for the view to handle,

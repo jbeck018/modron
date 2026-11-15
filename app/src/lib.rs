@@ -8,6 +8,7 @@ pub mod chat;
 pub mod demo;
 pub mod help;
 pub mod nav;
+pub mod portal;
 pub mod screens;
 pub mod session;
 pub mod slash;

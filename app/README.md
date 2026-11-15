@@ -68,9 +68,15 @@ the version the runtime links (0.2.130; the build prints the name it wants).
 
 Serve `dist/Modron/` with any static server. The page address picks the mode:
 
-- `index.html` with no query: the built-in demo.
+- `index.html` with no query: the page asks its own origin for `/api/me`.
+  200 shows the owner's session list (the portal), 401 the sign-in screen,
+  anything else (the portal is off) the built-in demo.
 - `index.html?url=ws%3A%2F%2Fhost%3A7000&token=T&session=UUID`: live server.
-  `url` is required for live mode; `token` and `session` are optional.
+  `url` is required for live mode; `token` and `session` are optional. A
+  signed-in owner also gets the Settings share section (invite links).
+
+The portal's sign-in token is sent once to `POST /auth` and never stored: no
+query string, no storage. The list refreshes every 15 s while it shows.
 
 The real server refuses browser Origins unless started with `--allow-origin`.
 

@@ -19,6 +19,7 @@ use modron_mobile_core::{
 use uuid::Uuid;
 
 use crate::chat::UiAction;
+use crate::portal::{self, PortalLine, PortalRow};
 use crate::slash;
 
 /// The screens. Chat is the root; the others open over it.
@@ -35,6 +36,10 @@ pub enum Screen {
     /// One sub-agent. Its id is kept beside the stack ([`Nav::agent_id`]),
     /// so the screen type stays `Copy`.
     Agent,
+    /// The owner sign-in (web, portal off the URL): one token input.
+    SignIn,
+    /// The owner's session list (web, portal mode).
+    Portal,
 }
 
 /// One navigation step. Keys and taps both become steps; [`Nav::apply`]
@@ -63,6 +68,9 @@ pub enum NavStep {
     NewSession,
     /// Enter or a tap on a model row: switch to it and go to Chat.
     PickModel(String),
+    /// Enter or a tap on a portal row (index into the visible rows): open it
+    /// when it is online.
+    OpenPortal(usize),
     /// `d` on a session row, or its delete control: ask first (the row index).
     AskDelete(usize),
     /// `k` on an empty steer draft, or the kill control: ask first.
@@ -116,6 +124,25 @@ impl SettingRow {
 pub struct ModelRow {
     pub model: String,
     pub text: String,
+    /// Catalog rows that the server cannot run are dim and not selectable.
+    pub available: bool,
+}
+
+/// One invite row of the Settings share section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InviteLine {
+    pub id: String,
+    pub text: String,
+}
+
+/// The Settings share section (owner, web, a connected session).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShareView {
+    pub invites: Vec<InviteLine>,
+    /// The URL of the invite just created, shown as selectable text.
+    pub created: Option<String>,
+    /// The shared word after a successful copy.
+    pub note: Option<String>,
 }
 
 /// What the view renders.
@@ -146,6 +173,21 @@ pub struct NavView {
     /// A completed composer text, with a sequence number so the view applies
     /// each one once.
     pub completion: (u64, String),
+    /// The portal list rows that match the filter.
+    pub portal: Vec<PortalLine>,
+    /// Every portal row the list holds (0 shows the empty state).
+    pub portal_total: usize,
+    /// The sign-in message from the last attempt.
+    pub signin_error: Option<String>,
+    /// The share section, when the owner is connected to a session.
+    pub share: Option<ShareView>,
+}
+
+impl NavView {
+    /// Whether the owner portal (sign-in or the list) is the screen.
+    pub fn is_portal(&self) -> bool {
+        matches!(self.screen, Screen::SignIn | Screen::Portal)
+    }
 }
 
 /// An action held until y confirms it.
@@ -174,12 +216,83 @@ pub struct Nav {
     slash_sel: usize,
     slash_hidden: bool,
     completion: (u64, String),
+    /// The screen under the stack: Chat, or the portal's sign-in or list.
+    root: Screen,
+    portal: Vec<PortalLine>,
+    signin_error: Option<String>,
+    /// The owner is signed in and the page has a session (Settings share).
+    share_enabled: bool,
+    session: Option<Uuid>,
+    invites: Vec<InviteLine>,
+    created: Option<String>,
+    share_note: Option<String>,
 }
 
 impl Nav {
     /// The screen on top of the stack.
     pub fn top(&self) -> Screen {
-        self.stack.last().copied().unwrap_or(Screen::Chat)
+        self.stack.last().copied().unwrap_or(self.root)
+    }
+
+    /// Whether the portal (sign-in or list) is the app's screen.
+    pub fn is_portal(&self) -> bool {
+        matches!(self.root, Screen::SignIn | Screen::Portal)
+    }
+
+    /// Makes `screen` the bottom of the stack and clears what is above it.
+    pub fn set_root(&mut self, screen: Screen) {
+        self.root = screen;
+        self.stack.clear();
+        self.filter.clear();
+        self.selected = 0;
+        self.pending = None;
+        self.clamp();
+    }
+
+    /// The portal list's rows (`GET /api/sessions`, in the server's order).
+    pub fn set_portal(&mut self, rows: &[PortalRow]) {
+        self.portal = portal::lines(rows);
+        self.clamp();
+    }
+
+    pub fn set_signin_error(&mut self, error: Option<String>) {
+        self.signin_error = error;
+    }
+
+    /// The owner's share section: on when `/api/me` answered 200.
+    pub fn set_share_enabled(&mut self, enabled: bool) {
+        self.share_enabled = enabled;
+    }
+
+    pub fn set_invites(&mut self, invites: Vec<InviteLine>) {
+        self.invites = invites;
+    }
+
+    pub fn set_created(&mut self, url: Option<String>) {
+        self.created = url;
+    }
+
+    pub fn set_share_note(&mut self, note: Option<String>) {
+        self.share_note = note;
+    }
+
+    /// The session the page is attached to (from the latest snapshot).
+    pub fn session(&self) -> Option<Uuid> {
+        self.session
+    }
+
+    /// Whether the share section is shown.
+    fn share_active(&self) -> bool {
+        self.share_enabled && self.session.is_some()
+    }
+
+    /// The portal rows that match the filter (the row text).
+    fn visible_portal(&self) -> Vec<&PortalLine> {
+        let needle = self.filter.to_lowercase();
+        self.portal
+            .iter()
+            .filter(|row| needle.is_empty() || row.text.to_lowercase().contains(&needle))
+            .collect()
     }
 
     /// The filter text (Sessions and Models).
@@ -205,6 +318,7 @@ impl Nav {
                 text: text.clone(),
             })
             .collect();
+        self.session = snapshot.session_id;
         self.settings = settings_rows(snapshot);
         self.models = model_rows(snapshot);
         self.agents = snapshot.agents.clone();
@@ -237,7 +351,7 @@ impl Nav {
 
     /// True on the two screens with a filter line.
     fn filtering(&self) -> bool {
-        matches!(self.top(), Screen::Sessions | Screen::Models)
+        matches!(self.top(), Screen::Sessions | Screen::Models | Screen::Portal)
     }
 
     /// The session Enter would attach (Sessions on top only).
@@ -253,7 +367,10 @@ impl Nav {
         if self.top() != Screen::Models {
             return None;
         }
-        self.visible_models().get(self.selected).map(|row| row.model.clone())
+        self.visible_models()
+            .get(self.selected)
+            .filter(|row| row.available)
+            .map(|row| row.model.clone())
     }
 
     /// The action Enter would send for the selected settings row.
@@ -303,7 +420,8 @@ impl Nav {
 
     fn list_len(&self) -> usize {
         match self.top() {
-            Screen::Chat | Screen::Help | Screen::Agent => 0,
+            Screen::Chat | Screen::Help | Screen::Agent | Screen::SignIn => 0,
+            Screen::Portal => self.visible_portal().len(),
             Screen::Sessions => self.visible().len(),
             Screen::Models => self.visible_models().len(),
             Screen::Settings => self.settings.len(),
@@ -346,6 +464,7 @@ impl Nav {
                 match screen {
                     Screen::Sessions => return vec![UiAction::ListSessions],
                     Screen::Models => return vec![UiAction::ListModels],
+                    Screen::Settings if self.share_active() => return vec![UiAction::ListInvites],
                     _ => {}
                 }
             }
@@ -381,6 +500,13 @@ impl Nav {
             NavStep::Move(delta) => {
                 let last = self.list_len().saturating_sub(1) as isize;
                 self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+            }
+            NavStep::OpenPortal(index) if self.top() == Screen::Portal => {
+                if let Some(url) =
+                    self.visible_portal().get(index).and_then(|l| portal::open_target(l))
+                {
+                    return vec![UiAction::OpenUrl(url)];
+                }
             }
             NavStep::Attach(id) => {
                 self.leave_to_chat();
@@ -452,6 +578,14 @@ impl Nav {
             slash_hidden: self.slash_hidden,
             slash_selected: self.slash_sel,
             completion: self.completion.clone(),
+            portal: self.visible_portal().into_iter().cloned().collect(),
+            portal_total: self.portal.len(),
+            signin_error: self.signin_error.clone(),
+            share: self.share_active().then(|| ShareView {
+                invites: self.invites.clone(),
+                created: self.created.clone(),
+                note: self.share_note.clone(),
+            }),
         }
     }
 }
@@ -460,14 +594,27 @@ fn row(label: &str, value: String, action: Option<UiAction>) -> SettingRow {
     SettingRow { label: label.to_string(), value, action }
 }
 
-/// The model picker's rows: the current model, the router's recommended
-/// cheap and strong models, and the fallbacks. The core has no full catalog
-/// on the wire, so these are the rows it can name; a model appears once.
+/// The model picker's rows. The server's catalog (`models`, from
+/// `models_req`) when it has arrived: one row per entry, the core's text,
+/// unavailable ones dim. Until then, the router-defaults rows: the current
+/// model, the recommended cheap and strong models and the fallbacks, each
+/// model once.
 pub fn model_rows(s: &ViewModelSnapshot) -> Vec<ModelRow> {
+    if !s.models.is_empty() {
+        return s
+            .models
+            .iter()
+            .map(|m| ModelRow { model: m.id.clone(), text: m.text.clone(), available: m.available })
+            .collect();
+    }
     let mut rows: Vec<ModelRow> = Vec::new();
     let mut push = |model: &str, role: &str| {
         if !model.is_empty() && !rows.iter().any(|r| r.model == model) {
-            rows.push(ModelRow { model: model.to_string(), text: format!("{model} ({role})") });
+            rows.push(ModelRow {
+                model: model.to_string(),
+                text: format!("{model} ({role})"),
+                available: true,
+            });
         }
     };
     push(&s.model, MODEL_ROLE_CURRENT);
@@ -663,5 +810,149 @@ mod tests {
             nav.enter_setting(),
             Some(UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll))
         );
+    }
+}
+
+#[cfg(test)]
+mod portal_tests {
+    use super::*;
+    use crate::chat::{route_key, Key, KeyFacts, Routed};
+    use crate::portal::parse_sessions;
+    use modron_mobile_core::view::ModelRowView;
+
+    const ROWS: &str = r#"[
+        {"id":"a","title":"fix router","host_label":"laptop","online":true,
+         "updated_at":"2026-11-15T10:20:30Z","open_url":"/app/?url=ws%3A%2F%2Fh%2Fws%2Fa"},
+        {"id":"b","title":"docs","host_label":"cloud","online":false,
+         "updated_at":"2026-11-14T08:00:00Z","open_url":"/app/?url=ws%3A%2F%2Fh%2Fws%2Fb"},
+        {"id":"c","title":"router tests","host_label":"laptop","online":true,
+         "updated_at":"","open_url":"/app/?url=ws%3A%2F%2Fh%2Fws%2Fc"}
+    ]"#;
+
+    fn portal_nav() -> Nav {
+        let mut nav = Nav::default();
+        nav.set_root(Screen::Portal);
+        nav.set_portal(&parse_sessions(ROWS).unwrap());
+        nav
+    }
+
+    #[test]
+    fn the_portal_list_filters_and_opens_only_online_rows() {
+        let mut nav = portal_nav();
+        assert!(nav.is_portal());
+        assert_eq!(nav.view().portal.len(), 3);
+        assert_eq!(nav.apply(NavStep::OpenPortal(1)), Vec::new());
+        assert_eq!(
+            nav.apply(NavStep::OpenPortal(0)),
+            vec![UiAction::OpenUrl("/app/?url=ws%3A%2F%2Fh%2Fws%2Fa".into())]
+        );
+        for c in "ROUTER".chars() {
+            nav.apply(NavStep::Filter(c));
+        }
+        let view = nav.view();
+        assert_eq!(view.portal.len(), 2);
+        assert_eq!(view.portal_total, 3);
+        assert_eq!(
+            nav.apply(NavStep::OpenPortal(1)),
+            vec![UiAction::OpenUrl("/app/?url=ws%3A%2F%2Fh%2Fws%2Fc".into())]
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_selected_portal_row_and_esc_clears_the_filter_first() {
+        let facts = KeyFacts { screen: Screen::Portal, selected_index: 2, ..Default::default() };
+        assert_eq!(
+            route_key(Key::Enter, false, false, facts.clone(), ""),
+            Routed::Nav(NavStep::OpenPortal(2))
+        );
+        let filtering = KeyFacts { filter_active: true, ..facts };
+        assert_eq!(
+            route_key(Key::Escape, false, false, filtering, ""),
+            Routed::Nav(NavStep::ClearFilter)
+        );
+    }
+
+    #[test]
+    fn the_sign_in_screen_sends_keys_to_its_input_and_ignores_esc() {
+        let mut nav = Nav::default();
+        nav.set_root(Screen::SignIn);
+        nav.set_signin_error(Some("wrong token".into()));
+        let view = nav.view();
+        assert!(view.is_portal());
+        assert_eq!(view.screen, Screen::SignIn);
+        assert_eq!(view.signin_error.as_deref(), Some("wrong token"));
+        let facts = KeyFacts { screen: Screen::SignIn, ..Default::default() };
+        assert_eq!(
+            route_key(Key::Char('x'), false, false, facts.clone(), ""),
+            Routed::Composer { queue: false }
+        );
+        assert_eq!(
+            route_key(Key::Enter, false, false, facts.clone(), ""),
+            Routed::Composer { queue: false }
+        );
+        assert_eq!(route_key(Key::Escape, false, false, facts, ""), Routed::Ignored);
+    }
+
+    #[test]
+    fn the_share_section_needs_an_owner_and_a_session() {
+        let mut nav = Nav::default();
+        let snapshot =
+            ViewModelSnapshot { session_id: Some(Uuid::from_u128(7)), ..Default::default() };
+        nav.observe(&snapshot);
+        assert!(nav.view().share.is_none());
+        nav.set_share_enabled(true);
+        nav.set_invites(vec![InviteLine {
+            id: "i1".into(),
+            text: "viewer \u{b7} expires x".into(),
+        }]);
+        assert_eq!(nav.apply(NavStep::Open(Screen::Settings)), vec![UiAction::ListInvites]);
+        let share = nav.view().share.expect("share section");
+        assert_eq!(share.invites.len(), 1);
+        nav.set_share_enabled(false);
+        assert!(nav.view().share.is_none());
+    }
+
+    #[test]
+    fn the_model_picker_lists_the_catalog_and_skips_unavailable_rows() {
+        let snapshot = ViewModelSnapshot {
+            model: "claude-opus-5".into(),
+            models: vec![
+                ModelRowView {
+                    id: "claude-opus-5".into(),
+                    provider: "anthropic".into(),
+                    text: "claude-opus-5 - anthropic".into(),
+                    available: true,
+                    current: true,
+                },
+                ModelRowView {
+                    id: "gpt-x".into(),
+                    provider: "openai".into(),
+                    text: "gpt-x - openai".into(),
+                    available: false,
+                    current: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let rows = model_rows(&snapshot);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "claude-opus-5 - anthropic");
+        assert!(!rows[1].available);
+        let mut nav = Nav::default();
+        nav.observe(&snapshot);
+        nav.apply(NavStep::Open(Screen::Models));
+        nav.apply(NavStep::Move(1));
+        assert_eq!(nav.selected_model(), None);
+        nav.apply(NavStep::Move(-1));
+        assert_eq!(nav.selected_model().as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn the_model_picker_falls_back_to_the_router_defaults_while_the_catalog_is_empty() {
+        let snapshot = ViewModelSnapshot { model: "claude-opus-5".into(), ..Default::default() };
+        let rows = model_rows(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "claude-opus-5 (current)");
+        assert!(rows[0].available);
     }
 }

@@ -15,7 +15,9 @@
 //! the session it had. [`Status::reconnecting`] tells the terminal host that
 //! Esc may leave.
 
-use modron_mobile_core::view::NO_SESSION_LABEL;
+use modron_mobile_core::view::{
+    connection_address_label, no_session_to_continue, NO_SESSION_LABEL,
+};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -385,10 +387,7 @@ impl Driver {
                         let _ = self.client.attach(session, 0);
                     }
                     None if self.options.resume == Resume::Continue => {
-                        self.status.fail(format!(
-                            "no session to continue on {}: start one with modron-app-tui --new",
-                            self.options.url
-                        ));
+                        self.status.fail(no_session_to_continue(&self.options.url));
                         return false;
                     }
                     None => {}
@@ -411,11 +410,7 @@ impl Driver {
     /// The connection label with the address (and the note, when set).
     fn label(&self, base: &str) -> String {
         let note = self.status.note();
-        if note.is_empty() {
-            format!("{base} \u{b7} {}", self.options.url)
-        } else {
-            format!("{base} \u{b7} {} \u{b7} {note}", self.options.url)
-        }
+        connection_address_label(base, &self.options.url, &note)
     }
 
     /// The post-connect setup: an exact session is attached; with none, the
@@ -503,7 +498,9 @@ fn apply(client: &RemoteClient, action: UiAction) {
             client.set_config(ConfigPatch { sandbox: Some(policy), ..Default::default() })
         }
         UiAction::SelectModel(model) => client.select_model(model),
-        UiAction::ListModels => client.router_defaults(),
+        // The catalog (`models_req`) and the router defaults: the picker
+        // shows the catalog once it arrives and the defaults until then.
+        UiAction::ListModels => client.request_models().and_then(|()| client.router_defaults()),
         UiAction::CycleMode => {
             let mode = approval_mode_next(client.state().approval_mode);
             client.set_config(ConfigPatch { approval_mode: Some(mode), ..Default::default() })
@@ -532,8 +529,17 @@ fn apply(client: &RemoteClient, action: UiAction) {
             client.note_local_error(text);
             Ok(())
         }
-        // Navigation is applied by the host before an action reaches here.
-        UiAction::Nav(_) => Ok(()),
+        // Navigation is applied by the host, and the owner portal's actions
+        // are the web host's (`Host::take_portal`); neither reaches here.
+        UiAction::Nav(_)
+        | UiAction::SignIn(_)
+        | UiAction::SignOut
+        | UiAction::RefreshPortal
+        | UiAction::OpenUrl(_)
+        | UiAction::ListInvites
+        | UiAction::CreateInvite(_)
+        | UiAction::RevokeInvite(_)
+        | UiAction::CopyInvite(_) => Ok(()),
     };
     if let Err(error) = result {
         client.note_local_error(error.to_string());

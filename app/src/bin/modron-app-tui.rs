@@ -45,9 +45,6 @@ mod terminal {
     };
     use ratatui::{backend::CrosstermBackend, widgets::Paragraph, Terminal};
 
-    /// How the app's own server is labelled in the connection line.
-    const OWN_SERVER_NOTE: &str = "started by modron-app";
-
     fn key_input(key: KeyEvent) -> Input {
         let name = match key.code {
             K::Char(c) => c.to_string(),
@@ -180,7 +177,7 @@ mod terminal {
             Plan::Fail { reason } => return fatal(&reason, &log),
         };
         if let (Some(live), Some(_)) = (live.as_ref(), server.as_ref()) {
-            live.status.set_note(OWN_SERVER_NOTE);
+            live.status.set_note(modron_mobile_core::view::OWN_SERVER_NOTE);
         }
         let outcome = run(live);
         if args.keep_server {

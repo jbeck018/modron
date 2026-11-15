@@ -2,17 +2,28 @@
 //   (a) demo mode: a transcript row and the status line show as DOM text.
 //   (b) live mode: a scripted WebSocket server (below, RFC 6455 by hand) sends
 //       welcome, a snapshot and a streamed delta; typing + Enter sends a submit.
-// Static files come from `python3 -m http.server`. Uses only Node built-ins
-// and the preinstalled Playwright (headless Chromium).
+//   (p1..p5) owner portal: sign-in, the session list, open and offline rows,
+//       sign-out, and an invite created, shown and revoked from Settings.
+// The page is served by a Node site (startSite) on one origin: the built
+// bundle under / and /app/, and the portal's routes (/api/*, /auth) answered
+// from a scripted state. Uses only Node built-ins and the preinstalled
+// Playwright (headless Chromium).
 const { chromium } = require('playwright');
-const { spawn } = require('child_process');
 const crypto = require('crypto');
+const fs = require('fs');
 const http = require('http');
 const net = require('net');
 const path = require('path');
 
 const DIST = path.join(__dirname, 'dist', 'Modron');
 const SESSION = '5b1e8f4a-2c3d-4e5f-8a9b-0c1d2e3f4a5b';
+const COOKIE = 'owner-cookie-for-tests';
+const TOKEN = 'correct-horse-token';
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css',
+  '.wasm': 'application/wasm', '.json': 'application/json', '.webmanifest': 'application/manifest+json',
+  '.bin': 'application/octet-stream', '.png': 'image/png', '.svg': 'image/svg+xml',
+};
 const STREAM = 'Migrating the router now';
 const TIMEOUT = 60000;
 
@@ -27,21 +38,78 @@ function freePort() {
   });
 }
 
-function startStatic(port) {
-  const child = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1', '--directory', DIST], { stdio: 'ignore' });
+// The page's origin: the bundle under / and /app/, plus the portal routes
+// answered from `state` (see the portal tests). `state.portal` is 'off'
+// (503 on /api/me, the demo) or 'on'; the owner cookie gates the rest.
+function startSite(port, state) {
+  const base = `http://127.0.0.1:${port}`;
+  const send = (res, code, body, headers = {}) => {
+    res.writeHead(code, headers);
+    res.end(body);
+  };
+  const json = (res, code, value) => send(res, code, JSON.stringify(value), { 'Content-Type': 'application/json' });
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      const url = new URL(req.url, base);
+      const owner = (req.headers.cookie || '').includes(`modron_owner=${COOKIE}`);
+      const p = url.pathname;
+      if (p.startsWith('/api/') || p.startsWith('/auth')) {
+        if (p === '/api/me' && req.method === 'GET') {
+          if (state.portal === 'off') return json(res, 503, { error: 'portal not configured' });
+          return owner ? json(res, 200, { owner: true }) : json(res, 401, { error: 'unauthorized' });
+        }
+        if (p === '/auth' && req.method === 'POST') {
+          if (state.rateLimited) return json(res, 429, { error: 'too many attempts' });
+          const { token } = JSON.parse(body || '{}');
+          if (token !== TOKEN) return json(res, 401, { error: 'unauthorized' });
+          return send(res, 200, '{}', { 'Content-Type': 'application/json',
+            'Set-Cookie': `modron_owner=${COOKIE}; Path=/; HttpOnly; SameSite=Strict` });
+        }
+        if (p === '/auth/logout' && req.method === 'POST') {
+          state.loggedOut += 1;
+          return send(res, 204, '', { 'Set-Cookie': 'modron_owner=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' });
+        }
+        if (!owner) return json(res, 401, { error: 'unauthorized' });
+        if (p === '/api/sessions' && req.method === 'GET') return json(res, 200, state.sessions);
+        if (p === '/api/invites' && req.method === 'GET') {
+          const sid = url.searchParams.get('session_id');
+          return json(res, 200, state.invites.filter((i) => !i.revoked && i.session_id === sid));
+        }
+        if (p === '/api/invites' && req.method === 'POST') {
+          const input = JSON.parse(body || '{}');
+          state.invitePosts.push(input);
+          const id = `inv${state.invitePosts.length}`;
+          const row = { id, session_id: input.session_id, role: input.role, revoked: false,
+            expires_at: '2026-11-16T10:00:00Z', url: `${base}/i/${id}.sig` };
+          state.invites.push(row);
+          return json(res, 201, { id, url: row.url, expires_at: row.expires_at });
+        }
+        const m = /^\/api\/invites\/([^/]+)$/.exec(p);
+        if (m && req.method === 'DELETE') {
+          const row = state.invites.find((i) => i.id === m[1]);
+          if (row) row.revoked = true;
+          state.deletes.push(m[1]);
+          return send(res, 204, '');
+        }
+        return json(res, 404, { error: 'not found' });
+      }
+      // Static: the bundle at / and at /app/.
+      let rel = decodeURIComponent(p);
+      if (rel === '/app' || rel.startsWith('/app/')) rel = rel.slice(4) || '/';
+      let file = path.join(DIST, rel);
+      if (!file.startsWith(DIST)) return send(res, 403, 'forbidden');
+      if (rel === '/' || (fs.existsSync(file) && fs.statSync(file).isDirectory())) file = path.join(file, 'index.html');
+      fs.readFile(file, (err, data) => {
+        if (err) return send(res, 404, 'not found');
+        send(res, 200, data, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+      });
+    });
+  });
   return new Promise((resolve, reject) => {
-    const deadline = Date.now() + 10000;
-    const poll = () => {
-      const req = http.get({ host: '127.0.0.1', port, path: '/' }, (res) => {
-        res.resume();
-        resolve(child);
-      });
-      req.on('error', () => {
-        if (Date.now() > deadline) return reject(new Error('static server did not start'));
-        setTimeout(poll, 100);
-      });
-    };
-    poll();
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => resolve({ base, state, close: () => server.close() }));
   });
 }
 
@@ -130,9 +198,15 @@ function startWsServer(opts = {}) {
 
 // Page errors and console errors both count: a logged wasm panic is a failure
 // even when the page keeps running.
+// The browser logs every failed HTTP answer as a console error. The portal's
+// probes answer 401, 429 or 503 on purpose, so those log lines are allowed;
+// any other error, and any page error, still fails a case.
+const EXPECTED_STATUS = /Failed to load resource: the server responded with a status of (401|429|503)\b/;
 function watchErrors(page, errors) {
   page.on('pageerror', (e) => errors.push(String(e)));
-  page.on('console', (m) => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
+  page.on('console', (m) => {
+    if (m.type() === 'error' && !EXPECTED_STATUS.test(m.text())) errors.push('console: ' + m.text());
+  });
 }
 
 async function openPage(browser, url) {
@@ -141,6 +215,120 @@ async function openPage(browser, url) {
   watchErrors(page, errors);
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   return { page, errors };
+}
+
+// A page in its own browser context (its own cookies), for the portal cases.
+async function openIsolated(browser, url, cookie) {
+  const context = await browser.newContext({ viewport: { width: 1000, height: 800 } });
+  if (cookie) await context.addCookies([{ name: 'modron_owner', value: COOKIE, url: cookie }]);
+  const page = await context.newPage();
+  const errors = [];
+  watchErrors(page, errors);
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  return { context, page, errors };
+}
+
+// The page's storage and address must never hold the token or the cookie.
+async function assertNoSecrets(page) {
+  const seen = await page.evaluate(() => [location.href, JSON.stringify(localStorage), JSON.stringify(sessionStorage)].join('\n'));
+  for (const secret of [TOKEN, COOKIE]) {
+    if (seen.includes(secret)) throw new Error('secret found in the page address or storage');
+  }
+}
+
+const PORTAL_ROWS = [
+  { id: 'aaaa', title: 'fix router', host_label: 'laptop', host_kind: 'local', viewer_key: 'vk1', state: 'idle',
+    online: true, updated_at: '2026-11-15T10:20:30Z', open_url: '/app/?opened=fix' },
+  { id: 'bbbb', title: 'old docs', host_label: 'cloud', host_kind: 'cloud', viewer_key: 'vk2', state: 'offline',
+    online: false, updated_at: '2026-11-14T08:00:00Z', open_url: '/app/?opened=docs' },
+];
+
+// Sign-in, wrong token then right token; the input is cleared after each try.
+async function testPortalSignIn(browser, site) {
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/');
+  try {
+    await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.keyboard.type('wrong-token');
+    await page.waitForFunction(() => document.activeElement.value === 'wrong-token', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('wrong token'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && document.activeElement.value === '', null, { timeout: TIMEOUT });
+    await page.keyboard.type(TOKEN);
+    await page.waitForFunction((t) => document.activeElement.value === t, TOKEN, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'fix router', { timeout: TIMEOUT });
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// An online row opens its URL; an offline row does not.
+async function testPortalRows(browser, site) {
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'fix router', { timeout: TIMEOUT });
+    await page.getByText('old docs', { exact: false }).first().click();
+    await page.waitForTimeout(800);
+    if (page.url().includes('opened=docs')) throw new Error('an offline row opened its URL');
+    await page.getByText('fix router', { exact: false }).first().click();
+    await page.waitForURL(/opened=fix/, { timeout: TIMEOUT });
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// Sign out goes back to the sign-in screen and asks the server to log out.
+async function testPortalSignOut(browser, site) {
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'sign out', { timeout: TIMEOUT });
+    await tapLabel(page, 'sign out');
+    await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('owner token') || document.querySelector('input[type="password"]'), null, { timeout: TIMEOUT });
+    if (site.state.loggedOut !== 1) throw new Error('logout requests: ' + site.state.loggedOut);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// Settings share: create a viewer invite for the attached session, show its
+// URL, list it, then revoke it.
+async function testInviteFromSettings(browser, site) {
+  const ws = await startWsServer();
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/?url=' + encodeURIComponent(ws.url) + '&session=' + SESSION, site.base);
+  try {
+    await page.waitForFunction((s) => document.body.innerText.includes(s), STREAM, { timeout: TIMEOUT });
+    await tapLabel(page, 'settings');
+    await page.waitForFunction(() => document.body.innerText.includes('share'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'viewer');
+    await page.waitForFunction(() => document.body.innerText.includes('/i/inv1.sig'), null, { timeout: TIMEOUT });
+    const post = site.state.invitePosts[0];
+    if (!post || post.session_id !== SESSION || post.role !== 'viewer' || post.ttl_hours !== 24) {
+      throw new Error('invite request was ' + JSON.stringify(post));
+    }
+    await page.waitForFunction(() => document.body.innerText.includes('viewer \u00b7 expires'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'copy');
+    await tapLabel(page, 'revoke');
+    await page.waitForFunction(() => document.body.innerText.includes('no invites'), null, { timeout: TIMEOUT });
+    if (site.state.deletes[0] !== 'inv1') throw new Error('revoke deleted ' + site.state.deletes.join(','));
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+function newSiteState(portal) {
+  return { portal, rateLimited: false, sessions: PORTAL_ROWS, invites: [], invitePosts: [], deletes: [], loggedOut: 0 };
 }
 
 async function testDemo(browser, base) {
@@ -444,12 +632,14 @@ async function testAgentSteerAndKill(browser, base) {
 }
 
 (async () => {
-  const staticPort = await freePort();
-  const staticServer = await startStatic(staticPort);
-  const base = `http://127.0.0.1:${staticPort}`;
+  const sitePort = await freePort();
+  // The portal is off here (/api/me 503), so no-url pages are the demo.
+  const site = await startSite(sitePort, newSiteState('off'));
+  const base = site.base;
   const ws = await startWsServer();
   const browser = await chromium.launch({ args: ['--no-sandbox'] });
   let failed = 0;
+  const portalSite = async (portal) => startSite(await freePort(), newSiteState(portal));
   try {
     await testDemo(browser, base);
     console.log('PASS (a) demo mode: transcript row and status line are DOM text');
@@ -473,6 +663,18 @@ async function testAgentSteerAndKill(browser, base) {
     ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
   ];
+  // The portal cases: each on its own site (its own state) and context.
+  const portal = [
+    ['(p1) no url, portal on: sign-in, wrong token then right token shows the list', async () => {
+      const s = await portalSite('on'); try { await testPortalSignIn(browser, s); } finally { s.close(); } }],
+    ['(p2) portal list: an online row opens its URL, an offline row does not', async () => {
+      const s = await portalSite('on'); try { await testPortalRows(browser, s); } finally { s.close(); } }],
+    ['(p3) portal sign out returns to the sign-in screen', async () => {
+      const s = await portalSite('on'); try { await testPortalSignOut(browser, s); } finally { s.close(); } }],
+    ['(p4) settings share: a viewer invite is created, shown and revoked', async () => {
+      const s = await portalSite('on'); try { await testInviteFromSettings(browser, s); } finally { s.close(); } }],
+  ];
+  more.push(...portal);
   for (const [name, run] of more) {
     try {
       await run();
@@ -497,7 +699,7 @@ async function testAgentSteerAndKill(browser, base) {
   } finally {
     await browser.close();
     ws.close();
-    staticServer.kill();
+    site.close();
   }
   process.exit(failed ? 1 : 0);
 })();

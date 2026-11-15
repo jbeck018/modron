@@ -2204,11 +2204,13 @@ dependencies = [
  "nsh-core",
  "nsh-platform-tui",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
  "uuid",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
