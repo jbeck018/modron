@@ -460,6 +460,9 @@ pub(crate) fn child_config(
         max_cost_usd: parent.max_cost_usd,
         price_lookup: parent.price_lookup.clone(),
         on_tool_event,
+        // Sub-agents inherit the parent's reasoning effort (H7a); no
+        // delegate or persona argument overrides it yet.
+        effort: parent.effort,
         ..EngineConfig::default()
     }
 }
@@ -561,6 +564,17 @@ mod tests {
             choice.model, "claude-haiku-4-5",
             "pinned to the Search-tier model"
         );
+    }
+
+    /// H7a: a sub-agent inherits the parent's reasoning effort.
+    #[test]
+    fn child_inherits_the_parent_effort() {
+        let mut parent = strict_parent_config();
+        parent.effort = Some(crate::Effort::Low);
+        let child = child_config(&parent, None, None, 1_000, None);
+        assert_eq!(child.effort, Some(crate::Effort::Low));
+        parent.effort = None;
+        assert_eq!(child_config(&parent, None, None, 1_000, None).effort, None);
     }
 
     fn strict_parent_config() -> EngineConfig {

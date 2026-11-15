@@ -409,6 +409,51 @@ pub enum Phase {
     Plan,
 }
 
+/// Reasoning effort (H7a): how hard the model should think on a turn.
+/// `None` on a request means the provider default (no field is sent).
+/// Providers map the five levels onto their own wire vocabulary (see each
+/// provider module); `label()` is the canonical user-facing word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    /// The canonical word: `low`, `medium`, `high`, `xhigh` or `max`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+}
+
+impl std::str::FromStr for Effort {
+    /// The message names the five accepted values.
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Effort::Low),
+            "medium" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            "xhigh" => Ok(Effort::Xhigh),
+            "max" => Ok(Effort::Max),
+            _ => Err(format!(
+                "unknown effort `{raw}` (use low, medium, high, xhigh or max)"
+            )),
+        }
+    }
+}
+
 /// Tool-activity notification (Phase-1d T0, additive): fired around every
 /// tool execution so UIs can render `● Bash …` lines live.
 #[derive(Clone, Debug, PartialEq, Eq)]

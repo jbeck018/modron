@@ -399,6 +399,7 @@ mod tests {
                     messages: vec![Message::user("hi")],
                     tools: vec![],
                     max_tokens: 16,
+                    effort: None,
                 }),
                 tx,
             )
@@ -445,6 +446,7 @@ mod tests {
                     messages: vec![Message::user("hi")],
                     tools: vec![],
                     max_tokens: 16,
+                    effort: None,
                 }),
                 tx,
             )
@@ -507,6 +509,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 16,
+            effort: None,
         })
     }
 
@@ -865,6 +868,7 @@ mod tests {
                 messages: vec![],
                 tools: vec![],
                 max_tokens: 16,
+                effort: None,
             }))
             .await
             .unwrap();

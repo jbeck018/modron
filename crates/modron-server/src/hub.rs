@@ -445,7 +445,7 @@ impl SessionHandle {
         // sandbox, phase and allow/deny lists (apply_config writes it, the
         // session's engine clone carries it). Copy them out and drop the
         // engine lock before taking the tracker lock.
-        let (approval_mode, sandbox, allow, deny, rules, phase) = {
+        let (approval_mode, sandbox, allow, deny, rules, phase, effort) = {
             let engine = self.engine_cell();
             let config = &engine.config;
             let mode = match config.approvals.mode {
@@ -466,6 +466,7 @@ impl SessionHandle {
                     .map(rule_wire)
                     .collect::<Vec<_>>(),
                 Some(config.phase),
+                config.effort,
             )
         };
         let tracker = lock(&self.tracker);
@@ -476,6 +477,7 @@ impl SessionHandle {
             deny,
             rules,
             phase,
+            effort,
             plan_pending: self.plan_pending.load(Ordering::Relaxed),
             running: self.busy.load(Ordering::Relaxed),
             streaming_text: lock(&self.text).clone(),
@@ -1158,6 +1160,12 @@ impl SessionHandle {
         }
         if let Some(phase) = patch.phase {
             config.phase = phase;
+        }
+        // `clear_effort` wins over `effort` (see ConfigPatch docs).
+        if patch.clear_effort {
+            config.effort = None;
+        } else if let Some(effort) = patch.effort {
+            config.effort = Some(effort);
         }
         if let Some(allow) = &patch.allow {
             config.approvals.allow = allow.clone();
@@ -2229,6 +2237,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
+    }
+
+    /// H7a: an effort patch reaches the engine config (future turns) and the
+    /// live state; `clear_effort` returns it to the provider default; a patch
+    /// without effort fields leaves it alone.
+    #[test]
+    fn effort_patch_reaches_the_engine_config_and_live_state() {
+        use modron_core::Effort;
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        assert_eq!(handle.live_state().effort, None);
+        handle
+            .apply_config(&ConfigPatch {
+                effort: Some(Effort::High),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.effort, Some(Effort::High));
+        assert_eq!(handle.live_state().effort, Some(Effort::High));
+        handle
+            .apply_config(&ConfigPatch {
+                model: Some("other-model".into()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.effort, Some(Effort::High));
+        handle
+            .apply_config(&ConfigPatch {
+                clear_effort: true,
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.effort, None);
+        assert_eq!(handle.live_state().effort, None);
     }
 
     /// A successful plan-phase run with a recorded plan proposes it, sets

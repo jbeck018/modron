@@ -346,6 +346,10 @@ struct Cli {
     /// Working directory the tools run in.
     #[arg(long, default_value = ".", global = true)]
     working_dir: PathBuf,
+    /// Reasoning effort for model turns: low, medium, high, xhigh or max.
+    /// Overrides config `effort`; unset = the provider default.
+    #[arg(long, global = true)]
+    effort: Option<String>,
     /// Session store directory (default: ~/.modron/sessions). The workspace
     /// memory root is derived as <this dir's parent>/memory.
     #[arg(long, global = true)]
@@ -1230,6 +1234,10 @@ fn build_agent_with(
         max_cost_usd: cli.max_cost,
         steer: None,
         phase: modron_core::Phase::Build,
+        // Flag > config.toml `effort` > provider default (H7a). Validated
+        // here, so a bad value stops startup on every run path.
+        effort: config::resolve_effort(cli.effort.as_deref(), cfg.effort.as_deref())
+            .map_err(anyhow::Error::msg)?,
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),

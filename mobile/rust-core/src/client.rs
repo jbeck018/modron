@@ -30,7 +30,7 @@ use modron_protocol::{
     ConfigPatch, ContextGaugeWire, Decision, Frame, Payload, PlanDecision, WireDelta, DEFAULT_PORT,
     PROTOCOL_VERSION,
 };
-use modron_types::{Phase, ToolActivity};
+use modron_types::{Effort, Phase, ToolActivity};
 use modron_view::TranscriptEntry;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -677,6 +677,16 @@ impl RemoteClient {
             self.next_request_id(),
             Payload::Compact { session_id },
         ))
+    }
+
+    /// Set the reasoning effort for future turns. `None` clears it back to
+    /// the provider default.
+    pub fn set_effort(&self, effort: Option<Effort>) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            effort,
+            clear_effort: effort.is_none(),
+            ..ConfigPatch::default()
+        })
     }
 
     /// Switch the run phase for future runs (`plan` read-only, `build`).
@@ -1337,6 +1347,12 @@ fn apply_config(vm: &mut SessionViewModel, patch: &ConfigPatch) {
     if let Some(phase) = patch.phase {
         vm.phase = phase;
     }
+    // `clear_effort` wins over `effort`, as on the server (H7a).
+    if patch.clear_effort {
+        vm.effort = None;
+    } else if let Some(effort) = patch.effort {
+        vm.effort = Some(effort);
+    }
     if let Some(rules) = &patch.rules {
         vm.rules = rules.clone();
     }
@@ -1550,6 +1566,51 @@ mod tests {
             ),
         ]);
         assert!(cleared.plan_pending.is_none());
+    }
+
+    #[test]
+    fn config_changed_effort_folds_into_the_status_line() {
+        let set = folded_all(vec![Frame::event(
+            None,
+            0,
+            Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    effort: Some(Effort::High),
+                    ..ConfigPatch::default()
+                },
+            },
+        )]);
+        assert_eq!(set.effort_label, "high");
+        assert!(
+            set.status_line.contains(" · effort high"),
+            "{}",
+            set.status_line
+        );
+
+        let cleared = folded_all(vec![
+            Frame::event(
+                None,
+                0,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        effort: Some(Effort::High),
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+            Frame::event(
+                None,
+                1,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        clear_effort: true,
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(cleared.effort_label, "");
+        assert!(!cleared.status_line.contains("effort"));
     }
 
     #[test]

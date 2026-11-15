@@ -39,6 +39,12 @@ pub struct Config {
     /// `None` (default) = no review pass.
     #[serde(default)]
     pub review_model: Option<String>,
+    /// Reasoning effort for model turns: `low`, `medium`, `high`, `xhigh` or
+    /// `max`. Kept raw here so a bad value is a startup error (see
+    /// [`resolve_effort`]), not a silent fallback to defaults. Unset = the
+    /// provider default. `--effort` overrides it.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Fix rounds the reviewer may request per run (default 1).
     #[serde(default)]
     pub review_max_rounds: Option<u32>,
@@ -82,6 +88,24 @@ pub struct Config {
     /// startup error rather than a silently ignored file.
     #[serde(default)]
     pub permissions: Option<PermissionsConfig>,
+}
+
+/// Resolve the reasoning effort: the `--effort` flag wins over the config
+/// file's top-level `effort`; neither set = `None` (provider default). An
+/// invalid or empty value is an error that names the five accepted levels.
+pub fn resolve_effort(
+    flag: Option<&str>,
+    file: Option<&str>,
+) -> Result<Option<modron_core::Effort>, String> {
+    use std::str::FromStr;
+    let (raw, source) = match (flag, file) {
+        (Some(raw), _) => (raw, "--effort"),
+        (None, Some(raw)) => (raw, "effort in config.toml"),
+        (None, None) => return Ok(None),
+    };
+    modron_core::Effort::from_str(raw)
+        .map(Some)
+        .map_err(|err| format!("invalid {source}: {err}"))
 }
 
 /// `[permissions]` section: rule text lists, one list per effect. Stored as
@@ -710,5 +734,45 @@ mod tests {
         assert!(load_from(&empty, no_env)
             .escalate_on_check_failure
             .is_none());
+    }
+
+    /// H7a: top-level `effort` loads as the raw word; the flag beats it, an
+    /// invalid value is an error naming the five levels, and nothing set is
+    /// the provider default.
+    #[test]
+    fn effort_loads_from_the_file_and_the_flag_overrides_it() {
+        use modron_core::Effort;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "effort = 'high'
+",
+        )
+        .unwrap();
+        let config = load_from(&path, no_env);
+        assert_eq!(config.effort.as_deref(), Some("high"));
+
+        assert_eq!(
+            resolve_effort(None, config.effort.as_deref()),
+            Ok(Some(Effort::High))
+        );
+        assert_eq!(
+            resolve_effort(Some("max"), config.effort.as_deref()),
+            Ok(Some(Effort::Max)),
+            "--effort wins over config"
+        );
+        assert_eq!(resolve_effort(None, None), Ok(None));
+    }
+
+    #[test]
+    fn invalid_effort_is_an_error_that_names_the_five_levels() {
+        let err = resolve_effort(None, Some("extreme")).unwrap_err();
+        assert!(err.contains("effort in config.toml"), "{err}");
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(err.contains(level), "{err} should list {level}");
+        }
+        let flag_err = resolve_effort(Some(""), None).unwrap_err();
+        assert!(flag_err.contains("--effort"), "{flag_err}");
     }
 }

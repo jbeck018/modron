@@ -330,6 +330,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 100,
+            effort: None,
         };
 
         assert_eq!(
@@ -369,6 +370,7 @@ mod tests {
                 messages: vec![],
                 tools: vec![],
                 max_tokens: 1,
+                effort: None,
             }))
             .await
             .unwrap();

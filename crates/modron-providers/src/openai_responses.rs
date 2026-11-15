@@ -379,6 +379,21 @@ pub fn build_body(req: &TurnRequest) -> Value {
     if req.max_tokens > 0 {
         body["max_output_tokens"] = json!(req.max_tokens);
     }
+    // Reasoning effort (H7a): `reasoning.effort`, merged into any existing
+    // `reasoning` object; absent when unset. The API has three levels, so
+    // `xhigh` and `max` map to `high`.
+    if let Some(effort) = req.effort {
+        if !body["reasoning"].is_object() {
+            body["reasoning"] = json!({});
+        }
+        body["reasoning"]["effort"] = json!(match effort {
+            modron_core::Effort::Low => "low",
+            modron_core::Effort::Medium => "medium",
+            modron_core::Effort::High | modron_core::Effort::Xhigh | modron_core::Effort::Max => {
+                "high"
+            }
+        });
+    }
     body
 }
 
@@ -547,6 +562,31 @@ mod tests {
                 parameters: json!({"type": "object"}),
             }],
             max_tokens: 1024,
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn effort_is_absent_from_the_body_when_unset() {
+        let body = build_body(&request());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn effort_maps_to_reasoning_effort_with_xhigh_and_max_as_high() {
+        use modron_core::Effort;
+        for (effort, word) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "high"),
+            (Effort::Max, "high"),
+        ] {
+            let mut req = request();
+            req.effort = Some(effort);
+            let body = build_body(&req);
+            assert_eq!(body["reasoning"], json!({ "effort": word }), "{effort:?}");
+            assert_eq!(body["store"], false, "rest of the body unchanged");
         }
     }
 

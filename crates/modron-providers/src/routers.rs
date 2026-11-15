@@ -40,6 +40,8 @@ impl AsyncRouter for LlmJudgeRouter {
             messages: vec![modron_core::Message::user(task)],
             tools: Vec::new(),
             max_tokens: 8,
+            // Router judge stays on the provider default (H7a).
+            effort: None,
         };
         let response = match self.provider.turn(std::sync::Arc::new(request)).await {
             Ok(response) => response,

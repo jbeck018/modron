@@ -39,7 +39,7 @@ use modron_protocol::{
     ApprovalModeWire, ContextGaugeWire, Decision, LiveState, PendingApproval, PlanDecision,
     RuleWire, SessionMetaWire, WireRunSummary,
 };
-use modron_types::{Phase, PlanItem, Role, SessionEvent, ToolActivity, ToolCall, Usage};
+use modron_types::{Effort, Phase, PlanItem, Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_view::{
     compact_tokens, replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry,
 };
@@ -69,6 +69,12 @@ pub const PLAN_DECISION_LABELS: [(PlanDecision, &str); 2] = [
     (PlanDecision::Approve, "approve"),
     (PlanDecision::Revise, "revise"),
 ];
+
+/// The reasoning-effort label for the status line (`effort high`): empty
+/// when unset, so the shell shows nothing for the provider default.
+pub fn effort_label(effort: Option<Effort>) -> String {
+    effort.map(|e| e.label().to_string()).unwrap_or_default()
+}
 
 /// The run-phase label for the status line and settings (`plan` / `build`).
 pub fn phase_label(phase: Phase) -> &'static str {
@@ -339,6 +345,9 @@ pub struct SessionViewModel {
     /// The run phase for future runs (`ConfigPatch.phase`, snapshot).
     /// Defaults to `build`.
     pub phase: Phase,
+    /// The reasoning effort for future turns (`ConfigPatch.effort` /
+    /// `clear_effort`, snapshot). `None` = provider default, no label.
+    pub effort: Option<Effort>,
     /// The context occupancy (`ContextChanged`, snapshot); `None` hides
     /// the meter.
     pub context: Option<ContextGaugeWire>,
@@ -447,6 +456,8 @@ pub struct ViewModelSnapshot {
     pub plan_pending: Option<PendingPlanView>,
     /// `plan` / `build`.
     pub phase_label: String,
+    /// `high` etc., empty when the effort is unset (see `effort_label`).
+    pub effort_label: String,
     /// `ctx 41% (74k/180k)`, empty when the context is unknown.
     pub context_label: String,
     /// Permission rules as `effect spec` lines (the settings view).
@@ -485,6 +496,10 @@ impl ViewModelSnapshot {
         } else {
             vm.model.clone()
         };
+        // The effort sits next to the model, and only when set (H7a).
+        if let Some(effort) = vm.effort {
+            status_line.push_str(&format!(" · effort {}", effort.label()));
+        }
         status_line.push_str(&format!(" · {} tok", vm.cumulative_usage.total()));
         if let Some(pct) = session_cache_pct {
             status_line.push_str(&format!(" · cache {pct:.0}%"));
@@ -523,6 +538,7 @@ impl ViewModelSnapshot {
             pending_steers: vm.pending_steers.clone(),
             plan_pending: vm.plan_pending.clone(),
             phase_label: phase_label(vm.phase).to_string(),
+            effort_label: effort_label(vm.effort),
             context_label: context_label(vm.context),
             rules: vm
                 .rules
@@ -778,6 +794,7 @@ pub(crate) fn fold_snapshot(
     vm.queued = live.queued.clone();
     vm.pending_steers.clear();
     vm.phase = live.phase.unwrap_or_default();
+    vm.effort = live.effort;
     // The Snapshot carries only the pending flag, so the plan's lines stay
     // empty until a live `PlanProposed` arrives.
     vm.plan_pending = live
@@ -1398,6 +1415,23 @@ mod tests {
             PLAN_DECISION_LABELS.map(|(_, label)| label),
             ["approve", "revise"]
         );
+    }
+
+    #[test]
+    fn effort_shows_next_to_the_model_only_when_set() {
+        let mut vm = SessionViewModel {
+            model: "m".into(),
+            ..SessionViewModel::default()
+        };
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(snap.status_line, "m · 0 tok · ask");
+        assert_eq!(snap.effort_label, "");
+
+        vm.effort = Some(Effort::Xhigh);
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(snap.status_line, "m · effort xhigh · 0 tok · ask");
+        assert_eq!(snap.effort_label, "xhigh");
+        assert_eq!(effort_label(None), "");
     }
 
     #[test]

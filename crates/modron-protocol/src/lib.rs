@@ -18,7 +18,7 @@
 pub mod client;
 
 use modron_types::{
-    Attachment, Phase, PlanItem, RunSummary, SandboxPolicy, SessionEvent, StreamDelta,
+    Attachment, Effort, Phase, PlanItem, RunSummary, SandboxPolicy, SessionEvent, StreamDelta,
     ToolActivity, ToolCall, Usage,
 };
 use modron_view::ToolEvent;
@@ -534,6 +534,16 @@ pub struct ConfigPatch {
     /// `ConfigChanged`; `LiveState.rules` reports the result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<RuleWire>>,
+    /// The reasoning effort for future turns (`low` .. `max`). Absent leaves
+    /// it alone. UI effect (ConfigChanged, every client): shows
+    /// `effort <label>` next to the model on the status surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    /// Clears the session's effort back to the provider default (no label).
+    /// The "unset" form, because `effort` alone cannot say "none". Wins over
+    /// `effort` when both are sent. Absent or false leaves it alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_effort: bool,
 }
 
 /// The approval-mode knob (`ask`/`yolo`/`deny`), mirrored because the core
@@ -706,6 +716,12 @@ pub struct LiveState {
     /// keeps the client's default (`build`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<Phase>,
+    /// The reasoning effort for future turns. UI effect: shows
+    /// `effort <label>` next to the model on the status surface through the
+    /// same mapping ConfigChanged uses. Absent means the provider default
+    /// and no label. Older peers omit it and still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
     /// A proposed plan awaits a decision (see `PlanProposed`). UI effect:
     /// shows the plan decision block on attach. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2049,5 +2065,48 @@ mod tests {
         let back: Payload = serde_json::from_value(top).unwrap();
         let reserialized = serde_json::to_value(&back).unwrap();
         assert!(reserialized.get("agent").is_none(), "absent when None");
+    }
+
+    /// H7a: the effort fields round-trip, an unset patch stays off the wire,
+    /// and an older peer's JSON (no effort keys) still parses.
+    #[test]
+    fn effort_fields_round_trip_and_stay_optional_on_the_wire() {
+        let patch = ConfigPatch {
+            effort: Some(Effort::Xhigh),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["effort"], "xhigh");
+        assert!(json.get("clear_effort").is_none(), "false is omitted");
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back, patch);
+
+        let clear = ConfigPatch {
+            clear_effort: true,
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&clear).unwrap();
+        assert_eq!(json["clear_effort"], true);
+        assert!(json.get("effort").is_none());
+
+        let old: ConfigPatch = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+        assert_eq!(old.effort, None);
+        assert!(!old.clear_effort);
+    }
+
+    #[test]
+    fn live_state_effort_is_omitted_when_unset_and_optional_on_read() {
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("effort").is_none());
+        let filled = LiveState {
+            effort: Some(Effort::Max),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["effort"], "max");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.effort, Some(Effort::Max));
+        let old: LiveState = serde_json::from_value(serde_json::json!({"running": false})).unwrap();
+        assert_eq!(old.effort, None);
     }
 }

@@ -62,8 +62,9 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 pub use modron_types::{
-    Attachment, Message, PlanItem, Role, RunSummary, SandboxPolicy, SessionEvent, SessionId,
-    SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec, Usage,
+    Attachment, Effort, Message, PlanItem, Role, RunSummary, SandboxPolicy, SessionEvent,
+    SessionId, SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec,
+    Usage,
 };
 
 /// Context handed to a tool execution.
@@ -258,6 +259,10 @@ pub struct TurnRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
+    /// Reasoning effort (H7a). `None` = the provider default; every
+    /// provider omits its effort field entirely in that case, so the request
+    /// bytes match a build without the setting.
+    pub effort: Option<Effort>,
 }
 
 #[derive(Clone, Debug)]
@@ -831,6 +836,10 @@ pub struct EngineConfig {
     /// gate; see [`Phase`]. Applies to the runs started after the config is
     /// set (the TUI/CLI sets it per run).
     pub phase: Phase,
+    /// Reasoning effort for the main, self-check and escalation turns (H7a,
+    /// default `None` = provider default). Not sent on compaction, reviewer
+    /// or router/judge requests. Sub-agents inherit it from the parent.
+    pub effort: Option<Effort>,
 }
 
 /// Per-tier ordered fallback candidates for [`EngineConfig::tier_fallbacks`].
@@ -894,6 +903,7 @@ impl Default for EngineConfig {
             background_subagents: Arc::new(std::sync::Mutex::new(Default::default())),
             steer: None,
             phase: Phase::Build,
+            effort: None,
         }
     }
 }
@@ -927,6 +937,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("on_tool_event", &self.on_tool_event.is_some())
             .field("async_router", &self.async_router.is_some())
             .field("personas", &self.personas.keys().collect::<Vec<_>>())
+            .field("effort", &self.effort)
             .field("tier_fallbacks", &self.tier_fallbacks.is_some())
             .field(
                 "background_subagents",

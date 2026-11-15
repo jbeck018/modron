@@ -759,6 +759,16 @@ fn build_body_inner(req: &TurnRequest) -> Value {
         }
         body["tools"] = Value::Array(tools);
     }
+    // Reasoning effort (H7a): the GA `output_config.effort` field, merged
+    // into `output_config` when another feature already set one. No beta
+    // header and no `thinking` change; absent when the provider default
+    // applies.
+    if let Some(effort) = req.effort {
+        if !body["output_config"].is_object() {
+            body["output_config"] = json!({});
+        }
+        body["output_config"]["effort"] = json!(effort.label());
+    }
     body
 }
 
@@ -999,6 +1009,7 @@ mod tests {
                 }),
             }],
             max_tokens: 8192,
+            effort: None,
         }
     }
 
@@ -1016,6 +1027,7 @@ mod tests {
             )],
             tools: Vec::new(),
             max_tokens: 128,
+            effort: None,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -1041,6 +1053,7 @@ mod tests {
             )],
             tools: Vec::new(),
             max_tokens: 128,
+            effort: None,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -1049,6 +1062,38 @@ mod tests {
             .unwrap()
             .contains("[Attached document: notes.md]"));
         assert!(content[0]["text"].as_str().unwrap().contains("hello notes"));
+    }
+
+    #[test]
+    fn effort_is_absent_from_the_body_when_unset() {
+        let body = build_body(&sample_request());
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["max_tokens", "messages", "model", "system", "tools"]);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn effort_maps_to_output_config_for_every_level() {
+        use modron_core::Effort;
+        for (effort, label) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            let mut req = sample_request();
+            req.effort = Some(effort);
+            let body = build_body(&req);
+            assert_eq!(body["output_config"], json!({ "effort": label }));
+            assert!(body.get("thinking").is_none(), "no thinking field added");
+            assert_eq!(body["max_tokens"], 8192, "rest of the body unchanged");
+        }
     }
 
     #[test]
@@ -1160,6 +1205,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 16,
+            effort: None,
         };
         let body = build_body(&req);
         assert!(body.get("tools").is_none());
@@ -1190,6 +1236,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 16,
+            effort: None,
         };
         let body = build_body(&req);
         assert!(body.get("system").is_none());
