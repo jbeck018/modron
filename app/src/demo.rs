@@ -2,8 +2,8 @@
 //! core's own types (`entry_lines`, `DECISION_LABELS`), played over time.
 
 use modron_mobile_core::{
-    entry_lines, ConnectionState, DecisionOption, PendingApprovalView, RenderedRow,
-    ViewModelSnapshot, DECISION_LABELS,
+    connection_label, entry_lines, ConnectionState, DecisionOption, PendingApprovalView,
+    RenderedRow, ViewModelSnapshot, DECISION_LABELS,
 };
 use modron_view::TranscriptEntry;
 
@@ -34,7 +34,7 @@ fn snap(
     };
     ViewModelSnapshot {
         connection: ConnectionState::Connected,
-        connection_label: "connected".into(),
+        connection_label: connection_label(&ConnectionState::Connected).into(),
         running,
         running_label: if running { "running" } else { "idle" }.into(),
         status_line: format!("claude-opus-5 \u{b7} {status}"),

@@ -40,7 +40,9 @@ use modron_protocol::{
     RuleWire, SessionMetaWire, WireRunSummary,
 };
 use modron_types::{Phase, PlanItem, Role, SessionEvent, ToolActivity, ToolCall, Usage};
-use modron_view::{replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry};
+use modron_view::{
+    compact_tokens, replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use uuid::Uuid;
@@ -73,16 +75,6 @@ pub fn phase_label(phase: Phase) -> &'static str {
     match phase {
         Phase::Plan => "plan",
         Phase::Build => "build",
-    }
-}
-
-/// Compact token count for the context meter: exact below a thousand,
-/// otherwise nearest thousand with a `k` suffix (`74k`, `180k`).
-fn compact_tokens(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else {
-        format!("{}k", n.saturating_add(500) / 1_000)
     }
 }
 

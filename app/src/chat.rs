@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use modron_mobile_core::{RenderedRow, ViewModelSnapshot};
-use modron_view::TranscriptEntry;
+use modron_view::{TranscriptEntry, COMPOSER_PLACEHOLDER, QUEUE_LABEL, STOP_LABEL};
 use nsh_core::element::{input, AdaptiveColor};
 use nsh_core::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,7 +40,8 @@ pub enum UiAction {
     /// Alt+Enter (or the web Queue control): hold the message for the
     /// session's next run.
     Queue(String),
-    /// Remove one queued message by position (0 = next to run).
+    /// Remove one queued message by position (0 = next to run). Backspace on
+    /// an empty composer, or a tap on a web chip.
     Dequeue(usize),
     /// Index into the pending approval's `options` (protocol order).
     Decide(usize),
@@ -102,9 +103,10 @@ fn draft_text() -> String {
 pub enum Key {
     Enter,
     Escape,
+    Backspace,
     /// One printable character, as the key produced it.
     Char(char),
-    /// Any other key (arrows, Backspace, dead keys): always the composer's.
+    /// Any other key (arrows, dead keys): always the composer's.
     Other,
 }
 
@@ -115,6 +117,7 @@ pub fn key_of(name: &str) -> Key {
     match name {
         "Enter" => Key::Enter,
         "Escape" => Key::Escape,
+        "Backspace" => Key::Backspace,
         _ => {
             let mut chars = name.chars();
             match (chars.next(), chars.next()) {
@@ -132,6 +135,8 @@ pub struct KeyFacts {
     pub approval_options: Option<usize>,
     /// Whether a proposed plan waits for a decision.
     pub plan_pending: bool,
+    /// Messages held for the next run (the queue chips).
+    pub queued: usize,
 }
 
 /// Where a key goes.
@@ -146,7 +151,8 @@ pub enum Routed {
 /// The one key-to-action rule, shared by every host. Pure: the composer's
 /// text is passed in, so the rule is testable without a view.
 ///
-/// Order: Enter always reaches the composer (Alt marks a queue); a chord
+/// Order: Enter always reaches the composer (Alt marks a queue); Backspace
+/// on an empty composer with messages queued removes the last one; a chord
 /// passes; Esc interrupts; with an approval pending, y / a / n decide its
 /// options and every other key is the composer's; with a plan pending, y
 /// approves and r revises with the trimmed composer text as the note.
@@ -154,7 +160,10 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     let composer = Routed::Composer { queue: false };
     match key {
         Key::Enter => return Routed::Composer { queue: alt },
-        Key::Other => return composer,
+        Key::Backspace if !chord && draft.is_empty() && facts.queued > 0 => {
+            return Routed::Action(UiAction::Dequeue(facts.queued - 1));
+        }
+        Key::Other | Key::Backspace => return composer,
         _ if chord => return composer,
         Key::Escape => return Routed::Action(UiAction::Interrupt),
         Key::Char(_) => {}
@@ -327,6 +336,8 @@ pub struct Host {
     pending: Option<usize>,
     /// Whether a proposed plan waits for a decision.
     plan_pending: bool,
+    /// Messages held for the next run (the queue chips).
+    queued: usize,
 }
 
 /// The view's end of the link, handed to `App` through `CLIENT`.
@@ -350,6 +361,7 @@ pub fn link() -> (Host, Client) {
             loopback: act_tx.clone(),
             pending: None,
             plan_pending: false,
+            queued: 0,
         },
         Client { snapshots: snap_rx, actions: act_tx },
     )
@@ -361,6 +373,7 @@ impl Host {
     pub fn push(&mut self, snapshot: &ViewModelSnapshot) {
         self.pending = snapshot.pending_approval.as_ref().map(|p| p.options.len());
         self.plan_pending = snapshot.plan_pending.is_some();
+        self.queued = snapshot.queued.len();
         let _ = self.snapshots.send(snapshot.clone());
     }
 
@@ -392,7 +405,11 @@ impl Host {
     /// became an action here (the host then consumes it); false when the
     /// composer gets it.
     pub fn route(&self, key: Key, alt: bool, chord: bool) -> bool {
-        let facts = KeyFacts { approval_options: self.pending, plan_pending: self.plan_pending };
+        let facts = KeyFacts {
+            approval_options: self.pending,
+            plan_pending: self.plan_pending,
+            queued: self.queued,
+        };
         match route_key(key, alt, chord, facts, &draft_text()) {
             Routed::Composer { queue } => {
                 if key == Key::Enter {
@@ -562,6 +579,34 @@ fn queue_rows(m: &Model) -> Vec<String> {
     m.queued.iter().enumerate().map(|(i, q)| format!("[{}] {q}", i + 1)).collect()
 }
 
+/// The queue chips above the composer. On the web each chip is a button
+/// that removes its message (`Dequeue` at its position); the terminal shows
+/// the chips as text and removes the last with Backspace.
+fn queue_chips(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    for i in 0..QUEUE_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || model.with(|m| m.queued.len() > i),
+            move || {
+                let label =
+                    move || model.with(|m| queue_rows(m).get(i).cloned().unwrap_or_default());
+                let chip = view()
+                    .child(text(label).text_color(move || token_ink(style_token(Style::Plain))));
+                if WEB_CONTROLS {
+                    let actions = actions.clone();
+                    chip.role(AccessibilityRole::Button).on_press(move || {
+                        let _ = actions.send(UiAction::Dequeue(i));
+                    })
+                } else {
+                    chip
+                }
+            },
+        ));
+    }
+    column
+}
+
 fn steer_rows(m: &Model) -> Vec<String> {
     m.pending_steers.iter().map(|s| format!("> {s}")).collect()
 }
@@ -720,7 +765,7 @@ fn composer_controls(
                 draft.set(String::new());
                 let _ = queue_actions.send(UiAction::Queue(task));
             })
-            .child(text("queue").text_color(move || token_ink(style_token(Style::Plain))))
+            .child(text(QUEUE_LABEL).text_color(move || token_ink(style_token(Style::Plain))))
     };
     let stop = move || {
         let stop_actions = actions.clone();
@@ -730,7 +775,7 @@ fn composer_controls(
             .on_press(move || {
                 let _ = stop_actions.send(UiAction::Interrupt);
             })
-            .child(text("stop").text_color(move || token_ink("warning")))
+            .child(text(STOP_LABEL).text_color(move || token_ink("warning")))
     };
     view()
         .flex_row()
@@ -751,7 +796,7 @@ pub fn screen(
         .auto_focus(true)
         // Enter sends and keeps focus, so the next line can be typed at once.
         .submit_behavior(SubmitBehavior::Submit)
-        .placeholder("Message")
+        .placeholder(COMPOSER_PLACEHOLDER)
         .value(move || draft.get())
         .on_change(move |s: &str| {
             set_draft(s);
@@ -810,7 +855,7 @@ pub fn screen(
             let actions = actions.clone();
             move || plan_block(model, actions.clone())
         }))
-        .child(row_slots(model, QUEUE_SLOTS, queue_rows, plain_token, false))
+        .child(queue_chips(model, actions.clone()))
         .child(composer)
         .child(composer_controls(model, draft, actions))
 }
@@ -824,14 +869,18 @@ fn action_is_empty(action: &UiAction) -> bool {
 mod tests {
     use super::*;
 
-    const NONE: KeyFacts = KeyFacts { approval_options: None, plan_pending: false };
+    const NONE: KeyFacts = KeyFacts { approval_options: None, plan_pending: false, queued: 0 };
 
     fn approval(options: usize) -> KeyFacts {
-        KeyFacts { approval_options: Some(options), plan_pending: false }
+        KeyFacts { approval_options: Some(options), plan_pending: false, queued: 0 }
     }
 
     fn plan() -> KeyFacts {
-        KeyFacts { approval_options: None, plan_pending: true }
+        KeyFacts { approval_options: None, plan_pending: true, queued: 0 }
+    }
+
+    fn queued(count: usize) -> KeyFacts {
+        KeyFacts { queued: count, ..NONE }
     }
 
     fn composer() -> Routed {
@@ -844,7 +893,8 @@ mod tests {
         assert_eq!(key_of("Escape"), Key::Escape);
         assert_eq!(key_of("y"), Key::Char('y'));
         assert_eq!(key_of(" "), Key::Char(' '));
-        assert_eq!(key_of("Backspace"), Key::Other);
+        assert_eq!(key_of("Backspace"), Key::Backspace);
+        assert_eq!(key_of("ArrowUp"), Key::Other);
         assert_eq!(key_of("ArrowLeft"), Key::Other);
         assert_eq!(key_of(""), Key::Other);
     }
@@ -903,7 +953,7 @@ mod tests {
 
     #[test]
     fn an_approval_takes_precedence_over_a_plan() {
-        let both = KeyFacts { approval_options: Some(3), plan_pending: true };
+        let both = KeyFacts { approval_options: Some(3), plan_pending: true, queued: 0 };
         assert_eq!(
             route_key(Key::Char('y'), false, false, both, ""),
             Routed::Action(UiAction::Decide(0))
@@ -938,6 +988,42 @@ mod tests {
     fn plan_pending_leaves_other_letters_to_the_composer() {
         assert_eq!(route_key(Key::Char('a'), false, false, plan(), ""), composer());
         assert_eq!(route_key(Key::Char('n'), false, false, plan(), ""), composer());
+    }
+
+    #[test]
+    fn backspace_on_an_empty_composer_dequeues_the_last_message() {
+        assert_eq!(
+            route_key(Key::Backspace, false, false, queued(3), ""),
+            Routed::Action(UiAction::Dequeue(2))
+        );
+        assert_eq!(
+            route_key(Key::Backspace, false, false, queued(1), ""),
+            Routed::Action(UiAction::Dequeue(0))
+        );
+    }
+
+    #[test]
+    fn backspace_does_nothing_with_an_empty_queue() {
+        assert_eq!(route_key(Key::Backspace, false, false, NONE, ""), composer());
+    }
+
+    #[test]
+    fn backspace_with_composer_text_edits_the_text() {
+        assert_eq!(route_key(Key::Backspace, false, false, queued(2), "fix"), composer());
+    }
+
+    #[test]
+    fn backspace_with_a_chord_is_the_composers() {
+        assert_eq!(route_key(Key::Backspace, false, true, queued(2), ""), composer());
+    }
+
+    #[test]
+    fn backspace_dequeues_while_an_approval_waits() {
+        let both = KeyFacts { approval_options: Some(3), plan_pending: false, queued: 2 };
+        assert_eq!(
+            route_key(Key::Backspace, false, false, both, ""),
+            Routed::Action(UiAction::Dequeue(1))
+        );
     }
 
     #[test]

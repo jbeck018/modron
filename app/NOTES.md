@@ -96,3 +96,28 @@ rows are coloured by their status mark (success / destructive / tool).
 
 Semantic names used in code: foreground, muted-foreground, primary, tool,
 success, warning, destructive, border (where used).
+
+# Packet C3e: loose ends (unified app, client core, shared view)
+
+- Share links: the core adopts the first session a frame names when none is
+  attached (`accept_session`, mobile/rust-core/src/client.rs). A `Snapshot`
+  names it; `Event`/`Delta` frames carry it in the envelope. Frames for a
+  second session are ignored after an adoption (debug log). `attach`,
+  `new_session`, `fork_session`, `create_task` and `TaskCreated` clear the
+  adoption, so their answers switch sessions. The driver attaches only when
+  the wanted session is not already attached. Web-test (g) and the headless
+  share-link tests cover it.
+- Refused calls: a core call that fails locally, and a server `Error` frame,
+  both land in the snapshot's `last_error` (`RemoteClient::note_local_error`).
+- Backspace on an empty composer removes the last queued message
+  (`route_key`, `Dequeue`). On the web, each queue chip is a button that
+  sends `Dequeue` for its position. The chip removes itself when the server's
+  `QueueChanged` arrives.
+- Shared copy in modron-view: `STOP_LABEL`, `QUEUE_LABEL`,
+  `COMPOSER_PLACEHOLDER`; `compact_tokens` (moved from the client view).
+
+Literal copy still in app/src, not from the core or modron-view:
+- chat.rs: queue chip format `[n] text`, steer echo `> text`, the key hints
+  `y a n` / `y r` and their `   ` joiner (terminal only).
+- demo.rs: demo fixture rows and `running` / `idle` (the core has the same
+  words inline in view.rs, with no shared constant).

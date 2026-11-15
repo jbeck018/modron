@@ -85,6 +85,28 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Compact token count for the context meter: exact below a thousand,
+/// otherwise nearest thousand with a `k` suffix (`74k`, `180k`). Used by
+/// every client's context label (`ctx 41% (74k/180k)`).
+pub fn compact_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else {
+        format!("{}k", n.saturating_add(500) / 1_000)
+    }
+}
+
+/// The composer's placeholder, shown while its draft is empty.
+pub const COMPOSER_PLACEHOLDER: &str = "Message";
+
+/// The composer's Stop control label, shown while a turn runs on the web
+/// host (AGENTS.md: a stop button stands in for the terminal's Esc).
+pub const STOP_LABEL: &str = "stop";
+
+/// The composer's Queue control label on the web host: queues the composer
+/// text, as Alt+Enter does in the terminal.
+pub const QUEUE_LABEL: &str = "queue";
+
 /// The sandbox label shown in every client's settings views: `off`,
 /// `seatbelt` (macOS Seatbelt) or `bwrap` (Linux bubblewrap).
 pub fn sandbox_label(policy: modron_types::SandboxPolicy) -> &'static str {
@@ -655,6 +677,23 @@ mod tests {
     use super::*;
     use modron_types::{Message, ToolCall, ToolOutcome};
     use serde_json::json;
+
+    #[test]
+    fn compact_tokens_is_exact_below_a_thousand_and_rounds_to_k() {
+        assert_eq!(compact_tokens(0), "0");
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(1_000), "1k");
+        assert_eq!(compact_tokens(1_499), "1k");
+        assert_eq!(compact_tokens(1_500), "2k");
+        assert_eq!(compact_tokens(74_000), "74k");
+        assert_eq!(compact_tokens(180_000), "180k");
+    }
+
+    #[test]
+    fn shared_control_labels_are_the_web_copy() {
+        assert_eq!(STOP_LABEL, "stop");
+        assert_eq!(QUEUE_LABEL, "queue");
+    }
 
     #[test]
     fn cache_hit_pct_is_cached_over_input() {

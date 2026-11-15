@@ -75,8 +75,9 @@ function textFrame(text) {
 // Starts the scripted modron server. `submitted` resolves with the first
 // submit frame the client sends. `opts.live` is the attach snapshot's live
 // state (e.g. { running: true }); `opts.after` are frames sent after the
-// attach snapshot (e.g. an approval request). `frames` keeps every client
-// frame, parsed.
+// attach snapshot (e.g. an approval request). `opts.shareLink` sends the
+// snapshot and stream unprompted after the welcome, as a share link's
+// server does (no attach). `frames` keeps every client frame, parsed.
 function startWsServer(opts = {}) {
   const received = [];
   const frames = [];
@@ -101,6 +102,10 @@ function startWsServer(opts = {}) {
         received.push(frame.type);
         if (frame.type === 'hello') {
           send({ seq: 0, type: 'welcome', server_version: '0.1.3', protocol: 1 });
+          if (opts.shareLink) {
+            send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: {} });
+            send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
+          }
         } else if (frame.type === 'attach') {
           send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: opts.live || {} });
           send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
@@ -256,6 +261,49 @@ async function testThemeColour(browser, base) {
   await page.close();
 }
 
+// A page opened with `?url=` only (a share link: no session). The server
+// names session S in a snapshot; a typed message must be a submit for S,
+// and the page must not send an attach.
+async function testShareLinkSubmit(browser, base) {
+  const ws = await startWsServer({ shareLink: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(String(e)));
+    await page.goto(base + '/?url=' + encodeURIComponent(ws.url), { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction((s) => document.body.innerText.includes(s), STREAM, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.keyboard.type('hi');
+    await page.waitForFunction(() => document.activeElement.value === 'hi', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    const frame = await waitFrame(ws, 'submit', (f) => f.task === 'hi');
+    if (frame.session_id !== SESSION) throw new Error('submit carried ' + frame.session_id + ', want the adopted session');
+    if (ws.received.includes('attach')) throw new Error('page sent an attach on a share link');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// A queue chip is a button: pressing "[2] two" sends dequeue for index 1.
+async function testChipDequeue(browser, base) {
+  const ws = await startWsServer({ after: [{ type: 'queue_changed', queued: ['one', 'two'] }] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('[2] two'), null, { timeout: TIMEOUT });
+    await tapLabel(page, '[2] two');
+    const frame = await waitFrame(ws, 'dequeue');
+    if (frame.index !== 1) throw new Error('dequeue index was ' + frame.index + ', want 1');
+    if (frame.session_id !== SESSION) throw new Error('dequeue carried the wrong session');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 (async () => {
   const staticPort = await freePort();
   const staticServer = await startStatic(staticPort);
@@ -276,6 +324,8 @@ async function testThemeColour(browser, base) {
     ['(d) Esc on web sends interrupt', () => testEscapeInterrupts(browser, base)],
     ['(e) approval buttons send approve', () => testApprovalTap(browser, base)],
     ['(f) theme primary colour applied on web', () => testThemeColour(browser, base)],
+    ['(g) share link (no session in URL): submit is for the adopted session', () => testShareLinkSubmit(browser, base)],
+    ['(h) queue chip press sends dequeue', () => testChipDequeue(browser, base)],
   ];
   for (const [name, run] of more) {
     try {

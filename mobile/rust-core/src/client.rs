@@ -265,6 +265,42 @@ struct Shared {
 struct CoreState {
     vm: SessionViewModel,
     fold: FoldState,
+    /// True when `vm.session_id` came from a frame rather than from an
+    /// explicit command (see [`accept_session`]).
+    adopted: bool,
+}
+
+/// The session a frame belongs to: its envelope's `session`, or for a
+/// `Snapshot` its own `session_id`.
+fn frame_session(frame: &Frame) -> Option<Uuid> {
+    frame.session.or(match &frame.payload {
+        Payload::Snapshot { session_id, .. } => Some(*session_id),
+        _ => None,
+    })
+}
+
+/// Decides whether a frame that names a session may fold.
+///
+/// With no session attached (a share link: the page has no `session` to
+/// attach to), the first session a frame names is adopted as the attached
+/// session, so later session-scoped commands target it. After an adoption,
+/// frames for a different session are ignored (debug log): the first
+/// session wins. An explicit command (attach, new session, fork, task)
+/// clears the adoption, so its answer is taken as the new session.
+fn accept_session(vm: &mut SessionViewModel, adopted: &mut bool, id: Uuid) -> bool {
+    match vm.session_id {
+        None => {
+            vm.session_id = Some(id);
+            *adopted = true;
+            true
+        }
+        Some(current) if current == id => true,
+        Some(current) if *adopted => {
+            tracing::debug!(attached = %current, frame = %id, "ignoring frame for another session");
+            false
+        }
+        Some(_) => true,
+    }
 }
 
 /// One installed connection: the outgoing frame channel the UI-facing
@@ -473,6 +509,7 @@ impl RemoteClient {
     /// view in the background (poll `state()` / `take_new_entries()`).
     /// `last_seq = 0` asks for the full replay.
     pub fn attach(&self, session_id: Uuid, last_seq: u64) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Attach {
@@ -536,15 +573,29 @@ impl RemoteClient {
     }
 
     /// The attached session, the target of every session-scoped command
-    /// below (steer, queue, plan, compact).
-    fn attached_session(&self) -> Result<Uuid, ClientError> {
-        self.shared
-            .state
-            .lock()
-            .unwrap()
-            .vm
-            .session_id
+    /// (steer, queue, plan, compact). Set by an explicit attach, by the
+    /// first session a frame names when none was attached (a share link),
+    /// or by a task or snapshot answer. `None` before any of those.
+    pub fn attached_session(&self) -> Option<Uuid> {
+        self.shared.state.lock().unwrap().vm.session_id
+    }
+
+    /// [`Self::attached_session`] as a request error when there is none.
+    fn require_session(&self) -> Result<Uuid, ClientError> {
+        self.attached_session()
             .ok_or_else(|| ClientError::Request("no session attached".into()))
+    }
+
+    /// Shows a call the client could not make (it was never sent) in
+    /// `state().last_error`, where the server's own refusals land too.
+    pub fn note_local_error(&self, text: impl Into<String>) {
+        self.shared.state.lock().unwrap().vm.last_error = Some(text.into());
+    }
+
+    /// Marks the session id as explicitly chosen: a later frame naming
+    /// another session is not ignored as a mismatch.
+    fn explicit_session(&self) {
+        self.shared.state.lock().unwrap().adopted = false;
     }
 
     /// Composer submit (PROTOCOL_V2 section 2): while the attached session
@@ -569,7 +620,7 @@ impl RemoteClient {
     /// Steer a running session: the text joins the active run at the next
     /// safe boundary. Errors when no session is attached.
     pub fn steer(&self, text: impl Into<String>) -> Result<(), ClientError> {
-        let session_id = self.attached_session()?;
+        let session_id = self.require_session()?;
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Steer {
@@ -581,7 +632,7 @@ impl RemoteClient {
 
     /// Hold a message for the session's next run (the alternate submit).
     pub fn enqueue(&self, text: impl Into<String>) -> Result<(), ClientError> {
-        let session_id = self.attached_session()?;
+        let session_id = self.require_session()?;
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Enqueue {
@@ -593,7 +644,7 @@ impl RemoteClient {
 
     /// Remove one queued message by position (0 = next to run).
     pub fn dequeue(&self, index: u32) -> Result<(), ClientError> {
-        let session_id = self.attached_session()?;
+        let session_id = self.require_session()?;
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Dequeue { session_id, index },
@@ -607,7 +658,7 @@ impl RemoteClient {
         decision: PlanDecision,
         note: Option<String>,
     ) -> Result<(), ClientError> {
-        let session_id = self.attached_session()?;
+        let session_id = self.require_session()?;
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::DecidePlan {
@@ -621,7 +672,7 @@ impl RemoteClient {
     /// Compact the attached session now (idle sessions only; the server
     /// refuses while a run is active).
     pub fn compact(&self) -> Result<(), ClientError> {
-        let session_id = self.attached_session()?;
+        let session_id = self.require_session()?;
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Compact { session_id },
@@ -781,6 +832,7 @@ impl RemoteClient {
 
     /// Create an empty session without submitting a task.
     pub fn new_session(&self, title: Option<&str>) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::NewSession {
@@ -792,6 +844,7 @@ impl RemoteClient {
     /// Fork a session: the server copies its log under a fresh id and
     /// both sessions get a note.
     pub fn fork_session(&self, session_id: Uuid) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Fork { session_id },
@@ -801,6 +854,7 @@ impl RemoteClient {
     /// Create a task: a new session in a dedicated worktree/branch off
     /// `base` (the reply adopts the new session).
     pub fn create_task(&self, title: &str, base: Option<&str>) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::CreateTask {
@@ -1095,7 +1149,13 @@ fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
 
 fn fold_frame(shared: &Shared, frame: Frame) {
     let mut st = shared.state.lock().unwrap();
-    let CoreState { vm, fold } = &mut *st;
+    let CoreState { vm, fold, adopted } = &mut *st;
+
+    if let Some(id) = frame_session(&frame) {
+        if !accept_session(vm, adopted, id) {
+            return;
+        }
+    }
 
     // Any session-scoped sequenced frame advances the resume cursor.
     if frame.session.is_some() && frame.seq > vm.last_seq {
@@ -1186,6 +1246,7 @@ fn fold_frame(shared: &Shared, frame: Frame) {
             branch,
         } => {
             vm.session_id = Some(session_id);
+            *adopted = false;
             vm.last_note = Some(format!("task created: {branch} in {worktree}"));
         }
         Payload::TaskStatus {
@@ -1327,6 +1388,85 @@ mod tests {
             snap.last_note.as_deref(),
             Some("remote-control live: https://bridge.example.com/s/abc - open on any device")
         );
+    }
+
+    /// A client with no connection, for folding frames by hand.
+    fn bare_client() -> RemoteClient {
+        RemoteClient {
+            shared: Arc::new(Shared::new(ConnectOptions::default())),
+        }
+    }
+
+    fn snapshot_for(session: Uuid) -> Frame {
+        Frame::event(
+            Some(session),
+            0,
+            Payload::Snapshot {
+                session_id: session,
+                last_seq: 0,
+                events: vec![],
+                live: modron_protocol::LiveState::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn the_first_session_a_frame_names_is_adopted() {
+        // Share link: no attach was sent, the first snapshot names the session.
+        let session = Uuid::new_v4();
+        let client = bare_client();
+        assert_eq!(client.attached_session(), None);
+        fold_frame(&client.shared, snapshot_for(session));
+        assert_eq!(client.attached_session(), Some(session));
+    }
+
+    #[test]
+    fn a_second_session_is_ignored_once_one_is_adopted() {
+        let first = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let client = bare_client();
+        fold_frame(
+            &client.shared,
+            Frame::event(
+                Some(first),
+                1,
+                Payload::Delta {
+                    delta: WireDelta::Text { text: "a".into() },
+                },
+            ),
+        );
+        fold_frame(
+            &client.shared,
+            Frame::event(
+                Some(other),
+                7,
+                Payload::Delta {
+                    delta: WireDelta::Text { text: "b".into() },
+                },
+            ),
+        );
+        assert_eq!(client.attached_session(), Some(first));
+        assert_eq!(client.state().streaming_text, "a");
+        assert_eq!(client.last_seq(), 1);
+    }
+
+    #[test]
+    fn an_explicit_new_session_takes_over_from_the_adopted_one() {
+        let first = Uuid::new_v4();
+        let next = Uuid::new_v4();
+        let client = bare_client();
+        fold_frame(&client.shared, snapshot_for(first));
+        // No connection, so the send fails; the explicit mark is still set.
+        assert!(client.new_session(None).is_err());
+        fold_frame(&client.shared, snapshot_for(next));
+        assert_eq!(client.attached_session(), Some(next));
+    }
+
+    #[test]
+    fn a_local_error_lands_in_last_error() {
+        let client = bare_client();
+        client.note_local_error("send refused");
+        assert_eq!(client.state().last_error.as_deref(), Some("send refused"));
     }
 
     /// Fold several frames, in order, into one fresh shared state.

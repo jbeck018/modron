@@ -206,8 +206,12 @@ impl Driver {
         }
         if !self.attached && self.client.is_connected() {
             self.attached = true;
+            // A snapshot for the wanted session may already have arrived (the
+            // bridge replays buffered frames): then it is attached already.
             if let Some(session) = self.options.session {
-                let _ = self.client.attach(session, 0);
+                if self.client.attached_session() != Some(session) {
+                    let _ = self.client.attach(session, 0);
+                }
             }
         }
         let snapshot = self.client.state();
@@ -230,8 +234,10 @@ impl Drop for Driver {
     }
 }
 
-/// Maps one UI action to its core call. A refused call (no session yet, or
-/// a closed link) changes nothing here; the next snapshot shows the state.
+/// Maps one UI action to its core call. A call the core refuses (no session
+/// attached, a closed link) is shown as the snapshot's error, so the user
+/// sees why nothing happened. Server refusals arrive as `Payload::Error` and
+/// land in the same field.
 fn apply(client: &RemoteClient, action: UiAction) {
     let result = match action {
         UiAction::Send(text) => client.send_message(text),
@@ -259,7 +265,9 @@ fn apply(client: &RemoteClient, action: UiAction) {
         },
         UiAction::Compact => client.compact(),
     };
-    let _ = result;
+    if let Err(error) = result {
+        client.note_local_error(error.to_string());
+    }
 }
 
 #[cfg(test)]

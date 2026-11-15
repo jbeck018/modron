@@ -1,4 +1,4 @@
-//! rc.rs — remote-control tunnels (the `/remote-control` flow): one
+//! rc.rs - remote-control tunnels (the `/remote-control` flow): one
 //! outbound WebSocket from this server to a relay bridge (a deployed
 //! cloud/bridge worker), keyed by a share code. The relay is
 //! transport-only for live traffic: it relays Frames and keeps only a
@@ -19,11 +19,16 @@
 use crate::dispatch::Outbound;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::dispatch::{handle_frame, ConnCtx, Flow, ServerState};
@@ -115,11 +120,341 @@ pub fn share_key() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// Environment variable holding the portal host token (the bridge's
+/// `HOST_TOKEN` secret). Unset or empty: the tunnel connects exactly as
+/// before and registers nothing with the portal.
+pub const HOST_TOKEN_ENV: &str = "MODRON_HOST_TOKEN";
+
+/// Environment variable naming this host's kind in the portal directory:
+/// `cloud`; `local` when unset.
+pub const HOST_KIND_ENV: &str = "MODRON_HOST_KIND";
+
+/// Environment lookup, injected so tests never mutate the process env.
+pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// The process environment as an [`EnvLookup`].
+pub fn process_env() -> EnvLookup {
+    Arc::new(|name| std::env::var(name).ok())
+}
+
+/// A variable through `lookup`; empty counts as unset.
+fn env_value(lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    lookup(name).filter(|value| !value.is_empty())
+}
+
+/// Timing of the portal registration. Production uses [`Default`]; tests
+/// shorten it so they never sleep for real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistrationTiming {
+    /// Minimum gap between two registration PUTs for one session.
+    pub debounce: Duration,
+    /// Re-PUT interval while the tunnel is up, even with no state change.
+    pub heartbeat: Duration,
+    /// How often the registration task samples the session's running state.
+    pub poll: Duration,
+}
+
+impl Default for RegistrationTiming {
+    fn default() -> Self {
+        Self {
+            debounce: Duration::from_secs(2),
+            heartbeat: Duration::from_secs(60),
+            poll: Duration::from_millis(250),
+        }
+    }
+}
+
+/// Per-request timeout for portal calls, so a stalled bridge cannot hold
+/// the DELETE at tunnel close for long.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The tunnel's WebSocket handshake request. With a host token the
+/// `Authorization: Bearer` header is set; the token never appears in an
+/// error message.
+fn tunnel_request(
+    agent_url: &str,
+    host_token: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = agent_url
+        .into_client_request()
+        .map_err(|_| anyhow!("the bridge agent url is malformed"))?;
+    if let Some(token) = host_token {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow!("{HOST_TOKEN_ENV} is not a valid header value"))?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
+    Ok(request)
+}
+
+/// The http(s) base of the bridge's HTTP routes, derived from the bridge
+/// base: `wss://` and `https://` map to `https://`, the rest to `http://`.
+fn bridge_http_base(bridge_base: &str) -> Result<String> {
+    let base = bridge_base.trim_end_matches('/');
+    let host = base
+        .strip_prefix("wss://")
+        .or_else(|| base.strip_prefix("ws://"))
+        .or_else(|| base.strip_prefix("https://"))
+        .or_else(|| base.strip_prefix("http://"))
+        .ok_or_else(|| anyhow!("bridge url must start with ws:// or wss://"))?;
+    let http = if base.starts_with("wss://") || base.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    Ok(format!("{http}://{host}"))
+}
+
+/// Trim control characters to spaces, trim, and keep at most `max_chars`.
+fn clean_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+/// The machine name for the portal directory: `HOSTNAME`, else
+/// `/etc/hostname`, else `modron`.
+fn host_label(lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let raw = env_value(lookup, "HOSTNAME")
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_default();
+    let label = clean_text(&raw, 100);
+    if label.is_empty() {
+        "modron".to_string()
+    } else {
+        label
+    }
+}
+
+/// The session's title for the portal, or `session <short id>` when it has
+/// none (at most 200 characters).
+async fn session_title(state: &ServerState, session: SessionId) -> String {
+    let stored = state.store.list().await.ok().and_then(|metas| {
+        metas
+            .into_iter()
+            .find(|meta| meta.id == session)
+            .map(|meta| meta.title)
+    });
+    let title = clean_text(&stored.unwrap_or_default(), 200);
+    if title.is_empty() {
+        let short = session.simple().to_string();
+        clean_text(&format!("session {}", &short[..8]), 200)
+    } else {
+        title
+    }
+}
+
+/// What a registration task needs to speak to the portal for one session.
+struct PortalHost {
+    /// The bridge's http(s) base (see [`bridge_http_base`]).
+    http: String,
+    session: SessionId,
+    /// The viewer key the bridge derives from the agent key.
+    viewer_key: String,
+    token: String,
+    host_label: String,
+    host_kind: &'static str,
+    state: Arc<ServerState>,
+    timing: RegistrationTiming,
+}
+
+impl PortalHost {
+    fn url(&self) -> String {
+        format!("{}/api/host/sessions/{}", self.http, self.session)
+    }
+
+    /// Busy = a run is in the session's slot.
+    fn running(&self) -> bool {
+        self.state
+            .hub
+            .handle(&self.session)
+            .is_some_and(|handle| handle.is_busy())
+    }
+}
+
+/// The portal's answer to one registration request.
+enum PutOutcome {
+    /// Accepted (2xx): the directory entry is current.
+    Accepted,
+    /// 503: the bridge has no portal. Registration is off for this tunnel.
+    NotConfigured,
+    /// 401 or 403: the host token was refused. Never retried.
+    Rejected,
+    /// Anything else: retried on the next heartbeat.
+    Failed,
+}
+
+/// A running registration task. Dropping `stop` (the tunnel ended, or its
+/// task was aborted) makes the task DELETE the session entry and exit.
+struct Registration {
+    stop: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl Registration {
+    /// Stop the task and wait for its DELETE.
+    async fn finish(mut self) {
+        drop(self.stop.take());
+        let _ = self.task.await;
+    }
+}
+
+/// Start registering the session with the portal (the host token is set).
+/// Runs on its own task so it never blocks the tunnel.
+fn start_registration(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    timing: RegistrationTiming,
+    state: Arc<ServerState>,
+    session: SessionId,
+    bridge_base: &str,
+    key: &str,
+    token: String,
+) -> Option<Registration> {
+    let Ok(http) = bridge_http_base(bridge_base) else {
+        return None;
+    };
+    let host = PortalHost {
+        http,
+        session,
+        viewer_key: viewer_key(key),
+        token,
+        host_label: host_label(lookup),
+        host_kind: if env_value(lookup, HOST_KIND_ENV).as_deref() == Some("cloud") {
+            "cloud"
+        } else {
+            "local"
+        },
+        state,
+        timing,
+    };
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(registration_loop(host, stop_rx));
+    Some(Registration {
+        stop: Some(stop_tx),
+        task,
+    })
+}
+
+/// The registration schedule. A PUT goes out on the first tick, when the
+/// running state changed (at most one per `debounce`), and on every
+/// `heartbeat`. A 503 or 401/403 turns the task off for good; any other
+/// failure waits for the next heartbeat. When `stop` closes, the entry is
+/// DELETEd unless the portal already refused this tunnel.
+async fn registration_loop(host: PortalHost, mut stop: oneshot::Receiver<()>) {
+    let client = reqwest::Client::new();
+    let url = host.url();
+    let mut last_attempt: Option<Instant> = None;
+    let mut sent_running: Option<bool> = None;
+    let mut off = false;
+    let mut ticker = tokio::time::interval(host.timing.poll);
+    loop {
+        if !off {
+            let running = host.running();
+            let due = match last_attempt {
+                None => true,
+                Some(at) => {
+                    let elapsed = at.elapsed();
+                    (sent_running != Some(running) && elapsed >= host.timing.debounce)
+                        || elapsed >= host.timing.heartbeat
+                }
+            };
+            if due {
+                match put_entry(&client, &url, &host, running).await {
+                    PutOutcome::Accepted => {}
+                    PutOutcome::NotConfigured => {
+                        tracing::debug!(session = %host.session, "portal not configured; not registering");
+                        off = true;
+                    }
+                    PutOutcome::Rejected => {
+                        tracing::warn!(session = %host.session, "portal rejected the host token");
+                        off = true;
+                    }
+                    PutOutcome::Failed => {
+                        tracing::debug!(session = %host.session, "portal registration failed; retrying on the next heartbeat");
+                    }
+                }
+                last_attempt = Some(Instant::now());
+                sent_running = Some(running);
+            }
+        }
+        tokio::select! {
+            _ = &mut stop => break,
+            _ = ticker.tick() => {}
+        }
+    }
+    if !off {
+        let outcome = client
+            .delete(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", host.token))
+            .timeout(REGISTRATION_TIMEOUT)
+            .send()
+            .await;
+        if !matches!(outcome, Ok(ref r) if r.status().is_success()) {
+            tracing::debug!(session = %host.session, "portal entry removal failed");
+        }
+    }
+}
+
+/// One PUT of the session's directory entry.
+async fn put_entry(
+    client: &reqwest::Client,
+    url: &str,
+    host: &PortalHost,
+    running: bool,
+) -> PutOutcome {
+    let body = serde_json::json!({
+        "title": session_title(&host.state, host.session).await,
+        "host_label": host.host_label,
+        "host_kind": host.host_kind,
+        "viewer_key": host.viewer_key,
+        "state": if running { "running" } else { "idle" },
+    });
+    let response = client
+        .put(url)
+        .header(AUTHORIZATION, format!("Bearer {}", host.token))
+        .header("content-type", "application/json")
+        .timeout(REGISTRATION_TIMEOUT)
+        .body(body.to_string())
+        .send()
+        .await;
+    match response.map(|r| r.status().as_u16()) {
+        Ok(status) if (200..300).contains(&status) => PutOutcome::Accepted,
+        Ok(503) => PutOutcome::NotConfigured,
+        Ok(401 | 403) => PutOutcome::Rejected,
+        _ => PutOutcome::Failed,
+    }
+}
+
 /// Run the tunnel for one session until the socket closes or the server
 /// shuts down. Frames from the relay are dispatched exactly like local
 /// client frames; outbound frames (snapshot, deltas, events) are relayed
-/// to the bridge.
+/// to the bridge. With `MODRON_HOST_TOKEN` set, the session is also
+/// registered in the portal directory for as long as the tunnel lives.
 pub async fn run_tunnel(
+    state: Arc<ServerState>,
+    session: SessionId,
+    bridge_base: String,
+    key: String,
+) -> Result<()> {
+    run_tunnel_with(
+        process_env(),
+        RegistrationTiming::default(),
+        state,
+        session,
+        bridge_base,
+        key,
+    )
+    .await
+}
+
+/// [`run_tunnel`] with the environment and the registration timing
+/// injected (tests use this).
+pub async fn run_tunnel_with(
+    lookup: EnvLookup,
+    timing: RegistrationTiming,
     state: Arc<ServerState>,
     session: SessionId,
     bridge_base: String,
@@ -128,7 +463,10 @@ pub async fn run_tunnel(
     // The agent URL carries the share key: never put it in an error
     // message or a log line, only the bridge base.
     let (agent_url, _open_url) = tunnel_urls(&bridge_base, &key);
-    let (socket, _) = connect_async(agent_url)
+    let host_token = env_value(&*lookup, HOST_TOKEN_ENV);
+    let request = tunnel_request(&agent_url, host_token.as_deref())
+        .with_context(|| format!("preparing the remote-control bridge request at {bridge_base}"))?;
+    let (socket, _) = connect_async(request)
         .await
         .with_context(|| format!("connecting to the remote-control bridge at {bridge_base}"))?;
     let (mut sink, mut stream) = socket.split();
@@ -178,6 +516,19 @@ pub async fn run_tunnel(
         let _ = sink.close().await;
     });
 
+    // Portal registration, only with a host token (see HOST_TOKEN_ENV).
+    let registration = host_token.and_then(|token| {
+        start_registration(
+            &*lookup,
+            timing,
+            Arc::clone(&state),
+            session,
+            &bridge_base,
+            &key,
+            token,
+        )
+    });
+
     // Relay loop: every frame from the bridge goes through the SAME
     // dispatch as local clients, under the tunnel's scope (see ConnCtx::scoped).
     loop {
@@ -205,6 +556,9 @@ pub async fn run_tunnel(
     }
     drop(ctx);
     let _ = writer.await;
+    if let Some(registration) = registration {
+        registration.finish().await;
+    }
     Ok(())
 }
 
@@ -266,18 +620,7 @@ async fn publish_page_with_lookup(
 ) -> Result<String> {
     let token = publish_token_from(lookup)?;
     check_bridge_transport(bridge_base)?;
-    let base = bridge_base.trim_end_matches('/');
-    let host = base
-        .strip_prefix("wss://")
-        .or_else(|| base.strip_prefix("ws://"))
-        .or_else(|| base.strip_prefix("https://"))
-        .or_else(|| base.strip_prefix("http://"))
-        .ok_or_else(|| anyhow!("bridge url must start with ws:// or wss://"))?;
-    let http = if base.starts_with("wss://") || base.starts_with("https://") {
-        "https"
-    } else {
-        "http"
-    };
+    let base_url = bridge_http_base(bridge_base)?;
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "title": title,
@@ -285,7 +628,7 @@ async fn publish_page_with_lookup(
         "content_md": content_md,
     });
     let response = client
-        .post(format!("{http}://{host}/pages/{key}"))
+        .post(format!("{base_url}/pages/{key}"))
         .header("content-type", "application/json")
         .header("authorization", publish_auth_header(&token))
         .body(body.to_string())
@@ -304,7 +647,7 @@ async fn publish_page_with_lookup(
         .get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("bridge page reply missing id"))?;
-    Ok(format!("{http}://{host}/p/{id}"))
+    Ok(format!("{base_url}/p/{id}"))
 }
 
 /// Register a remote-control tunnel for `session`: validates the session,

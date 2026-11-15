@@ -54,6 +54,7 @@ pub use client::{
     default_url, ConnectOptions, KeepaliveConfig, RemoteClient, CLIENT_NAME, UNDECODABLE_NOTE,
 };
 pub use error::ClientError;
+pub use modron_view::{QUEUE_LABEL, STOP_LABEL};
 pub use view::{
     approval_mode_label, connection_label, context_label, entry_lines, phase_label,
     ConnectionState, DecisionOption, OAuthProgressView, PendingApprovalView, PendingPlanView,

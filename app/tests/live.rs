@@ -289,6 +289,34 @@ fn plan_keys_are_plain_text_when_no_plan_waits() {
     assert_eq!(h.action(), None);
 }
 
+#[test]
+fn backspace_on_an_empty_composer_dequeues_the_last_message() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    snapshot.queued = vec!["fix the tests".into(), "then update the docs".into()];
+    h.push(&snapshot);
+    h.wait_for("queue chips", None, |s| s.contains("[2] then update the docs"));
+    h.send(key("Backspace"));
+    assert_eq!(h.action(), Some(UiAction::Dequeue(1)));
+}
+
+#[test]
+fn backspace_does_nothing_without_a_queue_or_with_composer_text() {
+    let mut h = Harness::new();
+    h.push(&fixture());
+    h.wait_for("transcript", None, |s| s.contains("fix the router crate"));
+    h.send(key("Backspace"));
+    assert_eq!(h.action(), None, "empty queue");
+    let mut queued = fixture();
+    queued.queued = vec!["later".into()];
+    h.push(&queued);
+    h.wait_for("queue chip", None, |s| s.contains("[1] later"));
+    h.type_text("zed");
+    h.wait_for("typed zed", None, |s| s.contains("zed"));
+    h.send(key("Backspace"));
+    assert_eq!(h.action(), None, "composer has text: Backspace edits it");
+}
+
 // ---------------------------------------------------------------------------
 // End to end: the session driver against a scripted server.
 // ---------------------------------------------------------------------------
@@ -312,14 +340,28 @@ async fn send_frame(ws: &mut Ws, frame: &Frame) {
     ws.send(WsMessage::Text(json.into())).await.expect("server: send");
 }
 
+/// How the scripted server behaves after the welcome.
+#[derive(Clone, Copy, Default)]
+struct Script {
+    /// Share link: no attach is sent; the server names the session in a
+    /// snapshot right after the welcome.
+    share_link: bool,
+    /// The attached session is running (the composer then steers).
+    running: bool,
+    /// Answer the first client request after the stream with this error.
+    refusal: Option<&'static str>,
+}
+
 /// Starts the scripted server on its own thread. Returns its ws URL and a
-/// channel that yields the task of the first Submit frame it receives.
+/// channel that yields the payload of the first client frame after the
+/// stream (the submit or steer under test).
 ///
-/// Script: hello -> welcome; attach -> snapshot (idle) + a text delta;
-/// then the first Submit's task is reported back.
-fn start_server(session: Uuid) -> (String, mpsc::Receiver<String>) {
+/// Script: hello -> welcome; then either attach -> snapshot, or (share
+/// link) snapshot at once; then a text delta; then the first request is
+/// reported back, and refused when the script says so.
+fn start_server(session: Uuid, script: Script) -> (String, mpsc::Receiver<Payload>) {
     let (url_tx, url_rx) = mpsc::channel();
-    let (task_tx, task_rx) = mpsc::channel();
+    let (report_tx, report_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -344,23 +386,21 @@ fn start_server(session: Uuid) -> (String, mpsc::Receiver<String>) {
             )
             .await;
 
-            let attach = read_frame(&mut ws).await;
-            assert!(
-                matches!(attach.payload, Payload::Attach { session_id, .. } if session_id == session),
-                "expected attach to the session, got {:?}",
-                attach.payload
-            );
+            if !script.share_link {
+                let attach = read_frame(&mut ws).await;
+                assert!(
+                    matches!(attach.payload, Payload::Attach { session_id, .. } if session_id == session),
+                    "expected attach to the session, got {:?}",
+                    attach.payload
+                );
+            }
+            let live = LiveState { running: script.running, ..LiveState::default() };
             send_frame(
                 &mut ws,
                 &Frame::event(
                     Some(session),
                     0,
-                    Payload::Snapshot {
-                        session_id: session,
-                        last_seq: 0,
-                        events: vec![],
-                        live: LiveState::default(),
-                    },
+                    Payload::Snapshot { session_id: session, last_seq: 0, events: vec![], live },
                 ),
             )
             .await;
@@ -376,24 +416,46 @@ fn start_server(session: Uuid) -> (String, mpsc::Receiver<String>) {
             )
             .await;
 
-            let submit = read_frame(&mut ws).await;
-            match submit.payload {
-                Payload::Submit { session_id, task, .. } => {
-                    assert_eq!(session_id, Some(session));
-                    task_tx.send(task).expect("report task");
-                }
-                other => panic!("expected submit, got {other:?}"),
+            let request = read_frame(&mut ws).await;
+            report_tx.send(request.payload).expect("report request");
+            if let Some(message) = script.refusal {
+                send_frame(
+                    &mut ws,
+                    &Frame::event(
+                        Some(session),
+                        2,
+                        Payload::Error { message: message.into(), kind: None },
+                    ),
+                )
+                .await;
+                // A live server keeps the socket open: hold it until the
+                // client closes, so the disconnect does not replace the error.
+                while ws.next().await.is_some() {}
             }
         });
     });
     let url = url_rx.recv_timeout(TIMEOUT).expect("server url");
-    (url, task_rx)
+    (url, report_rx)
+}
+
+/// Pumps the driver until the server reports the first request.
+fn next_request(h: &mut Harness, live: &mut Live, reports: &mpsc::Receiver<Payload>) -> Payload {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        live.pump(&mut h.host);
+        h.draw();
+        if let Ok(payload) = reports.try_recv() {
+            return payload;
+        }
+        assert!(Instant::now() < deadline, "server got no request\n{}", h.screen());
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
 fn driver_renders_the_stream_and_sends_a_typed_message_as_submit() {
     let session = Uuid::new_v4();
-    let (url, submitted) = start_server(session);
+    let (url, reports) = start_server(session, Script::default());
     let mut live = session::spawn(LiveOptions { url, token: None, session: Some(session) })
         .expect("spawn driver");
     let mut h = Harness::new();
@@ -404,17 +466,75 @@ fn driver_renders_the_stream_and_sends_a_typed_message_as_submit() {
     h.type_text("hi");
     h.wait_for("typed hi", Some(&mut live), |s| s.contains("hi"));
     h.send(key("Enter"));
-    // The action crosses to the driver on the next pump; the server then
-    // reports the frame it received.
-    let deadline = Instant::now() + TIMEOUT;
-    let task = loop {
-        live.pump(&mut h.host);
-        h.draw();
-        if let Ok(task) = submitted.try_recv() {
-            break task;
+    match next_request(&mut h, &mut live, &reports) {
+        Payload::Submit { session_id, task, .. } => {
+            assert_eq!(session_id, Some(session));
+            assert_eq!(task, "hi");
         }
-        assert!(Instant::now() < deadline, "server never got the submit\n{}", h.screen());
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert_eq!(task, "hi");
+        other => panic!("expected submit, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_share_link_adopts_the_session_its_snapshot_names() {
+    // No session in the options and no attach: the snapshot names it, and
+    // the typed message is a submit for that session.
+    let session = Uuid::new_v4();
+    let script = Script { share_link: true, ..Script::default() };
+    let (url, reports) = start_server(session, script);
+    let mut live =
+        session::spawn(LiveOptions { url, token: None, session: None }).expect("spawn driver");
+    let mut h = Harness::new();
+
+    h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
+    h.type_text("hi");
+    h.wait_for("typed hi", Some(&mut live), |s| s.contains("hi"));
+    h.send(key("Enter"));
+    match next_request(&mut h, &mut live, &reports) {
+        Payload::Submit { session_id, task, .. } => {
+            assert_eq!(session_id, Some(session));
+            assert_eq!(task, "hi");
+        }
+        other => panic!("expected submit for the adopted session, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_share_link_steers_when_the_adopted_session_is_running() {
+    let session = Uuid::new_v4();
+    let script = Script { share_link: true, running: true, ..Script::default() };
+    let (url, reports) = start_server(session, script);
+    let mut live =
+        session::spawn(LiveOptions { url, token: None, session: None }).expect("spawn driver");
+    let mut h = Harness::new();
+
+    h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
+    h.type_text("hi");
+    h.wait_for("typed hi", Some(&mut live), |s| s.contains("hi"));
+    h.send(key("Enter"));
+    match next_request(&mut h, &mut live, &reports) {
+        Payload::Steer { session_id, text } => {
+            assert_eq!(session_id, session);
+            assert_eq!(text, "hi");
+        }
+        other => panic!("expected steer for the adopted session, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_refused_send_shows_the_server_error_on_screen() {
+    let session = Uuid::new_v4();
+    let refusal = "single-session tunnel: submit refused";
+    let script = Script { refusal: Some(refusal), ..Script::default() };
+    let (url, reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions { url, token: None, session: Some(session) })
+        .expect("spawn driver");
+    let mut h = Harness::new();
+
+    h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
+    h.type_text("hi");
+    h.wait_for("typed hi", Some(&mut live), |s| s.contains("hi"));
+    h.send(key("Enter"));
+    let _ = next_request(&mut h, &mut live, &reports);
+    h.wait_for("refusal on screen", Some(&mut live), |s| s.contains(refusal));
 }
