@@ -3,7 +3,7 @@
 //! drift from behaviour. Slash commands come from [`crate::slash::all`].
 
 use modron_mobile_core::view::{HELP_COMMANDS_HEADING, HELP_KEYS_HEADING};
-use modron_view::slash::slash_help_lines;
+use modron_view::slash::{slash_help_lines, slash_lookup};
 use uuid::Uuid;
 
 use crate::chat::{Key, KeyFacts, Routed, ScrollStep, ToolsStep, UiAction};
@@ -40,6 +40,39 @@ fn session_id() -> Uuid {
 /// Every binding the app has, in help order.
 pub fn bindings() -> Vec<Binding> {
     vec![
+        Binding {
+            label: "ctrl+v",
+            what: "paste an image from the clipboard as a chip for the next message",
+            key: Key::Char('v'),
+            chord: true,
+            alt: false,
+            facts: chat,
+            draft: "",
+            expect: || Routed::Action(UiAction::Paste),
+        },
+        Binding {
+            label: "shift+s (model picker)",
+            what: "saves the highlighted model and provider as the default for new sessions",
+            key: Key::Char('S'),
+            chord: false,
+            alt: false,
+            facts: || {
+                with(|f| {
+                    f.screen = Screen::Models;
+                    f.save_default = Some(UiAction::SaveDefaultModel {
+                        model: "m".into(),
+                        provider: "p".into(),
+                    });
+                })
+            },
+            draft: "",
+            expect: || {
+                Routed::Action(UiAction::SaveDefaultModel {
+                    model: "m".into(),
+                    provider: "p".into(),
+                })
+            },
+        },
         Binding {
             label: "ctrl+t",
             what: "tool detail panel: this turn's tool rows (esc or ctrl+t closes)",
@@ -78,7 +111,7 @@ pub fn bindings() -> Vec<Binding> {
         },
         Binding {
             label: "!command",
-            what: "run the rest of the line in the shell (not the model); bare ! is a usage line",
+            what: "run the rest of the line in the shell (not the model); !! runs it privately (shown, never sent to the model)",
             key: Key::Enter,
             chord: false,
             alt: false,
@@ -193,7 +226,7 @@ pub fn bindings() -> Vec<Binding> {
         },
         Binding {
             label: "backspace",
-            what: "remove the last queued message (empty composer)",
+            what: "remove the last image chip, else the last queued message (empty composer)",
             key: Key::Backspace,
             chord: false,
             alt: false,
@@ -372,7 +405,13 @@ pub fn help_lines() -> Vec<String> {
     lines.extend(HOST_BINDINGS.iter().map(|(label, what)| format!("{label}   {what}")));
     lines.push(HELP_COMMANDS_HEADING.to_string());
     lines.extend(slash_help_lines());
-    lines.extend(slash::LOCAL.iter().map(|e| format!("{} - {}", e.usage, e.about)));
+    // The app's own rows only: a name the shared table lists is already above.
+    lines.extend(
+        slash::all()
+            .iter()
+            .filter(|e| slash_lookup(e.name).is_none())
+            .map(|e| format!("{} - {}", e.usage, e.about)),
+    );
     lines
 }
 

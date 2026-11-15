@@ -167,6 +167,9 @@ pub fn auth_rows(s: &ViewModelSnapshot) -> Vec<AuthRow> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelRow {
     pub model: String,
+    /// The provider the model runs on (`persist_default_model` saves the pair).
+    /// Empty for a router-default row that has no catalog entry yet.
+    pub provider: String,
     pub text: String,
     /// Catalog rows that the server cannot run are dim and not selectable.
     pub available: bool,
@@ -215,6 +218,8 @@ pub struct NavView {
     /// The model rows that match the filter, and every model row.
     pub models: Vec<ModelRow>,
     pub models_total: usize,
+    /// The save-as-default action for the highlighted model (web control).
+    pub save_default: Option<UiAction>,
     /// Every sub-agent of the attached session, in the core's order.
     pub agents: Vec<AgentRowView>,
     /// The agent the Agent screen shows (its last seen row).
@@ -451,6 +456,24 @@ impl Nav {
             .get(self.selected)
             .filter(|row| row.available)
             .map(|row| row.model.clone())
+    }
+
+    /// Shift+S (terminal) and the save control (web) on the Models screen:
+    /// save the highlighted row's model and provider as the server's default
+    /// for future sessions. None when the row is unavailable or has no
+    /// provider (the catalog has not arrived). The current session keeps its
+    /// model either way.
+    pub fn save_default_action(&self) -> Option<UiAction> {
+        if self.top() != Screen::Models {
+            return None;
+        }
+        self.visible_models()
+            .get(self.selected)
+            .filter(|row| row.available && !row.provider.is_empty())
+            .map(|row| UiAction::SaveDefaultModel {
+                model: row.model.clone(),
+                provider: row.provider.clone(),
+            })
     }
 
     /// The action Enter would send for the selected settings row.
@@ -708,6 +731,7 @@ impl Nav {
             settings: self.settings.clone(),
             models: self.visible_models().into_iter().cloned().collect(),
             models_total: self.models.len(),
+            save_default: self.save_default_action(),
             agents: self.agents.clone(),
             agent: if agent_open { self.agent_row.clone() } else { None },
             agent_live: self.agent_live(),
@@ -755,7 +779,13 @@ pub fn model_rows(s: &ViewModelSnapshot) -> Vec<ModelRow> {
                 } else {
                     m.text.clone()
                 };
-                ModelRow { model: m.id.clone(), text, available: m.available, current }
+                ModelRow {
+                    model: m.id.clone(),
+                    provider: m.provider.clone(),
+                    text,
+                    available: m.available,
+                    current,
+                }
             })
             .collect();
     }
@@ -764,6 +794,7 @@ pub fn model_rows(s: &ViewModelSnapshot) -> Vec<ModelRow> {
         if !model.is_empty() && !rows.iter().any(|r| r.model == model) {
             rows.push(ModelRow {
                 model: model.to_string(),
+                provider: if model == s.model { s.provider.clone() } else { String::new() },
                 text: format!("{model} ({role})"),
                 available: true,
                 current: model == s.model,

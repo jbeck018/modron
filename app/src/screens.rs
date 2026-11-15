@@ -453,6 +453,27 @@ fn setting_row(
 fn models_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
     let mut column = view().flex_col();
     column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    // The terminal's key is named; the web shows the control instead.
+    if !WEB_CONTROLS {
+        column = column.child(text(SAVE_DEFAULT_HINT).text_color(muted()));
+    }
+    if WEB_CONTROLS {
+        let save_actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.save_default.is_some()),
+            move || {
+                let save_actions = save_actions.clone();
+                view()
+                    .role(AccessibilityRole::Button)
+                    .on_press(move || {
+                        if let Some(action) = nav.with(|n| n.save_default.clone()) {
+                            let _ = save_actions.send(action);
+                        }
+                    })
+                    .child(text(SAVE_DEFAULT_LABEL).text_color(move || token_ink("primary")))
+            },
+        ));
+    }
     column = column.child(when(
         move || nav.with(|n| n.models_total == 0),
         move || text(MODELS_EMPTY_LABEL).text_color(muted()),
@@ -466,6 +487,11 @@ fn models_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl
     }
     column
 }
+
+/// The save control's label (web) and the terminal's hint line. App copy:
+/// the shared formatter does not carry it yet (see the report).
+pub(crate) const SAVE_DEFAULT_LABEL: &str = "save as default";
+pub(crate) const SAVE_DEFAULT_HINT: &str = "shift+s: save the highlighted model as the default";
 
 fn model_row(
     nav: Signal<NavView>,

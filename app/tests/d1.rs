@@ -196,12 +196,12 @@ fn a_bang_line_is_a_shell_action_and_never_a_submit() {
     h.type_text("!ls");
     h.settle();
     h.send(key("Enter"));
-    assert_eq!(h.action(), Some(UiAction::Shell("ls".into())));
+    assert_eq!(h.action(), Some(UiAction::Shell { command: "ls".into(), private: false }));
     h.settle();
     h.type_text("  !  pwd ");
     h.settle();
     h.send(key("Enter"));
-    assert_eq!(h.action(), Some(UiAction::Shell("pwd".into())));
+    assert_eq!(h.action(), Some(UiAction::Shell { command: "pwd".into(), private: false }));
 }
 
 #[test]

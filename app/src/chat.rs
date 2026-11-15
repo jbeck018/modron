@@ -23,8 +23,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use modron_mobile_core::view::{NEW_OUTPUT_BELOW_LABEL, NO_TOOLS_NOTE};
+use modron_mobile_core::Attachment;
 use modron_mobile_core::{
-    ApprovalModeWire, Effort, Phase, RenderedRow, SandboxPolicy, ViewModelSnapshot,
+    parse_shell_input, ApprovalModeWire, Effort, Phase, RenderedRow, SandboxPolicy,
+    ViewModelSnapshot,
 };
 use modron_view::{TranscriptEntry, COMPOSER_PLACEHOLDER, QUEUE_LABEL, STOP_LABEL};
 use nsh_core::element::{input, AdaptiveColor};
@@ -80,6 +82,14 @@ pub enum UiAction {
     Nav(NavStep),
     /// `/model <name>`: switch the model (the core's `select_model`).
     SelectModel(String),
+    /// Shift+S or the web save control: write the model and provider as the
+    /// server's default for future sessions (the core's
+    /// `persist_default_model`). The current session keeps its model. The
+    /// refusal, if any, shows through the last error.
+    SaveDefaultModel {
+        model: String,
+        provider: String,
+    },
     /// The model picker opened: ask the server for the router defaults.
     ListModels,
     /// `/mode` with no argument: the next approval mode.
@@ -89,6 +99,17 @@ pub enum UiAction {
     ToggleReasoning,
     /// `/sandbox` with no argument: the next sandbox policy.
     CycleSandbox,
+    /// `/allow <tool>` and `/deny <tool>`: add the tool to the allow or deny
+    /// list for future runs (the core's `set_tool_lists`, the list kept).
+    AddToolRule {
+        allow: bool,
+        tool: String,
+    },
+    /// `/allow` or `/deny` with no tool: show the current lists.
+    ShowToolLists,
+    /// `/worktree <title>`: a task session in its own worktree (the core's
+    /// `create_task`, off the default base).
+    CreateTask(String),
     /// `/fork`, `/tasks`, `/share`, `/remote-control <url>`.
     Fork,
     TaskStatus,
@@ -119,10 +140,18 @@ pub enum UiAction {
     CreateInvite(String),
     RevokeInvite(String),
     CopyInvite(String),
-    /// `!command`: run the command in the attached session's shell (the
-    /// core's `shell`). Never sent to the model; the bare `!` gives the
-    /// core's usage refusal.
-    Shell(String),
+    /// `!command` (shared: the output may reach the model) and `!!command`
+    /// (private: shown, never sent to the model). The core's `shell` and
+    /// `shell_private`; a bare `!` gives the core's usage refusal.
+    Shell {
+        command: String,
+        private: bool,
+    },
+    /// Ctrl+V: read an image (or the text) from the clipboard. An image is
+    /// staged as a chip for the next submit (see [`stage`]).
+    Paste,
+    /// Backspace on an empty composer with chips staged: drop the last chip.
+    Detach,
     /// The tool detail panel: Ctrl+T, or a tap on the turn summary (web).
     Tools(ToolsStep),
     /// Credentials: the core's `auth_providers` (the rows arrive in the
@@ -278,6 +307,8 @@ pub(crate) fn fit_transcript_height(window: f32) -> f32 {
 /// activity rows. Fixed slot counts keep NSH's cell layout static (see the
 /// transcript note below).
 const QUEUE_SLOTS: usize = 4;
+/// Visible image chips above the composer.
+const ATTACH_SLOTS: usize = 4;
 const STEER_SLOTS: usize = 3;
 const PLAN_LINE_SLOTS: usize = 12;
 const TOOL_SLOTS: usize = 6;
@@ -429,6 +460,8 @@ pub struct KeyFacts {
     pub selected_session: Option<Uuid>,
     /// The action Enter would send for the selected settings row.
     pub enter_setting: Option<UiAction>,
+    /// The save-as-default action for the highlighted model (Models only).
+    pub save_default: Option<UiAction>,
     /// Packet C3f: the number of command suggestions shown (0 when none).
     pub slash_len: usize,
     /// The composer text is exactly a command word.
@@ -455,6 +488,8 @@ pub struct KeyFacts {
     pub file_mode: bool,
     /// The credentials screen has a key entry open (Esc closes it first).
     pub auth_keying: bool,
+    /// Image chips staged for the next submit (Backspace removes one first).
+    pub attachments: usize,
 }
 
 /// One transcript scroll step (the keys PageUp, PageDown, Home, End).
@@ -549,6 +584,9 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
         Key::Char('t') if chord && facts.screen == Screen::Chat => {
             return Routed::Tools(ToolsStep::Toggle)
         }
+        Key::Char('v') if chord && facts.screen == Screen::Chat => {
+            return Routed::Action(UiAction::Paste)
+        }
         Key::Char('o') if chord => return Routed::Nav(NavStep::Open(Screen::Sessions)),
         Key::Char('a') if chord && facts.screen == Screen::Chat => {
             return match facts.first_agent.clone() {
@@ -586,6 +624,9 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
         Key::Down if recall => return Routed::Recall { up: false },
         Key::Char('?') if !chord && draft.is_empty() => {
             return Routed::Nav(NavStep::Open(Screen::Help))
+        }
+        Key::Backspace if !chord && draft.is_empty() && facts.attachments > 0 => {
+            return Routed::Action(UiAction::Detach);
         }
         Key::Backspace if !chord && draft.is_empty() && facts.queued > 0 => {
             return Routed::Action(UiAction::Dequeue(facts.queued - 1));
@@ -661,17 +702,10 @@ pub fn submit_action(task: &str) -> UiAction {
     if task.starts_with('/') {
         return slash::run(task);
     }
-    match shell_command(task) {
-        Some(command) => UiAction::Shell(command),
+    match parse_shell_input(task) {
+        Some(input) => UiAction::Shell { command: input.command, private: input.private },
         None => UiAction::Send(task.to_string()),
     }
-}
-
-/// `!command` detection: everything after the leading `!`, trimmed (the old
-/// TUI's rule, crates/modron-tui `shell_passthrough`). `Some("")` for a bare
-/// `!`. None for a task.
-pub fn shell_command(task: &str) -> Option<String> {
-    task.strip_prefix('!').map(|rest| rest.trim().to_string())
 }
 
 /// Esc, in precedence order: a pending approval is denied (its last option,
@@ -772,6 +806,12 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
                 Key::Up => Routed::Nav(NavStep::Move(-1)),
                 Key::Down => Routed::Nav(NavStep::Move(1)),
                 Key::Backspace => Routed::Nav(NavStep::FilterBack),
+                // Shift+S saves the highlighted model as the default (the old
+                // terminal's key). It does not type into the filter.
+                Key::Char('S') => match &facts.save_default {
+                    Some(action) => Routed::Action(action.clone()),
+                    None => Routed::Ignored,
+                },
                 Key::Char(c) => Routed::Nav(NavStep::Filter(c)),
                 _ => Routed::Ignored,
             };
@@ -846,6 +886,8 @@ pub enum Style {
     Meta,
     /// Tool activity and sub-agent rows.
     Tool,
+    /// Shell output lines (dim; the command header is `Bold`).
+    Dim,
 }
 
 /// One visual line of the transcript.
@@ -906,11 +948,14 @@ pub struct Model {
     /// their title, verbatim from the snapshot.
     pub tool_detail: Vec<String>,
     pub tool_title: String,
+    /// The staged image chips (`[img name · size]`), above the composer.
+    pub attachments: Vec<String>,
 }
 
 impl Model {
     pub fn from_snapshot(s: &ViewModelSnapshot) -> Self {
         Self {
+            attachments: staged_labels(),
             connection: s.connection_label.clone(),
             provider: s.provider.clone(),
             running: s.running_label.clone(),
@@ -958,9 +1003,10 @@ fn reasoning_tail(text: &str, count: usize) -> String {
 pub fn style_of(entry: &TranscriptEntry) -> Style {
     match entry {
         TranscriptEntry::Task { .. } => Style::Bold,
-        TranscriptEntry::ToolSummary { .. }
-        | TranscriptEntry::Swarm { .. }
-        | TranscriptEntry::Shell { .. } => Style::Tool,
+        TranscriptEntry::ToolSummary { .. } | TranscriptEntry::Swarm { .. } => Style::Tool,
+        // A shell row: the `$ command` line is prominent (see transcript_lines),
+        // its output dim.
+        TranscriptEntry::Shell { .. } => Style::Tool,
         TranscriptEntry::Model { .. }
         | TranscriptEntry::Usage { .. }
         | TranscriptEntry::Compaction { .. } => Style::Meta,
@@ -978,7 +1024,17 @@ pub fn transcript_lines(history: &[RenderedRow]) -> Vec<Line> {
         .iter()
         .flat_map(|row| {
             let style = style_of(&row.entry);
-            row.lines.iter().map(move |text| Line { style, text: text.clone() })
+            let shell = matches!(row.entry, TranscriptEntry::Shell { .. });
+            row.lines.iter().enumerate().map(move |(index, text)| {
+                // Shell rows: the header line (`$ command`, with the shared
+                // private mark) is bold, the output lines are dim.
+                let style = match (shell, index) {
+                    (true, 0) => Style::Bold,
+                    (true, _) => Style::Dim,
+                    _ => style,
+                };
+                Line { style, text: text.clone() }
+            })
         })
         .collect()
 }
@@ -1189,6 +1245,7 @@ impl Host {
             filter_active: !self.nav.filter().is_empty(),
             selected_session: self.nav.selected_session(),
             enter_setting: self.nav.enter_setting(),
+            save_default: self.nav.save_default_action(),
             slash_len: if self.nav.suggestions_shown() { items.names.len() } else { 0 },
             file_mode: items.file,
             tool_panel: self.tool_panel.is_some(),
@@ -1202,6 +1259,7 @@ impl Host {
             recalling: history_pos().is_some(),
             history_len: HISTORY.lock().map(|h| h.len()).unwrap_or(0),
             auth_keying: self.nav.auth_keying(),
+            attachments: staged_count(),
         };
         let routed = route_key(key, alt, chord, facts, &draft);
         // Typing or deleting changes the text: the suggestions show again.
@@ -1420,6 +1478,7 @@ pub(crate) fn style_token(style: Style) -> &'static str {
         Style::Plain => "foreground",
         Style::Meta => "muted-foreground",
         Style::Tool => "tool",
+        Style::Dim => "dim",
     }
 }
 
@@ -1449,7 +1508,7 @@ fn styled_line(model: Signal<Model>, at: Position, style: Style) -> impl IntoEle
     match style {
         Style::Bold => line.font_weight(FontWeight::BOLD),
         Style::Meta => line.italic(),
-        Style::Plain | Style::Tool => line,
+        Style::Plain | Style::Tool | Style::Dim => line,
     }
 }
 
@@ -1472,6 +1531,10 @@ fn transcript_row(model: Signal<Model>, at: Position) -> impl IntoElement {
         .child(when(
             move || is_style(model, at, Style::Tool),
             move || styled_line(model, at, Style::Tool),
+        ))
+        .child(when(
+            move || is_style(model, at, Style::Dim),
+            move || styled_line(model, at, Style::Dim),
         ))
 }
 
@@ -1539,6 +1602,10 @@ fn dim_token(_: &str) -> &'static str {
 
 fn tool_token(_: &str) -> &'static str {
     style_token(Style::Tool)
+}
+
+fn attachment_rows(m: &Model) -> Vec<String> {
+    m.attachments.clone()
 }
 
 fn queue_rows(m: &Model) -> Vec<String> {
@@ -1894,6 +1961,7 @@ pub fn screen(
             move || tool_strip(model, actions.clone())
         }))
         .child(swarm_slots(model, nav, actions.clone()))
+        .child(row_slots(model, ATTACH_SLOTS, attachment_rows, dim_token, true))
         .child(row_slots(model, NOTE_SLOTS, note_rows, dim_token, true))
         .child(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true))
         .child(when(
@@ -2023,6 +2091,8 @@ mod tests {
         filter_active: false,
         selected_session: None,
         enter_setting: None,
+        save_default: None,
+        attachments: 0,
         slash_len: 0,
         slash_exact: false,
         selected_index: 0,
@@ -2568,5 +2638,146 @@ mod wheel_tests {
         // Less than one row still moves one row.
         assert_eq!(rows_for_pixels(-3.0), 1);
         assert_eq!(rows_for_pixels(3.0), -1);
+    }
+}
+
+#[cfg(test)]
+mod shell_input_tests {
+    use super::*;
+    use modron_mobile_core::view::entry_lines;
+
+    #[test]
+    fn bang_is_shared_and_double_bang_is_private() {
+        assert_eq!(
+            submit_action("!ls -la"),
+            UiAction::Shell { command: "ls -la".into(), private: false }
+        );
+        assert_eq!(submit_action("!!ls"), UiAction::Shell { command: "ls".into(), private: true });
+        assert_eq!(
+            submit_action("!!   pwd  "),
+            UiAction::Shell { command: "pwd".into(), private: true }
+        );
+    }
+
+    #[test]
+    fn a_bare_bang_sends_an_empty_command_for_the_core_usage_refusal() {
+        assert_eq!(submit_action("!"), UiAction::Shell { command: String::new(), private: false });
+        assert_eq!(submit_action("!!"), UiAction::Shell { command: String::new(), private: true });
+    }
+
+    #[test]
+    fn plain_text_and_commands_are_not_shell() {
+        assert_eq!(submit_action("hello !x"), UiAction::Send("hello !x".into()));
+        assert_eq!(submit_action("/help"), slash::run("/help"));
+    }
+
+    #[test]
+    fn shell_rows_put_the_command_first_and_dim_the_output() {
+        let entry = TranscriptEntry::Shell {
+            command: "ls".into(),
+            lines: vec!["a.txt".into(), "b.txt".into()],
+            is_error: false,
+            private: false,
+        };
+        let history = vec![RenderedRow { lines: entry_lines(&entry), entry }];
+        let lines = transcript_lines(&history);
+        let styles: Vec<Style> = lines.iter().map(|l| l.style).collect();
+        assert_eq!(styles, vec![Style::Bold, Style::Dim, Style::Dim]);
+        assert_eq!(lines[0].text, "$ ls");
+    }
+
+    #[test]
+    fn private_rows_keep_the_shared_mark() {
+        let entry = TranscriptEntry::Shell {
+            command: "env".into(),
+            lines: vec![],
+            is_error: false,
+            private: true,
+        };
+        let lines = entry_lines(&entry);
+        assert_eq!(lines[0], format!("$ env [{}]", modron_view::PRIVATE_SHELL_MARK));
+    }
+}
+
+/// One image staged for the next submit (PARITY item 10): the chip's name and
+/// size, and the wire attachment the core sends.
+#[derive(Clone, Debug)]
+pub struct Staged {
+    pub name: String,
+    pub bytes: u64,
+    pub wire: Attachment,
+}
+
+/// The images staged for the next submit. The driver clears them only when
+/// the submit is accepted, so a refused submit keeps its chips.
+static STAGED: Mutex<Vec<Staged>> = Mutex::new(Vec::new());
+
+/// The chip text: `[img name · size]`, the size through the shared formatter.
+pub fn chip_label(name: &str, bytes: u64) -> String {
+    format!("[img {name} \u{b7} {}]", modron_view::human_bytes(bytes))
+}
+
+/// Stages an image for the next submit.
+pub fn stage(item: Staged) {
+    if let Ok(mut staged) = STAGED.lock() {
+        staged.push(item);
+    }
+}
+
+/// Removes the last staged image; true when one was removed.
+pub fn unstage_last() -> bool {
+    STAGED.lock().map(|mut s| s.pop().is_some()).unwrap_or(false)
+}
+
+/// Clears every staged image (after an accepted submit).
+pub fn clear_staged() {
+    if let Ok(mut staged) = STAGED.lock() {
+        staged.clear();
+    }
+}
+
+/// How many images are staged.
+pub fn staged_count() -> usize {
+    STAGED.lock().map(|s| s.len()).unwrap_or(0)
+}
+
+/// The wire attachments the next submit carries.
+pub fn staged_wire() -> Vec<Attachment> {
+    STAGED.lock().map(|s| s.iter().map(|i| i.wire.clone()).collect()).unwrap_or_default()
+}
+
+/// The chip labels, in staging order.
+pub fn staged_labels() -> Vec<String> {
+    STAGED
+        .lock()
+        .map(|s| s.iter().map(|i| chip_label(&i.name, i.bytes)).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_v_pastes_and_backspace_drops_a_chip_before_a_queued_message() {
+        let chip = KeyFacts { attachments: 1, queued: 2, ..Default::default() };
+        assert_eq!(
+            route_key(Key::Backspace, false, false, chip, ""),
+            Routed::Action(UiAction::Detach)
+        );
+        let queued = KeyFacts { queued: 2, ..Default::default() };
+        assert_eq!(
+            route_key(Key::Backspace, false, false, queued, ""),
+            Routed::Action(UiAction::Dequeue(1))
+        );
+        assert_eq!(
+            route_key(Key::Char('v'), false, true, KeyFacts::default(), ""),
+            Routed::Action(UiAction::Paste)
+        );
+    }
+
+    #[test]
+    fn chips_show_name_and_the_shared_size() {
+        assert_eq!(chip_label("pic.png", 1229), "[img pic.png \u{b7} 1.2 KB]");
     }
 }

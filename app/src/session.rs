@@ -556,7 +556,28 @@ impl Drop for Driver {
 /// land in the same field.
 fn apply(client: &RemoteClient, action: UiAction) {
     let result = match action {
-        UiAction::Send(text) => client.send_message(text),
+        UiAction::Send(text) => {
+            // The staged images go with this submit; they are cleared only
+            // when the core accepts it (a refusal keeps the chips).
+            let staged = crate::chat::staged_wire();
+            let had_images = !staged.is_empty();
+            let result = client.send_message_with(text, staged);
+            if result.is_ok() && had_images {
+                crate::chat::clear_staged();
+            }
+            result
+        }
+        UiAction::Detach => {
+            if crate::chat::unstage_last() {
+                client.note_local_error(ATTACH_REMOVED_NOTE);
+            }
+            Ok(())
+        }
+        UiAction::Paste => {
+            let note = paste_clipboard();
+            client.note_local_error(note);
+            Ok(())
+        }
         UiAction::Queue(text) => client.enqueue(text),
         UiAction::Dequeue(index) => client.dequeue(u32::try_from(index).unwrap_or(u32::MAX)),
         UiAction::Decide(index) => {
@@ -585,7 +606,8 @@ fn apply(client: &RemoteClient, action: UiAction) {
             Ok(())
         }
         UiAction::Compact => client.compact(),
-        UiAction::Shell(command) => client.shell(command),
+        UiAction::Shell { command, private: false } => client.shell(command),
+        UiAction::Shell { command, private: true } => client.shell_private(command),
         UiAction::ListSessions => client.list_sessions(),
         UiAction::Attach(session) => client.attach(session, 0),
         UiAction::NewSession => client.new_session(None),
@@ -598,6 +620,9 @@ fn apply(client: &RemoteClient, action: UiAction) {
             client.set_config(ConfigPatch { sandbox: Some(policy), ..Default::default() })
         }
         UiAction::SelectModel(model) => client.select_model(model),
+        UiAction::SaveDefaultModel { model, provider } => {
+            client.persist_default_model(&model, &provider)
+        }
         // The catalog (`models_req`) and the router defaults: the picker
         // shows the catalog once it arrives and the defaults until then.
         UiAction::ListModels => client.request_models().and_then(|()| client.router_defaults()),
@@ -608,6 +633,29 @@ fn apply(client: &RemoteClient, action: UiAction) {
         UiAction::CycleSandbox => {
             let policy = sandbox_next(client.state().sandbox_policy);
             client.set_config(ConfigPatch { sandbox: Some(policy), ..Default::default() })
+        }
+        UiAction::CreateTask(title) => client.create_task(&title, None),
+        UiAction::AddToolRule { allow, tool } => {
+            let state = client.state();
+            let mut list = if allow { state.allow_tools.clone() } else { state.deny_tools.clone() };
+            if !list.contains(&tool) {
+                list.push(tool);
+            }
+            if allow {
+                client.set_tool_lists(Some(list), None)
+            } else {
+                client.set_tool_lists(None, Some(list))
+            }
+        }
+        UiAction::ShowToolLists => {
+            let state = client.state();
+            let note = format!(
+                "allow: {} | deny: {}",
+                tool_list_text(&state.allow_tools),
+                tool_list_text(&state.deny_tools)
+            );
+            client.note_local_error(note);
+            Ok(())
         }
         UiAction::Fork => with_session(client, |s| client.fork_session(s)),
         UiAction::TaskStatus => with_session(client, |s| client.task_status(s)),
@@ -775,5 +823,50 @@ mod stall_tests {
             since + Duration::from_millis(CONNECT_STALL.as_millis() as u64 - 1)
         ));
         assert!(connect_stalled(since, since + CONNECT_STALL));
+    }
+}
+
+/// Shown when a clipboard image is removed with Backspace.
+const ATTACH_REMOVED_NOTE: &str = "image removed";
+/// The clipboard holds text, not an image: the terminal's own paste carries it.
+const CLIPBOARD_TEXT_NOTE: &str = "clipboard has text, not an image: paste it with the terminal";
+#[cfg(not(target_arch = "wasm32"))]
+const CLIPBOARD_EMPTY_NOTE: &str = "clipboard is empty";
+
+/// Ctrl+V: reads the clipboard and stages an image as a chip. Returns the
+/// note the status line shows. Runs the OS clipboard tools (bounded at 2 s
+/// each) on the driver's thread.
+fn paste_clipboard() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::clipboard::{harvest, Harvest};
+        match harvest() {
+            Harvest::Image { name, mime, bytes } => {
+                match modron_mobile_core::attachment_from_bytes(&name, mime, &bytes) {
+                    Ok(wire) => {
+                        let size = bytes.len() as u64;
+                        let label = crate::chat::chip_label(&name, size);
+                        crate::chat::stage(crate::chat::Staged { name, bytes: size, wire });
+                        format!("attached {label} (goes with your next message)")
+                    }
+                    Err(reason) => reason,
+                }
+            }
+            Harvest::Text(_) => CLIPBOARD_TEXT_NOTE.to_string(),
+            Harvest::Empty => CLIPBOARD_EMPTY_NOTE.to_string(),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        CLIPBOARD_TEXT_NOTE.to_string()
+    }
+}
+
+/// A tool list as the status line shows it: comma separated, or `none`.
+fn tool_list_text(tools: &[String]) -> String {
+    if tools.is_empty() {
+        "none".to_string()
+    } else {
+        tools.join(", ")
     }
 }

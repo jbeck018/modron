@@ -18,7 +18,7 @@ use modron_mobile_core::view::{
     SLASH_UNKNOWN_LABEL,
 };
 use modron_mobile_core::{ApprovalModeWire, Effort, Phase, SandboxPolicy};
-use modron_view::slash::{slash_lookup, suggestions, SLASH_COMMANDS};
+use modron_view::slash::{slash_lookup, SLASH_COMMANDS};
 
 use crate::chat::UiAction;
 use crate::nav::{NavStep, Screen};
@@ -43,13 +43,33 @@ pub const LOCAL: &[Entry] = &[
     Entry { name: "exit", usage: "/exit", about: "leave the app" },
 ];
 
-/// Every command: the shared table in its order, then [`LOCAL`].
+/// Shown for `/automations` until its screen exists.
+const AUTOMATIONS_NOT_BUILT: &str =
+    "automations screen is not in this app yet; use modron automations";
+
+/// The shared table as entries, in its order.
+fn table_entries() -> Vec<Entry> {
+    SLASH_COMMANDS.iter().map(|c| Entry { name: c.name, usage: c.usage, about: c.about }).collect()
+}
+
+/// Merge the shared table with the app's own list, de-duplicated by name.
+/// The shared entry wins for a name both lists have (its usage and copy are
+/// the ones every client shows); the app's entry is dropped. Order: the
+/// shared table first, then the app's remaining rows.
+pub fn merge(shared: &[Entry], local: &[Entry]) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::with_capacity(shared.len() + local.len());
+    for entry in shared.iter().chain(local.iter()) {
+        if !out.iter().any(|e| e.name == entry.name) {
+            out.push(*entry);
+        }
+    }
+    out
+}
+
+/// Every command: the shared table in its order, then the app's own rows
+/// the table does not name. Each name appears once.
 pub fn all() -> Vec<Entry> {
-    SLASH_COMMANDS
-        .iter()
-        .map(|c| Entry { name: c.name, usage: c.usage, about: c.about })
-        .chain(LOCAL.iter().copied())
-        .collect()
+    merge(&table_entries(), LOCAL)
 }
 
 /// The suggestions for the composer text: none unless the text is a slash
@@ -61,18 +81,9 @@ pub fn suggestions_for(text: &str) -> Vec<Entry> {
     if rest.chars().any(char::is_whitespace) {
         return Vec::new();
     }
+    // Prefix matches over the merged list, in its order: a name shows once.
     let token = rest.to_lowercase();
-    let table = suggestions(&token);
-    all()
-        .into_iter()
-        .filter(|e| {
-            if LOCAL.iter().any(|l| l.name == e.name) {
-                e.name.starts_with(&token)
-            } else {
-                table.contains(&e.name)
-            }
-        })
-        .collect()
+    all().into_iter().filter(|e| e.name.starts_with(&token)).collect()
 }
 
 /// True when the text is exactly a command word (Enter then runs it
@@ -106,7 +117,11 @@ pub fn run(line: &str) -> UiAction {
         Some((word, args)) => (word, args.trim()),
         None => (body, ""),
     };
+    // The shared table resolves first (a shared alias or renamed entry maps
+    // to its own name); the arms below are the app's dispatch, including the
+    // aliases the table does not carry.
     let word = word.to_lowercase();
+    let word = slash_lookup(&word).map(|spec| spec.name.to_string()).unwrap_or(word);
     let usage = |name: &str| {
         all()
             .iter()
@@ -162,6 +177,14 @@ pub fn run(line: &str) -> UiAction {
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,
         "tasks" => UiAction::TaskStatus,
+        "allow" | "deny" if args.is_empty() => UiAction::ShowToolLists,
+        "allow" => UiAction::AddToolRule { allow: true, tool: args.to_string() },
+        "deny" => UiAction::AddToolRule { allow: false, tool: args.to_string() },
+        // The automations screen (PARITY-D2 item 18) is not built yet: the
+        // word is recognised so the command list and help stay honest.
+        "automations" => UiAction::Notice(AUTOMATIONS_NOT_BUILT.to_string()),
+        "worktree" | "worktrees" if args.is_empty() => usage("worktree"),
+        "worktree" | "worktrees" => UiAction::CreateTask(args.to_string()),
         "share" | "publish" => UiAction::Share,
         "remote-control" | "rc" if args.is_empty() => usage("remote-control"),
         "remote-control" | "rc" => UiAction::RemoteControl(args.to_string()),
@@ -199,6 +222,28 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), len);
+    }
+
+    #[test]
+    fn a_shared_entry_wins_over_a_local_one_with_the_same_name() {
+        let shared = [Entry { name: "review", usage: "/review [focus]", about: "shared" }];
+        let local = [
+            Entry { name: "review", usage: "/review", about: "local" },
+            Entry { name: "exit", usage: "/exit", about: "leave" },
+        ];
+        let merged = merge(&shared, &local);
+        let names: Vec<&str> = merged.iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["review", "exit"]);
+        assert_eq!(merged[0].about, "shared");
+    }
+
+    #[test]
+    fn suggestions_never_show_a_name_twice() {
+        let names: Vec<&str> = suggestions_for("/").iter().map(|e| e.name).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(names.len(), unique.len());
     }
 
     #[test]

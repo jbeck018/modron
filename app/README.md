@@ -79,6 +79,29 @@ Shell passthrough: a composer line starting with `!` runs the rest of the
 line on the server (through the core's `shell` call, under the usual approval
 rules) and never reaches the model. A bare `!` is the server's usage refusal.
 Refusals and output arrive through the status line's note or error.
+`!!command` is the private form: the same run, shown in the transcript with the
+shared private mark, and never sent to the model (the core's
+`shell_private`). Its output rows are dim; the command line is bold.
+
+Model picker: Enter switches the session's model only. Shift+S (terminal) or
+the "save as default" control (web) on the highlighted row writes that model
+and its provider as the server's default for future sessions
+(`persist_default_model`). A refusal (for example over a portal tunnel) shows
+through the status line's error.
+
+Images: Ctrl+V (terminal) reads an image from the system clipboard with
+`wl-paste` or `xclip` (Linux) or `pbpaste` for text on macOS, bounded at 2 s
+per tool (`src/clipboard.rs`, the tools injectable for tests). An image becomes
+a chip above the composer (`[img name, size]`) that the next submit carries;
+Backspace on an empty composer removes the last chip before it dequeues a
+message. A refused submit keeps its chips. Not done: the macOS image read, and
+the web attach control. The old terminal did not attach typed or dropped
+paths either, so they stay text.
+
+Tool lists: `/allow <tool>` and `/deny <tool>` add the tool to the list for
+future runs (the core's `set_tool_lists`); bare, they show both lists.
+`/worktree <title>` creates a task session. `/automations` is recognised but
+its screen is not built yet.
 
 `@file` completion (terminal only): an `@` that starts a token opens the
 suggestion list with workspace paths that contain the text typed after it

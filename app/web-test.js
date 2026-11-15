@@ -710,6 +710,23 @@ async function testCtrlTAndShellPassthrough(browser, base) {
   }
 }
 
+// PARITY-D2 item 1. "!!ls" sends a shell frame with private true, never a submit.
+async function testBangBangPrivate(browser, base) {
+  const ws = await startWsServer();
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.keyboard.type('!!ls');
+    await page.keyboard.press('Enter');
+    const frame = await waitFrame(ws, 'shell', (f) => f.command === 'ls');
+    if (frame.private !== true) throw new Error('!!ls frame was not private: ' + JSON.stringify(frame));
+    if (ws.received.includes('submit')) throw new Error('a shell line was submitted: ' + ws.received.join(','));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // Packet C3f. Typing "/co" in the composer shows the compact suggestion.
 async function testSlashSuggestions(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
@@ -899,6 +916,7 @@ async function testAgentSteerAndKill(browser, base) {
     ['(p4) settings share: a viewer invite is created, shown and revoked', async () => {
       const s = await portalSite('on'); try { await testInviteFromSettings(browser, s); } finally { s.close(); } }],
     ['(d1) ctrl+t note, and "!ls" sends a shell frame (no submit)', () => testCtrlTAndShellPassthrough(browser, base)],
+    ['(d1b) "!!ls" sends a private shell frame (no submit)', () => testBangBangPrivate(browser, base)],
   ];
   more.push(...portal);
   for (const [name, run] of more) {
