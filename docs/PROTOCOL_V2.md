@@ -240,6 +240,37 @@ checkpoint. A refused command persists nothing and ends with a `note`
 carrying the reason, followed by `turn_done`. A command that ran ends
 with `turn_done` and no `notify`.
 
+## 7c. Removing a saved credential (AUTH-REMOVE)
+
+```
+client -> server  { "type": "auth_remove", "session_id": <uuid>, "provider": "<id>" }
+server -> client  note (correlated to the request)
+server -> client  auth_providers { rows }  (uncorrelated, to the same connection)
+```
+
+- `provider` must be an auth-registry id (`anthropic`, `openai-compat`,
+  `zai`, `groq`, ...). Any other id gets `error` with kind `not_found`.
+- What is removed: the provider's `export <VAR>=` line in Modron's env
+  file (rewritten atomically at mode 0600 or the file's existing mode;
+  every other line is kept verbatim), and Modron's own stored sign-in
+  tokens for that provider (`~/.modron/auth/anthropic.json` or
+  `~/.modron/auth/openai.json`). Nothing else is touched.
+- Refused, nothing changed: a credential that only another tool holds
+  (Codex CLI, Claude Code) gets an `error` naming the tool ("sign out
+  there"). An env-file line that names the variable in a shape Modron
+  cannot parse also fails, and the file is left as it was.
+- Nothing stored is not an error: the note says "nothing saved for this
+  provider".
+- The note never contains a key or token. If the variable is still set in
+  the server's environment (a shell export), the note says so.
+- UI effect (every client): show the note; replace the provider's
+  credentials row with the refreshed `auth_providers` row, which reads
+  "not configured" (or the remaining status). Running sessions are not
+  stopped: their provider object keeps the key or tokens it was built
+  with.
+- Local connections only. A relayed tunnel refuses `auth_remove` for every
+  role (owner, approver, viewer), as it does for `auth_set_key`.
+
 ## 8. Host and handoff (C6)
 
 ```

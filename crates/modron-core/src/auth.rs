@@ -260,6 +260,175 @@ pub fn remove_key_from_env_file(path: &std::path::Path, env_var: &str) -> std::i
     Ok(true)
 }
 
+/// What [`remove_credential`] removed for one provider. Carries only which
+/// kinds were removed, never a secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovedCredential {
+    /// Registry provider id (`anthropic`, `zai`, ...).
+    pub provider_id: &'static str,
+    /// The env var whose saved line was removed (`ANTHROPIC_API_KEY`, ...).
+    pub env_var: &'static str,
+    /// A saved API key line was removed from the env file.
+    pub key_removed: bool,
+    /// Modron's own stored sign-in tokens were deleted.
+    pub oauth_removed: bool,
+}
+
+impl RemovedCredential {
+    /// True when Modron had nothing saved for the provider (not an error).
+    pub fn nothing_stored(&self) -> bool {
+        !self.key_removed && !self.oauth_removed
+    }
+
+    /// One human line for notes and pickers. Names kinds only.
+    pub fn describe(&self) -> String {
+        match (self.key_removed, self.oauth_removed) {
+            (true, true) => "API key and sign-in tokens removed".into(),
+            (true, false) => "API key removed".into(),
+            (false, true) => "sign-in tokens removed".into(),
+            (false, false) => "nothing saved for this provider".into(),
+        }
+    }
+}
+
+/// Modron's own OAuth token files, injectable so tests stay hermetic.
+struct TokenFiles {
+    anthropic: std::path::PathBuf,
+    openai: std::path::PathBuf,
+}
+
+/// Remove what MODRON stored for one provider: its key line in the env
+/// file and its own OAuth tokens. Never touches another tool's credential
+/// files. When nothing is stored Modron holds but another tool's sign-in
+/// is discovered, the call is refused and nothing is changed.
+pub fn remove_credential(provider_id: &str) -> Result<RemovedCredential, String> {
+    let env = env_file().map_err(|e| format!("cannot resolve env file: {e}"))?;
+    let tokens = TokenFiles {
+        anthropic: oauth::auth_file().map_err(|e| e.to_string())?,
+        openai: oauth::chatgpt::token_file().map_err(|e| e.to_string())?,
+    };
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    remove_credential_at(provider_id, &env, &tokens, &home)
+}
+
+fn remove_credential_at(
+    provider_id: &str,
+    env_path: &std::path::Path,
+    tokens: &TokenFiles,
+    home: &std::path::Path,
+) -> Result<RemovedCredential, String> {
+    let info =
+        provider_info(provider_id).ok_or_else(|| format!("unknown provider {provider_id}"))?;
+
+    // The env file first: if it cannot be parsed safely we stop before any
+    // other file is touched.
+    let key_removed = remove_env_key_checked(env_path, info.env_var)?;
+
+    let token_path = match info.provider_id {
+        "anthropic" => Some(&tokens.anthropic),
+        "openai-compat" => Some(&tokens.openai),
+        _ => None,
+    };
+    let oauth_removed = match token_path {
+        Some(path) if path.exists() => {
+            std::fs::remove_file(path).map_err(|e| {
+                let prefix = if key_removed {
+                    "the saved key was removed, but "
+                } else {
+                    ""
+                };
+                format!("{prefix}cannot remove sign-in tokens: {e}")
+            })?;
+            true
+        }
+        _ => false,
+    };
+
+    if !key_removed && !oauth_removed {
+        // Modron holds nothing for this provider. If another tool's sign-in
+        // exists, say so instead of reporting "nothing to remove": that
+        // credential is not Modron's to delete.
+        let discovered_id = if info.provider_id == "openai-compat" {
+            "chatgpt"
+        } else {
+            info.provider_id
+        };
+        if let Some(signin) = discovery::find_existing_signins_in(home)
+            .into_iter()
+            .find(|s| s.provider_id == discovered_id)
+        {
+            return Err(format!(
+                "this sign-in belongs to {}; sign out there",
+                signin.source
+            ));
+        }
+    }
+
+    Ok(RemovedCredential {
+        provider_id: info.provider_id,
+        env_var: info.env_var,
+        key_removed,
+        oauth_removed,
+    })
+}
+
+/// The name a line assigns in `export NAME=...` form, if it has that shape.
+fn export_line_name(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("export ")?;
+    let (name, _) = rest.split_once('=')?;
+    Some(name.trim())
+}
+
+/// Remove the `export <env_var>=` line(s) from the env file, keeping every
+/// other line verbatim and the file's mode. Fails closed: a line that
+/// mentions `env_var` in a shape this code does not recognise makes the
+/// whole call an error and nothing is rewritten. Error text never includes
+/// line contents (they may hold a key). Ok(false) = nothing matched, no write.
+fn remove_env_key_checked(path: &std::path::Path, env_var: &str) -> Result<bool, String> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = 0usize;
+    for line in existing.lines() {
+        match export_line_name(line) {
+            Some(name) if name == env_var => removed += 1,
+            None if line.contains(env_var) => {
+                return Err(format!(
+                    "{} has a line naming {env_var} that Modron cannot parse; \
+                     edit it by hand (nothing was changed)",
+                    path.display()
+                ))
+            }
+            _ => kept.push(line),
+        }
+    }
+    if removed == 0 {
+        return Ok(false);
+    }
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .ok()
+    };
+    write_private(path, &body).map_err(|e| format!("cannot rewrite {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("cannot restore mode of {}: {e}", path.display()))?;
+    }
+    Ok(true)
+}
+
 /// Cross-process lock around an OAuth token refresh (E8). Refresh tokens
 /// are single-use: two Modron processes (a TUI and a daemon, two terminals)
 /// that both hit a 401 must not both spend the same refresh token, or the
@@ -1122,6 +1291,165 @@ mod tests {
 // the code for tokens at the documented endpoint. STATUS: unverified
 // against the live endpoint (needs a subscription + browser round-trip).
 // ToS-gray: API keys remain the first-class path.
+
+#[cfg(test)]
+mod remove_credential_tests {
+    use super::*;
+
+    /// A fresh temp home (no `tempfile` dep in this crate). Paths mirror the
+    /// production layout under HOME.
+    fn scratch_home(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let home = std::env::temp_dir().join(format!(
+            "modron-core-remove-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        home
+    }
+
+    fn files(home: &std::path::Path) -> (std::path::PathBuf, TokenFiles) {
+        (
+            home.join(".config").join("modron").join("env"),
+            TokenFiles {
+                anthropic: home.join(".modron").join("auth").join("anthropic.json"),
+                openai: home.join(".modron").join("auth").join("openai.json"),
+            },
+        )
+    }
+
+    fn write(path: &std::path::Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, contents).expect("write fixture");
+    }
+
+    #[test]
+    fn key_line_removed_and_other_lines_intact() {
+        let home = scratch_home("key");
+        let (env, tokens) = files(&home);
+        write(
+            &env,
+            "# saved by modron\nexport GROQ_API_KEY=\"gsk_fixture_one\"\nexport ZAI_API_KEY=\"zai_fixture\"\n",
+        );
+        let removed = remove_credential_at("groq", &env, &tokens, &home).expect("removed");
+        assert!(removed.key_removed, "groq key line removed");
+        assert!(!removed.oauth_removed);
+        assert_eq!(removed.describe(), "API key removed");
+        let after = std::fs::read_to_string(&env).expect("env");
+        assert!(!after.contains("GROQ_API_KEY"), "groq line gone");
+        assert!(after.contains("# saved by modron"), "comment kept");
+        assert!(
+            after.contains("export ZAI_API_KEY=\"zai_fixture\""),
+            "other provider line kept verbatim"
+        );
+        // A second removal finds nothing and is not an error.
+        let again = remove_credential_at("groq", &env, &tokens, &home).expect("second call ok");
+        assert!(again.nothing_stored());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn oauth_tokens_removed_and_other_provider_tokens_kept() {
+        let home = scratch_home("oauth");
+        let (env, tokens) = files(&home);
+        write(&tokens.anthropic, "{\"access_token\":\"fixture\"}");
+        write(&tokens.openai, "{\"access_token\":\"fixture\"}");
+        let removed = remove_credential_at("anthropic", &env, &tokens, &home).expect("removed");
+        assert!(removed.oauth_removed, "anthropic tokens removed");
+        assert!(!removed.key_removed);
+        assert!(!tokens.anthropic.exists(), "anthropic token file gone");
+        assert!(tokens.openai.exists(), "openai tokens untouched");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn discovered_only_sign_in_is_refused_and_untouched() {
+        let home = scratch_home("discovered");
+        let (env, tokens) = files(&home);
+        let codex = home.join(".codex").join("auth.json");
+        let body = "{\"tokens\":{\"access_token\":\"fixture_access\",\"refresh_token\":\"fixture_refresh\",\"account_id\":\"acct_fixture\"}}";
+        write(&codex, body);
+        let err = remove_credential_at("openai-compat", &env, &tokens, &home)
+            .expect_err("another tool's sign-in is refused");
+        assert!(
+            err.contains("Codex CLI") && err.contains("sign out there"),
+            "refusal names the tool: {err}"
+        );
+        assert!(!err.contains("fixture_access"), "refusal carries no token");
+        assert_eq!(
+            std::fs::read_to_string(&codex).expect("codex file"),
+            body,
+            "another tool's file is byte-identical"
+        );
+        assert!(!env.exists(), "no env file created");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unknown_provider_is_refused() {
+        let home = scratch_home("unknown");
+        let (env, tokens) = files(&home);
+        let err = remove_credential_at("no-such-provider", &env, &tokens, &home)
+            .expect_err("unknown provider");
+        assert_eq!(err, "unknown provider no-such-provider");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn nothing_stored_is_an_empty_result_not_an_error() {
+        let home = scratch_home("empty");
+        let (env, tokens) = files(&home);
+        let removed = remove_credential_at("zai", &env, &tokens, &home).expect("ok");
+        assert!(removed.nothing_stored());
+        assert_eq!(removed.describe(), "nothing saved for this provider");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unparseable_line_refuses_and_rewrites_nothing() {
+        let home = scratch_home("unparseable");
+        let (env, tokens) = files(&home);
+        let contents = "GROQ_API_KEY=gsk_fixture_bare\nexport ZAI_API_KEY=\"zai_fixture\"\n";
+        write(&env, contents);
+        let err = remove_credential_at("groq", &env, &tokens, &home)
+            .expect_err("unrecognised line refused");
+        assert!(!err.contains("gsk_fixture_bare"), "error carries no key");
+        assert_eq!(std::fs::read_to_string(&env).expect("env"), contents);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_file_mode_is_preserved() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = scratch_home("mode");
+        let (env, tokens) = files(&home);
+        set_key_in_env_file(&env, "GROQ_API_KEY", "gsk_fixture_mode").expect("save");
+        set_key_in_env_file(&env, "ZAI_API_KEY", "zai_fixture").expect("save");
+        assert_eq!(
+            std::fs::metadata(&env).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+        remove_credential_at("groq", &env, &tokens, &home).expect("removed");
+        assert_eq!(
+            std::fs::metadata(&env).expect("meta").permissions().mode() & 0o777,
+            0o600,
+            "0600 kept"
+        );
+        // A deliberately different mode is kept too, not reset to 0600.
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        remove_credential_at("zai", &env, &tokens, &home).expect("removed");
+        assert_eq!(
+            std::fs::metadata(&env).expect("meta").permissions().mode() & 0o777,
+            0o640,
+            "existing mode kept"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
 
 pub mod oauth {
     use anyhow::anyhow;

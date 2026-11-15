@@ -502,6 +502,16 @@ pub enum Payload {
         provider: String,
         key: String,
     },
+    /// Remove a provider's saved credential: the API key line in Modron's
+    /// env file and Modron's own stored sign-in tokens. Never another
+    /// tool's files; a credential that only another tool holds is refused.
+    /// Answered by a correlated `note` (what was removed, or the refusal)
+    /// and followed by a fresh `auth_providers` frame to the requester.
+    /// UI effect (every client): the provider's credentials row returns to
+    /// "not configured" (or to what remains, such as a shell-exported key),
+    /// and the note is shown. Running sessions keep the provider object they
+    /// were built with; removal does not stop them.
+    AuthRemove { session_id: Uuid, provider: String },
     /// The router's default-model picture: what is signed in, the
     /// derived recommendation, and the active fallback chains. The
     /// settings page prefills its defaults card from this.
@@ -1180,6 +1190,32 @@ mod tests {
         assert_eq!(ApprovalModeWire::Deny.label(), "deny");
         assert_eq!(ApprovalModeWire::Ask.label(), "ask");
         assert_eq!(ApprovalModeWire::ApproveAll.label(), "yolo");
+    }
+
+    /// `auth_remove` carries the session and provider id intact and uses the
+    /// snake_case tag the relay table and clients match on.
+    #[test]
+    fn auth_remove_roundtrips_with_snake_case_tag() {
+        let session = Uuid::new_v4();
+        let frame = Frame::request(
+            9,
+            Payload::AuthRemove {
+                session_id: session,
+                provider: "anthropic".into(),
+            },
+        );
+        let tag = serde_json::to_value(&frame.payload).unwrap();
+        assert_eq!(tag["type"], "auth_remove");
+        match roundtrip(&frame).payload {
+            Payload::AuthRemove {
+                session_id,
+                provider,
+            } => {
+                assert_eq!(session_id, session);
+                assert_eq!(provider, "anthropic");
+            }
+            _ => panic!("auth_remove did not round-trip to AuthRemove"),
+        }
     }
 
     /// The model catalog frames use snake_case tags clients branch on, and

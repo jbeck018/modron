@@ -1104,6 +1104,19 @@ impl RemoteClient {
         ))
     }
 
+    /// Remove a provider's saved credential (the env-file key and Modron's
+    /// own sign-in tokens). The outcome arrives as a note and the refreshed
+    /// rows land in `state().providers`.
+    pub fn auth_remove(&self, session_id: Uuid, provider: &str) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AuthRemove {
+                session_id,
+                provider: provider.into(),
+            },
+        ))
+    }
+
     /// Create an empty session without submitting a task.
     pub fn new_session(&self, title: Option<&str>) -> Result<(), ClientError> {
         self.explicit_session();

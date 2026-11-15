@@ -283,7 +283,8 @@ const SERVER_WIDE: &str = "this request is not available through a remote-contro
 /// Refused for every role: list / delete / create sessions and tasks,
 /// submit that starts a new session or names another one, attach to another
 /// session, merge_task (it writes the repository's base branch), automations,
-/// remote_control, publish_page, auth_start, auth_set_key, persist_router and
+/// remote_control, publish_page, auth_start, auth_set_key, auth_remove,
+/// persist_router and
 /// persist_default_model (server-wide settings and credentials). Shell is
 /// Owner-only: the owner's own `!` command, never a guest's.
 pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTier, &'static str> {
@@ -346,6 +347,7 @@ pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTie
         | Payload::PublishPage { .. }
         | Payload::AuthStart { .. }
         | Payload::AuthSetKey { .. }
+        | Payload::AuthRemove { .. }
         | Payload::PersistRouter { .. }
         | Payload::PersistDefaultModel { .. } => Err(SERVER_WIDE),
         Payload::Welcome { .. }
@@ -743,6 +745,12 @@ async fn dispatch_frame(
             key,
         } => {
             handle_auth_set_key(state, ctx, request_id, session_id, provider, key).await;
+        }
+        Payload::AuthRemove {
+            session_id,
+            provider,
+        } => {
+            handle_auth_remove(state, ctx, request_id, session_id, provider);
         }
         Payload::RouterDefaultsReq {} => {
             handle_router_defaults_req(state, ctx, request_id).await;
@@ -1770,6 +1778,65 @@ async fn handle_auth_set_key(
     }
 }
 
+/// AuthRemove (local connections only, like auth_set_key): delete what
+/// Modron stored for a provider (the env-file key line and Modron's own
+/// OAuth tokens), then answer with a correlated `note` and a fresh
+/// `auth_providers` frame so the rows update.
+///
+/// A running session is not touched: its engine holds the provider object
+/// it was built with, which carries the key or tokens read at that time.
+/// The env file is read again only when a provider is built, and the
+/// Anthropic subscription provider re-reads its token file only on refresh.
+fn handle_auth_remove(
+    _state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    _session_id: SessionId,
+    provider: String,
+) {
+    let Some(info) = modron_core::auth::provider_info(&provider) else {
+        send(
+            ctx,
+            error_kind(
+                request_id,
+                format!("unknown provider {provider}"),
+                modron_protocol::ErrorKind::NotFound,
+            ),
+        );
+        return;
+    };
+    match modron_core::auth::remove_credential(info.provider_id) {
+        Ok(removed) => {
+            if removed.key_removed {
+                std::env::remove_var(info.env_var);
+            }
+            let mut text = format!("{}: {}", info.name, removed.describe());
+            if std::env::var(info.env_var).is_ok() {
+                text.push_str(
+                    "; a key is still set in this server's environment (unset it where modron serve starts)",
+                );
+            }
+            if !removed.nothing_stored() {
+                text.push_str("; sessions already running keep the provider they were built with");
+            }
+            send(ctx, reply(request_id, None, Payload::Note { text }));
+            // Uncorrelated on purpose: the request id was answered by the
+            // note above. Clients fold this frame by its payload.
+            send(
+                ctx,
+                reply(
+                    None,
+                    None,
+                    Payload::AuthProviders {
+                        rows: auth_provider_rows(),
+                    },
+                ),
+            );
+        }
+        Err(message) => send(ctx, error(request_id, message)),
+    }
+}
+
 /// Why a default model/provider pair cannot be saved, or `None` when it can.
 /// Both strings must be non-empty and free of control characters, and the
 /// provider must be one the server knows: a provider in the auth registry
@@ -2175,6 +2242,7 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::ModelsReq {} => "models_req",
         Payload::Models { .. } => "models",
         Payload::AuthSetKey { .. } => "auth_set_key",
+        Payload::AuthRemove { .. } => "auth_remove",
         Payload::AuthProviders { .. } | Payload::AuthProvidersReq {} => "auth_providers",
         Payload::PersistRouter { .. } => "persist_router",
         Payload::PersistDefaultModel { .. } => "persist_default_model",
@@ -2854,6 +2922,14 @@ mod tests {
                 [false, false, false, false],
             ),
             (
+                "auth_remove",
+                Payload::AuthRemove {
+                    session_id: own,
+                    provider: "p".into(),
+                },
+                [false, false, false, false],
+            ),
+            (
                 "persist_router",
                 Payload::PersistRouter {
                     cheap: "a".into(),
@@ -2920,6 +2996,7 @@ mod tests {
         "auth_providers",
         "auth_start",
         "auth_set_key",
+        "auth_remove",
         "persist_router",
         "ping",
         "router_defaults_req",
@@ -3017,6 +3094,150 @@ mod tests {
                 other => panic!("expected a reply, got {other:?}"),
             }
         }
+    }
+
+    /// AuthRemove is local-only: a trusted tunnel refuses it for every
+    /// relayed role, and the env file is left as it was.
+    #[tokio::test]
+    async fn auth_remove_is_refused_over_a_tunnel_for_every_role() {
+        let (state, dir) = test_state();
+        let env = dir.path().join("env");
+        std::fs::write(&env, "export GROQ_API_KEY=\"gsk_tunnel_fixture\"\n").unwrap();
+        let id = SessionId::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tunnel = ConnCtx::trusted_tunnel(tx, id);
+        tunnel.authed = true;
+        for role in [
+            modron_protocol::RelayRole::Owner,
+            modron_protocol::RelayRole::Approver,
+            modron_protocol::RelayRole::Viewer,
+        ] {
+            let mut frame = Frame::request(
+                20,
+                Payload::AuthRemove {
+                    session_id: id,
+                    provider: "groq".into(),
+                },
+            );
+            frame.role = Some(role);
+            handle_relayed_frame(&state, &mut tunnel, frame).await;
+            match next_outbound(&mut rx).await {
+                Outbound::Reply(frame) => match frame.payload {
+                    Payload::Error { kind, .. } => assert_eq!(
+                        kind,
+                        Some(modron_protocol::ErrorKind::Forbidden),
+                        "{role:?} is refused"
+                    ),
+                    _ => panic!("{role:?}: expected a forbidden error"),
+                },
+                other => panic!("{role:?}: expected a reply, got {other:?}"),
+            }
+        }
+        assert!(
+            std::fs::read_to_string(&env)
+                .unwrap()
+                .contains("GROQ_API_KEY"),
+            "a refused tunnel frame changes nothing"
+        );
+    }
+
+    /// Serialises the tests that point HOME and MODRON_CONFIG at a temp dir.
+    static CREDENTIAL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Local AuthRemove: the key line goes, the note carries no secret, and
+    /// the refreshed `auth_providers` rows show "not configured". Unknown
+    /// providers get a NotFound error.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises env mutation; single-threaded runtime
+    async fn auth_remove_local_updates_the_rows() {
+        let _guard = CREDENTIAL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, _dir) = test_state();
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let env = config.join("env");
+        let fixture = "gsk_local_fixture_value";
+        std::fs::write(
+            &env,
+            format!("export GROQ_API_KEY=\"{fixture}\"\nexport ZAI_API_KEY=\"zai_keep\"\n"),
+        )
+        .unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let saved_config = std::env::var_os("MODRON_CONFIG");
+        let saved_key = std::env::var_os("GROQ_API_KEY");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("MODRON_CONFIG", &config);
+        std::env::set_var("GROQ_API_KEY", fixture);
+
+        let id = SessionId::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut local = ConnCtx::new(tx);
+        local.authed = true;
+        let groq_row = |frame: &Frame| match &frame.payload {
+            Payload::AuthProviders { rows } => rows
+                .iter()
+                .find(|r| r.id == "groq")
+                .map(|r| r.status.clone()),
+            _ => None,
+        };
+        let frame = Frame::request(
+            30,
+            Payload::AuthRemove {
+                session_id: id,
+                provider: "groq".into(),
+            },
+        );
+        handle_frame(&state, &mut local, true, frame).await;
+        let note = match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => frame,
+            other => panic!("expected the note reply, got {other:?}"),
+        };
+        assert_eq!(note.id, Some(30), "the note answers the request");
+        let text = match &note.payload {
+            Payload::Note { text } => text.clone(),
+            Payload::Error { message, .. } => panic!("expected a note, got error: {message}"),
+            _ => panic!("expected a note"),
+        };
+        assert!(text.contains("API key removed"), "note names the removal");
+        assert!(!text.contains(fixture), "note carries no key");
+        let rows = match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => frame,
+            other => panic!("expected the rows, got {other:?}"),
+        };
+        assert_eq!(
+            groq_row(&rows).as_deref(),
+            Some("not configured"),
+            "the groq row returns to not configured"
+        );
+        let after = std::fs::read_to_string(&env).unwrap();
+        assert!(!after.contains("GROQ_API_KEY"), "groq line removed");
+        assert!(after.contains("zai_keep"), "other provider line kept");
+
+        let bad = Frame::request(
+            31,
+            Payload::AuthRemove {
+                session_id: id,
+                provider: "no-such-provider".into(),
+            },
+        );
+        handle_frame(&state, &mut local, true, bad).await;
+        match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => match frame.payload {
+                Payload::Error { kind, .. } => {
+                    assert_eq!(kind, Some(modron_protocol::ErrorKind::NotFound))
+                }
+                _ => panic!("expected an error for an unknown provider"),
+            },
+            other => panic!("expected a reply, got {other:?}"),
+        }
+
+        let restore = |name: &str, value: Option<std::ffi::OsString>| match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        restore("HOME", saved_home);
+        restore("MODRON_CONFIG", saved_config);
+        restore("GROQ_API_KEY", saved_key);
     }
 
     /// On a trusted tunnel the relayed role decides: a viewer may ping but

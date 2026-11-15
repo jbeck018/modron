@@ -1063,6 +1063,83 @@ async fn remote_control_started_lands_in_the_note() {
     server.abort();
 }
 
+/// `auth_remove` puts the provider on the wire; the correlated note and the
+/// refreshed auth rows fold into the snapshot (the row returns to
+/// "not configured").
+#[tokio::test]
+async fn auth_remove_sends_the_provider_and_folds_the_refreshed_rows() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let request = read_frame(&mut ws).await;
+        match &request.payload {
+            Payload::AuthRemove {
+                session_id,
+                provider,
+            } => {
+                assert_eq!(*session_id, session, "the frame names the session");
+                assert_eq!(provider, "anthropic", "the frame names the provider");
+            }
+            _ => panic!("expected an auth_remove frame"),
+        }
+        send_frame(
+            &mut ws,
+            &Frame {
+                id: request.id,
+                session: None,
+                seq: 0,
+                role: None,
+                payload: Payload::Note {
+                    text: "Anthropic (Claude): sign-in tokens removed".into(),
+                },
+            },
+        )
+        .await;
+        send_frame(
+            &mut ws,
+            &Frame {
+                id: None,
+                session: None,
+                seq: 0,
+                role: None,
+                payload: Payload::AuthProviders {
+                    rows: vec![modron_protocol::AuthProviderWire {
+                        id: "anthropic".into(),
+                        label: "Anthropic (Claude)".into(),
+                        status: "not configured".into(),
+                        oauth_capable: true,
+                    }],
+                },
+            },
+        )
+        .await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client
+        .auth_remove(session, "anthropic")
+        .expect("auth_remove sent");
+    wait_for(&client, |snap| {
+        snap.last_note.is_some() && !snap.providers.is_empty()
+    })
+    .await;
+    let snap = client.state();
+    let note = snap.last_note.expect("note");
+    assert!(note.contains("sign-in tokens removed"), "note: {note}");
+    let row = snap
+        .providers
+        .iter()
+        .find(|row| row.id == "anthropic")
+        .expect("anthropic row folded");
+    assert_eq!(row.status, "not configured");
+
+    server.abort();
+}
+
 // Parity invariant 5 end to end: reasoning deltas are dropped while
 // show_reasoning is off (the default) and stream once opted in; the
 // snapshot-seeded live reasoning buffer follows the same gate.
