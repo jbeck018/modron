@@ -1439,7 +1439,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 |---|---|---|---|
 | C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | DONE | 16ac999; labels in modron-protocol / modron-view, client core delegates |
 | C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | DONE | 43c3dbe; app/theme/oculus.json + check.py. Owner to confirm: chart colours, mono font, tool colour, large radius |
-| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | TODO | Depends on S1 |
+| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | ACTIVE | C3a DONE: app/ (crate modron-app, own workspace, NSH 0.5.1 no-JS), chat screen over the client core ViewModelSnapshot, terminal host `modron-app-tui` with a demo script, 7 headless tests. Open: tool/turn/sub-agent lines, theme colours, websocket transport, queue chips, plan card, sessions and settings screens |
 | C4 | Portal: Worker serves the web build; owner sign-in; linked GitHub accounts; session directory; invite links | TODO | Deploy needs the owner's Cloudflare login |
 | C5 | Tandem: multi-device attach, replay on reconnect, push for approvals | TODO | |
 | C6 | Cloud runs: container runs modron serve; sleep/restore; handoff | TODO | Depends on S3; deploy needs the owner's Cloudflare login |
@@ -1490,3 +1490,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   type error, which the lead fixed; .gitignore was found truncated to
   zero bytes and was restored from the index. Gates: fmt clean, clippy
   clean, 1063 tests pass.
+- 2026-11-15: C3a landed: first screen of the unified NSH app, on the
+  terminal target. App gates (in app/): fmt clean, clippy clean, 7
+  tests pass. The app is its own workspace, so root gates do not cover
+  it yet (C10).
