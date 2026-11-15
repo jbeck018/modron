@@ -7,6 +7,8 @@ use modron_mobile_core::{
 };
 use modron_view::TranscriptEntry;
 
+use crate::chat::Host;
+
 fn row(entry: TranscriptEntry) -> RenderedRow {
     RenderedRow { lines: entry_lines(&entry), entry }
 }
@@ -58,4 +60,33 @@ pub fn script() -> Vec<(u64, ViewModelSnapshot)> {
         (4_500, snap("2.4k tok \u{b7} ask", true, reading, vec![task.clone()], true)),
         (7_000, snap("6.1k tok \u{b7} ask", false, "", vec![task, reply, model], false)),
     ]
+}
+
+/// Plays [`script`] into a host: each frame is pushed once its time has come.
+/// Both hosts drive it from their own clock.
+pub struct Player {
+    frames: std::iter::Peekable<std::vec::IntoIter<(u64, ViewModelSnapshot)>>,
+}
+
+impl Default for Player {
+    fn default() -> Self {
+        Self { frames: script().into_iter().peekable() }
+    }
+}
+
+impl Player {
+    /// Pushes every frame due at `elapsed_ms` (since the demo started).
+    /// Returns true when a frame was pushed.
+    pub fn pump(&mut self, host: &mut Host, elapsed_ms: u64) -> bool {
+        let mut pushed = false;
+        while let Some((at, _)) = self.frames.peek() {
+            if *at > elapsed_ms {
+                break;
+            }
+            let (_, snapshot) = self.frames.next().expect("peeked");
+            host.push(&snapshot);
+            pushed = true;
+        }
+        pushed
+    }
 }

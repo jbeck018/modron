@@ -18,6 +18,7 @@ use modron_mobile_core::{RenderedRow, ViewModelSnapshot};
 use modron_view::TranscriptEntry;
 use nsh_core::element::input;
 use nsh_core::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
 use nsh_platform_tui::{Input, Modifiers};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -227,43 +228,53 @@ impl Host {
         self.actions.try_recv().ok()
     }
 
-    /// Routes one key. Returns `Some(input)` for the view to handle, or
-    /// `None` when the key became an action here.
+    /// Routes one terminal key. Returns `Some(input)` for the view to handle,
+    /// or `None` when the key became an action here.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn filter(&self, input: Input) -> Option<Input> {
         let Input::Key { key, modifiers, release: false } = &input else {
             return Some(input);
         };
-        let (key, alt, chord) = (key.clone(), modifiers.alt, has_chord(modifiers));
+        if self.take_key(key, modifiers.alt, has_chord(modifiers)) {
+            None
+        } else {
+            Some(input)
+        }
+    }
+
+    /// Routes a key by name, the same rules on every host: Enter always
+    /// reaches the composer (`alt` marks a queue), chords pass, Esc
+    /// interrupts, `y`/`a`/`n` decide a pending approval, and `y`/`r` decide
+    /// a pending plan. Returns true when the key became an action here.
+    pub fn take_key(&self, key: &str, alt: bool, chord: bool) -> bool {
         if key == "Enter" {
-            // Enter always reaches the composer; the flag tells its submit
-            // whether this was Alt+Enter (a queue) or a plain send.
+            // The flag tells the composer's submit whether this was Alt+Enter.
             QUEUE_NEXT.store(alt, Ordering::SeqCst);
-            return Some(input);
+            return false;
         }
         if chord {
-            return Some(input);
+            return false;
         }
         if key == "Escape" {
             self.act(UiAction::Interrupt);
-            return None;
+            return true;
         }
         if let Some(count) = self.pending {
-            let index = DECISION_KEYS.iter().position(|k| *k == key.as_str());
-            return match index {
+            return match DECISION_KEYS.iter().position(|k| *k == key) {
                 Some(index) if index < count => {
                     self.act(UiAction::Decide(index));
-                    None
+                    true
                 }
-                _ => Some(input),
+                _ => false,
             };
         }
         if self.plan_pending {
-            if let Some(action) = plan_action(&key) {
+            if let Some(action) = plan_action(key) {
                 self.act(action);
-                return None;
+                return true;
             }
         }
-        Some(input)
+        false
     }
 
     fn act(&self, action: UiAction) {
@@ -297,6 +308,7 @@ pub fn after_snapshot(snapshot: &ViewModelSnapshot, draft: Signal<String>) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn has_chord(m: &Modifiers) -> bool {
     m.ctrl || m.alt || m.cmd
 }
