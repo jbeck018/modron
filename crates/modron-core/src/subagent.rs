@@ -523,6 +523,7 @@ mod tests {
             hooks: HookConfig {
                 pre_tool: Some("true".into()),
                 post_tool: None,
+                ..Default::default()
             },
             max_cost_usd: Some(1.0),
             price_lookup: Some(Arc::new(|_: &str| Some((1.0, 1.0)))),

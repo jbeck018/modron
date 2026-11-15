@@ -18,7 +18,8 @@
 pub mod client;
 
 use modron_types::{
-    Attachment, RunSummary, SandboxPolicy, SessionEvent, StreamDelta, ToolActivity, ToolCall, Usage,
+    Attachment, Phase, PlanItem, RunSummary, SandboxPolicy, SessionEvent, StreamDelta,
+    ToolActivity, ToolCall, Usage,
 };
 use modron_view::ToolEvent;
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,17 @@ pub enum Payload {
         request_id: String,
         decision: Decision,
     },
+    /// Answer a proposed plan (H2b). `Approve` flips the session to `build`
+    /// and starts a run that executes the plan (`note`, when present, is
+    /// appended). `Revise` keeps `plan` and starts another plan run with the
+    /// `note` as the task (required). Errors when no plan is pending. Replies
+    /// with `PlanDecided` to subscribers, then the run's own frames.
+    DecidePlan {
+        session_id: Uuid,
+        decision: PlanDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     /// Mutate session/engine config for future turns.
     SetConfig { patch: ConfigPatch },
     /// Fork a session: copy its log under a fresh id (engine `fork`).
@@ -268,7 +280,19 @@ pub enum Payload {
     /// them the same way on attach.
     QueueChanged { queued: Vec<String> },
     /// Config mutated (echo of the applied patch).
+    /// UI effect: a `phase` in the patch updates the phase label on the
+    /// status surface (`plan` / `build`); the other fields as before.
     ConfigChanged { patch: ConfigPatch },
+    /// A plan-phase run finished with a plan: the run is paused and waits
+    /// for a decision. `items` is the proposed plan.
+    /// UI effect: BLOCKS on a decision exactly like an approval (the strip,
+    /// buttons or sheet per target), showing `items`. Queued follow-ups
+    /// wait until the decision. Snapshot's `LiveState.plan_pending` shows it
+    /// on attach.
+    PlanProposed { items: Vec<PlanItem> },
+    /// The plan decision landed (echoed to every client).
+    /// UI effect: CLEARS the plan decision block opened by `PlanProposed`.
+    PlanDecided { decision: PlanDecision },
     /// Answer to `list_sessions`.
     Sessions { sessions: Vec<SessionMetaWire> },
     /// Answer to `create_task`: the new session runs inside a dedicated
@@ -373,6 +397,16 @@ pub enum Decision {
     Deny,
 }
 
+/// The answer to a proposed plan (`DecidePlan` / `PlanDecided`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDecision {
+    /// Flip to `build` and execute the plan.
+    Approve,
+    /// Stay in `plan` and plan again with the note.
+    Revise,
+}
+
 impl Decision {
     /// Every decision, in protocol order (approval sheet and strip rows).
     pub const ALL: [Decision; 3] = [Decision::AllowOnce, Decision::AllowAll, Decision::Deny];
@@ -410,6 +444,9 @@ pub struct ConfigPatch {
     /// Standing goal prepended to submitted tasks (the /goal command).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// The run phase for future runs: `plan` (read-only) or `build`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
 }
 
 /// The approval-mode knob (`ask`/`yolo`/`deny`), mirrored because the core
@@ -554,6 +591,15 @@ pub struct LiveState {
     /// The server's tool deny list (see the struct docs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// The session's run phase. UI effect: sets the phase label on the
+    /// status surface through the same mapping ConfigChanged uses. Absent
+    /// keeps the client's default (`build`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    /// A proposed plan awaits a decision (see `PlanProposed`). UI effect:
+    /// shows the plan decision block on attach. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_pending: bool,
 }
 
 /// An approval awaiting a decision.
@@ -1402,6 +1448,110 @@ mod tests {
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    /// DecidePlan (client) and PlanProposed / PlanDecided (server) round-trip
+    /// with snake_case tags; `note` is omitted when absent.
+    #[test]
+    fn plan_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let decide = Frame::request(
+            14,
+            Payload::DecidePlan {
+                session_id: session,
+                decision: PlanDecision::Revise,
+                note: Some("split step 2".into()),
+            },
+        );
+        assert_roundtrip(&decide);
+        let json = serde_json::to_value(&decide).unwrap();
+        assert_eq!(json["type"], "decide_plan");
+        assert_eq!(json["decision"], "revise");
+        assert_eq!(json["note"], "split step 2");
+
+        let bare = Frame::request(
+            15,
+            Payload::DecidePlan {
+                session_id: session,
+                decision: PlanDecision::Approve,
+                note: None,
+            },
+        );
+        assert_roundtrip(&bare);
+        let json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(json["decision"], "approve");
+        assert!(json.get("note").is_none());
+
+        let items = vec![PlanItem {
+            text: "add the parser".into(),
+            done_criteria: "parser tests pass".into(),
+            status: "pending".into(),
+        }];
+        let proposed = Frame::event(
+            Some(session),
+            16,
+            Payload::PlanProposed {
+                items: items.clone(),
+            },
+        );
+        assert_roundtrip(&proposed);
+        let json = serde_json::to_value(&proposed).unwrap();
+        assert_eq!(json["type"], "plan_proposed");
+        assert_eq!(json["items"][0]["text"], "add the parser");
+
+        let decided = Frame::event(
+            Some(session),
+            17,
+            Payload::PlanDecided {
+                decision: PlanDecision::Approve,
+            },
+        );
+        assert_roundtrip(&decided);
+        let json = serde_json::to_value(&decided).unwrap();
+        assert_eq!(json["type"], "plan_decided");
+        assert_eq!(json["decision"], "approve");
+    }
+
+    /// The phase rides ConfigPatch and LiveState; unset, both stay off the
+    /// wire, and older JSON without them still parses.
+    #[test]
+    fn phase_and_plan_pending_are_optional_on_the_wire() {
+        let patch = ConfigPatch {
+            phase: Some(Phase::Plan),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["phase"], "plan");
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back.phase, Some(Phase::Plan));
+
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(unset.get("phase").is_none());
+        let old: ConfigPatch = serde_json::from_str(r#"{"model":"m"}"#).expect("old patch loads");
+        assert_eq!(old.phase, None);
+        assert_eq!(old.model.as_deref(), Some("m"));
+
+        let live = LiveState {
+            phase: Some(Phase::Build),
+            plan_pending: true,
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["phase"], "build");
+        assert_eq!(json["plan_pending"], true);
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.phase, Some(Phase::Build));
+        assert!(back.plan_pending);
+
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("phase").is_none());
+        assert!(empty.get("plan_pending").is_none());
+
+        // A LiveState / ConfigPatch from an older peer (no plan fields).
+        let old_live: LiveState =
+            serde_json::from_str(r#"{"running":false,"model":"m"}"#).expect("old live loads");
+        assert_eq!(old_live.phase, None);
+        assert!(!old_live.plan_pending);
     }
 
     #[test]

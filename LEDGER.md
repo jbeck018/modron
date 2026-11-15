@@ -1053,7 +1053,7 @@ in a turn concurrently); what was missing was visibility.
 | ID | Item | Status | Evidence |
 |---|---|---|---|
 | H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | ACTIVE | H1a steer inbox, H1b Steer/Steered, H1c Enqueue/Dequeue/QueueChanged + LiveState.queued DONE. Open: actor on frames, LiveState.steer_pending; a Submit racing a queued start drops that queued message with a Note (fix: requeue at front) |
-| H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | ACTIVE | H2a DONE: EngineConfig.phase (Plan refuses every gated tool, skips the finish gate), transient per-turn plan tail replaces the resume-time injection. Open: H2b ConfigPatch.phase, PlanProposed/DecidePlan/PlanDecided frames and server flow |
+| H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | DONE | H2a engine plan phase + per-turn plan tail; H2b ConfigPatch.phase, LiveState.phase/plan_pending, PlanProposed / DecidePlan / PlanDecided, queue held while a plan is pending. Client rendering lands with C3 |
 | H3 | ACP: subagent events surface as tool_call / status notifications to the editor | ACTIVE | H3a DONE: progress heartbeats carry live turns/tokens (MeteredStore). Open: approvals routed to the parent, completion push (AgentFinished), SteerAgent/KillAgent, cap |
 | H4 | Parallel delegates verified: two delegate calls in ONE turn run concurrently (read-only dispatch), results land in transcript in call order, each child under its persona's forced model | DONE | interactivity::parallel_delegates_run_concurrently |
 | V21 | Gates | DONE | **337 passed / 0 failed**, clippy clean |
@@ -1429,7 +1429,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | H8 | Command and path permission rules + explain command | ACTIVE | H8a matcher and H8b engine gate + [permissions] config DONE (rules apply to `modron` CLI runs). Open: H8c rules for serve/acp sessions, ConfigPatch.rules, explain command |
 | H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | DONE | stub and delegate_status descriptions fixed |
 | H9b | Real compact command and true context occupancy over the protocol | TODO | |
-| H9c | Hooks: turn-end and session-start events | TODO | |
+| H9c | Hooks: turn-end and session-start events | DONE | session_start and turn_end hooks: observe-only, never block; do not disable speculative reads |
 | H9d | MCP over HTTP | TODO | |
 | H9e | Web fetch tool | TODO | |
 
@@ -1476,3 +1476,5 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   verdict: the NSH terminal backend is fast enough; the blockers to
   retire before C7 are binary size, a no-JS feature set that compiles,
   and an external-event path into the reactive graph (S2b).
+- 2026-11-15: wave 4. H2b and H9c landed (H2 closed). Gates on Linux,
+  full workspace (desktop is gone): fmt clean, clippy clean, 1004 tests.

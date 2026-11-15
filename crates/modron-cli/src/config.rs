@@ -233,6 +233,10 @@ pub struct HooksConfig {
     pub pre_tool: Option<String>,
     /// Run after every tool call; failures never block.
     pub post_tool: Option<String>,
+    /// Run once at the start of each run; observe-only, never blocks.
+    pub session_start: Option<String>,
+    /// Run once per model turn after its tools; observe-only, never blocks.
+    pub turn_end: Option<String>,
 }
 
 /// `~/.config/modron/config.toml`, or `None` when no home directory is
@@ -524,6 +528,23 @@ mod tests {
             );
         }
         // None (no home dir) is equally acceptable; nothing to assert.
+    }
+
+    #[test]
+    fn lifecycle_hooks_parse_alongside_tool_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[hooks]\nsession_start = \"echo start\"\nturn_end = \"echo end\"\n",
+        )
+        .unwrap();
+        let hooks = load_from(&path, no_env)
+            .hooks
+            .expect("hooks section parsed");
+        assert_eq!(hooks.session_start.as_deref(), Some("echo start"));
+        assert_eq!(hooks.turn_end.as_deref(), Some("echo end"));
+        assert!(hooks.pre_tool.is_none() && hooks.post_tool.is_none());
     }
 
     #[test]

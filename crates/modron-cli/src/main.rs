@@ -1249,6 +1249,8 @@ fn build_agent_with(
             .map(|h| modron_core::hooks::HookConfig {
                 pre_tool: h.pre_tool,
                 post_tool: h.post_tool,
+                session_start: h.session_start,
+                turn_end: h.turn_end,
             })
             .unwrap_or_default(),
         sandbox: {

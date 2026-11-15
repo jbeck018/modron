@@ -21,12 +21,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use async_trait::async_trait;
 use modron_core::{
-    Engine, RunSummary, SessionEvent, SessionId, SessionMeta, SessionStore, SteerInbox,
-    StreamDelta, ToolActivity, ToolCall, Usage,
+    Engine, Phase, PlanItem, RunSummary, SessionEvent, SessionId, SessionMeta, SessionStore,
+    SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_protocol::{
-    ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval, WireDelta,
-    WireRunSummary, WireSwarmRow, WireToolActivity,
+    ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval,
+    PlanDecision, WireDelta, WireRunSummary, WireSwarmRow, WireToolActivity,
 };
 use modron_view::ActivityTracker;
 use tokio::sync::broadcast;
@@ -42,6 +42,9 @@ pub const QUEUE_CAP: usize = 20;
 
 /// Error text for an enqueue that would exceed [`QUEUE_CAP`].
 pub const QUEUE_FULL: &str = "queue full";
+
+/// Error text for a plan decision when no plan is awaiting one (H2b).
+pub const NO_PLAN_PENDING: &str = "no plan is pending";
 
 /// Starts a queued message as a new run for the session. Installed once by
 /// the dispatch layer (it owns the run-building path). The hub calls it
@@ -338,6 +341,12 @@ pub struct SessionHandle {
     /// interrupts; popped only when a run completes successfully. Lock
     /// order: `run` -> `seq` -> `queue`.
     queue: Mutex<VecDeque<String>>,
+    /// The newest `SessionEvent::Plan` this handle has seen via
+    /// `on_persisted` (H2b). Read when a plan-phase run completes.
+    plan: Mutex<Vec<PlanItem>>,
+    /// A proposed plan awaits a decision (H2b). Set when a plan-phase run
+    /// completes with a plan; cleared only by `decide_plan`.
+    plan_pending: AtomicBool,
 }
 
 impl SessionHandle {
@@ -421,10 +430,10 @@ impl SessionHandle {
     /// The live (non-persisted) half of a snapshot.
     pub fn live_state(&self) -> LiveState {
         // The effective config is the source of truth for the mode,
-        // sandbox and allow/deny lists (apply_config writes it, the
+        // sandbox, phase and allow/deny lists (apply_config writes it, the
         // session's engine clone carries it). Copy them out and drop the
         // engine lock before taking the tracker lock.
-        let (approval_mode, sandbox, allow, deny) = {
+        let (approval_mode, sandbox, allow, deny, phase) = {
             let engine = self.engine_cell();
             let config = &engine.config;
             let mode = match config.approvals.mode {
@@ -437,6 +446,7 @@ impl SessionHandle {
                 Some(config.sandbox),
                 config.approvals.allow.clone(),
                 config.approvals.deny.clone(),
+                Some(config.phase),
             )
         };
         let tracker = lock(&self.tracker);
@@ -445,6 +455,8 @@ impl SessionHandle {
             sandbox,
             allow,
             deny,
+            phase,
+            plan_pending: self.plan_pending.load(Ordering::Relaxed),
             running: self.busy.load(Ordering::Relaxed),
             streaming_text: lock(&self.text).clone(),
             streaming_reasoning: lock(&self.reasoning).clone(),
@@ -727,6 +739,11 @@ impl SessionHandle {
                         summary: WireRunSummary::from(&summary),
                     },
                 );
+                // A plan-phase run that produced a plan waits for its
+                // decision: the queue stays put until `decide_plan`.
+                if self.propose_plan_locked(&mut seq) {
+                    return None;
+                }
                 self.pop_queued_locked(&mut seq)
             }
             Err(error) => {
@@ -780,6 +797,41 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Plan gate (H2b, caller holds the seq lock): a successful run in the
+    /// `plan` phase with a non-empty recorded plan proposes it and waits.
+    /// Returns true when the plan was proposed.
+    fn propose_plan_locked(&self, seq: &mut u64) -> bool {
+        let phase = lock(&self.engine).config.phase;
+        if phase != Phase::Plan {
+            return false;
+        }
+        let items = lock(&self.plan).clone();
+        if items.is_empty() {
+            return false;
+        }
+        self.plan_pending.store(true, Ordering::Relaxed);
+        self.publish_locked(seq, Payload::PlanProposed { items });
+        true
+    }
+
+    /// Whether a proposed plan awaits a decision (H2b).
+    pub fn plan_pending(&self) -> bool {
+        self.plan_pending.load(Ordering::Relaxed)
+    }
+
+    /// Record a decision on the pending plan (H2b): clears `plan_pending`
+    /// and echoes `PlanDecided`. Errors when no plan is pending. The caller
+    /// applies the phase change (before this, so the echo order is
+    /// ConfigChanged then PlanDecided) and starts the follow-up run.
+    pub fn decide_plan(&self, decision: PlanDecision) -> Result<(), String> {
+        let mut seq = lock(&self.seq);
+        if !self.plan_pending.swap(false, Ordering::Relaxed) {
+            return Err(NO_PLAN_PENDING.to_string());
+        }
+        self.publish_locked(&mut seq, Payload::PlanDecided { decision });
+        Ok(())
+    }
+
     /// Pop the front follow-up (caller holds the seq lock) and publish the
     /// remaining queue. `None` when the queue is empty.
     fn pop_queued_locked(&self, seq: &mut u64) -> Option<String> {
@@ -801,6 +853,9 @@ impl SessionHandle {
             total.input_tokens += usage.input_tokens;
             total.output_tokens += usage.output_tokens;
             total.cached_input_tokens += usage.cached_input_tokens;
+        }
+        if let SessionEvent::Plan { items } = event {
+            *lock(&self.plan) = items.clone();
         }
         self.publish_locked(
             &mut seq,
@@ -866,6 +921,9 @@ impl SessionHandle {
                     modron_core::ApprovalMode::ApproveAll
                 }
             };
+        }
+        if let Some(phase) = patch.phase {
+            config.phase = phase;
         }
         if let Some(allow) = &patch.allow {
             config.approvals.allow = allow.clone();
@@ -1114,6 +1172,8 @@ impl SessionHub {
             engine: Mutex::new(engine),
             steer,
             queue: Mutex::new(VecDeque::new()),
+            plan: Mutex::new(Vec::new()),
+            plan_pending: AtomicBool::new(false),
         });
         sessions.insert(id, Arc::clone(&handle));
         handle
@@ -1533,5 +1593,182 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(starts.try_recv().is_err(), "starter must not run");
+    }
+
+    fn plan_items() -> Vec<PlanItem> {
+        vec![PlanItem {
+            text: "add the parser".into(),
+            done_criteria: "parser tests pass".into(),
+            status: "pending".into(),
+        }]
+    }
+
+    /// Read live frames until one of `kind` arrives (2s budget).
+    async fn next_frame_of(
+        rx: &mut broadcast::Receiver<LiveFrame>,
+        kind: &str,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = rx.recv().await.expect("live frame");
+                let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+                if json["type"] == kind {
+                    return json;
+                }
+            }
+        })
+        .await
+        .expect("frame arrives")
+    }
+
+    /// A phase patch sets the engine config for future runs and shows in
+    /// the live state; a patch without `phase` leaves it alone.
+    #[test]
+    fn phase_patch_reaches_the_engine_config_and_live_state() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        assert_eq!(handle.live_state().phase, Some(Phase::Build));
+        handle
+            .apply_config(&ConfigPatch {
+                phase: Some(Phase::Plan),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
+        assert_eq!(handle.live_state().phase, Some(Phase::Plan));
+        handle
+            .apply_config(&ConfigPatch {
+                model: Some("other-model".into()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
+    }
+
+    /// A successful plan-phase run with a recorded plan proposes it, sets
+    /// plan_pending, and does NOT start the queued follow-up.
+    #[tokio::test]
+    async fn plan_run_with_a_recorded_plan_proposes_it_and_holds_the_queue() {
+        let hub = test_hub();
+        let mut starts = recording_starter(&hub);
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        handle
+            .apply_config(&ConfigPatch {
+                phase: Some(Phase::Plan),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        let mut rx = handle.tx.subscribe();
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        hub.enqueue(id, "next".into()).unwrap();
+        handle.on_persisted(&SessionEvent::Plan {
+            items: plan_items(),
+        });
+        done.send(()).unwrap();
+
+        let proposed = next_frame_of(&mut rx, "plan_proposed").await;
+        assert_eq!(proposed["items"][0]["text"], "add the parser");
+        assert!(handle.plan_pending());
+        assert!(handle.live_state().plan_pending);
+        assert_eq!(queued_of(&handle), vec!["next".to_string()]);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(starts.try_recv().is_err(), "queued start must wait");
+    }
+
+    /// A build-phase run publishes no proposal even with a recorded plan,
+    /// and the queue starts as before.
+    #[tokio::test]
+    async fn build_phase_run_publishes_no_plan_proposal() {
+        let hub = test_hub();
+        let mut starts = recording_starter(&hub);
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let mut rx = handle.tx.subscribe();
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        hub.enqueue(id, "next".into()).unwrap();
+        handle.on_persisted(&SessionEvent::Plan {
+            items: plan_items(),
+        });
+        done.send(()).unwrap();
+
+        let (started, text) = starts.recv().await.expect("queued run starts");
+        assert_eq!(started, id);
+        assert_eq!(text, "next");
+        assert!(!handle.plan_pending());
+        while let Ok(frame) = rx.try_recv() {
+            let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+            assert_ne!(json["type"], "plan_proposed");
+        }
+    }
+
+    /// A plan-phase run with no recorded plan proposes nothing.
+    #[tokio::test]
+    async fn plan_run_without_a_plan_proposes_nothing() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        handle
+            .apply_config(&ConfigPatch {
+                phase: Some(Phase::Plan),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        done.send(()).unwrap();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!handle.is_busy());
+        assert!(!handle.plan_pending());
+    }
+
+    /// A decision with nothing pending is refused and changes nothing.
+    #[test]
+    fn decide_plan_with_nothing_pending_is_refused() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        assert_eq!(
+            handle.decide_plan(PlanDecision::Approve).unwrap_err(),
+            NO_PLAN_PENDING
+        );
+        assert!(!handle.plan_pending());
+    }
+
+    /// decide_plan clears the pending flag, echoes PlanDecided, and only
+    /// succeeds once.
+    #[tokio::test]
+    async fn decide_plan_clears_pending_and_publishes_once() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        handle
+            .apply_config(&ConfigPatch {
+                phase: Some(Phase::Plan),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        let (done, gate) = tokio::sync::oneshot::channel();
+        let mut rx = handle.tx.subscribe();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        handle.on_persisted(&SessionEvent::Plan {
+            items: plan_items(),
+        });
+        done.send(()).unwrap();
+        next_frame_of(&mut rx, "plan_proposed").await;
+
+        handle.decide_plan(PlanDecision::Revise).unwrap();
+        assert!(!handle.plan_pending());
+        assert!(!handle.live_state().plan_pending);
+        let decided = next_frame_of(&mut rx, "plan_decided").await;
+        assert_eq!(decided["decision"], "revise");
+        assert!(handle.decide_plan(PlanDecision::Approve).is_err());
     }
 }

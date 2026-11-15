@@ -344,6 +344,19 @@ fn default_plan_status() -> String {
     "pending".to_string()
 }
 
+/// The run's phase (H2a). `Build` is the normal mode. `Plan` is an
+/// engine-enforced read-only phase: every approval-gated tool is refused
+/// (even under ApproveAll or an allow rule), ungated read-only tools still
+/// run, the finish gate is skipped, and every turn carries the current plan
+/// plus a phase line as a transient tail message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    #[default]
+    Build,
+    Plan,
+}
+
 /// Tool-activity notification (Phase-1d T0, additive): fired around every
 /// tool execution so UIs can render `● Bash …` lines live.
 #[derive(Clone, Debug, PartialEq, Eq)]

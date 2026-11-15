@@ -537,6 +537,7 @@ impl Engine {
         let prompt_hash = prompt_wire_hash(&system, &tool_specs);
         let mut state = RunLoopState::new(transcript, self.config.max_total_tokens);
         state.current_plan = initial_plan;
+        self.run_session_start_hook(session_id).await;
 
         loop {
             if state.turns >= self.config.max_turns {
@@ -626,6 +627,14 @@ impl Engine {
                     .trim()
                     .to_string();
                     state.stop_label = "spend_cap";
+                    self.run_turn_end_hook(
+                        session_id,
+                        state.turns,
+                        &turn.model,
+                        turn.response.usage,
+                        turn.response.tool_calls.len(),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -653,6 +662,14 @@ impl Engine {
             if turn.response.stop_reason != StopReason::ToolUse
                 || turn.response.tool_calls.is_empty()
             {
+                self.run_turn_end_hook(
+                    session_id,
+                    state.turns,
+                    &turn.model,
+                    turn.response.usage,
+                    turn.response.tool_calls.len(),
+                )
+                .await;
                 // Finish gate (harness-enforced verification): a run that
                 // dispatched mutating tools must show verify evidence
                 // before it may end — outcome-only scoring hides unverified
@@ -714,6 +731,14 @@ impl Engine {
                 &mut state,
             )
             .await?;
+            self.run_turn_end_hook(
+                session_id,
+                state.turns,
+                &turn.model,
+                turn.response.usage,
+                turn.response.tool_calls.len(),
+            )
+            .await;
             // A `plan` write this turn replaces the current plan: re-read it
             // from the log so the next turn's tail shows the new value.
             if turn.response.tool_calls.iter().any(|c| c.name == "plan") {
@@ -1500,6 +1525,49 @@ impl Engine {
             self.store.append(session_id, &checkpoint).await?;
         }
         Ok(())
+    }
+
+    /// Observe-only `session_start` hook, run once per run before the first
+    /// route. A no-op unless configured; never fails the run.
+    async fn run_session_start_hook(&self, session_id: SessionId) {
+        if let Some(cmd) = self.config.hooks.session_start.as_deref() {
+            hooks::run_session_start_hook(
+                cmd,
+                &session_id.to_string(),
+                &self.config.working_dir.display().to_string(),
+            )
+            .await;
+        }
+    }
+
+    /// Observe-only `turn_end` hook, run once per model turn after its tools
+    /// are dispatched (or after the provider turn when it requested none). A
+    /// no-op unless configured; never fails the run and holds no lock.
+    async fn run_turn_end_hook(
+        &self,
+        session_id: SessionId,
+        turn: u32,
+        model: &str,
+        usage: Usage,
+        tool_calls: usize,
+    ) {
+        if let Some(cmd) = self.config.hooks.turn_end.as_deref() {
+            let session = session_id.to_string();
+            let working = self.config.working_dir.display().to_string();
+            hooks::run_turn_end_hook(
+                cmd,
+                hooks::TurnEndFacts {
+                    session_id: &session,
+                    working_dir: &working,
+                    turn,
+                    model,
+                    tool_calls: u32::try_from(tool_calls).unwrap_or(u32::MAX),
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            )
+            .await;
+        }
     }
 
     /// Dispatch one tool call through the hook pipeline (H1): a `pre_tool`
@@ -3031,6 +3099,90 @@ mod tests {
                 .any(|(_, _, label)| label.as_deref() == Some("end_turn")),
             "terminal record carries the stop label: {traces:?}"
         );
+    }
+
+    /// Observe-only lifecycle hooks (H9c): `session_start` fires once per run,
+    /// `turn_end` once per model turn with the right turn numbers, and the
+    /// turn_end stdin carries the turn's usage but no assistant text.
+    #[tokio::test]
+    async fn lifecycle_hooks_fire_once_per_run_and_once_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let starts = dir.path().join("starts.txt");
+        let ends = dir.path().join("ends.txt");
+        let json = dir.path().join("turn_end.json");
+        let config = EngineConfig {
+            hooks: crate::hooks::HookConfig {
+                session_start: Some(format!(
+                    "printf '%s\\n' \"$MODRON_EVENT\" >> {}",
+                    starts.display()
+                )),
+                turn_end: Some(format!(
+                    "printf '%s|%s|%s\\n' \"$MODRON_EVENT\" \"$MODRON_TURN\" \"$MODRON_TOOL_CALLS\" >> {ends}; \
+                     cat >> {json}; echo >> {json}",
+                    ends = ends.display(),
+                    json = json.display()
+                )),
+                ..Default::default()
+            },
+            ..approve_all_config()
+        };
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut first = call_with("probe", json!({}));
+        first.usage = Usage {
+            input_tokens: 11,
+            output_tokens: 3,
+            cached_input_tokens: 0,
+        };
+        let mut last = text("done");
+        last.usage = Usage {
+            input_tokens: 20,
+            output_tokens: 5,
+            cached_input_tokens: 0,
+        };
+        let tool: Arc<dyn Tool> = Arc::new(CountingTool {
+            name: "probe",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(vec![first, last], config, vec![tool]);
+        let summary = engine.run_task("go").await.unwrap();
+        assert_eq!(summary.turns, 2);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        assert_eq!(std::fs::read_to_string(&starts).unwrap(), "session_start\n");
+        assert_eq!(
+            std::fs::read_to_string(&ends).unwrap(),
+            "turn_end|1|1\nturn_end|2|0\n"
+        );
+        let raw = std::fs::read_to_string(&json).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{raw}");
+        assert_eq!(lines[0]["turn"], 1);
+        assert_eq!(lines[0]["input_tokens"], 11);
+        assert_eq!(lines[0]["output_tokens"], 3);
+        assert_eq!(lines[1]["turn"], 2);
+        assert_eq!(lines[1]["input_tokens"], 20);
+        assert_eq!(lines[1]["output_tokens"], 5);
+        assert!(!raw.contains("done"), "assistant text leaked: {raw}");
+    }
+
+    /// Lifecycle hooks are observe-only: a failing hook never fails the run.
+    #[tokio::test]
+    async fn failing_lifecycle_hooks_never_fail_the_run() {
+        let config = EngineConfig {
+            hooks: crate::hooks::HookConfig {
+                session_start: Some("echo boom >&2; exit 1".into()),
+                turn_end: Some("exit 2".into()),
+                ..Default::default()
+            },
+            ..approve_all_config()
+        };
+        let engine = engine_over(vec![text("fine")], config, Vec::new());
+        let summary = engine.run_task("go").await.unwrap();
+        assert_eq!(summary.answer, "fine");
+        assert_eq!(summary.turns, 1);
     }
 
     /// Glob stub counting executions (speculative-execution tests).

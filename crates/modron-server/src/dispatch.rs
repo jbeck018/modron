@@ -15,12 +15,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use modron_core::SessionId;
-use modron_protocol::{Frame, Payload, SessionMetaWire, PROTOCOL_VERSION};
+use modron_core::{Phase, SessionId};
+use modron_protocol::{
+    ConfigPatch, Frame, Payload, PlanDecision, SessionMetaWire, PROTOCOL_VERSION,
+};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::hub::{session_title, task_with_goal, RunFuture, RunStarter, SessionHub};
+use crate::hub::{
+    session_title, task_with_goal, RunFuture, RunStarter, SessionHub, NO_PLAN_PENDING,
+};
 use crate::pairing;
 
 /// Everything a connection's frames need.
@@ -202,7 +206,8 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
         | Payload::Interrupt { session_id }
         | Payload::Steer { session_id, .. }
         | Payload::Enqueue { session_id, .. }
-        | Payload::Dequeue { session_id, .. } => {
+        | Payload::Dequeue { session_id, .. }
+        | Payload::DecidePlan { session_id, .. } => {
             if *session_id == scope {
                 Ok(())
             } else {
@@ -711,6 +716,13 @@ pub async fn handle_frame(
                 (Err(message), None) => send(ctx, error(request_id, message)),
             }
         }
+        Payload::DecidePlan {
+            session_id,
+            decision,
+            note,
+        } => {
+            decide_plan(state, ctx, request_id, session_id, decision, note).await;
+        }
         Payload::SetConfig { patch } => {
             let Some(sub) = &ctx.subscription else {
                 send(
@@ -853,6 +865,89 @@ fn ensure_session_for(state: &Arc<ServerState>, id: SessionId) -> Arc<crate::hub
     }
     let worktree = state.tasks.get(&id).map(|record| record.worktree);
     state.hub.ensure_session_in(id, Some(id), worktree)
+}
+
+/// Answer a proposed plan (H2b). `Approve` flips the session to `build`
+/// (echoed as ConfigChanged), records PlanDecided, and starts a run that
+/// executes the plan. `Revise` keeps `plan` phase, records PlanDecided, and
+/// starts another plan run with the note as the task. Both use the resume
+/// path a Submit to a known session uses.
+async fn decide_plan(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    session_id: SessionId,
+    decision: PlanDecision,
+    note: Option<String>,
+) {
+    let task = match plan_decision_task(decision, note) {
+        Ok(task) => task,
+        Err(message) => {
+            send(ctx, error(request_id, message));
+            return;
+        }
+    };
+    let Some(handle) = state.hub.handle(&session_id) else {
+        send(
+            ctx,
+            error_kind(
+                request_id,
+                format!("no such session {session_id}"),
+                modron_protocol::ErrorKind::NotFound,
+            ),
+        );
+        return;
+    };
+    if !handle.plan_pending() {
+        send(ctx, error(request_id, NO_PLAN_PENDING));
+        return;
+    }
+    if handle.is_busy() {
+        send(
+            ctx,
+            error_kind(
+                request_id,
+                "session busy (a run is active)",
+                modron_protocol::ErrorKind::Conflict,
+            ),
+        );
+        return;
+    }
+    if decision == PlanDecision::Approve {
+        let patch = ConfigPatch {
+            phase: Some(Phase::Build),
+            ..ConfigPatch::default()
+        };
+        if let Err(e) = handle.apply_config(&patch) {
+            send(ctx, error(request_id, e.to_string()));
+            return;
+        }
+        handle.publish(Payload::ConfigChanged { patch });
+    }
+    if let Err(message) = handle.decide_plan(decision) {
+        send(ctx, error(request_id, message));
+        return;
+    }
+    let run = resume_run(&handle, task, Vec::new(), true);
+    if let Err(message) = state.hub.start_run(session_id, run) {
+        send(ctx, error(request_id, message));
+    }
+}
+
+/// The task a plan decision runs (H2b). Approve executes the approved plan,
+/// with the note on its own line when present. Revise plans again with the
+/// note as the task, so a note is required.
+fn plan_decision_task(
+    decision: PlanDecision,
+    note: Option<String>,
+) -> Result<String, &'static str> {
+    let note = note.filter(|text| !text.trim().is_empty());
+    match (decision, note) {
+        (PlanDecision::Approve, Some(note)) => Ok(format!("Execute the approved plan.\n{note}")),
+        (PlanDecision::Approve, None) => Ok("Execute the approved plan.".to_string()),
+        (PlanDecision::Revise, Some(note)) => Ok(note),
+        (PlanDecision::Revise, None) => Err("revising a plan needs a note"),
+    }
 }
 
 /// The starter the hub calls when a queued follow-up must run: the same
@@ -1529,6 +1624,9 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Dequeue { .. } => "dequeue",
         Payload::QueueChanged { .. } => "queue_changed",
         Payload::Approve { .. } => "approve",
+        Payload::DecidePlan { .. } => "decide_plan",
+        Payload::PlanProposed { .. } => "plan_proposed",
+        Payload::PlanDecided { .. } => "plan_decided",
         Payload::SetConfig { .. } => "set_config",
         Payload::Fork { .. } => "fork",
         Payload::NewSession { .. } => "new_session",
@@ -1561,7 +1659,7 @@ fn variant_name(payload: &Payload) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::BroadcastingStore;
+    use crate::hub::{BroadcastingStore, LiveFrame};
     use crate::tasks::TaskRecord;
     use modron_core::testing::StaticSelector;
     use modron_core::{Engine, EngineConfig, RunSummary, SessionStore, ToolRegistry};
@@ -1778,5 +1876,228 @@ mod tests {
             Outbound::Live(live) => assert_eq!(live.seq, 4, "first live frame after the watermark"),
             other => panic!("expected a live frame, got {other:?}"),
         }
+    }
+
+    /// A run that finishes successfully when the test sends on `done`.
+    fn finishing_run(id: SessionId, done: tokio::sync::oneshot::Receiver<()>) -> RunFuture {
+        Box::pin(async move {
+            let _ = done.await;
+            Ok(RunSummary {
+                session_id: id,
+                answer: "planned".into(),
+                turns: 1,
+                tool_calls: 0,
+                usage: Default::default(),
+                models_used: vec![],
+            })
+        })
+    }
+
+    fn error_message(outbound: Outbound) -> String {
+        match outbound {
+            Outbound::Reply(frame) => match frame.payload {
+                Payload::Error { message, .. } => message,
+                _ => panic!("expected an error reply"),
+            },
+            other => panic!("expected a reply, got {other:?}"),
+        }
+    }
+
+    /// A session in plan phase whose plan run finished with one recorded
+    /// plan item, so a decision is pending.
+    async fn session_with_pending_plan(
+        state: &Arc<ServerState>,
+    ) -> (SessionId, Arc<crate::hub::SessionHandle>) {
+        let id = state.store.create_session("plan").await.unwrap().id;
+        let handle = state.hub.ensure_session(id, None);
+        handle
+            .apply_config(&ConfigPatch {
+                phase: Some(Phase::Plan),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        let (done, gate) = tokio::sync::oneshot::channel();
+        state.hub.start_run(id, finishing_run(id, gate)).unwrap();
+        handle.on_persisted(&modron_core::SessionEvent::Plan {
+            items: vec![modron_core::PlanItem {
+                text: "add the parser".into(),
+                done_criteria: "parser tests pass".into(),
+                status: "pending".into(),
+            }],
+        });
+        done.send(()).unwrap();
+        for _ in 0..200 {
+            if handle.plan_pending() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(handle.plan_pending(), "the plan run proposed its plan");
+        (id, handle)
+    }
+
+    /// Read live frames until a run's terminal frame, proving the decision
+    /// started a run that ended (2s budget).
+    async fn await_terminal_frame(rx: &mut tokio::sync::broadcast::Receiver<LiveFrame>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = rx.recv().await.expect("live frame");
+                let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+                if matches!(
+                    json["type"].as_str(),
+                    Some("turn_done" | "turn_failed" | "turn_aborted")
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the decision started a run that ended");
+    }
+
+    #[test]
+    fn plan_decision_task_text_and_note_rules() {
+        assert_eq!(
+            plan_decision_task(PlanDecision::Approve, None).unwrap(),
+            "Execute the approved plan."
+        );
+        assert_eq!(
+            plan_decision_task(PlanDecision::Approve, Some("keep it small".into())).unwrap(),
+            "Execute the approved plan.\nkeep it small"
+        );
+        assert_eq!(
+            plan_decision_task(PlanDecision::Approve, Some("  ".into())).unwrap(),
+            "Execute the approved plan."
+        );
+        assert_eq!(
+            plan_decision_task(PlanDecision::Revise, Some("split step two".into())).unwrap(),
+            "split step two"
+        );
+        assert_eq!(
+            plan_decision_task(PlanDecision::Revise, None).unwrap_err(),
+            "revising a plan needs a note"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_plan_with_nothing_pending_errors() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("idle").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                1,
+                Payload::DecidePlan {
+                    session_id: id,
+                    decision: PlanDecision::Approve,
+                    note: None,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(error_message(next_outbound(&mut rx).await), NO_PLAN_PENDING);
+        assert_eq!(
+            state.hub.handle(&id).unwrap().engine_cell().config.phase,
+            Phase::Build
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_without_a_note_is_refused_and_keeps_the_plan_pending() {
+        let (state, _dir) = test_state();
+        let (id, handle) = session_with_pending_plan(&state).await;
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                2,
+                Payload::DecidePlan {
+                    session_id: id,
+                    decision: PlanDecision::Revise,
+                    note: Some("   ".into()),
+                },
+            ),
+        )
+        .await;
+        assert!(error_message(next_outbound(&mut rx).await).contains("needs a note"));
+        assert!(handle.plan_pending());
+        assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
+    }
+
+    /// Approve flips the phase to build (ConfigChanged before PlanDecided),
+    /// clears the pending plan, and starts a run whose task is the approved
+    /// plan line followed by the note.
+    #[tokio::test]
+    async fn approve_flips_to_build_clears_pending_and_runs_the_plan() {
+        let (state, _dir) = test_state();
+        let (id, handle) = session_with_pending_plan(&state).await;
+        let mut live = handle.subscribe();
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                3,
+                Payload::DecidePlan {
+                    session_id: id,
+                    decision: PlanDecision::Approve,
+                    note: Some("keep it small".into()),
+                },
+            ),
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "approve replies with no error");
+        assert_eq!(handle.engine_cell().config.phase, Phase::Build);
+        assert!(!handle.plan_pending());
+        assert!(!handle.live_state().plan_pending);
+
+        let mut kinds = Vec::new();
+        while let Ok(frame) = live.try_recv() {
+            let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+            kinds.push(json["type"].as_str().unwrap_or_default().to_string());
+        }
+        let changed = kinds.iter().position(|k| k == "config_changed");
+        let decided = kinds.iter().position(|k| k == "plan_decided");
+        assert!(changed.is_some() && decided.is_some(), "{kinds:?}");
+        assert!(changed < decided, "ConfigChanged precedes PlanDecided");
+        // The run may already have ended before the drain above.
+        if !kinds.iter().any(|k| k.starts_with("turn_")) {
+            await_terminal_frame(&mut live).await;
+        }
+    }
+
+    /// Revise keeps the plan phase, clears the pending plan, and starts
+    /// another plan run with the note as its task.
+    #[tokio::test]
+    async fn revise_keeps_the_plan_phase_and_replans_with_the_note() {
+        let (state, _dir) = test_state();
+        let (id, handle) = session_with_pending_plan(&state).await;
+        let (mut ctx, mut rx) = authed_ctx();
+        let mut live = handle.subscribe();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                4,
+                Payload::DecidePlan {
+                    session_id: id,
+                    decision: PlanDecision::Revise,
+                    note: Some("split step two".into()),
+                },
+            ),
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "revise replies with no error");
+        assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
+        assert!(!handle.plan_pending());
+        await_terminal_frame(&mut live).await;
     }
 }

@@ -233,6 +233,7 @@ async fn pre_tool_hook_vetoes_the_tool() {
         cfg.hooks = HookConfig {
             pre_tool: Some("echo no-writes-allowed >&2; exit 1".to_string()),
             post_tool: None,
+            ..Default::default()
         };
     });
 

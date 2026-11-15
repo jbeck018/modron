@@ -600,18 +600,9 @@ impl SteerInbox {
     }
 }
 
-/// The run's phase (H2a). `Build` is the normal mode. `Plan` is an
-/// engine-enforced read-only phase: every approval-gated tool is refused
-/// (even under ApproveAll or an allow rule), ungated read-only tools still
-/// run, the finish gate is skipped, and every turn carries the current plan
-/// plus a phase line as a transient tail message.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Phase {
-    #[default]
-    Build,
-    Plan,
-}
+/// The run's phase (H2a): defined in modron-types so the protocol can
+/// carry it; re-exported here so every `modron_core::Phase` path keeps working.
+pub use modron_types::Phase;
 
 #[derive(Clone)]
 pub struct EngineConfig {
