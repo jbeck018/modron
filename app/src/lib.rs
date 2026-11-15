@@ -6,6 +6,8 @@
 
 pub mod chat;
 pub mod demo;
+pub mod nav;
+pub mod screens;
 pub mod session;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
@@ -13,6 +15,7 @@ pub mod web;
 use std::sync::Mutex;
 
 use chat::{Client, Model};
+use nav::NavView;
 use nsh_core::element::{AdaptiveColor, Tokens};
 use nsh_core::prelude::*;
 use tokio::sync::mpsc::unbounded_channel;
@@ -82,11 +85,21 @@ pub fn App() -> impl IntoElement {
     install_theme();
     let model = signal(Model::default());
     let draft = signal(String::new());
+    let nav = signal(NavView::default());
     let client = CLIENT.lock().ok().and_then(|mut slot| slot.take()).or_else(default_client);
-    let (actions, snapshots) = match client {
-        Some(client) => (client.actions, Some(client.snapshots)),
-        None => (unbounded_channel().0, None),
+    let (actions, snapshots, navs) = match client {
+        Some(client) => (client.actions, Some(client.snapshots), Some(client.nav)),
+        None => (unbounded_channel().0, None, None),
     };
+    if let Some(mut rx) = navs {
+        // The host's navigation state: the screen, the sessions filter and
+        // rows, the settings rows.
+        spawn(async move {
+            while let Some(view) = rx.recv().await {
+                nav.set(view);
+            }
+        });
+    }
     if let Some(mut rx) = snapshots {
         // Runs on the engine thread under this view's owner; the channel's
         // waker wakes the engine when the host pushes a snapshot.
@@ -97,5 +110,5 @@ pub fn App() -> impl IntoElement {
             }
         });
     }
-    chat::screen(model, draft, actions)
+    screens::frame(model, draft, nav, actions)
 }

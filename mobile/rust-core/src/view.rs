@@ -123,6 +123,88 @@ pub fn connection_label(state: &ConnectionState) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sessions and settings copy (the NSH app's screens and any later shell)
+// ---------------------------------------------------------------------------
+
+/// Navigation and screen words.
+pub const SESSIONS_LABEL: &str = "sessions";
+pub const SETTINGS_LABEL: &str = "settings";
+pub const NEW_SESSION_LABEL: &str = "new session";
+pub const SESSIONS_EMPTY_LABEL: &str = "no sessions yet";
+pub const SESSIONS_NO_MATCH_LABEL: &str = "no sessions match";
+pub const FILTER_LABEL: &str = "filter";
+/// The running/idle words, for a session row and the status surface.
+pub const RUNNING_LABEL: &str = "running";
+pub const IDLE_LABEL: &str = "idle";
+/// Settings row labels, in screen order.
+pub const SETTING_MODEL_LABEL: &str = "model";
+pub const SETTING_PROVIDER_LABEL: &str = "provider";
+pub const SETTING_APPROVAL_LABEL: &str = "approval mode";
+pub const SETTING_PHASE_LABEL: &str = "phase";
+pub const SETTING_EFFORT_LABEL: &str = "effort";
+pub const SETTING_SANDBOX_LABEL: &str = "sandbox";
+pub const SETTING_CONTEXT_LABEL: &str = "context";
+pub const SETTING_RULES_LABEL: &str = "rules";
+pub const SETTING_COMPACT_LABEL: &str = "compact";
+/// Shown as the value of an unset effort, and of an empty rule list.
+pub const EFFORT_UNSET_LABEL: &str = "unset";
+pub const RULES_NONE_LABEL: &str = "none";
+
+/// One sessions-list row: the title (the short id when untitled), the
+/// running/idle word and the message count. Shells show it verbatim.
+pub fn session_row(meta: &SessionMetaWire, running: bool) -> String {
+    let title = if meta.title.trim().is_empty() {
+        meta.id.to_string().chars().take(8).collect()
+    } else {
+        meta.title.clone()
+    };
+    let state = if running { RUNNING_LABEL } else { IDLE_LABEL };
+    format!(
+        "{title} \u{b7} {state} \u{b7} {} messages",
+        meta.message_count
+    )
+}
+
+/// The next approval mode in the settings cycle: ask, yolo, deny, ask.
+pub fn approval_mode_next(mode: Option<ApprovalModeWire>) -> ApprovalModeWire {
+    match mode.unwrap_or(ApprovalModeWire::Ask) {
+        ApprovalModeWire::Ask => ApprovalModeWire::ApproveAll,
+        ApprovalModeWire::ApproveAll => ApprovalModeWire::Deny,
+        ApprovalModeWire::Deny => ApprovalModeWire::Ask,
+    }
+}
+
+/// The next reasoning effort: unset, low, medium, high, xhigh, max, unset.
+pub fn effort_next(effort: Option<Effort>) -> Option<Effort> {
+    match effort {
+        None => Some(Effort::Low),
+        Some(Effort::Low) => Some(Effort::Medium),
+        Some(Effort::Medium) => Some(Effort::High),
+        Some(Effort::High) => Some(Effort::Xhigh),
+        Some(Effort::Xhigh) => Some(Effort::Max),
+        Some(Effort::Max) => None,
+    }
+}
+
+/// The other run phase: build and plan swap.
+pub fn phase_next(phase: Phase) -> Phase {
+    match phase {
+        Phase::Build => Phase::Plan,
+        Phase::Plan => Phase::Build,
+    }
+}
+
+/// The next sandbox policy: off, seatbelt, bwrap, off.
+pub fn sandbox_next(policy: modron_types::SandboxPolicy) -> modron_types::SandboxPolicy {
+    use modron_types::SandboxPolicy as S;
+    match policy {
+        S::Off => S::Seatbelt,
+        S::Seatbelt => S::Bubblewrap,
+        S::Bubblewrap => S::Off,
+    }
+}
+
 /// One pre-rendered transcript row for shells that cannot call Rust
 /// helpers: the shared copy verbatim.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -445,6 +527,15 @@ pub struct ViewModelSnapshot {
     pub approval_mode_label: String,
     /// `off` / `seatbelt` / `bwrap` (the desktop's sandbox words).
     pub sandbox: String,
+    /// The sandbox policy itself (the settings cycle sends the next one).
+    pub sandbox_policy: modron_types::SandboxPolicy,
+    /// The run phase and the reasoning effort as values (the settings
+    /// cycles start from them; the labels above are for display).
+    pub phase: Phase,
+    pub effort: Option<Effort>,
+    /// One formatted row per `sessions` entry, in the same order
+    /// ([`session_row`]). The sessions screen shows these verbatim.
+    pub session_rows: Vec<String>,
     /// Tool allow/deny lists (editable in the settings views).
     pub allow_tools: Vec<String>,
     pub deny_tools: Vec<String>,
@@ -532,6 +623,18 @@ impl ViewModelSnapshot {
             approval_mode: vm.approval_mode,
             approval_mode_label: approval_mode_label(vm.approval_mode).to_string(),
             sandbox: sandbox_label(vm.sandbox).to_string(),
+            sandbox_policy: vm.sandbox,
+            phase: vm.phase,
+            effort: vm.effort,
+            session_rows: vm
+                .sessions
+                .iter()
+                .map(|meta| {
+                    let running = meta.task_state.as_deref() == Some("running")
+                        || (vm.running && vm.session_id == Some(meta.id));
+                    session_row(meta, running)
+                })
+                .collect(),
             allow_tools: vm.allow_tools.clone(),
             deny_tools: vm.deny_tools.clone(),
             queued: vm.queued.clone(),
@@ -1498,5 +1601,127 @@ mod tests {
         assert_eq!(snap.rules, vec!["allow read".to_string()]);
         assert!(snap.context_label.is_empty());
         assert!(snap.plan_pending.is_none());
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use modron_types::SandboxPolicy;
+
+    fn meta(id: &str, title: &str, count: u32, state: Option<&str>) -> SessionMetaWire {
+        SessionMetaWire {
+            id: Uuid::parse_str(id).expect("uuid"),
+            title: title.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            message_count: count,
+            task_branch: None,
+            task_state: state.map(String::from),
+            working_dir: None,
+        }
+    }
+
+    const ID_A: &str = "abcdef01-2345-6789-abcd-ef0123456789";
+    const ID_B: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn session_row_shows_title_state_and_count() {
+        let m = meta(ID_A, "router fix", 3, None);
+        assert_eq!(
+            session_row(&m, false),
+            "router fix \u{b7} idle \u{b7} 3 messages"
+        );
+        assert_eq!(
+            session_row(&m, true),
+            "router fix \u{b7} running \u{b7} 3 messages"
+        );
+    }
+
+    #[test]
+    fn an_untitled_session_shows_its_short_id() {
+        let m = meta(ID_A, "  ", 0, None);
+        assert_eq!(
+            session_row(&m, false),
+            "abcdef01 \u{b7} idle \u{b7} 0 messages"
+        );
+    }
+
+    #[test]
+    fn approval_cycle_is_ask_yolo_deny() {
+        assert_eq!(
+            approval_mode_next(Some(ApprovalModeWire::Ask)),
+            ApprovalModeWire::ApproveAll
+        );
+        assert_eq!(
+            approval_mode_next(Some(ApprovalModeWire::ApproveAll)),
+            ApprovalModeWire::Deny
+        );
+        assert_eq!(
+            approval_mode_next(Some(ApprovalModeWire::Deny)),
+            ApprovalModeWire::Ask
+        );
+        assert_eq!(approval_mode_next(None), ApprovalModeWire::ApproveAll);
+    }
+
+    #[test]
+    fn effort_cycle_runs_unset_through_max_and_back() {
+        let mut effort = None;
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            effort = effort_next(effort);
+            seen.push(effort.map(|e| e.label()).unwrap_or(EFFORT_UNSET_LABEL));
+        }
+        assert_eq!(
+            seen,
+            ["low", "medium", "high", "xhigh", "max", "unset", "low"]
+        );
+    }
+
+    #[test]
+    fn phase_and_sandbox_cycles() {
+        assert_eq!(phase_next(Phase::Build), Phase::Plan);
+        assert_eq!(phase_next(Phase::Plan), Phase::Build);
+        let s = SandboxPolicy::Off;
+        assert_eq!(sandbox_next(s), SandboxPolicy::Seatbelt);
+        assert_eq!(sandbox_next(sandbox_next(s)), SandboxPolicy::Bubblewrap);
+        assert_eq!(
+            sandbox_next(sandbox_next(sandbox_next(s))),
+            SandboxPolicy::Off
+        );
+    }
+
+    #[test]
+    fn snapshot_rows_follow_the_session_list_and_running_state() {
+        let a = Uuid::parse_str(ID_A).expect("uuid");
+        let vm = SessionViewModel {
+            session_id: Some(a),
+            running: true,
+            sessions: vec![
+                meta(ID_A, "attached", 2, None),
+                meta(ID_B, "other", 5, None),
+            ],
+            ..Default::default()
+        };
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(snap.session_rows.len(), snap.sessions.len());
+        assert_eq!(
+            snap.session_rows[0],
+            "attached \u{b7} running \u{b7} 2 messages"
+        );
+        assert_eq!(snap.session_rows[1], "other \u{b7} idle \u{b7} 5 messages");
+    }
+
+    #[test]
+    fn a_task_marked_running_on_the_server_shows_running() {
+        let vm = SessionViewModel {
+            sessions: vec![meta(ID_B, "task", 1, Some("running"))],
+            ..Default::default()
+        };
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(
+            snap.session_rows,
+            vec!["task \u{b7} running \u{b7} 1 messages".to_string()]
+        );
     }
 }

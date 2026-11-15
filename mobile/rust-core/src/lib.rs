@@ -54,10 +54,17 @@ pub use client::{
     default_url, ConnectOptions, KeepaliveConfig, RemoteClient, CLIENT_NAME, UNDECODABLE_NOTE,
 };
 pub use error::ClientError;
+pub use modron_protocol::{ApprovalModeWire, ConfigPatch, SessionMetaWire};
+pub use modron_types::{Effort, Phase, SandboxPolicy};
 pub use modron_view::{QUEUE_LABEL, STOP_LABEL};
 pub use view::{
-    approval_mode_label, connection_label, context_label, entry_lines, phase_label,
-    ConnectionState, DecisionOption, OAuthProgressView, PendingApprovalView, PendingPlanView,
-    PlanDecisionOption, RenderedRow, SessionViewModel, ViewModelSnapshot, DECISION_LABELS,
-    PLAN_DECISION_LABELS,
+    approval_mode_label, approval_mode_next, connection_label, context_label, effort_next,
+    entry_lines, phase_label, phase_next, sandbox_next, session_row, ConnectionState,
+    DecisionOption, OAuthProgressView, PendingApprovalView, PendingPlanView, PlanDecisionOption,
+    RenderedRow, SessionViewModel, ViewModelSnapshot, DECISION_LABELS, EFFORT_UNSET_LABEL,
+    FILTER_LABEL, IDLE_LABEL, NEW_SESSION_LABEL, PLAN_DECISION_LABELS, RULES_NONE_LABEL,
+    RUNNING_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL, SESSIONS_NO_MATCH_LABEL, SETTINGS_LABEL,
+    SETTING_APPROVAL_LABEL, SETTING_COMPACT_LABEL, SETTING_CONTEXT_LABEL, SETTING_EFFORT_LABEL,
+    SETTING_MODEL_LABEL, SETTING_PHASE_LABEL, SETTING_PROVIDER_LABEL, SETTING_RULES_LABEL,
+    SETTING_SANDBOX_LABEL,
 };

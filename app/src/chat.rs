@@ -22,13 +22,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use modron_mobile_core::{RenderedRow, ViewModelSnapshot};
+use modron_mobile_core::{
+    ApprovalModeWire, Effort, Phase, RenderedRow, SandboxPolicy, ViewModelSnapshot,
+};
 use modron_view::{TranscriptEntry, COMPOSER_PLACEHOLDER, QUEUE_LABEL, STOP_LABEL};
 use nsh_core::element::{input, AdaptiveColor};
 use nsh_core::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use nsh_platform_tui::{Input, Modifiers};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use uuid::Uuid;
+
+use crate::nav::{Nav, NavStep, NavView, Screen};
 
 /// What the user asked the client to do. The host or the view sends these;
 /// the session driver (`crate::session`) turns them into core calls.
@@ -53,6 +58,21 @@ pub enum UiAction {
     Interrupt,
     /// `/compact` in the composer.
     Compact,
+    /// Sessions screen: refresh the list (the core's `list_sessions`).
+    ListSessions,
+    /// Attach to a session from its start (the core's `attach`).
+    Attach(Uuid),
+    /// Create a session (the core's `new_session`).
+    NewSession,
+    /// Settings: one config change, sent as a command. The screen shows it
+    /// when the server's ConfigChanged comes back in the snapshot.
+    SetApprovalMode(ApprovalModeWire),
+    SetPhase(Phase),
+    SetEffort(Option<Effort>),
+    SetSandbox(SandboxPolicy),
+    /// A screen-navigation step: from a key (through `Host::route`) or a tap
+    /// (the web header). The host applies it; it never reaches the driver.
+    Nav(NavStep),
 }
 
 /// Key hints for the approval options, in protocol order. Keys are TUI
@@ -64,7 +84,7 @@ const PLAN_KEYS: [&str; 2] = ["y", "r"];
 
 /// True on the web host: tappable controls are drawn there only. The
 /// terminal keeps its key hints as text (AGENTS.md divergence table).
-const WEB_CONTROLS: bool = cfg!(target_arch = "wasm32");
+pub(crate) const WEB_CONTROLS: bool = cfg!(target_arch = "wasm32");
 
 /// Visible slots for queue chips, steer echoes, plan lines and the live
 /// activity rows. Fixed slot counts keep NSH's cell layout static (see the
@@ -106,7 +126,12 @@ pub enum Key {
     Backspace,
     /// One printable character, as the key produced it.
     Char(char),
-    /// Any other key (arrows, dead keys): always the composer's.
+    /// Up and Down arrows (the sessions and settings lists).
+    Up,
+    Down,
+    /// F2: opens Settings from any screen.
+    F2,
+    /// Any other key (dead keys, Tab): always the composer's.
     Other,
 }
 
@@ -128,8 +153,20 @@ pub fn key_of(name: &str) -> Key {
     }
 }
 
+/// Maps a key name as a host reports it, including the names only the
+/// screens use (`ArrowUp`, `ArrowDown`, `F2`); everything else is
+/// [`key_of`]'s. Both hosts call this.
+pub fn host_key(name: &str) -> Key {
+    match name {
+        "ArrowUp" => Key::Up,
+        "ArrowDown" => Key::Down,
+        "F2" => Key::F2,
+        _ => key_of(name),
+    }
+}
+
 /// The snapshot facts key routing needs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyFacts {
     /// Option count of the pending approval, when one is pending.
     pub approval_options: Option<usize>,
@@ -137,6 +174,14 @@ pub struct KeyFacts {
     pub plan_pending: bool,
     /// Messages held for the next run (the queue chips).
     pub queued: usize,
+    /// The screen on top of the stack (Chat unless another is open).
+    pub screen: Screen,
+    /// Whether the sessions filter has text.
+    pub filter_active: bool,
+    /// The session Enter would attach (Sessions only).
+    pub selected_session: Option<Uuid>,
+    /// The action Enter would send for the selected settings row.
+    pub enter_setting: Option<UiAction>,
 }
 
 /// Where a key goes.
@@ -146,24 +191,44 @@ pub enum Routed {
     Composer { queue: bool },
     /// The key became an action.
     Action(UiAction),
+    /// The key is a screen step (Sessions, Settings, and the Ctrl+O / F2
+    /// openers).
+    Nav(NavStep),
+    /// A key the open screen has no use for: consumed, nothing happens.
+    Ignored,
 }
 
-/// The one key-to-action rule, shared by every host. Pure: the composer's
-/// text is passed in, so the rule is testable without a view.
+/// The one key-to-action rule, shared by every host.
 ///
-/// Order: Enter always reaches the composer (Alt marks a queue); Backspace
-/// on an empty composer with messages queued removes the last one; a chord
-/// passes; Esc interrupts; with an approval pending, y / a / n decide its
-/// options and every other key is the composer's; with a plan pending, y
-/// approves and r revises with the trimmed composer text as the note.
+/// Order: F2 opens Settings and Ctrl+O opens Sessions (from any screen);
+/// on Sessions and Settings every other key is the screen's
+/// ([`route_screen_key`]); on Chat, Enter always reaches the composer (Alt
+/// marks a queue); Backspace on an empty composer with messages queued
+/// removes the last one; a chord passes; Esc interrupts; with an approval
+/// pending, y / a / n decide its options and every other key is the
+/// composer's; with a plan pending, y approves and r revises with the
+/// trimmed composer text as the note.
+///
+/// Esc precedence: on Sessions, Esc clears a non-empty filter first and
+/// closes the screen second; on Settings it closes the screen; on Chat it
+/// interrupts. The composer's text is passed in, so the rule is testable
+/// without a view.
 pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str) -> Routed {
     let composer = Routed::Composer { queue: false };
+    match key {
+        Key::F2 => return Routed::Nav(NavStep::Open(Screen::Settings)),
+        Key::Char('o') if chord => return Routed::Nav(NavStep::Open(Screen::Sessions)),
+        _ => {}
+    }
+    if facts.screen != Screen::Chat {
+        return route_screen_key(key, chord, &facts);
+    }
     match key {
         Key::Enter => return Routed::Composer { queue: alt },
         Key::Backspace if !chord && draft.is_empty() && facts.queued > 0 => {
             return Routed::Action(UiAction::Dequeue(facts.queued - 1));
         }
-        Key::Other | Key::Backspace => return composer,
+        Key::Other | Key::Backspace | Key::Up | Key::Down | Key::F2 => return composer,
         _ if chord => return composer,
         Key::Escape => return Routed::Action(UiAction::Interrupt),
         Key::Char(_) => {}
@@ -185,6 +250,37 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
         }
     }
     composer
+}
+
+/// Keys on the Sessions and Settings screens. There is no composer there,
+/// so these keys are the screen's: arrows move, Enter activates, Esc backs
+/// out, and on Sessions the printable keys type the filter (`n` and j / k
+/// act only while the filter is empty). A chord still passes.
+fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts) -> Routed {
+    if chord {
+        return Routed::Composer { queue: false };
+    }
+    let sessions = facts.screen == Screen::Sessions;
+    match key {
+        Key::Escape if facts.filter_active => Routed::Nav(NavStep::ClearFilter),
+        Key::Escape => Routed::Nav(NavStep::Back),
+        Key::Enter if sessions => match facts.selected_session {
+            Some(id) => Routed::Nav(NavStep::Attach(id)),
+            None => Routed::Ignored,
+        },
+        Key::Enter => match &facts.enter_setting {
+            Some(action) => Routed::Action(action.clone()),
+            None => Routed::Ignored,
+        },
+        Key::Up => Routed::Nav(NavStep::Move(-1)),
+        Key::Down => Routed::Nav(NavStep::Move(1)),
+        Key::Backspace => Routed::Nav(NavStep::FilterBack),
+        Key::Char('n') if sessions && !facts.filter_active => Routed::Nav(NavStep::NewSession),
+        Key::Char('j') if sessions && !facts.filter_active => Routed::Nav(NavStep::Move(1)),
+        Key::Char('k') if sessions && !facts.filter_active => Routed::Nav(NavStep::Move(-1)),
+        Key::Char(c) if sessions => Routed::Nav(NavStep::Filter(c)),
+        _ => Routed::Ignored,
+    }
 }
 
 /// The plan answer for `approve`. A revise carries the trimmed draft as its
@@ -326,24 +422,30 @@ pub fn transcript_lines(history: &[RenderedRow]) -> Vec<Line> {
         .collect()
 }
 
+/// The view's end of the link, handed to `App` through `CLIENT`.
+pub struct Client {
+    pub snapshots: UnboundedReceiver<ViewModelSnapshot>,
+    pub actions: UnboundedSender<UiAction>,
+    /// The navigation state the view renders; sent whenever it changes.
+    pub nav: UnboundedReceiver<NavView>,
+}
+
 /// The host's end of the link: pushes snapshots, takes actions, and routes
-/// the keys that the view must not see.
+/// the keys that the view must not see. It owns the screen stack and the
+/// sessions and settings state, because the keys that drive them are routed
+/// here.
 pub struct Host {
     snapshots: UnboundedSender<ViewModelSnapshot>,
     actions: UnboundedReceiver<UiAction>,
     loopback: UnboundedSender<UiAction>,
+    navs: UnboundedSender<NavView>,
     /// Option count of the pending approval, when one is pending.
     pending: Option<usize>,
     /// Whether a proposed plan waits for a decision.
     plan_pending: bool,
     /// Messages held for the next run (the queue chips).
     queued: usize,
-}
-
-/// The view's end of the link, handed to `App` through `CLIENT`.
-pub struct Client {
-    pub snapshots: UnboundedReceiver<ViewModelSnapshot>,
-    pub actions: UnboundedSender<UiAction>,
+    nav: Nav,
 }
 
 /// Creates the two ends of the link. Also resets the composer mirror, so a
@@ -354,61 +456,76 @@ pub fn link() -> (Host, Client) {
     CLEAR_DRAFT.store(false, Ordering::SeqCst);
     let (snap_tx, snap_rx) = unbounded_channel();
     let (act_tx, act_rx) = unbounded_channel();
+    let (nav_tx, nav_rx) = unbounded_channel();
     (
         Host {
             snapshots: snap_tx,
             actions: act_rx,
             loopback: act_tx.clone(),
+            navs: nav_tx,
             pending: None,
             plan_pending: false,
             queued: 0,
+            nav: Nav::default(),
         },
-        Client { snapshots: snap_rx, actions: act_tx },
+        Client { snapshots: snap_rx, actions: act_tx, nav: nav_rx },
     )
 }
 
 impl Host {
     /// Sends a snapshot to the view and records what the key routing needs:
-    /// whether an approval or a plan waits.
+    /// whether an approval or a plan waits, and the sessions and settings.
     pub fn push(&mut self, snapshot: &ViewModelSnapshot) {
         self.pending = snapshot.pending_approval.as_ref().map(|p| p.options.len());
         self.plan_pending = snapshot.plan_pending.is_some();
         self.queued = snapshot.queued.len();
+        self.nav.observe(snapshot);
         let _ = self.snapshots.send(snapshot.clone());
+        self.notify();
     }
 
-    /// The next action the view produced, if any.
+    /// The next action for the driver, if any. Navigation steps (from taps)
+    /// are applied here and never returned.
     pub fn try_action(&mut self) -> Option<UiAction> {
-        self.actions.try_recv().ok()
+        loop {
+            match self.actions.try_recv().ok()? {
+                UiAction::Nav(step) => self.nav_step(step),
+                action => return Some(action),
+            }
+        }
     }
 
     /// Routes one terminal key. Returns `Some(input)` for the view to handle,
-    /// or `None` when the key became an action here.
+    /// or `None` when the key became an action or a screen step here.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn filter(&self, input: Input) -> Option<Input> {
+    pub fn filter(&mut self, input: Input) -> Option<Input> {
         let Input::Key { key, modifiers, release: false } = &input else {
             return Some(input);
         };
-        if self.route(key_of(key), modifiers.alt, has_chord(modifiers)) {
+        if self.route(host_key(key), modifiers.alt, has_chord(modifiers)) {
             None
         } else {
             Some(input)
         }
     }
 
-    /// Routes a key by name: [`Host::route`] with [`key_of`].
-    pub fn take_key(&self, key: &str, alt: bool, chord: bool) -> bool {
-        self.route(key_of(key), alt, chord)
+    /// Routes a key by name: [`Host::route`] with [`host_key`].
+    pub fn take_key(&mut self, key: &str, alt: bool, chord: bool) -> bool {
+        self.route(host_key(key), alt, chord)
     }
 
-    /// Routes one key, the same on every host. Returns true when the key
-    /// became an action here (the host then consumes it); false when the
-    /// composer gets it.
-    pub fn route(&self, key: Key, alt: bool, chord: bool) -> bool {
+    /// Routes one key, the same on every host. Returns true when the host
+    /// consumes the key (an action, a screen step, or an ignored key); false
+    /// when the composer gets it.
+    pub fn route(&mut self, key: Key, alt: bool, chord: bool) -> bool {
         let facts = KeyFacts {
             approval_options: self.pending,
             plan_pending: self.plan_pending,
             queued: self.queued,
+            screen: self.nav.top(),
+            filter_active: !self.nav.filter().is_empty(),
+            selected_session: self.nav.selected_session(),
+            enter_setting: self.nav.enter_setting(),
         };
         match route_key(key, alt, chord, facts, &draft_text()) {
             Routed::Composer { queue } => {
@@ -423,7 +540,25 @@ impl Host {
                 self.act(action);
                 true
             }
+            Routed::Nav(step) => {
+                self.nav_step(step);
+                true
+            }
+            Routed::Ignored => true,
         }
+    }
+
+    /// Applies a screen step now (so the next key sees its result), sends
+    /// the core calls it implies, and tells the view.
+    fn nav_step(&mut self, step: NavStep) {
+        for action in self.nav.apply(step) {
+            self.act(action);
+        }
+        self.notify();
+    }
+
+    fn notify(&self) {
+        let _ = self.navs.send(self.nav.view());
     }
 
     fn act(&self, action: UiAction) {
@@ -447,12 +582,12 @@ fn has_chord(m: &Modifiers) -> bool {
 
 /// A theme colour by its `theme/oculus.json` token name. Read reactively,
 /// so a new theme reaches the text that reads it.
-fn token_ink(name: &str) -> AdaptiveColor {
+pub(crate) fn token_ink(name: &str) -> AdaptiveColor {
     tokens().color(name).unwrap_or_else(|| AdaptiveColor::from(nsh_core::color::black()))
 }
 
 /// The theme token each row style is drawn with.
-fn style_token(style: Style) -> &'static str {
+pub(crate) fn style_token(style: Style) -> &'static str {
     match style {
         Style::Bold => "primary",
         Style::Plain => "foreground",
@@ -513,7 +648,7 @@ fn transcript_row(model: Signal<Model>, at: Position) -> impl IntoElement {
         ))
 }
 
-fn header(model: Signal<Model>) -> impl IntoElement {
+pub(crate) fn header(model: Signal<Model>) -> impl IntoElement {
     view()
         .flex_row()
         .child(
@@ -783,7 +918,9 @@ fn composer_controls(
         .child(when(move || WEB_CONTROLS && model.with(|m| m.is_running), stop))
 }
 
-/// The chat screen. `actions` receives the composer's own actions (Send,
+/// The chat body: the transcript, the live strips, the decision blocks and
+/// the composer. The status surface and navigation are drawn around it by
+/// `screens::frame`. `actions` receives the composer's own actions (Send,
 /// Queue, Compact) and the web controls' actions; decisions, interrupts and
 /// plan answers from the keys come from the host's key routing.
 pub fn screen(
@@ -822,11 +959,6 @@ pub fn screen(
     view()
         .flex_col()
         .size_full()
-        .child(header(model))
-        .child(
-            text(move || model.with(|m| m.status_line.clone()))
-                .text_color(move || token_ink("muted-foreground")),
-        )
         .child(
             virtual_list(
                 move || model.with(|m| m.lines.len()),
@@ -868,15 +1000,24 @@ fn action_is_empty(action: &UiAction) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nav::Screen;
 
-    const NONE: KeyFacts = KeyFacts { approval_options: None, plan_pending: false, queued: 0 };
+    const NONE: KeyFacts = KeyFacts {
+        approval_options: None,
+        plan_pending: false,
+        queued: 0,
+        screen: Screen::Chat,
+        filter_active: false,
+        selected_session: None,
+        enter_setting: None,
+    };
 
     fn approval(options: usize) -> KeyFacts {
-        KeyFacts { approval_options: Some(options), plan_pending: false, queued: 0 }
+        KeyFacts { approval_options: Some(options), ..NONE }
     }
 
     fn plan() -> KeyFacts {
-        KeyFacts { approval_options: None, plan_pending: true, queued: 0 }
+        KeyFacts { plan_pending: true, ..NONE }
     }
 
     fn queued(count: usize) -> KeyFacts {
@@ -953,12 +1094,12 @@ mod tests {
 
     #[test]
     fn an_approval_takes_precedence_over_a_plan() {
-        let both = KeyFacts { approval_options: Some(3), plan_pending: true, queued: 0 };
+        let both = KeyFacts { approval_options: Some(3), plan_pending: true, ..NONE };
         assert_eq!(
-            route_key(Key::Char('y'), false, false, both, ""),
+            route_key(Key::Char('y'), false, false, both.clone(), ""),
             Routed::Action(UiAction::Decide(0))
         );
-        assert_eq!(route_key(Key::Char('r'), false, false, both, "note"), composer());
+        assert_eq!(route_key(Key::Char('r'), false, false, both.clone(), "note"), composer());
     }
 
     #[test]
@@ -1019,9 +1160,9 @@ mod tests {
 
     #[test]
     fn backspace_dequeues_while_an_approval_waits() {
-        let both = KeyFacts { approval_options: Some(3), plan_pending: false, queued: 2 };
+        let both = KeyFacts { approval_options: Some(3), queued: 2, ..NONE };
         assert_eq!(
-            route_key(Key::Backspace, false, false, both, ""),
+            route_key(Key::Backspace, false, false, both.clone(), ""),
             Routed::Action(UiAction::Dequeue(1))
         );
     }
@@ -1035,6 +1176,166 @@ mod tests {
         assert_eq!(
             plan_answer_for(false, " fix "),
             UiAction::DecidePlan { approve: false, note: Some("fix".into()) }
+        );
+    }
+
+    fn sessions(filter_active: bool) -> KeyFacts {
+        KeyFacts {
+            screen: Screen::Sessions,
+            filter_active,
+            selected_session: Some(uuid::Uuid::from_u128(7)),
+            ..NONE
+        }
+    }
+
+    fn settings(enter: Option<UiAction>) -> KeyFacts {
+        KeyFacts { screen: Screen::Settings, enter_setting: enter, ..NONE }
+    }
+
+    #[test]
+    fn f2_opens_settings_and_ctrl_o_opens_sessions_from_any_screen() {
+        for facts in [NONE, sessions(false), settings(None), approval(3)] {
+            assert_eq!(
+                route_key(Key::F2, false, false, facts.clone(), ""),
+                Routed::Nav(NavStep::Open(Screen::Settings))
+            );
+            assert_eq!(
+                route_key(Key::Char('o'), false, true, facts, ""),
+                Routed::Nav(NavStep::Open(Screen::Sessions))
+            );
+        }
+    }
+
+    #[test]
+    fn host_key_maps_arrows_and_f2_and_leaves_other_names_alone() {
+        assert_eq!(host_key("ArrowUp"), Key::Up);
+        assert_eq!(host_key("ArrowDown"), Key::Down);
+        assert_eq!(host_key("F2"), Key::F2);
+        assert_eq!(host_key("Enter"), Key::Enter);
+        assert_eq!(host_key("ArrowLeft"), Key::Other);
+    }
+
+    #[test]
+    fn esc_clears_a_filter_before_it_closes_sessions() {
+        assert_eq!(
+            route_key(Key::Escape, false, false, sessions(true), ""),
+            Routed::Nav(NavStep::ClearFilter)
+        );
+        assert_eq!(
+            route_key(Key::Escape, false, false, sessions(false), ""),
+            Routed::Nav(NavStep::Back)
+        );
+    }
+
+    #[test]
+    fn esc_closes_settings_and_interrupts_only_on_chat() {
+        assert_eq!(
+            route_key(Key::Escape, false, false, settings(None), ""),
+            Routed::Nav(NavStep::Back)
+        );
+        assert_eq!(
+            route_key(Key::Escape, false, false, NONE, ""),
+            Routed::Action(UiAction::Interrupt)
+        );
+    }
+
+    #[test]
+    fn sessions_typing_filters_and_n_or_jk_act_only_on_an_empty_filter() {
+        assert_eq!(
+            route_key(Key::Char('n'), false, false, sessions(false), ""),
+            Routed::Nav(NavStep::NewSession)
+        );
+        assert_eq!(
+            route_key(Key::Char('n'), false, false, sessions(true), ""),
+            Routed::Nav(NavStep::Filter('n'))
+        );
+        assert_eq!(
+            route_key(Key::Char('j'), false, false, sessions(false), ""),
+            Routed::Nav(NavStep::Move(1))
+        );
+        assert_eq!(
+            route_key(Key::Char('k'), false, false, sessions(false), ""),
+            Routed::Nav(NavStep::Move(-1))
+        );
+        assert_eq!(
+            route_key(Key::Char('j'), false, false, sessions(true), ""),
+            Routed::Nav(NavStep::Filter('j'))
+        );
+        assert_eq!(
+            route_key(Key::Char('x'), false, false, sessions(false), ""),
+            Routed::Nav(NavStep::Filter('x'))
+        );
+    }
+
+    #[test]
+    fn enter_on_a_session_attaches_the_selected_row() {
+        assert_eq!(
+            route_key(Key::Enter, false, false, sessions(false), ""),
+            Routed::Nav(NavStep::Attach(uuid::Uuid::from_u128(7)))
+        );
+        let empty = KeyFacts { screen: Screen::Sessions, ..NONE };
+        assert_eq!(route_key(Key::Enter, false, false, empty, ""), Routed::Ignored);
+    }
+
+    #[test]
+    fn enter_on_settings_sends_the_row_action_or_nothing() {
+        let effort = UiAction::SetEffort(Some(Effort::Low));
+        assert_eq!(
+            route_key(Key::Enter, false, false, settings(Some(effort.clone())), ""),
+            Routed::Action(effort)
+        );
+        assert_eq!(route_key(Key::Enter, false, false, settings(None), ""), Routed::Ignored);
+    }
+
+    #[test]
+    fn arrows_move_on_sessions_and_settings() {
+        for facts in [sessions(false), settings(None)] {
+            assert_eq!(
+                route_key(Key::Up, false, false, facts.clone(), ""),
+                Routed::Nav(NavStep::Move(-1))
+            );
+            assert_eq!(
+                route_key(Key::Down, false, false, facts, ""),
+                Routed::Nav(NavStep::Move(1))
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_edits_the_sessions_filter_and_is_a_no_op_on_settings() {
+        assert_eq!(
+            route_key(Key::Backspace, false, false, sessions(true), ""),
+            Routed::Nav(NavStep::FilterBack)
+        );
+        assert_eq!(
+            route_key(Key::Backspace, false, false, settings(None), ""),
+            Routed::Nav(NavStep::FilterBack)
+        );
+    }
+
+    #[test]
+    fn letters_on_settings_are_consumed_not_typed() {
+        assert_eq!(route_key(Key::Char('a'), false, false, settings(None), ""), Routed::Ignored);
+    }
+
+    #[test]
+    fn a_chord_passes_to_the_composer_on_every_screen() {
+        assert_eq!(
+            route_key(Key::Char('a'), false, true, sessions(false), ""),
+            Routed::Composer { queue: false }
+        );
+        assert_eq!(
+            route_key(Key::Escape, false, true, settings(None), ""),
+            Routed::Composer { queue: false }
+        );
+    }
+
+    #[test]
+    fn chat_keys_are_unchanged_by_the_new_screens() {
+        assert_eq!(route_key(Key::Up, false, false, NONE, ""), Routed::Composer { queue: false });
+        assert_eq!(
+            route_key(Key::Char('n'), false, false, NONE, ""),
+            Routed::Composer { queue: false }
         );
     }
 }

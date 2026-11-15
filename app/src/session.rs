@@ -16,7 +16,8 @@
 use std::time::Duration;
 
 use modron_mobile_core::{
-    connection_label, ConnectionState, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
+    connection_label, ConfigPatch, ConnectionState, RemoteClient, ViewModelSnapshot,
+    PLAN_DECISION_LABELS,
 };
 use tokio::sync::mpsc::{
     error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender,
@@ -264,6 +265,19 @@ fn apply(client: &RemoteClient, action: UiAction) {
             None => Ok(()),
         },
         UiAction::Compact => client.compact(),
+        UiAction::ListSessions => client.list_sessions(),
+        UiAction::Attach(session) => client.attach(session, 0),
+        UiAction::NewSession => client.new_session(None),
+        UiAction::SetApprovalMode(mode) => {
+            client.set_config(ConfigPatch { approval_mode: Some(mode), ..Default::default() })
+        }
+        UiAction::SetPhase(phase) => client.set_phase(phase),
+        UiAction::SetEffort(effort) => client.set_effort(effort),
+        UiAction::SetSandbox(policy) => {
+            client.set_config(ConfigPatch { sandbox: Some(policy), ..Default::default() })
+        }
+        // Navigation is applied by the host before an action reaches here.
+        UiAction::Nav(_) => Ok(()),
     };
     if let Err(error) = result {
         client.note_local_error(error.to_string());

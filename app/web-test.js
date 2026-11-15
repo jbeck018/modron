@@ -112,6 +112,9 @@ function startWsServer(opts = {}) {
           (opts.after || []).forEach((extra, i) => send({ session: SESSION, seq: 2 + i, ...extra }));
         } else if (frame.type === 'submit') {
           onSubmit(frame);
+        } else if (frame.type === 'list_sessions') {
+          // The sessions screen's refresh: answer with the scripted rows.
+          send({ session: SESSION, seq: 3, type: 'sessions', sessions: opts.sessions || [] });
         }
         frames.push(frame);
       }
@@ -304,6 +307,51 @@ async function testChipDequeue(browser, base) {
   }
 }
 
+// The header's pressable controls open the screens (demo: no server).
+async function testHeaderOpensScreens(browser, base) {
+  const { page, errors } = await openPage(browser, base + '/');
+  await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
+  await tapLabel(page, 'sessions');
+  await page.waitForFunction(() => document.body.innerText.includes('write the release notes'), null, { timeout: TIMEOUT });
+  await tapLabel(page, 'settings');
+  await page.waitForFunction(() => document.body.innerText.includes('approval mode: ask'), null, { timeout: TIMEOUT });
+  if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  await page.close();
+}
+// A session row is pressable: a tap sends an attach frame for that session.
+async function testSessionRowAttaches(browser, base) {
+  const other = '9c2d7e10-1a2b-4c3d-8e4f-5a6b7c8d9e0f';
+  const ws = await startWsServer({ sessions: [{ id: other, title: 'other work', created_at: '', updated_at: '', message_count: 2 }] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await tapLabel(page, 'sessions');
+    await page.waitForFunction(() => document.body.innerText.includes('other work'), null, { timeout: TIMEOUT });
+    await page.getByText('other work', { exact: false }).first().click();
+    const frame = await waitFrame(ws, 'attach', (f) => f.session_id === other);
+    if (frame.session_id !== other) throw new Error('attach carried ' + frame.session_id);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+// The effort row is pressable: a tap on "effort: unset" sends set_config
+// with effort low (unset -> low).
+async function testEffortTapSendsConfig(browser, base) {
+  const ws = await startWsServer();
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await tapLabel(page, 'settings');
+    await page.waitForFunction(() => document.body.innerText.includes('effort: unset'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'effort: unset');
+    const frame = await waitFrame(ws, 'set_config', (f) => f.patch && f.patch.effort === 'low');
+    if (frame.patch.effort !== 'low') throw new Error('effort patch was ' + JSON.stringify(frame.patch));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
 (async () => {
   const staticPort = await freePort();
   const staticServer = await startStatic(staticPort);
@@ -326,6 +374,9 @@ async function testChipDequeue(browser, base) {
     ['(f) theme primary colour applied on web', () => testThemeColour(browser, base)],
     ['(g) share link (no session in URL): submit is for the adopted session', () => testShareLinkSubmit(browser, base)],
     ['(h) queue chip press sends dequeue', () => testChipDequeue(browser, base)],
+    ['(i) header controls open the sessions and settings screens', () => testHeaderOpensScreens(browser, base)],
+    ['(j) session row tap sends attach', () => testSessionRowAttaches(browser, base)],
+    ['(k) effort tap sends set_config', () => testEffortTapSendsConfig(browser, base)],
   ];
   for (const [name, run] of more) {
     try {

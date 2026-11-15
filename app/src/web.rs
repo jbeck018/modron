@@ -10,7 +10,7 @@ use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::{prelude::*, JsCast};
 
 use crate::{
-    chat::{key_of, link, Client, Host},
+    chat::{host_key, link, Client, Host},
     demo::Player,
     session::{Driver, Live, LiveOptions, TICK},
 };
@@ -86,9 +86,9 @@ fn listen_keys(web: Rc<RefCell<Web>>) {
     };
     let on_key =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |event: web_sys::KeyboardEvent| {
-            let key = key_of(&event.key());
+            let key = host_key(&event.key());
             let chord = event.ctrl_key() || event.meta_key() || event.alt_key();
-            if web.borrow().host.route(key, event.alt_key(), chord) {
+            if web.borrow_mut().host.route(key, event.alt_key(), chord) {
                 event.prevent_default();
             }
         });

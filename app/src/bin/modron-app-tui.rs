@@ -44,6 +44,9 @@ mod terminal {
             K::Enter => "Enter".into(),
             K::Esc => "Escape".into(),
             K::Backspace => "Backspace".into(),
+            K::Up => "ArrowUp".into(),
+            K::Down => "ArrowDown".into(),
+            K::F(2) => "F2".into(),
             _ => "Unknown".into(),
         };
         let m = key.modifiers;
