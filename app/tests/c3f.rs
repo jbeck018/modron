@@ -208,9 +208,9 @@ fn chat_with(agents: Vec<AgentRowView>) -> Harness {
 fn typing_a_slash_shows_suggestions_and_esc_hides_them_keeping_the_text() {
     let mut h = chat_with(vec![]);
     h.type_text("/co");
-    h.wait_for("compact suggestion", |s| s.contains("/compact - compact the session"));
+    h.wait_for("compact suggestion", |s| s.contains("/compact - compact this session"));
     h.key("Escape");
-    h.wait_for("suggestions hidden", |s| !s.contains("/compact - compact the session"));
+    h.wait_for("suggestions hidden", |s| !s.contains("/compact - compact this session"));
     assert!(h.screen().contains("/co"), "the typed text stays\n{}", h.screen());
     // Esc hid the list, so it did not interrupt the run.
     assert_eq!(h.action(), None);
@@ -220,7 +220,7 @@ fn typing_a_slash_shows_suggestions_and_esc_hides_them_keeping_the_text() {
 fn enter_completes_a_partial_command_then_runs_the_complete_one() {
     let mut h = chat_with(vec![]);
     h.type_text("/co");
-    h.wait_for("compact suggestion", |s| s.contains("/compact - compact the session"));
+    h.wait_for("compact suggestion", |s| s.contains("/compact - compact this session"));
     // Enter on a partial word completes it; nothing is sent yet.
     h.key("Enter");
     assert_eq!(h.action(), None);

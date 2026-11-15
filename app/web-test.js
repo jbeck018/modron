@@ -370,7 +370,7 @@ async function testSlashSuggestions(browser, base) {
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
   await page.keyboard.type('/co');
-  await page.waitForFunction(() => document.body.innerText.includes("/compact - compact the session"), null, { timeout: TIMEOUT });
+  await page.waitForFunction(() => document.body.innerText.includes("/compact - compact this session"), null, { timeout: TIMEOUT });
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   await page.close();
 }

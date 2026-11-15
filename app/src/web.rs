@@ -58,7 +58,7 @@ pub fn start() -> Client {
     let feed = match LiveOptions::from_query(&query) {
         Ok(Some(options)) => {
             let (live, actions, out) = Live::channels();
-            let driver = Driver::start(options, actions, out);
+            let driver = Driver::start(options, live.status.clone(), actions, out);
             Feed::Live { live, driver }
         }
         Ok(None) => Feed::Demo { player: Player::default(), started: js_sys::Date::now() },

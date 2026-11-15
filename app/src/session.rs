@@ -1,25 +1,34 @@
 //! The live session driver, shared by both hosts. A [`Driver`] owns one
 //! `RemoteClient`; each [`Driver::step`] applies the UI's pending actions,
-//! attaches once the handshake lands, and publishes the snapshot when it
-//! changed. The view side is [`Live`], which moves those snapshots into the
-//! host and the host's actions back to the driver.
+//! runs the post-connect setup (attach, or pick a session), retries a dropped
+//! connection, and publishes the snapshot when it changed. The view side is
+//! [`Live`], which moves those snapshots into the host and the host's actions
+//! back to the driver.
 //!
 //! Who calls `step`: the terminal host runs it on its own thread
 //! ([`spawn`]); the web host runs it from the page's timer. The core needs no
 //! runtime of its own on either target (native owns one; wasm uses
 //! `spawn_local`), so the driver itself is plain sync code.
 //!
-//! The driver publishes a snapshot whenever the folded view state changes,
-//! and stops after the connection goes `Disconnected` (reconnect is out of
-//! scope): that final snapshot carries the core's `disconnected` label.
+//! Connection loss: the driver keeps the core's `disconnected` state on
+//! screen, retries every 2 s (doubling, capped at 30 s), and re-attaches to
+//! the session it had. [`Status::reconnecting`] tells the terminal host that
+//! Esc may leave.
 
 use modron_mobile_core::view::NO_SESSION_LABEL;
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
 
 use modron_mobile_core::{
     approval_mode_next, connection_label, sandbox_next, ClientError, ConfigPatch, ConnectionState,
     RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
 };
+use modron_protocol::SessionMetaWire;
 use tokio::sync::mpsc::{
     error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
@@ -30,13 +39,40 @@ use crate::chat::{Host, UiAction};
 /// How often the driver is stepped.
 pub const TICK: Duration = Duration::from_millis(20);
 
-/// Where the live driver connects, and which session it attaches to. With
-/// no session, the first submit starts one and the server names it.
+/// How long a session list may take to arrive. The rows land in the state's
+/// `sessions`, and an empty list looks the same as a late one, so the wait
+/// is bounded.
+pub const LIST_WAIT: Duration = Duration::from_secs(2);
+
+/// The first reconnect delay; each failed try doubles it up to the cap.
+pub const RETRY_FIRST: Duration = Duration::from_secs(2);
+/// The longest wait between reconnect tries.
+pub const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Which session a connection attaches to when no exact one is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Resume {
+    /// Nothing attached: the first submit starts a session.
+    #[default]
+    New,
+    /// The most recently updated session whose folder is `cwd`, else new.
+    Latest,
+    /// The most recently updated session of any folder; none is an error.
+    Continue,
+}
+
+/// Where the live driver connects, and which session it attaches to.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct LiveOptions {
     pub url: String,
     pub token: Option<String>,
+    /// An exact session to attach to (wins over `resume`).
     pub session: Option<Uuid>,
+    /// What to attach to when `session` is None.
+    pub resume: Resume,
+    /// The folder `Resume::Latest` matches against (the session's
+    /// `working_dir`).
+    pub cwd: Option<String>,
 }
 
 impl LiveOptions {
@@ -57,7 +93,7 @@ impl LiveOptions {
             }
         }
         match url {
-            Some(url) => Ok(Some(Self { url, token, session })),
+            Some(url) => Ok(Some(Self { url, token, session, ..Self::default() })),
             None if token.is_some() || session.is_some() => {
                 Err("--token and --session need --url".into())
             }
@@ -82,7 +118,7 @@ impl LiveOptions {
                 _ => {}
             }
         }
-        Ok(url.filter(|u| !u.is_empty()).map(|url| Self { url, token, session }))
+        Ok(url.filter(|u| !u.is_empty()).map(|url| Self { url, token, session, ..Self::default() }))
     }
 }
 
@@ -114,10 +150,50 @@ fn decode_form(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Flags the driver raises for the terminal host, shared between the two.
+#[derive(Debug, Default)]
+pub struct Status {
+    reconnecting: AtomicBool,
+    fatal: Mutex<Option<String>>,
+    note: Mutex<String>,
+}
+
+impl Status {
+    /// True while the connection is down and the driver is retrying.
+    pub fn reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::SeqCst)
+    }
+
+    /// The reason the driver stopped on its own (for example `Resume::Continue`
+    /// with no session to continue). The host leaves its screen when set.
+    pub fn fatal(&self) -> Option<String> {
+        self.fatal.lock().ok().and_then(|f| f.clone())
+    }
+
+    /// Text appended to the connection label, e.g. who started the server.
+    pub fn set_note(&self, text: &str) {
+        if let Ok(mut note) = self.note.lock() {
+            *note = text.into();
+        }
+    }
+
+    fn note(&self) -> String {
+        self.note.lock().map(|n| n.clone()).unwrap_or_default()
+    }
+
+    fn fail(&self, reason: String) {
+        if let Ok(mut fatal) = self.fatal.lock() {
+            *fatal = Some(reason);
+        }
+    }
+}
+
 /// The view's end of the driver.
 pub struct Live {
     snapshots: UnboundedReceiver<ViewModelSnapshot>,
     actions: UnboundedSender<UiAction>,
+    /// The driver's flags (shared with the driver thread).
+    pub status: Arc<Status>,
 }
 
 impl Live {
@@ -126,7 +202,8 @@ impl Live {
     pub fn channels() -> (Self, UnboundedReceiver<UiAction>, UnboundedSender<ViewModelSnapshot>) {
         let (snap_tx, snap_rx) = unbounded_channel();
         let (act_tx, act_rx) = unbounded_channel();
-        (Self { snapshots: snap_rx, actions: act_tx }, act_rx, snap_tx)
+        let live = Self { snapshots: snap_rx, actions: act_tx, status: Arc::default() };
+        (live, act_rx, snap_tx)
     }
 
     /// Moves the driver's snapshots into the host and the host's actions to
@@ -143,6 +220,16 @@ impl Live {
         }
         changed
     }
+
+    /// Sends one action to the driver directly (no host in between).
+    pub fn act(&self, action: UiAction) {
+        let _ = self.actions.send(action);
+    }
+
+    /// The next snapshot the driver published, if one is waiting.
+    pub fn try_snapshot(&mut self) -> Option<ViewModelSnapshot> {
+        self.snapshots.try_recv().ok()
+    }
 }
 
 /// Starts the driver on its own thread (terminal host). Connecting is
@@ -150,8 +237,9 @@ impl Live {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn(options: LiveOptions) -> std::io::Result<Live> {
     let (live, actions, out) = Live::channels();
+    let status = Arc::clone(&live.status);
     std::thread::Builder::new().name("modron-session".into()).spawn(move || {
-        if let Some(mut driver) = Driver::start(options, actions, out) {
+        if let Some(mut driver) = Driver::start(options, status, actions, out) {
             while driver.step() {
                 std::thread::sleep(TICK);
             }
@@ -160,13 +248,51 @@ pub fn spawn(options: LiveOptions) -> std::io::Result<Live> {
     Ok(live)
 }
 
-/// The driver: one client, its attach state and the last snapshot sent.
+/// Picks the session a connection resumes: the most recently updated row
+/// (`updated_at` is RFC 3339 from the server, so text order is time order),
+/// among the rows in `cwd` for [`Resume::Latest`]. `None` for `New`.
+pub fn pick_session(rows: &[SessionMetaWire], resume: Resume, cwd: Option<&str>) -> Option<Uuid> {
+    let folder = match resume {
+        Resume::New => return None,
+        Resume::Latest => cwd,
+        Resume::Continue => None,
+    };
+    rows.iter()
+        .filter(|row| folder.is_none_or(|dir| row.working_dir.as_deref() == Some(dir)))
+        .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+        .map(|row| row.id)
+}
+
+/// How long to wait before reconnect try number `attempts` (0-based).
+pub fn retry_delay(attempts: u32) -> Duration {
+    let factor = 1u32.checked_shl(attempts.min(16)).unwrap_or(u32::MAX);
+    RETRY_FIRST.saturating_mul(factor).min(RETRY_MAX)
+}
+
+/// Where the driver is in the session choice after a connect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Ready,
+    /// A session list was requested; choose by this deadline at the latest.
+    Listing(Instant),
+}
+
+/// The driver: one client, its connection and attach state, and the last
+/// snapshot sent.
 pub struct Driver {
     client: RemoteClient,
     options: LiveOptions,
+    status: Arc<Status>,
     actions: UnboundedReceiver<UiAction>,
     out: UnboundedSender<ViewModelSnapshot>,
-    attached: bool,
+    /// The current connection ran its post-connect setup.
+    linked: bool,
+    stage: Stage,
+    /// The session last seen attached: a reconnect re-attaches to it.
+    resume: Option<Uuid>,
+    /// When the next reconnect try runs, and how many have run.
+    retry_at: Option<Instant>,
+    attempts: u32,
     last: String,
 }
 
@@ -175,13 +301,24 @@ impl Driver {
     /// as a `Disconnected` snapshot first, so the view still shows it.
     pub fn start(
         options: LiveOptions,
+        status: Arc<Status>,
         actions: UnboundedReceiver<UiAction>,
         out: UnboundedSender<ViewModelSnapshot>,
     ) -> Option<Self> {
         match RemoteClient::connect(&options.url, options.token.as_deref()) {
-            Ok(client) => {
-                Some(Self { client, options, actions, out, attached: false, last: String::new() })
-            }
+            Ok(client) => Some(Self {
+                client,
+                options,
+                status,
+                actions,
+                out,
+                linked: false,
+                stage: Stage::Ready,
+                resume: None,
+                retry_at: None,
+                attempts: 0,
+                last: String::new(),
+            }),
             Err(e) => {
                 let _ = out.send(ViewModelSnapshot {
                     connection: ConnectionState::Disconnected,
@@ -194,9 +331,11 @@ impl Driver {
         }
     }
 
-    /// One pass: apply the UI's actions, attach once connected, publish the
-    /// snapshot if it changed. Returns false when the driver is finished (the
-    /// view is gone, the link closed, or the connection is `Disconnected`).
+    /// One pass: apply the UI's actions, keep the connection up, publish the
+    /// snapshot if it changed. Returns false when the driver is finished: the
+    /// view is gone, the driver hit a fatal condition (see [`Status::fatal`]),
+    /// or the snapshot receiver is gone. A dropped connection is not finished:
+    /// the driver retries it.
     pub fn step(&mut self) -> bool {
         loop {
             match self.actions.try_recv() {
@@ -206,18 +345,58 @@ impl Driver {
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
-        if !self.attached && self.client.is_connected() {
-            self.attached = true;
-            // A snapshot for the wanted session may already have arrived (the
-            // bridge replays buffered frames): then it is attached already.
-            if let Some(session) = self.options.session {
-                if self.client.attached_session() != Some(session) {
-                    let _ = self.client.attach(session, 0);
+        let state = self.client.state();
+        if state.session_id.is_some() {
+            self.resume = state.session_id;
+        }
+        match state.connection {
+            ConnectionState::Connected => {
+                self.status.reconnecting.store(false, Ordering::SeqCst);
+                if !self.linked {
+                    self.linked = true;
+                    self.attempts = 0;
+                    self.retry_at = None;
+                    self.link_up();
+                }
+            }
+            ConnectionState::Connecting => {}
+            ConnectionState::Disconnected => {
+                self.linked = false;
+                self.status.reconnecting.store(true, Ordering::SeqCst);
+                let due = *self
+                    .retry_at
+                    .get_or_insert_with(|| Instant::now() + retry_delay(self.attempts));
+                if Instant::now() >= due {
+                    self.retry_at = None;
+                    self.attempts = self.attempts.saturating_add(1);
+                    self.reconnect();
                 }
             }
         }
-        let snapshot = self.client.state();
-        let closed = snapshot.connection == ConnectionState::Disconnected;
+        if let Stage::Listing(deadline) = self.stage {
+            if !state.sessions.is_empty() || Instant::now() >= deadline {
+                self.stage = Stage::Ready;
+                match pick_session(
+                    &state.sessions,
+                    self.options.resume,
+                    self.options.cwd.as_deref(),
+                ) {
+                    Some(session) => {
+                        let _ = self.client.attach(session, 0);
+                    }
+                    None if self.options.resume == Resume::Continue => {
+                        self.status.fail(format!(
+                            "no session to continue on {}: start one with modron-app-tui --new",
+                            self.options.url
+                        ));
+                        return false;
+                    }
+                    None => {}
+                }
+            }
+        }
+        let mut snapshot = self.client.state();
+        snapshot.connection_label = self.label(&snapshot.connection_label);
         // Snapshots carry no PartialEq; the JSON form is the change test.
         let json = serde_json::to_string(&snapshot).unwrap_or_default();
         if json != self.last {
@@ -226,7 +405,53 @@ impl Driver {
                 return false;
             }
         }
-        !closed
+        true
+    }
+
+    /// The connection label with the address (and the note, when set).
+    fn label(&self, base: &str) -> String {
+        let note = self.status.note();
+        if note.is_empty() {
+            format!("{base} \u{b7} {}", self.options.url)
+        } else {
+            format!("{base} \u{b7} {} \u{b7} {note}", self.options.url)
+        }
+    }
+
+    /// The post-connect setup: an exact session is attached; with none, the
+    /// resume choice runs. A reconnect that already names a session has
+    /// re-attached itself (the core does it after the welcome).
+    fn link_up(&mut self) {
+        if self.resume.is_some() {
+            return;
+        }
+        if let Some(session) = self.options.session {
+            if self.client.attached_session() != Some(session) {
+                let _ = self.client.attach(session, 0);
+            }
+            return;
+        }
+        if self.options.resume != Resume::New {
+            let _ = self.client.list_sessions();
+            self.stage = Stage::Listing(Instant::now() + LIST_WAIT);
+        }
+    }
+
+    /// One reconnect try: re-attach to the known session, or connect afresh
+    /// when no session was ever seen (the post-connect setup runs again).
+    fn reconnect(&mut self) {
+        let token = self.options.token.as_deref();
+        match self.resume {
+            Some(session) => {
+                let _ = self.client.reconnect(&self.options.url, session, token);
+            }
+            None => {
+                if let Ok(client) = RemoteClient::connect(&self.options.url, token) {
+                    self.client = client;
+                }
+            }
+        }
+        self.stage = Stage::Ready;
     }
 }
 
@@ -354,6 +579,7 @@ mod tests {
                 url: "ws://localhost:7000".into(),
                 token: Some("a b!".into()),
                 session: Some(id),
+                ..LiveOptions::default()
             }))
         );
     }
@@ -363,5 +589,51 @@ mod tests {
         assert!(LiveOptions::from_query("?url=ws://h&session=nope").is_err());
         assert_eq!(decode_form("100%"), "100%");
         assert_eq!(decode_form("%zz"), "%zz");
+    }
+
+    fn row(id: u128, updated: &str, dir: Option<&str>) -> SessionMetaWire {
+        SessionMetaWire {
+            id: Uuid::from_u128(id),
+            title: format!("s{id}"),
+            created_at: updated.into(),
+            updated_at: updated.into(),
+            message_count: 1,
+            task_branch: None,
+            task_state: None,
+            working_dir: dir.map(String::from),
+        }
+    }
+
+    #[test]
+    fn latest_picks_the_newest_row_in_the_folder() {
+        let rows = [
+            row(1, "2026-11-14T10:00:00+00:00", Some("/work/a")),
+            row(2, "2026-11-15T09:00:00+00:00", Some("/work/b")),
+            row(3, "2026-11-15T08:00:00+00:00", Some("/work/a")),
+        ];
+        assert_eq!(pick_session(&rows, Resume::Latest, Some("/work/a")), Some(Uuid::from_u128(3)));
+        assert_eq!(pick_session(&rows, Resume::Latest, Some("/work/c")), None);
+    }
+
+    #[test]
+    fn continue_ignores_the_folder_and_new_picks_nothing() {
+        let rows = [
+            row(1, "2026-11-14T10:00:00+00:00", Some("/work/a")),
+            row(2, "2026-11-15T09:00:00+00:00", Some("/work/b")),
+        ];
+        assert_eq!(
+            pick_session(&rows, Resume::Continue, Some("/work/a")),
+            Some(Uuid::from_u128(2))
+        );
+        assert_eq!(pick_session(&rows, Resume::Continue, None), Some(Uuid::from_u128(2)));
+        assert_eq!(pick_session(&rows, Resume::New, None), None);
+        assert_eq!(pick_session(&[], Resume::Continue, None), None);
+    }
+
+    #[test]
+    fn retry_doubles_from_two_seconds_and_caps_at_thirty() {
+        let secs: Vec<u64> = (0..7).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(retry_delay(u32::MAX), RETRY_MAX);
     }
 }

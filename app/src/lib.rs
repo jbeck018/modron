@@ -11,6 +11,8 @@ pub mod nav;
 pub mod screens;
 pub mod session;
 pub mod slash;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod startup;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

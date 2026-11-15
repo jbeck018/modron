@@ -28,18 +28,10 @@ pub struct Entry {
     pub about: &'static str,
 }
 
-/// Commands this app serves beyond the shared table.
-pub const LOCAL: &[Entry] = &[
-    Entry { name: "sessions", usage: "/sessions", about: "open the sessions list" },
-    Entry { name: "compact", usage: "/compact", about: "compact the session's history now" },
-    Entry {
-        name: "effort",
-        usage: "/effort [low|medium|high|xhigh|max|unset]",
-        about: "reasoning effort for future turns",
-    },
-    Entry { name: "plan", usage: "/plan", about: "plan phase for future turns (read-only)" },
-    Entry { name: "build", usage: "/build", about: "build phase for future turns" },
-];
+/// Commands this app serves beyond the shared table. Empty: `/sessions`,
+/// `/compact`, `/effort`, `/plan` and `/build` moved into
+/// `modron_view::slash::SLASH_COMMANDS`, so every client lists them.
+pub const LOCAL: &[Entry] = &[];
 
 /// Every command: the shared table in its order, then [`LOCAL`].
 pub fn all() -> Vec<Entry> {
@@ -140,7 +132,7 @@ pub fn run(line: &str) -> UiAction {
             "high" => UiAction::SetEffort(Some(Effort::High)),
             "xhigh" => UiAction::SetEffort(Some(Effort::Xhigh)),
             "max" => UiAction::SetEffort(Some(Effort::Max)),
-            "unset" => UiAction::SetEffort(None),
+            "off" | "unset" => UiAction::SetEffort(None),
             _ => usage("effort"),
         },
         "plan" => UiAction::SetPhase(Phase::Plan),

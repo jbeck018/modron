@@ -461,8 +461,13 @@ fn next_request(h: &mut Harness, live: &mut Live, reports: &mpsc::Receiver<Paylo
 fn driver_renders_the_stream_and_sends_a_typed_message_as_submit() {
     let session = Uuid::new_v4();
     let (url, reports) = start_server(session, Script::default());
-    let mut live = session::spawn(LiveOptions { url, token: None, session: Some(session) })
-        .expect("spawn driver");
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
     let mut h = Harness::new();
 
     h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
@@ -488,7 +493,8 @@ fn a_share_link_adopts_the_session_its_snapshot_names() {
     let script = Script { share_link: true, ..Script::default() };
     let (url, reports) = start_server(session, script);
     let mut live =
-        session::spawn(LiveOptions { url, token: None, session: None }).expect("spawn driver");
+        session::spawn(LiveOptions { url, token: None, session: None, ..Default::default() })
+            .expect("spawn driver");
     let mut h = Harness::new();
 
     h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
@@ -510,7 +516,8 @@ fn a_share_link_steers_when_the_adopted_session_is_running() {
     let script = Script { share_link: true, running: true, ..Script::default() };
     let (url, reports) = start_server(session, script);
     let mut live =
-        session::spawn(LiveOptions { url, token: None, session: None }).expect("spawn driver");
+        session::spawn(LiveOptions { url, token: None, session: None, ..Default::default() })
+            .expect("spawn driver");
     let mut h = Harness::new();
 
     h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
@@ -532,8 +539,13 @@ fn a_refused_send_shows_the_server_error_on_screen() {
     let refusal = "single-session tunnel: submit refused";
     let script = Script { refusal: Some(refusal), ..Script::default() };
     let (url, reports) = start_server(session, script);
-    let mut live = session::spawn(LiveOptions { url, token: None, session: Some(session) })
-        .expect("spawn driver");
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
     let mut h = Harness::new();
 
     h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));

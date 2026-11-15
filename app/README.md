@@ -8,10 +8,53 @@ client core (`mobile/rust-core`), with two hosts.
 
 ## Terminal
 
-    cargo run --bin modron-app-tui                       # demo script
-    cargo run --bin modron-app-tui -- --url ws://127.0.0.1:7000 [--token T] [--session UUID]
+    cargo run --bin modron-app-tui                     # the local server (see below)
+    cargo run --bin modron-app-tui -- --demo           # built-in demo script
+    cargo run --bin modron-app-tui -- --url ws://127.0.0.1:7000 [--token T]
 
-Ctrl+C exits. Esc interrupts; y/a/n decide approvals; Enter sends,
+With no flags the app picks its server in this order:
+
+1. `MODRON_URL` (default `ws://127.0.0.1:7699`) answers a websocket
+   handshake within 500 ms: connect to it.
+2. Nothing answers and the address is loopback: start `modron serve
+   --listen 127.0.0.1:<port>` as a child of the app, wait up to 5 s for the
+   port, connect. The app stops that child on exit (SIGTERM, SIGKILL after
+   2 s), also on Ctrl+C and on panic. A server that was already running is
+   never touched.
+3. Otherwise (remote address, or no binary): a full-screen message with the
+   reason and the two ways out. Any key exits non-zero.
+
+`--url` connects to that server without probing; `--demo` plays the demo.
+
+Flags:
+
+- `--token T`: device token for the server (any mode that connects).
+- `--session UUID`: attach to that session.
+- `--new`: attach to nothing; the first submit starts a new session.
+- Default (no session flag): the most recently updated session whose folder
+  is the current directory; with none, a new session on the first submit.
+- `--continue`: the most recently updated session of any folder; with none,
+  a message screen that exits non-zero.
+- `--provider P`, `--model M`: passed to a server the app starts.
+- `--keep-server`: leave a server the app started running after exit.
+
+Environment:
+
+- `MODRON_URL`: the server address to probe, connect to, or start.
+- `MODRON_BIN`: the `modron` binary to start. When set it must be a file
+  (no fallback). Otherwise `modron` next to the app's executable, then `modron`
+  on `PATH`.
+- `XDG_STATE_HOME`, `HOME`: the log of a server the app starts goes to
+  `$XDG_STATE_HOME/modron/app-serve.log`, or `~/.local/state/modron/app-serve.log`.
+  Server output never reaches the terminal UI.
+
+Connection line: `connected` / `connecting` / `disconnected` (the core's
+words), then the address, then `started by modron-app` when the app started
+the server. If the connection drops, the app shows `disconnected`, retries
+every 2 s (doubling, capped at 30 s) and re-attaches to the same session.
+Esc or Ctrl+C leaves while it retries.
+
+Keys: Ctrl+C exits. Esc interrupts; y/a/n decide approvals; Enter sends,
 Alt+Enter queues; `/compact` compacts.
 
 ## Web bundle
