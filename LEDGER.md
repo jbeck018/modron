@@ -1439,7 +1439,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 |---|---|---|---|
 | C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | DONE | 16ac999; labels in modron-protocol / modron-view, client core delegates |
 | C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | DONE | 43c3dbe; app/theme/oculus.json + check.py. Owner to confirm: chart colours, mono font, tool colour, large radius |
-| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | ACTIVE | C3a chat screen on the terminal target; C3b client core speaks the v2 frames (steer, queue, plan decision, compact, phase, context label, rules). Open: C3c app wired to a live session over websocket and rendering queue chips, steer echoes, plan card, context label; move compact_tokens into modron-view; theme colours; sessions and settings screens |
+| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | ACTIVE | C3a chat screen on the terminal target; C3b client core speaks the v2 frames (steer, queue, plan decision, compact, phase, context label, rules). C3c DONE: `modron-app-tui --url ws://host:port [--token] [--session]` drives a live session (driver thread around RemoteClient; Enter = send/steer, Alt+Enter = queue, y/r on a pending plan, /compact); queue chips, steer echoes, plan block rendered. Open: tool/turn/sub-agent lines, dequeue binding, surfacing refused calls, move compact_tokens into modron-view, theme colours, sessions and settings screens |
 | C4 | Portal: Worker serves the web build; owner sign-in; linked GitHub accounts; session directory; invite links | TODO | Deploy needs the owner's Cloudflare login |
 | C5 | Tandem: multi-device attach, replay on reconnect, push for approvals | TODO | |
 | C6 | Cloud runs: container runs modron serve; sleep/restore; handoff | TODO | Depends on S3; deploy needs the owner's Cloudflare login |
@@ -1498,3 +1498,8 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   fmt clean, clippy clean, 1093 tests pass. wasm32 target is not
   installed here, so the client core wasm check did not run.
 - 2026-11-15: H5b landed. Gates: fmt clean, clippy clean, 1096 tests.
+- 2026-11-15: C3c landed. App gates (app/): fmt clean, clippy clean,
+  16 tests pass. Live smoke by the lead: `modron serve --provider mock`
+  plus `modron-app-tui --url ws://127.0.0.1:7711` under a pty: connected,
+  a typed task was submitted, the mock run reached a bash approval and
+  the app showed the three decision labels.

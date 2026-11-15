@@ -212,7 +212,7 @@ fn typing_and_enter_submits_and_keeps_focus() {
     h.type_text("hi");
     h.wait_for("typed hi", |s| s.contains("hi"));
     h.send(key("Enter"));
-    assert_eq!(h.action(), Some(UiAction::Submit("hi".into())));
+    assert_eq!(h.action(), Some(UiAction::Send("hi".into())));
     // Focus stayed in the composer: the next text lands in it.
     h.type_text("zq");
     h.wait_for("typed after submit", |s| s.contains("zq"));

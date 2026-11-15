@@ -4,6 +4,7 @@
 
 pub mod chat;
 pub mod demo;
+pub mod session;
 
 use std::sync::Mutex;
 
@@ -28,6 +29,7 @@ pub fn App() -> impl IntoElement {
         // waker wakes the engine when the host pushes a snapshot.
         spawn(async move {
             while let Some(snapshot) = rx.recv().await {
+                chat::after_snapshot(&snapshot, draft);
                 model.set(Model::from_snapshot(&snapshot));
             }
         });

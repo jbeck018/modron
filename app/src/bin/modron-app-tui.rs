@@ -1,5 +1,7 @@
 //! Real-terminal host for the unified client app: crossterm events in,
-//! ratatui frames out, and the built-in demo script (`modron_app::demo`).
+//! ratatui frames out. With `--url <ws url>` [`--token <t>`] [`--session
+//! <uuid>`] it drives a live server (`modron_app::session`); without
+//! `--url` it plays the built-in demo script (`modron_app::demo`).
 //! Ctrl+C exits.
 
 use std::{
@@ -13,7 +15,12 @@ use crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use modron_app::{chat::link, demo::script, App};
+use modron_app::{
+    chat::link,
+    demo::script,
+    session::{self, LiveOptions},
+    App,
+};
 use nsh_platform_tui::{
     run_app, AppOptions, AppView, CacheOptions, Input, Modifiers, Root, RunEvent,
 };
@@ -38,6 +45,12 @@ fn key_input(key: KeyEvent) -> Input {
 }
 
 fn main() -> io::Result<()> {
+    let live_options = LiveOptions::from_args(std::env::args().skip(1)).unwrap_or_else(|message| {
+        eprintln!("modron-app-tui: {message}");
+        eprintln!("usage: modron-app-tui [--url <ws url> [--token <t>] [--session <uuid>]]");
+        std::process::exit(2);
+    });
+    let mut live = live_options.map(session::spawn).transpose()?;
     let (mut host, client) = link();
     *modron_app::CLIENT.lock().expect("client slot") = Some(client);
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
@@ -56,9 +69,17 @@ fn main() -> io::Result<()> {
     let (start, mut frames) = (Instant::now(), script().into_iter().peekable());
     let result = run_app(&mut term, &mut view, |wait| {
         let mut redraw = wake_rx.try_iter().count() > 0;
-        while frames.peek().is_some_and(|(at, _)| start.elapsed() >= Duration::from_millis(*at)) {
-            host.push(&frames.next().expect("peeked").1);
-            redraw = true;
+        match live.as_mut() {
+            Some(live) => redraw |= live.pump(&mut host),
+            None => {
+                while frames
+                    .peek()
+                    .is_some_and(|(at, _)| start.elapsed() >= Duration::from_millis(*at))
+                {
+                    host.push(&frames.next().expect("peeked").1);
+                    redraw = true;
+                }
+            }
         }
         if !redraw && event::poll(wait)? {
             return Ok(match event::read()? {
