@@ -1032,6 +1032,34 @@ impl std::fmt::Debug for Engine {
     }
 }
 
+/// What a user-issued `!command` produced (see [`Engine::run_user_shell`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserShellOutcome {
+    /// Whether the command passed every gate and the bash tool ran it.
+    pub allowed: bool,
+    /// The bash tool's output (exit code line included), capped. Empty when
+    /// the command did not run.
+    pub output: String,
+    /// The bash tool reported an error (non-zero exit, timeout), or the
+    /// command was refused.
+    pub is_error: bool,
+    /// Why the command did not run: a deny rule, the approval mode, a
+    /// vetoing hook, a missing bash tool, or an empty command.
+    pub refused_reason: Option<String>,
+}
+
+impl UserShellOutcome {
+    /// An outcome for a command that did not run.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            allowed: false,
+            output: String::new(),
+            is_error: true,
+            refused_reason: Some(reason.into()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Token estimation (pre-flight only; provider usage is ground truth)
 // ---------------------------------------------------------------------------

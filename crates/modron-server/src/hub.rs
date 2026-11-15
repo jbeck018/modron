@@ -25,6 +25,7 @@ use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
     ApprovalAsk, ContextGauge, Engine, Phase, PlanItem, RunSummary, SessionEvent, SessionId,
     SessionMeta, SessionStore, SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
+    UserShellOutcome,
 };
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, LiveState, NotifyKind,
@@ -256,6 +257,18 @@ impl SessionStore for PinnedCreateStore {
 /// The boxed engine future a `Submit` produces (which `Engine::run_task*`
 /// variant to drive for this run).
 pub type RunFuture = Pin<Box<dyn Future<Output = modron_core::Result<RunSummary>> + Send>>;
+
+/// A user-issued `!command` run (PARITY-C), occupying the run slot like a
+/// turn but ending with no Notify.
+pub type ShellRunFuture =
+    Pin<Box<dyn Future<Output = modron_core::Result<UserShellOutcome>> + Send>>;
+
+/// How a run ended, as the terminal frame sees it. A turn may notify; a
+/// shell run never does.
+pub enum RunEnd {
+    Turn(modron_core::Result<RunSummary>),
+    Shell(modron_core::Result<UserShellOutcome>),
+}
 
 /// Error text for a steer sent while the session has no active run.
 pub const STEER_IDLE: &str = "session idle - submit instead";
@@ -828,11 +841,7 @@ impl SessionHandle {
     /// same locks as TurnDone). The caller must start it after this returns:
     /// every lock and the run slot are released by then. Failed and aborted
     /// runs return `None` and leave the queue intact.
-    pub fn complete(
-        &self,
-        result: modron_core::Result<RunSummary>,
-        title: Option<String>,
-    ) -> Option<String> {
+    pub fn complete(&self, end: RunEnd, title: Option<String>) -> Option<String> {
         let mut slot = lock(&self.run);
         // Interrupted: the slot (and the terminal frame) went to the interrupt.
         slot.take()?;
@@ -863,8 +872,36 @@ impl SessionHandle {
         lock(&self.text).clear();
         lock(&self.reasoning).clear();
         lock(&self.tracker).clear_turn();
-        match result {
-            Ok(summary) => {
+        match end {
+            RunEnd::Shell(Ok(outcome)) => {
+                // A refused command says why; a command that ran shows its
+                // output through the persisted Task event, not here.
+                if let Some(reason) = outcome.refused_reason.as_deref() {
+                    self.publish_locked(
+                        &mut seq,
+                        Payload::Note {
+                            text: format!("shell refused: {reason}"),
+                        },
+                    );
+                }
+                self.publish_locked(
+                    &mut seq,
+                    Payload::TurnDone {
+                        summary: shell_summary(self.id, &outcome),
+                    },
+                );
+                self.pop_queued_locked(&mut seq)
+            }
+            RunEnd::Shell(Err(error)) => {
+                self.publish_locked(
+                    &mut seq,
+                    Payload::TurnFailed {
+                        error: error.to_string(),
+                    },
+                );
+                None
+            }
+            RunEnd::Turn(Ok(summary)) => {
                 self.publish_locked(
                     &mut seq,
                     Payload::TurnDone {
@@ -885,7 +922,7 @@ impl SessionHandle {
                 }
                 self.pop_queued_locked(&mut seq)
             }
-            Err(error) => {
+            RunEnd::Turn(Err(error)) => {
                 self.publish_locked(
                     &mut seq,
                     Payload::TurnFailed {
@@ -1524,6 +1561,21 @@ impl SessionHub {
     /// Spawn a run for a session: busy-check + slot store are atomic, the
     /// run task itself publishes the terminal frame on completion.
     pub fn start_run(&self, id: SessionId, run: RunFuture) -> Result<(), String> {
+        self.spawn_run(id, Box::pin(async move { RunEnd::Turn(run.await) }))
+    }
+
+    /// Spawn a user-issued `!command` run (PARITY-C) in the run slot: busy,
+    /// interruptible and approval-gated like a turn, with the same terminal
+    /// frame (TurnDone / TurnFailed) but no Notify.
+    pub fn start_shell_run(&self, id: SessionId, run: ShellRunFuture) -> Result<(), String> {
+        self.spawn_run(id, Box::pin(async move { RunEnd::Shell(run.await) }))
+    }
+
+    fn spawn_run(
+        &self,
+        id: SessionId,
+        run: Pin<Box<dyn Future<Output = RunEnd> + Send>>,
+    ) -> Result<(), String> {
         let handle = self
             .handle(&id)
             .ok_or_else(|| format!("no such session {id}"))?;
@@ -1553,21 +1605,21 @@ impl SessionHub {
         let owner = Arc::clone(&handle);
         let hub = self.clone();
         let task = tokio::spawn(async move {
-            let result = run.await;
+            let end = run.await;
             // H9b: the context gauge is recomputed for every run outcome
             // (success or failure) before the terminal frame. An abort never
             // reaches this point; interrupt refreshes on its own path.
             owner.refresh_context().await;
             // The done Notify names the session: the title is read here,
-            // with no hub lock held, and only for a successful run.
-            let title = if result.is_ok() {
+            // with no hub lock held, and only for a successful turn.
+            let title = if matches!(end, RunEnd::Turn(Ok(_))) {
                 owner.notify_title().await
             } else {
                 None
             };
             // `complete` returns only after its run-slot and seq guards are
             // dropped, so the starter may take the slot itself.
-            if let Some(next) = owner.complete(result, title) {
+            if let Some(next) = owner.complete(end, title) {
                 hub.start_queued(owner.id, next);
             }
         });
@@ -1698,6 +1750,19 @@ impl SessionHub {
         Err(format!(
             "unknown or already-resolved request id {request_id}"
         ))
+    }
+}
+
+/// The terminal `TurnDone` summary of a user-issued shell run: no answer,
+/// no turns, one tool call when the command ran.
+fn shell_summary(id: SessionId, outcome: &UserShellOutcome) -> WireRunSummary {
+    WireRunSummary {
+        session_id: id,
+        answer: String::new(),
+        turns: 0,
+        tool_calls: u32::from(outcome.allowed),
+        usage: Usage::default(),
+        models_used: Vec::new(),
     }
 }
 

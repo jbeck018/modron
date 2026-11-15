@@ -182,9 +182,9 @@ Shell { session_id, command }                  // client, owner or driver
 Runs one command where the session's tools run, under the same approval
 policy and permission rules as a model-issued `bash` call, and appends
 the labelled output to the transcript. Refused for a busy session.
-Status: the frame and its refusals exist; execution answers "shell
-passthrough is not available yet" until the engine exposes an entry
-point for a user-issued tool call.
+It occupies the session's run slot (busy, interruptible) and ends with
+the same terminal frame as a turn. A refusal is a `note` followed by
+`turn_done`. Share-link connections cannot send it.
 
 ## 8. Host and handoff (C6)
 

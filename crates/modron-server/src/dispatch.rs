@@ -660,14 +660,10 @@ pub async fn handle_frame(
                 ),
             }
         }
-        // `!command` passthrough (PARITY item 5). Not runnable yet: the
-        // engine applies the bash admission (approval mode, permission
-        // rules, checkpoint, sandbox) only to model tool calls. Its
-        // `admission_for_call` and `execute_tool` are private
-        // (crates/modron-core/src/engine.rs), so the entry point this needs
-        // is a public Engine method that runs one `bash` ToolCall for a
-        // session through `execute_tool`. Until it exists, the frame is
-        // refused here, after the same checks the run would make.
+        // `!command` passthrough (PARITY-C): one bash call through the same
+        // admission and execution as a model call (Engine::run_user_shell),
+        // run in the session's run slot so it is busy, interruptible and
+        // approval-gated like a turn. Ends with TurnDone or TurnFailed.
         Payload::Shell {
             session_id,
             command,
@@ -692,14 +688,23 @@ pub async fn handle_frame(
                             modron_protocol::ErrorKind::Conflict,
                         ),
                     ),
-                    Some(_) => send(
-                        ctx,
-                        error_kind(
-                            request_id,
-                            "shell passthrough is not available yet",
-                            modron_protocol::ErrorKind::Other,
-                        ),
-                    ),
+                    Some(handle) => {
+                        let engine = handle.engine_cell().clone();
+                        let run: crate::hub::ShellRunFuture =
+                            Box::pin(
+                                async move { engine.run_user_shell(session_id, &command).await },
+                            );
+                        match state.hub.start_shell_run(session_id, run) {
+                            Err(message) => send(ctx, error(request_id, message)),
+                            Ok(()) => {
+                                // Like Submit: a connection with no
+                                // subscription watches the session it ran in.
+                                if ctx.subscription.is_none() {
+                                    attach(state, ctx, None, session_id).await;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1916,20 +1921,34 @@ mod tests {
     /// wired like the real server: the engine's store is the hub's
     /// broadcasting store. The TempDir must outlive the state.
     fn test_state() -> (Arc<ServerState>, tempfile::TempDir) {
+        test_state_with(Vec::new(), Default::default())
+    }
+
+    /// [`test_state`] with the given tools and approval policy on the
+    /// template engine every session is built from.
+    fn test_state_with(
+        tools: Vec<Arc<dyn modron_core::Tool>>,
+        approvals: modron_core::ApprovalPolicy,
+    ) -> (Arc<ServerState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let hub = SessionHub::empty();
         let inner: Arc<dyn SessionStore> = Arc::new(modron_store::JsonlSessionStore::new(
             dir.path().join("sessions"),
         ));
         let store: Arc<dyn SessionStore> = Arc::new(BroadcastingStore::new(inner, hub.clone()));
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(tool);
+        }
         hub.set_engine(Engine {
             selector: Arc::new(StaticSelector::new("mock-model", "mock")),
             providers: Default::default(),
-            tools: Arc::new(ToolRegistry::new()),
+            tools: Arc::new(registry),
             store: Arc::clone(&store),
             config: EngineConfig {
                 default_model: "mock-model".into(),
                 default_provider: "mock".into(),
+                approvals,
                 ..EngineConfig::default()
             },
         });
@@ -1960,6 +1979,297 @@ mod tests {
             .await
             .expect("an outbound frame")
             .expect("channel open")
+    }
+
+    /// Subscribe `ctx` to the session before a run starts, so no live frame
+    /// (the approval prompt, the terminal frame) can race the subscription.
+    /// Consumes the attach snapshot.
+    async fn subscribe_first(
+        state: &Arc<ServerState>,
+        ctx: &mut ConnCtx,
+        rx: &mut mpsc::UnboundedReceiver<Outbound>,
+        id: SessionId,
+    ) {
+        attach(state, ctx, None, id).await;
+        let snapshot = next_outbound(rx).await;
+        assert!(
+            matches!(snapshot, Outbound::Reply(_)),
+            "attach snapshot first"
+        );
+    }
+
+    /// Collect the `type` of each live frame until `terminal` arrives (or a
+    /// timeout), returning every type seen in order.
+    async fn collect_live_types_until(
+        rx: &mut mpsc::UnboundedReceiver<Outbound>,
+        terminal: &str,
+    ) -> Vec<String> {
+        let mut types = Vec::new();
+        loop {
+            let outbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a live frame before the timeout")
+                .expect("channel open");
+            if let Outbound::Live(live) = outbound {
+                let json: serde_json::Value = serde_json::from_str(&live.json).unwrap();
+                let kind = json["type"].as_str().unwrap_or_default().to_string();
+                types.push(kind.clone());
+                if kind == terminal {
+                    return types;
+                }
+            }
+        }
+    }
+
+    /// A stand-in `bash` tool for shell-passthrough tests: returns a fixed
+    /// output after an optional delay, counting its runs.
+    struct ShellStub {
+        output: String,
+        delay: Duration,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl modron_core::Tool for ShellStub {
+        fn spec(&self) -> modron_core::ToolSpec {
+            modron_core::ToolSpec {
+                name: "bash".into(),
+                description: "stub".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &modron_core::ToolCtx,
+        ) -> modron_core::Result<modron_core::ToolOutcome> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(modron_core::ToolOutcome {
+                content: self.output.clone(),
+                is_error: false,
+                usage: None,
+                meta: None,
+            })
+        }
+    }
+
+    fn stub_bash(
+        output: &str,
+        delay: Duration,
+    ) -> (
+        Arc<dyn modron_core::Tool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = Arc::new(ShellStub {
+            output: output.into(),
+            delay,
+            runs: Arc::clone(&runs),
+        });
+        (tool, runs)
+    }
+
+    fn allow_all() -> modron_core::ApprovalPolicy {
+        modron_core::ApprovalPolicy {
+            mode: modron_core::ApprovalMode::ApproveAll,
+            ..Default::default()
+        }
+    }
+
+    /// PARITY-C: `Shell` on an idle session runs the command in the run
+    /// slot, persists its output as a user Task event, and ends with the
+    /// normal TurnDone frame and no Notify.
+    #[tokio::test]
+    async fn shell_on_an_idle_session_runs_and_ends_with_turn_done() {
+        let (tool, runs) = stub_bash("hi\nexit code: 0", Duration::ZERO);
+        let (state, _dir) = test_state_with(vec![tool], allow_all());
+        let id = state.store.create_session("shell").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        let (mut ctx, mut rx) = authed_ctx();
+        subscribe_first(&state, &mut ctx, &mut rx, id).await;
+
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                1,
+                Payload::Shell {
+                    session_id: id,
+                    command: "echo hi".into(),
+                },
+            ),
+        )
+        .await;
+        let types = collect_live_types_until(&mut rx, "turn_done").await;
+        assert!(!types.contains(&"notify".to_string()), "{types:?}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!state.hub.handle(&id).unwrap().is_busy(), "slot released");
+
+        let tasks: Vec<String> = state
+            .store
+            .load(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                modron_core::SessionEvent::Task { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tasks,
+            vec![modron_core::engine::user_shell_transcript(
+                "echo hi",
+                "hi\nexit code: 0"
+            )]
+        );
+    }
+
+    /// A `!command` the approval policy denies ends its run with a Note
+    /// carrying the reason, not a Notify or a failure.
+    #[tokio::test]
+    async fn shell_refused_by_policy_ends_with_a_note_and_turn_done() {
+        let (tool, runs) = stub_bash("never", Duration::ZERO);
+        let policy = modron_core::ApprovalPolicy {
+            deny: vec!["bash".into()],
+            ..allow_all()
+        };
+        let (state, _dir) = test_state_with(vec![tool], policy);
+        let id = state.store.create_session("shell").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        let (mut ctx, mut rx) = authed_ctx();
+        subscribe_first(&state, &mut ctx, &mut rx, id).await;
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                1,
+                Payload::Shell {
+                    session_id: id,
+                    command: "ls".into(),
+                },
+            ),
+        )
+        .await;
+        let types = collect_live_types_until(&mut rx, "turn_done").await;
+        assert!(types.contains(&"note".to_string()), "{types:?}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Interrupt aborts a running shell command and publishes TurnAborted,
+    /// and the slot is free afterwards.
+    #[tokio::test]
+    async fn interrupt_aborts_a_running_shell_command() {
+        let (tool, _runs) = stub_bash("late", Duration::from_secs(5));
+        let (state, _dir) = test_state_with(vec![tool], allow_all());
+        let id = state.store.create_session("shell").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        let (mut ctx, mut rx) = authed_ctx();
+        subscribe_first(&state, &mut ctx, &mut rx, id).await;
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                1,
+                Payload::Shell {
+                    session_id: id,
+                    command: "sleep 5".into(),
+                },
+            ),
+        )
+        .await;
+        // Wait until the run is live, then interrupt.
+        for _ in 0..200 {
+            if state.hub.handle(&id).unwrap().is_busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(2, Payload::Interrupt { session_id: id }),
+        )
+        .await;
+        let types = collect_live_types_until(&mut rx, "turn_aborted").await;
+        assert!(!types.contains(&"turn_done".to_string()), "{types:?}");
+        assert!(!state.hub.handle(&id).unwrap().is_busy());
+    }
+
+    /// Under Ask with no standing allow, the policy's prompt is published to
+    /// the attached client; a Deny decision refuses the command.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shell_publishes_the_approval_request_when_the_policy_asks() {
+        let (tool, runs) = stub_bash("never", Duration::ZERO);
+        let policy = modron_core::ApprovalPolicy {
+            mode: modron_core::ApprovalMode::Ask,
+            ..Default::default()
+        };
+        let (state, _dir) = test_state_with(vec![tool], policy);
+        let id = state.store.create_session("shell").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        let (mut ctx, mut rx) = authed_ctx();
+        subscribe_first(&state, &mut ctx, &mut rx, id).await;
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                1,
+                Payload::Shell {
+                    session_id: id,
+                    command: "ls".into(),
+                },
+            ),
+        )
+        .await;
+        let request_id = loop {
+            let outbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("frames before the timeout")
+                .expect("channel open");
+            if let Outbound::Live(live) = outbound {
+                let json: serde_json::Value = serde_json::from_str(&live.json).unwrap();
+                if json["type"] == "approval_requested" {
+                    break json["request_id"].as_str().unwrap().to_string();
+                }
+            }
+        };
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                2,
+                Payload::Approve {
+                    request_id,
+                    decision: modron_protocol::Decision::Deny,
+                },
+            ),
+        )
+        .await;
+        let types = collect_live_types_until(&mut rx, "turn_done").await;
+        assert!(types.contains(&"note".to_string()), "{types:?}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A scoped (share or tunnel guest) connection may not run `!`, even in
+    /// its own session: the scope does not tell a host from a guest, and
+    /// guests never get a shell. Submit keeps its own-session rule.
+    #[test]
+    fn scoped_connection_refuses_shell() {
+        let own = SessionId::new_v4();
+        let shell = Payload::Shell {
+            session_id: own,
+            command: "ls".into(),
+        };
+        assert!(scoped_gate(own, &shell).is_err());
     }
 
     fn parked_run(id: SessionId) -> RunFuture {
@@ -2100,6 +2410,7 @@ mod tests {
         let id = state.store.create_session("shell").await.unwrap().id;
         state.hub.ensure_session(id, None);
         let (mut ctx, mut rx) = authed_ctx();
+        subscribe_first(&state, &mut ctx, &mut rx, id).await;
 
         let run = |command: &str| Payload::Shell {
             session_id: id,
@@ -2123,15 +2434,25 @@ mod tests {
         .await;
         assert!(error_message(next_outbound(&mut rx).await).contains("no such session"));
 
+        // Idle and no bash tool registered: the run starts and refuses the
+        // command with a reason, ending with TurnDone (no Notify).
         handle_frame(&state, &mut ctx, true, Frame::request(3, run("ls"))).await;
-        assert!(
-            error_message(next_outbound(&mut rx).await).contains("not available yet"),
-            "idle sessions reach the honest refusal until the engine entry exists"
-        );
+        let types = collect_live_types_until(&mut rx, "turn_done").await;
+        assert!(types.contains(&"note".to_string()), "{types:?}");
+        assert!(!types.contains(&"notify".to_string()), "{types:?}");
+        assert!(!state.hub.handle(&id).unwrap().is_busy());
 
         state.hub.start_run(id, parked_run(id)).unwrap();
         handle_frame(&state, &mut ctx, true, Frame::request(4, run("ls"))).await;
-        let busy = error_message(next_outbound(&mut rx).await);
+        // Skip any attach snapshot still queued on this subscription.
+        let busy = loop {
+            match next_outbound(&mut rx).await {
+                Outbound::Reply(frame) if matches!(frame.payload, Payload::Error { .. }) => {
+                    break error_message(Outbound::Reply(frame));
+                }
+                _ => {}
+            }
+        };
         assert!(busy.contains("run is active"), "{busy}");
         state.hub.handle(&id).unwrap().interrupt();
 

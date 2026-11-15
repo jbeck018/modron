@@ -1416,7 +1416,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 
 | PARITY-A | Terminal input: parity items 1, 2, 3, 4, 8 (keys), 9, 14, 15 | DONE | Full key map; multi-line composer (Shift+Enter, Ctrl+J, trailing backslash) with bracketed paste; Esc denies a pending approval; input history; PgUp/PgDn/Home/End scrollback with a follow marker; first Ctrl+C interrupts, second exits; session id in the header and a resume line on exit; /reasoning with a live tail. Open: the composer has no height cap; paging moves a fixed 10 lines; app-local strings need a shared home ("new output below", "press ctrl+c again to quit", the resume line); /reasoning is not in the shared slash table; the Backspace-dequeue live test is racy under load |
 | PARITY-B | Client core and wire support for parity items 5, 7, 10, 11, 16, 17 | DONE | Snapshot tool_detail rows (and a fix: the tracker was never cleared at turn end, so a new turn re-showed old rows); attachments on submit with type checks (no size cap exists on the server beyond the 256 MiB websocket limit); unix-socket transport, ?token= and device token helpers; startup setters. Shell frame, client method and refusals exist; execution is a stub pending an engine entry point (PARITY-C). --working-dir and --sessions-dir have no wire equivalent |
-| PARITY-C | Engine entry point for a user-issued bash call; server runs Shell through it | TODO | |
+| PARITY-C | Engine entry point for a user-issued bash call; server runs Shell through it | DONE (two owner decisions open) | Engine::run_user_shell takes the command through the same deny list, rules, approval mode, phase, approver, hooks and sandbox as a model-issued bash call; the server runs it in the session run slot (busy, interruptible, ends with TurnDone). OWNER DECISIONS: (1) the output is persisted as a Task and so reaches the model on the next turn, while the old TUI kept `!` output away from the model; (2) the command is approval-gated like a model call, while the old TUI ran it ungated because the user typed it. Scoped (share-link) connections cannot use Shell at all |
 
 ### Protocol
 
@@ -1591,3 +1591,5 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   client core wasm check passes.
 - 2026-11-15: PARITY-A landed. App gates: fmt, clippy, wasm32 check
   clean; 143 tests (two clean runs); web-test.js 21 of 21 twice.
+- 2026-11-15: PARITY-C landed. Gates: fmt clean, clippy clean, 1269
+  tests pass.
