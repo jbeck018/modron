@@ -243,6 +243,13 @@ impl Tool for DelegateTool {
         // via delegate's working_dir parameter) — results are reported,
         // never auto-merged.
 
+        // H3c: the child belongs to the run that spawns it. Capture that run's
+        // token now, during the call, so a background child started here can
+        // ask only while this run lasts (never during a later run).
+        let token = ctx
+            .session_id
+            .and_then(|session| modron_core::run_scope().token(session));
+
         if background {
             let bg = engine.config.background_subagents.clone();
             let id = modron_core::subagent::new_worktree_id();
@@ -272,7 +279,8 @@ impl Tool for DelegateTool {
             let registry = bg.clone();
             let task_id = id.clone();
             let handle = tokio::spawn(async move {
-                let report = modron_core::subagent::delegate(
+                let report = modron_core::subagent::delegate_owned(
+                    token,
                     &engine,
                     &task,
                     persona_for_task.as_ref(),
@@ -310,7 +318,8 @@ impl Tool for DelegateTool {
             )));
         }
 
-        match modron_core::subagent::delegate(
+        match modron_core::subagent::delegate_owned(
+            token,
             engine,
             task,
             persona,

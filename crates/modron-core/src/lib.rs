@@ -545,6 +545,83 @@ pub struct ApprovalAsk<'a> {
 /// y/N/a prompt; `None` keeps the block-and-explain behavior.
 pub type Approver = dyn Fn(&ApprovalAsk<'_>) -> bool + Send + Sync;
 
+/// H3c: identifies one live top-level run of one session. A token is taken
+/// while the spawning run is executing; its child's asks are forwarded to the
+/// parent approver only while that same run is still live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunToken {
+    session: SessionId,
+    run: u64,
+}
+
+/// H3c: the registry of live top-level runs. It is process-wide rather than
+/// held on `EngineConfig`: the server clones one template config into every
+/// session, so an engine-held handle would be shared across sessions. Runs
+/// are keyed by session and numbered from a process-unique counter, so runs
+/// of different sessions never match each other and a finished run's number
+/// is never reused.
+pub struct RunScope {
+    next: std::sync::atomic::AtomicU64,
+    active: std::sync::Mutex<std::collections::BTreeMap<SessionId, u64>>,
+}
+
+static RUN_SCOPE: RunScope = RunScope {
+    next: std::sync::atomic::AtomicU64::new(1),
+    active: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+};
+
+/// The process-wide run registry (see [`RunScope`]).
+pub fn run_scope() -> &'static RunScope {
+    &RUN_SCOPE
+}
+
+impl RunScope {
+    fn live(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<SessionId, u64>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Mark a run of `session` live until the returned guard drops. The run
+    /// loop holds the guard for its whole body, so every exit (normal end,
+    /// `?` error, panic, task abort) ends the run.
+    pub(crate) fn begin(&self, session: SessionId) -> RunGuard {
+        let run = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.live().insert(session, run);
+        RunGuard { session, run }
+    }
+
+    /// The token of the run `session` is executing right now, if any.
+    pub fn token(&self, session: SessionId) -> Option<RunToken> {
+        self.live()
+            .get(&session)
+            .map(|&run| RunToken { session, run })
+    }
+
+    /// True only while the token's own run is still the live run of its
+    /// session. A later run, or no run, makes it false.
+    pub fn is_live(&self, token: RunToken) -> bool {
+        self.live().get(&token.session) == Some(&token.run)
+    }
+}
+
+/// Ends its run on drop (see [`RunScope::begin`]). A guard whose run was
+/// already superseded removes nothing.
+#[must_use = "dropping the guard ends the run"]
+pub(crate) struct RunGuard {
+    session: SessionId,
+    run: u64,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        let mut live = run_scope().live();
+        if live.get(&self.session) == Some(&self.run) {
+            live.remove(&self.session);
+        }
+    }
+}
+
 /// Live-delta sink for streaming turns (Phase-1c I1): called for each
 /// [`StreamDelta`] as the provider emits it. Never blocks the engine; the
 /// sink runs on a Tokio task, so keep it cheap and non-panicking.

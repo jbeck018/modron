@@ -236,6 +236,31 @@ pub async fn delegate(
     budget_tokens: u64,
     working_dir: Option<&std::path::Path>,
 ) -> Result<ExploreReport> {
+    delegate_owned(
+        None,
+        parent,
+        task,
+        persona,
+        tool_filter,
+        budget_tokens,
+        working_dir,
+    )
+    .await
+}
+
+/// H3c: [`delegate`] for a child that belongs to a known parent run. Take
+/// `token` (see [`crate::RunScope::token`]) while the spawning run is live,
+/// before any background spawn, so the child's asks are forwarded only while
+/// that run lasts. `None` (no run) refuses every ask the child makes.
+pub async fn delegate_owned(
+    token: Option<crate::RunToken>,
+    parent: &Engine,
+    task: &str,
+    persona: Option<&crate::PersonaSpec>,
+    tool_filter: Option<&[String]>,
+    budget_tokens: u64,
+    working_dir: Option<&std::path::Path>,
+) -> Result<ExploreReport> {
     if task.trim().is_empty() {
         return Err(Error::Config(
             "empty delegate task".into(),
@@ -324,20 +349,9 @@ pub async fn delegate(
         budget_tokens,
         progress_sink,
     );
-    // H3b: the child asks through the parent's approver, tagged with the
-    // child's label. Sharing the parent's closure is what makes allow-all
-    // and the run boundary apply to children exactly as to the parent: the
-    // parent's own stickiness flag and its run-end refusal decide every ask.
-    config.approver = parent.config.approver.as_ref().map(|parent_approver| {
-        let parent_approver = Arc::clone(parent_approver);
-        let agent = label.clone();
-        Arc::new(move |ask: &crate::ApprovalAsk<'_>| {
-            parent_approver(&crate::ApprovalAsk {
-                call: ask.call,
-                agent: Some(agent.as_str()),
-            })
-        }) as Arc<crate::Approver>
-    });
+    // H3b/H3c: the child asks through the parent's approver, tagged with the
+    // child's label, and only while the parent run that spawned it is live.
+    config.approver = child_approver(parent.config.approver.as_ref(), token, &label);
     let child = Engine {
         selector,
         providers: parent.providers.clone(),
@@ -373,6 +387,34 @@ pub async fn delegate(
         usage,
         turns,
     })
+}
+
+/// H3c: the approver a child asks through. An ask is forwarded to the
+/// parent's approver only while the parent run in `token` is still live;
+/// otherwise it is refused without prompting anyone. Enforced here, in core,
+/// so every transport (TTY, TUI, server) gets the same rule.
+pub(crate) fn child_approver(
+    parent: Option<&Arc<crate::Approver>>,
+    token: Option<crate::RunToken>,
+    label: &str,
+) -> Option<Arc<crate::Approver>> {
+    let parent = Arc::clone(parent?);
+    let agent = label.to_string();
+    Some(Arc::new(move |ask: &crate::ApprovalAsk<'_>| {
+        let live = token.is_some_and(|t| crate::run_scope().is_live(t));
+        if !live {
+            tracing::info!(
+                agent = agent.as_str(),
+                tool = ask.call.name.as_str(),
+                "subagent approval refused: parent run ended; approval unavailable"
+            );
+            return false;
+        }
+        parent(&crate::ApprovalAsk {
+            call: ask.call,
+            agent: Some(agent.as_str()),
+        })
+    }))
 }
 
 /// Build the child `EngineConfig` for a subagent (D2: inherit, never widen).
@@ -790,11 +832,205 @@ mod approval_tests {
         }
     }
 
+    /// Run one child inside a live parent run (the child's asks are honoured
+    /// only while that run is live, so the run must span the call).
     async fn run_child(engine: &Engine) -> ExploreReport {
+        let session = uuid::Uuid::new_v4();
+        let _run = crate::run_scope().begin(session);
+        let token = crate::run_scope().token(session);
         let filter = ["write".to_string()];
-        delegate(engine, "write the file", None, Some(&filter), 100_000, None)
-            .await
-            .unwrap()
+        delegate_owned(
+            token,
+            engine,
+            "write the file",
+            None,
+            Some(&filter),
+            100_000,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn write_call() -> ToolCall {
+        ToolCall {
+            id: "c".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn child_asks_follow_only_the_run_that_spawned_it() {
+        let session = uuid::Uuid::new_v4();
+        let (approver, asks) = recording_approver(true);
+        let call = write_call();
+        let ask = ApprovalAsk {
+            call: &call,
+            agent: None,
+        };
+        // Run 1 spawns the child.
+        let run1 = crate::run_scope().begin(session);
+        let child = child_approver(
+            Some(&approver),
+            crate::run_scope().token(session),
+            "delegate",
+        )
+        .unwrap();
+        assert!(child(&ask), "allowed during its own run");
+        assert_eq!(asks.lock().unwrap().len(), 1);
+        drop(run1);
+        assert!(!child(&ask), "refused once run 1 has ended");
+        // Run 2: its approver would say yes (allow-all), but the child is
+        // still bound to run 1.
+        let run2 = crate::run_scope().begin(session);
+        assert!(
+            !child(&ask),
+            "refused during run 2 though the approver says yes"
+        );
+        drop(run2);
+        assert_eq!(
+            asks.lock().unwrap().len(),
+            1,
+            "the parent approver was consulted only during run 1"
+        );
+    }
+
+    #[test]
+    fn a_child_without_a_run_is_refused_and_other_sessions_never_match() {
+        let (approver, asks) = recording_approver(true);
+        let call = write_call();
+        let ask = ApprovalAsk {
+            call: &call,
+            agent: None,
+        };
+        let session = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let _run = crate::run_scope().begin(session);
+        let no_run = child_approver(Some(&approver), None, "delegate").unwrap();
+        assert!(!no_run(&ask), "no run token, no prompt");
+        let foreign = crate::run_scope().token(session);
+        let other_run = crate::run_scope().begin(other);
+        let child = child_approver(Some(&approver), foreign, "delegate").unwrap();
+        assert!(child(&ask), "its own session's run is still live");
+        drop(other_run);
+        let token_other = crate::run_scope().token(other);
+        assert!(token_other.is_none(), "a finished run leaves no token");
+        assert!(asks.lock().unwrap().len() == 1);
+    }
+
+    /// Records the session id the probe tool was called in.
+    struct Probe {
+        seen: Arc<Mutex<Option<uuid::Uuid>>>,
+    }
+
+    #[async_trait]
+    impl Tool for Probe {
+        fn spec(&self) -> crate::ToolSpec {
+            crate::ToolSpec {
+                name: "probe".into(),
+                description: "probe".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            ctx: &ToolCtx,
+        ) -> Result<crate::ToolOutcome> {
+            *self.seen.lock().unwrap() = ctx.session_id;
+            Ok(crate::ToolOutcome::ok("seen"))
+        }
+    }
+
+    /// One probe tool call, then whatever the script does next.
+    fn probe_engine(
+        provider: Arc<dyn crate::ModelProvider>,
+        seen: Arc<Mutex<Option<uuid::Uuid>>>,
+    ) -> Engine {
+        let mut providers: HashMap<String, Arc<dyn crate::ModelProvider>> = HashMap::new();
+        providers.insert("anthropic".into(), provider);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Probe { seen }));
+        Engine {
+            selector: Arc::new(StaticSelector::new("claude-haiku-4-5", "anthropic")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config: EngineConfig {
+                working_dir: std::env::temp_dir(),
+                default_provider: "anthropic".into(),
+                default_model: "claude-haiku-4-5".into(),
+                ..EngineConfig::default()
+            },
+        }
+    }
+
+    /// Calls the probe once, then stalls forever (for the abort test).
+    struct StallAfterFirst {
+        first: MockProvider,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::ModelProvider for StallAfterFirst {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn turn(&self, req: Arc<crate::TurnRequest>) -> Result<crate::TurnResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first.turn(req).await
+            } else {
+                std::future::pending().await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_run_scope_ends_on_an_error_exit() {
+        let seen = Arc::new(Mutex::new(None));
+        // The script runs out after the probe turn, so the run errors.
+        let provider = MockProvider::new().then_tool_call("p1", "probe", serde_json::json!({}));
+        let engine = probe_engine(Arc::new(provider), Arc::clone(&seen));
+        assert!(engine.run_task("go").await.is_err());
+        let session = seen.lock().unwrap().expect("the probe ran in the session");
+        assert!(
+            crate::run_scope().token(session).is_none(),
+            "an error exit ends the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_run_scope_ends_when_the_run_is_aborted() {
+        let seen = Arc::new(Mutex::new(None));
+        let provider = StallAfterFirst {
+            first: MockProvider::new().then_tool_call("p1", "probe", serde_json::json!({})),
+            calls: AtomicUsize::new(0),
+        };
+        let engine = Arc::new(probe_engine(Arc::new(provider), Arc::clone(&seen)));
+        let task = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.run_task("go").await })
+        };
+        let mut session = None;
+        for _ in 0..500 {
+            session = *seen.lock().unwrap();
+            if session.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let session = session.expect("the probe ran in the session");
+        assert!(
+            crate::run_scope().token(session).is_some(),
+            "the run is live while it stalls"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            crate::run_scope().token(session).is_none(),
+            "an aborted run ends its scope"
+        );
     }
 
     #[tokio::test]

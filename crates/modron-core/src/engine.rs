@@ -262,6 +262,24 @@ fn rewind_view<'a>(
     }
 }
 
+/// One reviewer outcome ready to record (H4b): the verdict and findings the
+/// reviewer gave, or `Skipped` when the review could not run.
+struct ReviewedDiff {
+    verdict: ReviewVerdict,
+    findings: Vec<modron_types::Finding>,
+    model: String,
+}
+
+impl ReviewedDiff {
+    fn skipped(model: String) -> Self {
+        Self {
+            verdict: ReviewVerdict::Skipped,
+            findings: Vec::new(),
+            model,
+        }
+    }
+}
+
 /// Reviewer diff cap (H4a): stdout beyond this many bytes is cut and a
 /// truncation marker is appended before the diff reaches the reviewer.
 const REVIEW_DIFF_MAX_BYTES: usize = 60 * 1024;
@@ -283,38 +301,113 @@ fn truncate_review_diff(mut text: String) -> String {
     text
 }
 
-/// `git diff --no-color` in `dir` (H4a). `None` when git cannot run, the
-/// directory is not a repository (non-zero exit) or the call times out.
-/// Stdout is read incrementally so a huge diff is never buffered whole.
-async fn git_diff_text(dir: &std::path::Path) -> Option<String> {
+/// Upper bound on the untracked-path listing read (a pathological repo must
+/// not buffer an unbounded list). Over it, the new files are left out.
+const REVIEW_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Run `git args` in `dir` and read its stdout. `None` when git cannot run
+/// or exits non-zero. Output past `cap` bytes stops the producer and returns
+/// `cap + 1` bytes, so the caller can tell the output was cut.
+/// Stdout is read incrementally so a huge output is never buffered whole.
+async fn git_stdout(dir: &std::path::Path, args: &[&str], cap: usize) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let mut buf = Vec::new();
+    stdout
+        .take(cap as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .ok()?;
+    if buf.len() > cap {
+        let _ = child.kill().await;
+    } else {
+        let status = child.wait().await.ok()?;
+        if !status.success() {
+            return None;
+        }
+    }
+    Some(buf)
+}
+
+/// Read one untracked path for the reviewer (H4b). Never follows a symlink:
+/// the metadata is taken with `symlink_metadata`, content is read only for a
+/// regular file whose canonical path is inside the working dir and that is
+/// within the size limit. Anything else is returned unread.
+fn read_untracked(dir: &std::path::Path, path: String) -> review::UntrackedFile {
+    let full = dir.join(&path);
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
+        return review::UntrackedFile {
+            path,
+            bytes: 0,
+            content: None,
+        };
+    };
+    let bytes = meta.len();
+    let inside = match (std::fs::canonicalize(&full), std::fs::canonicalize(dir)) {
+        (Ok(file), Ok(base)) => file.starts_with(base),
+        _ => false,
+    };
+    let content = (meta.file_type().is_file() && inside && bytes <= review::NEW_FILE_MAX_BYTES)
+        .then(|| std::fs::read(&full).ok())
+        .flatten();
+    review::UntrackedFile {
+        path,
+        bytes,
+        content,
+    }
+}
+
+/// The working-tree diff the reviewer sees (H4a, H4b): `git diff --no-color
+/// HEAD` (plain `git diff` when HEAD does not exist) followed by unified
+/// new-file diffs for untracked files. `None` when git cannot run or the
+/// directory is not a repository, or when the 15 s budget runs out. The
+/// combined text is capped at [`REVIEW_DIFF_MAX_BYTES`]; tracked changes come
+/// first, so a cut always falls in the new-file section.
+async fn git_diff_text(dir: &std::path::Path) -> Option<String> {
     let read = async {
-        let mut child = tokio::process::Command::new("git")
-            .args(["diff", "--no-color"])
-            .current_dir(dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .ok()?;
-        let stdout = child.stdout.take()?;
-        let mut buf = Vec::new();
-        stdout
-            .take(REVIEW_DIFF_MAX_BYTES as u64 + 1)
-            .read_to_end(&mut buf)
-            .await
-            .ok()?;
-        if buf.len() > REVIEW_DIFF_MAX_BYTES {
-            // Over the cap: stop the producer; the truncation happens below.
-            let _ = child.kill().await;
-        } else {
-            let status = child.wait().await.ok()?;
-            if !status.success() {
-                return None;
+        let tracked =
+            match git_stdout(dir, &["diff", "--no-color", "HEAD"], REVIEW_DIFF_MAX_BYTES).await {
+                Some(text) => text,
+                // No HEAD yet (a repository without commits): plain diff.
+                None => git_stdout(dir, &["diff", "--no-color"], REVIEW_DIFF_MAX_BYTES).await?,
+            };
+        let mut text = String::from_utf8_lossy(&tracked).into_owned();
+        let listing = git_stdout(
+            dir,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            REVIEW_LIST_MAX_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+        if listing.len() <= REVIEW_LIST_MAX_BYTES {
+            let paths: Vec<String> = listing
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect();
+            let (paths, left_out) = review::select_untracked(paths);
+            let files: Vec<review::UntrackedFile> = paths
+                .into_iter()
+                .map(|path| read_untracked(dir, path))
+                .collect();
+            let section = review::render_new_files(&files, left_out);
+            if !section.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&section);
             }
         }
-        Some(String::from_utf8_lossy(&buf).into_owned())
+        Some(text)
     };
     let text = tokio::time::timeout(REVIEW_DIFF_TIMEOUT, read)
         .await
@@ -423,6 +516,9 @@ struct RunLoopState {
     /// `mutated_this_run` (the finish gate's pending-verification flag) it
     /// is never cleared: the reviewer pass keys off it.
     ran_file_mutation: bool,
+    /// Facts for the cheap claim checks on the final answer (H4b): bash
+    /// commands that ran and the outcome of the last verify run.
+    run_facts: review::RunFacts,
     /// Reviewer feedback rounds spent this run (NeedsFix findings fed back).
     review_feedback_rounds: u32,
     /// Why the loop ended (`end_turn` / `max_turns` / `spend_cap` /
@@ -454,6 +550,7 @@ impl RunLoopState {
             run_tier_override: None,
             last_dispatch_ended_with_passing_verify: false,
             ran_file_mutation: false,
+            run_facts: review::RunFacts::default(),
             review_feedback_rounds: 0,
             stop_label: "end_turn",
             current_plan: None,
@@ -600,6 +697,8 @@ impl Engine {
         transcript: Vec<Message>,
         initial_plan: Option<Vec<modron_types::PlanItem>>,
     ) -> Result<RunSummary> {
+        // H3c: the run is live until this guard drops, on every exit path.
+        let _run = crate::run_scope().begin(session_id);
         let tool_specs = self.tools.specs_prompt();
         let system = self.assemble_system(&tool_specs);
         // Cache-discipline audit key: one hash over the exact wire prefix
@@ -1292,6 +1391,25 @@ impl Engine {
         {
             state.mutated_this_run = true;
             state.ran_file_mutation = true;
+        }
+        // Claim-check facts (H4b): bash commands that actually ran, and the
+        // outcome of each verify call that actually ran.
+        for (call, (outcome, ran)) in tool_calls.iter().zip(&dispatched) {
+            if !*ran {
+                continue;
+            }
+            match call.name.as_str() {
+                "bash" => {
+                    if let Some(command) = call.arguments.get("command").and_then(|c| c.as_str()) {
+                        state.run_facts.commands.push(command.to_string());
+                    }
+                }
+                "verify" => {
+                    state.run_facts.verify_ran = true;
+                    state.run_facts.verify_passed = Some(!outcome.is_error);
+                }
+                _ => {}
+            }
         }
         let outcomes: Vec<ToolOutcome> =
             dispatched.into_iter().map(|(outcome, _)| outcome).collect();
@@ -2033,6 +2151,8 @@ impl Engine {
             "finish gate verification"
         );
         let passed = !outcome.is_error;
+        state.run_facts.verify_ran = true;
+        state.run_facts.verify_passed = Some(passed);
         // Persisted as a user message (not an orphan ToolResult): resume and
         // compaction rebuild transcripts from the event log and an unpaired
         // Role::Tool breaks provider request building.
@@ -2061,27 +2181,107 @@ impl Engine {
         Ok(true)
     }
 
-    /// Independent reviewer pass (H4a) at normal run completion. Returns
-    /// `true` when NeedsFix findings were queued as a user message and the
-    /// loop must continue; `false` ends the run normally. A reviewer error
-    /// never fails the run: every such path records `Skipped`.
+    /// Independent reviewer pass (H4a) and claim checks (H4b) at normal run
+    /// completion. Returns `true` when NeedsFix findings were queued as a
+    /// user message and the loop must continue; `false` ends the run
+    /// normally. A reviewer error never fails the run: every such path
+    /// records `Skipped`. Claim findings never extend the run: a claim-driven
+    /// NeedsFix is recorded, but only the reviewer's own verdict queues a
+    /// feedback round.
     async fn review_round(
         &self,
         session_id: SessionId,
         task: &str,
         state: &mut RunLoopState,
     ) -> Result<bool> {
+        let claims = self.run_claim_findings(state);
         let Some(reviewer) = self.config.reviewer.clone() else {
+            self.record_claims_only(session_id, claims).await?;
             return Ok(false);
         };
+        let Some(reviewed) = self
+            .run_reviewer(session_id, task, state, &reviewer)
+            .await?
+        else {
+            self.record_claims_only(session_id, claims).await?;
+            return Ok(false);
+        };
+        let reviewer_verdict = reviewed.verdict;
+        let (verdict, findings) = review::merge_claims(reviewer_verdict, reviewed.findings, claims);
+        self.record_review(session_id, verdict, findings.clone(), &reviewed.model)
+            .await?;
+
+        // Feedback only while the round bound, the turn headroom and the
+        // budgets all leave the loop able to service the fix.
+        let can_feed_back = reviewer_verdict == ReviewVerdict::NeedsFix
+            && state.review_feedback_rounds < reviewer.max_rounds
+            && state.turns < self.config.max_turns
+            && !state.governor.exceeded()
+            && !self
+                .config
+                .max_cost_usd
+                .is_some_and(|cap| state.spend_usd > cap);
+        if !can_feed_back {
+            return Ok(false);
+        }
+        state.review_feedback_rounds += 1;
+        // Persisted as a user message, like the finish gate's feedback.
+        let feedback = Message::user(review::feedback_message(&findings));
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: feedback.clone(),
+                },
+            )
+            .await?;
+        state.transcript.push(feedback);
+        Ok(true)
+    }
+
+    /// Record the claim checks alone, under model `rules`, when no reviewer
+    /// result is recorded. No claim findings records nothing.
+    async fn record_claims_only(
+        &self,
+        session_id: SessionId,
+        claims: Vec<modron_types::Finding>,
+    ) -> Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+        let (verdict, findings) = review::merge_claims(ReviewVerdict::Pass, Vec::new(), claims);
+        self.record_review(session_id, verdict, findings, "rules")
+            .await
+    }
+
+    /// Claim checks (H4b) on the final answer. Only runs once a file-mutating
+    /// tool ran; a read-only answer makes no claim this check cares about.
+    fn run_claim_findings(&self, state: &RunLoopState) -> Vec<modron_types::Finding> {
+        if !state.ran_file_mutation {
+            return Vec::new();
+        }
+        review::claim_findings(&state.answer, &state.run_facts)
+    }
+
+    /// The reviewer call (H4a). `None` when no review applies (wrong phase,
+    /// nothing mutated, verification given up, budget exhausted). Otherwise
+    /// the outcome to record; `Skipped` whenever the review could not run.
+    async fn run_reviewer(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        state: &mut RunLoopState,
+        reviewer: &crate::ReviewerConfig,
+    ) -> Result<Option<ReviewedDiff>> {
         // Build phase only, and only after a file-mutating tool actually ran.
         if self.config.phase != Phase::Build || !state.ran_file_mutation {
-            return Ok(false);
+            return Ok(None);
         }
         // The finish gate gave up with verification still failing: the
         // escalation owns that outcome, the reviewer does not run.
         if state.mutated_this_run && state.verify_rounds >= MAX_VERIFY_ROUNDS {
-            return Ok(false);
+            return Ok(None);
         }
         // Abnormal stops never get a review: budget, spend cap, and no
         // turn headroom left to service a feedback round.
@@ -2092,14 +2292,12 @@ impl Engine {
                 .max_cost_usd
                 .is_some_and(|cap| state.spend_usd > cap)
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         let model = reviewer.model.clone();
         let Some(diff) = self.collect_review_diff().await else {
-            self.record_review(session_id, ReviewVerdict::Skipped, Vec::new(), &model)
-                .await?;
-            return Ok(false);
+            return Ok(Some(ReviewedDiff::skipped(model)));
         };
 
         // Provider resolution mirrors the escalation turn: the selector's
@@ -2123,9 +2321,7 @@ impl Engine {
             Ok(resolved) if resolved.1 == model => resolved,
             _ => {
                 tracing::warn!(model = %model, "reviewer model did not resolve; review skipped");
-                self.record_review(session_id, ReviewVerdict::Skipped, Vec::new(), &model)
-                    .await?;
-                return Ok(false);
+                return Ok(Some(ReviewedDiff::skipped(model.clone())));
             }
         };
 
@@ -2143,9 +2339,7 @@ impl Engine {
             Ok(response) => response,
             Err(err) => {
                 tracing::warn!(error = %err, "review turn failed; review skipped");
-                self.record_review(session_id, ReviewVerdict::Skipped, Vec::new(), &model)
-                    .await?;
-                return Ok(false);
+                return Ok(Some(ReviewedDiff::skipped(model.clone())));
             }
         };
 
@@ -2185,36 +2379,11 @@ impl Engine {
             .await?;
 
         let (verdict, findings) = review::parse_review(&response.text);
-        self.record_review(session_id, verdict, findings.clone(), &model)
-            .await?;
-
-        // Feedback only while the round bound, the turn headroom and the
-        // budgets all leave the loop able to service the fix.
-        let can_feed_back = verdict == ReviewVerdict::NeedsFix
-            && state.review_feedback_rounds < reviewer.max_rounds
-            && state.turns < self.config.max_turns
-            && !state.governor.exceeded()
-            && !self
-                .config
-                .max_cost_usd
-                .is_some_and(|cap| state.spend_usd > cap);
-        if !can_feed_back {
-            return Ok(false);
-        }
-        state.review_feedback_rounds += 1;
-        // Persisted as a user message, like the finish gate's feedback.
-        let feedback = Message::user(review::feedback_message(&findings));
-        self.store
-            .append(
-                session_id,
-                &SessionEvent::Message {
-                    parent_id: None,
-                    message: feedback.clone(),
-                },
-            )
-            .await?;
-        state.transcript.push(feedback);
-        Ok(true)
+        Ok(Some(ReviewedDiff {
+            verdict,
+            findings,
+            model,
+        }))
     }
 
     /// Append one `Review` event (H4a).
@@ -4845,6 +5014,306 @@ mod tests {
         assert!(messages
             .iter()
             .all(|m| !m.content.contains("standing plan")));
+    }
+}
+
+#[cfg(test)]
+mod claim_pass_tests {
+    //! Claim checks and the working-tree diff (H4b) against the scripted
+    //! mock provider. Only the new-file test touches git (a temp repo).
+    use super::*;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalMode, ApprovalPolicy, EngineConfig, ReviewDiffSource, ReviewerConfig, SessionStore,
+        Tool, ToolRegistry,
+    };
+    use async_trait::async_trait;
+    use modron_types::{Finding, ReviewVerdict, Severity};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A named tool: `write`/`bash` always succeed; `verify` succeeds only
+    /// when `passes` is set.
+    struct NamedTool {
+        name: &'static str,
+        passes: bool,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "test tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(if self.passes {
+                ToolOutcome::ok("ok")
+            } else {
+                ToolOutcome::err("tests failed")
+            })
+        }
+    }
+
+    struct Harness {
+        engine: Engine,
+        mock: Arc<MockProvider>,
+        store: Arc<InMemoryStore>,
+    }
+
+    fn build(script: Vec<TurnResponse>, config: EngineConfig, tools: Vec<NamedTool>) -> Harness {
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(Arc::new(tool));
+        }
+        let mock = Arc::new(MockProvider::with_script(script));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let store = Arc::new(InMemoryStore::default());
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::clone(&store) as Arc<dyn SessionStore>,
+            config,
+        };
+        Harness {
+            engine,
+            mock,
+            store,
+        }
+    }
+
+    fn auto_approve() -> ApprovalPolicy {
+        ApprovalPolicy {
+            mode: ApprovalMode::ApproveAll,
+            ..ApprovalPolicy::default()
+        }
+    }
+
+    fn fixed_diff(diff: Option<&str>) -> Option<Arc<ReviewDiffSource>> {
+        let diff = diff.map(String::from);
+        Some(Arc::new(move || diff.clone()) as Arc<ReviewDiffSource>)
+    }
+
+    fn tool_turn(name: &str, arguments: serde_json::Value) -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("{name}-call"),
+                name: name.into(),
+                arguments,
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    fn reply(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    async fn reviews(
+        h: &Harness,
+        session: SessionId,
+    ) -> Vec<(ReviewVerdict, Vec<Finding>, String)> {
+        h.store
+            .load(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Review {
+                    verdict,
+                    findings,
+                    model,
+                } => Some((verdict, findings, model)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rules_config() -> EngineConfig {
+        EngineConfig {
+            approvals: auto_approve(),
+            ..EngineConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_without_a_reviewer_is_recorded_under_rules() {
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                reply("All tests pass."),
+            ],
+            rules_config(),
+            vec![NamedTool {
+                name: "write",
+                passes: true,
+            }],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, ReviewVerdict::Pass);
+        assert_eq!(found[0].2, "rules");
+        assert_eq!(found[0].1.len(), 1);
+        assert_eq!(found[0].1[0].severity, Severity::P2);
+        assert_eq!(h.mock.requests().len(), 2, "no reviewer call, no fix round");
+    }
+
+    #[tokio::test]
+    async fn no_claim_records_nothing_without_a_reviewer() {
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                reply("Edited the file."),
+            ],
+            rules_config(),
+            vec![NamedTool {
+                name: "write",
+                passes: true,
+            }],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_test_command_that_ran_silences_the_tests_claim() {
+        let h = build(
+            vec![
+                tool_turn("bash", serde_json::json!({"command": "cargo test -q"})),
+                tool_turn("write", serde_json::json!({})),
+                reply("All tests pass."),
+            ],
+            rules_config(),
+            vec![
+                NamedTool {
+                    name: "write",
+                    passes: true,
+                },
+                NamedTool {
+                    name: "bash",
+                    passes: true,
+                },
+            ],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_verify_claim_flips_pass_to_needs_fix_without_a_round() {
+        // Ask mode: the approver grants the model's own verify call and
+        // refuses the finish gate's, so verify ends failed and the gate
+        // stands down (the run is not extended by the gate or a feedback round).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let approver_calls = Arc::clone(&calls);
+        let approver = Arc::new(move |_ask: &crate::ApprovalAsk<'_>| {
+            approver_calls.fetch_add(1, Ordering::SeqCst) == 0
+        }) as Arc<crate::Approver>;
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::Ask,
+                allow: vec!["write".into()],
+                ..ApprovalPolicy::default()
+            },
+            approver: Some(approver),
+            reviewer: Some(ReviewerConfig {
+                model: "rev-model".into(),
+                max_rounds: 1,
+            }),
+            review_diff_source: fixed_diff(Some("diff --git a/a b/a\n+x\n")),
+            ..EngineConfig::default()
+        };
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                tool_turn("verify", serde_json::json!({})),
+                reply("All tests pass."),
+                reply("VERDICT: PASS"),
+            ],
+            config,
+            vec![
+                NamedTool {
+                    name: "write",
+                    passes: true,
+                },
+                NamedTool {
+                    name: "verify",
+                    passes: false,
+                },
+            ],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, ReviewVerdict::NeedsFix);
+        assert_eq!(found[0].2, "rev-model");
+        assert!(
+            found[0].1.iter().any(|f| f.severity == Severity::P1
+                && f.text == "claims success, but the verify command failed"),
+            "{:?}",
+            found[0].1
+        );
+        assert_eq!(
+            h.mock.requests().len(),
+            4,
+            "write, verify, answer, reviewer: no feedback round"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_files_only_change_is_reviewed_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+
+        let config = EngineConfig {
+            approvals: auto_approve(),
+            working_dir: dir.path().to_path_buf(),
+            reviewer: Some(ReviewerConfig {
+                model: "rev-model".into(),
+                max_rounds: 1,
+            }),
+            review_diff_source: None,
+            ..EngineConfig::default()
+        };
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                reply("Added new.rs."),
+                reply("VERDICT: PASS"),
+            ],
+            config,
+            vec![NamedTool {
+                name: "write",
+                passes: true,
+            }],
+        );
+        let summary = h.engine.run_task("add new.rs").await.unwrap();
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, ReviewVerdict::Pass, "reviewed, not Skipped");
+        let requests = h.mock.requests();
+        let reviewer_prompt = &requests[2].messages[0].content;
+        assert!(reviewer_prompt.contains("diff --git a/new.rs b/new.rs"));
+        assert!(reviewer_prompt.contains("+fn main() {}"));
     }
 }
 
