@@ -151,3 +151,23 @@ Literal copy still in app/src, not from the core or modron-view:
   lazy start, and only happens when a config flag is given.
 - Strings with no shared home yet: "no tool activity yet" (Ctrl+T note), and
   the `!`, `@file` and Ctrl+T help rows.
+
+## APP-6 parity gaps (not done)
+
+- Pickers for `/mode`, `/sandbox`, `/effort` and `/agent` are not built;
+  bare `/mode` and `/sandbox` still cycle. `/agent` lists nothing (the
+  snapshot has no persona list).
+- Removal: no rule removal in Settings or `/allow`/`/deny`; `ConfigPatch.rules`
+  replaces the whole set and could carry it. No credential sign-out: the core
+  has no logout or key-removal call (`mobile/rust-core/src/client.rs` has only
+  `remove_automation`). It would need a server frame.
+- Help tabs (General, Commands, Shortcuts) and scrolling are not built; help is
+  one page with Esc only.
+- The terminal loop only wakes on its own events, so the spinner and idle hint
+  advance while events arrive (a streaming turn) but may pause during a silent
+  wait. Not checked in a pty.
+- Theme switching: NSH exposes `ambient::set_tokens` and `set_color_scheme`
+  (`nsh-core-0.5.1/src/element/ambient.rs`) and `tailwind::set_theme`
+  (`nsh-core-0.5.1/src/tailwind/mod.rs`). A real switcher would load a second
+  palette file and call `set_tokens` on `/theme`; NSH does not own named themes.
+- The resume hint's print on exit is untested (the format is tested).

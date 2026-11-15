@@ -206,3 +206,22 @@ and page text after Enter.
 - `src/chat.rs`: screen, model and key routing (target-neutral).
 - `src/session.rs`: the driver (`Driver::step`), target-neutral.
 - `nsh.json`: app id `dev.modron.app`, theme `theme/oculus.json`.
+
+## Status line, first screen and theme
+
+- Context: the gauge reads `ctx 85%! (153k/180k)` from 80 percent up (the
+  old TUI's `!` marker, `CONTEXT_WARNING_PCT` and `CONTEXT_WARNING_MARK` in
+  `mobile/rust-core/src/view.rs`). The marker stays while the gauge is at or
+  above 80 percent; it is not a once-only note. The old TUI suggests no
+  `/compact`, so none is suggested.
+- Header while a turn runs: a spinner frame (the old TUI's calculus spinner)
+  and `esc to interrupt`. Idle with an empty composer: a hint that rotates
+  every eight animation steps (the old TUI's eight hints, same words). Typing
+  hides the hint. The steps come from `Host::tick_now` (`src/chat.rs`), which
+  the web frame and the terminal loop call; the step period is `ANIM_PERIOD`
+  (120 ms). The spinner stops when idle.
+- A blank idle session shows the welcome banner (`welcome_lines`); the first
+  row replaces it.
+- `/theme` answers with `THEME_NOTE`: the one built-in theme (oculus, light
+  and dark), following the system appearance on the web. There is no theme
+  switch; see `NOTES.md` for what NSH would need.

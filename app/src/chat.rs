@@ -22,6 +22,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use modron_mobile_core::view::{idle_hint, spinner_frame, RUNNING_HINT};
 use modron_mobile_core::view::{NEW_OUTPUT_BELOW_LABEL, NO_TOOLS_NOTE};
 use modron_mobile_core::Attachment;
 use modron_mobile_core::{
@@ -1046,6 +1047,11 @@ pub struct Model {
     pub attachments: Vec<String>,
     /// The standing goal (`[goal: ...]`), empty when none is set.
     pub goal: String,
+    /// The running spinner frame (empty when idle, so it stops).
+    pub spinner: String,
+    /// The header hint: the interrupt hint while running, else the rotating
+    /// idle hint while the composer is empty (empty otherwise).
+    pub hint: String,
 }
 
 impl Model {
@@ -1053,12 +1059,34 @@ impl Model {
         Self {
             attachments: staged_labels(),
             goal: modron_mobile_core::view::goal_label(&s.goal),
+            spinner: spinner_text(s.running, ANIM_TICK.load(Ordering::SeqCst)),
+            hint: hint_text(
+                s.running,
+                composer_text().is_empty(),
+                ANIM_TICK.load(Ordering::SeqCst),
+            ),
             connection: s.connection_label.clone(),
             provider: s.provider.clone(),
             running: s.running_label.clone(),
             is_running: s.running,
             status_line: s.status_line.clone(),
-            lines: transcript_lines(&s.history),
+            lines: if s.history.is_empty() && !s.running {
+                // A blank idle session shows the welcome banner; the first
+                // row (the task echo, a note) replaces it.
+                let welcome = vec![RenderedRow {
+                    lines: modron_mobile_core::view::welcome_lines(
+                        &s.model,
+                        env!("CARGO_PKG_VERSION"),
+                    ),
+                    entry: TranscriptEntry::Model {
+                        model: s.model.clone(),
+                        reason: "welcome".into(),
+                    },
+                }];
+                transcript_lines(&welcome)
+            } else {
+                transcript_lines(&s.history)
+            },
             streaming: s.streaming_text.clone(),
             approval: s.pending_approval.as_ref().map(|p| Approval {
                 tool: p.tool.clone(),
@@ -1320,6 +1348,41 @@ impl Host {
     }
 
     /// Sends the latest snapshot again (the note expired, or `/clear` ran).
+    /// One animation step at the injected time `now`. A step is due every
+    /// [`ANIM_PERIOD`]. It advances the spinner while a turn runs and the
+    /// idle hint while the composer is empty, and republishes only when the
+    /// header changes (including the hint clearing once the user types).
+    /// Returns whether it republished.
+    pub fn tick(&mut self, now: Instant) -> bool {
+        {
+            let mut next = ANIM_NEXT.lock().unwrap_or_else(|e| e.into_inner());
+            match *next {
+                None => {
+                    *next = Some(now + ANIM_PERIOD);
+                    return false;
+                }
+                Some(due) if now < due => return false,
+                Some(_) => *next = Some(now + ANIM_PERIOD),
+            }
+        }
+        let typing = !composer_text().is_empty();
+        let animating = self.running || !typing;
+        if !animating && !HINT_SHOWN.load(Ordering::SeqCst) {
+            return false;
+        }
+        if animating {
+            ANIM_TICK.fetch_add(1, Ordering::SeqCst);
+        }
+        HINT_SHOWN.store(!self.running && !typing, Ordering::SeqCst);
+        self.republish();
+        true
+    }
+
+    /// [`Host::tick`] on the app clock (the terminal loop and the web frame).
+    pub fn tick_now(&mut self) -> bool {
+        self.tick(Instant::now())
+    }
+
     fn republish(&mut self) {
         let Some(raw) = self.raw.clone() else {
             return;
@@ -1709,6 +1772,40 @@ pub(crate) fn set_line_total(lines: usize) {
 
 /// Clears the composer after a revise note went out, once the plan is no
 /// longer pending. The view calls this for every snapshot it receives.
+/// The animation step period, on the app clock. The old TUI polled every
+/// 50 ms (crates/modron-tui/src/lib.rs:2446); the spinner and hints step at
+/// this rate, and the hint holds for `IDLE_HINT_TICKS` steps.
+pub const ANIM_PERIOD: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Animation steps taken so far; the spinner frame and idle hint read it.
+static ANIM_TICK: AtomicU64 = AtomicU64::new(0);
+/// When the next animation step is due on the app clock.
+static ANIM_NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+/// Whether the header shows an idle hint (so clearing it republishes once).
+static HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// The header hint for a state: the interrupt hint while a turn runs, the
+/// rotating idle hint while the composer is empty, nothing once the user has
+/// typed.
+pub fn hint_text(running: bool, composer_empty: bool, tick: u64) -> String {
+    if running {
+        RUNNING_HINT.to_string()
+    } else if composer_empty {
+        idle_hint(tick).to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The spinner glyph: the frame while a turn runs, nothing when idle.
+pub fn spinner_text(running: bool, tick: u64) -> String {
+    if running {
+        spinner_frame(tick).to_string()
+    } else {
+        String::new()
+    }
+}
+
 pub fn after_snapshot(snapshot: &ViewModelSnapshot, draft: Signal<String>) {
     if snapshot.plan_pending.is_none() && CLEAR_DRAFT.swap(false, Ordering::SeqCst) {
         set_draft("");
@@ -1807,6 +1904,14 @@ pub(crate) fn header(model: Signal<Model>) -> impl IntoElement {
         )
         .child(
             text(move || model.with(|m| m.running.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
+        .child(
+            text(move || model.with(|m| m.spinner.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
+        .child(
+            text(move || model.with(|m| m.hint.clone()))
                 .text_color(move || token_ink("muted-foreground")),
         )
         .child(
@@ -2635,6 +2740,68 @@ mod tests {
     fn plan_pending_leaves_other_letters_to_the_composer() {
         assert_eq!(route_key(Key::Char('a'), false, false, plan(), ""), composer());
         assert_eq!(route_key(Key::Char('n'), false, false, plan(), ""), composer());
+    }
+
+    #[test]
+    fn the_cursor_and_delete_keys_reach_the_composer_and_never_scroll_or_recall() {
+        for draft in ["", "one line", "a\nb"] {
+            for key in [Key::Left, Key::Right, Key::Delete] {
+                let facts = KeyFacts { history_len: 3, ..NONE };
+                assert_eq!(
+                    route_key(key, false, false, facts, draft),
+                    composer(),
+                    "{key:?} {draft:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn up_and_down_on_a_multi_line_draft_reach_the_composer_not_recall() {
+        for key in [Key::Up, Key::Down] {
+            let facts = KeyFacts { history_len: 3, ..NONE };
+            assert_eq!(route_key(key, false, false, facts, "a\nb"), composer(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_reasoning_tail_is_the_last_two_lines_and_only_when_opted_in() {
+        let mut s = ViewModelSnapshot {
+            streaming_reasoning: "one\ntwo\nthree".into(),
+            ..Default::default()
+        };
+        assert_eq!(Model::from_snapshot(&s).reasoning, "", "off by default");
+        s.show_reasoning = true;
+        assert_eq!(Model::from_snapshot(&s).reasoning, "two\nthree");
+    }
+
+    #[test]
+    fn the_header_shows_the_first_eight_characters_of_the_session() {
+        let id = uuid::Uuid::from_u128(0x1234_abcd_0000_4000_8000_0000_0000_0000);
+        let s = ViewModelSnapshot { session_id: Some(id), ..Default::default() };
+        assert_eq!(Model::from_snapshot(&s).session, "1234abcd");
+        assert_eq!(Model::from_snapshot(&ViewModelSnapshot::default()).session, "");
+    }
+
+    #[test]
+    fn a_blank_idle_session_shows_the_welcome_banner() {
+        let welcome = modron_mobile_core::view::welcome_lines("m1", env!("CARGO_PKG_VERSION"));
+        let blank = ViewModelSnapshot { model: "m1".into(), ..Default::default() };
+        assert_eq!(Model::from_snapshot(&blank).lines.len(), welcome.len());
+        let running = ViewModelSnapshot { model: "m1".into(), running: true, ..Default::default() };
+        assert!(
+            Model::from_snapshot(&running).lines.is_empty(),
+            "a running blank session shows nothing"
+        );
+    }
+
+    #[test]
+    fn the_header_hint_and_spinner_follow_the_running_state_only() {
+        assert_eq!(hint_text(true, false, 0), RUNNING_HINT);
+        assert_eq!(hint_text(false, true, 8), idle_hint(8));
+        assert_eq!(hint_text(false, false, 8), "", "typing hides the idle hint");
+        assert_eq!(spinner_text(false, 3), "", "the spinner stops when idle");
+        assert_eq!(spinner_text(true, 1), spinner_frame(1));
     }
 
     #[test]

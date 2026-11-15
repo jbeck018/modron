@@ -76,6 +76,7 @@ fn now() -> f64 {
 
 impl Web {
     fn tick(&mut self) {
+        self.host.tick_now();
         if let Some(h) =
             web_sys::window().and_then(|w| w.inner_height().ok()).and_then(|v| v.as_f64())
         {

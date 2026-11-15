@@ -15,11 +15,13 @@ use modron_app::{
     App, CLIENT,
 };
 use modron_mobile_core::{
-    entry_lines, ConnectionState, PendingPlanView, PlanDecisionOption, RenderedRow,
-    ViewModelSnapshot, PLAN_DECISION_LABELS,
+    entry_lines, ConnectionState, DecisionOption, PendingApprovalView, PendingPlanView,
+    PlanDecisionOption, RenderedRow, ViewModelSnapshot, DECISION_LABELS, PLAN_DECISION_LABELS,
+    UNDECODABLE_NOTE,
 };
-use modron_protocol::{Frame, LiveState, Payload, WireDelta, PROTOCOL_VERSION};
-use modron_view::TranscriptEntry;
+use modron_protocol::{Frame, LiveState, Payload, PendingApproval, WireDelta, PROTOCOL_VERSION};
+use modron_types::{ToolCall, Usage};
+use modron_view::{GenUi, TranscriptEntry};
 use nsh_platform_tui::{AppOptions, AppView, CacheOptions, Input, Modifiers, Root};
 use ratatui::{backend::TestBackend, Terminal};
 use tokio::net::{TcpListener, TcpStream};
@@ -379,6 +381,12 @@ struct Script {
     running: bool,
     /// Answer the first client request after the stream with this error.
     refusal: Option<&'static str>,
+    /// The first snapshot carries a pending `bash` approval ("req-1").
+    approval: bool,
+    /// One text frame the client cannot decode, sent before the snapshot.
+    garbage: bool,
+    /// The Welcome names a protocol one version ahead of the client's.
+    protocol_skew: bool,
 }
 
 /// Starts the scripted server on its own thread. Returns its ws URL and a
@@ -410,10 +418,16 @@ fn start_server(session: Uuid, script: Script) -> (String, mpsc::Receiver<Payloa
                 &Frame::event(
                     None,
                     0,
-                    Payload::Welcome { server_version: "0.1.3".into(), protocol: PROTOCOL_VERSION },
+                    Payload::Welcome {
+                        server_version: "0.1.3".into(),
+                        protocol: PROTOCOL_VERSION + u32::from(script.protocol_skew),
+                    },
                 ),
             )
             .await;
+            if script.garbage {
+                ws.send(WsMessage::Text("not a frame".into())).await.expect("server: garbage");
+            }
 
             if !script.share_link {
                 let attach = read_frame(&mut ws).await;
@@ -423,7 +437,17 @@ fn start_server(session: Uuid, script: Script) -> (String, mpsc::Receiver<Payloa
                     attach.payload
                 );
             }
-            let live = LiveState { running: script.running, ..LiveState::default() };
+            let pending_approval = script.approval.then(|| PendingApproval {
+                request_id: "req-1".into(),
+                call: ToolCall {
+                    id: "call-1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({ "command": "ls" }),
+                },
+                agent: None,
+            });
+            let live =
+                LiveState { running: script.running, pending_approval, ..LiveState::default() };
             send_frame(
                 &mut ws,
                 &Frame::event(
@@ -588,4 +612,190 @@ fn a_refused_send_shows_the_server_error_on_screen() {
     h.send(key("Enter"));
     let _ = next_request(&mut h, &mut live, &reports);
     h.wait_for("refusal on screen", Some(&mut live), |s| s.contains(refusal));
+}
+
+// ---------------------------------------------------------------------------
+// Rendering of core entries and notes, and the wire calls behind the
+// slash commands, approvals and handshake (one scripted server per test).
+// ---------------------------------------------------------------------------
+
+fn pending_view() -> PendingApprovalView {
+    PendingApprovalView {
+        request_id: "req-1".into(),
+        tool: "edit".into(),
+        args_summary: "crates/modron-router/src/lib.rs".into(),
+        arguments: serde_json::json!({}),
+        arguments_text: "{}".into(),
+        options: DECISION_LABELS
+            .iter()
+            .map(|(decision, label)| DecisionOption { decision: *decision, label: (*label).into() })
+            .collect(),
+    }
+}
+
+#[test]
+fn an_interrupted_turn_note_stays_in_the_notes_row() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    snapshot.last_note = Some("turn interrupted by the user".into());
+    h.push(&snapshot);
+    h.wait_for("interrupted note", None, |s| s.contains("turn interrupted by the user"));
+}
+
+#[test]
+fn turn_end_usage_swarm_and_generative_rows_render_from_the_core_entries() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    snapshot.history.push(row(TranscriptEntry::Usage {
+        model: "claude-opus-5".into(),
+        usage: Usage { input_tokens: 1200, output_tokens: 300, cached_input_tokens: 600 },
+    }));
+    snapshot.history.push(row(TranscriptEntry::Swarm {
+        lines: vec!["[scout] done - 3 turns - last: read".into()],
+    }));
+    snapshot.history.push(row(TranscriptEntry::GenerativeUi {
+        ui: GenUi::Table {
+            title: None,
+            columns: vec!["file".into()],
+            rows: vec![vec!["router-table-cell.rs".into()]],
+        },
+    }));
+    h.push(&snapshot);
+    h.wait_for("usage row", None, |s| s.contains("1500 tok"));
+    let screen = h.screen();
+    assert!(screen.contains("cache 50%"), "{screen}");
+    assert!(screen.contains("[scout] done - 3 turns"), "{screen}");
+    assert!(screen.contains("router-table-cell.rs"), "{screen}");
+}
+
+#[test]
+fn an_approval_that_leaves_the_snapshot_clears_the_prompt() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    snapshot.pending_approval = Some(pending_view());
+    h.push(&snapshot);
+    h.wait_for("approval labels", None, |s| s.contains("allow once"));
+    // Resolved elsewhere: the next snapshot has no pending approval.
+    h.push(&fixture());
+    h.wait_for("prompt cleared", None, |s| !s.contains("allow once"));
+}
+
+/// Types `command`, submits it, and returns the first request the scripted
+/// server reads after the stream.
+fn wire_request(script: Script, command: &str) -> Payload {
+    let session = Uuid::new_v4();
+    let (url, reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
+    let mut h = Harness::new();
+    h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
+    h.type_text(command);
+    h.wait_draft(command);
+    h.send(key("Enter"));
+    next_request(&mut h, &mut live, &reports)
+}
+
+#[test]
+fn fork_sends_a_fork_frame() {
+    match wire_request(Script::default(), "/fork") {
+        Payload::Fork { .. } => {}
+        other => panic!("expected fork, got {other:?}"),
+    }
+}
+
+#[test]
+fn share_publishes_the_transcript_page() {
+    match wire_request(Script::default(), "/share") {
+        Payload::PublishPage { .. } => {}
+        other => panic!("expected publish_page, got {other:?}"),
+    }
+}
+
+#[test]
+fn remote_control_sends_the_bridge_url_it_was_given() {
+    match wire_request(Script::default(), "/remote-control wss://relay.test/rc") {
+        Payload::RemoteControl { bridge_url, .. } => assert_eq!(bridge_url, "wss://relay.test/rc"),
+        other => panic!("expected remote_control, got {other:?}"),
+    }
+}
+
+#[test]
+fn agent_sends_the_persona_as_a_config_patch() {
+    let request = wire_request(Script::default(), "/agent reviewer");
+    assert!(format!("{request:?}").contains("persona: Some(\"reviewer\")"), "{request:?}");
+}
+
+#[test]
+fn allow_and_deny_send_the_tool_lists_as_config_patches() {
+    let allow = wire_request(Script::default(), "/allow read");
+    assert!(format!("{allow:?}").contains("allow: Some([\"read\"])"), "{allow:?}");
+    let deny = wire_request(Script::default(), "/deny bash");
+    assert!(format!("{deny:?}").contains("deny: Some([\"bash\"])"), "{deny:?}");
+}
+
+#[test]
+fn sandbox_sends_the_policy_as_a_config_patch() {
+    let request = wire_request(Script::default(), "/sandbox off");
+    assert!(format!("{request:?}").contains("sandbox: Some("), "{request:?}");
+}
+
+#[test]
+fn y_sends_the_approval_decision_over_the_wire() {
+    let session = Uuid::new_v4();
+    let script = Script { approval: true, ..Script::default() };
+    let (url, reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
+    let mut h = Harness::new();
+    h.wait_for("approval labels", Some(&mut live), |s| s.contains("allow once"));
+    h.send(key("y"));
+    match next_request(&mut h, &mut live, &reports) {
+        Payload::Approve { request_id, .. } => assert_eq!(request_id, "req-1"),
+        other => panic!("expected approve, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_undecodable_frame_shows_the_shared_notice() {
+    let session = Uuid::new_v4();
+    let script = Script { garbage: true, ..Script::default() };
+    let (url, _reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
+    let mut h = Harness::new();
+    h.wait_for("undecodable notice", Some(&mut live), |s| s.contains(UNDECODABLE_NOTE));
+}
+
+#[test]
+fn a_server_one_protocol_ahead_is_refused_and_never_streams() {
+    let session = Uuid::new_v4();
+    let script = Script { protocol_skew: true, ..Script::default() };
+    let (url, _reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
+    let mut h = Harness::new();
+    // A Welcome with another protocol never sets the connection up: the
+    // header reads disconnected and the server's stream is not folded.
+    h.wait_for("refused handshake", Some(&mut live), |s| s.contains("disconnected"));
+    assert!(!h.screen().contains("Migrating the router now"), "{}", h.screen());
 }

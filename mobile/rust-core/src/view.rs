@@ -84,16 +84,97 @@ pub fn phase_label(phase: Phase) -> &'static str {
     }
 }
 
+/// The status text while a turn runs (the old TUI's input box title
+/// "working (esc to interrupt)", crates/modron-tui/src/lib.rs:3771).
+pub const RUNNING_HINT: &str = "esc to interrupt";
+
+/// The running spinner frames: the old TUI's calculus spinner
+/// (crates/modron-tui/src/lib.rs:904, SPINNER_WORKING: partial, nabla,
+/// delta, nabla). Escapes keep the source ASCII.
+pub const SPINNER_FRAMES: [&str; 4] = ["\u{2202}", "\u{2207}", "\u{2206}", "\u{2207}"];
+
+/// Clock ticks each idle hint holds before the next one shows (the old TUI
+/// rotated on `spinner_tick / 8`, crates/modron-tui/src/lib.rs:3832).
+pub const IDLE_HINT_TICKS: u64 = 8;
+
+/// The idle hints, shown in the empty composer and rotated (the old TUI's
+/// HINTS, crates/modron-tui/src/lib.rs:3821-3830; same words).
+pub const IDLE_HINTS: [&str; 8] = [
+    "type a task (or / for commands)\u{2026}",
+    "try /model \u{2014} switch models mid-session",
+    "try /auth \u{2014} sign in or reuse existing logins",
+    "try @file \u{2014} attach a file to the task",
+    "try !command \u{2014} run shell passthrough",
+    "try /tasks \u{2014} check background subagents",
+    "try /fork \u{2014} branch the session to explore",
+    "try ctrl+t \u{2014} expand the tool activity panel",
+];
+
+/// The spinner frame for a clock tick.
+pub fn spinner_frame(tick: u64) -> &'static str {
+    SPINNER_FRAMES[(tick % SPINNER_FRAMES.len() as u64) as usize]
+}
+
+/// The idle hint for a clock tick.
+pub fn idle_hint(tick: u64) -> &'static str {
+    IDLE_HINTS[((tick / IDLE_HINT_TICKS) % IDLE_HINTS.len() as u64) as usize]
+}
+
+/// The welcome banner's tagline (the old TUI's banner, crates/modron-tui/src/run.rs:541-575).
+pub const WELCOME_TAGLINE: &str = "a token-efficient Rust coding agent";
+
+/// The welcome banner's key hints. The app's keys: Shift+Enter adds a line
+/// and Alt+Enter queues (the old banner said alt+enter newline).
+pub const WELCOME_KEYS: &str =
+    "enter send \u{b7} shift+enter newline \u{b7} pgup/pgdn scroll \u{b7} esc interrupt";
+
+/// The welcome banner rows for a blank session: the app name and version,
+/// the tagline, and the model with the key hints. The app passes its own
+/// version.
+pub fn welcome_lines(model: &str, version: &str) -> Vec<String> {
+    vec![
+        String::new(),
+        format!("\u{2726} modron v{version}"),
+        format!("  {WELCOME_TAGLINE}"),
+        String::new(),
+        format!("  model {model}  \u{b7}  {WELCOME_KEYS}"),
+        String::new(),
+    ]
+}
+
+/// The `/theme` answer. The app ships one palette (`app/theme/oculus.json`,
+/// light and dark); the web follows the system appearance. Custom and named
+/// themes from the old TUI (crates/modron-tui/src/theme.rs) are not carried
+/// over, so the command says what exists instead of saying "unknown".
+pub const THEME_NOTE: &str =
+    "one theme: oculus, light and dark; the web follows the system appearance";
+
+/// The percentage at which the context gauge warns: the old TUI's compaction
+/// trigger (crates/modron-tui/src/lib.rs, `status_spans`: `pct >= 80`).
+pub const CONTEXT_WARNING_PCT: u64 = 80;
+
+/// The marker the gauge appends to its percentage once it reaches
+/// [`CONTEXT_WARNING_PCT`] (`ctx 85%!`), the old status line's `!`
+/// (crates/modron-tui/src/lib.rs, `status_spans`). Shown on every client's
+/// status line and `/context` note for as long as the gauge stays there.
+pub const CONTEXT_WARNING_MARK: &str = "!";
+
 /// The context meter label (`ctx 41% (74k/180k)`). Empty when the gauge
 /// is absent or its window is zero (no meaningful percentage), so the
-/// shell hides the meter.
+/// shell hides the meter. At or above the warning percentage the marker
+/// follows the percentage (`ctx 85%! (153k/180k)`).
 pub fn context_label(gauge: Option<ContextGaugeWire>) -> String {
     match gauge {
         Some(ContextGaugeWire { used, window }) if window > 0 => {
             // Rounded percentage, computed in integers.
             let pct = used.saturating_mul(100).saturating_add(window / 2) / window;
+            let mark = if pct >= CONTEXT_WARNING_PCT {
+                CONTEXT_WARNING_MARK
+            } else {
+                ""
+            };
             format!(
-                "ctx {pct}% ({}/{})",
+                "ctx {pct}%{mark} ({}/{})",
                 compact_tokens(used),
                 compact_tokens(window)
             )
@@ -2009,6 +2090,46 @@ mod tests {
         assert_eq!(snap.status_line, "m · effort xhigh · 0 tok · ask");
         assert_eq!(snap.effort_label, "xhigh");
         assert_eq!(effort_label(None), "");
+    }
+
+    #[test]
+    fn the_welcome_banner_names_the_app_the_model_and_the_keys() {
+        let lines = welcome_lines("claude-opus-5", "0.2.0");
+        assert_eq!(lines[1], "\u{2726} modron v0.2.0");
+        assert_eq!(lines[2], "  a token-efficient Rust coding agent");
+        assert!(
+            lines[4].starts_with("  model claude-opus-5  "),
+            "{}",
+            lines[4]
+        );
+        assert!(lines[4].contains("enter send") && lines[4].contains("esc interrupt"));
+    }
+
+    #[test]
+    fn running_spinner_and_rotating_idle_hints_follow_the_clock_tick() {
+        assert_eq!(RUNNING_HINT, "esc to interrupt");
+        let frames: Vec<&str> = (0..5).map(spinner_frame).collect();
+        assert_eq!(frames[0], SPINNER_FRAMES[0]);
+        assert_eq!(frames[4], frames[0], "the spinner wraps after four frames");
+        assert_ne!(frames[0], frames[1]);
+        // Each hint holds for IDLE_HINT_TICKS ticks, then the next shows.
+        assert_eq!(idle_hint(0), IDLE_HINTS[0]);
+        assert_eq!(idle_hint(IDLE_HINT_TICKS - 1), IDLE_HINTS[0]);
+        assert_eq!(idle_hint(IDLE_HINT_TICKS), IDLE_HINTS[1]);
+        let wrap = IDLE_HINT_TICKS * IDLE_HINTS.len() as u64;
+        assert_eq!(idle_hint(wrap), IDLE_HINTS[0]);
+        assert!(IDLE_HINTS.iter().all(|h| !h.is_empty()));
+    }
+
+    #[test]
+    fn context_label_warns_from_eighty_percent_with_the_old_marker() {
+        let gauge = |used| Some(ContextGaugeWire { used, window: 180 });
+        // 79.4% rounds to 79: no marker. 80% exactly: the marker follows it.
+        assert_eq!(context_label(gauge(143)), "ctx 79% (143/180)");
+        assert_eq!(context_label(gauge(144)), "ctx 80%! (144/180)");
+        assert_eq!(context_label(gauge(180)), "ctx 100%! (180/180)");
+        assert_eq!(CONTEXT_WARNING_PCT, 80);
+        assert_eq!(CONTEXT_WARNING_MARK, "!");
     }
 
     #[test]

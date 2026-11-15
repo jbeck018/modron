@@ -325,6 +325,7 @@ mod terminal {
                     return Ok(RunEvent::Exit);
                 }
                 let mut redraw = wake_rx.try_iter().count() > 0;
+                redraw |= host.tick_now();
                 match live.as_mut() {
                     Some(live) => redraw |= live.pump(&mut host),
                     None => {

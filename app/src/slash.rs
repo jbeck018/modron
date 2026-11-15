@@ -15,7 +15,7 @@
 
 use modron_mobile_core::view::{
     btw_task, learn_task, plan_task, AGENT_USAGE, BTW_USAGE, REVIEW_TASK, SLASH_NEEDS_ARG_PREFIX,
-    SLASH_UNKNOWN_LABEL,
+    SLASH_UNKNOWN_LABEL, THEME_NOTE,
 };
 use modron_mobile_core::{ApprovalModeWire, Effort, Phase, SandboxPolicy};
 use modron_view::slash::{slash_lookup, SLASH_COMMANDS};
@@ -43,6 +43,7 @@ pub const LOCAL: &[Entry] = &[
     Entry { name: "exit", usage: "/exit", about: "leave the app" },
     Entry { name: "clear", usage: "/clear", about: "clear the transcript view (nothing is sent)" },
     Entry { name: "context", usage: "/context", about: "context window, tokens and cache use" },
+    Entry { name: "theme", usage: "/theme", about: "the one built-in theme" },
 ];
 
 /// The shared table as entries, in its order.
@@ -174,6 +175,7 @@ pub fn run(line: &str) -> UiAction {
         "exit" | "quit" | "q" => UiAction::Exit,
         "clear" => UiAction::Clear,
         "context" => UiAction::Context,
+        "theme" => UiAction::Notice(THEME_NOTE.to_string()),
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,
         "tasks" => UiAction::Nav(NavStep::Open(Screen::Tasks)),
@@ -258,6 +260,13 @@ mod tests {
             run("/model claude-haiku-5-5"),
             UiAction::SelectModel("claude-haiku-5-5".into())
         );
+    }
+
+    #[test]
+    fn theme_answers_with_the_single_theme_note_and_is_not_unknown() {
+        assert_eq!(run("/theme"), UiAction::Notice(THEME_NOTE.to_string()));
+        assert_eq!(run("/theme dracula"), UiAction::Notice(THEME_NOTE.to_string()));
+        assert!(THEME_NOTE.contains("oculus") && THEME_NOTE.contains("system appearance"));
     }
 
     #[test]
