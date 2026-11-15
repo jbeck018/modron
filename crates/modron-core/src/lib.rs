@@ -23,6 +23,7 @@ pub mod hooks;
 pub mod judge;
 pub mod memory;
 pub mod permissions;
+pub mod review;
 pub mod rewind;
 pub mod sandbox;
 /// Speculative mid-stream execution subsystem (private to the crate; the
@@ -604,6 +605,28 @@ impl SteerInbox {
 /// carry it; re-exported here so every `modron_core::Phase` path keeps working.
 pub use modron_types::Phase;
 
+/// Independent reviewer configuration (H4a). `model` is a model id resolved
+/// through the run's selector provider (the escalation path); `max_rounds`
+/// bounds how many `NeedsFix` findings are fed back to the main model per
+/// run (default 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerConfig {
+    pub model: String,
+    pub max_rounds: u32,
+}
+
+impl Default for ReviewerConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            max_rounds: 1,
+        }
+    }
+}
+
+/// Injected reviewer diff source (see [`EngineConfig::review_diff_source`]).
+pub type ReviewDiffSource = dyn Fn() -> Option<String> + Send + Sync;
+
 #[derive(Clone)]
 pub struct EngineConfig {
     pub working_dir: PathBuf,
@@ -664,6 +687,16 @@ pub struct EngineConfig {
     /// success; any failure keeps the pre-escalation answer. Bound: one per
     /// run (a resume grants a fresh bound, like the gate rounds).
     pub escalate_on_check_failure: Option<String>,
+    /// Independent reviewer pass (H4a, additive, `None` = off). At normal
+    /// run completion, when a file-mutating tool ran in a Build-phase run,
+    /// one tool-less provider call on `model` reviews the `git diff`; a
+    /// `NeedsFix` verdict feeds its findings back for up to `max_rounds`
+    /// rounds. See [`ReviewerConfig`].
+    pub reviewer: Option<ReviewerConfig>,
+    /// Test seam for the reviewer's diff (H4a). `None` (default) runs
+    /// `git diff --no-color` in `working_dir`; `Some` returns the diff text
+    /// (or `None` for "no diff") without touching git.
+    pub review_diff_source: Option<Arc<ReviewDiffSource>>,
     /// OS sandbox applied to mutating tool subprocesses (Phase-1b A2,
     /// additive; default [`SandboxPolicy::Off`]).
     pub sandbox: SandboxPolicy,
@@ -762,6 +795,8 @@ impl Default for EngineConfig {
             resume_skip_ranges: Vec::new(),
             self_check_on_finish: false,
             escalate_on_check_failure: None,
+            reviewer: None,
+            review_diff_source: None,
             sandbox: SandboxPolicy::Off,
             approver: None,
             on_delta: None,
@@ -797,6 +832,8 @@ impl std::fmt::Debug for EngineConfig {
             .field("resume_skip_end", &self.resume_skip_end)
             .field("resume_skip_ranges", &self.resume_skip_ranges)
             .field("escalate_on_check_failure", &self.escalate_on_check_failure)
+            .field("reviewer", &self.reviewer)
+            .field("review_diff_source", &self.review_diff_source.is_some())
             .field("sandbox", &self.sandbox)
             .field("approver", &self.approver.is_some())
             .field("on_delta", &self.on_delta.is_some())

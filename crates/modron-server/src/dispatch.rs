@@ -205,6 +205,7 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
         Payload::Attach { session_id, .. }
         | Payload::Interrupt { session_id }
         | Payload::Steer { session_id, .. }
+        | Payload::ExplainRule { session_id, .. }
         | Payload::Enqueue { session_id, .. }
         | Payload::Dequeue { session_id, .. }
         | Payload::DecidePlan { session_id, .. } => {
@@ -740,6 +741,29 @@ pub async fn handle_frame(
                 Err(e) => send(ctx, error(request_id, e.to_string())),
             }
         }
+        Payload::ExplainRule {
+            session_id,
+            tool,
+            args,
+        } => match state.hub.handle(&session_id) {
+            // Correlated reply: the rule lines against the rules the
+            // session holds now (read-only, nothing is published).
+            Some(handle) => {
+                let text = handle.explain_rule(&tool, &args);
+                send(
+                    ctx,
+                    reply(request_id, Some(session_id), Payload::Note { text }),
+                );
+            }
+            None => send(
+                ctx,
+                error_kind(
+                    request_id,
+                    format!("no such session {session_id}"),
+                    modron_protocol::ErrorKind::NotFound,
+                ),
+            ),
+        },
         Payload::Fork { session_id } => {
             handle_fork(state, ctx, request_id, session_id).await;
         }
@@ -1628,6 +1652,7 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::PlanProposed { .. } => "plan_proposed",
         Payload::PlanDecided { .. } => "plan_decided",
         Payload::SetConfig { .. } => "set_config",
+        Payload::ExplainRule { .. } => "explain_rule",
         Payload::Fork { .. } => "fork",
         Payload::NewSession { .. } => "new_session",
         Payload::ListSessions {} => "list_sessions",
@@ -1876,6 +1901,73 @@ mod tests {
             Outbound::Live(live) => assert_eq!(live.seq, 4, "first live frame after the watermark"),
             other => panic!("expected a live frame, got {other:?}"),
         }
+    }
+
+    /// ExplainRule is answered by a correlated Note whose text is the
+    /// explain lines against the session's current rules, ending in result.
+    #[tokio::test]
+    async fn explain_rule_answers_a_correlated_note_with_the_verdict() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("rules").await.unwrap().id;
+        let handle = state.hub.ensure_session(id, None);
+        handle
+            .apply_config(&ConfigPatch {
+                rules: Some(vec![modron_protocol::RuleWire {
+                    effect: "deny".into(),
+                    spec: "bash(rm -rf*)".into(),
+                }]),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                7,
+                Payload::ExplainRule {
+                    session_id: id,
+                    tool: "bash".into(),
+                    args: serde_json::json!({"command": "rm -rf x"}),
+                },
+            ),
+        )
+        .await;
+        match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => {
+                assert_eq!(frame.id, Some(7), "correlated to the request");
+                match frame.payload {
+                    Payload::Note { text } => assert_eq!(
+                        text.lines().collect::<Vec<_>>(),
+                        vec!["deny bash(rm -rf*): matched", "result: deny"]
+                    ),
+                    other => panic!("expected a note, got {other:?}"),
+                }
+            }
+            other => panic!("expected a reply, got {other:?}"),
+        }
+
+        // An unknown session is NotFound, not a note.
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                8,
+                Payload::ExplainRule {
+                    session_id: uuid::Uuid::new_v4(),
+                    tool: "bash".into(),
+                    args: serde_json::Value::Null,
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(
+            next_outbound(&mut rx).await,
+            Outbound::Reply(ref f) if matches!(f.payload, Payload::Error { .. })
+        ));
     }
 
     /// A run that finishes successfully when the test sends on `done`.

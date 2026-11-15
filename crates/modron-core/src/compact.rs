@@ -171,6 +171,7 @@ fn render_events<'a>(
             // the file state they protect is reflected in tool results.
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
+            | SessionEvent::Review { .. }
             | SessionEvent::Usage { .. } => {}
         }
     }

@@ -110,6 +110,13 @@ pub fn entry_lines(entry: &TranscriptEntry) -> Vec<String> {
         } => vec![format!("compacted {summarized_events} events: {summary}")],
         TranscriptEntry::GenerativeUi { ui } => modron_view::render_ascii(ui),
         TranscriptEntry::Plan { items } => modron_view::plan_lines(items),
+        // Reviewer verdict: the shared one-line summary, then the shared
+        // finding rows (same words as every client).
+        TranscriptEntry::Review {
+            summary, findings, ..
+        } => std::iter::once(summary.clone())
+            .chain(findings.iter().map(|f| format!("  {f}")))
+            .collect(),
         // Generative widgets render as ASCII on text surfaces (same
         // projection the TUI uses).
     }

@@ -4,11 +4,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
     ApprovalMode, ApprovalPolicy, Engine, EngineConfig, SandboxPolicy, SessionEvent, SessionId,
     SessionStore, StreamDelta, ToolActivity, ToolCall, Usage,
 };
-use modron_protocol::{ApprovalModeWire, ConfigPatch, Decision, Frame, Payload, WireDelta};
+use modron_protocol::{
+    ApprovalModeWire, ConfigPatch, Decision, Frame, Payload, RuleWire, WireDelta,
+};
 use modron_server::{BroadcastingStore, SessionHub};
 use tokio::sync::broadcast;
 
@@ -687,4 +690,166 @@ async fn accepted_config_patch_moves_config_and_labels_together() {
     assert_eq!(live.model, "other-model");
     assert_eq!(live.goal, "ship it");
     assert_eq!(handle.engine_cell().config.default_model, "other-model");
+}
+
+fn rule_wire(effect: &str, spec: &str) -> RuleWire {
+    RuleWire {
+        effect: effect.into(),
+        spec: spec.into(),
+    }
+}
+
+/// The CLI's `[permissions]` reach a new session through the hub template:
+/// the session's engine config carries the rules and live state reports
+/// them as wire rules.
+#[tokio::test]
+async fn template_rules_reach_a_new_session() {
+    let hub = SessionHub::empty();
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::new());
+    let rules = RuleSet::new(vec![Rule::parse(RuleEffect::Deny, "bash(rm -rf*)").unwrap()]);
+    hub.set_engine(Engine {
+        selector: Arc::new(modron_core::testing::StaticSelector::new(
+            "mock-model",
+            "mock",
+        )),
+        providers: Default::default(),
+        tools: Arc::new(modron_core::ToolRegistry::new()),
+        store,
+        config: EngineConfig {
+            approvals: ApprovalPolicy {
+                rules,
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        },
+    });
+    let id = uuid::Uuid::new_v4();
+    let handle = hub.ensure_session(id, None);
+    assert_eq!(
+        handle.live_state().rules,
+        vec![rule_wire("deny", "bash(rm -rf*)")]
+    );
+    assert!(handle
+        .engine_cell()
+        .config
+        .approvals
+        .rules
+        .evaluate("bash", &serde_json::json!({"command": "rm -rf x"}))
+        .is_some());
+}
+
+/// A valid rules patch replaces the whole set for future runs and shows in
+/// live state; an empty list clears it.
+#[tokio::test]
+async fn rules_patch_replaces_the_set_and_shows_in_live_state() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    assert!(handle.live_state().rules.is_empty());
+
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![
+                rule_wire("deny", "bash(rm -rf*)"),
+                rule_wire("ask", "bash(git push*)"),
+                rule_wire("allow", "read(src/**)"),
+            ]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    assert_eq!(
+        handle.live_state().rules,
+        vec![
+            rule_wire("deny", "bash(rm -rf*)"),
+            rule_wire("ask", "bash(git push*)"),
+            rule_wire("allow", "read(src/**)"),
+        ]
+    );
+
+    // A second patch replaces the whole set, it does not merge.
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![rule_wire("allow", "read")]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    assert_eq!(handle.live_state().rules, vec![rule_wire("allow", "read")]);
+
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(Vec::new()),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    assert!(handle.live_state().rules.is_empty());
+}
+
+/// One invalid rule rejects the whole patch: the error names that rule, and
+/// the rules, the model and everything else in the patch stay as they were.
+#[tokio::test]
+async fn invalid_rule_rejects_the_whole_patch_and_changes_nothing() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![rule_wire("deny", "bash(rm -rf*)")]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let before = handle.live_state();
+
+    let err = handle
+        .apply_config(&ConfigPatch {
+            model: Some("other-model".into()),
+            rules: Some(vec![rule_wire("allow", "read"), rule_wire("deny", "bash(")]),
+            ..ConfigPatch::default()
+        })
+        .expect_err("a bad rule rejects the patch");
+    assert!(
+        err.to_string().contains("bash("),
+        "error names the rule: {err}"
+    );
+
+    let after = handle.live_state();
+    assert_eq!(after.rules, before.rules);
+    assert_eq!(after.model, before.model);
+    assert_ne!(handle.engine_cell().config.default_model, "other-model");
+
+    let bad_effect = handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![rule_wire("maybe", "read")]),
+            ..ConfigPatch::default()
+        })
+        .expect_err("an unknown effect is rejected");
+    assert!(bad_effect.to_string().contains("maybe"));
+}
+
+/// ExplainRule's text: one line per rule, then `result:` with the verdict
+/// the engine would reach. Deny beats the allow-all rule.
+#[tokio::test]
+async fn explain_rule_lists_each_rule_and_ends_with_the_result() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![
+                rule_wire("allow", "bash"),
+                rule_wire("deny", "bash(rm -rf*)"),
+            ]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+
+    let text = handle.explain_rule("bash", &serde_json::json!({"command": "rm -rf /"}));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "allow bash: matched",
+            "deny bash(rm -rf*): matched",
+            "result: deny",
+        ]
+    );
+
+    let none = handle.explain_rule("read", &serde_json::json!({"path": "a"}));
+    assert!(none.lines().last() == Some("result: no rule"), "{none}");
 }

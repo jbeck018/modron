@@ -410,6 +410,46 @@ pub enum TranscriptEntry {
     /// an assistant answer (table, chart, form). The GUI renders native
     /// widgets; the TUI renders the ASCII projection.
     GenerativeUi { ui: crate::gen_ui::GenUi },
+    /// An independent reviewer verdict (H4a). `summary` is the one-line
+    /// verdict ([`review_summary`]); `findings` are the expandable rows
+    /// ([`finding_line`]).
+    Review {
+        verdict: modron_types::ReviewVerdict,
+        summary: String,
+        findings: Vec<String>,
+    },
+}
+
+/// The one-line reviewer verdict shared by every client: `review: pass`,
+/// `review: skipped`, or `review: needs fix - N findings` (`1 finding`
+/// singular).
+pub fn review_summary(verdict: modron_types::ReviewVerdict, finding_count: usize) -> String {
+    use modron_types::ReviewVerdict;
+    match verdict {
+        ReviewVerdict::Pass => "review: pass".to_string(),
+        ReviewVerdict::Skipped => "review: skipped".to_string(),
+        ReviewVerdict::NeedsFix => {
+            let noun = if finding_count == 1 {
+                "finding"
+            } else {
+                "findings"
+            };
+            format!("review: needs fix - {finding_count} {noun}")
+        }
+    }
+}
+
+/// One reviewer finding row: `p1 path:line - text`. The `path:line` part is
+/// omitted when absent (`p1 - text`); the line alone is never shown without
+/// its path.
+pub fn finding_line(finding: &modron_types::Finding) -> String {
+    let code = finding.severity.code().to_ascii_lowercase();
+    let location = match (&finding.path, finding.line) {
+        (Some(path), Some(line)) => format!("{path}:{line} - "),
+        (Some(path), None) => format!("{path} - "),
+        (None, _) => "- ".to_string(),
+    };
+    format!("{code} {location}{}", finding.text)
 }
 
 /// Rebuild the display transcript from a session's persisted event log —
@@ -539,6 +579,16 @@ impl ReplayFolder {
                 self.entries.push(TranscriptEntry::Compaction {
                     summary: summary.clone(),
                     summarized_events: *summarized_events,
+                });
+            }
+            SessionEvent::Review {
+                verdict, findings, ..
+            } => {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Review {
+                    verdict: *verdict,
+                    summary: review_summary(*verdict, findings.len()),
+                    findings: findings.iter().map(finding_line).collect(),
                 });
             }
             SessionEvent::TurnTrace { .. } | SessionEvent::Checkpoint { .. } => {}
@@ -821,6 +871,7 @@ mod tests {
                 TranscriptEntry::Compaction { .. } => "compaction",
                 TranscriptEntry::GenerativeUi { .. } => "gen_ui",
                 TranscriptEntry::Plan { .. } => "plan",
+                TranscriptEntry::Review { .. } => "review",
             })
             .collect();
         assert_eq!(
@@ -935,5 +986,120 @@ mod tests {
         assert_eq!(sandbox_label(SandboxPolicy::Off), "off");
         assert_eq!(sandbox_label(SandboxPolicy::Seatbelt), "seatbelt");
         assert_eq!(sandbox_label(SandboxPolicy::Bubblewrap), "bwrap");
+    }
+
+    fn finding(
+        severity: modron_types::Severity,
+        path: Option<&str>,
+        line: Option<u32>,
+        text: &str,
+    ) -> modron_types::Finding {
+        modron_types::Finding {
+            severity,
+            path: path.map(String::from),
+            line,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn review_summary_has_three_shapes() {
+        use modron_types::ReviewVerdict;
+        assert_eq!(review_summary(ReviewVerdict::Pass, 0), "review: pass");
+        assert_eq!(review_summary(ReviewVerdict::Skipped, 0), "review: skipped");
+        assert_eq!(
+            review_summary(ReviewVerdict::NeedsFix, 1),
+            "review: needs fix - 1 finding"
+        );
+        assert_eq!(
+            review_summary(ReviewVerdict::NeedsFix, 3),
+            "review: needs fix - 3 findings"
+        );
+    }
+
+    #[test]
+    fn finding_line_omits_absent_location() {
+        use modron_types::Severity;
+        assert_eq!(
+            finding_line(&finding(
+                Severity::P1,
+                Some("src/a.rs"),
+                Some(7),
+                "off by one"
+            )),
+            "p1 src/a.rs:7 - off by one"
+        );
+        assert_eq!(
+            finding_line(&finding(Severity::P2, Some("src/a.rs"), None, "no line")),
+            "p2 src/a.rs - no line"
+        );
+        assert_eq!(
+            finding_line(&finding(Severity::P0, None, None, "general concern")),
+            "p0 - general concern"
+        );
+    }
+
+    #[test]
+    fn replay_folds_review_events_in_log_order() {
+        use modron_types::{ReviewVerdict, Severity};
+        let events = vec![
+            SessionEvent::Message {
+                parent_id: None,
+                message: Message::assistant("done"),
+            },
+            SessionEvent::Review {
+                verdict: ReviewVerdict::NeedsFix,
+                findings: vec![finding(Severity::P1, Some("a.rs"), Some(2), "bad")],
+                model: "rev".into(),
+            },
+            SessionEvent::Review {
+                verdict: ReviewVerdict::Pass,
+                findings: Vec::new(),
+                model: "rev".into(),
+            },
+            SessionEvent::Review {
+                verdict: ReviewVerdict::Skipped,
+                findings: Vec::new(),
+                model: "rev".into(),
+            },
+        ];
+        let entries = replay(&events);
+        let reviews: Vec<(&str, &str, Vec<String>)> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Review {
+                    verdict,
+                    summary,
+                    findings,
+                } => Some((
+                    match verdict {
+                        ReviewVerdict::Pass => "pass",
+                        ReviewVerdict::NeedsFix => "needs_fix",
+                        ReviewVerdict::Skipped => "skipped",
+                    },
+                    summary.as_str(),
+                    findings.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reviews,
+            vec![
+                (
+                    "needs_fix",
+                    "review: needs fix - 1 finding",
+                    vec!["p1 a.rs:2 - bad".to_string()]
+                ),
+                ("pass", "review: pass", Vec::new()),
+                ("skipped", "review: skipped", Vec::new()),
+            ]
+        );
+        assert!(matches!(entries[0], TranscriptEntry::Assistant { .. }));
+        assert_eq!(
+            entries.len(),
+            4,
+            "one row per Review event after the message"
+        );
     }
 }

@@ -326,6 +326,58 @@ pub enum SessionEvent {
         #[serde(default)]
         uncaptured: bool,
     },
+    /// Independent reviewer verdict (H4a), appended once per reviewer round
+    /// at normal run completion. `Skipped` records that no review ran
+    /// (no diff, provider error, unparsable output). Additive variant: older
+    /// logs without it load unchanged.
+    Review {
+        verdict: ReviewVerdict,
+        #[serde(default)]
+        findings: Vec<Finding>,
+        model: String,
+    },
+}
+
+/// The reviewer's verdict for one review round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    Pass,
+    NeedsFix,
+    Skipped,
+}
+
+/// Reviewer finding severity (P0 = most severe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+impl Severity {
+    /// Upper-case wire label (`P0`..`P3`) for model-facing text.
+    pub fn code(self) -> &'static str {
+        match self {
+            Severity::P0 => "P0",
+            Severity::P1 => "P1",
+            Severity::P2 => "P2",
+            Severity::P3 => "P3",
+        }
+    }
+}
+
+/// One reviewer finding: a real defect the diff introduces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub severity: Severity,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    pub text: String,
 }
 
 /// One measurable subtask of the standing plan.

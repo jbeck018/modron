@@ -22,7 +22,8 @@ pub enum RuleEffect {
 }
 
 impl RuleEffect {
-    fn as_str(self) -> &'static str {
+    /// The effect word: `allow`, `ask` or `deny`.
+    pub fn as_str(self) -> &'static str {
         match self {
             RuleEffect::Allow => "allow",
             RuleEffect::Ask => "ask",
@@ -83,9 +84,15 @@ impl Rule {
 
     /// The rule as text, e.g. `deny bash(rm -rf*)` or `allow read`.
     pub fn text(&self) -> String {
+        format!("{} {}", self.effect.as_str(), self.spec())
+    }
+
+    /// The rule without its effect word, e.g. `bash(rm -rf*)` or `read`.
+    /// Parsing this back with the same effect yields an equal rule.
+    pub fn spec(&self) -> String {
         match &self.pattern {
-            None => format!("{} {}", self.effect.as_str(), self.tool),
-            Some(p) => format!("{} {}({})", self.effect.as_str(), self.tool, p),
+            None => self.tool.clone(),
+            Some(p) => format!("{}({})", self.tool, p),
         }
     }
 }
@@ -122,6 +129,16 @@ pub struct Verdict {
 impl RuleSet {
     pub fn new(rules: Vec<Rule>) -> Self {
         Self { rules }
+    }
+
+    /// The rules in evaluation order (the order `explain` reports them).
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// True when the set holds no rules (every call gets no verdict).
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
     }
 
     pub fn evaluate(&self, tool: &str, args: &Value) -> Option<Verdict> {

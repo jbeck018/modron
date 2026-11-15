@@ -2312,6 +2312,21 @@ impl App {
                         }
                     }
                 }
+                TranscriptEntry::Review {
+                    summary, findings, ..
+                } => {
+                    // The shared verdict line and finding rows, verbatim.
+                    let plain = Style::default();
+                    let rows = std::iter::once(summary.clone())
+                        .chain(findings.iter().map(|f| format!("  {f}")));
+                    for line in rows {
+                        for row in wrap_line(&Line::from(line).style(plain), self.hist_wrap_width())
+                        {
+                            self.history.push(row);
+                        }
+                    }
+                    self.history.push(Line::from(""));
+                }
                 TranscriptEntry::Plan { items } => {
                     let dim = Style::default().fg(t.tool);
                     for row in wrap_line(&Line::from("plan").style(dim), self.hist_wrap_width()) {

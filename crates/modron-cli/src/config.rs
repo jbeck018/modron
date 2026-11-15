@@ -34,6 +34,14 @@ pub struct Config {
     /// answer replaces the run answer on success. Unset = never escalate.
     #[serde(default)]
     pub escalate_on_check_failure: Option<String>,
+    /// Reviewer model id (engine `reviewer`): when set, a run that changed
+    /// files ends with an independent review of the diff on this model.
+    /// `None` (default) = no review pass.
+    #[serde(default)]
+    pub review_model: Option<String>,
+    /// Fix rounds the reviewer may request per run (default 1).
+    #[serde(default)]
+    pub review_max_rounds: Option<u32>,
     /// Lifecycle hooks around tool calls (Phase-1c I4): `pre_tool` may veto
     /// (non-zero exit blocks the tool), `post_tool` observes. Shell commands
     /// receiving the `MODRON_TOOL_*` env contract.

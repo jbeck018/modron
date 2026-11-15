@@ -12,6 +12,7 @@ use crate::compact;
 use crate::context;
 use crate::hooks;
 use crate::permissions::{RuleEffect, RuleSet, Verdict};
+use crate::review;
 use crate::speculative;
 use crate::{
     estimate_tokens, judge, ActionKind, ApprovalMode, Engine, Error, JudgeMode, Message,
@@ -19,6 +20,7 @@ use crate::{
     SessionId, StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome, ToolSpec,
     TurnRequest, TurnResponse, Usage,
 };
+use modron_types::ReviewVerdict;
 use std::sync::Arc;
 
 /// Output-token ask sent with every provider turn (`EngineConfig` has no
@@ -259,6 +261,66 @@ fn rewind_view<'a>(
     }
 }
 
+/// Reviewer diff cap (H4a): stdout beyond this many bytes is cut and a
+/// truncation marker is appended before the diff reaches the reviewer.
+const REVIEW_DIFF_MAX_BYTES: usize = 60 * 1024;
+
+/// Wall-clock bound on the `git diff` call that feeds the reviewer (H4a).
+const REVIEW_DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Cap a diff at [`REVIEW_DIFF_MAX_BYTES`] on a char boundary, with a marker.
+fn truncate_review_diff(mut text: String) -> String {
+    if text.len() <= REVIEW_DIFF_MAX_BYTES {
+        return text;
+    }
+    let mut end = REVIEW_DIFF_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n[diff truncated at 60 KB]");
+    text
+}
+
+/// `git diff --no-color` in `dir` (H4a). `None` when git cannot run, the
+/// directory is not a repository (non-zero exit) or the call times out.
+/// Stdout is read incrementally so a huge diff is never buffered whole.
+async fn git_diff_text(dir: &std::path::Path) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let read = async {
+        let mut child = tokio::process::Command::new("git")
+            .args(["diff", "--no-color"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let mut buf = Vec::new();
+        stdout
+            .take(REVIEW_DIFF_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut buf)
+            .await
+            .ok()?;
+        if buf.len() > REVIEW_DIFF_MAX_BYTES {
+            // Over the cap: stop the producer; the truncation happens below.
+            let _ = child.kill().await;
+        } else {
+            let status = child.wait().await.ok()?;
+            if !status.success() {
+                return None;
+            }
+        }
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    };
+    let text = tokio::time::timeout(REVIEW_DIFF_TIMEOUT, read)
+        .await
+        .ok()??;
+    Some(truncate_review_diff(text))
+}
+
 /// Finish-gate bound: verification feedback rounds before the run may end
 /// without passing verification (StaminaBench: gains plateau after 3-5
 /// retries; 2 keeps the worst case tight).
@@ -356,6 +418,12 @@ struct RunLoopState {
     /// Whether the most recent dispatch turn ENDED with a passing
     /// `verify` call — the model's own evidence satisfies the gate.
     last_dispatch_ended_with_passing_verify: bool,
+    /// Whether a file-mutating tool actually ran this run. Unlike
+    /// `mutated_this_run` (the finish gate's pending-verification flag) it
+    /// is never cleared: the reviewer pass keys off it.
+    ran_file_mutation: bool,
+    /// Reviewer feedback rounds spent this run (NeedsFix findings fed back).
+    review_feedback_rounds: u32,
     /// Why the loop ended (`end_turn` / `max_turns` / `spend_cap` /
     /// `budget_exhausted`) — the terminal TurnTrace's failure label.
     stop_label: &'static str,
@@ -384,6 +452,8 @@ impl RunLoopState {
             self_check_turn_pending: false,
             run_tier_override: None,
             last_dispatch_ended_with_passing_verify: false,
+            ran_file_mutation: false,
+            review_feedback_rounds: 0,
             stop_label: "end_turn",
             current_plan: None,
         }
@@ -684,6 +754,13 @@ impl Engine {
                     // drains it and the model answers). Checked before the
                     // escalation so the escalation's one-shot bound holds.
                     if self.steer_pending() {
+                        continue;
+                    }
+                    // Independent reviewer (H4a, opt-in): one tool-less
+                    // review of the diff at normal completion. NeedsFix
+                    // findings feed back and the loop continues; the
+                    // escalation below always exits, so it stays one-shot.
+                    if self.review_round(session_id, task, &mut state).await? {
                         continue;
                     }
                     // Escalation (ONE per run): the gate just exhausted its
@@ -1204,6 +1281,7 @@ impl Engine {
             .any(|(c, (_, ran))| *ran && FILE_MUTATING_TOOLS.contains(&c.name.as_str()))
         {
             state.mutated_this_run = true;
+            state.ran_file_mutation = true;
         }
         let outcomes: Vec<ToolOutcome> =
             dispatched.into_iter().map(|(outcome, _)| outcome).collect();
@@ -1965,6 +2043,192 @@ impl Engine {
         Ok(true)
     }
 
+    /// Independent reviewer pass (H4a) at normal run completion. Returns
+    /// `true` when NeedsFix findings were queued as a user message and the
+    /// loop must continue; `false` ends the run normally. A reviewer error
+    /// never fails the run: every such path records `Skipped`.
+    async fn review_round(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        state: &mut RunLoopState,
+    ) -> Result<bool> {
+        let Some(reviewer) = self.config.reviewer.clone() else {
+            return Ok(false);
+        };
+        // Build phase only, and only after a file-mutating tool actually ran.
+        if self.config.phase != Phase::Build || !state.ran_file_mutation {
+            return Ok(false);
+        }
+        // The finish gate gave up with verification still failing: the
+        // escalation owns that outcome, the reviewer does not run.
+        if state.mutated_this_run && state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            return Ok(false);
+        }
+        // Abnormal stops never get a review: budget, spend cap, and no
+        // turn headroom left to service a feedback round.
+        if state.governor.exceeded()
+            || state.turns >= self.config.max_turns
+            || self
+                .config
+                .max_cost_usd
+                .is_some_and(|cap| state.spend_usd > cap)
+        {
+            return Ok(false);
+        }
+
+        let model = reviewer.model.clone();
+        let Some(diff) = self.collect_review_diff().await else {
+            self.record_review(session_id, ReviewVerdict::Skipped, Vec::new(), &model)
+                .await?;
+            return Ok(false);
+        };
+
+        // Provider resolution mirrors the escalation turn: the selector's
+        // provider with the reviewer model swapped in; a model that does not
+        // resolve to itself is not silently run elsewhere (Skipped).
+        let prompt = review::build_review_prompt(task, &diff);
+        let context_tokens = estimate_tokens(review::REVIEWER_SYSTEM) + estimate_tokens(&prompt);
+        let mut choice = self.selector.select(&SelectRequest {
+            task: task.to_string(),
+            action: ActionKind::Chat,
+            context_tokens,
+            budget_remaining_usd: self
+                .config
+                .max_cost_usd
+                .map(|cap| (cap - state.spend_usd).max(0.0)),
+        });
+        choice.model = model.clone();
+        choice.reason = format!("review: independent reviewer → {model}");
+        choice.confident = true;
+        let (provider, _) = match self.resolve_provider(&choice) {
+            Ok(resolved) if resolved.1 == model => resolved,
+            _ => {
+                tracing::warn!(model = %model, "reviewer model did not resolve; review skipped");
+                self.record_review(session_id, ReviewVerdict::Skipped, Vec::new(), &model)
+                    .await?;
+                return Ok(false);
+            }
+        };
+
+        // ONE tool-less call. Its usage is counted like any other turn.
+        let request = Arc::new(TurnRequest {
+            model: model.clone(),
+            system: review::REVIEWER_SYSTEM.to_string(),
+            messages: vec![Message::user(prompt)],
+            tools: Vec::new(),
+            max_tokens: MAX_OUTPUT_TOKENS,
+        });
+        tracing::info!(provider = provider.id(), model = %model, "review turn: independent reviewer");
+        let turn_started = std::time::Instant::now();
+        let response = match provider.turn(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(error = %err, "review turn failed; review skipped");
+                self.record_review(session_id, ReviewVerdict::Skipped, Vec::new(), &model)
+                    .await?;
+                return Ok(false);
+            }
+        };
+
+        state.turns += 1;
+        state.governor.feed_turn(response.usage);
+        add_usage(&mut state.total, &response.usage);
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Usage {
+                    model: model.clone(),
+                    usage: response.usage,
+                },
+            )
+            .await?;
+        if !state.models_used.contains(&model) {
+            state.models_used.push(model.clone());
+        }
+        let turn_cost = self.turn_cost_usd(&model, &response.usage);
+        state.spend_usd += turn_cost;
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::TurnTrace {
+                    turn: state.turns,
+                    harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                    provider: provider.id().to_string(),
+                    model: model.clone(),
+                    prompt_hash: None,
+                    latency_ms: Some(turn_started.elapsed().as_millis() as u64),
+                    cost_usd: Some(turn_cost),
+                    usage: Some(response.usage),
+                    verifier: None,
+                    failure_label: None,
+                },
+            )
+            .await?;
+
+        let (verdict, findings) = review::parse_review(&response.text);
+        self.record_review(session_id, verdict, findings.clone(), &model)
+            .await?;
+
+        // Feedback only while the round bound, the turn headroom and the
+        // budgets all leave the loop able to service the fix.
+        let can_feed_back = verdict == ReviewVerdict::NeedsFix
+            && state.review_feedback_rounds < reviewer.max_rounds
+            && state.turns < self.config.max_turns
+            && !state.governor.exceeded()
+            && !self
+                .config
+                .max_cost_usd
+                .is_some_and(|cap| state.spend_usd > cap);
+        if !can_feed_back {
+            return Ok(false);
+        }
+        state.review_feedback_rounds += 1;
+        // Persisted as a user message, like the finish gate's feedback.
+        let feedback = Message::user(review::feedback_message(&findings));
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: feedback.clone(),
+                },
+            )
+            .await?;
+        state.transcript.push(feedback);
+        Ok(true)
+    }
+
+    /// Append one `Review` event (H4a).
+    async fn record_review(
+        &self,
+        session_id: SessionId,
+        verdict: ReviewVerdict,
+        findings: Vec<modron_types::Finding>,
+        model: &str,
+    ) -> Result<()> {
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Review {
+                    verdict,
+                    findings,
+                    model: model.to_string(),
+                },
+            )
+            .await
+    }
+
+    /// The diff the reviewer sees: the injected source when configured,
+    /// else `git diff --no-color` in the working dir. Empty means no review.
+    async fn collect_review_diff(&self) -> Option<String> {
+        let diff = match &self.config.review_diff_source {
+            Some(source) => (source.as_ref())().map(truncate_review_diff),
+            None => git_diff_text(&self.config.working_dir).await,
+        }?;
+        (!diff.trim().is_empty()).then_some(diff)
+    }
+
     /// ONE best-effort escalation turn after the finish gate exhausted its
     /// feedback rounds (`escalate_on_check_failure` set): the configured
     /// model re-checks every concrete requirement and its answer REPLACES
@@ -2472,6 +2736,9 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
             }
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
+            // A review verdict is not conversation content: its feedback
+            // is persisted as its own `Message` event.
+            | SessionEvent::Review { .. }
             | SessionEvent::Usage { .. } => {}
             // The plan is not a conversation message: `run_loop` re-injects
             // the current plan as a transient tail on every turn (H2a), so
@@ -4459,5 +4726,299 @@ mod tests {
         assert!(messages
             .iter()
             .all(|m| !m.content.contains("standing plan")));
+    }
+}
+
+#[cfg(test)]
+mod review_pass_tests {
+    //! Reviewer pass (H4a) against the scripted mock provider. The diff is
+    //! injected through `EngineConfig::review_diff_source`, so no git repo
+    //! is needed. The mock serves main turns and reviewer calls alike.
+    use super::*;
+    use crate::review::REVIEWER_SYSTEM;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalMode, ApprovalPolicy, EngineConfig, ReviewDiffSource, ReviewerConfig, SessionStore,
+        Tool, ToolRegistry,
+    };
+    use async_trait::async_trait;
+    use modron_types::{Finding, ReviewVerdict, Severity};
+    use std::collections::HashMap;
+
+    /// A file-mutating tool that always succeeds (no verify tool registered,
+    /// so the finish gate stays out of the way).
+    struct ReviewWriteTool;
+
+    #[async_trait]
+    impl Tool for ReviewWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "test write".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::ok("wrote"))
+        }
+    }
+
+    struct Harness {
+        engine: Engine,
+        mock: Arc<MockProvider>,
+        store: Arc<InMemoryStore>,
+    }
+
+    fn reviewer(max_rounds: u32) -> Option<ReviewerConfig> {
+        Some(ReviewerConfig {
+            model: "rev-model".into(),
+            max_rounds,
+        })
+    }
+
+    fn harness(
+        script: Vec<TurnResponse>,
+        reviewer: Option<ReviewerConfig>,
+        diff: Option<&str>,
+    ) -> Harness {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReviewWriteTool));
+        let mock = Arc::new(MockProvider::with_script(script));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let store = Arc::new(InMemoryStore::default());
+        let diff = diff.map(String::from);
+        let source = Arc::new(move || diff.clone()) as Arc<ReviewDiffSource>;
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                ..ApprovalPolicy::default()
+            },
+            reviewer,
+            review_diff_source: Some(source),
+            ..EngineConfig::default()
+        };
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::clone(&store) as Arc<dyn SessionStore>,
+            config,
+        };
+        Harness {
+            engine,
+            mock,
+            store,
+        }
+    }
+
+    fn write_call() -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    fn reply(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    fn reply_with_usage(text: &str, usage: Usage) -> TurnResponse {
+        TurnResponse {
+            usage,
+            ..reply(text)
+        }
+    }
+
+    async fn reviews(
+        h: &Harness,
+        session: SessionId,
+    ) -> Vec<(ReviewVerdict, Vec<Finding>, String)> {
+        h.store
+            .load(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Review {
+                    verdict,
+                    findings,
+                    model,
+                } => Some((verdict, findings, model)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\n+let x = 1;\n";
+
+    #[tokio::test]
+    async fn pass_verdict_is_recorded_and_the_run_ends() {
+        let h = harness(
+            vec![
+                write_call(),
+                reply("done"),
+                reply("VERDICT: PASS\nP3 src/a.rs:1 - naming nit"),
+            ],
+            reviewer(1),
+            Some(DIFF),
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "done", "a pass leaves the answer alone");
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, ReviewVerdict::Pass);
+        assert_eq!(found[0].2, "rev-model");
+        assert_eq!(found[0].1.len(), 1, "findings on a pass are kept as notes");
+        assert_eq!(found[0].1[0].severity, Severity::P3);
+        assert_eq!(h.mock.requests().len(), 3, "main, main, one reviewer call");
+    }
+
+    #[tokio::test]
+    async fn reviewer_call_is_tool_less_with_the_review_prompt() {
+        let h = harness(
+            vec![write_call(), reply("done"), reply("VERDICT: PASS")],
+            reviewer(1),
+            Some(DIFF),
+        );
+        h.engine.run_task("add x").await.unwrap();
+        let requests = h.mock.requests();
+        let review_request = requests.last().unwrap();
+        assert_eq!(review_request.model, "rev-model");
+        assert_eq!(review_request.system, REVIEWER_SYSTEM);
+        assert!(
+            review_request.tools.is_empty(),
+            "the reviewer gets no tools"
+        );
+        assert_eq!(review_request.messages.len(), 1);
+        let prompt = &review_request.messages[0].content;
+        assert!(prompt.contains("add x") && prompt.contains("+let x = 1;"));
+    }
+
+    #[tokio::test]
+    async fn needs_fix_feeds_back_then_is_bounded_by_max_rounds() {
+        // write -> answer -> review NEEDS_FIX -> feedback -> fixed answer ->
+        // review NEEDS_FIX again: max_rounds = 1 spent, so the run ends with
+        // the second verdict recorded and no third review.
+        let h = harness(
+            vec![
+                write_call(),
+                reply("first answer"),
+                reply("VERDICT: NEEDS_FIX\nP1 src/a.rs:4 - off by one in the bound"),
+                reply("fixed answer"),
+                reply("VERDICT: NEEDS_FIX\nP2 src/a.rs:9 - still wrong"),
+            ],
+            reviewer(1),
+            Some(DIFF),
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "fixed answer");
+
+        let requests = h.mock.requests();
+        assert_eq!(
+            requests.len(),
+            5,
+            "main, main, review, main after feedback, review"
+        );
+        let next_turn = &requests[3];
+        assert!(
+            next_turn
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.contains("P1 src/a.rs:4 - off by one")),
+            "the findings reach the next main TurnRequest"
+        );
+
+        let found = reviews(&h, summary.session_id).await;
+        let verdicts: Vec<ReviewVerdict> = found.iter().map(|r| r.0).collect();
+        assert_eq!(
+            verdicts,
+            vec![ReviewVerdict::NeedsFix, ReviewVerdict::NeedsFix]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_file_mutation_means_no_review() {
+        let h = harness(vec![reply("just an answer")], reviewer(1), Some(DIFF));
+        let summary = h.engine.run_task("explain").await.unwrap();
+        assert_eq!(summary.answer, "just an answer");
+        assert_eq!(h.mock.requests().len(), 1, "no reviewer call");
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviewer_not_configured_means_no_review() {
+        let h = harness(vec![write_call(), reply("done")], None, Some(DIFF));
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(h.mock.requests().len(), 2);
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_diff_records_skipped_without_a_provider_call() {
+        let h = harness(vec![write_call(), reply("done")], reviewer(1), None);
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "done");
+        assert_eq!(
+            h.mock.requests().len(),
+            2,
+            "no reviewer call without a diff"
+        );
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, ReviewVerdict::Skipped);
+        assert!(found[0].1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviewer_provider_error_is_skipped_and_the_run_succeeds() {
+        // The script ends after the main answer: the reviewer call errors.
+        let h = harness(vec![write_call(), reply("done")], reviewer(1), Some(DIFF));
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "done", "the run still succeeds");
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, ReviewVerdict::Skipped);
+    }
+
+    #[tokio::test]
+    async fn reviewer_usage_is_counted_in_the_run_total() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+        };
+        let h = harness(
+            vec![
+                write_call(),
+                reply("done"),
+                reply_with_usage("VERDICT: PASS", usage),
+            ],
+            reviewer(1),
+            Some(DIFF),
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(
+            summary.usage.input_tokens, 100,
+            "review input is in the total"
+        );
+        assert_eq!(summary.usage.output_tokens, 10);
+        let events = h.store.load(summary.session_id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Usage { model, usage: u } if model == "rev-model" && u.input_tokens == 100
+        )));
+        assert!(summary.models_used.contains(&"rev-model".to_string()));
     }
 }

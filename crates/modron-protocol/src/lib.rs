@@ -169,6 +169,19 @@ pub enum Payload {
     },
     /// Mutate session/engine config for future turns.
     SetConfig { patch: ConfigPatch },
+    /// Ask which permission rules decide a hypothetical tool call in this
+    /// session (the rules as the session holds them now). `args` are the
+    /// call's JSON arguments, e.g. `{"command": "rm -rf x"}`. Answered by a
+    /// correlated `note` whose text is one line per rule (`matched` or `no
+    /// match (reason)`) and a final `result: allow|ask|deny|no rule` line.
+    /// UI effect: shows the note (the explain view / scrollback note); it
+    /// changes nothing. Scoped like `steer`.
+    ExplainRule {
+        session_id: Uuid,
+        tool: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
     /// Fork a session: copy its log under a fresh id (engine `fork`).
     Fork { session_id: Uuid },
     /// Create an empty session without submitting a task.
@@ -281,7 +294,8 @@ pub enum Payload {
     QueueChanged { queued: Vec<String> },
     /// Config mutated (echo of the applied patch).
     /// UI effect: a `phase` in the patch updates the phase label on the
-    /// status surface (`plan` / `build`); the other fields as before.
+    /// status surface (`plan` / `build`); a `rules` list replaces the
+    /// rules the settings view lists; the other fields as before.
     ConfigChanged { patch: ConfigPatch },
     /// A plan-phase run finished with a plan: the run is paused and waits
     /// for a decision. `items` is the proposed plan.
@@ -421,6 +435,18 @@ impl Decision {
     }
 }
 
+/// One permission rule on the wire (`[permissions]` in config.toml, the
+/// same grammar). `effect` is `"allow"`, `"ask"` or `"deny"`; `spec` is
+/// `tool` or `tool(pattern)`, e.g. `bash(cargo test*)` or `read`.
+///
+/// UI effect: the settings view lists each rule as `effect spec`. The
+/// server rejects a whole `ConfigPatch` when any entry does not parse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleWire {
+    pub effect: String,
+    pub spec: String,
+}
+
 /// Config mutations a client may request (all optional; `None` = leave).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -447,6 +473,13 @@ pub struct ConfigPatch {
     /// The run phase for future runs: `plan` (read-only) or `build`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<Phase>,
+    /// The whole permission rule set for future runs (`allow`/`ask`/`deny`
+    /// rules). When present it REPLACES the session's rules; an empty list
+    /// clears them. Any unparsable entry rejects the whole patch with an
+    /// error that names that rule, and nothing changes. Echoed back in
+    /// `ConfigChanged`; `LiveState.rules` reports the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<RuleWire>>,
 }
 
 /// The approval-mode knob (`ask`/`yolo`/`deny`), mirrored because the core
@@ -547,6 +580,10 @@ pub struct AuthProviderWire {
 ///   allow and deny lists (the TUI's `RemoteLists`, the mobile tool
 ///   editor). Absent means the server has no entries, so the copy is
 ///   emptied; a SetConfig sends the whole list back.
+/// - `rules`: replace the client's copy of the permission rules (the
+///   settings view lists them as `effect spec`). Empty or absent means
+///   the session has no rules; a SetConfig `rules` patch sends the whole
+///   set back.
 ///
 /// The four config fields are optional on the wire (`skip_serializing_if`
 /// and serde defaults), so an older peer that omits them still parses,
@@ -591,6 +628,10 @@ pub struct LiveState {
     /// The server's tool deny list (see the struct docs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// The session's permission rules, in evaluation order (see
+    /// `RuleWire`). UI effect: replaces the rules listed in settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleWire>,
     /// The session's run phase. UI effect: sets the phase label on the
     /// status surface through the same mapping ConfigChanged uses. Absent
     /// keeps the client's default (`build`).
@@ -1564,5 +1605,107 @@ mod tests {
         }];
         let message = Message::user_with_attachments("see attached", attachments);
         assert_eq!(message.attachments.len(), 1);
+    }
+
+    /// Permission rules ride ConfigPatch (replace-all), LiveState (report)
+    /// and ExplainRule (client request, correlated Note reply). Unset rules
+    /// stay off the wire, and older JSON without them still parses.
+    #[test]
+    fn rules_frames_roundtrip_and_stay_optional() {
+        let session = Uuid::new_v4();
+        let rule = |effect: &str, spec: &str| RuleWire {
+            effect: effect.into(),
+            spec: spec.into(),
+        };
+
+        let patch = ConfigPatch {
+            rules: Some(vec![rule("deny", "bash(rm -rf*)"), rule("allow", "read")]),
+            ..ConfigPatch::default()
+        };
+        let set = Frame::request(
+            21,
+            Payload::SetConfig {
+                patch: patch.clone(),
+            },
+        );
+        assert_roundtrip(&set);
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["patch"]["rules"][0]["effect"], "deny");
+        assert_eq!(json["patch"]["rules"][0]["spec"], "bash(rm -rf*)");
+        assert_eq!(json["patch"]["rules"][1]["spec"], "read");
+
+        // An absent rules field is "leave alone", and an empty list is a
+        // real clear: the two must stay distinct on the wire.
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(unset.get("rules").is_none());
+        let cleared = serde_json::to_value(ConfigPatch {
+            rules: Some(Vec::new()),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+        assert_eq!(cleared["rules"], serde_json::json!([]));
+
+        let live = LiveState {
+            rules: vec![rule("ask", "bash(git push*)")],
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["rules"][0]["effect"], "ask");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back, live);
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("rules").is_none());
+
+        let explain = Frame::request(
+            22,
+            Payload::ExplainRule {
+                session_id: session,
+                tool: "bash".into(),
+                args: serde_json::json!({"command": "rm -rf x"}),
+            },
+        );
+        assert_roundtrip(&explain);
+        let json = serde_json::to_value(&explain).unwrap();
+        assert_eq!(json["type"], "explain_rule");
+        assert_eq!(json["tool"], "bash");
+        assert_eq!(json["args"]["command"], "rm -rf x");
+
+        // `args` may be omitted; it then reads as JSON null.
+        let bare: Payload = serde_json::from_value(serde_json::json!({
+            "type": "explain_rule",
+            "session_id": session,
+            "tool": "read",
+        }))
+        .unwrap();
+        match bare {
+            Payload::ExplainRule { args, tool, .. } => {
+                assert_eq!(tool, "read");
+                assert!(args.is_null());
+            }
+            _ => panic!("expected explain_rule"),
+        }
+
+        let note = Frame::event(
+            Some(session),
+            23,
+            Payload::Note {
+                text: "allow read: matched\nresult: allow".into(),
+            },
+        );
+        assert_roundtrip(&note);
+    }
+
+    /// JSON written before the rules fields existed (a SetConfig without
+    /// `rules`, a Snapshot LiveState without `rules`) still deserializes.
+    #[test]
+    fn rules_absent_from_older_json_still_parses() {
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"model":"m1","approval_mode":"ask"}"#).unwrap();
+        assert_eq!(patch.model.as_deref(), Some("m1"));
+        assert_eq!(patch.rules, None);
+
+        let live: LiveState =
+            serde_json::from_str(r#"{"running":false,"model":"m1","provider":"mock"}"#).unwrap();
+        assert!(live.rules.is_empty());
     }
 }

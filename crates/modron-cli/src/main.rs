@@ -1276,6 +1276,16 @@ fn build_agent_with(
         // config.toml top-level `escalate_on_check_failure = "<model id>"`:
         // one verify-failure escalation turn on that model (None = off).
         escalate_on_check_failure: cfg.escalate_on_check_failure.clone(),
+        // config.toml top-level `review_model = "<model id>"` (+ optional
+        // `review_max_rounds`): the end-of-run reviewer pass.
+        reviewer: cfg
+            .review_model
+            .clone()
+            .map(|model| modron_core::ReviewerConfig {
+                model,
+                max_rounds: cfg.review_max_rounds.unwrap_or(1),
+            }),
+        review_diff_source: None,
         on_delta: sinks.on_delta,
         on_tool_event: sinks.on_tool_event,
         personas: Default::default(),
@@ -3658,5 +3668,49 @@ mod tests {
                 .expect_err("out-of-range threshold must be rejected");
             assert!(err.to_string().starts_with("[compaction].threshold_frac"));
         }
+    }
+
+    /// `[permissions]` reach the engine every front end builds through
+    /// `build_agent_with` (run, tui, chat, serve, daemon, acp): `serve` and
+    /// the daemon use the returned engine as their template, so rules set
+    /// in config.toml are enforced there too.
+    #[test]
+    fn configured_permission_rules_reach_the_built_engine() {
+        use modron_core::permissions::RuleEffect;
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let cli = Cli::try_parse_from([
+            "modron",
+            "--provider",
+            "mock",
+            "--working-dir",
+            work.to_str().unwrap(),
+            "--sessions-dir",
+            dir.path().join("sessions").to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg = config::Config {
+            permissions: Some(config::PermissionsConfig {
+                deny: vec!["bash(rm -rf*)".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let agent = build_agent_with(
+            &cli,
+            &cfg,
+            false,
+            AgentSinks::for_mode(RunMode::HEADLESS),
+            &[],
+        )
+        .unwrap();
+        let verdict = agent
+            .engine
+            .config
+            .approvals
+            .rules
+            .evaluate("bash", &serde_json::json!({"command": "rm -rf x"}));
+        assert_eq!(verdict.map(|v| v.effect), Some(RuleEffect::Deny));
     }
 }

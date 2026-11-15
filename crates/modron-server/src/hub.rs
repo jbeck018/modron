@@ -20,13 +20,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use async_trait::async_trait;
+use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
     Engine, Phase, PlanItem, RunSummary, SessionEvent, SessionId, SessionMeta, SessionStore,
     SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval,
-    PlanDecision, WireDelta, WireRunSummary, WireSwarmRow, WireToolActivity,
+    PlanDecision, RuleWire, WireDelta, WireRunSummary, WireSwarmRow, WireToolActivity,
 };
 use modron_view::ActivityTracker;
 use tokio::sync::broadcast;
@@ -433,7 +434,7 @@ impl SessionHandle {
         // sandbox, phase and allow/deny lists (apply_config writes it, the
         // session's engine clone carries it). Copy them out and drop the
         // engine lock before taking the tracker lock.
-        let (approval_mode, sandbox, allow, deny, phase) = {
+        let (approval_mode, sandbox, allow, deny, rules, phase) = {
             let engine = self.engine_cell();
             let config = &engine.config;
             let mode = match config.approvals.mode {
@@ -446,6 +447,13 @@ impl SessionHandle {
                 Some(config.sandbox),
                 config.approvals.allow.clone(),
                 config.approvals.deny.clone(),
+                config
+                    .approvals
+                    .rules
+                    .rules()
+                    .iter()
+                    .map(rule_wire)
+                    .collect::<Vec<_>>(),
                 Some(config.phase),
             )
         };
@@ -455,6 +463,7 @@ impl SessionHandle {
             sandbox,
             allow,
             deny,
+            rules,
             phase,
             plan_pending: self.plan_pending.load(Ordering::Relaxed),
             running: self.busy.load(Ordering::Relaxed),
@@ -865,6 +874,18 @@ impl SessionHandle {
         );
     }
 
+    /// The `explain` lines for a hypothetical call under the session's
+    /// current permission rules (the wire's `ExplainRule`), joined by
+    /// newlines. Read-only.
+    pub fn explain_rule(&self, tool: &str, args: &serde_json::Value) -> String {
+        self.engine_cell()
+            .config
+            .approvals
+            .rules
+            .explain(tool, args)
+            .join("\n")
+    }
+
     /// Mutate the session's engine config for future turns (the wire's
     /// `SetConfig`). The model/provider switch follows the TUI's /model:
     /// provider follows the catalog (or the explicit patch), and the
@@ -931,6 +952,10 @@ impl SessionHandle {
         if let Some(deny) = &patch.deny {
             config.approvals.deny = deny.clone();
         }
+        if let Some(rules) = &patch.rules {
+            // Parsed before commit: one bad entry rejects the whole patch.
+            config.approvals.rules = parse_rule_set(rules).map_err(anyhow::Error::msg)?;
+        }
         if let Some(persona) = &patch.persona {
             // The /agent pattern: system prompt + model/provider/allow/deny
             // follow the configured persona when set.
@@ -985,6 +1010,43 @@ impl SessionHandle {
 // ---------------------------------------------------------------------------
 // SessionHub — the map of live sessions
 // ---------------------------------------------------------------------------
+
+/// One core rule as its wire form: the effect word and `tool(pattern)`.
+pub(crate) fn rule_wire(rule: &Rule) -> RuleWire {
+    RuleWire {
+        effect: rule.effect.as_str().to_string(),
+        spec: rule.spec(),
+    }
+}
+
+/// Parse a wire rule list into a rule set. The error names the first rule
+/// that does not parse; callers reject the whole list on any error.
+pub(crate) fn parse_rule_set(rules: &[RuleWire]) -> Result<RuleSet, String> {
+    let parsed = rules
+        .iter()
+        .map(|wire| {
+            let effect = match wire.effect.as_str() {
+                "allow" => RuleEffect::Allow,
+                "ask" => RuleEffect::Ask,
+                "deny" => RuleEffect::Deny,
+                other => {
+                    return Err(format!(
+                        "invalid permission rule `{} {}`: unknown effect `{other}` \
+                         (use allow, ask or deny)",
+                        wire.effect, wire.spec
+                    ))
+                }
+            };
+            Rule::parse(effect, &wire.spec).map_err(|err| {
+                format!(
+                    "invalid permission rule `{} {}`: {err}",
+                    wire.effect, wire.spec
+                )
+            })
+        })
+        .collect::<Result<Vec<Rule>, String>>()?;
+    Ok(RuleSet::new(parsed))
+}
 
 /// Cheap-cloneable map of live sessions plus the engine template every
 /// per-session engine clones from.
