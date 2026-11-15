@@ -24,12 +24,13 @@ use crate::error::ClientError;
 use crate::transport;
 use crate::view::{
     fold_snapshot, fold_turn_done, fold_turn_unfinished, FoldState, OAuthProgressView,
-    PendingApprovalView, SessionViewModel, ViewModelSnapshot,
+    PendingApprovalView, PendingPlanView, SessionViewModel, ViewModelSnapshot,
 };
 use modron_protocol::{
-    ConfigPatch, Decision, Frame, Payload, WireDelta, DEFAULT_PORT, PROTOCOL_VERSION,
+    ConfigPatch, ContextGaugeWire, Decision, Frame, Payload, PlanDecision, WireDelta, DEFAULT_PORT,
+    PROTOCOL_VERSION,
 };
-use modron_types::ToolActivity;
+use modron_types::{Phase, ToolActivity};
 use modron_view::TranscriptEntry;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -532,6 +533,107 @@ impl RemoteClient {
         let mut st = self.shared.state.lock().unwrap();
         crate::view::resolve_approval(&mut st.vm, &request_id);
         Ok(())
+    }
+
+    /// The attached session, the target of every session-scoped command
+    /// below (steer, queue, plan, compact).
+    fn attached_session(&self) -> Result<Uuid, ClientError> {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .vm
+            .session_id
+            .ok_or_else(|| ClientError::Request("no session attached".into()))
+    }
+
+    /// Composer submit (PROTOCOL_V2 section 2): while the attached session
+    /// runs, the text is a steer (injected at the next safe boundary);
+    /// otherwise it is a submit (a new run, or a new session when none is
+    /// attached).
+    pub fn send_message(&self, text: impl Into<String>) -> Result<(), ClientError> {
+        let text = text.into();
+        let (session_id, running) = {
+            let st = self.shared.state.lock().unwrap();
+            (st.vm.session_id, st.vm.running)
+        };
+        match (running, session_id) {
+            (true, Some(session_id)) => self.send_frame(Frame::request(
+                self.next_request_id(),
+                Payload::Steer { session_id, text },
+            )),
+            _ => self.submit(session_id, text),
+        }
+    }
+
+    /// Steer a running session: the text joins the active run at the next
+    /// safe boundary. Errors when no session is attached.
+    pub fn steer(&self, text: impl Into<String>) -> Result<(), ClientError> {
+        let session_id = self.attached_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Steer {
+                session_id,
+                text: text.into(),
+            },
+        ))
+    }
+
+    /// Hold a message for the session's next run (the alternate submit).
+    pub fn enqueue(&self, text: impl Into<String>) -> Result<(), ClientError> {
+        let session_id = self.attached_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Enqueue {
+                session_id,
+                text: text.into(),
+            },
+        ))
+    }
+
+    /// Remove one queued message by position (0 = next to run).
+    pub fn dequeue(&self, index: u32) -> Result<(), ClientError> {
+        let session_id = self.attached_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Dequeue { session_id, index },
+        ))
+    }
+
+    /// Answer the proposed plan: `Approve` flips to build and runs the
+    /// plan; `Revise` plans again with the note as the task.
+    pub fn decide_plan(
+        &self,
+        decision: PlanDecision,
+        note: Option<String>,
+    ) -> Result<(), ClientError> {
+        let session_id = self.attached_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::DecidePlan {
+                session_id,
+                decision,
+                note,
+            },
+        ))
+    }
+
+    /// Compact the attached session now (idle sessions only; the server
+    /// refuses while a run is active).
+    pub fn compact(&self) -> Result<(), ClientError> {
+        let session_id = self.attached_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Compact { session_id },
+        ))
+    }
+
+    /// Switch the run phase for future runs (`plan` read-only, `build`).
+    pub fn set_phase(&self, phase: Phase) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            phase: Some(phase),
+            ..ConfigPatch::default()
+        })
     }
 
     /// Mutate config for future turns only (server semantics).
@@ -1042,6 +1144,17 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         Payload::ApprovalResolved { request_id, .. } => {
             crate::view::resolve_approval(vm, &request_id);
         }
+        // Steer echo: pending until its persisted Task event arrives.
+        Payload::Steered { text } => vm.pending_steers.push(text),
+        // Queue chips: the server's full list replaces ours.
+        Payload::QueueChanged { queued } => vm.queued = queued,
+        Payload::ContextChanged { used, window } => {
+            vm.context = Some(ContextGaugeWire { used, window });
+        }
+        Payload::PlanProposed { items } => {
+            vm.plan_pending = Some(PendingPlanView::new(&items));
+        }
+        Payload::PlanDecided { .. } => vm.plan_pending = None,
         Payload::ConfigChanged { patch } => apply_config(vm, &patch),
         Payload::Sessions { sessions } => vm.sessions = sessions,
         Payload::Automations { rows } => vm.automations = rows,
@@ -1156,6 +1269,12 @@ fn apply_config(vm: &mut SessionViewModel, patch: &ConfigPatch) {
     if let Some(goal) = &patch.goal {
         vm.goal = goal.clone();
     }
+    if let Some(phase) = patch.phase {
+        vm.phase = phase;
+    }
+    if let Some(rules) = &patch.rules {
+        vm.rules = rules.clone();
+    }
 }
 
 #[cfg(test)]
@@ -1204,6 +1323,140 @@ mod tests {
             snap.last_note.as_deref(),
             Some("remote-control live: https://bridge.example.com/s/abc - open on any device")
         );
+    }
+
+    /// Fold several frames, in order, into one fresh shared state.
+    fn folded_all(frames: Vec<Frame>) -> ViewModelSnapshot {
+        let shared = Shared::new(ConnectOptions::default());
+        for frame in frames {
+            fold_frame(&shared, frame);
+        }
+        let st = shared.state.lock().unwrap();
+        ViewModelSnapshot::from_vm(&st.vm)
+    }
+
+    #[test]
+    fn steer_queue_and_context_frames_fold_into_the_view() {
+        let session = Uuid::new_v4();
+        let snap = folded_all(vec![
+            Frame::event(
+                Some(session),
+                1,
+                Payload::Steered {
+                    text: "also check B".into(),
+                },
+            ),
+            Frame::event(
+                Some(session),
+                2,
+                Payload::QueueChanged {
+                    queued: vec!["first".into(), "second".into()],
+                },
+            ),
+            Frame::event(
+                Some(session),
+                3,
+                Payload::QueueChanged {
+                    queued: vec!["second".into()],
+                },
+            ),
+            Frame::event(
+                Some(session),
+                4,
+                Payload::ContextChanged {
+                    used: 74_000,
+                    window: 180_000,
+                },
+            ),
+        ]);
+        assert_eq!(snap.pending_steers, vec!["also check B".to_string()]);
+        // QueueChanged replaces the list rather than appending to it.
+        assert_eq!(snap.queued, vec!["second".to_string()]);
+        assert_eq!(snap.context_label, "ctx 41% (74k/180k)");
+    }
+
+    #[test]
+    fn plan_proposed_opens_the_block_and_plan_decided_clears_it() {
+        let session = Uuid::new_v4();
+        let items = vec![modron_types::PlanItem {
+            text: "Add the endpoint".into(),
+            done_criteria: "curl returns 200".into(),
+            status: "pending".into(),
+        }];
+        let open = folded_all(vec![Frame::event(
+            Some(session),
+            1,
+            Payload::PlanProposed {
+                items: items.clone(),
+            },
+        )]);
+        let plan = open.plan_pending.expect("plan block opens");
+        assert_eq!(plan.lines, vec!["○ Add the endpoint - curl returns 200"]);
+        assert_eq!(plan.options[0].label, "approve");
+        assert_eq!(plan.options[1].label, "revise");
+
+        let cleared = folded_all(vec![
+            Frame::event(Some(session), 1, Payload::PlanProposed { items }),
+            Frame::event(
+                Some(session),
+                2,
+                Payload::PlanDecided {
+                    decision: PlanDecision::Approve,
+                },
+            ),
+        ]);
+        assert!(cleared.plan_pending.is_none());
+    }
+
+    #[test]
+    fn config_changed_phase_and_rules_fold_into_labels() {
+        let snap = folded_all(vec![Frame::event(
+            None,
+            0,
+            Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    phase: Some(Phase::Plan),
+                    rules: Some(vec![modron_protocol::RuleWire {
+                        effect: "ask".into(),
+                        spec: "bash(git push*)".into(),
+                    }]),
+                    ..ConfigPatch::default()
+                },
+            },
+        )]);
+        assert_eq!(snap.phase_label, "plan");
+        assert!(
+            snap.status_line.ends_with(" · plan"),
+            "{}",
+            snap.status_line
+        );
+        assert_eq!(snap.rules, vec!["ask bash(git push*)".to_string()]);
+
+        // A patch without phase or rules leaves both alone.
+        let snap = folded_all(vec![
+            Frame::event(
+                None,
+                0,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        phase: Some(Phase::Plan),
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+            Frame::event(
+                None,
+                1,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        model: Some("m2".into()),
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(snap.phase_label, "plan");
+        assert!(snap.rules.is_empty());
     }
 
     #[test]

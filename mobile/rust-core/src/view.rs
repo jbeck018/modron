@@ -21,6 +21,14 @@
 //!   queue; answering removes the front. A `Snapshot` replaces the queue
 //!   with the snapshot's own pending approval; a disconnect clears it.
 //!   Config changes are label updates for future turns only.
+//! - `Steered` queues a pending steer echo; the persisted `Task` event with
+//!   the same text removes it; turn end and a Snapshot clear the rest.
+//! - `QueueChanged` replaces the queue; `ContextChanged` sets the context
+//!   gauge; `PlanProposed` opens the plan block (lines from
+//!   `modron_view::plan_lines`), `PlanDecided` clears it. A Snapshot sets
+//!   the plan block from `LiveState.plan_pending` (no lines on attach).
+//! - `ConfigChanged` `phase` sets the phase label, `rules` replaces the
+//!   rule list; a Snapshot sets all of them from `LiveState`.
 //!
 //! Usage accounting: cumulative usage grows from persisted `Usage` events
 //! (`usage_totals` arithmetic) and resets to the snapshot's live value on
@@ -28,9 +36,10 @@
 //! not add usage (the server's `Usage` events already covered the turn).
 
 use modron_protocol::{
-    ApprovalModeWire, Decision, LiveState, PendingApproval, SessionMetaWire, WireRunSummary,
+    ApprovalModeWire, ContextGaugeWire, Decision, LiveState, PendingApproval, PlanDecision,
+    RuleWire, SessionMetaWire, WireRunSummary,
 };
-use modron_types::{Role, SessionEvent, ToolActivity, ToolCall, Usage};
+use modron_types::{Phase, PlanItem, Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_view::{replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -50,6 +59,50 @@ pub const DECISION_LABELS: [(Decision, &str); 3] = [
     (Decision::AllowAll, Decision::AllowAll.label()),
     (Decision::Deny, Decision::Deny.label()),
 ];
+
+/// The plan decision labels for the plan decision block, in protocol
+/// order. Shared words for every client (the plan block is the approval
+/// surface's sibling: `approve` flips to build, `revise` plans again).
+pub const PLAN_DECISION_LABELS: [(PlanDecision, &str); 2] = [
+    (PlanDecision::Approve, "approve"),
+    (PlanDecision::Revise, "revise"),
+];
+
+/// The run-phase label for the status line and settings (`plan` / `build`).
+pub fn phase_label(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Plan => "plan",
+        Phase::Build => "build",
+    }
+}
+
+/// Compact token count for the context meter: exact below a thousand,
+/// otherwise nearest thousand with a `k` suffix (`74k`, `180k`).
+fn compact_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else {
+        format!("{}k", n.saturating_add(500) / 1_000)
+    }
+}
+
+/// The context meter label (`ctx 41% (74k/180k)`). Empty when the gauge
+/// is absent or its window is zero (no meaningful percentage), so the
+/// shell hides the meter.
+pub fn context_label(gauge: Option<ContextGaugeWire>) -> String {
+    match gauge {
+        Some(ContextGaugeWire { used, window }) if window > 0 => {
+            // Rounded percentage, computed in integers.
+            let pct = used.saturating_mul(100).saturating_add(window / 2) / window;
+            format!(
+                "ctx {pct}% ({}/{})",
+                compact_tokens(used),
+                compact_tokens(window)
+            )
+        }
+        _ => String::new(),
+    }
+}
 
 /// The approval mode label for the status line (`ask`/`yolo`/`deny`,
 /// default `ask`), delegating to the shared protocol label.
@@ -177,6 +230,37 @@ impl PendingApprovalView {
     }
 }
 
+/// One selectable decision on the plan block.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDecisionOption {
+    pub decision: PlanDecision,
+    /// Shared label (`approve` / `revise`).
+    pub label: String,
+}
+
+/// A proposed plan awaiting a decision (`PlanProposed`), pre-rendered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPlanView {
+    /// The plan as checkbox rows (`modron_view::plan_lines`). Empty when
+    /// the plan came from a Snapshot: its `LiveState` carries only the
+    /// pending flag, not the items.
+    pub lines: Vec<String>,
+    /// The two decisions with their shared labels, protocol order.
+    pub options: [PlanDecisionOption; 2],
+}
+
+impl PendingPlanView {
+    pub fn new(items: &[PlanItem]) -> Self {
+        Self {
+            lines: modron_view::plan_lines(items),
+            options: PLAN_DECISION_LABELS.map(|(decision, label)| PlanDecisionOption {
+                decision,
+                label: label.to_string(),
+            }),
+        }
+    }
+}
+
 /// OAuth sign-in progress surfaced to remote clients.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthProgressView {
@@ -240,6 +324,25 @@ pub struct SessionViewModel {
     /// Tool allow/deny lists (the last config patches).
     pub allow_tools: Vec<String>,
     pub deny_tools: Vec<String>,
+    /// Messages held for the next run, front first (`QueueChanged`
+    /// replaces it; a Snapshot seeds it from `LiveState.queued`).
+    pub queued: Vec<String>,
+    /// Steered texts accepted but not yet persisted as a task echo. Each
+    /// is removed when its persisted `Task` event arrives; turn end and
+    /// a Snapshot clear the lot.
+    pub pending_steers: Vec<String>,
+    /// A proposed plan awaiting a decision (`PlanProposed` sets it,
+    /// `PlanDecided` clears it).
+    pub plan_pending: Option<PendingPlanView>,
+    /// The run phase for future runs (`ConfigPatch.phase`, snapshot).
+    /// Defaults to `build`.
+    pub phase: Phase,
+    /// The context occupancy (`ContextChanged`, snapshot); `None` hides
+    /// the meter.
+    pub context: Option<ContextGaugeWire>,
+    /// Permission rules in evaluation order (`ConfigPatch.rules`,
+    /// snapshot).
+    pub rules: Vec<RuleWire>,
     /// Sessions list (answers to `list_sessions`).
     pub sessions: Vec<SessionMetaWire>,
     /// Scheduled automations (answers to `list_automations`; settings
@@ -334,6 +437,18 @@ pub struct ViewModelSnapshot {
     /// Tool allow/deny lists (editable in the settings views).
     pub allow_tools: Vec<String>,
     pub deny_tools: Vec<String>,
+    /// Messages held for the next run, front first (the queue chips).
+    pub queued: Vec<String>,
+    /// Steers accepted but not yet echoed as persisted tasks (dim echoes).
+    pub pending_steers: Vec<String>,
+    /// The proposed plan awaiting a decision (the plan decision block).
+    pub plan_pending: Option<PendingPlanView>,
+    /// `plan` / `build`.
+    pub phase_label: String,
+    /// `ctx 41% (74k/180k)`, empty when the context is unknown.
+    pub context_label: String,
+    /// Permission rules as `effect spec` lines (the settings view).
+    pub rules: Vec<String>,
     pub cumulative_usage: Usage,
     pub cumulative_tokens: u64,
     /// Session-cumulative cache hit rate, `None` before any tokens.
@@ -373,6 +488,15 @@ impl ViewModelSnapshot {
             status_line.push_str(&format!(" · cache {pct:.0}%"));
         }
         status_line.push_str(&format!(" · {}", approval_mode_label(vm.approval_mode)));
+        // Phase shows only in plan (build is the quiet default); the
+        // context meter shows whenever the window is known.
+        if vm.phase == Phase::Plan {
+            status_line.push_str(&format!(" · {}", phase_label(vm.phase)));
+        }
+        let context = context_label(vm.context);
+        if !context.is_empty() {
+            status_line.push_str(&format!(" · {context}"));
+        }
         Self {
             connection: vm.connection,
             connection_label: connection_label(&vm.connection).to_string(),
@@ -393,6 +517,16 @@ impl ViewModelSnapshot {
             sandbox: sandbox_label(vm.sandbox).to_string(),
             allow_tools: vm.allow_tools.clone(),
             deny_tools: vm.deny_tools.clone(),
+            queued: vm.queued.clone(),
+            pending_steers: vm.pending_steers.clone(),
+            plan_pending: vm.plan_pending.clone(),
+            phase_label: phase_label(vm.phase).to_string(),
+            context_label: context_label(vm.context),
+            rules: vm
+                .rules
+                .iter()
+                .map(|rule| format!("{} {}", rule.effect, rule.spec))
+                .collect(),
             cumulative_usage: vm.cumulative_usage,
             cumulative_tokens: vm.cumulative_usage.total(),
             session_cache_pct,
@@ -492,6 +626,14 @@ impl FoldState {
 
     /// Fold one live `SessionEvent` into committed rows.
     pub fn fold_event(&mut self, vm: &mut SessionViewModel, event: SessionEvent) {
+        // A persisted task echo settles its pending steer (the server
+        // injects a steer as a `Task` event, same text): the pending echo
+        // gives way to the committed row below, in transcript order.
+        if let SessionEvent::Task { text } = &event {
+            if let Some(index) = vm.pending_steers.iter().position(|steer| steer == text) {
+                vm.pending_steers.remove(index);
+            }
+        }
         // A persisted assistant message supersedes the streamed buffer
         // (the replayed row carries the authoritative text).
         if let SessionEvent::Message { message, .. } = &event {
@@ -629,6 +771,18 @@ pub(crate) fn fold_snapshot(
     vm.model = live.model.clone();
     vm.provider = live.provider.clone();
     vm.goal = live.goal.clone();
+    // H1-H9b: queue, steer echoes, phase, plan, context and rules are the
+    // snapshot's whole truth (a reattach never keeps stale values).
+    vm.queued = live.queued.clone();
+    vm.pending_steers.clear();
+    vm.phase = live.phase.unwrap_or_default();
+    // The Snapshot carries only the pending flag, so the plan's lines stay
+    // empty until a live `PlanProposed` arrives.
+    vm.plan_pending = live
+        .plan_pending
+        .then(|| PendingPlanView::new(&[] as &[PlanItem]));
+    vm.context = live.context;
+    vm.rules = live.rules.clone();
     // C5: the server's real approval mode and sandbox (an absent field
     // keeps the client's default), and the server's allow/deny lists, so
     // the tool editor starts from what the server holds.
@@ -740,6 +894,7 @@ pub(crate) fn fold_turn_done(
     }
     vm.turn_tools.clear();
     vm.subagents.clear();
+    vm.pending_steers.clear();
     vm.running = false;
     vm.pending_approvals.clear();
     vm.turns_completed += summary.turns;
@@ -771,6 +926,7 @@ pub(crate) fn fold_turn_unfinished(
     vm.streaming_reasoning.clear();
     vm.turn_tools.clear();
     vm.subagents.clear();
+    vm.pending_steers.clear();
     vm.running = false;
     vm.pending_approvals.clear();
     if let Some(error) = error {
@@ -1077,5 +1233,202 @@ mod tests {
             },
         });
         assert_eq!(rows, vec!["100 tok · cache 33%"]);
+    }
+
+    fn steer_vm(texts: &[&str]) -> SessionViewModel {
+        SessionViewModel {
+            running: true,
+            pending_steers: texts.iter().map(|t| t.to_string()).collect(),
+            ..SessionViewModel::default()
+        }
+    }
+
+    #[test]
+    fn steer_echo_is_removed_by_its_persisted_task_event() {
+        let mut vm = steer_vm(&["also check B", "and C"]);
+        let mut fold = FoldState::default();
+        fold.fold_event(
+            &mut vm,
+            SessionEvent::Task {
+                text: "also check B".into(),
+            },
+        );
+        assert_eq!(vm.pending_steers, vec!["and C".to_string()]);
+        // The committed task row lands in history as usual.
+        assert!(vm
+            .history
+            .iter()
+            .any(|row| row.lines == vec!["❯ also check B".to_string()]));
+        // An unrelated task leaves the pending echo alone.
+        fold.fold_event(
+            &mut vm,
+            SessionEvent::Task {
+                text: "something else".into(),
+            },
+        );
+        assert_eq!(vm.pending_steers, vec!["and C".to_string()]);
+    }
+
+    #[test]
+    fn steer_echoes_clear_on_abort_failure_and_turn_done() {
+        let mut fold = FoldState::default();
+        let mut vm = steer_vm(&["one"]);
+        fold_turn_unfinished(&mut vm, &mut fold, None);
+        assert!(vm.pending_steers.is_empty(), "abort clears steers");
+
+        let mut vm = steer_vm(&["two"]);
+        fold_turn_unfinished(&mut vm, &mut fold, Some("boom".into()));
+        assert!(vm.pending_steers.is_empty(), "failure clears steers");
+
+        let mut vm = steer_vm(&["three"]);
+        let summary = WireRunSummary {
+            session_id: Uuid::nil(),
+            answer: String::new(),
+            turns: 0,
+            tool_calls: 0,
+            usage: Usage::default(),
+            models_used: Vec::new(),
+        };
+        fold_turn_done(&mut vm, &mut fold, &summary);
+        assert!(vm.pending_steers.is_empty(), "turn done clears steers");
+    }
+
+    #[test]
+    fn snapshot_resets_queue_steers_phase_context_and_rules() {
+        let session = Uuid::new_v4();
+        let mut vm = SessionViewModel {
+            queued: vec!["stale".into()],
+            pending_steers: vec!["stale steer".into()],
+            plan_pending: Some(PendingPlanView::new(&[])),
+            phase: Phase::Plan,
+            context: Some(ContextGaugeWire { used: 1, window: 2 }),
+            ..SessionViewModel::default()
+        };
+        let mut fold = FoldState::default();
+        let live = LiveState {
+            queued: vec!["next".into()],
+            phase: Some(Phase::Build),
+            context: Some(ContextGaugeWire {
+                used: 74_000,
+                window: 180_000,
+            }),
+            rules: vec![RuleWire {
+                effect: "deny".into(),
+                spec: "bash(rm -rf*)".into(),
+            }],
+            ..LiveState::default()
+        };
+        fold_snapshot(&mut vm, &mut fold, session, 3, &[], &live);
+        assert_eq!(vm.queued, vec!["next".to_string()]);
+        assert!(vm.pending_steers.is_empty());
+        assert!(vm.plan_pending.is_none(), "snapshot says not pending");
+        assert_eq!(vm.phase, Phase::Build);
+        assert_eq!(
+            vm.context,
+            Some(ContextGaugeWire {
+                used: 74_000,
+                window: 180_000
+            })
+        );
+        assert_eq!(vm.rules.len(), 1);
+
+        // A snapshot that says a plan awaits keeps the block with no lines.
+        let live = LiveState {
+            plan_pending: true,
+            ..LiveState::default()
+        };
+        fold_snapshot(&mut vm, &mut fold, session, 4, &[], &live);
+        let plan = vm.plan_pending.clone().expect("pending plan on attach");
+        assert!(plan.lines.is_empty(), "attach carries no items");
+        assert_eq!(plan.options[0].label, "approve");
+        assert_eq!(plan.options[1].label, "revise");
+        // Absent context and phase reset to the defaults.
+        assert_eq!(vm.phase, Phase::Build);
+        assert!(vm.context.is_none());
+    }
+
+    #[test]
+    fn plan_block_renders_items_and_the_shared_option_labels() {
+        let items = vec![PlanItem {
+            text: "Edit the parser".into(),
+            done_criteria: "parser tests pass".into(),
+            status: "pending".into(),
+        }];
+        let plan = PendingPlanView::new(&items);
+        assert_eq!(plan.lines, vec!["○ Edit the parser - parser tests pass"]);
+        assert_eq!(plan.options[0].decision, PlanDecision::Approve);
+        assert_eq!(plan.options[0].label, "approve");
+        assert_eq!(plan.options[1].decision, PlanDecision::Revise);
+        assert_eq!(plan.options[1].label, "revise");
+        assert_eq!(
+            PLAN_DECISION_LABELS.map(|(_, label)| label),
+            ["approve", "revise"]
+        );
+    }
+
+    #[test]
+    fn context_label_formats_the_meter_and_hides_when_unknown() {
+        assert_eq!(context_label(None), "");
+        // A zero window has no percentage: the meter stays hidden.
+        assert_eq!(
+            context_label(Some(ContextGaugeWire { used: 5, window: 0 })),
+            ""
+        );
+        assert_eq!(
+            context_label(Some(ContextGaugeWire {
+                used: 74_000,
+                window: 180_000
+            })),
+            "ctx 41% (74k/180k)"
+        );
+        assert_eq!(
+            context_label(Some(ContextGaugeWire {
+                used: 0,
+                window: 200
+            })),
+            "ctx 0% (0/200)"
+        );
+    }
+
+    #[test]
+    fn status_line_shows_plan_phase_and_context_only_when_relevant() {
+        let mut vm = SessionViewModel {
+            model: "m".into(),
+            context: Some(ContextGaugeWire {
+                used: 74_000,
+                window: 180_000,
+            }),
+            ..SessionViewModel::default()
+        };
+        // Build: no phase word; the context meter still shows.
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(snap.status_line, "m · 0 tok · ask · ctx 41% (74k/180k)");
+        assert_eq!(snap.phase_label, "build");
+        assert_eq!(snap.context_label, "ctx 41% (74k/180k)");
+
+        vm.phase = Phase::Plan;
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(
+            snap.status_line,
+            "m · 0 tok · ask · plan · ctx 41% (74k/180k)"
+        );
+        assert_eq!(snap.phase_label, "plan");
+    }
+
+    #[test]
+    fn rules_and_queue_project_into_the_snapshot() {
+        let vm = SessionViewModel {
+            queued: vec!["a".into(), "b".into()],
+            rules: vec![RuleWire {
+                effect: "allow".into(),
+                spec: "read".into(),
+            }],
+            ..SessionViewModel::default()
+        };
+        let snap = ViewModelSnapshot::from_vm(&vm);
+        assert_eq!(snap.queued, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(snap.rules, vec!["allow read".to_string()]);
+        assert!(snap.context_label.is_empty());
+        assert!(snap.plan_pending.is_none());
     }
 }

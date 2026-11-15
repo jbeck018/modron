@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use crate::wake::ArmedWake;
 use async_trait::async_trait;
 use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
@@ -26,9 +27,9 @@ use modron_core::{
     SessionStore, SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_protocol::{
-    ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, LiveState, Payload,
-    PendingApproval, PlanDecision, RuleWire, WireDelta, WireRunSummary, WireSwarmRow,
-    WireToolActivity,
+    ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, LiveState, NotifyKind,
+    Payload, PendingApproval, PlanDecision, RuleWire, WakeWire, WireDelta, WireRunSummary,
+    WireSwarmRow, WireToolActivity,
 };
 use modron_view::ActivityTracker;
 use tokio::sync::broadcast;
@@ -353,6 +354,9 @@ pub struct SessionHandle {
     /// until a run or a `Compact` on this handle computes one. Written
     /// under the seq lock together with its `ContextChanged` frame.
     context: Mutex<Option<ContextGauge>>,
+    /// The armed scheduled wake (H5a), if any. Written under the seq lock
+    /// together with its `WakeChanged` frame (see `arm_wake`).
+    wake: Mutex<Option<ArmedWake>>,
 }
 
 impl SessionHandle {
@@ -497,6 +501,7 @@ impl SessionHandle {
                 used: gauge.used,
                 window: gauge.window,
             }),
+            wake: self.wake_wire(),
         }
     }
 
@@ -757,6 +762,13 @@ impl SessionHandle {
                         summary: WireRunSummary::from(&summary),
                     },
                 );
+                self.publish_locked(
+                    &mut seq,
+                    Payload::Notify {
+                        kind: NotifyKind::Done,
+                        text: notify_done_text(self.id),
+                    },
+                );
                 // A plan-phase run that produced a plan waits for its
                 // decision: the queue stays put until `decide_plan`.
                 if self.propose_plan_locked(&mut seq) {
@@ -769,6 +781,13 @@ impl SessionHandle {
                     &mut seq,
                     Payload::TurnFailed {
                         error: error.to_string(),
+                    },
+                );
+                self.publish_locked(
+                    &mut seq,
+                    Payload::Notify {
+                        kind: NotifyKind::Failed,
+                        text: notify_failed_text(&error.to_string()),
                     },
                 );
                 None
@@ -829,6 +848,13 @@ impl SessionHandle {
         }
         self.plan_pending.store(true, Ordering::Relaxed);
         self.publish_locked(seq, Payload::PlanProposed { items });
+        self.publish_locked(
+            seq,
+            Payload::Notify {
+                kind: NotifyKind::Plan,
+                text: NOTIFY_PLAN_TEXT.to_string(),
+            },
+        );
         true
     }
 
@@ -886,6 +912,83 @@ impl SessionHandle {
         }
         self.publish_locked(&mut seq, Payload::PlanDecided { decision });
         Ok(())
+    }
+
+    /// The armed wake as it reads on the wire (LiveState, persistence).
+    pub(crate) fn wake_wire(&self) -> Option<WakeWire> {
+        lock(&self.wake).as_ref().map(|armed| armed.wire.clone())
+    }
+
+    /// The armed wake's wire when `token` still names it (the timer checks
+    /// this before every firing: a replaced or cancelled wake goes quiet).
+    pub(crate) fn wake_if_current(&self, token: u64) -> Option<WakeWire> {
+        lock(&self.wake)
+            .as_ref()
+            .filter(|armed| armed.token == token)
+            .map(|armed| armed.wire.clone())
+    }
+
+    /// Arm `wire` as the session's one wake, replacing (and aborting the
+    /// timer of) any armed wake, and publish `WakeChanged`. `start` builds
+    /// the timer task; it runs under the seq and wake locks, so the timer
+    /// can never observe a half-installed wake.
+    pub(crate) fn arm_wake(
+        &self,
+        token: u64,
+        wire: WakeWire,
+        start: impl FnOnce() -> JoinHandle<()>,
+    ) {
+        let mut seq = lock(&self.seq);
+        let mut slot = lock(&self.wake);
+        if let Some(old) = slot.take() {
+            old.task.abort();
+        }
+        let task = start();
+        *slot = Some(ArmedWake {
+            wire: wire.clone(),
+            token,
+            task,
+        });
+        drop(slot);
+        self.publish_locked(&mut seq, Payload::WakeChanged { wake: Some(wire) });
+    }
+
+    /// A firing settled. `next` re-arms the same wake (recurring) with its
+    /// new time; `None` clears it (one-shot). Returns false, changing
+    /// nothing, when `token` is no longer the armed wake.
+    pub(crate) fn settle_wake(&self, token: u64, next: Option<WakeWire>) -> bool {
+        let mut seq = lock(&self.seq);
+        let mut slot = lock(&self.wake);
+        if !slot.as_ref().is_some_and(|armed| armed.token == token) {
+            return false;
+        }
+        let wake = match next {
+            Some(wire) => {
+                if let Some(armed) = slot.as_mut() {
+                    armed.wire = wire.clone();
+                }
+                Some(wire)
+            }
+            None => {
+                *slot = None;
+                None
+            }
+        };
+        drop(slot);
+        self.publish_locked(&mut seq, Payload::WakeChanged { wake });
+        true
+    }
+
+    /// Cancel the armed wake: abort its timer and publish
+    /// `WakeChanged { wake: None }`. False when none was armed.
+    pub(crate) fn cancel_wake(&self) -> bool {
+        let mut seq = lock(&self.seq);
+        let Some(armed) = lock(&self.wake).take() else {
+            return false;
+        };
+        armed.task.abort();
+        self.publish_locked(&mut seq, Payload::WakeChanged { wake: None });
+        true
     }
 
     /// Pop the front follow-up (caller holds the seq lock) and publish the
@@ -1284,6 +1387,7 @@ impl SessionHub {
             plan: Mutex::new(Vec::new()),
             plan_pending: AtomicBool::new(false),
             context: Mutex::new(None),
+            wake: Mutex::new(None),
         });
         sessions.insert(id, Arc::clone(&handle));
         handle
@@ -1357,7 +1461,7 @@ impl SessionHub {
     /// Start a popped follow-up. Runs on the completed run's task with no
     /// hub lock held. Without a starter the message is reported, not lost
     /// silently.
-    fn start_queued(&self, id: SessionId, text: String) {
+    pub(crate) fn start_queued(&self, id: SessionId, text: String) {
         match self.inner.run_starter.get() {
             Some(starter) => starter(id, text),
             None => {
@@ -1368,6 +1472,16 @@ impl SessionHub {
                 }
             }
         }
+    }
+
+    /// Every armed scheduled wake in this hub, for the persisted registry
+    /// (H5a).
+    pub(crate) fn armed_wakes(&self) -> Vec<(SessionId, WakeWire)> {
+        let sessions = lock(&self.inner.sessions);
+        sessions
+            .values()
+            .filter_map(|handle| handle.wake_wire().map(|wire| (handle.id, wire)))
+            .collect()
     }
 
     /// Hold a message for the session's next run (see
@@ -1441,6 +1555,39 @@ impl SessionHub {
             "unknown or already-resolved request id {request_id}"
         ))
     }
+}
+
+/// Text of the `Notify` a plan proposal sends.
+pub(crate) const NOTIFY_PLAN_TEXT: &str = "plan ready for review";
+
+/// Characters of a failed run's first error line kept in its `Notify`.
+const NOTIFY_FAILED_CHARS: usize = 120;
+
+/// Characters of a wake's prompt kept in its `Notify`.
+const NOTIFY_WAKE_CHARS: usize = 80;
+
+/// Notify text for a finished run: `done: <short session id>`. Every
+/// `Notify` text is built here, so the wording lives in one place (H5a).
+pub(crate) fn notify_done_text(session: SessionId) -> String {
+    let id = session.to_string();
+    format!("done: {}", &id[..8])
+}
+
+/// Notify text for a failed run: its first error line, cut to 120 chars.
+pub(crate) fn notify_failed_text(error: &str) -> String {
+    let first = error.lines().next().unwrap_or("");
+    format!(
+        "failed: {}",
+        first.chars().take(NOTIFY_FAILED_CHARS).collect::<String>()
+    )
+}
+
+/// Notify text for a fired wake: the first 80 chars of its prompt.
+pub(crate) fn notify_wake_text(prompt: &str) -> String {
+    format!(
+        "wake: {}",
+        prompt.chars().take(NOTIFY_WAKE_CHARS).collect::<String>()
+    )
 }
 
 /// Session title for a submitted task (mirror of the engine's own rule:
@@ -1614,6 +1761,147 @@ mod tests {
             "system prompt and tool specs always count"
         );
         assert!(context.window > 0, "the window is never zero");
+    }
+
+    /// Frames up to and including the first `notify` of `kind`.
+    async fn until_notify(
+        rx: &mut broadcast::Receiver<LiveFrame>,
+        kind: &str,
+    ) -> Vec<serde_json::Value> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut seen = Vec::new();
+            loop {
+                let frame = rx.recv().await.expect("live frame");
+                let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+                let hit = json["type"] == "notify" && json["kind"] == kind;
+                seen.push(json);
+                if hit {
+                    return seen;
+                }
+            }
+        })
+        .await
+        .expect("notify arrives")
+    }
+
+    /// The `notify` frames among `frames`, as (kind, text) pairs.
+    fn notify_pairs(frames: &[serde_json::Value]) -> Vec<(String, String)> {
+        frames
+            .iter()
+            .filter(|f| f["type"] == "notify")
+            .map(|f| {
+                (
+                    f["kind"].as_str().unwrap().to_string(),
+                    f["text"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_notifies_done() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        let mut rx = handle.subscribe();
+        done.send(()).unwrap();
+        let frames = until_notify(&mut rx, "done").await;
+        assert!(frames.iter().any(|f| f["type"] == "turn_done"));
+        let expected = notify_done_text(id);
+        assert_eq!(
+            notify_pairs(&frames),
+            vec![("done".to_string(), expected.clone())]
+        );
+        assert!(expected.starts_with("done: ") && expected.len() == "done: ".len() + 8);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_notifies_failed_with_the_first_error_line() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, failing_run(gate)).unwrap();
+        let mut rx = handle.subscribe();
+        done.send(()).unwrap();
+        let frames = until_notify(&mut rx, "failed").await;
+        assert!(frames.iter().any(|f| f["type"] == "turn_failed"));
+        let error = modron_core::Error::Session("boom".into()).to_string();
+        assert_eq!(
+            notify_pairs(&frames),
+            vec![("failed".to_string(), notify_failed_text(&error))]
+        );
+    }
+
+    #[test]
+    fn notify_texts_are_built_in_one_place_and_cut_short() {
+        let long_error = format!("{}\nsecond line", "e".repeat(200));
+        let failed = notify_failed_text(&long_error);
+        assert_eq!(failed, format!("failed: {}", "e".repeat(120)));
+        let wake = notify_wake_text(&"w".repeat(100));
+        assert_eq!(wake, format!("wake: {}", "w".repeat(80)));
+        assert_eq!(NOTIFY_PLAN_TEXT, "plan ready for review");
+    }
+
+    #[tokio::test]
+    async fn a_proposed_plan_notifies_plan_ready() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        handle
+            .apply_config(&ConfigPatch {
+                phase: Some(Phase::Plan),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        handle.on_persisted(&modron_core::SessionEvent::Plan {
+            items: vec![modron_core::PlanItem {
+                text: "add the parser".into(),
+                done_criteria: "parser tests pass".into(),
+                status: "pending".into(),
+            }],
+        });
+        let mut rx = handle.subscribe();
+        done.send(()).unwrap();
+        let frames = until_notify(&mut rx, "plan").await;
+        assert!(frames.iter().any(|f| f["type"] == "plan_proposed"));
+        // The plan run ended (done), then waits for a decision (plan).
+        assert_eq!(
+            notify_pairs(&frames),
+            vec![
+                ("done".to_string(), notify_done_text(id)),
+                ("plan".to_string(), NOTIFY_PLAN_TEXT.to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_notifies_nothing() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        hub.start_run(id, parked_run(id)).unwrap();
+        let mut rx = handle.subscribe();
+        assert!(handle.interrupt());
+        let frames = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut seen = Vec::new();
+            loop {
+                let frame = rx.recv().await.expect("live frame");
+                let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+                let end = json["type"] == "turn_aborted";
+                seen.push(json);
+                if end {
+                    return seen;
+                }
+            }
+        })
+        .await
+        .expect("turn_aborted arrives");
+        assert!(notify_pairs(&frames).is_empty(), "abort is not a notify");
     }
 
     /// A run that finishes successfully when the test sends on `done`.

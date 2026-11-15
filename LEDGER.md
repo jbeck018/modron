@@ -1423,7 +1423,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | H2 | Enforced plan phase, approve step, per-turn plan re-injection | TODO | |
 | H3 | Sub-agents: approvals to parent, live counters, completion events, cap | TODO | |
 | H4 | Reviewer role + verdict event + non-LLM claim checks | TODO | |
-| H5 | Scheduled wakeups, pause reasons, completion/block notifications | TODO | |
+| H5 | Scheduled wakeups, pause reasons, completion/block notifications | ACTIVE | H5a DONE: Wake / CancelWake / WakeChanged, LiveState.wake, persisted and re-armed at start; Notify for done, failed, plan, wake. Open: H5b Notify for approval requests (three server tests assert ApprovalRequested is followed directly by ApprovalResolved; update them), SessionEvent::Paused, session title in the done text |
 | H6 | Hash-anchored line edits, measured with modron bench | ACTIVE | H6a edit_lines tool + read(line_hashes) DONE, on-demand, approval-gated, edit allow/deny entries cover it. Open: modron bench comparison before any default change |
 | H7 | Reasoning-effort parameter and named model roles | TODO | |
 | H8 | Command and path permission rules + explain command | DONE | H8a matcher, H8b engine gate + [permissions] config, H8c rules reach serve/daemon/acp sessions (shared build path), ConfigPatch.rules / LiveState.rules / ExplainRule. Evals stay rule-free |
@@ -1439,7 +1439,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 |---|---|---|---|
 | C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | DONE | 16ac999; labels in modron-protocol / modron-view, client core delegates |
 | C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | DONE | 43c3dbe; app/theme/oculus.json + check.py. Owner to confirm: chart colours, mono font, tool colour, large radius |
-| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | ACTIVE | C3a DONE: app/ (crate modron-app, own workspace, NSH 0.5.1 no-JS), chat screen over the client core ViewModelSnapshot, terminal host `modron-app-tui` with a demo script, 7 headless tests. Open: tool/turn/sub-agent lines, theme colours, websocket transport, queue chips, plan card, sessions and settings screens |
+| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | ACTIVE | C3a chat screen on the terminal target; C3b client core speaks the v2 frames (steer, queue, plan decision, compact, phase, context label, rules). Open: C3c app wired to a live session over websocket and rendering queue chips, steer echoes, plan card, context label; move compact_tokens into modron-view; theme colours; sessions and settings screens |
 | C4 | Portal: Worker serves the web build; owner sign-in; linked GitHub accounts; session directory; invite links | TODO | Deploy needs the owner's Cloudflare login |
 | C5 | Tandem: multi-device attach, replay on reconnect, push for approvals | TODO | |
 | C6 | Cloud runs: container runs modron serve; sleep/restore; handoff | TODO | Depends on S3; deploy needs the owner's Cloudflare login |
@@ -1494,3 +1494,6 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   terminal target. App gates (in app/): fmt clean, clippy clean, 7
   tests pass. The app is its own workspace, so root gates do not cover
   it yet (C10).
+- 2026-11-15: wave 7. C3b and H5a landed. Gates (root workspace):
+  fmt clean, clippy clean, 1093 tests pass. wasm32 target is not
+  installed here, so the client core wasm check did not run.

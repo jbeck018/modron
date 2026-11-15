@@ -158,6 +158,24 @@ pub enum Payload {
     /// `Note` (`compacted: N -> M tokens`, or the nothing-to-compact note),
     /// then `ContextChanged` with the refreshed gauge.
     Compact { session_id: Uuid },
+    /// Arm a scheduled wake for the session (H5a). One wake per session: a
+    /// new one replaces the old. Exactly one of `after_minutes` (one-shot,
+    /// 1..=10080) or `every_minutes` (recurring, 5..=10080) must be set, and
+    /// `prompt` must not be empty. When the wake fires on an idle session the
+    /// prompt starts a run through the same path a queued follow-up uses; on
+    /// a busy session it is queued. Replies by publishing `WakeChanged` to
+    /// subscribers; bad arguments are an error.
+    Wake {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        every_minutes: Option<u32>,
+        prompt: String,
+    },
+    /// Cancel the session's armed wake (publishes `WakeChanged { wake: None }`).
+    /// Errors when no wake is armed.
+    CancelWake { session_id: Uuid },
     /// Answer a pending approval (first responder wins).
     Approve {
         request_id: String,
@@ -307,6 +325,19 @@ pub enum Payload {
     /// This is the context figure; cumulative tokens are not context.
     /// Snapshot's `LiveState.context` shows the last value on attach.
     ContextChanged { used: u64, window: u64 },
+    /// The session's armed wake changed: set, replaced, cancelled, fired (a
+    /// one-shot clears, a recurring one re-arms with a new `next_at_unix`).
+    /// UI effect: SET the status surface's wake line from `wake` ("wakes in
+    /// 12m", formatted client-side from `next_at_unix`); `None` clears it.
+    /// Snapshot's `LiveState.wake` shows it on attach.
+    WakeChanged { wake: Option<WakeWire> },
+    /// An event worth a push for devices that are not attached (H5a). Never
+    /// rendered in the transcript. UI effect: an attached client MAY show
+    /// `text` as a toast; the relay turns the frame into a push for detached
+    /// devices. Sent for run done / failed, proposed plans and fired wakes;
+    /// never for an interrupt. Approval requests are not notified yet (the
+    /// `approval` kind is reserved).
+    Notify { kind: NotifyKind, text: String },
     /// Config mutated (echo of the applied patch).
     /// UI effect: a `phase` in the patch updates the phase label on the
     /// status surface (`plan` / `build`); a `rules` list replaces the
@@ -671,6 +702,38 @@ pub struct LiveState {
     /// shows the plan decision block on attach. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_pending: bool,
+    /// The session's armed wake (see `WakeChanged`). UI effect: the wake
+    /// line on the status surface. Absent when no wake is armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeWire>,
+}
+
+/// A scheduled wake on the wire (H5a): when it next fires and what it runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeWire {
+    /// Epoch seconds of the next firing.
+    pub next_at_unix: u64,
+    /// Recurrence in minutes; absent for a one-shot wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_minutes: Option<u32>,
+    /// The task the wake runs when it fires.
+    pub prompt: String,
+}
+
+/// Why a `Notify` frame was sent (snake_case on the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyKind {
+    /// An approval is waiting for a decision. Reserved: not sent yet.
+    Approval,
+    /// A run completed.
+    Done,
+    /// A run failed.
+    Failed,
+    /// A plan is ready for review.
+    Plan,
+    /// A scheduled wake fired.
+    Wake,
 }
 
 /// An approval awaiting a decision.
@@ -1156,6 +1219,151 @@ mod tests {
         assert_eq!(json["type"], "context_changed");
         assert_eq!(json["used"], 41_000);
         assert_eq!(json["window"], 128_000);
+    }
+
+    /// Wake / CancelWake (client) and WakeChanged / Notify (server) round-trip
+    /// with snake_case tags; the optional arguments stay off the wire when
+    /// unset, and NotifyKind uses snake_case names.
+    #[test]
+    fn wake_and_notify_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let after = Frame::request(
+            20,
+            Payload::Wake {
+                session_id: session,
+                after_minutes: Some(15),
+                every_minutes: None,
+                prompt: "check the build".into(),
+            },
+        );
+        assert_roundtrip(&after);
+        let json = serde_json::to_value(&after).unwrap();
+        assert_eq!(json["type"], "wake");
+        assert_eq!(json["after_minutes"], 15);
+        assert!(json.get("every_minutes").is_none());
+
+        let every = Frame::request(
+            21,
+            Payload::Wake {
+                session_id: session,
+                after_minutes: None,
+                every_minutes: Some(30),
+                prompt: "poll".into(),
+            },
+        );
+        assert_roundtrip(&every);
+        let json = serde_json::to_value(&every).unwrap();
+        assert_eq!(json["every_minutes"], 30);
+        assert!(json.get("after_minutes").is_none());
+
+        let cancel = Frame::request(
+            22,
+            Payload::CancelWake {
+                session_id: session,
+            },
+        );
+        assert_roundtrip(&cancel);
+        assert_eq!(
+            serde_json::to_value(&cancel).unwrap()["type"],
+            "cancel_wake"
+        );
+
+        let changed = Frame::event(
+            Some(session),
+            23,
+            Payload::WakeChanged {
+                wake: Some(WakeWire {
+                    next_at_unix: 1_800_000_000,
+                    every_minutes: Some(30),
+                    prompt: "poll".into(),
+                }),
+            },
+        );
+        assert_roundtrip(&changed);
+        let json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(json["type"], "wake_changed");
+        assert_eq!(json["wake"]["next_at_unix"], 1_800_000_000u64);
+        assert_eq!(json["wake"]["every_minutes"], 30);
+
+        let cleared = Frame::event(Some(session), 24, Payload::WakeChanged { wake: None });
+        assert_roundtrip(&cleared);
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(json["type"], "wake_changed");
+        assert!(json["wake"].is_null());
+
+        for (kind, tag) in [
+            (NotifyKind::Approval, "approval"),
+            (NotifyKind::Done, "done"),
+            (NotifyKind::Failed, "failed"),
+            (NotifyKind::Plan, "plan"),
+            (NotifyKind::Wake, "wake"),
+        ] {
+            let frame = Frame::event(
+                Some(session),
+                25,
+                Payload::Notify {
+                    kind,
+                    text: "done: abc".into(),
+                },
+            );
+            assert_roundtrip(&frame);
+            let json = serde_json::to_value(&frame).unwrap();
+            assert_eq!(json["type"], "notify");
+            assert_eq!(json["kind"], tag);
+            assert_eq!(json["text"], "done: abc");
+        }
+    }
+
+    /// A WakeWire omits `every_minutes` for a one-shot, and LiveState.wake is
+    /// absent when no wake is armed; an older LiveState without `wake` loads.
+    #[test]
+    fn live_state_wake_is_optional_on_the_wire() {
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("wake").is_none());
+
+        let filled = LiveState {
+            wake: Some(WakeWire {
+                next_at_unix: 42,
+                every_minutes: None,
+                prompt: "later".into(),
+            }),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["wake"]["next_at_unix"], 42);
+        assert!(json["wake"].get("every_minutes").is_none());
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.wake, filled.wake);
+
+        let old: LiveState = serde_json::from_value(serde_json::json!({"running": false})).unwrap();
+        assert!(old.wake.is_none());
+    }
+
+    /// Wake frames that omit the optional arguments still parse (an older
+    /// client), and a Notify without a known kind is rejected.
+    #[test]
+    fn wake_frame_arguments_default_to_none() {
+        let session = Uuid::new_v4();
+        let json = serde_json::json!({
+            "type": "wake",
+            "session_id": session,
+            "prompt": "ping"
+        });
+        let back: Payload = serde_json::from_value(json).unwrap();
+        match back {
+            Payload::Wake {
+                after_minutes,
+                every_minutes,
+                prompt,
+                ..
+            } => {
+                assert!(after_minutes.is_none() && every_minutes.is_none());
+                assert_eq!(prompt, "ping");
+            }
+            other => panic!("expected wake, got {other:?}"),
+        }
+        let bad = serde_json::json!({"type": "notify", "kind": "nope", "text": "x"});
+        assert!(serde_json::from_value::<Payload>(bad).is_err());
     }
 
     #[test]

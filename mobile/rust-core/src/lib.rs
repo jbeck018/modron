@@ -55,7 +55,8 @@ pub use client::{
 };
 pub use error::ClientError;
 pub use view::{
-    approval_mode_label, connection_label, entry_lines, ConnectionState, DecisionOption,
-    OAuthProgressView, PendingApprovalView, RenderedRow, SessionViewModel, ViewModelSnapshot,
-    DECISION_LABELS,
+    approval_mode_label, connection_label, context_label, entry_lines, phase_label,
+    ConnectionState, DecisionOption, OAuthProgressView, PendingApprovalView, PendingPlanView,
+    PlanDecisionOption, RenderedRow, SessionViewModel, ViewModelSnapshot, DECISION_LABELS,
+    PLAN_DECISION_LABELS,
 };

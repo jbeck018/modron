@@ -6,7 +6,8 @@
 use futures_util::{SinkExt, StreamExt};
 use modron_mobile_core::{ClientError, ConnectOptions, KeepaliveConfig, RemoteClient};
 use modron_protocol::{
-    ConfigPatch, Decision, Frame, LiveState, Payload, WireDelta, WireToolActivity, PROTOCOL_VERSION,
+    ConfigPatch, Decision, Frame, LiveState, Payload, PlanDecision, WireDelta, WireToolActivity,
+    PROTOCOL_VERSION,
 };
 use modron_view::{ToolEvent, TranscriptEntry};
 use tokio::net::{TcpListener, TcpStream};
@@ -1665,6 +1666,159 @@ async fn snapshot_replaces_the_approval_queue_and_disconnect_clears_it() {
     // Disconnect clears whatever is queued.
     client.disconnect();
     assert!(client.state().pending_approval.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn send_message_submits_when_idle_and_steers_when_running() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        // Idle: the composer sends a submit for the attached session.
+        match read_frame(&mut ws).await.payload {
+            Payload::Submit {
+                session_id,
+                task,
+                attachments,
+            } => {
+                assert_eq!(session_id, Some(session));
+                assert_eq!(task, "first");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected submit while idle, got {other:?}"),
+        }
+        // The session starts running; the next composer send is a steer.
+        send_frame(
+            &mut ws,
+            &snapshot_frame(
+                session,
+                0,
+                vec![],
+                LiveState {
+                    running: true,
+                    ..LiveState::default()
+                },
+            ),
+        )
+        .await;
+        match read_frame(&mut ws).await.payload {
+            Payload::Steer { session_id, text } => {
+                assert_eq!(session_id, session);
+                assert_eq!(text, "second");
+            }
+            other => panic!("expected steer while running, got {other:?}"),
+        }
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+
+    client.send_message("first").expect("submit");
+    // The server flips the session to running only after it saw the submit.
+    wait_for(&client, |snap| snap.running).await;
+    client.send_message("second").expect("steer while running");
+    server.await.expect("server script ran to the end");
+    client.disconnect();
+}
+
+#[tokio::test]
+async fn queue_plan_and_compact_frames_carry_the_attached_session() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        match read_frame(&mut ws).await.payload {
+            Payload::Enqueue { session_id, text } => {
+                assert_eq!(session_id, session);
+                assert_eq!(text, "later");
+            }
+            other => panic!("expected enqueue, got {other:?}"),
+        }
+        match read_frame(&mut ws).await.payload {
+            Payload::Dequeue { session_id, index } => {
+                assert_eq!(session_id, session);
+                assert_eq!(index, 2);
+            }
+            other => panic!("expected dequeue, got {other:?}"),
+        }
+        match read_frame(&mut ws).await.payload {
+            Payload::DecidePlan {
+                session_id,
+                decision,
+                note,
+            } => {
+                assert_eq!(session_id, session);
+                assert_eq!(decision, PlanDecision::Revise);
+                assert_eq!(note.as_deref(), Some("tighter"));
+            }
+            other => panic!("expected decide_plan, got {other:?}"),
+        }
+        match read_frame(&mut ws).await.payload {
+            Payload::Compact { session_id } => assert_eq!(session_id, session),
+            other => panic!("expected compact, got {other:?}"),
+        }
+        match read_frame(&mut ws).await.payload {
+            Payload::SetConfig { patch } => {
+                assert_eq!(patch.phase, Some(modron_types::Phase::Plan));
+                assert_eq!(patch.model, None, "set_phase sends only the phase");
+            }
+            other => panic!("expected set_config, got {other:?}"),
+        }
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+
+    client.enqueue("later").expect("enqueue");
+    client.dequeue(2).expect("dequeue");
+    client
+        .decide_plan(PlanDecision::Revise, Some("tighter".into()))
+        .expect("decide plan");
+    client.compact().expect("compact");
+    client.set_phase(modron_types::Phase::Plan).expect("phase");
+    server.await.expect("server script ran to the end");
+}
+
+#[tokio::test]
+async fn session_scoped_commands_need_an_attached_session() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    // Nothing attached: the composer's steer and the plan answer refuse
+    // locally instead of sending a frame with no session.
+    assert!(matches!(client.steer("x"), Err(ClientError::Request(_))));
+    assert!(matches!(client.compact(), Err(ClientError::Request(_))));
+    // send_message with no attached session starts a new session.
+    client.send_message("hi").expect("submit without session");
+    client.disconnect();
     server.abort();
 }
 

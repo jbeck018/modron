@@ -32,6 +32,7 @@ pub mod rc;
 pub mod serve;
 pub mod tasks;
 pub mod unix;
+pub mod wake;
 pub mod ws;
 
 pub use dispatch::{ConnCtx, Flow, ServerState};

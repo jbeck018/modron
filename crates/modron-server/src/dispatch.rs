@@ -206,6 +206,8 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
         | Payload::Interrupt { session_id }
         | Payload::Steer { session_id, .. }
         | Payload::Compact { session_id, .. }
+        | Payload::Wake { session_id, .. }
+        | Payload::CancelWake { session_id }
         | Payload::ExplainRule { session_id, .. }
         | Payload::Enqueue { session_id, .. }
         | Payload::Dequeue { session_id, .. }
@@ -670,6 +672,37 @@ pub async fn handle_frame(
         Payload::Compact { session_id } => {
             compact(state, ctx, request_id, session_id).await;
         }
+        Payload::Wake {
+            session_id,
+            after_minutes,
+            every_minutes,
+            prompt,
+        } => match crate::wake::validate(after_minutes, every_minutes, &prompt) {
+            // Arguments are checked before anything is armed; the reply is
+            // the WakeChanged frame the arm publishes.
+            Err(message) => send(ctx, error(request_id, message)),
+            Ok(schedule) => {
+                let armed = crate::wake::set(
+                    state,
+                    session_id,
+                    schedule,
+                    prompt,
+                    crate::wake::system_clock(),
+                )
+                .await;
+                if let Err(message) = armed {
+                    send(ctx, error(request_id, message));
+                }
+            }
+        },
+        Payload::CancelWake { session_id } => {
+            if let Err(message) = crate::wake::cancel(state, session_id) {
+                send(
+                    ctx,
+                    error_kind(request_id, message, modron_protocol::ErrorKind::NotFound),
+                );
+            }
+        }
         Payload::Enqueue { session_id, text } => {
             if text.trim().is_empty() {
                 send(ctx, error(request_id, "queue text is empty"));
@@ -932,7 +965,10 @@ async fn handle_fork(
 /// on demand. A worktree task's session runs its engine INSIDE the task's
 /// worktree: after a server restart the handle is gone, and re-creating it
 /// without the recorded worktree would run the task in the base checkout.
-fn ensure_session_for(state: &Arc<ServerState>, id: SessionId) -> Arc<crate::hub::SessionHandle> {
+pub(crate) fn ensure_session_for(
+    state: &Arc<ServerState>,
+    id: SessionId,
+) -> Arc<crate::hub::SessionHandle> {
     // Every run (Submit, or a queued follow-up) reaches the
     // hub through here, so the queue starter is installed before any run
     // can complete. Weak: the hub must not keep the server state alive.
@@ -1144,6 +1180,7 @@ fn forget_session_state(state: &Arc<ServerState>, session_id: SessionId) {
         tunnel.abort();
     }
     state.tasks.remove(&session_id);
+    crate::wake::forget(state, session_id);
 }
 
 async fn handle_publish_page(
@@ -1703,6 +1740,10 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Compact { .. } => "compact",
         Payload::QueueChanged { .. } => "queue_changed",
         Payload::ContextChanged { .. } => "context_changed",
+        Payload::Wake { .. } => "wake",
+        Payload::CancelWake { .. } => "cancel_wake",
+        Payload::WakeChanged { .. } => "wake_changed",
+        Payload::Notify { .. } => "notify",
         Payload::Approve { .. } => "approve",
         Payload::DecidePlan { .. } => "decide_plan",
         Payload::PlanProposed { .. } => "plan_proposed",
@@ -1808,6 +1849,92 @@ mod tests {
                 models_used: vec![],
             })
         })
+    }
+
+    /// H5a: a `Wake` with bad arguments or a blank prompt is refused with an
+    /// error and arms nothing; a good one arms, and `CancelWake` clears it.
+    #[tokio::test]
+    async fn wake_frames_validate_arguments_then_arm_and_cancel() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("wake").await.unwrap().id;
+        state
+            .store
+            .append(
+                id,
+                &modron_core::SessionEvent::Task {
+                    text: "earlier".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let (mut ctx, mut rx) = authed_ctx();
+        let bad = [
+            (Some(5), Some(5), "x"),
+            (None, None, "x"),
+            (None, Some(4), "x"),
+            (Some(0), None, "x"),
+            (Some(5), None, "   "),
+        ];
+        for (after, every, prompt) in bad {
+            handle_frame(
+                &state,
+                &mut ctx,
+                true,
+                Frame::request(
+                    1,
+                    Payload::Wake {
+                        session_id: id,
+                        after_minutes: after,
+                        every_minutes: every,
+                        prompt: prompt.into(),
+                    },
+                ),
+            )
+            .await;
+            assert!(!error_message(next_outbound(&mut rx).await).is_empty());
+        }
+        assert!(state
+            .hub
+            .handle(&id)
+            .is_none_or(|handle| handle.live_state().wake.is_none()));
+
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                2,
+                Payload::Wake {
+                    session_id: id,
+                    after_minutes: Some(30),
+                    every_minutes: None,
+                    prompt: "check later".into(),
+                },
+            ),
+        )
+        .await;
+        let handle = state.hub.handle(&id).expect("armed session is live");
+        assert_eq!(
+            handle.live_state().wake.map(|wake| wake.prompt),
+            Some("check later".to_string())
+        );
+
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(3, Payload::CancelWake { session_id: id }),
+        )
+        .await;
+        assert!(handle.live_state().wake.is_none());
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(4, Payload::CancelWake { session_id: id }),
+        )
+        .await;
+        assert!(error_message(next_outbound(&mut rx).await).contains("no wake"));
     }
 
     /// H9b: `Compact` on a busy session is refused with a conflict error; the
