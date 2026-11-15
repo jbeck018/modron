@@ -225,18 +225,16 @@ pub const AUTH_WAITING_LABEL: &str = "waiting for the sign-in... esc backs out";
 pub const AUTH_CODE_LABEL: &str = "code";
 pub const AUTH_VISIT_LABEL: &str = "open";
 
-/// Parity D2: the task text the old TUI submitted for its task commands
-/// (crates/modron-tui/src/lib.rs, `SlashCommand::{CodeReview, Btw, Plan,
-/// Learn}`), copied here so every client sends the same words. The old TUI
-/// should import these before it is deleted. ASCII dashes replace its em
-/// dashes.
-pub const REVIEW_TASK: &str = "Review the working tree: run `git diff` (and `git status`), then report findings only - bugs, risks, and gaps, each with file:line references. Do not fix anything.";
+/// Usage lines for the task commands (copy, not prompt text).
 pub const BTW_USAGE: &str = "use /btw <quick question>";
 pub const PLAN_USAGE: &str = "use /plan <task>";
 pub const AGENT_USAGE: &str = "use /agent <name>";
-pub const BTW_SUFFIX: &str =
-    "(Quick side question: answer directly from what you already know - do not use tools.)";
-pub const PLAN_SUFFIX: &str = "(Plan first: produce a concrete, step-by-step plan with file references. Do NOT edit any files yet - wait for approval.)";
+/// The canned task text (REVIEW_TASK, the BTW and PLAN suffixes, btw_task,
+/// plan_task, learn_task, skill_slug) has one home in modron-view's slash
+/// module. Re-exported under the same names so the app keeps compiling.
+pub use modron_view::slash::{
+    btw_task, learn_task, plan_task, skill_slug, BTW_SUFFIX, PLAN_SUFFIX, REVIEW_TASK,
+};
 
 /// Parity D2: app copy moved here so every client shares it. The Ctrl+T
 /// note with no tool rows, the scrolled-up marker, and the second-Ctrl+C
@@ -244,47 +242,6 @@ pub const PLAN_SUFFIX: &str = "(Plan first: produce a concrete, step-by-step pla
 pub const NO_TOOLS_NOTE: &str = "no tool activity yet";
 pub const NEW_OUTPUT_BELOW_LABEL: &str = "new output below - end to follow";
 pub const CTRL_C_QUIT_HINT: &str = "press ctrl+c again to quit";
-
-/// `/btw <question>`: the question with the no-tools suffix.
-pub fn btw_task(question: &str) -> String {
-    format!("{question}\n\n{BTW_SUFFIX}")
-}
-
-/// `/plan <task>`: the task with the plan-first suffix.
-pub fn plan_task(task: &str) -> String {
-    format!("{task}\n\n{PLAN_SUFFIX}")
-}
-
-/// The skill-name slug `/learn` uses: ASCII letters and digits lowercased,
-/// runs of anything else collapsed to one dash, trimmed, at most 48 chars.
-pub fn skill_slug(text: &str) -> String {
-    let mut out = String::new();
-    for ch in text.trim().chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').chars().take(48).collect()
-}
-
-/// `/learn [title]`: distil the session into a skill file (the old TUI's
-/// wording; an empty title names it `session-skill`).
-pub fn learn_task(title: &str) -> String {
-    let slug = skill_slug_or_default(title);
-    format!(
-        "Distill this session into a reusable skill. Write the file .modron/skills/{slug}/SKILL.md with `---` frontmatter (name: {slug}, description: one line) followed by a concise, step-by-step workflow capturing what actually worked here (commands, file paths, pitfalls). Create the directories. Then reply with just the path you wrote."
-    )
-}
-
-fn skill_slug_or_default(title: &str) -> String {
-    skill_slug(if title.is_empty() {
-        "session-skill"
-    } else {
-        title
-    })
-}
 
 /// One credentials row: the core's label and status, verbatim, joined by
 /// `: ` (the same shape as the settings rows).
