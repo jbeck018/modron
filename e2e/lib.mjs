@@ -3,7 +3,7 @@
 // Playwright viewer helpers. No npm installs; Playwright is preinstalled.
 import { spawn } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
-import { cpSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
@@ -37,6 +37,17 @@ export function killAll(signal = 'SIGTERM') {
       try { process.kill(-child.pid, signal); } catch { /* already gone */ }
     }
   }
+}
+
+// Stop one tracked process (by its spawn name, e.g. 'serve-pb') and wait for it.
+export async function stopProc(name, signal = 'SIGTERM', ms = 8000) {
+  const p = procs.find((x) => x.name === name);
+  if (!p) return false;
+  if (p.child.exitCode === null && p.child.signalCode === null) {
+    try { process.kill(-p.child.pid, signal); } catch { /* already gone */ }
+  }
+  await waitUntil(() => p.child.exitCode !== null || p.child.signalCode !== null, ms, `${name} exit`).catch(() => {});
+  return true;
 }
 
 export function liveCount() {
@@ -231,6 +242,22 @@ export class Local {
     return this.waitFor((f) => f.type === 'turn_done' && f.session === sid, ms, 'turn_done', from);
   }
 
+  // Creates an empty session (no run, so the mock script is not consumed).
+  // The reply is a note with the id in the frame's session field.
+  async newSession(title) {
+    const from = this.frames.length;
+    this.send({ type: 'new_session', title });
+    const f = await this.waitFor(
+      (x) => x.type === 'note' && String(x.text).startsWith('session created: '), 15000, 'session created', from,
+    );
+    return f.session;
+  }
+
+  // Frames after `from` whose JSON contains needle.
+  saw(needle, from = 0) {
+    return this.frames.slice(from).some((f) => JSON.stringify(f).includes(needle));
+  }
+
   close() {
     try { this.ws.close(); } catch { /* ignore */ }
   }
@@ -243,8 +270,11 @@ export async function launchBrowser() {
   return chromium.launch({ headless: true, args: ['--no-sandbox'] });
 }
 
-export async function openViewer(browser, url, label) {
+// `cookie` ({ name, value, url }) is set in the new context before the page
+// loads: an owner browser for the owner-only steps (config, shell, steer).
+export async function openViewer(browser, url, label, cookie = null) {
   const ctx = await browser.newContext();
+  if (cookie) await ctx.addCookies([{ name: cookie.name, value: cookie.value, url: cookie.url }]);
   const page = await ctx.newPage();
   const v = { label, ctx, page, sockets: [], errors: [], finalUrl: '', requested: url };
   page.on('websocket', (sock) => {
@@ -263,7 +293,8 @@ export async function openViewer(browser, url, label) {
     if (m.type() === 'error' && !expected.test(m.text())) v.errors.push(m.text());
   });
   page.on('pageerror', (e) => v.errors.push('pageerror: ' + e.message));
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => v.errors.push('goto: ' + e.message));
+  const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => { v.errors.push('goto: ' + e.message); return null; });
+  v.status = resp ? resp.status() : null; // main-document status (a refused invite is 410)
   v.finalUrl = page.url();
   return v;
 }
@@ -342,4 +373,56 @@ export async function api(base, cookie, method, path, body) {
 // Share URLs come back as ws(s)://; a browser needs http(s)://.
 export function toHttp(url) {
   return url.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
+}
+
+// ---- browser helpers for the portal and workflow scenarios -----------------
+
+// Visible text of the page, role=button elements (their text) and the
+// console-error list, for failure evidence.
+export async function snapshotViewer(v) {
+  const text = await bodyText(v);
+  const buttons = await v.page
+    .$$eval('[role=button]', (els) => els.map((e) => (e.innerText || e.textContent || '').trim()).slice(0, 80))
+    .catch(() => ['(could not list buttons)']);
+  return { label: v.label, url: v.page.url(), text: text.slice(0, 4000), buttons, errors: v.errors.slice(-10) };
+}
+
+// The portal's session list, read with the owner cookie from the browser context.
+export async function ownerCookieFrom(v, base) {
+  const cs = await v.ctx.cookies(base);
+  const c = cs.find((x) => x.name === 'modron_owner');
+  return c ? `${c.name}=${c.value}` : null;
+}
+
+// Click the first element whose text contains `text` (portal rows carry
+// "title · host · state" in one line).
+export async function clickContains(v, text, ms = 15000) {
+  await v.page.getByText(text, { exact: false }).first().click({ timeout: ms });
+}
+
+// True while the approval strip shows its allow-once option.
+export function approvalPending(v) {
+  return bodyText(v).then((t) => t.includes('allow once'));
+}
+
+export function inviteUrlIn(text, base) {
+  const m = text.match(/https?:\/\/[^\s]+\/i\/[A-Za-z0-9._-]+|\/i\/[A-Za-z0-9._-]+/);
+  return m ? new URL(m[0], base) : null;
+}
+
+// Normalise ANSI-free terminal text for loose matching (cell redraws drop spaces).
+export function squash(s) {
+  return s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+}
+
+// Newest mtime under a directory (recursive); used to decide whether a
+// prebuilt binary is fresh relative to its sources.
+export function newestMtime(dir) {
+  let newest = 0;
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    const st = statSync(p);
+    newest = Math.max(newest, st.isDirectory() ? newestMtime(p) : st.mtimeMs);
+  }
+  return newest;
 }

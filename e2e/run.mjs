@@ -2,12 +2,14 @@
 // (wrangler dev --local) -> real web app in headless Chromium.
 // Run:  node /home/user/modron/e2e/run.mjs      (see e2e/README.md)
 import { randomBytes } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  Local, SCRATCH, api, bodyText, clickText, copyApp, killAll, launchBrowser, liveCount,
-  openViewer, ownerCookie, refused, sleep, shot, startBridge, startServe, tail, toHttp,
-  typeAndSend, waitBody, waitUntil, wsFrames,
+  freePort, MODRON, REPO, Local, SCRATCH, api, bodyText, clickContains, clickText, copyApp, inviteUrlIn,
+  killAll, launchBrowser, liveCount, newestMtime, openViewer, ownerCookie, ownerCookieFrom, refused, sleep,
+  shot, snapshotViewer, startBridge, startServe, stopProc, tail, toHttp, typeAndSend, waitBody,
+  waitUntil, wsFrames,
 } from './lib.mjs';
 
 const hex = () => randomBytes(16).toString('hex');
@@ -19,8 +21,21 @@ const locals = [];
 const viewers = [];
 const track = (list, x) => { list.push(x); return x; };
 
+// --only S1,P2,W1 (prefixes allowed: S7 runs S7a to S7d, P runs every P step).
+const ONLY = (() => {
+  const i = process.argv.indexOf('--only');
+  return i > 0 && process.argv[i + 1] ? process.argv[i + 1].split(',').map((x) => x.trim()).filter(Boolean) : null;
+})();
+const want = (id) => !ONLY || ONLY.some((o) => id === o || id.startsWith(o));
+function skipScenario(id, title, reason) {
+  if (want(id) || reason !== 'not selected by --only') results.push({ id, title, ok: true, skipped: true, fails: [reason] });
+  if (!want(id)) return;
+  console.log(`\n== ${id}: ${title}\nSKIP ${id} -- ${reason}`);
+}
+
 // Run a step: body(s) records checks; a throw or failed check is a FAIL.
 async function scenario(id, title, body) {
+  if (!want(id)) return;
   const s = { id, fails: [] };
   s.check = (ok, msg) => { if (!ok) s.fails.push(msg); return ok; };
   console.log(`\n== ${id}: ${title}`);
@@ -35,7 +50,7 @@ async function scenario(id, title, body) {
   const ok = s.fails.length === 0;
   results.push({ id, title, ok, fails: s.fails });
   console.log(`${ok ? 'PASS' : 'FAIL'} ${id}${ok ? '' : ' -- ' + s.fails.join(' | ')}`);
-  if (!ok) dumpEvidence(id, s);
+  if (!ok) await dumpEvidence(id, s);
 }
 
 // Every viewer's console errors and page errors fail the step that observed
@@ -62,10 +77,12 @@ async function soft(s, promise, msg) {
   }
 }
 
-function dumpEvidence(id, s) {
+async function dumpEvidence(id, s) {
   const ev = {
     id,
     fails: s.fails,
+    // Each viewer's visible text, its role=button elements and console errors.
+    pages: await Promise.all(viewers.map((v) => snapshotViewer(v).catch((e) => ({ label: v.label, error: e.message })))),
     serveLogs: serves.map((x) => ({ name: x.name, tail: tail(x.log, 40) })),
     bridgeLogs: bridges.map((x) => ({ name: x.name, tail: tail(x.log, 40) })),
     localFrames: locals.map((l) => ({
@@ -82,6 +99,7 @@ function dumpEvidence(id, s) {
   };
   const path = join(SCRATCH, `evidence-${id.split(' ')[0]}.json`);
   writeFileSync(path, JSON.stringify(ev, null, 2));
+  for (const v of viewers) await shot(v, `${id}-${v.label}`);
   console.log(`   evidence: ${path}`);
 }
 
@@ -232,9 +250,12 @@ await scenario('S6b', 'late viewer, history over 96 KB: earlier rows (expected g
 
 // S7: portal mode ----------------------------------------------------------------
 let portal;
+const needPortal = !ONLY || ONLY.some((o) => 'S7'.startsWith(o) || o.startsWith('S7'));
 try {
-  portal = await startBridge('portal', { OWNER_TOKEN: OWNER, HOST_TOKEN: HOST });
-  bridges.push(portal);
+  if (needPortal) {
+    portal = await startBridge('portal', { OWNER_TOKEN: OWNER, HOST_TOKEN: HOST });
+    bridges.push(portal);
+  }
 } catch (e) {
   console.log('FAIL S7 setup: could not start the portal bridge: ' + e.message);
   results.push({ id: 'S7', title: 'portal', ok: false, fails: ['setup: ' + e.message] });
@@ -333,6 +354,337 @@ if (portal) {
   });
 }
 
+// ---- P: portal through the UI (own portal bridge, MODRON_TEST_HOOKS=1) -------
+// P1 signs in and keeps the owner browser (pOwner) for P2 to P4. Each P step
+// needs the one before it (see README).
+let pb = null;                 // portal bridge with the test clock
+let pOwner = null;             // owner browser context, signed in by P1
+let sidA = null, shareA = null, lA = null;   // P1: serve A, history
+let sidB = null, shareB = null, lB = null;   // P2: serve B, driven from the browser
+
+async function ensurePortalHooks() {
+  if (!pb) pb = track(bridges, await startBridge('portal-hooks', { OWNER_TOKEN: OWNER, HOST_TOKEN: HOST, MODRON_TEST_HOOKS: '1' }));
+  return pb;
+}
+
+await scenario('P1', 'portal sign-in through the UI: wrong token refused, right token lists and opens the session', async (s) => {
+  const b = await ensurePortalHooks();
+  const sa = track(serves, await startServe('pa', { bridgeWs: b.ws, hostToken: HOST }));
+  lA = track(locals, new Local(sa));
+  await lA.connect();
+  lA.setAuto(true);
+  sidA = await lA.newSession('e2e portal A');
+  await lA.attach(sidA);
+  await lA.run('e2e portal history', sidA);
+  await lA.turnDone(sidA);
+  shareA = await lA.rc(sidA, b.ws);
+
+  pOwner = track(viewers, await openViewer(browser, b.base + '/', 'owner-ui'));
+  s.check(pOwner.finalUrl.includes('/app/'), `GET / did not land on /app/: ${pOwner.finalUrl}`);
+  await soft(s, waitBody(pOwner, (t) => t.includes('sign in'), 30000, 'sign-in screen'), 'no sign-in screen');
+
+  const box = pOwner.page.getByPlaceholder('owner token');
+  await box.fill('not-the-owner-token');
+  await box.press('Enter');
+  await soft(s, waitBody(pOwner, (t) => t.includes('wrong token'), 20000, 'wrong token message'), 'no "wrong token" message');
+  s.check((await box.inputValue().catch(() => 'unreadable')) === '', 'the token input was not cleared after a wrong token');
+
+  await box.fill(OWNER);
+  await pOwner.page.getByRole('button', { name: 'sign in' }).click({ timeout: 15000 });
+  const cookie = await soft(s, ownerCookieFrom(pOwner, b.base), 'no owner cookie after sign-in');
+  let row = null;
+  if (cookie) {
+    row = await soft(s, waitUntil(async () => {
+      const r = await api(b.base, cookie, 'GET', '/api/sessions');
+      return Array.isArray(r.json) ? r.json.find((x) => x.id === sidA) || null : null;
+    }, 40000, 'session A in /api/sessions'), 'session A never listed by the portal API');
+  }
+  if (row) {
+    await soft(s, waitBody(pOwner, (t) => t.includes(row.title) && t.includes('online'), 30000, 'session A row online'),
+      'the portal list does not show session A as online');
+    await soft(s, clickContains(pOwner, row.title).then(() =>
+      waitBody(pOwner, (t) => t.includes('e2e portal history') && t.includes('connected'), 30000, 'chat with history')),
+    'opening session A did not show its history');
+  }
+  const leak = await pOwner.page.evaluate(() => ({
+    href: location.href, ls: JSON.stringify(localStorage), ss: JSON.stringify(sessionStorage),
+  })).catch(() => null);
+  s.check(leak !== null, 'could not read location and storage');
+  if (leak) {
+    s.check(!leak.href.includes(OWNER), 'owner token appears in location.href');
+    s.check(!leak.ls.includes(OWNER), 'owner token appears in localStorage');
+    s.check(!leak.ss.includes(OWNER), 'owner token appears in sessionStorage');
+  }
+  s.check(!(await bodyText(pOwner)).includes(OWNER), 'owner token appears in the page text');
+  await shot(pOwner, 'p1-owner');
+});
+
+await scenario('P2', 'owner drives through the portal: typed task runs, approval answered in the browser', async (s) => {
+  if (!pOwner || !pb) throw new Error('P1 did not set up the owner browser');
+  const sb = track(serves, await startServe('pb', { bridgeWs: pb.ws, hostToken: HOST }));
+  lB = track(locals, new Local(sb));
+  await lB.connect(); // approvals are NOT auto-answered here
+  sidB = await lB.newSession('e2e portal B');
+  await lB.attach(sidB);
+  shareB = await lB.rc(sidB, pb.ws);
+
+  await pOwner.page.goto(pb.base + '/', { waitUntil: 'domcontentloaded' });
+  await soft(s, waitBody(pOwner, (t) => t.includes('e2e portal B') && t.includes('online'), 40000, 'row B online'),
+    'session B not listed online');
+  await clickContains(pOwner, 'e2e portal B');
+  await soft(s, waitBody(pOwner, (t) => t.includes('connected'), 30000, 'connected'), 'no connected status on session B');
+
+  const from = lB.frames.length;
+  await typeAndSend(pOwner, 'e2e portal drive');
+  const req = await soft(s, lB.waitFor((f) => f.type === 'approval_requested' && f.session === sidB, 60000,
+    'approval_requested', from), 'the browser task never reached an approval');
+  await soft(s, waitBody(pOwner, (t) => t.includes('allow once'), 30000, 'approval strip'), 'approval strip not shown in the browser');
+  await clickText(pOwner, 'allow once');
+  if (req) {
+    await soft(s, lB.waitFor((f) => f.type === 'approval_resolved' && f.request_id === req.request_id, 20000, 'approval_resolved'),
+      'browser "allow once" did not resolve the approval');
+  }
+  lB.setAuto(true); // drain the write and bash approvals that follow
+  await soft(s, lB.turnDone(sidB, 90000, from), 'run did not finish');
+  await soft(s, waitBody(pOwner, (t) => t.includes('e2e portal drive'), 20000, 'task row'), 'task row not shown');
+});
+
+await scenario('P3', 'invite from the UI: guest sees the transcript, cannot submit; revoked link refused', async (s) => {
+  if (!pOwner || !lB) throw new Error('P2 did not set up session B');
+  await clickText(pOwner, 'settings');
+  await soft(s, waitBody(pOwner, (t) => t.includes('share'), 20000, 'share section'), 'no share section in Settings');
+  await clickText(pOwner, 'viewer');
+  const shown = await soft(s, waitBody(pOwner, (t) => /\/i\/[A-Za-z0-9._-]+/.test(t), 20000, 'invite URL'), 'no invite URL shown');
+  const url = shown ? inviteUrlIn(await bodyText(pOwner), pb.base) : null;
+  s.check(!!url, 'could not read the invite URL from the page');
+  if (!url) return;
+
+  const guest = track(viewers, await openViewer(browser, url.href, 'guest-p3')); // fresh context, no cookies
+  s.check(guest.finalUrl.includes('/app/?url='), `invite did not redirect into the app: ${guest.finalUrl}`);
+  await soft(s, waitBody(guest, (t) => t.includes('connected') && t.includes('e2e portal drive'), 30000, 'guest transcript'),
+    'guest does not see the transcript');
+  const mark = lB.frames.length;
+  await typeAndSend(guest, 'e2e guest typed');
+  await soft(s, waitUntil(() => wsFrames(guest, 'in', 'forbidden').length > 0, 15000, 'forbidden'),
+    'no "forbidden" reply to the guest submit');
+  s.check(!lB.saw('e2e guest typed', mark), 'a viewer submit reached the server');
+
+  await soft(s, waitBody(pOwner, (t) => t.includes('revoke'), 20000, 'revoke control'), 'no revoke control in Settings');
+  await clickText(pOwner, 'revoke');
+  await sleep(1500);
+  const again = track(viewers, await openViewer(browser, url.href, 'guest-after-revoke'));
+  await soft(s, waitBody(again, (t) => t.includes('invite is not valid'), 20000, 'refusal text'),
+    'a revoked invite was not refused');
+  // The refused document is a 410 and the browser logs it as a resource error.
+  // That log is the refusal itself, so only this one message is allowed, and
+  // only when the main document answered 410.
+  s.check(again.status === 410, `revoked invite main document answered ${again.status}, not 410`);
+  if (again.status === 410) again.errors = again.errors.filter((e) => !/status of 410/.test(e));
+  s.check(!again.finalUrl.includes('/app/?url='), `revoked invite still redirected into the app: ${again.finalUrl}`);
+});
+
+await scenario('P4', 'offline marking: a stopped serve is listed offline and cannot be opened', async (s) => {
+  if (!pOwner || !shareB || !pb) throw new Error('P2 did not set up session B');
+  await stopProc('serve-pb');
+  // Test clock: this page's /api/sessions reads are six minutes ahead (x-test-now).
+  await pOwner.page.route('**/api/sessions', (route) => route.continue({
+    headers: { ...route.request().headers(), 'x-test-now': String(Date.now() + 6 * 60 * 1000) },
+  }));
+  const socketsBefore = pOwner.sockets.length;
+  await pOwner.page.goto(pb.base + '/', { waitUntil: 'domcontentloaded' });
+  await soft(s, waitBody(pOwner, (t) => t.includes('e2e portal B') && t.includes('offline'), 40000, 'row B offline'),
+    'session B not shown offline after its serve stopped');
+  await clickContains(pOwner, 'e2e portal B').catch(() => {});
+  await sleep(3000);
+  const vkey = shareB.split('/s/')[1];
+  s.check(!pOwner.sockets.slice(socketsBefore).some((so) => so.url.includes(vkey)), 'an offline row opened its viewer socket');
+  s.check(!(await bodyText(pOwner)).includes('connected'), 'an offline row reached the chat');
+  await pOwner.page.unroute('**/api/sessions').catch(() => {});
+});
+
+// ---- W: workflow steps against a real serve (fresh serve per step) ----------
+// Each W step starts its own serve so the mock script (scripted tool turns
+// are consumed once per process) begins at its first turn. The steps run as
+// the portal owner: a share link is read-only for configuration and shell
+// (docs/remote-control.md, dispatch.rs "not allowed on a share link").
+let ownerCk = null;
+async function sharedSession(name, title) {
+  const b = await ensurePortalHooks();
+  const sv = track(serves, await startServe(name, { bridgeWs: b.ws, hostToken: HOST }));
+  const lx = track(locals, new Local(sv));
+  await lx.connect();
+  const sid = await lx.newSession(title);
+  await lx.attach(sid);
+  const share = await lx.rc(sid, b.ws);
+  if (!ownerCk) ownerCk = await ownerCookie(b.base, OWNER);
+  const [ckName, ...ckValue] = ownerCk.split('=');
+  const socketUrl = `${b.ws}/ws/${share.split('/s/')[1]}`;
+  const vw = track(viewers, await openViewer(browser, `${b.base}/app/?url=${encodeURIComponent(socketUrl)}`, name + '-owner',
+    { name: ckName, value: ckValue.join('='), url: b.base }));
+  await waitBody(vw, (t) => t.includes('connected'), 30000, 'connected').catch(() => {});
+  return { sv, lx, sid, vw };
+}
+
+await scenario('W1', 'steer and queue from the browser while an approval waits', async (s) => {
+  const { lx, sid, vw } = await sharedSession('w1', 'e2e w1');
+  const from = lx.frames.length;
+  await typeAndSend(vw, 'e2e steer task');
+  const req = await soft(s, lx.waitFor((f) => f.type === 'approval_requested' && f.session === sid, 60000,
+    'approval_requested', from), 'no approval for the first run');
+  if (!req) return;
+  await soft(s, waitBody(vw, (t) => t.includes('allow once'), 20000, 'approval strip'), 'approval strip not shown');
+  await typeAndSend(vw, 'e2e steer text'); // Enter while running = steer
+  await soft(s, lx.waitFor((f) => f.type === 'steered' && String(f.text).includes('e2e steer text'), 20000, 'steered', from),
+    'no steered frame for the steer');
+  const box = vw.page.getByPlaceholder('Message').first();
+  await box.click({ timeout: 15000 });
+  await box.fill('e2e queued text');
+  await box.press('Alt+Enter'); // queue
+  await soft(s, lx.waitFor((f) => f.type === 'queue_changed' && JSON.stringify(f.queued || []).includes('e2e queued text'), 20000,
+    'queue_changed', from), 'no queue_changed for the queued message');
+  await soft(s, waitBody(vw, (t) => t.includes('e2e queued text'), 20000, 'queue chip'), 'queue chip not shown');
+  await clickText(vw, 'allow all'); // covers the rest of this run (write, bash)
+  await soft(s, waitUntil(() => lx.frames.slice(from).filter((f) => f.type === 'turn_done' && f.session === sid).length >= 2,
+    90000, 'second turn_done'), 'the queued message did not start a run of its own');
+  await soft(s, waitBody(vw, (t) => t.includes('e2e steer text') && !t.includes('[1] e2e queued text'), 20000, 'steer echo'),
+    'steered text not shown as a task echo, or the queue chip stayed');
+});
+
+await scenario('W2', 'plan phase: /plan refuses gated tools in the engine, /build returns to build', async (s) => {
+  const { lx, sid, vw } = await sharedSession('w2', 'e2e w2');
+  lx.setAuto(true); // none expected in plan phase; auto keeps the run moving if one comes
+  const from = lx.frames.length;
+  await typeAndSend(vw, '/plan');
+  await soft(s, lx.waitFor((f) => f.type === 'config_changed' && JSON.stringify(f).includes('plan'), 15000, 'config plan', from),
+    'no config echo for /plan');
+  await soft(s, waitBody(vw, (t) => /\bplan\b/.test(t), 15000, 'plan in status'), 'status line does not show plan');
+  const mark = lx.frames.length;
+  await typeAndSend(vw, 'e2e plan task');
+  await soft(s, lx.turnDone(sid, 90000, mark), 'plan run did not finish');
+  s.check(lx.saw('plan phase: read-only', mark), 'no "plan phase: read-only" refusal in the server frames');
+  s.check(!lx.frames.slice(mark).some((f) => f.type === 'approval_requested'), 'a gated tool asked for approval in plan phase');
+  await vw.page.keyboard.press('Control+t').catch(() => {}); // tool detail panel, for the evidence
+  await sleep(500);
+  await vw.page.keyboard.press('Control+t').catch(() => {});
+  const mark2 = lx.frames.length;
+  await typeAndSend(vw, '/build');
+  await soft(s, lx.waitFor((f) => f.type === 'config_changed' && JSON.stringify(f).includes('build'), 15000, 'config build', mark2),
+    'no config echo for /build');
+});
+
+await scenario('W3', 'settings round trip: effort and approval mode echo into the status line', async (s) => {
+  const { lx, vw } = await sharedSession('w3', 'e2e w3');
+  await clickText(vw, 'settings');
+  await soft(s, waitBody(vw, (t) => t.includes('effort'), 20000, 'settings rows'), 'settings screen did not open');
+  const mark = lx.frames.length;
+  await clickContains(vw, 'effort');
+  await soft(s, lx.waitFor((f) => f.type === 'config_changed' && JSON.stringify(f).includes('low'), 15000, 'effort echo', mark),
+    'server did not echo effort low');
+  await clickContains(vw, 'approval mode');
+  await soft(s, lx.waitFor((f) => f.type === 'config_changed', 15000, 'mode echo', mark + 1), 'server did not echo the mode change');
+  await sleep(500);
+  await vw.page.keyboard.press('Escape');
+  await soft(s, waitBody(vw, (t) => t.includes('effort low') && t.includes('yolo'), 20000, 'status line'),
+    'status line does not show "effort low" and "yolo" after the echo');
+});
+
+await scenario('W4', 'shell passthrough: approval, output in transcript; /mode deny refuses', async (s) => {
+  const { lx, sid, vw } = await sharedSession('w4', 'e2e w4');
+  lx.setAuto(false);
+  const from = lx.frames.length;
+  await typeAndSend(vw, '!echo e2e-shell-ok');
+  const req = await soft(s, lx.waitFor((f) => f.type === 'approval_requested' && f.session === sid, 30000, 'shell approval', from),
+    'the shell command asked for no approval');
+  await soft(s, waitBody(vw, (t) => t.includes('allow once'), 20000, 'approval strip'), 'approval strip not shown for shell');
+  await clickText(vw, 'allow once');
+  if (req) await soft(s, lx.waitFor((f) => f.type === 'approval_resolved' && f.request_id === req.request_id, 15000, 'resolved', from), 'shell approval not resolved');
+  await soft(s, lx.turnDone(sid, 60000, from), 'shell turn did not finish');
+  await soft(s, waitUntil(async () => {
+    const t = await bodyText(vw);
+    return /(^|\n)\s*e2e-shell-ok\s*(\n|$)/.test(t) && !t.includes('allow once');
+  }, 20000, 'shell output'), 'shell output not shown in the transcript');
+
+  await typeAndSend(vw, '/mode deny');
+  await soft(s, lx.waitFor((f) => f.type === 'config_changed', 15000, 'mode deny echo', from), 'no config echo for /mode deny');
+  const mark = lx.frames.length;
+  await typeAndSend(vw, '!echo e2e-shell-denied');
+  await soft(s, lx.turnDone(sid, 60000, mark), 'denied shell turn did not finish');
+  s.check(!lx.frames.slice(mark).some((f) => f.type === 'approval_requested'), 'deny mode still asked for approval');
+  const refusal = lx.frames.slice(mark).some((f) => /denied|refus|not allowed|deny/i.test(JSON.stringify(f)));
+  s.check(refusal, 'no refusal reached the server frames for the denied shell command');
+});
+
+await scenario('W5', 'sessions screen: a new session, then back to the first, each with its own transcript', async (s) => {
+  const { lx, sid, vw } = await sharedSession('w5', 'e2e w5 first');
+  lx.setAuto(true);
+  await lx.run('e2e w5 first history', sid);
+  await lx.turnDone(sid);
+  await soft(s, waitBody(vw, (t) => t.includes('e2e w5 first history'), 30000, 'first history'), 'first history not shown');
+
+  await vw.page.keyboard.press('Control+o');
+  await soft(s, waitBody(vw, (t) => t.includes('new session') && t.includes('e2e w5 first'), 20000, 'sessions list'),
+    'Ctrl+O did not show the sessions list');
+  await clickText(vw, 'new session');
+  await typeAndSend(vw, 'e2e w5 second');
+  await soft(s, waitBody(vw, (t) => t.includes('e2e w5 second'), 30000, 'second transcript'), 'second session transcript not shown');
+  s.check(!(await bodyText(vw)).includes('e2e w5 first history'), 'the new session shows the first transcript');
+
+  await vw.page.keyboard.press('Control+o');
+  await soft(s, waitBody(vw, (t) => t.includes('e2e w5 first'), 20000, 'first row'), 'the list does not show the first session');
+  await clickContains(vw, 'e2e w5 first');
+  await soft(s, waitBody(vw, (t) => t.includes('e2e w5 first history'), 20000, 'first transcript back'),
+    'switching back did not show the first transcript');
+  s.check(!(await bodyText(vw)).includes('e2e w5 second'), 'the first session shows the second transcript');
+});
+
+await scenario('W6', 'compact: /compact on a session with history shows a before/after or nothing-to-compact note', async (s) => {
+  const { lx, sid, vw } = await sharedSession('w6', 'e2e w6');
+  lx.setAuto(true);
+  await lx.run('e2e w6 history', sid);
+  await lx.turnDone(sid);
+  await soft(s, waitBody(vw, (t) => t.includes('e2e w6 history'), 30000, 'history'), 'history not shown');
+  const mark = lx.frames.length;
+  await typeAndSend(vw, '/compact');
+  const note = await soft(s, lx.waitFor((f) => f.type === 'note' && /compact/.test(String(f.text)), 30000, 'compact note', mark),
+    'no compact note from the server');
+  if (note) {
+    s.check(/nothing to compact|compacted: \d+ -> \d+ tokens/.test(note.text), `unexpected compact note: ${note.text}`);
+    await soft(s, waitBody(vw, (t) => /nothing to compact|compacted: \d+ -> \d+/.test(t), 20000, 'compact note shown'),
+      'compact note not shown in the browser');
+  }
+});
+
+// ---- T1: terminal app under a pty (only with a fresh binary) -----------------
+const TUI_BIN = join(REPO, 'app/target/debug/modron-app-tui');
+const tuiFresh = existsSync(TUI_BIN) && newestMtime(join(REPO, 'app/src')) < statSync(TUI_BIN).mtimeMs;
+if (!want('T1')) {
+  // not selected: nothing to report
+} else if (!tuiFresh) {
+  skipScenario('T1', 'terminal app under a pty',
+    existsSync(TUI_BIN) ? 'modron-app-tui is older than app/src (not built here; build is not allowed)' : 'modron-app-tui not built');
+} else {
+  await scenario('T1', 'terminal app under a pty: starts the server, approval, Esc denies, Ctrl+C twice exits', async (s) => {
+    const port = await freePort();
+    const home = join(SCRATCH, 'h-tui');
+    const work = join(home, 'w');
+    mkdirSync(work, { recursive: true });
+    const cfgPath = join(SCRATCH, 'tui-pty.cfg.json');
+    const out = join(SCRATCH, 'tui-pty.json');
+    writeFileSync(cfgPath, JSON.stringify({ bin: TUI_BIN, serve_bin: MODRON, url: `ws://127.0.0.1:${port}`, home, cwd: work, out }));
+    const run = spawnSync('python3', ['-I', join(REPO, 'e2e/tui_pty.py'), cfgPath], { timeout: 170000, encoding: 'utf8' });
+    if (!existsSync(out)) throw new Error(`pty driver produced no output: ${run.stderr || run.error}`);
+    const r = JSON.parse(readFileSync(out, 'utf8'));
+    s.check(r.connected, 'the app never showed "connected"');
+    s.check(r.approval, 'the typed task never reached an approval prompt');
+    s.check(r.deny_seen, 'no deny/refusal text after Esc');
+    s.check(r.exit_code === 0, `the app did not exit 0 after Ctrl+C twice (exit ${r.exit_code}, still running: ${r.still_running})`);
+    s.check(r.resume_line, 'the resume line (--session) was not printed');
+    s.check(r.serve_left.length === 0, `server process left behind: ${r.serve_left.join(' | ')}`);
+    s.check(!r.still_running, 'the app was still running after Ctrl+C twice');
+    console.log(`   tui tail: ${r.tail.slice(-400).replace(/\s+/g, ' ')}`);
+  });
+}
+
 // ---- wrap up ----------------------------------------------------------------------
 await browser.close().catch(() => {});
 killAll('SIGTERM');
@@ -340,10 +692,11 @@ await sleep(2000);
 killAll('SIGKILL');
 await sleep(500);
 
-const failed = results.filter((r) => !r.ok);
+const failed = results.filter((r) => !r.ok && !r.skipped);
 console.log('\n== summary');
-for (const r of results) console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.id} ${r.title}`);
-console.log(`${results.length - failed.length}/${results.length} passed; left-over tracked processes: ${liveCount()}`);
+for (const r of results) console.log(`${r.skipped ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'} ${r.id} ${r.title}${r.skipped ? ' -- ' + r.fails[0] : ''}`);
+const skipped = results.filter((r) => r.skipped).length;
+console.log(`${results.length - failed.length - skipped}/${results.length} passed, ${failed.length} failed, ${skipped} skipped; left-over tracked processes: ${liveCount()}`);
 writeFileSync(join(SCRATCH, 'results.json'), JSON.stringify(results, null, 2));
 console.log(`results: ${join(SCRATCH, 'results.json')}`);
 process.exit(failed.length ? 1 : 0);
