@@ -141,6 +141,15 @@ pub enum Payload {
     /// run continues. An idle session refuses it (submit instead). Replies
     /// `Steered` on success; the injected text persists as a `Task` event.
     Steer { session_id: Uuid, text: String },
+    /// Hold a message for the session's NEXT run. While a run is active the
+    /// server keeps it in the session queue and starts it as a new run when
+    /// the current run finishes successfully (never after a failure or an
+    /// interrupt). Replies `QueueChanged` to the session's subscribers. An
+    /// idle session starts the run at once, exactly like `Submit`.
+    Enqueue { session_id: Uuid, text: String },
+    /// Remove one queued message by its position (0 = next to run). Replies
+    /// `QueueChanged`; an out-of-range index is an error.
+    Dequeue { session_id: Uuid, index: u32 },
     /// Answer a pending approval (first responder wins).
     Approve {
         request_id: String,
@@ -252,6 +261,12 @@ pub enum Payload {
     /// persisted `Event { event: SessionEvent::Task }` arrives with the same
     /// text, which replaces the pending echo in transcript order.
     Steered { text: String },
+    /// The session's queue changed (enqueue, dequeue, or a queued message
+    /// starting its run). `queued` is the full list, front first.
+    /// UI effect: REPLACE the queue chips above the composer with `queued`
+    /// (an empty list clears them). Snapshot's `LiveState.queued` resets
+    /// them the same way on attach.
+    QueueChanged { queued: Vec<String> },
     /// Config mutated (echo of the applied patch).
     ConfigChanged { patch: ConfigPatch },
     /// Answer to `list_sessions`.
@@ -522,6 +537,11 @@ pub struct LiveState {
     pub provider: String,
     /// Standing goal (the /goal command).
     pub goal: String,
+    /// Messages held for the next run, front first (see `Enqueue`). UI
+    /// effect: the queue chips above the composer; `QueueChanged` replaces
+    /// them. Omitted on the wire when empty (older peers never send it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<String>,
     /// The server's approval mode (see the struct docs: sets the label).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<ApprovalModeWire>,
@@ -946,6 +966,70 @@ mod tests {
         let json = serde_json::to_value(&steered).unwrap();
         assert_eq!(json["type"], "steered");
         assert_eq!(json["text"], "use the other crate");
+    }
+
+    /// Enqueue / Dequeue (client) and QueueChanged (server) round-trip with
+    /// snake_case tags, and an older LiveState without `queued` still loads.
+    #[test]
+    fn queue_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let enqueue = Frame::request(
+            11,
+            Payload::Enqueue {
+                session_id: session,
+                text: "then run the tests".into(),
+            },
+        );
+        assert_roundtrip(&enqueue);
+        let json = serde_json::to_value(&enqueue).unwrap();
+        assert_eq!(json["type"], "enqueue");
+        assert_eq!(json["text"], "then run the tests");
+
+        let dequeue = Frame::request(
+            12,
+            Payload::Dequeue {
+                session_id: session,
+                index: 1,
+            },
+        );
+        assert_roundtrip(&dequeue);
+        let json = serde_json::to_value(&dequeue).unwrap();
+        assert_eq!(json["type"], "dequeue");
+        assert_eq!(json["index"], 1);
+
+        let changed = Frame::event(
+            Some(session),
+            13,
+            Payload::QueueChanged {
+                queued: vec!["a".into(), "b".into()],
+            },
+        );
+        assert_roundtrip(&changed);
+        let json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(json["type"], "queue_changed");
+        assert_eq!(json["queued"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn live_state_queued_is_omitted_when_empty_and_optional_on_read() {
+        let empty = LiveState::default();
+        let json = serde_json::to_value(&empty).unwrap();
+        assert!(json.get("queued").is_none());
+
+        let filled = LiveState {
+            queued: vec!["next".into()],
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["queued"], serde_json::json!(["next"]));
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.queued, vec!["next".to_string()]);
+
+        // A LiveState from an older peer (no `queued` key) still loads.
+        let old: LiveState =
+            serde_json::from_str(r#"{"running":true,"model":"m"}"#).expect("old live state loads");
+        assert!(old.running);
+        assert!(old.queued.is_empty());
     }
 
     #[test]

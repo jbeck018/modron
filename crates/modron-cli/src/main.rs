@@ -1229,6 +1229,7 @@ fn build_agent_with(
         },
         max_cost_usd: cli.max_cost,
         steer: None,
+        phase: modron_core::Phase::Build,
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),

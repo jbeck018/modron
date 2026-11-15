@@ -15,9 +15,9 @@ use crate::permissions::{RuleEffect, RuleSet, Verdict};
 use crate::speculative;
 use crate::{
     estimate_tokens, judge, ActionKind, ApprovalMode, Engine, Error, JudgeMode, Message,
-    ModelChoice, ModelProvider, Result, Role, RunSummary, SelectRequest, SessionEvent, SessionId,
-    StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome, ToolSpec, TurnRequest,
-    TurnResponse, Usage,
+    ModelChoice, ModelProvider, Phase, Result, Role, RunSummary, SelectRequest, SessionEvent,
+    SessionId, StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome, ToolSpec,
+    TurnRequest, TurnResponse, Usage,
 };
 use std::sync::Arc;
 
@@ -74,6 +74,45 @@ fn has_http_status_prefix(message: &str, code: &str) -> bool {
 /// [`MUTATING_TOOLS`] or any `mcp__`-prefixed tool.
 fn is_gated(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name) || name.starts_with("mcp__")
+}
+
+/// The refusal a gated tool gets in [`Phase::Plan`] (H2a).
+const PLAN_PHASE_REFUSAL: &str =
+    "plan phase: read-only. Explore with read/grep/glob, then record the plan with the plan tool and stop.";
+
+/// The transient per-turn plan message (H2a), built into the TurnRequest
+/// only: `Current plan:` plus one `[status] text` line per item (with the
+/// done criteria when present), then the phase line in Plan phase. `None`
+/// when there is nothing to say (Build phase with no plan).
+fn plan_tail_message(phase: Phase, plan: Option<&[modron_types::PlanItem]>) -> Option<Message> {
+    let mut lines: Vec<String> = Vec::new();
+    let has_plan = plan.is_some_and(|items| !items.is_empty());
+    if let Some(items) = plan.filter(|items| !items.is_empty()) {
+        lines.push("Current plan:".to_string());
+        for item in items {
+            let mut line = format!("[{}] {}", item.status, item.text);
+            if !item.done_criteria.trim().is_empty() {
+                line.push_str(&format!(" (done: {})", item.done_criteria.trim()));
+            }
+            lines.push(line);
+        }
+    }
+    if phase == Phase::Plan {
+        if has_plan {
+            lines.push("Phase: plan (read-only).".to_string());
+        } else {
+            lines.push(
+                "This session is in plan phase (read-only) and must end by recording a plan \
+                 with the plan tool."
+                    .to_string(),
+            );
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(Message::user(lines.join("\n")))
+    }
 }
 
 /// The approval policy's verdict on one tool name, before any prompt (A5).
@@ -320,6 +359,10 @@ struct RunLoopState {
     /// Why the loop ended (`end_turn` / `max_turns` / `spend_cap` /
     /// `budget_exhausted`) — the terminal TurnTrace's failure label.
     stop_label: &'static str,
+    /// The run's current plan (H2a): the latest `Plan` event, loaded at run
+    /// start and refreshed after any turn whose tools included `plan`. It
+    /// feeds the transient per-turn tail message only, never the transcript.
+    current_plan: Option<Vec<modron_types::PlanItem>>,
 }
 
 impl RunLoopState {
@@ -342,6 +385,7 @@ impl RunLoopState {
             run_tier_override: None,
             last_dispatch_ended_with_passing_verify: false,
             stop_label: "end_turn",
+            current_plan: None,
         }
     }
 }
@@ -389,7 +433,7 @@ impl Engine {
             )
             .await?;
         let transcript = vec![Message::user_with_attachments(task, attachments)];
-        self.run_loop(meta.id, task, transcript).await
+        self.run_loop(meta.id, task, transcript, None).await
     }
 
     /// Continue an existing session in the SAME session id (LEDGER L1
@@ -452,6 +496,9 @@ impl Engine {
         // rewrite also trims a rewind tail.
         let pruned = prune_unanswered_tool_calls(sliced);
         let mut transcript = reconstruct_transcript(&pruned, self.config.compaction.tail_messages);
+        // The run's starting plan comes from the same (rewound) events the
+        // transcript was rebuilt from.
+        let initial_plan = latest_plan(&pruned).filter(|items| !items.is_empty());
         self.store
             .append(
                 session_id,
@@ -461,7 +508,8 @@ impl Engine {
             )
             .await?;
         transcript.push(Message::user_with_attachments(task, attachments));
-        self.run_loop(session_id, task, transcript).await
+        self.run_loop(session_id, task, transcript, initial_plan)
+            .await
     }
 
     /// Shared turn loop for fresh and resumed runs. `task` is the current
@@ -479,6 +527,7 @@ impl Engine {
         session_id: SessionId,
         task: &str,
         transcript: Vec<Message>,
+        initial_plan: Option<Vec<modron_types::PlanItem>>,
     ) -> Result<RunSummary> {
         let tool_specs = self.tools.specs_prompt();
         let system = self.assemble_system(&tool_specs);
@@ -487,6 +536,7 @@ impl Engine {
         // instability (cache busts), visible in TurnTrace records.
         let prompt_hash = prompt_wire_hash(&system, &tool_specs);
         let mut state = RunLoopState::new(transcript, self.config.max_total_tokens);
+        state.current_plan = initial_plan;
 
         loop {
             if state.turns >= self.config.max_turns {
@@ -664,6 +714,11 @@ impl Engine {
                 &mut state,
             )
             .await?;
+            // A `plan` write this turn replaces the current plan: re-read it
+            // from the log so the next turn's tail shows the new value.
+            if turn.response.tool_calls.iter().any(|c| c.name == "plan") {
+                state.current_plan = self.load_current_plan(session_id).await?;
+            }
 
             // A main turn completed: it counts toward the compaction
             // min-interval (the compaction call itself is not a turn).
@@ -681,6 +736,28 @@ impl Engine {
         }
 
         self.finalize_run(session_id, &mut state).await
+    }
+
+    /// The session's current plan: the latest `Plan` event, `None` when no
+    /// non-empty plan has been recorded.
+    async fn load_current_plan(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<Vec<modron_types::PlanItem>>> {
+        let events = self.store.load(session_id).await?;
+        Ok(latest_plan(&events).filter(|items| !items.is_empty()))
+    }
+
+    /// The messages for one model turn (H2a): the transcript plus, when
+    /// there is a plan or the run is in Plan phase, the transient tail
+    /// message. The tail lives only in the request; the transcript and the
+    /// persisted log never see it.
+    fn turn_messages(&self, state: &RunLoopState) -> Vec<Message> {
+        let mut messages = state.transcript.clone();
+        if let Some(tail) = plan_tail_message(self.config.phase, state.current_plan.as_deref()) {
+            messages.push(tail);
+        }
+        messages
     }
 
     /// True when a steer message is queued for the active run.
@@ -878,7 +955,7 @@ impl Engine {
             let request = std::sync::Arc::new(TurnRequest {
                 model: model.clone(),
                 system: system.to_string(),
-                messages: state.transcript.clone(),
+                messages: self.turn_messages(state),
                 tools: tool_specs.to_vec(),
                 max_tokens: MAX_OUTPUT_TOKENS,
             });
@@ -1519,6 +1596,12 @@ impl Engine {
         if listed(&self.config.approvals.deny) {
             return Admission::Refused(format!("tool `{name}` denied by configuration (--deny)"));
         }
+        // Plan phase (H2a): read-only by construction. Checked before the
+        // permission rules and the ApproveAll fast path, so no allow rule
+        // or mode can lift it. Ungated tools fall through and still run.
+        if self.config.phase == Phase::Plan && is_gated(name) {
+            return Admission::Refused(PLAN_PHASE_REFUSAL.to_string());
+        }
         // Permission rules come after the deny list and before the mode
         // fast path. No verdict, or an `allow` in Deny mode, falls through.
         if let Some(verdict) = verdict {
@@ -1696,6 +1779,11 @@ impl Engine {
         session_id: SessionId,
         state: &mut RunLoopState,
     ) -> Result<bool> {
+        // Plan phase (H2a) is read-only and ends with a recorded plan, not a
+        // verified change: no verify, self-check or escalation runs.
+        if self.config.phase == Phase::Plan {
+            return Ok(false);
+        }
         if !state.mutated_this_run {
             return Ok(false);
         }
@@ -1916,7 +2004,7 @@ impl Engine {
         let request = std::sync::Arc::new(TurnRequest {
             model: model.clone(),
             system: format!("{system}{ESCALATION_SYSTEM_ADDENDUM}"),
-            messages: state.transcript.clone(),
+            messages: self.turn_messages(state),
             // No tools: see the doc comment — a tool call the harness
             // cannot service must not be provoked.
             tools: Vec::new(),
@@ -2317,9 +2405,9 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
             | SessionEvent::Usage { .. } => {}
-            // The plan is not a conversation message: the context builder
-            // re-injects the latest plan every turn (the stays-on-track
-            // mechanism), so raw plan writes stay out of the transcript.
+            // The plan is not a conversation message: `run_loop` re-injects
+            // the current plan as a transient tail on every turn (H2a), so
+            // raw plan writes stay out of the transcript.
             SessionEvent::Plan { .. } => {}
         }
     }
@@ -2344,7 +2432,9 @@ fn reconstruct_transcript(events: &[SessionEvent], tail_messages: usize) -> Vec<
             SessionEvent::Compaction { summary, .. } => Some((idx, summary)),
             _ => None,
         });
-    let mut messages = match last_compaction {
+    // The standing plan is not replayed here: `run_loop` re-injects the
+    // current plan as a transient tail on every model turn (H2a).
+    match last_compaction {
         None => events_to_messages(events),
         Some((idx, summary)) => {
             let mut messages = vec![compact_state_message(summary)];
@@ -2353,27 +2443,7 @@ fn reconstruct_transcript(events: &[SessionEvent], tail_messages: usize) -> Vec<
             messages.extend(events_to_messages(&events[idx + 1..]));
             messages
         }
-    };
-    // The standing plan rides at the end of every turn (the
-    // stays-on-track mechanism): the model re-reads its own commitments
-    // before responding. One message; no plan writes to the transcript.
-    if let Some(items) = latest_plan(events) {
-        if !items.is_empty() {
-            let mut body =
-                String::from("[standing plan - keep statuses current via the plan tool]\n");
-            for (ix, item) in items.iter().enumerate() {
-                body.push_str(&format!(
-                    "{}. [{}] {} - {}\n",
-                    ix + 1,
-                    item.status,
-                    item.text,
-                    item.done_criteria
-                ));
-            }
-            messages.push(Message::user(body));
-        }
     }
-    messages
 }
 
 /// The most recent plan in the log, if any.
@@ -3977,5 +4047,265 @@ mod tests {
             result.is_err(),
             "a provider error on a later turn must propagate, got {result:?}"
         );
+    }
+
+    /// Plan-phase fixtures (H2a). `PlanWriteTool` appends a plan to the
+    /// run's log the way the real `plan` tool does (the engine supplies the
+    /// session through the tool context).
+    struct PlanWriteTool;
+    #[async_trait]
+    impl Tool for PlanWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "plan".into(),
+                description: "test plan".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+            let (Some(engine), Some(session)) = (ctx.engine.as_ref(), ctx.session_id) else {
+                return Ok(ToolOutcome::err("no session in context"));
+            };
+            engine
+                .store
+                .append(
+                    session,
+                    &SessionEvent::Plan {
+                        items: plan_items(),
+                    },
+                )
+                .await?;
+            Ok(ToolOutcome::ok("plan set"))
+        }
+    }
+
+    fn plan_items() -> Vec<modron_types::PlanItem> {
+        vec![
+            modron_types::PlanItem {
+                text: "map the crate".into(),
+                done_criteria: "crate listed".into(),
+                status: "done".into(),
+            },
+            modron_types::PlanItem {
+                text: "draft the fix".into(),
+                done_criteria: String::new(),
+                status: "pending".into(),
+            },
+        ]
+    }
+
+    const PLAN_TAIL: &str = "Current plan:\n[done] map the crate (done: crate listed)\n[pending] draft the fix\nPhase: plan (read-only).";
+
+    fn plan_config(approvals: crate::ApprovalPolicy) -> EngineConfig {
+        EngineConfig {
+            phase: Phase::Plan,
+            approvals,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn plan_phase_refuses_gated_tools_even_under_approve_all_and_allow_rules() {
+        let approve_all_plan = admission_engine(plan_config(approve_all()));
+        assert_eq!(
+            admission_tag(&approve_all_plan.admission_for_call("write", &json!({}))),
+            format!("refused: {PLAN_PHASE_REFUSAL}")
+        );
+        assert_eq!(
+            admission_tag(&approve_all_plan.admission("bash")),
+            format!("refused: {PLAN_PHASE_REFUSAL}"),
+            "every gated tool is refused, not just write"
+        );
+        let allow_rule_plan = admission_engine(plan_config(crate::ApprovalPolicy {
+            mode: ApprovalMode::Ask,
+            rules: rules_of(&[(crate::permissions::RuleEffect::Allow, "write")]),
+            ..crate::ApprovalPolicy::default()
+        }));
+        assert_eq!(
+            admission_tag(&allow_rule_plan.admission_for_call("write", &json!({"path": "a"}))),
+            format!("refused: {PLAN_PHASE_REFUSAL}"),
+            "an allow rule cannot lift the plan-phase refusal"
+        );
+    }
+
+    /// Engine with no tools or script, for admission-level checks.
+    fn admission_engine(config: EngineConfig) -> Engine {
+        engine_over(Vec::new(), config, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn plan_phase_never_runs_a_gated_tool() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write = Arc::new(CountingTool {
+            name: "write",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call("write"), text("done")],
+            plan_config(approve_all()),
+            vec![write],
+        );
+        let summary = engine.run_task("plan it").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(summary.answer, "done");
+    }
+
+    #[tokio::test]
+    async fn plan_phase_still_runs_ungated_tools() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read = Arc::new(CountingTool {
+            name: "read",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call("read"), text("done")],
+            plan_config(crate::ApprovalPolicy::default()),
+            vec![read],
+        );
+        engine.run_task("explore").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn build_phase_runs_gated_tools_under_approve_all() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write = Arc::new(CountingTool {
+            name: "write",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call("write"), text("done")],
+            approve_all_config(),
+            vec![write],
+        );
+        engine.run_task("build it").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn plan_tail_message_shapes() {
+        let items = plan_items();
+        let plan_with = plan_tail_message(Phase::Plan, Some(&items)).unwrap();
+        assert_eq!(plan_with.content, PLAN_TAIL);
+        let build_with = plan_tail_message(Phase::Build, Some(&items)).unwrap();
+        assert_eq!(
+            build_with.content,
+            PLAN_TAIL.replace("\nPhase: plan (read-only).", "")
+        );
+        let plan_none = plan_tail_message(Phase::Plan, None).unwrap();
+        assert_eq!(
+            plan_none.content,
+            "This session is in plan phase (read-only) and must end by recording a plan with the plan tool."
+        );
+        assert!(plan_tail_message(Phase::Build, None).is_none());
+        assert!(plan_tail_message(Phase::Build, Some(&[])).is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_tail_is_transient_and_refreshed_after_a_plan_write() {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(PlanWriteTool));
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![
+            call("plan"),
+            text("done"),
+        ]));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: plan_config(crate::ApprovalPolicy::default()),
+        };
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.turns, 2);
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        // Turn 1: no plan yet, so the tail only states the phase; the
+        // request is the task plus that tail.
+        let first = &requests[0].messages;
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            first.last().unwrap().content,
+            "This session is in plan phase (read-only) and must end by recording a plan with the plan tool."
+        );
+        // Turn 2: the plan written during turn 1 is in the tail, last.
+        let second = &requests[1].messages;
+        assert_eq!(second.len(), 4, "task, plan call, plan result, tail");
+        assert_eq!(second.last().unwrap().content, PLAN_TAIL);
+
+        // The tail is never persisted: no event carries it.
+        let session = engine.store.list().await.unwrap()[0].id;
+        let events = engine.store.load(session).await.unwrap();
+        let dump = format!("{events:?}");
+        assert!(!dump.contains("Current plan:"), "tail leaked into the log");
+        assert!(
+            !dump.contains("plan phase (read-only)"),
+            "tail leaked into the log"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Plan { .. })),
+            "the plan itself is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_run_gets_the_plan_tail_not_a_transcript_copy() {
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![text(
+            "continued",
+        )]));
+        let mut providers: std::collections::HashMap<String, Arc<dyn ModelProvider>> =
+            std::collections::HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                phase: Phase::Build,
+                ..EngineConfig::default()
+            },
+        };
+        let session = engine.store.create_session("resume").await.unwrap().id;
+        engine
+            .store
+            .append(
+                session,
+                &SessionEvent::Task {
+                    text: "first".into(),
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .store
+            .append(
+                session,
+                &SessionEvent::Plan {
+                    items: plan_items(),
+                },
+            )
+            .await
+            .unwrap();
+        engine.run_task_resuming(session, "again").await.unwrap();
+
+        let requests = mock.requests();
+        let messages = &requests[0].messages;
+        // Task, the new task, and exactly one plan tail: the plan is not
+        // also replayed as a transcript message.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages.last().unwrap().content,
+            PLAN_TAIL.replace("\nPhase: plan (read-only).", "")
+        );
+        assert!(messages
+            .iter()
+            .all(|m| !m.content.contains("standing plan")));
     }
 }

@@ -12,12 +12,12 @@
 //! one mutex, so frames from any task (engine sinks, approval resolutions)
 //! are strictly ordered per session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use async_trait::async_trait;
 use modron_core::{
@@ -36,6 +36,17 @@ use uuid::Uuid;
 /// Broadcast-channel capacity per session (frames, not bytes). A client
 /// slower than 1024 queued frames is lagged and must re-attach.
 const CHANNEL_CAPACITY: usize = 1024;
+
+/// Maximum messages held in a session's follow-up queue (`Enqueue`).
+pub const QUEUE_CAP: usize = 20;
+
+/// Error text for an enqueue that would exceed [`QUEUE_CAP`].
+pub const QUEUE_FULL: &str = "queue full";
+
+/// Starts a queued message as a new run for the session. Installed once by
+/// the dispatch layer (it owns the run-building path). The hub calls it
+/// only after every hub lock is released, from the completed run's task.
+pub type RunStarter = Arc<dyn Fn(SessionId, String) + Send + Sync>;
 
 /// Lock a mutex, recovering from poisoning. The hub's data stays usable
 /// after a panic elsewhere — same convention as `modron_core::testing`.
@@ -323,6 +334,10 @@ pub struct SessionHandle {
     /// Steer messages waiting for the run loop (the same inbox as
     /// `engine.config.steer`). Created with the handle; never replaced.
     steer: Arc<SteerInbox>,
+    /// Follow-up messages (`Enqueue`), front = next to run. Held across
+    /// interrupts; popped only when a run completes successfully. Lock
+    /// order: `run` -> `seq` -> `queue`.
+    queue: Mutex<VecDeque<String>>,
 }
 
 impl SessionHandle {
@@ -451,6 +466,7 @@ impl SessionHandle {
             model: lock(&self.model).clone(),
             provider: lock(&self.provider).clone(),
             goal: lock(&self.goal).clone(),
+            queued: lock(&self.queue).iter().cloned().collect(),
         }
     }
 
@@ -683,11 +699,16 @@ impl SessionHandle {
     /// successfully takes the run slot owns the terminal frame; if
     /// [`interrupt`](Self::interrupt) already took it, TurnAborted was
     /// published there and this is a no-op.
-    pub fn complete(&self, result: modron_core::Result<RunSummary>) {
+    ///
+    /// Returns the front queued message when the run SUCCEEDED and the queue
+    /// was non-empty (it is popped and `QueueChanged` is published under the
+    /// same locks as TurnDone). The caller must start it after this returns:
+    /// every lock and the run slot are released by then. Failed and aborted
+    /// runs return `None` and leave the queue intact.
+    pub fn complete(&self, result: modron_core::Result<RunSummary>) -> Option<String> {
         let mut slot = lock(&self.run);
-        if slot.take().is_none() {
-            return; // interrupted: the slot (and the terminal frame) went to it
-        }
+        // Interrupted: the slot (and the terminal frame) went to the interrupt.
+        slot.take()?;
         self.busy.store(false, Ordering::Relaxed);
         // The slot stays locked through the terminal frame, so a run that
         // starts next cannot publish ahead of this turn's end.
@@ -699,19 +720,76 @@ impl SessionHandle {
         lock(&self.reasoning).clear();
         lock(&self.tracker).clear_turn();
         match result {
-            Ok(summary) => self.publish_locked(
-                &mut seq,
-                Payload::TurnDone {
-                    summary: WireRunSummary::from(&summary),
-                },
-            ),
-            Err(error) => self.publish_locked(
-                &mut seq,
-                Payload::TurnFailed {
-                    error: error.to_string(),
-                },
-            ),
+            Ok(summary) => {
+                self.publish_locked(
+                    &mut seq,
+                    Payload::TurnDone {
+                        summary: WireRunSummary::from(&summary),
+                    },
+                );
+                self.pop_queued_locked(&mut seq)
+            }
+            Err(error) => {
+                self.publish_locked(
+                    &mut seq,
+                    Payload::TurnFailed {
+                        error: error.to_string(),
+                    },
+                );
+                None
+            }
         }
+    }
+
+    /// Hold a message for the next run. Only meaningful while a run is
+    /// active: an idle session refuses it (the caller submits instead). The
+    /// run slot is held across the push and the publish, like steer.
+    pub fn enqueue_message(&self, text: String) -> Result<(), String> {
+        let slot = lock(&self.run);
+        if slot.is_none() {
+            return Err(STEER_IDLE.to_string());
+        }
+        let mut seq = lock(&self.seq);
+        let queued = {
+            let mut queue = lock(&self.queue);
+            if queue.len() >= QUEUE_CAP {
+                return Err(QUEUE_FULL.to_string());
+            }
+            queue.push_back(text);
+            queue.iter().cloned().collect::<Vec<_>>()
+        };
+        self.publish_locked(&mut seq, Payload::QueueChanged { queued });
+        drop(seq);
+        drop(slot);
+        Ok(())
+    }
+
+    /// Remove the queued message at `index` (0 = next to run) and publish
+    /// the new list.
+    pub fn dequeue_message(&self, index: usize) -> Result<(), String> {
+        let mut seq = lock(&self.seq);
+        let queued = {
+            let mut queue = lock(&self.queue);
+            if index >= queue.len() {
+                return Err(format!("queue index {index} out of range"));
+            }
+            queue.remove(index);
+            queue.iter().cloned().collect::<Vec<_>>()
+        };
+        self.publish_locked(&mut seq, Payload::QueueChanged { queued });
+        Ok(())
+    }
+
+    /// Pop the front follow-up (caller holds the seq lock) and publish the
+    /// remaining queue. `None` when the queue is empty.
+    fn pop_queued_locked(&self, seq: &mut u64) -> Option<String> {
+        let (next, queued) = {
+            let mut queue = lock(&self.queue);
+            let next = queue.pop_front()?;
+            (next, queue.iter().cloned().collect::<Vec<_>>())
+        };
+        self.publish_locked(seq, Payload::QueueChanged { queued });
+        Some(next)
     }
 
     /// Fold one persisted event into the live view (usage accounting) and
@@ -864,6 +942,7 @@ pub struct SessionHub {
 struct HubInner {
     sessions: Mutex<HashMap<SessionId, Arc<SessionHandle>>>,
     template: Mutex<Option<Engine>>,
+    run_starter: OnceLock<RunStarter>,
 }
 
 impl Clone for SessionHub {
@@ -882,6 +961,7 @@ impl SessionHub {
             inner: Arc::new(HubInner {
                 sessions: Mutex::new(HashMap::new()),
                 template: Mutex::new(None),
+                run_starter: OnceLock::new(),
             }),
         }
     }
@@ -1033,6 +1113,7 @@ impl SessionHub {
             goal: Mutex::new(String::new()),
             engine: Mutex::new(engine),
             steer,
+            queue: Mutex::new(VecDeque::new()),
         });
         sessions.insert(id, Arc::clone(&handle));
         handle
@@ -1074,13 +1155,63 @@ impl SessionHub {
         // interaction semantics): a new run starts un-approved.
         handle.allow_rest.store(false, Ordering::Relaxed);
         let owner = Arc::clone(&handle);
+        let hub = self.clone();
         let task = tokio::spawn(async move {
             let result = run.await;
-            owner.complete(result);
+            // `complete` returns only after its run-slot and seq guards are
+            // dropped, so the starter may take the slot itself.
+            if let Some(next) = owner.complete(result) {
+                hub.start_queued(owner.id, next);
+            }
         });
         *slot = Some(task);
         handle.busy.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Install the starter for queued messages (set once by the dispatch
+    /// layer at server start; later calls are ignored).
+    pub fn set_run_starter(&self, starter: RunStarter) {
+        let _ = self.inner.run_starter.set(starter);
+    }
+
+    /// Whether a run starter has been installed.
+    pub fn has_run_starter(&self) -> bool {
+        self.inner.run_starter.get().is_some()
+    }
+
+    /// Start a popped follow-up. Runs on the completed run's task with no
+    /// hub lock held. Without a starter the message is reported, not lost
+    /// silently.
+    fn start_queued(&self, id: SessionId, text: String) {
+        match self.inner.run_starter.get() {
+            Some(starter) => starter(id, text),
+            None => {
+                if let Some(handle) = self.handle(&id) {
+                    handle.publish(Payload::Note {
+                        text: format!("queued message not started: no run starter ({text})"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Hold a message for the session's next run (see
+    /// [`SessionHandle::enqueue_message`]).
+    pub fn enqueue(&self, id: SessionId, text: String) -> Result<(), String> {
+        let handle = self
+            .handle(&id)
+            .ok_or_else(|| format!("no such session {id}"))?;
+        handle.enqueue_message(text)
+    }
+
+    /// Remove the queued message at `index` (see
+    /// [`SessionHandle::dequeue_message`]).
+    pub fn dequeue(&self, id: SessionId, index: u32) -> Result<(), String> {
+        let handle = self
+            .handle(&id)
+            .ok_or_else(|| format!("no such session {id}"))?;
+        handle.dequeue_message(index as usize)
     }
 
     /// Steer a session's active run (see [`SessionHandle::steer_message`]).
@@ -1258,5 +1389,149 @@ mod tests {
         hub.steer(id, "first".into()).unwrap();
         assert!(handle.interrupt());
         assert!(handle.steer.is_empty());
+    }
+
+    /// A run that finishes successfully when the test sends on `done`.
+    fn gated_run(id: SessionId, done: tokio::sync::oneshot::Receiver<()>) -> RunFuture {
+        Box::pin(async move {
+            let _ = done.await;
+            Ok(RunSummary {
+                session_id: id,
+                answer: "ok".into(),
+                turns: 1,
+                tool_calls: 0,
+                usage: Default::default(),
+                models_used: vec![],
+            })
+        })
+    }
+
+    /// A run that fails when the test sends on `done`.
+    fn failing_run(done: tokio::sync::oneshot::Receiver<()>) -> RunFuture {
+        Box::pin(async move {
+            let _ = done.await;
+            Err(modron_core::Error::Session("boom".into()))
+        })
+    }
+
+    /// Starter that forwards every starter call to a channel the test reads.
+    fn recording_starter(
+        hub: &SessionHub,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(SessionId, String)> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        hub.set_run_starter(Arc::new(move |id, text| {
+            let _ = tx.send((id, text));
+        }));
+        rx
+    }
+
+    fn queued_of(handle: &SessionHandle) -> Vec<String> {
+        handle.live_state().queued
+    }
+
+    #[tokio::test]
+    async fn enqueue_on_a_busy_session_publishes_and_shows_in_live_state() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let mut rx = handle.tx.subscribe();
+        hub.start_run(id, parked_run(id)).unwrap();
+        hub.enqueue(id, "first follow-up".into()).unwrap();
+        hub.enqueue(id, "second".into()).unwrap();
+        assert_eq!(
+            queued_of(&handle),
+            vec!["first follow-up".to_string(), "second".to_string()]
+        );
+        let frame = rx.recv().await.expect("live frame");
+        let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+        assert_eq!(json["type"], "queue_changed");
+        assert_eq!(json["queued"], serde_json::json!(["first follow-up"]));
+        handle.interrupt();
+    }
+
+    #[tokio::test]
+    async fn enqueue_on_an_idle_session_is_refused() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let err = hub.enqueue(id, "later".into()).unwrap_err();
+        assert_eq!(err, STEER_IDLE);
+        assert!(queued_of(&handle).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dequeue_removes_the_indexed_entry_and_rejects_out_of_range() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        hub.start_run(id, parked_run(id)).unwrap();
+        for text in ["a", "b", "c"] {
+            hub.enqueue(id, text.into()).unwrap();
+        }
+        hub.dequeue(id, 1).unwrap();
+        assert_eq!(queued_of(&handle), vec!["a".to_string(), "c".to_string()]);
+        assert!(hub.dequeue(id, 2).is_err());
+        assert_eq!(queued_of(&handle).len(), 2);
+        assert!(hub.dequeue(SessionId::new_v4(), 0).is_err());
+        handle.interrupt();
+    }
+
+    #[tokio::test]
+    async fn queue_cap_is_enforced() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        hub.start_run(id, parked_run(id)).unwrap();
+        for n in 0..QUEUE_CAP {
+            hub.enqueue(id, format!("m{n}")).unwrap();
+        }
+        assert_eq!(hub.enqueue(id, "overflow".into()).unwrap_err(), QUEUE_FULL);
+        assert_eq!(queued_of(&handle).len(), QUEUE_CAP);
+        handle.interrupt();
+    }
+
+    #[tokio::test]
+    async fn successful_run_starts_the_front_queued_message() {
+        let hub = test_hub();
+        let mut starts = recording_starter(&hub);
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        hub.enqueue(id, "next".into()).unwrap();
+        hub.enqueue(id, "after".into()).unwrap();
+        done.send(()).unwrap();
+        let (started_id, text) = starts.recv().await.expect("starter invoked");
+        assert_eq!(started_id, id);
+        assert_eq!(text, "next");
+        assert_eq!(queued_of(&handle), vec!["after".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failed_or_aborted_run_keeps_the_queue_and_skips_the_starter() {
+        let hub = test_hub();
+        let mut starts = recording_starter(&hub);
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+
+        // Failure: TurnFailed, no start, queue intact.
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, failing_run(gate)).unwrap();
+        hub.enqueue(id, "kept".into()).unwrap();
+        done.send(()).unwrap();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!handle.is_busy());
+        assert_eq!(queued_of(&handle), vec!["kept".to_string()]);
+
+        // Interrupt: TurnAborted, no start, queue intact.
+        hub.start_run(id, parked_run(id)).unwrap();
+        assert!(handle.interrupt());
+        assert_eq!(queued_of(&handle), vec!["kept".to_string()]);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(starts.try_recv().is_err(), "starter must not run");
     }
 }

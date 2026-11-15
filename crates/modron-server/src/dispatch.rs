@@ -20,7 +20,7 @@ use modron_protocol::{Frame, Payload, SessionMetaWire, PROTOCOL_VERSION};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::hub::{session_title, task_with_goal, RunFuture, SessionHub};
+use crate::hub::{session_title, task_with_goal, RunFuture, RunStarter, SessionHub};
 use crate::pairing;
 
 /// Everything a connection's frames need.
@@ -200,7 +200,9 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
         }
         Payload::Attach { session_id, .. }
         | Payload::Interrupt { session_id }
-        | Payload::Steer { session_id, .. } => {
+        | Payload::Steer { session_id, .. }
+        | Payload::Enqueue { session_id, .. }
+        | Payload::Dequeue { session_id, .. } => {
             if *session_id == scope {
                 Ok(())
             } else {
@@ -655,6 +657,37 @@ pub async fn handle_frame(
                 send(ctx, error_kind(request_id, message, kind));
             }
         }
+        Payload::Enqueue { session_id, text } => {
+            if text.trim().is_empty() {
+                send(ctx, error(request_id, "queue text is empty"));
+            } else if state
+                .hub
+                .handle(&session_id)
+                .is_some_and(|handle| handle.is_busy())
+            {
+                if let Err(message) = state.hub.enqueue(session_id, text) {
+                    let kind = if state.hub.handle(&session_id).is_none() {
+                        modron_protocol::ErrorKind::NotFound
+                    } else {
+                        modron_protocol::ErrorKind::Conflict
+                    };
+                    send(ctx, error_kind(request_id, message, kind));
+                }
+            } else {
+                // Idle (or unknown) session: exactly the Submit path.
+                submit(state, ctx, request_id, Some(session_id), text, Vec::new()).await;
+            }
+        }
+        Payload::Dequeue { session_id, index } => {
+            if let Err(message) = state.hub.dequeue(session_id, index) {
+                let kind = if state.hub.handle(&session_id).is_none() {
+                    modron_protocol::ErrorKind::NotFound
+                } else {
+                    modron_protocol::ErrorKind::Conflict
+                };
+                send(ctx, error_kind(request_id, message, kind));
+            }
+        }
         Payload::Approve {
             request_id: req,
             decision,
@@ -809,9 +842,72 @@ async fn handle_fork(
 /// on demand. A worktree task's session runs its engine INSIDE the task's
 /// worktree: after a server restart the handle is gone, and re-creating it
 /// without the recorded worktree would run the task in the base checkout.
-fn ensure_session_for(state: &ServerState, id: SessionId) -> Arc<crate::hub::SessionHandle> {
+fn ensure_session_for(state: &Arc<ServerState>, id: SessionId) -> Arc<crate::hub::SessionHandle> {
+    // Every run (Submit, or a queued follow-up) reaches the
+    // hub through here, so the queue starter is installed before any run
+    // can complete. Weak: the hub must not keep the server state alive.
+    if !state.hub.has_run_starter() {
+        state
+            .hub
+            .set_run_starter(queued_run_starter(Arc::downgrade(state)));
+    }
     let worktree = state.tasks.get(&id).map(|record| record.worktree);
     state.hub.ensure_session_in(id, Some(id), worktree)
+}
+
+/// The starter the hub calls when a queued follow-up must run: the same
+/// run construction as a Submit to a known session. A failed start is
+/// reported as a Note; the remaining queue stays as it is.
+fn queued_run_starter(state: std::sync::Weak<ServerState>) -> RunStarter {
+    Arc::new(move |id: SessionId, text: String| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let Some(handle) = state.hub.handle(&id) else {
+            return;
+        };
+        // A queued message exists only after a run completed, and that run
+        // persisted its task, so the session has events to resume.
+        let run = resume_run(&handle, text, Vec::new(), true);
+        if let Err(message) = state.hub.start_run(id, run) {
+            handle.publish(Payload::Note {
+                text: format!("queued message not started: {message}"),
+            });
+        }
+    })
+}
+
+/// Build the run that continues a known session with `task`. Re-arms the
+/// adoption pin, then wraps the task with the standing goal, exactly as a
+/// Submit to a known session always has. `has_events` picks resume (the
+/// log has events) over a fresh run in an empty `new_session` shell.
+fn resume_run(
+    handle: &crate::hub::SessionHandle,
+    task: String,
+    attachments: Vec<modron_core::Attachment>,
+    has_events: bool,
+) -> RunFuture {
+    // Re-arm the adoption pin: a known session always runs in itself, even
+    // when an earlier run already consumed the pin without writing an event
+    // (LG-e).
+    handle.rearm_adoption();
+    let id = handle.id;
+    let engine = handle.engine_cell().clone();
+    let goal = handle_goal(handle);
+    let full_task = task_with_goal(&goal, &task);
+    if has_events {
+        Box::pin(async move {
+            engine
+                .run_task_resuming_with_attachments(id, &full_task, attachments)
+                .await
+        })
+    } else {
+        Box::pin(async move {
+            engine
+                .run_task_with_attachments(&full_task, attachments)
+                .await
+        })
+    }
 }
 
 async fn handle_delete_session(
@@ -1227,23 +1323,7 @@ async fn submit(
                 }
             };
             let handle = ensure_session_for(state, id);
-            // Re-arm the adoption pin: a known session always runs in
-            // itself, even when an earlier run already consumed the pin
-            // without writing an event (LG-e).
-            handle.rearm_adoption();
-            let engine = handle.engine_cell().clone();
-            let goal = handle_goal(&handle);
-            let full_task = task_with_goal(&goal, &task);
-            let run: RunFuture = if event_count == 0 {
-                let task = full_task;
-                Box::pin(async move { engine.run_task_with_attachments(&task, attachments).await })
-            } else {
-                Box::pin(async move {
-                    engine
-                        .run_task_resuming_with_attachments(id, &full_task, attachments)
-                        .await
-                })
-            };
+            let run = resume_run(&handle, task, attachments, event_count > 0);
             (handle, run)
         }
     };
@@ -1445,6 +1525,9 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Interrupt { .. } => "interrupt",
         Payload::Steer { .. } => "steer",
         Payload::Steered { .. } => "steered",
+        Payload::Enqueue { .. } => "enqueue",
+        Payload::Dequeue { .. } => "dequeue",
+        Payload::QueueChanged { .. } => "queue_changed",
         Payload::Approve { .. } => "approve",
         Payload::SetConfig { .. } => "set_config",
         Payload::Fork { .. } => "fork",

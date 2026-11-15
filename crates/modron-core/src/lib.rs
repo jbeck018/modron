@@ -600,6 +600,19 @@ impl SteerInbox {
     }
 }
 
+/// The run's phase (H2a). `Build` is the normal mode. `Plan` is an
+/// engine-enforced read-only phase: every approval-gated tool is refused
+/// (even under ApproveAll or an allow rule), ungated read-only tools still
+/// run, the finish gate is skipped, and every turn carries the current plan
+/// plus a phase line as a transient tail message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    #[default]
+    Build,
+    Plan,
+}
+
 #[derive(Clone)]
 pub struct EngineConfig {
     pub working_dir: PathBuf,
@@ -702,6 +715,11 @@ pub struct EngineConfig {
     /// are drained between model turns and appended as user messages (see
     /// `Engine::run_loop`). `None` (default) = no steering.
     pub steer: Option<Arc<SteerInbox>>,
+    /// Run phase (H2a, additive; default [`Phase::Build`]). `Phase::Plan`
+    /// makes the engine refuse every approval-gated tool and skip the finish
+    /// gate; see [`Phase`]. Applies to the runs started after the config is
+    /// set (the TUI/CLI sets it per run).
+    pub phase: Phase,
 }
 
 /// Per-tier ordered fallback candidates for [`EngineConfig::tier_fallbacks`].
@@ -762,6 +780,7 @@ impl Default for EngineConfig {
             tier_fallbacks: None,
             background_subagents: Arc::new(std::sync::Mutex::new(Default::default())),
             steer: None,
+            phase: Phase::Build,
         }
     }
 }

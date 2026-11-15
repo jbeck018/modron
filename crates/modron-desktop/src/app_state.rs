@@ -366,7 +366,12 @@ impl AppState {
             | Payload::Fork { .. }
             | Payload::NewSession { .. }
             | Payload::ListSessions {}
+            | Payload::Steer { .. }
+            | Payload::Enqueue { .. }
+            | Payload::Dequeue { .. }
             | Payload::Ping {} => {}
+            // Program U frames: this client is frozen and ignores them.
+            Payload::Steered { .. } | Payload::QueueChanged { .. } => {}
         }
     }
 

@@ -1052,9 +1052,9 @@ in a turn concurrently); what was missing was visibility.
 
 | ID | Item | Status | Evidence |
 |---|---|---|---|
-| H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | ACTIVE | H1a engine SteerInbox and H1b Steer/Steered frames + server hub DONE. Open: H1c queue (Enqueue/Dequeue/QueueChanged), actor on frames, LiveState.steer_pending |
-| H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | DONE | App.subagents + view; run.rs clears |
-| H3 | ACP: subagent events surface as tool_call / status notifications to the editor | DONE | acp.rs update mapping |
+| H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | ACTIVE | H1a steer inbox, H1b Steer/Steered, H1c Enqueue/Dequeue/QueueChanged + LiveState.queued DONE. Open: actor on frames, LiveState.steer_pending; a Submit racing a queued start drops that queued message with a Note (fix: requeue at front) |
+| H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | ACTIVE | H2a DONE: EngineConfig.phase (Plan refuses every gated tool, skips the finish gate), transient per-turn plan tail replaces the resume-time injection. Open: H2b ConfigPatch.phase, PlanProposed/DecidePlan/PlanDecided frames and server flow |
+| H3 | ACP: subagent events surface as tool_call / status notifications to the editor | ACTIVE | H3a DONE: progress heartbeats carry live turns/tokens (MeteredStore). Open: approvals routed to the parent, completion push (AgentFinished), SteerAgent/KillAgent, cap |
 | H4 | Parallel delegates verified: two delegate calls in ONE turn run concurrently (read-only dispatch), results land in transcript in call order, each child under its persona's forced model | DONE | interactivity::parallel_delegates_run_concurrently |
 | V21 | Gates | DONE | **337 passed / 0 failed**, clippy clean |
 
@@ -1466,3 +1466,8 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   speculative read driver is disarmed whenever a rule set is present
   (it runs reads before the gate). PROTOCOL_VERSION stays 1 until the
   v2 set is complete. Gates: fmt clean, clippy clean, 969 tests pass.
+- 2026-11-15: wave 3. H1c, H2a, H3a landed. The frozen desktop client
+  got no-op match arms for the new frames (it has an exhaustive Payload
+  match and is compiled on macOS CI); NOT compiled here (gpui needs GUI
+  libraries this container lacks) - needs a macOS CI pass. Gates on
+  Linux excluding modron-desktop: fmt clean, clippy clean, 985 tests.
