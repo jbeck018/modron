@@ -254,7 +254,14 @@ export async function openViewer(browser, url, label) {
     sock.on('framesent', (e) => rec.frames.push(['out', String(e.payload)]));
     sock.on('close', () => rec.frames.push(['close', '']));
   });
-  page.on('console', (m) => { if (m.type() === 'error') v.errors.push(m.text()); });
+  // The app asks GET /api/me on every page to learn whether it is the
+  // portal owner. A relay without a portal answers 503 and a guest gets
+  // 401; the browser logs both as resource errors. Those two are
+  // expected; every other console error still fails the step.
+  const expected = /server responded with a status of (401|503)/;
+  page.on('console', (m) => {
+    if (m.type() === 'error' && !expected.test(m.text())) v.errors.push(m.text());
+  });
   page.on('pageerror', (e) => v.errors.push('pageerror: ' + e.message));
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => v.errors.push('goto: ' + e.message));
   v.finalUrl = page.url();

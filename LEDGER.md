@@ -1412,6 +1412,8 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 
 | E2E | Whole chain, real pieces: modron serve (mock) -> bridge (local wrangler dev) -> web app in headless Chromium | ACTIVE | e2e/run.mjs, e2e/FINDINGS.md. First run 2 of 11; it exposed that the remote-control tunnel never subscribed to its session, that share URLs carried a ws scheme, and that late viewers lost history over 96 KB. All three fixed in rc.rs by the lead; then 11 of 11 after an app layout fix: a fixed 600 pt transcript pushed the approval and stop controls below the viewport; the transcript now follows the window height. Console-error capture is on for every scenario. Open: the wasm closure error on load (F3) has not reproduced since and its first panic is unidentified |
 
+| PARITY | Audit: everything crates/modron-tui does versus the new app | DONE | docs/APP_PARITY.md: 140 rows; DONE 52, PARTIAL 17, CORE-ONLY 15, MISSING 50, N/A 6; a 20-item ordered list of what must land before the old TUI is deleted (keys, multi-line entry and paste, Esc on an approval, input history, @file and !command, credentials, tool detail panel, scrollback keys, attachments, startup flags) |
+
 ### Protocol
 
 | ID | Packet | Status | Evidence / blocker |
@@ -1578,3 +1580,6 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   collided when run in parallel; they now hold a lock (3 clean reruns).
   They skip when the prebuilt server binary is absent, so CI does not
   run them yet.
+- 2026-11-15: parity audit recorded. e2e reran 11 of 11 against the
+  portal front end after the harness learned that the app's /api/me
+  probe answers 401 or 503 on non-owner pages (expected, not errors).
