@@ -468,6 +468,15 @@ pub enum Payload {
         cheap_fallback: Vec<String>,
         strong_fallback: Vec<String>,
     },
+    /// Ask for the model catalog (answered by `models`). Clients send it
+    /// when a model picker opens.
+    ModelsReq {},
+    /// The reply to `models_req`. UI effect (every client): the model
+    /// picker replaces its list with `models`, in the order given (the
+    /// server sorts available rows first, then provider, then id). Rows
+    /// with `available: false` are shown but cannot be selected; a
+    /// selectable row is switched with `set_config` (`ConfigPatch.model`).
+    Models { models: Vec<ModelWire> },
     /// An informational toast/scrollback note (slash-command results).
     Note { text: String },
     /// Answer to `ping`.
@@ -659,6 +668,26 @@ pub struct RouterDefaults {
     pub recommended_strong: Option<String>,
     pub cheap_fallback: Vec<String>,
     pub strong_fallback: Vec<String>,
+}
+
+/// One model row of the catalog (reply to `models_req`). UI effect: a
+/// picker row. `available` is whether the model's provider is signed in;
+/// an unavailable row is shown dimmed and cannot be selected. `tier` is
+/// the catalog's routing tier, shown as a hint when present.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelWire {
+    /// The canonical model name, as sent to the provider (`ConfigPatch.model`).
+    pub id: String,
+    /// The catalog provider id, e.g. `anthropic`.
+    pub provider: String,
+    /// The display name. The catalog has no display names, so this is the id.
+    pub label: String,
+    /// Advertised context window in tokens, when the catalog knows it.
+    pub context_window: Option<u64>,
+    /// The provider is signed in (a key or sign-in is present).
+    pub available: bool,
+    /// `"cheap"` or `"strong"` when the catalog marks the model's tier.
+    pub tier: Option<String>,
 }
 
 /// One provider row for the onboarding/settings surfaces.
@@ -1105,6 +1134,55 @@ mod tests {
         assert_eq!(ApprovalModeWire::Deny.label(), "deny");
         assert_eq!(ApprovalModeWire::Ask.label(), "ask");
         assert_eq!(ApprovalModeWire::ApproveAll.label(), "yolo");
+    }
+
+    /// The model catalog frames use snake_case tags clients branch on, and
+    /// both round-trip with every row field intact.
+    #[test]
+    fn models_frames_roundtrip_with_snake_case_tags() {
+        let req = Frame::request(5, Payload::ModelsReq {});
+        let tag = serde_json::to_value(&req.payload).unwrap();
+        assert_eq!(tag["type"], "models_req");
+        assert!(matches!(roundtrip(&req).payload, Payload::ModelsReq {}));
+
+        let row = ModelWire {
+            id: "claude-haiku-4-5".into(),
+            provider: "anthropic".into(),
+            label: "claude-haiku-4-5".into(),
+            context_window: Some(200_000),
+            available: true,
+            tier: Some("cheap".into()),
+        };
+        let reply = Frame {
+            id: Some(5),
+            session: None,
+            seq: 0,
+            payload: Payload::Models {
+                models: vec![
+                    row.clone(),
+                    ModelWire {
+                        id: "llama-3.3-70b".into(),
+                        provider: "ollama".into(),
+                        label: "llama-3.3-70b".into(),
+                        context_window: None,
+                        available: false,
+                        tier: None,
+                    },
+                ],
+            },
+        };
+        let tag = serde_json::to_value(&reply.payload).unwrap();
+        assert_eq!(tag["type"], "models");
+        match roundtrip(&reply).payload {
+            Payload::Models { models } => {
+                assert_eq!(models.len(), 2);
+                assert_eq!(models[0], row);
+                assert!(!models[1].available);
+                assert_eq!(models[1].context_window, None);
+                assert_eq!(models[1].tier, None);
+            }
+            other => panic!("expected models, got {other:?}"),
+        }
     }
 
     /// `forbidden` is a wire name clients can branch on: it serializes as

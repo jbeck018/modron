@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use modron_core::{Phase, SessionId};
 use modron_protocol::{
-    ConfigPatch, Frame, Payload, PlanDecision, SessionMetaWire, PROTOCOL_VERSION,
+    ConfigPatch, Frame, ModelWire, Payload, PlanDecision, SessionMetaWire, PROTOCOL_VERSION,
 };
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
@@ -523,6 +523,9 @@ pub async fn handle_frame(
         Payload::RouterDefaultsReq {} => {
             handle_router_defaults_req(state, ctx, request_id).await;
         }
+        Payload::ModelsReq {} => {
+            handle_models_req(state, ctx, request_id);
+        }
         Payload::AuthProvidersReq {} | Payload::AuthProviders { .. } => {
             // AuthProvidersReq is the documented request shape; the
             // reply-shaped frame still works for older clients.
@@ -906,6 +909,57 @@ async fn compact(
     handle.refresh_context().await;
 }
 
+/// The signed-in providers: the registry entries whose key or sign-in is
+/// present. Shared by the router defaults and the model catalog.
+fn signed_in_providers() -> Vec<String> {
+    modron_core::auth::provider_registry()
+        .iter()
+        .filter(|p| modron_core::auth::catalog_provider_authenticated(p.provider_id))
+        .map(|p| p.provider_id.to_string())
+        .collect()
+}
+
+/// The model catalog rows for `models_req`, built from the same static
+/// catalog the CLI routes with (`modron_router::catalog`).
+fn handle_models_req(_state: &Arc<ServerState>, ctx: &mut ConnCtx, request_id: Option<u64>) {
+    let models = models_for(modron_router::catalog(), |provider| {
+        modron_core::auth::catalog_provider_authenticated(provider)
+    });
+    send(ctx, reply(request_id, None, Payload::Models { models }));
+}
+
+/// Catalog rows with `available` from `signed_in(provider)`, sorted
+/// available first, then provider, then id. Takes the catalog and the
+/// sign-in check as arguments so tests can inject both.
+///
+/// `available` asks the same per-provider check the router defaults use
+/// (`catalog_provider_authenticated`) rather than the registry-derived
+/// `authed` list: the catalog names providers that are not registry
+/// entries (`chatgpt`, `ollama`), which that list can never contain.
+fn models_for(
+    catalog: &[modron_router::ModelInfo],
+    signed_in: impl Fn(&str) -> bool,
+) -> Vec<ModelWire> {
+    let mut rows: Vec<ModelWire> = catalog
+        .iter()
+        .map(|info| ModelWire {
+            id: info.name.clone(),
+            provider: info.provider.clone(),
+            label: info.name.clone(),
+            context_window: Some(info.context_window),
+            available: signed_in(&info.provider),
+            tier: Some(info.tier.as_str().to_string()),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.available
+            .cmp(&a.available)
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows
+}
+
 async fn handle_router_defaults_req(
     _state: &Arc<ServerState>,
     ctx: &mut ConnCtx,
@@ -915,11 +969,7 @@ async fn handle_router_defaults_req(
     // catalog providers, the derived recommendation (the same
     // auto-routing the serve startup notes), and the fallback
     // chains that follow.
-    let authed: Vec<String> = modron_core::auth::provider_registry()
-        .iter()
-        .filter(|p| modron_core::auth::catalog_provider_authenticated(p.provider_id))
-        .map(|p| p.provider_id.to_string())
-        .collect();
+    let authed: Vec<String> = signed_in_providers();
     let (recommended_cheap, recommended_strong, cheap_fallback, strong_fallback) =
         match modron_router::derive_tier_candidates(&authed) {
             Some(candidates) => (
@@ -1786,6 +1836,8 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::AuthStart { .. } => "auth_start",
         Payload::RouterDefaultsReq { .. } => "router_defaults_req",
         Payload::RouterDefaults { .. } => "router_defaults",
+        Payload::ModelsReq {} => "models_req",
+        Payload::Models { .. } => "models",
         Payload::AuthSetKey { .. } => "auth_set_key",
         Payload::AuthProviders { .. } | Payload::AuthProvidersReq {} => "auth_providers",
         Payload::PersistRouter { .. } => "persist_router",
@@ -2520,5 +2572,63 @@ mod tests {
         assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
         assert!(!handle.plan_pending());
         await_terminal_frame(&mut live).await;
+    }
+
+    fn catalog_entry(
+        name: &str,
+        provider: &str,
+        tier: modron_router::Tier,
+    ) -> modron_router::ModelInfo {
+        modron_router::ModelInfo {
+            name: name.into(),
+            provider: provider.into(),
+            context_window: 128_000,
+            input_per_m: 0.0,
+            output_per_m: 0.0,
+            tier,
+        }
+    }
+
+    #[test]
+    fn models_sort_available_first_then_provider_then_id() {
+        use modron_router::Tier::{Cheap, Strong};
+        let catalog = [
+            catalog_entry("zeta-strong", "beta", Strong),
+            catalog_entry("gamma-x", "gamma", Cheap),
+            catalog_entry("beta-cheap", "beta", Cheap),
+            catalog_entry("alpha-cheap", "alpha", Cheap),
+        ];
+        let rows = models_for(&catalog, |p| p == "alpha" || p == "beta");
+        let order: Vec<(&str, bool)> = rows.iter().map(|r| (r.id.as_str(), r.available)).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("alpha-cheap", true),
+                ("beta-cheap", true),
+                ("zeta-strong", true),
+                ("gamma-x", false),
+            ]
+        );
+        // Label falls back to the id; tier and window come from the catalog.
+        assert_eq!(rows[0].label, "alpha-cheap");
+        assert_eq!(rows[0].provider, "alpha");
+        assert_eq!(rows[0].context_window, Some(128_000));
+        assert_eq!(rows[0].tier.as_deref(), Some("cheap"));
+        assert_eq!(rows[2].tier.as_deref(), Some("strong"));
+    }
+
+    #[test]
+    fn models_over_the_real_catalog_cover_every_entry_once() {
+        let catalog = modron_router::catalog();
+        let rows = models_for(catalog, |_| false);
+        assert_eq!(rows.len(), catalog.len());
+        assert!(rows.iter().all(|r| !r.available));
+        let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), catalog.len(), "catalog model names are unique");
+        // With every provider signed in, nothing sorts after an unavailable row.
+        let all = models_for(catalog, |_| true);
+        assert!(all.iter().all(|r| r.available));
     }
 }

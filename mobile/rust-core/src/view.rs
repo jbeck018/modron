@@ -36,8 +36,8 @@
 //! not add usage (the server's `Usage` events already covered the turn).
 
 use modron_protocol::{
-    ApprovalModeWire, ContextGaugeWire, Decision, LiveState, PendingApproval, PlanDecision,
-    RuleWire, SessionMetaWire, WireRunSummary,
+    ApprovalModeWire, ContextGaugeWire, Decision, LiveState, ModelWire, PendingApproval,
+    PlanDecision, RuleWire, SessionMetaWire, WireRunSummary,
 };
 use modron_types::{Effort, Phase, PlanItem, Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_view::{
@@ -193,6 +193,45 @@ pub fn kill_confirm_text(label: &str) -> String {
 
 /// One sessions-list row: the title (the short id when untitled), the
 /// running/idle word and the message count. Shells show it verbatim.
+/// One model-picker row (the `models` answer, as the picker shows it).
+/// `current` marks the session's model; `available` gates selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRowView {
+    pub id: String,
+    pub provider: String,
+    /// `id - provider - 1000k ctx` (the window is omitted when unknown).
+    pub text: String,
+    pub available: bool,
+    pub current: bool,
+}
+
+/// The picker's one-line text for a catalog model. The context window
+/// goes through the shared token formatter (`compact_tokens`).
+pub fn model_row_text(model: &ModelWire) -> String {
+    match model.context_window {
+        Some(window) => format!(
+            "{} - {} - {} ctx",
+            model.id,
+            model.provider,
+            compact_tokens(window)
+        ),
+        None => format!("{} - {}", model.id, model.provider),
+    }
+}
+
+/// One picker row. `current` is the session's model and provider (an
+/// empty provider matches on the model name alone).
+pub fn model_row(model: &ModelWire, current_model: &str, current_provider: &str) -> ModelRowView {
+    ModelRowView {
+        id: model.id.clone(),
+        provider: model.provider.clone(),
+        text: model_row_text(model),
+        available: model.available,
+        current: model.id == current_model
+            && (current_provider.is_empty() || model.provider == current_provider),
+    }
+}
+
 pub fn session_row(meta: &SessionMetaWire, running: bool) -> String {
     let title = if meta.title.trim().is_empty() {
         meta.id.to_string().chars().take(8).collect()
@@ -487,6 +526,8 @@ pub struct SessionViewModel {
     /// The router's default-model picture (answers to
     /// `router_defaults_req`; the settings defaults card renders it).
     pub router_defaults: Option<modron_protocol::RouterDefaults>,
+    /// The model catalog (answers to `models_req`), in the server's order.
+    pub models: Vec<ModelWire>,
     /// Last seen server seq for this session (reconnect resumes past it).
     pub last_seq: u64,
     pub turns_completed: u32,
@@ -645,6 +686,9 @@ pub struct ViewModelSnapshot {
     pub providers: Vec<modron_protocol::AuthProviderWire>,
     /// The router's default-model picture (the settings defaults card).
     pub router_defaults: Option<modron_protocol::RouterDefaults>,
+    /// The model picker rows, one per catalog entry, in the server's
+    /// order ([`model_row`]). Unavailable rows are listed but not selectable.
+    pub models: Vec<ModelRowView>,
     pub last_seq: u64,
     pub last_error: Option<String>,
     pub last_note: Option<String>,
@@ -737,6 +781,11 @@ impl ViewModelSnapshot {
             automations: vm.automations.clone(),
             providers: vm.providers.clone(),
             router_defaults: vm.router_defaults.clone(),
+            models: vm
+                .models
+                .iter()
+                .map(|model| model_row(model, &vm.model, &vm.provider))
+                .collect(),
             last_seq: vm.last_seq,
             last_error: vm.last_error.clone(),
             last_note: vm.last_note.clone(),
@@ -1702,6 +1751,33 @@ mod copy_tests {
 
     const ID_A: &str = "abcdef01-2345-6789-abcd-ef0123456789";
     const ID_B: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn model_rows_format_and_mark_only_the_current_model() {
+        let wire = |id: &str, provider: &str, window: Option<u64>| ModelWire {
+            id: id.into(),
+            provider: provider.into(),
+            label: id.into(),
+            context_window: window,
+            available: true,
+            tier: None,
+        };
+        assert_eq!(
+            model_row_text(&wire("claude-opus-5-5", "anthropic", Some(1_000_000))),
+            "claude-opus-5-5 - anthropic - 1000k ctx"
+        );
+        assert_eq!(
+            model_row_text(&wire("mini", "ollama", None)),
+            "mini - ollama"
+        );
+        // Same name under another provider is not the current model.
+        let other = model_row(&wire("shared", "openrouter", None), "shared", "anthropic");
+        assert!(!other.current);
+        let same = model_row(&wire("shared", "anthropic", None), "shared", "anthropic");
+        assert!(same.current);
+        // An empty provider matches on the name alone.
+        assert!(model_row(&wire("shared", "openrouter", None), "shared", "").current);
+    }
 
     #[test]
     fn session_row_shows_title_state_and_count() {

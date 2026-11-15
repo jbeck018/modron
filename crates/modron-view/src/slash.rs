@@ -59,6 +59,12 @@ pub const SLASH_COMMANDS: &[SlashSpec] = &[
         scope: Scope::Session,
     },
     SlashSpec {
+        name: "sessions",
+        usage: "/sessions",
+        about: "open the session list",
+        scope: Scope::Client,
+    },
+    SlashSpec {
         name: "fork",
         usage: "/fork",
         about: "branch the session log; the original is untouched",
@@ -68,6 +74,30 @@ pub const SLASH_COMMANDS: &[SlashSpec] = &[
         name: "tasks",
         usage: "/tasks",
         about: "status of background delegates and worktree tasks",
+        scope: Scope::Session,
+    },
+    SlashSpec {
+        name: "compact",
+        usage: "/compact",
+        about: "compact this session's context now",
+        scope: Scope::Session,
+    },
+    SlashSpec {
+        name: "effort",
+        usage: "/effort <low|medium|high|xhigh|max|off>",
+        about: "reasoning effort for future turns; off uses the provider default",
+        scope: Scope::Session,
+    },
+    SlashSpec {
+        name: "plan",
+        usage: "/plan",
+        about: "switch to the plan phase (read-only) for future runs",
+        scope: Scope::Session,
+    },
+    SlashSpec {
+        name: "build",
+        usage: "/build",
+        about: "switch to the build phase (edits allowed) for future runs",
         scope: Scope::Session,
     },
     SlashSpec {
@@ -155,5 +185,66 @@ mod tests {
         let lines = slash_help_lines();
         assert_eq!(lines.len(), SLASH_COMMANDS.len());
         assert!(lines.iter().any(|l| l.contains("picker")));
+    }
+
+    #[test]
+    fn no_two_commands_share_a_name() {
+        let mut names: Vec<&str> = SLASH_COMMANDS.iter().map(|c| c.name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two commands share a name");
+        // Every usage line leads with its own name, so `/help` never lists
+        // one command under another's word.
+        for spec in SLASH_COMMANDS {
+            assert!(
+                spec.usage.starts_with(&format!("/{}", spec.name)),
+                "usage {:?} does not lead with /{}",
+                spec.usage,
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn new_remote_commands_lookup_with_scope_and_usage() {
+        let cases: &[(&str, &str, Scope)] = &[
+            ("sessions", "/sessions", Scope::Client),
+            ("compact", "/compact", Scope::Session),
+            (
+                "effort",
+                "/effort <low|medium|high|xhigh|max|off>",
+                Scope::Session,
+            ),
+            ("plan", "/plan", Scope::Session),
+            ("build", "/build", Scope::Session),
+        ];
+        for (name, usage, scope) in cases {
+            let spec = slash_lookup(name).unwrap_or_else(|| panic!("/{name} missing"));
+            assert_eq!(spec.usage, *usage, "usage for /{name}");
+            assert_eq!(spec.scope, *scope, "scope for /{name}");
+            assert!(!spec.about.is_empty(), "/{name} has no description");
+            assert!(
+                slash_help_lines().iter().any(|l| l.starts_with(usage)),
+                "/{name} missing from /help"
+            );
+        }
+        assert!(slash_lookup("nope").is_none());
+    }
+
+    #[test]
+    fn suggestions_complete_the_new_commands() {
+        assert_eq!(suggestions("/sess"), vec!["sessions"]);
+        assert_eq!(suggestions("com"), vec!["compact"]);
+        assert_eq!(suggestions("/eff"), vec!["effort"]);
+        assert_eq!(suggestions("/pl"), vec!["plan"]);
+        assert_eq!(suggestions("/bu"), vec!["build"]);
+        // Shared prefixes keep canonical table order.
+        assert_eq!(
+            suggestions("/s"),
+            vec!["sandbox", "sessions", "share", "settings"]
+        );
+        assert!(suggestions("/zzz").is_empty());
+        assert_eq!(suggestions("").len(), SLASH_COMMANDS.len());
     }
 }

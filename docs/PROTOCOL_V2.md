@@ -161,6 +161,18 @@ is never rendered in the transcript.
   `LiveState.context: Option<ContextGauge { used, window }>` is the true
   occupancy of the next request, not cumulative tokens.
 
+## 7a. Model catalog
+
+```
+ModelsReq {}                                   // client
+Models { models: Vec<ModelWire> }              // server
+ModelWire { id, provider, label, context_window, available, tier }
+```
+
+Answered from the router catalog; `available` is true when the model's
+provider is signed in. UI effect: the model picker lists these rows;
+unavailable rows are shown but cannot be selected.
+
 ## 8. Host and handoff (C6)
 
 ```

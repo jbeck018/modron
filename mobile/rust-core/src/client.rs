@@ -935,6 +935,15 @@ impl RemoteClient {
         ))
     }
 
+    /// Request the model catalog for a picker; the rows land in
+    /// `state().models`.
+    pub fn request_models(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::ModelsReq {},
+        ))
+    }
+
     /// Persist router defaults into the server's config; the outcome
     /// lands as a note.
     pub fn persist_router(
@@ -1279,6 +1288,7 @@ fn fold_frame(shared: &Shared, frame: Frame) {
                 strong_fallback,
             });
         }
+        Payload::Models { models } => vm.models = models,
         // A task creation adopts the fresh session (the desktop does the
         // same); status and merge answers land as scrollback notes.
         Payload::TaskCreated {
@@ -1421,6 +1431,53 @@ mod tests {
         assert!(validate_ws_url("http://127.0.0.1:7699", false).is_err());
         assert!(validate_ws_url("ws://", false).is_err());
         assert!(validate_ws_url("ws:///path", false).is_err());
+    }
+
+    /// The catalog reply folds into the picker rows: the session's model
+    /// is marked current, and an unavailable row keeps its flag.
+    #[test]
+    fn models_reply_folds_into_picker_rows() {
+        use modron_protocol::ModelWire;
+        let row = |id: &str, provider: &str, window: u64, available: bool| ModelWire {
+            id: id.into(),
+            provider: provider.into(),
+            label: id.into(),
+            context_window: Some(window),
+            available,
+            tier: Some("cheap".into()),
+        };
+        let current = Frame {
+            id: None,
+            session: None,
+            seq: 0,
+            payload: Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    model: Some("claude-haiku-4-5".into()),
+                    provider: Some("anthropic".into()),
+                    ..ConfigPatch::default()
+                },
+            },
+        };
+        let catalog = Frame {
+            id: Some(7),
+            session: None,
+            seq: 0,
+            payload: Payload::Models {
+                models: vec![
+                    row("claude-haiku-4-5", "anthropic", 200_000, true),
+                    row("llama-3.3-70b", "ollama", 128_000, false),
+                ],
+            },
+        };
+        let snap = folded_all(vec![current, catalog]);
+        assert_eq!(snap.models.len(), 2);
+        assert_eq!(
+            snap.models[0].text,
+            "claude-haiku-4-5 - anthropic - 200k ctx"
+        );
+        assert!(snap.models[0].current && snap.models[0].available);
+        assert!(!snap.models[1].available && !snap.models[1].current);
+        assert_eq!(snap.models[1].text, "llama-3.3-70b - ollama - 128k ctx");
     }
 
     /// Fold one frame into a fresh shared state and return the snapshot.
