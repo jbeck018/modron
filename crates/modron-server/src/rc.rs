@@ -46,8 +46,11 @@ pub fn viewer_key(agent_key: &str) -> String {
 }
 
 /// Build the relay URLs for a bridge base + agent key: the agent tunnel
-/// `ws(s)://host/agent/{key}` and the viewer page `base/s/{viewer key}`
-/// (see [`viewer_key`]; the share link never contains the agent key).
+/// `ws(s)://host/agent/{key}` and the viewer page
+/// `http(s)://host/s/{viewer key}` (see [`viewer_key`]; the share link
+/// never contains the agent key). The viewer page is opened in a browser,
+/// so it always carries an http(s) scheme, whatever scheme the bridge
+/// base was given with.
 pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
     let base = bridge_base.trim_end_matches('/');
     let ws_scheme = if base.starts_with("wss://") || base.starts_with("https://") {
@@ -61,9 +64,10 @@ pub fn tunnel_urls(bridge_base: &str, key: &str) -> (String, String) {
         .or_else(|| base.strip_prefix("https://"))
         .or_else(|| base.strip_prefix("http://"))
         .unwrap_or(base);
+    let page_scheme = if ws_scheme == "wss" { "https" } else { "http" };
     (
         format!("{ws_scheme}://{host}/agent/{key}"),
-        format!("{base}/s/{}", viewer_key(key)),
+        format!("{page_scheme}://{host}/s/{}", viewer_key(key)),
     )
 }
 
@@ -495,10 +499,12 @@ pub async fn run_tunnel_with(
             last_seq: 0,
         },
     );
-    for frame in [hello, attach] {
-        let text: String = serde_json::to_string(&frame).context("frame serialization")?;
-        sink.send(WsMessage::Text(text.into())).await?;
-    }
+    // These two frames are requests TO this server, on behalf of the
+    // tunnel: they go through the same dispatch as every relayed frame
+    // (below, once the writer is draining), so the tunnel's connection is
+    // subscribed to its session and the snapshot and every live frame flow
+    // to the bridge. Writing them into the sink instead would send them to
+    // the viewers as if the agent had said them, and subscribe nothing.
 
     let writer = tokio::spawn(async move {
         while let Some(outbound) = out_rx.recv().await {
@@ -515,6 +521,14 @@ pub async fn run_tunnel_with(
         }
         let _ = sink.close().await;
     });
+
+    for frame in [hello, attach] {
+        if handle_frame(&state, &mut ctx, true, frame).await == Flow::Close {
+            drop(ctx);
+            let _ = writer.await;
+            return Ok(());
+        }
+    }
 
     // Portal registration, only with a host token (see HOST_TOKEN_ENV).
     let registration = host_token.and_then(|token| {
@@ -550,8 +564,27 @@ pub async fn run_tunnel_with(
         let Some(frame) = frame else {
             continue;
         };
+        // A viewer that just joined says hello and may not know the session
+        // id (share links carry only the viewer key). Answer every relayed
+        // hello with a fresh snapshot of the tunnel's one session, so a
+        // late viewer gets full history from the server instead of relying
+        // on what the relay happened to buffer. A snapshot resets a client's
+        // view, so viewers already attached are unaffected.
+        let joined = matches!(frame.payload, modron_protocol::Payload::Hello { .. });
         if handle_frame(&state, &mut ctx, true, frame).await == Flow::Close {
             break;
+        }
+        if joined {
+            let resync = modron_protocol::Frame::request(
+                0,
+                modron_protocol::Payload::Attach {
+                    session_id: session,
+                    last_seq: 0,
+                },
+            );
+            if handle_frame(&state, &mut ctx, true, resync).await == Flow::Close {
+                break;
+            }
         }
     }
     drop(ctx);
@@ -888,7 +921,12 @@ mod key_tests {
         assert!(!share_url.contains(key), "{share_url}");
         assert_eq!(
             share_url,
-            format!("wss://bridge.example/s/{}", viewer_key(key))
+            format!("https://bridge.example/s/{}", viewer_key(key))
+        );
+        let (_, local) = tunnel_urls("ws://127.0.0.1:8787", key);
+        assert_eq!(
+            local,
+            format!("http://127.0.0.1:8787/s/{}", viewer_key(key))
         );
     }
 }
