@@ -1,7 +1,7 @@
 // Helpers for e2e/run.mjs: tracked child processes (killed on exit), free
 // ports, a minimal local protocol client (Node's built-in WebSocket), and
 // Playwright viewer helpers. No npm installs; Playwright is preinstalled.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { cpSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -39,6 +39,28 @@ export function killAll(signal = 'SIGTERM') {
   }
 }
 
+// Every Chromium this run starts carries RUN_TAG on its command line (see
+// launchBrowser). Playwright's browser is not one of `procs`, so it is found
+// by the tag: killed with the same signal as the tracked groups.
+export const RUN_TAG = `modron-e2e-run-${process.pid}`;
+
+export function killTagged(signal = 'SIGKILL') {
+  spawnSync('pkill', [`-${signal.replace(/^SIG/, '')}`, '-f', RUN_TAG], { stdio: 'ignore' });
+}
+
+// Everything this run started: the tracked process groups and the tagged
+// Chromium. Called from the exit handler, the signal handlers, and the
+// wrap-up's finally.
+export function killEverything(signal = 'SIGTERM') {
+  killAll(signal);
+  killTagged(signal);
+}
+
+export function taggedCount() {
+  const r = spawnSync('pgrep', ['-f', RUN_TAG], { encoding: 'utf8' });
+  return r.stdout ? r.stdout.trim().split('\n').filter(Boolean).length : 0;
+}
+
 // Stop one tracked process (by its spawn name, e.g. 'serve-pb') and wait for it.
 export async function stopProc(name, signal = 'SIGTERM', ms = 8000) {
   const p = procs.find((x) => x.name === name);
@@ -54,10 +76,14 @@ export function liveCount() {
   return procs.filter(({ child }) => child.exitCode === null && child.signalCode === null).length;
 }
 
-process.on('exit', () => killAll('SIGKILL'));
+process.on('exit', () => killEverything('SIGKILL'));
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-  process.on(sig, () => { killAll('SIGKILL'); process.exit(130); });
+  process.on(sig, () => { killEverything('SIGKILL'); process.exit(130); });
 }
+// An error outside a step (or a rejected promise) still tears everything down:
+// 'exit' runs the group kill, and the exit code says the run did not finish.
+process.on('uncaughtException', (e) => { console.error('uncaught: ' + (e && e.stack || e)); process.exit(1); });
+process.on('unhandledRejection', (e) => { console.error('unhandled: ' + (e && e.stack || e)); process.exit(1); });
 
 export function tail(path, n = 30) {
   try {
@@ -267,7 +293,7 @@ export class Local {
 
 export async function launchBrowser() {
   const { chromium } = require('playwright');
-  return chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  return chromium.launch({ headless: true, args: ['--no-sandbox', `--${RUN_TAG}`] });
 }
 
 // `cookie` ({ name, value, url }) is set in the new context before the page

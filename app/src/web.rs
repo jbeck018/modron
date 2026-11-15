@@ -349,6 +349,7 @@ pub fn start() -> Client {
     };
     let web = Rc::new(RefCell::new(Web { host, feed, replies, reply_tx }));
     listen_keys(web.clone());
+    listen_scroll(web.clone());
     if let Some(window) = web_sys::window() {
         let web = web.clone();
         let tick = Closure::<dyn FnMut()>::new(move || web.borrow_mut().tick());
@@ -365,6 +366,71 @@ pub fn start() -> Client {
 /// Routes the page's keys the terminal's way, before the composer sees them
 /// (capture phase, so the key is decided first). A consumed key is
 /// cancelled, so no character lands in the composer.
+/// Wheel and touch scrolling of the transcript. The page itself does not
+/// scroll (`html, body { overflow: hidden }`), so a wheel turn or a finger
+/// drag over the page moves the transcript's offset by rows, as PageUp and
+/// PageDown do (see `chat::rows_for_pixels`).
+fn listen_scroll(web: Rc<RefCell<Web>>) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let on_wheel = {
+        let web = web.clone();
+        Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |event: web_sys::WheelEvent| {
+            // Not cancelled: the document listener is passive in Chromium, and the
+            // page does not scroll natively (html, body overflow: hidden).
+            web.borrow_mut().host.wheel(event.delta_y());
+        })
+    };
+    let _ = document.add_event_listener_with_callback_and_bool(
+        "wheel",
+        on_wheel.as_ref().unchecked_ref(),
+        false,
+    );
+    on_wheel.forget();
+    // Touch: the previous finger y (None between gestures) and each move's
+    // delta. A finger moving down (clientY grows) scrolls toward older rows,
+    // which is a negative pixel delta for the wheel mapping, so the sign flips.
+    let last_y: Rc<RefCell<Option<f64>>> = Rc::new(RefCell::new(None));
+    let on_touch_start = {
+        let last_y = last_y.clone();
+        Closure::<dyn FnMut(web_sys::TouchEvent)>::new(move |event: web_sys::TouchEvent| {
+            *last_y.borrow_mut() = touch_y(&event);
+        })
+    };
+    let on_touch_move = {
+        let last_y = last_y.clone();
+        Closure::<dyn FnMut(web_sys::TouchEvent)>::new(move |event: web_sys::TouchEvent| {
+            let Some(now) = touch_y(&event) else { return };
+            let previous = last_y.borrow_mut().replace(now);
+            if let Some(previous) = previous {
+                web.borrow_mut().host.wheel(previous - now);
+            }
+        })
+    };
+    let on_touch_end = {
+        let last_y = last_y.clone();
+        Closure::<dyn FnMut(web_sys::TouchEvent)>::new(move |_: web_sys::TouchEvent| {
+            *last_y.borrow_mut() = None;
+        })
+    };
+    for (name, closure) in [
+        ("touchstart", on_touch_start.as_ref().unchecked_ref()),
+        ("touchmove", on_touch_move.as_ref().unchecked_ref()),
+        ("touchend", on_touch_end.as_ref().unchecked_ref()),
+    ] {
+        let _ = document.add_event_listener_with_callback_and_bool(name, closure, false);
+    }
+    on_touch_start.forget();
+    on_touch_move.forget();
+    on_touch_end.forget();
+}
+
+/// The first touch point's vertical position, if any.
+fn touch_y(event: &web_sys::TouchEvent) -> Option<f64> {
+    event.touches().get(0).map(|touch| f64::from(touch.client_y()))
+}
+
 fn listen_keys(web: Rc<RefCell<Web>>) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;

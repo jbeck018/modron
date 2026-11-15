@@ -1620,3 +1620,15 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   closed under it.
 - 2026-11-15: SHELL-2 landed. Gates: fmt clean, clippy clean, 1298
   tests pass; client core wasm check passes.
+- 2026-11-15: E2E-DIAG landed. Full suite twice: 20 of 22 pass both
+  times. Causes found: the first-run credentials screen covered blank
+  sessions whose provider needs no sign-in (app; fixed); a web user had
+  no way to scroll the transcript, so old rows were unreachable (app;
+  wheel and touch scrolling added); W5 expected a session list through
+  the tunnel, which the role table refuses by design (test reframed,
+  the app now shows the refusal). OPEN: W6, after a local run the page
+  stops sending frames and pings (suspect the client core send path);
+  T1, the terminal app idles on "connecting" although the serve
+  answers. The harness now kills its process groups on exit, signal
+  and exception. App gates: fmt, clippy, wasm32 check clean; 190
+  tests; web-test.js 26 of 26.

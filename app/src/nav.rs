@@ -206,6 +206,9 @@ pub struct NavView {
     pub selected: usize,
     /// Every session the core holds (0 shows the empty state).
     pub total: usize,
+    /// Why the list is empty when the server refused it (the snapshot's last
+    /// error, shown only while no session is listed). None otherwise.
+    pub sessions_note: Option<String>,
     /// The rows that match the filter, in the core's order.
     pub sessions: Vec<SessionRow>,
     pub settings: Vec<SettingRow>,
@@ -263,6 +266,8 @@ struct Pending {
 pub struct Nav {
     /// Screens above Chat, oldest first. Empty means Chat.
     stack: Vec<Screen>,
+    /// The snapshot's last error (see [`NavView::sessions_note`]).
+    last_error: Option<String>,
     filter: String,
     selected: usize,
     all: Vec<SessionRow>,
@@ -380,6 +385,7 @@ impl Nav {
     /// Takes the latest snapshot's sessions, settings, models and agents,
     /// then keeps the selection inside the list it now shows.
     pub fn observe(&mut self, snapshot: &ViewModelSnapshot) {
+        self.last_error = snapshot.last_error.clone();
         self.all = snapshot
             .sessions
             .iter()
@@ -497,16 +503,24 @@ impl Nav {
     /// nothing is signed in and Chat is showing, the credentials screen
     /// opens once. Returns the core calls to send.
     pub fn first_run(&mut self, snapshot: &ViewModelSnapshot) -> Vec<UiAction> {
-        if self.first_run_done || snapshot.providers.is_empty() {
+        // The session's provider comes with its snapshot, which can arrive
+        // after the provider rows: wait for it, or a mock session would be
+        // judged as having no provider at all.
+        if self.first_run_done || snapshot.providers.is_empty() || snapshot.provider.is_empty() {
             return Vec::new();
         }
         self.first_run_done = true;
         let none = snapshot.providers.iter().all(|p| !auth_is_signed_in(&p.status));
+        // The session's own provider decides too: a provider with no
+        // credentials row (the mock, a local one) needs no sign-in, so the
+        // screen must not cover a session that already runs on it.
+        let active_needs_no_sign_in = !snapshot.provider.is_empty()
+            && !snapshot.providers.iter().any(|p| p.id == snapshot.provider);
         // Only on a blank session: a session with history or a run in
         // progress (a share link, a resumed session, a local provider that
         // needs no sign-in) must not be covered by the credentials screen.
         let blank = snapshot.history.is_empty() && !snapshot.running;
-        if none && blank && self.top() == Screen::Chat {
+        if none && blank && !active_needs_no_sign_in && self.top() == Screen::Chat {
             self.apply(NavStep::Open(Screen::Auth))
         } else {
             Vec::new()
@@ -689,6 +703,7 @@ impl Nav {
             filter: self.filter.clone(),
             selected: self.selected,
             total: self.all.len(),
+            sessions_note: if self.all.is_empty() { self.last_error.clone() } else { None },
             sessions: self.visible().into_iter().cloned().collect(),
             settings: self.settings.clone(),
             models: self.visible_models().into_iter().cloned().collect(),
@@ -1206,10 +1221,38 @@ mod auth_tests {
         let mut nav = Nav::default();
         let empty = ViewModelSnapshot::default();
         assert!(nav.first_run(&empty).is_empty(), "rows not in yet");
-        let none = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        let mut none = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        none.provider = "openai".into();
         assert_eq!(nav.first_run(&none), vec![UiAction::ListAuth]);
         assert_eq!(nav.top(), Screen::Auth);
         assert!(nav.first_run(&none).is_empty());
+    }
+
+    #[test]
+    fn first_run_waits_for_the_sessions_provider() {
+        // The provider rows can arrive before the session's snapshot: the
+        // check waits for the provider rather than judging an unknown one.
+        let mut nav = Nav::default();
+        let mut known = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        assert!(nav.first_run(&known).is_empty(), "provider not known yet");
+        known.provider = "openai".into();
+        assert_eq!(nav.first_run(&known), vec![UiAction::ListAuth]);
+    }
+
+    #[test]
+    fn an_empty_sessions_list_shows_the_servers_refusal() {
+        let mut nav = Nav::default();
+        let refused = ViewModelSnapshot {
+            last_error: Some(
+                "this request is not available through a remote-control tunnel".into(),
+            ),
+            ..Default::default()
+        };
+        nav.observe(&refused);
+        assert_eq!(
+            nav.view().sessions_note.as_deref(),
+            Some("this request is not available through a remote-control tunnel")
+        );
     }
 
     #[test]
@@ -1219,6 +1262,22 @@ mod auth_tests {
         busy.running = true;
         assert!(nav.first_run(&busy).is_empty());
         assert_eq!(nav.top(), Screen::Chat);
+    }
+
+    #[test]
+    fn first_run_stays_quiet_when_the_session_runs_on_a_provider_without_rows() {
+        // The mock (and any local provider) has no credentials row: a blank
+        // session on it is ready to use, so the screen must not open.
+        let mut nav = Nav::default();
+        let mut mock = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        mock.provider = "mock".into();
+        assert!(nav.first_run(&mock).is_empty());
+        assert_eq!(nav.top(), Screen::Chat);
+        // A provider that has a row and no credentials still gets the screen.
+        let mut unsigned = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        unsigned.provider = "openai".into();
+        let mut nav = Nav::default();
+        assert_eq!(nav.first_run(&unsigned), vec![UiAction::ListAuth]);
     }
 
     #[test]

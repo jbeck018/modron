@@ -464,6 +464,28 @@ pub enum ScrollStep {
     Down,
     Top,
     Bottom,
+    /// A wheel or touch drag: rows toward the older end (positive) or the
+    /// newer end (negative).
+    Lines(isize),
+}
+
+/// Pixels per transcript row for wheel and touch scrolling (one row is
+/// about one text line on the web host).
+pub const WHEEL_PX_PER_ROW: f64 = 24.0;
+
+/// The rows a wheel or touch movement of `delta_y` pixels scrolls. Scrolling
+/// up (negative `delta_y`, the wheel convention) moves toward older rows, so
+/// the result is positive; a movement below one row still moves one row.
+pub fn rows_for_pixels(delta_y: f64) -> isize {
+    if delta_y == 0.0 || !delta_y.is_finite() {
+        return 0;
+    }
+    let rows = (delta_y.abs() / WHEEL_PX_PER_ROW).ceil().max(1.0) as isize;
+    if delta_y < 0.0 {
+        rows
+    } else {
+        -rows
+    }
 }
 
 /// Where a key goes.
@@ -936,7 +958,9 @@ fn reasoning_tail(text: &str, count: usize) -> String {
 pub fn style_of(entry: &TranscriptEntry) -> Style {
     match entry {
         TranscriptEntry::Task { .. } => Style::Bold,
-        TranscriptEntry::ToolSummary { .. } | TranscriptEntry::Swarm { .. } => Style::Tool,
+        TranscriptEntry::ToolSummary { .. }
+        | TranscriptEntry::Swarm { .. }
+        | TranscriptEntry::Shell { .. } => Style::Tool,
         TranscriptEntry::Model { .. }
         | TranscriptEntry::Usage { .. }
         | TranscriptEntry::Compaction { .. } => Style::Meta,
@@ -1256,6 +1280,15 @@ impl Host {
         self.notify();
     }
 
+    /// A wheel or touch movement over the transcript (web host). Returns the
+    /// same offset change a PageUp or PageDown key makes, by rows.
+    pub fn wheel(&mut self, delta_y: f64) {
+        let rows = rows_for_pixels(delta_y);
+        if rows != 0 {
+            self.scroll(ScrollStep::Lines(rows));
+        }
+    }
+
     /// PageUp, PageDown, Home and End: moves the transcript's offset from
     /// the newest row. The view scrolls to it once per step (SCROLL_SEQ).
     fn scroll(&mut self, step: ScrollStep) {
@@ -1266,6 +1299,10 @@ impl Host {
             ScrollStep::Down => current.saturating_sub(SCROLL_PAGE),
             ScrollStep::Top => total.saturating_sub(1),
             ScrollStep::Bottom => 0,
+            ScrollStep::Lines(rows) => {
+                let moved = current as isize + rows;
+                moved.clamp(0, total.saturating_sub(1) as isize) as usize
+            }
         };
         set_scroll_offset(next);
         if next == 0 {
@@ -2506,11 +2543,30 @@ mod first_run_tests {
                 status: AUTH_NOT_CONFIGURED.into(),
                 oauth_capable: false,
             }],
+            // The session's provider comes with its snapshot (Nav::first_run).
+            provider: "openai".into(),
             ..Default::default()
         };
         host.push(&snapshot);
         assert_eq!(host.screen(), Screen::Auth);
         host.route(Key::Escape, false, false);
         assert_eq!(host.screen(), Screen::Chat);
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+
+    #[test]
+    fn wheel_pixels_map_to_rows_toward_the_older_end() {
+        assert_eq!(rows_for_pixels(0.0), 0);
+        assert_eq!(rows_for_pixels(f64::NAN), 0);
+        // Wheel up (negative delta) reads older rows: a positive row count.
+        assert_eq!(rows_for_pixels(-100.0), 5);
+        assert_eq!(rows_for_pixels(100.0), -5);
+        // Less than one row still moves one row.
+        assert_eq!(rows_for_pixels(-3.0), 1);
+        assert_eq!(rows_for_pixels(3.0), -1);
     }
 }

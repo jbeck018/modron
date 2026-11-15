@@ -564,6 +564,86 @@ async function testChipDequeue(browser, base) {
   }
 }
 
+// Mouse wheel over the transcript scrolls it to the older rows. The page
+// does not scroll natively, and the transcript is a virtual list, so only
+// the rows in view are in the DOM: the oldest row must not be visible first.
+async function testWheelScrollsTranscript(browser, base) {
+  const after = [];
+  for (let i = 0; i < 60; i++) {
+    after.push({ session: SESSION, seq: 100 + i, type: 'event', event: { type: 'task', text: `wheel row ${i}` } });
+  }
+  const ws = await startWsServer({ after });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('wheel row 59'), null, { timeout: TIMEOUT });
+    if ((await page.evaluate(() => document.body.innerText)).includes('wheel row 0')) {
+      throw new Error('precondition: the oldest row is already in view, the history is too short');
+    }
+    for (let i = 0; i < 80; i++) {
+      if ((await page.evaluate(() => document.body.innerText)).includes('wheel row 0')) break;
+      await page.mouse.move(500, 300);
+      await page.mouse.wheel(0, -240);
+      await page.waitForTimeout(100);
+    }
+    const text = await page.evaluate(() => document.body.innerText);
+    if (!text.includes('wheel row 0')) throw new Error('the wheel did not reach the oldest row');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Every pressable control and the composer are inside the window at a
+// desktop and a phone size, with an approval pending, a run in progress and
+// two queued messages (the layout the user has to reach).
+async function testLayoutInViewport(browser, base) {
+  const ws = await startWsServer({
+    live: { running: true },
+    after: [APPROVAL, { type: 'queue_changed', queued: ['one', 'two'] }],
+  });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('[2] two'), null, { timeout: TIMEOUT });
+    for (const [width, height] of [[1280, 720], [390, 844]]) {
+      await page.setViewportSize({ width, height });
+      await page.waitForTimeout(400);
+      const report = await page.evaluate(() => {
+        const labels = ['allow once', 'allow all', 'deny', 'stop', 'interrupt', 'queue'];
+        const els = [...document.querySelectorAll('[role=button], input, textarea, span, div, p')].filter((el) => {
+          if (el.querySelector('[role=button], input, textarea')) return false;
+          const text = (el.innerText || el.placeholder || '').trim();
+          return el.matches('[role=button], input, textarea') || labels.includes(text) || /^\[\d+\] /.test(text);
+        });
+        const boxes = els.map((el) => {
+          const r = el.getBoundingClientRect();
+          return {
+            label: (el.innerText || el.placeholder || el.tagName).trim().slice(0, 40),
+            visible: r.width > 0 && r.height > 0,
+            top: r.top, left: r.left, bottom: r.bottom, right: r.right,
+          };
+        }).filter((b) => b.visible);
+        return { vw: window.innerWidth, vh: window.innerHeight, boxes };
+      });
+      const names = report.boxes.map((b) => b.label);
+      for (const want of ['allow once', '[1] one', '[2] two', 'Message']) {
+        if (!names.some((n) => n === want || (want.startsWith('[') && n.startsWith(want)))) {
+          throw new Error(`${width}x${height}: no control "${want}" (have ${names.join(' | ')})`);
+        }
+      }
+      const outside = report.boxes.filter((b) => b.top < 0 || b.left < 0 || b.bottom > report.vh || b.right > report.vw);
+      if (outside.length) {
+        throw new Error(`${width}x${height} (viewport ${report.vw}x${report.vh}): outside: ` +
+          outside.map((b) => `${b.label} [${Math.round(b.top)}..${Math.round(b.bottom)}]`).join(', '));
+      }
+    }
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // The header's pressable controls open the screens (demo: no server).
 async function testHeaderOpensScreens(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
@@ -805,6 +885,8 @@ async function testAgentSteerAndKill(browser, base) {
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
     ['(q) shift+enter adds a line and does not submit', () => testShiftEnterNewline(browser, base)],
     ['(r) esc on a pending approval sends deny', () => testEscDeniesApproval(browser, base)],
+    ['(w) mouse wheel over the transcript reaches the oldest row', () => testWheelScrollsTranscript(browser, base)],
+    ['(l2) at 1280x720 and 390x844 every control and the composer are inside the window (approval, run, two queued)', () => testLayoutInViewport(browser, base)],
   ];
   // The portal cases: each on its own site (its own state) and context.
   const portal = [

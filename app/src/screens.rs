@@ -330,6 +330,13 @@ fn sessions_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> im
         move || text(SESSIONS_EMPTY_LABEL).text_color(muted()),
     ));
     column = column.child(when(
+        move || nav.with(|n| n.total == 0 && n.sessions_note.is_some()),
+        move || {
+            text(move || nav.with(|n| n.sessions_note.clone().unwrap_or_default()))
+                .text_color(muted())
+        },
+    ));
+    column = column.child(when(
         move || nav.with(|n| n.total > 0 && n.sessions.is_empty()),
         move || text(SESSIONS_NO_MATCH_LABEL).text_color(muted()),
     ));

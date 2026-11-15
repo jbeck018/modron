@@ -1,215 +1,175 @@
 # End-to-end findings
 
-`node e2e/run.mjs` drives a real `modron serve` (mock provider) through
-the real bridge Worker (local wrangler dev) to the real web app in
-headless Chromium.
+`node e2e/run.mjs` drives a real `modron serve` (mock provider) through the
+real bridge Worker (local wrangler dev) to the real web app in headless
+Chromium, plus the terminal app under a pty (T1). How to run: README.md.
+Status is as of 2026-11-15 (packet E2E-DIAG). Finding ids are unique; a
+scenario points at the finding that explains its status.
 
-## 2026-11-15, first run: 2 of 11 passed
+## Status table
 
-| ID | Finding | Status |
+Full-suite results are at the end of this file (two runs).
+
+| Scenario | Status | Finding |
 |---|---|---|
-| F1 | The remote-control tunnel never subscribed to its session. It wrote its own `hello` and `attach` into the bridge sink (so viewers received them as agent frames) instead of dispatching them, so no snapshot, event or approval ever reached a viewer that did not attach by itself. | Fixed in crates/modron-server/src/rc.rs: both frames go through `handle_frame`. |
-| F2 | The share URL kept the `ws://` / `wss://` scheme of the bridge base, which a browser cannot open. | Fixed: the viewer page URL is always http(s). |
-| F4 | A late viewer got no history when the snapshot exceeded the relay's 96 KB buffer limit (181 KB observed). | Fixed on the server: every relayed `hello` is answered with a fresh snapshot of the tunnel's session, so history no longer depends on the relay buffer. |
-| F3 | The web app logs "closure invoked recursively or after being dropped" on load. | Not reproduced after E2E-fix; see below. |
+| S1 legacy relay: share URL, history | PASS | F1, F2 (fixed earlier) |
+| S2 browser drives the session | PASS | |
+| S3 approve from the browser | PASS | |
+| S4 stop from the browser | PASS | F9 (layout, fixed earlier) |
+| S5 two viewers | PASS | |
+| S6a late viewer, small history | PASS | |
+| S6b late viewer, history over 96 KB | PASS | F4 (fixed in this packet) |
+| S7a-S7d portal host, invites, approver | PASS | |
+| P1-P4 portal sign-in, owner, invites, offline | PASS | |
+| W1 steer and queue | PASS | F10 (fixed in this packet) |
+| W2 plan phase | PASS | F10 |
+| W3 settings round trip | PASS | F1 (fixed earlier) |
+| W4 shell passthrough | PASS | F10 |
+| W5 sessions screen over the tunnel | PASS (reframed) | F12 |
+| W6 /compact | FAIL | F13 (open, not in app) |
+| T1 terminal app under a pty | FAIL | F14 (open) |
 
-## After the fixes: 9 of 11 pass
+## Findings
 
-Open:
+### F1. Owner role did not reach the serve (config and shell refused). FIXED (earlier commit 1205b20)
+Owner cookie now carries the owner role through the tunnel. W3 and W2/W4
+config and shell frames are accepted.
 
-- S4 (stop from the browser): the stop control was not clickable within
-  15 s. Not yet diagnosed: the control may not be shown for a run that
-  is waiting on an approval, or the mock run may end too quickly.
-- S7d (approver invite approves): the approval control was not
-  clickable within 15 s for an approver-role viewer. Not yet diagnosed.
+### F2. Steer refused while an approval waits (web). FIXED (earlier)
+The client's running flag and steer-while-approving landed earlier; W1 steers
+and queues.
 
-Evidence for each run is written to the run's temp directory
-(evidence-<id>.json and screenshots); see README.md.
+### F3. wasm closure "invoked recursively" message. CLOSED
+A symptom of an earlier panic (F5). Not seen in any run since F5 was fixed.
 
-## E2E-fix, 2026-11-15: 11 of 11 pass
+### F4. Late viewer cannot reach the older rows of a long transcript (web). FIXED in this packet
+- Expected: a web user can scroll the transcript to its oldest row.
+- Observed: the transcript is a virtual list; only visible rows are in the
+  DOM (about 6.7k characters). The page had no wheel or touch handling, and
+  `html, body { overflow: hidden }` stops native scrolling. Only PageUp and
+  Home (with an empty composer) moved it.
+- Smallest reproduction: a session with 25 turns of about 6 KB each; open the
+  share link in a new browser; look for `BIGMARK-0` (no wheel input).
+- Root cause (app): app/src/web.rs had no wheel or touch listener.
+- Fix: app/src/web.rs `listen_scroll` (wheel and touchmove on the document)
+  calls `Host::wheel` (app/src/chat.rs), which applies `ScrollStep::Lines`
+  through `rows_for_pixels`. Unit test: chat.rs `wheel_tests`. Web test: web-test.js
+  `(w)`. The S6b step now scrolls with the wheel the way a user does (test
+  change: the old step only waited, and asserted the oldest row was in view).
 
-Every viewer's console errors and page errors now fail the step that
-observed them (run.mjs `checkConsole`), and web-test.js cases (a) and (b)
-assert no page or console errors.
+### F5. wasm panic: `Instant::now` on wasm32 (session.rs). FIXED (earlier)
+The driver uses the web host's clock. No panic in any run since.
 
-### S4 (stop not clickable): product defect, layout
+### F6. Page stops sending after the first wasm panic. FIXED (consequence of F5)
 
-Root cause: the chat body put a fixed 600 px virtual list above the
-approval strip, queue/stop row and composer (app/src/chat.rs, the
-`.h(px(600.0))` on the transcript). The page is `html, body { overflow:
-hidden }` (packaged index.html), so nothing scrolls. At the Playwright
-default viewport of 1280x720 the approval options sat at y=719 and the
-queue/stop row at y=736, outside the viewport. Playwright refused the
-click ("element is outside of the viewport"). The run was in fact
-active: the Stop control was rendered and the snapshot said running
-while the approval was pending.
+### F7. Owner page sent no session list on connect. FIXED (earlier)
+session.rs requests `list_sessions` on connect; the frame is sent in every
+run (refused by design, see F12).
 
-Fix: the transcript height follows the window (app/src/web.rs sends
-`innerHeight` on change over a channel; app/src/lib.rs drains it into a
-signal; app/src/chat.rs `fit_transcript_height`: window minus 330 px,
-clamped to 240..600). At 720 px: allow once y=509, stop y=543, click
-lands on the stop span. Unit test: chat.rs
-`transcript_leaves_the_controls_on_a_short_window`.
+### F8. Terminal app stays on "connecting". SEE F14
 
-Note for later: a signal may not be set from the page timer (outside the
-engine's reactive runtime): nsh panics with "no reactive runtime". The
-channel avoids that.
+### F9. Controls clipped below the fold (S4, S7d). FIXED (earlier)
+Transcript height follows the window (chat.rs `fit_transcript_height`).
+New web-test case `(l2)` checks every `[role=button]`, the composer, the
+approval options, and the queue chips at 1280x720 and 390x844 with an
+approval, a run, and two queued messages. It passes.
 
-### S7d (approver approve): same root cause
+### F10. Blank session on the mock provider covered by the first-run credentials screen. FIXED in this packet
+- Expected: a new session on `--provider mock` is usable at once.
+- Observed: the credentials list (Screen::Auth) replaced the chat, so the
+  composer was not in the DOM. W1, W2, W4, W5, W6 all start on a blank session
+  and failed on `getByPlaceholder('Message')` or on a click.
+- Root cause (app): app/src/nav.rs `Nav::first_run` treated "no provider row
+  is signed in" as "nothing signed in". The mock has no row, so it needs no
+  sign-in.
+- Fix: nav.rs `first_run` (a) stays quiet when the session's own provider has
+  no credentials row, and (b) waits until the snapshot names the session's
+  provider (T1's TUI judged an unknown provider as none). Unit tests in
+  nav.rs: `first_run_stays_quiet_when_the_session_runs_on_a_provider_without_rows`,
+  `first_run_waits_for_the_sessions_provider`.
 
-The approver invite page has the same bottom rows, so "allow once" was
-clipped by the same fixed height. S7d passes after the layout fix. I did
-not capture the pre-fix approver page, so this attribution rests on the
-identical symptom and the S4 measurement, not on a before/after capture.
-The bridge's PERMITTED_FRAMES were not the cause: the approver's
-`approve` frame was forwarded and resolved the approval (the scenario
-checks approval_resolved on the local side).
+### F11. Build break: shell transcript rows had no style arm (app/src/chat.rs). FIXED in this packet
+- The shared view (crates/modron-view, in progress) added
+  `TranscriptEntry::Shell`; `style_of` in app/src/chat.rs did not match it, so
+  the web bundle did not build.
+- Fix: `TranscriptEntry::Shell` is styled as a tool row (chat.rs `style_of`).
 
-### F3 (wasm closure message): not reproduced
+### F12. The tunnel cannot list, create or delete sessions (design). Test reframed; sessions note added
+- Expected by W5 (old): a tunnel-pinned owner switches between two sessions
+  from the sessions screen.
+- Observed: `list_sessions` (and `new_session`) get
+  `{"type":"error","kind":"forbidden","message":"this request is not available through a remote-control tunnel"}`.
+  This is deliberate: crates/modron-server/src/dispatch.rs `relay_tier`
+  ("Refused for every role: list / delete / create sessions", the
+  `SERVER_WIDE` constant at dispatch.rs:265). A tunnel page is pinned to one session.
+- Root cause: design (not a defect). The test expected a capability the tunnel
+  does not offer.
+- Changes: W5 now checks that Ctrl+O opens the sessions screen and shows the
+  refusal. The screen used to say only "no sessions yet": app/src/nav.rs
+  `NavView::sessions_note` carries the snapshot's last error into the empty
+  list, and screens.rs shows it. Multi-session switching stays covered by the
+  local terminal app and the portal list (P1, P2).
 
-No "closure invoked recursively" message appears with the current build
-in any run (11 e2e scenarios, web-test.js a to k, console errors captured
-for every viewer). The message is wasm-bindgen's report for a Closure
-called after a panic left its borrow flag set, so it is a symptom of an
-earlier panic inside a web closure (web.rs tick or keydown listener).
-The first panic is not identified. The two closures keep `forget()`
-because they live for the page's life (one per page, not per render).
-Action if it returns: capture the console message location
-(`m.location()`) and the first pageerror before it.
+### F13. /compact typed on the owner page never reaches the socket (W6). OPEN, outside the app
+- Expected: `/compact` sends a `compact` frame; the serve answers with a
+  compaction note.
+- Observed: the composer clears (the line was submitted). The app reaches
+  `UiAction::Compact` and `client.compact()` returns `Ok(())` (checked with
+  a temporary note in session.rs, since removed). The browser socket writes
+  only `hello`, `auth_providers_req`, `list_sessions` for the whole step. The
+  serve receives no compact frame. Keepalive pings also stop on that socket.
+  Inbound events keep arriving. The socket works for W2, W3 and W4 (submit,
+  set_config, shell are sent there).
+- Correlation (unconfirmed): in W5 and W6 the local client starts a run
+  before the owner page sends anything; in W1 to W4 the owner's own submit
+  comes first.
+- Smallest reproduction: owner page through the bridge; a run started by a
+  second client; then `/compact` in the page.
+- Likely location (not edited, per packet rules): mobile/rust-core/src/client.rs
+  `send_frame` (around line 1231) and the connection loop (around lines
+  1330-1400). The lead should instrument the outbound channel.
 
-### Left for the lead
+### F14. Terminal app stays on "connecting" under a pty (T1). OPEN
+- Observed: the TUI (`app/target/debug/modron-app-tui --url ws://127.0.0.1:<port>`,
+  fresh HOME) draws one frame, then no output. The header reads
+  `connecting - ws://127.0.0.1:<port>`. Its threads are idle in epoll (not
+  spinning). The serve it started logs "listening"; a plain WebSocket client
+  gets `welcome` from the same serve and a handshake works.
+- Not resolved: no connection to the serve was observed (`ss` shows nothing;
+  tooling limit). The connect path is app/src/session.rs (`connect_stalled`
+  at line 56, retry at lines 60-70, connect at about line 505) and
+  mobile/rust-core/src/transport_native.rs. Next step: strace the TUI, or
+  log `RemoteClient::connect_with_options` from the driver.
+- Also seen: the first-run list was covering the TUI (F10); fixed.
 
-None in crates/ or mobile/ were needed for these three items. The app
-build consumes crates/modron-view, which was briefly mid-edit (a
-non-exhaustive match on ToolActivity); the bundle was built once it
-compiled and includes the in-progress crate changes present at that time.
+### F15. Doc drift: effort levels. OPEN (docs/, outside this packet)
+`docs/PROTOCOL_V2.md` section 7 lists `effort` as low, medium, high. The code
+has six levels (mobile/rust-core/src/view.rs: low, medium, high, xhigh, max).
 
-## E2E-2, 2026-11-15: portal, invites, steer/queue, plan, settings, shell, sessions, compact, terminal
+### H1. Harness left processes behind. FIXED in this packet
+- Each child is in its own process group (lib.mjs `spawnLogged`).
+- Playwright's Chromium is not tracked, so it survived a signal. Now every
+  Chromium carries `--modron-e2e-run-<pid>` (lib.mjs `RUN_TAG`) and is killed
+  by that tag (`killTagged`).
+- `killEverything` runs from the exit handler, from SIGINT, SIGTERM and SIGHUP,
+  from uncaught errors and rejections, and in a `finally` around the wrap-up
+  (run.mjs). The summary counts tagged leftovers too.
+- Verification: see the packet report (kill midway, then `ps`).
 
-Run: `node e2e/run.mjs` (all steps). Evidence: `/tmp/claude-0/e2e/run-*/evidence-<id>.json`
-(page text, role=button list, console errors, socket frames, serve and bridge logs).
-Result table: see the summary at the end of this section.
+## Full-suite results
 
-### Results
+Run 1 (`node e2e/run.mjs`, after the fixes above): 20 passed, 1 failed (W6),
+1 skipped (T1: binary older than the source; the T1 skip is correct behaviour,
+the binary was rebuilt afterwards and T1 then failed, F14).
 
-| ID | Result | Where it stands |
-|---|---|---|
-| S1-S5, S6a, S7a-S7d | PASS | unchanged |
-| S6b | FAIL | regressed since the 11-of-11 run: page shows 6660 chars and no `BIGMARK-0`. Not diagnosed (see F4). |
-| P1 portal sign-in through the UI | PASS | |
-| P2 owner drives through the portal | PASS | |
-| P3 invite from the UI, revoke | PASS | the 410 console message is allowed only when the main document is 410 |
-| P4 offline marking | PASS | test clock through `route` (x-test-now) |
-| W1 steer and queue | FAIL | F2 (no `steered`), F5 (wasm panic). |
-| W2 plan phase | FAIL | F3: `/plan` refused by the serve, so no plan run |
-| W3 settings round trip | FAIL | F3: `set_config` refused |
-| W4 shell passthrough | FAIL | F1 and F3: `shell` refused by the serve; F5 panic |
-| W5 sessions screen | FAIL | F7: no frames sent from the page; list stays "no sessions yet" |
-| W6 compact | FAIL | F7: `/compact` never sent |
-| T1 terminal app under a pty | FAIL | F8: stays on "connecting"; first-run screen does not close |
+Run 2 (same code, after the last test fix): 20 passed, 2 failed: W6 (F13) and T1
+(F14). S6b, W1 to W5, S7a to S7d, P1 to P4 and S1 to S5 pass in both runs.
 
-### F1. Owner is treated as a share link by the serve (config, shell)
+Per scenario, run 1 / run 2: S1 PASS/PASS, S2 PASS/PASS, S3 PASS/PASS, S4 PASS/PASS,
+S5 PASS/PASS, S6a PASS/PASS, S6b PASS/PASS, S7a-S7d PASS/PASS, P1-P4 PASS/PASS,
+W1-W5 PASS/PASS, W6 FAIL/FAIL, T1 SKIP/FAIL (run 1 skipped only because cargo fmt
+touched the source after the binary was built; rebuilt, then FAIL).
 
-- Scenario: W2, W3, W4 (owner browser through the portal bridge).
-- Expected: the portal owner has "everything" (docs/PORTAL.md, Viewer roles table: `owner (cookie)`
-  may send everything). PROTOCOL_V2.md section 1: `owner` role, `Actor` on each frame.
-- Observed: `set_config` (phase, effort, approval_mode) and `shell` get
-  `{"type":"error","message":"this request is not allowed on a share link","kind":"forbidden"}`.
-  The same error is returned for the owner socket and for a share-link socket.
-- Smallest reproduction: `OWNER_TOKEN` and `HOST_TOKEN` on a bridge with `MODRON_TEST_HOOKS=1`; serve
-  with `MODRON_HOST_TOKEN` and `remote_control`; sign in (`POST /auth`); open
-  `/app/?url=ws://<bridge>/ws/<viewer key>` with the cookie; type `/effort low`. Error comes back.
-- Diagnosis: the serve scopes every relayed connection to its session. `crates/modron-server/src/dispatch.rs:213-232`
-  allows only Submit / Steer / Interrupt / approve-type frames for a scoped connection and answers
-  `_ => Err("this request is not allowed on a share link")` at `dispatch.rs:232`. The bridge
-  never tells the serve which role a viewer socket has: `cloud/bridge/src/index.ts:438-453` tags the
-  socket (`role:viewer`), and the forwarded frame carries no actor (no `actor` field under
-  `cloud/bridge/src`). So an owner socket and a share socket look the same to the serve.
-- Also: the owner cannot run `!` shell passthrough from the portal (W4), and docs/remote-control.md:169
-  says a share link cannot change configuration. Decide whether the owner path should carry the
-  owner role to the serve (PROTOCOL_V2 section 1), then fix dispatch.
-
-### F2. Steer is not sent while a run waits on an approval (web)
-
-- Scenario: W1.
-- Expected: text sent while a run is active is a steer (PROTOCOL_V2.md section 2: "submit while
-  running = steer"); the server answers `steered`.
-- Observed: the browser sent `{"type":"submit", ...,"task":"e2e steer text"}`; the server answered
-  `{"type":"error","message":"session busy (a run is active)"}`. The header read `idle` while the
-  approval strip was on screen.
-- Smallest reproduction: live page on a session with a run that asks for approval (mock, first run);
-  type a second message and press Enter before answering.
-- Diagnosis (candidate, not confirmed): `mobile/rust-core/src/client.rs:750-762` chooses steer only
-  when the client's `running` flag is set (`st.vm.running`). The flag was not set while the approval
-  was pending. Check where `running` is set in the client's event handling.
-
-### F3. Config and shell from the owner path are refused (consequence of F1)
-
-W2 (`/plan`), W3 (effort, approval mode) and W4 (`!echo`) all end at F1. The plan refusal
-(`plan phase: read-only`) and the shell approval were never reached, so their behaviour is not
-verified. Re-run after F1 is fixed.
-
-### F4. S6b (late viewer, history over 96 KB) fails in this run
-
-- Expected (previous run): earlier rows visible to a late viewer (F4 fix).
-- Observed: page shows 6660 characters and no `BIGMARK-0`. Not diagnosed. Check whether the
-  transcript shows only the visible window of the virtual list (app/src/chat.rs) before concluding
-  that the replay is missing rows.
-
-### F5. A wasm panic kills the web page (`Instant::now` on wasm32)
-
-- Scenario: W1, W3, W4, W5 (the owner page). The first console error is
-  `panicked at .../std/src/sys/time/unsupported.rs:13: time not implemented on this platform`, then
-  `RefCell already borrowed` (app/src/web.rs:354) and `closure invoked recursively or after being
-  dropped`. After that the page sends no more frames.
-- Diagnosis: `app/src/session.rs:26` imports `std::time::Instant` in the target-neutral driver and
-  calls it on the web path: `session.rs:386` (reconnect due time), `session.rs:394` (`Stage::Listing`
-  deadline, evaluated while the session list is empty) and `session.rs:458`. On
-  `wasm32-unknown-unknown`, `Instant::now()` panics. The web host has its own clock (`app/src/web.rs:73`
-  `now()`), so the driver needs that clock. This is the first panic behind the "closure invoked
-  recursively" message that E2E-fix left open (F3 in the first section).
-- Smallest reproduction: open a live page without a `session=` parameter (the owner page after the
-  portal list, or W1's owner page); the panic appears within a few steps. Not pinned to one call site
-  (the panic report has no caller frame).
-
-### F6. The page stops sending after its first wasm panic
-
-Consequence of F5: after the panic, typed text and clicks produce no frames (W1 Steered, W4 shell).
-
-### F7. Owner page sends nothing: sessions list and compact (W5, W6)
-
-- Expected: Ctrl+O on a live page asks for the session list; "new session" and `/compact` send frames.
-- Observed: the page's socket sent only `hello`: no `list_sessions`, no `new_session`, no `compact`,
-  and no keepalive `ping`. The list shows "no sessions yet" although the session exists.
-- Diagnosis (partial): `app/src/session.rs:456-461` requests the list only when `resume != New`, and
-  `app/src/session.rs:58` makes `New` the default. A live page with no `session=` parameter therefore
-  never asks the server for sessions. The missing frames for the new-session click and `/compact`
-  are not explained; the driver may have stopped ticking (see F5).
-
-### F8. Terminal app stays on "connecting" under a pty (T1)
-
-- Observed: the header reads `connecting | ws://127.0.0.1:<port> | started by modron-app`; the app's
-  own serve logs `listening on ws://127.0.0.1:<port>` (`app-serve.log`). It reached `connected` in
-  one of three runs. On a fresh HOME the first-run provider list opens (`app/src/nav.rs:499-509`,
-  `Screen::Auth`), and Esc did not close it in five presses.
-- Not diagnosed. Check the connect path in `app/src/session.rs` (connect and retry) and whether Esc
-  is routed on `Screen::Auth` (`app/src/chat.rs` key router).
-
-### F9. Doc drift: effort levels
-
-`docs/PROTOCOL_V2.md` section 7 lists `ConfigPatch.effort` as `low | medium | high`. The code has six
-levels (`mobile/rust-core/src/view.rs:362-370`: low, medium, high, xhigh, max). Update the doc.
-
-### Harness notes
-
-- A console error is attributed to the step that is running when it is checked. F5 errors that
-  appear after a step ends are reported in the next step (W3 reports the W1 panic).
-- The mock's `rich_demo_script` is consumed once per process, so every step that needs a tool
-  approval or a refusal uses its own serve (see README).
-
-### Run status at hand-back
-
-The full run (`/tmp/claude-0/e2e/full-run.log`) was still in W3 to W6 and T1 when this section was
-written; it ends with an `EXIT` line and kills its own processes. The W and T1 rows above come from the
-isolated runs (`--only W`, `--only T1`); the full run's W3 to T1 lines should be read from its log.
-S6b failed in the full run and is not diagnosed (F4).
+Other checks: `cargo test` 190 passed, 0 failed; `cargo clippy --all-targets -D warnings`
+clean; `cargo check --lib --target wasm32-unknown-unknown` clean; web-test.js 26 PASS
+in each of two runs (the 24 earlier cases plus (w) and (l2)).

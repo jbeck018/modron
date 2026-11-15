@@ -7,7 +7,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'no
 import { join } from 'node:path';
 import {
   freePort, MODRON, REPO, Local, SCRATCH, api, bodyText, clickContains, clickText, copyApp, inviteUrlIn,
-  killAll, launchBrowser, liveCount, newestMtime, openViewer, ownerCookie, ownerCookieFrom, refused, sleep,
+  killEverything, taggedCount, launchBrowser, liveCount, newestMtime, openViewer, ownerCookie, ownerCookieFrom, refused, sleep,
   shot, snapshotViewer, startBridge, startServe, stopProc, tail, toHttp, typeAndSend, waitBody,
   waitUntil, wsFrames,
 } from './lib.mjs';
@@ -242,10 +242,19 @@ await scenario('S6b', 'late viewer, history over 96 KB: earlier rows (expected g
   const share6 = toHttp(await l6.rc(sid6, legacy.ws));
   const late = track(viewers, await openViewer(browser, share6, 'late-large'));
   await soft(s, waitBody(late, (t) => t.includes('connected'), 30000, 'connected'), 'no connected');
-  await sleep(5000);
-  const text = await bodyText(late);
-  s.check(text.includes('BIGMARK-0'), `earlier rows missing (page shows ${text.length} chars; BIGMARK-0 absent)`);
-  s.check(text.includes('BIGMARK-24') || text.includes('BIGMARK-0'), 'no history row at all');
+  await sleep(3000);
+  // The transcript is a virtual list: only the rows in view are in the DOM.
+  // A web user reaches the older rows with the wheel (the page does not
+  // scroll natively; the app maps wheel turns to transcript rows).
+  let text = await bodyText(late);
+  s.check(text.includes('BIGMARK-24') || text.includes('BIGMARK-23'), 'no newest history row at all');
+  for (let i = 0; i < 120 && !text.includes('BIGMARK-0'); i++) {
+    await late.page.mouse.move(500, 300);
+    await late.page.mouse.wheel(0, -800);
+    await sleep(120);
+    text = await bodyText(late);
+  }
+  s.check(text.includes('BIGMARK-0'), `earlier rows not reachable by the wheel (page shows ${text.length} chars; BIGMARK-0 absent)`);
 });
 
 // S7: portal mode ----------------------------------------------------------------
@@ -614,7 +623,12 @@ await scenario('W4', 'shell passthrough: approval, output in transcript; /mode d
   s.check(refusal, 'no refusal reached the server frames for the denied shell command');
 });
 
-await scenario('W5', 'sessions screen: a new session, then back to the first, each with its own transcript', async (s) => {
+// A remote-control tunnel is pinned to one session: the serve refuses list,
+// create and delete on it for every role (dispatch.rs relay_tier, "Refused for
+// every role"). So the sessions screen opens, shows that it has no list, and
+// shows the refusal. Switching sessions is checked on the local terminal app
+// (T1) and in the portal list (P1, P2), which do list sessions.
+await scenario('W5', 'sessions screen over the tunnel: Ctrl+O opens it, the server refusal is shown', async (s) => {
   const { lx, sid, vw } = await sharedSession('w5', 'e2e w5 first');
   lx.setAuto(true);
   await lx.run('e2e w5 first history', sid);
@@ -622,19 +636,10 @@ await scenario('W5', 'sessions screen: a new session, then back to the first, ea
   await soft(s, waitBody(vw, (t) => t.includes('e2e w5 first history'), 30000, 'first history'), 'first history not shown');
 
   await vw.page.keyboard.press('Control+o');
-  await soft(s, waitBody(vw, (t) => t.includes('new session') && t.includes('e2e w5 first'), 20000, 'sessions list'),
-    'Ctrl+O did not show the sessions list');
-  await clickText(vw, 'new session');
-  await typeAndSend(vw, 'e2e w5 second');
-  await soft(s, waitBody(vw, (t) => t.includes('e2e w5 second'), 30000, 'second transcript'), 'second session transcript not shown');
-  s.check(!(await bodyText(vw)).includes('e2e w5 first history'), 'the new session shows the first transcript');
-
-  await vw.page.keyboard.press('Control+o');
-  await soft(s, waitBody(vw, (t) => t.includes('e2e w5 first'), 20000, 'first row'), 'the list does not show the first session');
-  await clickContains(vw, 'e2e w5 first');
-  await soft(s, waitBody(vw, (t) => t.includes('e2e w5 first history'), 20000, 'first transcript back'),
-    'switching back did not show the first transcript');
-  s.check(!(await bodyText(vw)).includes('e2e w5 second'), 'the first session shows the second transcript');
+  await soft(s, waitBody(vw, (t) => t.includes('no sessions yet'), 20000, 'sessions screen'),
+    'Ctrl+O did not show the sessions screen');
+  await soft(s, waitBody(vw, (t) => t.includes('not available through a remote-control tunnel'), 20000, 'refusal'),
+    'the tunnel refusal for list_sessions is not shown on the sessions screen');
 });
 
 await scenario('W6', 'compact: /compact on a session with history shows a before/after or nothing-to-compact note', async (s) => {
@@ -686,17 +691,21 @@ if (!want('T1')) {
 }
 
 // ---- wrap up ----------------------------------------------------------------------
-await browser.close().catch(() => {});
-killAll('SIGTERM');
-await sleep(2000);
-killAll('SIGKILL');
-await sleep(500);
+// Always reached: a normal end, or a step's error that escaped its wrapper.
+try {
+  await browser?.close().catch(() => {});
+} finally {
+  killEverything('SIGTERM');
+  await sleep(2000);
+  killEverything('SIGKILL');
+  await sleep(500);
+}
 
 const failed = results.filter((r) => !r.ok && !r.skipped);
 console.log('\n== summary');
 for (const r of results) console.log(`${r.skipped ? 'SKIP' : r.ok ? 'PASS' : 'FAIL'} ${r.id} ${r.title}${r.skipped ? ' -- ' + r.fails[0] : ''}`);
 const skipped = results.filter((r) => r.skipped).length;
-console.log(`${results.length - failed.length - skipped}/${results.length} passed, ${failed.length} failed, ${skipped} skipped; left-over tracked processes: ${liveCount()}`);
+console.log(`${results.length - failed.length - skipped}/${results.length} passed, ${failed.length} failed, ${skipped} skipped; left-over tracked processes: ${liveCount() + taggedCount()}`);
 writeFileSync(join(SCRATCH, 'results.json'), JSON.stringify(results, null, 2));
 console.log(`results: ${join(SCRATCH, 'results.json')}`);
 process.exit(failed.length ? 1 : 0);
