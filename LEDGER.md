@@ -1414,6 +1414,9 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 
 | PARITY | Audit: everything crates/modron-tui does versus the new app | DONE | docs/APP_PARITY.md: 140 rows; DONE 52, PARTIAL 17, CORE-ONLY 15, MISSING 50, N/A 6; a 20-item ordered list of what must land before the old TUI is deleted (keys, multi-line entry and paste, Esc on an approval, input history, @file and !command, credentials, tool detail panel, scrollback keys, attachments, startup flags) |
 
+| PARITY-B | Client core and wire support for parity items 5, 7, 10, 11, 16, 17 | DONE | Snapshot tool_detail rows (and a fix: the tracker was never cleared at turn end, so a new turn re-showed old rows); attachments on submit with type checks (no size cap exists on the server beyond the 256 MiB websocket limit); unix-socket transport, ?token= and device token helpers; startup setters. Shell frame, client method and refusals exist; execution is a stub pending an engine entry point (PARITY-C). --working-dir and --sessions-dir have no wire equivalent |
+| PARITY-C | Engine entry point for a user-issued bash call; server runs Shell through it | TODO | |
+
 ### Protocol
 
 | ID | Packet | Status | Evidence / blocker |
@@ -1583,3 +1586,5 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 - 2026-11-15: parity audit recorded. e2e reran 11 of 11 against the
   portal front end after the harness learned that the app's /api/me
   probe answers 401 or 503 on non-owner pages (expected, not errors).
+- 2026-11-15: PARITY-B landed. Gates: clippy clean, 1255 tests pass,
+  client core wasm check passes.

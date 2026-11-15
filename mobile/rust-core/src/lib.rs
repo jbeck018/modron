@@ -36,6 +36,7 @@
 //! The nsh shell that consumes this lives in `mobile/app` (Track 2 of the
 //! mobile spike); the findings live in `mobile/SPIKE.md`.
 
+pub mod attach;
 pub mod client;
 pub mod error;
 pub mod view;
@@ -50,12 +51,16 @@ pub(crate) use transport_native as transport;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use transport_web as transport;
 
+pub use attach::attachment_from_bytes;
+#[cfg(not(target_arch = "wasm32"))]
+pub use client::default_socket_path;
 pub use client::{
-    default_url, ConnectOptions, KeepaliveConfig, RemoteClient, CLIENT_NAME, UNDECODABLE_NOTE,
+    default_url, device_token_from_env, split_url_token, ConnectOptions, KeepaliveConfig,
+    RemoteClient, CLIENT_NAME, DEVICE_TOKEN_ENV, UNDECODABLE_NOTE,
 };
 pub use error::ClientError;
 pub use modron_protocol::{ApprovalModeWire, ConfigPatch, SessionMetaWire};
-pub use modron_types::{Effort, Phase, SandboxPolicy};
+pub use modron_types::{Attachment, Effort, Phase, SandboxPolicy};
 pub use modron_view::{QUEUE_LABEL, STOP_LABEL};
 pub use view::{
     approval_mode_label, approval_mode_next, connection_label, context_label, effort_next,

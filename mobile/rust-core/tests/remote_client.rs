@@ -140,12 +140,15 @@ async fn wait_for(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting; last error: {:?}, last note: {:?}, turns: {}, tools: {}, undecodable: {}",
+            "timed out waiting; last error: {:?}, last note: {:?}, turns: {}, tools: {}, undecodable: {}, running: {}, tool_lines: {:?}, tool_detail: {:?}",
             snap.last_error,
             snap.last_note,
             snap.turns_completed,
             snap.tool_calls_total,
-            client.undecodable_frames()
+            client.undecodable_frames(),
+            snap.running,
+            snap.tool_lines,
+            snap.tool_detail
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -1848,4 +1851,538 @@ async fn non_loopback_plain_ws_needs_the_insecure_opt_in() {
     )
     .expect("insecure opt-in accepted");
     allowed.disconnect();
+}
+
+// ---------------------------------------------------------------------------
+// Tool detail panel (TUI ctrl+t parity): rows, title, and the boundaries.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_detail_shows_the_live_turn_then_the_last_committed_group() {
+    use modron_protocol::WireRunSummary;
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, Vec::new(), LiveState::default()),
+        )
+        .await;
+        let tool = |seq: u64, activity: WireToolActivity| {
+            Frame::event(Some(session), seq, Payload::Tool { activity })
+        };
+        let start = |name: &str| WireToolActivity::Start {
+            name: name.into(),
+            call_id: None,
+        };
+        send_frame(&mut ws, &tool(1, start("glob"))).await;
+        send_frame(
+            &mut ws,
+            &tool(
+                2,
+                WireToolActivity::Done {
+                    name: "glob".into(),
+                    is_error: false,
+                    bytes: 2150,
+                    call_id: None,
+                },
+            ),
+        )
+        .await;
+        send_frame(&mut ws, &tool(3, start("read"))).await;
+        send_frame(
+            &mut ws,
+            &tool(
+                4,
+                WireToolActivity::Done {
+                    name: "read".into(),
+                    is_error: true,
+                    bytes: 10,
+                    call_id: None,
+                },
+            ),
+        )
+        .await;
+        let _ = read_frame(&mut ws).await; // signal A: live turn checked
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                Some(session),
+                5,
+                Payload::TurnDone {
+                    summary: WireRunSummary {
+                        session_id: session,
+                        answer: "done".into(),
+                        turns: 1,
+                        tool_calls: 2,
+                        usage: modron_types::Usage::default(),
+                        models_used: vec!["m".into()],
+                    },
+                },
+            ),
+        )
+        .await;
+        // Turn two: one tool still running. The client's list_sessions
+        // frames (signals A and B) let each checkpoint settle first.
+        let _ = read_frame(&mut ws).await; // signal B: post-turn checked
+        send_frame(&mut ws, &tool(6, start("bash"))).await;
+        // Wait for the client to disconnect (its close ends the stream).
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+
+    let glob = ToolEvent {
+        name: "glob".into(),
+        bytes: Some(2150),
+        is_error: false,
+        done: true,
+    };
+    let read = ToolEvent {
+        name: "read".into(),
+        bytes: Some(10),
+        is_error: true,
+        done: true,
+    };
+    // Live turn: every event row, in order, with the TUI panel's formatter.
+    wait_for(&client, |snap| snap.tool_lines.len() == 2).await;
+    let snap = client.state();
+    assert_eq!(snap.tool_detail.len(), 2);
+    client.list_sessions().expect("signal A");
+    assert_eq!(
+        snap.tool_detail,
+        vec![glob.summary(), read.summary()],
+        "rows are the modron-view ToolEvent::summary strings, in order"
+    );
+    // The shared formatter's own rows: the byte size and the mark come from
+    // modron-view, not from copies written here.
+    assert_eq!(snap.tool_detail[0], glob.summary());
+    assert_eq!(snap.tool_detail[1], read.summary());
+    assert_eq!(
+        snap.tool_detail_title,
+        modron_view::tool_summary_line(&[glob.clone(), read.clone()]),
+        "title is the turn's collapsed summary line"
+    );
+
+    // After TurnDone the live strip is gone, but the panel keeps the
+    // committed group (the TUI's tool_log tail) until a new one lands.
+    wait_for(&client, |snap| {
+        snap.tool_lines.is_empty() && snap.tool_detail.len() == 2
+    })
+    .await;
+    assert_eq!(
+        client.state().tool_detail,
+        vec![glob.summary(), read.summary()]
+    );
+
+    // A new live turn with no finished group yet shows its own rows.
+    client.list_sessions().expect("signal B");
+    let running_bash = ToolEvent {
+        name: "bash".into(),
+        bytes: None,
+        is_error: false,
+        done: false,
+    };
+    wait_for(&client, |snap| {
+        snap.tool_lines == vec![running_bash.summary()]
+    })
+    .await;
+    let snap = client.state();
+    assert_eq!(snap.tool_detail, vec![running_bash.summary()]);
+    assert_eq!(
+        snap.tool_detail_title,
+        modron_view::tool_summary_line(&[ToolEvent {
+            name: "bash".into(),
+            bytes: None,
+            is_error: false,
+            done: false,
+        }])
+    );
+
+    client.disconnect();
+    server.await.expect("server task");
+}
+
+#[test]
+fn tool_detail_is_empty_without_tool_activity() {
+    let client =
+        RemoteClient::connect_with_options("ws://127.0.0.1:1", None, ConnectOptions::default())
+            .expect("loopback accepted");
+    let snap = client.state();
+    assert!(snap.tool_detail.is_empty());
+    assert!(snap.tool_detail_title.is_empty());
+    client.disconnect();
+}
+
+// ---------------------------------------------------------------------------
+// Attachments on submit (PARITY item 10)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn attachments_ride_submit_and_are_refused_while_a_run_is_active() {
+    use modron_mobile_core::{attachment_from_bytes, Attachment};
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+    let image = attachment_from_bytes("shot.png", "image/png", &png).expect("png");
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        // Idle, no session: the first message is a submit with its image.
+        match read_frame(&mut ws).await.payload {
+            Payload::Submit {
+                session_id,
+                task,
+                attachments,
+            } => {
+                assert_eq!(session_id, None);
+                assert_eq!(task, "describe");
+                assert_eq!(attachments.len(), 1, "the attachment reaches the wire");
+                assert!(matches!(
+                    &attachments[0],
+                    Attachment::Image { media_type, .. } if media_type == "image/png"
+                ));
+            }
+            other => panic!("expected submit, got {other:?}"),
+        }
+        // Attach, then a running snapshot: only text may steer.
+        let attach = read_frame(&mut ws).await;
+        assert!(matches!(attach.payload, Payload::Attach { .. }));
+        send_frame(
+            &mut ws,
+            &snapshot_frame(
+                session,
+                0,
+                Vec::new(),
+                LiveState {
+                    running: true,
+                    ..LiveState::default()
+                },
+            ),
+        )
+        .await;
+        match read_frame(&mut ws).await.payload {
+            Payload::Steer { session_id, text } => {
+                assert_eq!(session_id, session);
+                assert_eq!(text, "and also this");
+            }
+            other => panic!("expected steer (no attachments), got {other:?}"),
+        }
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client
+        .send_message_with("describe", vec![image.clone()])
+        .expect("idle submit with an attachment");
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    wait_for(&client, |snap| snap.running).await;
+
+    match client.send_message_with("with a picture", vec![image]) {
+        Err(ClientError::Request(text)) => {
+            assert_eq!(
+                text,
+                "attachments can only be sent when the session is idle"
+            )
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+    // Text alone still steers the running turn.
+    client
+        .send_message_with("and also this", Vec::new())
+        .expect("steer");
+    server.await.expect("server task");
+    client.disconnect();
+}
+
+// ---------------------------------------------------------------------------
+// Transports and tokens (PARITY items 16 and 17)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn split_url_token_takes_the_token_out_of_ws_targets_only() {
+    use modron_mobile_core::split_url_token;
+    assert_eq!(
+        split_url_token("ws://10.0.0.5:7699/?token=abc&room=1"),
+        (
+            "ws://10.0.0.5:7699/?room=1".to_string(),
+            Some("abc".to_string())
+        )
+    );
+    assert_eq!(
+        split_url_token("wss://host.example/?token=abc"),
+        ("wss://host.example/".to_string(), Some("abc".to_string()))
+    );
+    // An empty value is no token and is still removed from the target.
+    assert_eq!(
+        split_url_token("ws://127.0.0.1:7699/?token="),
+        ("ws://127.0.0.1:7699/".to_string(), None)
+    );
+    // Unix targets have no query: returned untouched.
+    assert_eq!(
+        split_url_token("unix:///tmp/serve.sock?token=x"),
+        ("unix:///tmp/serve.sock?token=x".to_string(), None)
+    );
+}
+
+#[tokio::test]
+// The handshake callback's Err type is tungstenite's own (large by design).
+#[allow(clippy::result_large_err)]
+async fn token_in_the_url_is_dialed_away_and_sent_in_the_hello() {
+    use std::sync::{Arc, Mutex};
+    let listener = bind_server().await;
+    let addr = listener.local_addr().expect("addr");
+    let seen_uri = Arc::new(Mutex::new(String::new()));
+    let seen = seen_uri.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut ws = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                  resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                *seen.lock().unwrap() = req.uri().to_string();
+                Ok(resp)
+            },
+        )
+        .await
+        .expect("ws accept");
+        match read_frame(&mut ws).await.payload {
+            Payload::Hello { token, .. } => {
+                assert_eq!(
+                    token.as_deref(),
+                    Some("s3cret"),
+                    "the URL token is the hello token"
+                )
+            }
+            other => panic!("expected hello, got {other:?}"),
+        }
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                None,
+                0,
+                Payload::Welcome {
+                    server_version: "0.1.2".into(),
+                    protocol: PROTOCOL_VERSION,
+                },
+            ),
+        )
+        .await;
+        let _ = ws.next().await;
+    });
+
+    let client =
+        RemoteClient::connect(&format!("ws://{addr}/?token=s3cret"), None).expect("accepted");
+    wait_connected(&client).await;
+    client.disconnect();
+    server.await.expect("server task");
+    let uri = seen_uri.lock().unwrap().clone();
+    assert!(
+        !uri.contains("token") && !uri.contains("s3cret"),
+        "dialed: {uri}"
+    );
+}
+
+#[cfg(unix)]
+async fn next_line(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+) -> String {
+    lines
+        .next_line()
+        .await
+        .expect("read")
+        .expect("a line before EOF")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_socket_target_speaks_the_line_framed_protocol() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("mobile-{}.sock", Uuid::new_v4().simple()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind unix socket");
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let hello: Frame = serde_json::from_str(&next_line(&mut lines).await).expect("json");
+        assert!(matches!(hello.payload, Payload::Hello { .. }));
+        let welcome = Frame::event(
+            None,
+            0,
+            Payload::Welcome {
+                server_version: "0.1.2".into(),
+                protocol: PROTOCOL_VERSION,
+            },
+        );
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&welcome).unwrap()).as_bytes())
+            .await
+            .expect("welcome");
+        let attach: Frame = serde_json::from_str(&next_line(&mut lines).await).expect("json");
+        assert!(matches!(attach.payload, Payload::Attach { .. }));
+        let snapshot = snapshot_frame(session, 0, Vec::new(), LiveState::default());
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&snapshot).unwrap()).as_bytes())
+            .await
+            .expect("snapshot");
+        // The client's disconnect closes the stream: EOF on our side.
+        assert!(lines.next_line().await.expect("read").is_none());
+    });
+
+    let client = RemoteClient::connect(&format!("unix://{}", path.display()), None)
+        .expect("unix target accepted");
+    wait_connected(&client).await;
+    assert_eq!(client.state().server_version, "0.1.2");
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    client.disconnect();
+    server.await.expect("server task");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn unix_targets_need_a_path_and_insecure_lan_still_needs_the_flag() {
+    assert!(matches!(
+        RemoteClient::connect("unix:", None),
+        Err(ClientError::Connect(_))
+    ));
+    // allow_insecure is about plain ws to a LAN host, not unix sockets.
+    assert!(RemoteClient::connect_with_options(
+        "ws://192.168.1.20:7699/?token=t",
+        None,
+        ConnectOptions::default()
+    )
+    .is_err());
+    assert!(matches!(
+        RemoteClient::connect_with_options(
+            "ws://192.168.1.20:7699",
+            None,
+            ConnectOptions::default()
+        ),
+        Err(ClientError::Connect(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn default_socket_path_is_under_dot_modron() {
+    let path = modron_mobile_core::default_socket_path();
+    assert!(path.ends_with(".modron/serve.sock"), "{}", path.display());
+}
+
+// ---------------------------------------------------------------------------
+// Shell passthrough and startup config (PARITY items 5 and 11)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn shell_needs_an_attached_session_and_surfaces_the_server_refusal() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let attach = read_frame(&mut ws).await;
+        assert!(matches!(attach.payload, Payload::Attach { .. }));
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, Vec::new(), LiveState::default()),
+        )
+        .await;
+        match read_frame(&mut ws).await.payload {
+            Payload::Shell {
+                session_id,
+                command,
+            } => {
+                assert_eq!(session_id, session);
+                assert_eq!(command, "ls -la");
+            }
+            other => panic!("expected shell, got {other:?}"),
+        }
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                None,
+                0,
+                Payload::Error {
+                    message: "shell passthrough is not available yet".into(),
+                    kind: Some(modron_protocol::ErrorKind::Other),
+                },
+            ),
+        )
+        .await;
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    // Refused locally, nothing sent: no session, and an empty command.
+    assert!(matches!(client.shell("ls"), Err(ClientError::Request(_))));
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    assert!(matches!(client.shell("   "), Err(ClientError::Request(_))));
+
+    client.shell("ls -la").expect("shell frame");
+    wait_for(&client, |snap| {
+        snap.last_error.as_deref() == Some("shell passthrough is not available yet")
+    })
+    .await;
+    server.await.expect("server task");
+    client.disconnect();
+}
+
+#[tokio::test]
+async fn startup_flags_send_their_config_patches() {
+    use modron_protocol::ApprovalModeWire;
+    use modron_types::SandboxPolicy;
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let mut patches = Vec::new();
+        for _ in 0..5 {
+            match read_frame(&mut ws).await.payload {
+                Payload::SetConfig { patch } => patches.push(patch),
+                other => panic!("expected set_config, got {other:?}"),
+            }
+        }
+        patches
+    });
+
+    let client = connect_client(&url).await;
+    client
+        .set_approval_mode(ApprovalModeWire::ApproveAll)
+        .expect("yolo");
+    client.set_sandbox(SandboxPolicy::Off).expect("sandbox");
+    client.set_goal("ship the parity packet").expect("goal");
+    client.set_persona("reviewer").expect("agent");
+    client
+        .set_tool_lists(Some(vec!["bash".into()]), Some(Vec::new()))
+        .expect("allow/deny");
+    let patches = server.await.expect("server task");
+    client.disconnect();
+
+    assert_eq!(patches[0].approval_mode, Some(ApprovalModeWire::ApproveAll));
+    assert_eq!(patches[1].sandbox, Some(SandboxPolicy::Off));
+    assert_eq!(patches[2].goal.as_deref(), Some("ship the parity packet"));
+    assert_eq!(patches[3].persona.as_deref(), Some("reviewer"));
+    assert_eq!(patches[4].allow, Some(vec!["bash".to_string()]));
+    assert_eq!(patches[4].deny, Some(Vec::new()), "an empty list clears");
+    // Each patch carries only its own field.
+    assert!(patches[0].goal.is_none() && patches[0].sandbox.is_none());
 }

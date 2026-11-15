@@ -547,6 +547,11 @@ pub struct SessionViewModel {
     pub turn_tools: Vec<ToolEvent>,
     /// Live swarm rows.
     pub subagents: Vec<SwarmRow>,
+    /// The last committed tool group's events (the TUI's `tool_log` tail):
+    /// what the tool detail panel shows once the live turn has no tools.
+    /// Set by [`commit`] on every `ToolSummary`, replaced by a Snapshot.
+    #[serde(default)]
+    pub last_tool_turn: Vec<ToolEvent>,
     /// Approvals awaiting a decision, oldest first. The view shows the
     /// front; see the module docs for the queue rules.
     pub pending_approvals: VecDeque<PendingApprovalView>,
@@ -639,6 +644,16 @@ fn rendered_row(entry: &TranscriptEntry) -> RenderedRow {
     }
 }
 
+/// The events the tool detail panel shows (TUI `latest_tool_events`):
+/// the live turn's tools when there are any, else the last committed group.
+pub(crate) fn tool_detail_events(vm: &SessionViewModel) -> &[ToolEvent] {
+    if vm.turn_tools.is_empty() {
+        &vm.last_tool_turn
+    } else {
+        &vm.turn_tools
+    }
+}
+
 impl SessionViewModel {
     /// The collapsed turn-tool line (`⏺ 21 tools · glob ×9 · read ×8 …`),
     /// straight from modron-view.
@@ -703,6 +718,16 @@ pub struct ViewModelSnapshot {
     pub tool_lines: Vec<String>,
     /// The collapsed per-turn line (`⏺ 21 tools · glob ×9 …`), if any.
     pub turn_summary_line: Option<String>,
+    /// The tool detail panel rows (ctrl+t in the TUI), in order: every
+    /// event of the live turn, or of the last committed tool group when
+    /// the live turn has none (TUI `latest_tool_events`). Formatted by
+    /// `ToolEvent::summary`, the TUI panel's own formatter.
+    #[serde(default)]
+    pub tool_detail: Vec<String>,
+    /// The title over `tool_detail`: `tool_summary_line` of the same
+    /// events. Empty when there is no tool activity to show.
+    #[serde(default)]
+    pub tool_detail_title: String,
     /// Live swarm rows (`⏵ [label] done · 3 turns · …`).
     pub subagent_rows: Vec<String>,
     /// The same sub-agents as structured rows (Packet C3f): ids for steer
@@ -770,6 +795,7 @@ pub struct ViewModelSnapshot {
 
 impl ViewModelSnapshot {
     pub fn from_vm(vm: &SessionViewModel) -> Self {
+        let detail = tool_detail_events(vm);
         // The shared cache-hit arithmetic (None before any tokens).
         let session_cache_pct = modron_view::cache_hit_pct(&vm.cumulative_usage);
         let mut status_line = if vm.model.is_empty() {
@@ -808,6 +834,12 @@ impl ViewModelSnapshot {
             show_reasoning: vm.show_reasoning,
             tool_lines: vm.turn_tools.iter().map(ToolEvent::summary).collect(),
             turn_summary_line: vm.turn_summary_line(),
+            tool_detail: detail.iter().map(ToolEvent::summary).collect(),
+            tool_detail_title: if detail.is_empty() {
+                String::new()
+            } else {
+                modron_view::tool_summary_line(detail)
+            },
             subagent_rows: vm.subagents.iter().map(SwarmRow::summary).collect(),
             agents: vm.subagents.iter().map(AgentRowView::from_row).collect(),
             pending_approval: vm.pending_approvals.front().cloned(),
@@ -1030,6 +1062,9 @@ impl FoldState {
 /// re-runs `entry_lines`). Both stores drop their oldest rows past
 /// [`HISTORY_CAP`].
 pub(crate) fn commit(vm: &mut SessionViewModel, entry: TranscriptEntry) {
+    if let TranscriptEntry::ToolSummary { events, .. } = &entry {
+        vm.last_tool_turn = events.clone();
+    }
     vm.history.push(rendered_row(&entry));
     cap_rows(&mut vm.history);
     vm.new_entries.push(entry);
@@ -1055,6 +1090,15 @@ pub(crate) fn fold_snapshot(
     // entries for incremental shells.)
     let entries = replay(events);
     let rows: Vec<RenderedRow> = entries.iter().map(rendered_row).collect();
+    // Same rule as `commit`: the newest replayed tool group, or none.
+    vm.last_tool_turn = entries
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            TranscriptEntry::ToolSummary { events, .. } => Some(events.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
     vm.history = rows;
     vm.new_entries = entries;
     cap_rows(&mut vm.history);
@@ -1221,6 +1265,9 @@ pub(crate) fn fold_turn_done(
     if !lines.is_empty() {
         commit(vm, TranscriptEntry::Swarm { lines });
     }
+    // The tracker is the source `fold_tool` re-syncs from: clear it with
+    // the view, or the next turn's first tool event re-adds this turn's rows.
+    fold.tracker.clear_turn();
     vm.turn_tools.clear();
     vm.subagents.clear();
     vm.pending_steers.clear();
@@ -1253,6 +1300,9 @@ pub(crate) fn fold_turn_unfinished(
     fold.committed_tools = false;
     vm.streaming_text.clear();
     vm.streaming_reasoning.clear();
+    // The tracker is the source `fold_tool` re-syncs from: clear it with
+    // the view, or the next turn's first tool event re-adds this turn's rows.
+    fold.tracker.clear_turn();
     vm.turn_tools.clear();
     vm.subagents.clear();
     vm.pending_steers.clear();

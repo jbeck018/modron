@@ -137,6 +137,14 @@ pub enum Payload {
     /// Abort the session's active run (JoinHandle-abort parity with the
     /// TUI's Esc).
     Interrupt { session_id: Uuid },
+    /// Run `command` in the session's shell, the terminal's `!command`
+    /// passthrough. It executes where the session's tools run (the server
+    /// host), under the same approval policy and permission rules as a
+    /// model-issued `bash` call; it is never a model turn. Refused for a
+    /// busy session (Conflict). Client effect: none until the server
+    /// answers; the server's reply is an `Error` or a `Note` with the
+    /// labelled output, and the output is not part of the model transcript.
+    Shell { session_id: Uuid, command: String },
     /// Steer one live sub-agent of a RUNNING session (PROTOCOL_V2 section 4,
     /// H3d): `text` joins that child's own transcript at its next safe
     /// boundary, so its next model turn carries it. `agent` is the swarm

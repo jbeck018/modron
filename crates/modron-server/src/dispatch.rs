@@ -660,6 +660,49 @@ pub async fn handle_frame(
                 ),
             }
         }
+        // `!command` passthrough (PARITY item 5). Not runnable yet: the
+        // engine applies the bash admission (approval mode, permission
+        // rules, checkpoint, sandbox) only to model tool calls. Its
+        // `admission_for_call` and `execute_tool` are private
+        // (crates/modron-core/src/engine.rs), so the entry point this needs
+        // is a public Engine method that runs one `bash` ToolCall for a
+        // session through `execute_tool`. Until it exists, the frame is
+        // refused here, after the same checks the run would make.
+        Payload::Shell {
+            session_id,
+            command,
+        } => {
+            if command.trim().is_empty() {
+                send(ctx, error(request_id, "usage: !<shell command>"));
+            } else {
+                match state.hub.handle(&session_id) {
+                    None => send(
+                        ctx,
+                        error_kind(
+                            request_id,
+                            format!("no such session {session_id}"),
+                            modron_protocol::ErrorKind::NotFound,
+                        ),
+                    ),
+                    Some(handle) if handle.is_busy() => send(
+                        ctx,
+                        error_kind(
+                            request_id,
+                            "a run is active in this session; shell passthrough waits for it",
+                            modron_protocol::ErrorKind::Conflict,
+                        ),
+                    ),
+                    Some(_) => send(
+                        ctx,
+                        error_kind(
+                            request_id,
+                            "shell passthrough is not available yet",
+                            modron_protocol::ErrorKind::Other,
+                        ),
+                    ),
+                }
+            }
+        }
         Payload::Steer { session_id, text } => {
             if text.trim().is_empty() {
                 send(ctx, error(request_id, "steer text is empty"));
@@ -1809,6 +1852,7 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Detach {} => "detach",
         Payload::Submit { .. } => "submit",
         Payload::Interrupt { .. } => "interrupt",
+        Payload::Shell { .. } => "shell",
         Payload::Steer { .. } => "steer",
         Payload::SteerAgent { .. } => "steer_agent",
         Payload::KillAgent { .. } => "kill_agent",
@@ -2045,6 +2089,65 @@ mod tests {
             other => panic!("expected a reply, got {other:?}"),
         }
         state.hub.handle(&id).unwrap().interrupt();
+    }
+
+    /// PARITY item 5: `Shell` is refused for a missing session, an empty
+    /// command, a busy session, and (until the engine entry exists) an idle
+    /// one. A share-link connection cannot send it at all.
+    #[tokio::test]
+    async fn shell_passthrough_refusal_paths() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("shell").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        let (mut ctx, mut rx) = authed_ctx();
+
+        let run = |command: &str| Payload::Shell {
+            session_id: id,
+            command: command.into(),
+        };
+        handle_frame(&state, &mut ctx, true, Frame::request(1, run("   "))).await;
+        assert!(error_message(next_outbound(&mut rx).await).contains("usage: !"));
+
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(
+                2,
+                Payload::Shell {
+                    session_id: SessionId::new_v4(),
+                    command: "ls".into(),
+                },
+            ),
+        )
+        .await;
+        assert!(error_message(next_outbound(&mut rx).await).contains("no such session"));
+
+        handle_frame(&state, &mut ctx, true, Frame::request(3, run("ls"))).await;
+        assert!(
+            error_message(next_outbound(&mut rx).await).contains("not available yet"),
+            "idle sessions reach the honest refusal until the engine entry exists"
+        );
+
+        state.hub.start_run(id, parked_run(id)).unwrap();
+        handle_frame(&state, &mut ctx, true, Frame::request(4, run("ls"))).await;
+        let busy = error_message(next_outbound(&mut rx).await);
+        assert!(busy.contains("run is active"), "{busy}");
+        state.hub.handle(&id).unwrap().interrupt();
+
+        // A share link is scoped to its session and may not run commands.
+        let (tx, mut link_rx) = mpsc::unbounded_channel();
+        let mut link = ConnCtx::scoped(tx, id);
+        handle_frame(&state, &mut link, false, Frame::request(5, run("ls"))).await;
+        match next_outbound(&mut link_rx).await {
+            Outbound::Reply(frame) => match frame.payload {
+                Payload::Error { kind, .. } => {
+                    assert_eq!(kind, Some(modron_protocol::ErrorKind::Forbidden))
+                }
+                other => panic!("expected an error, got {other:?}"),
+            },
+            other => panic!("expected a reply, got {other:?}"),
+        }
     }
 
     /// H3d: a sub-agent steer or stop that cannot land is refused to the

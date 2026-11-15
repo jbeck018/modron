@@ -173,6 +173,19 @@ Answered from the router catalog; `available` is true when the model's
 provider is signed in. UI effect: the model picker lists these rows;
 unavailable rows are shown but cannot be selected.
 
+## 7b. Shell passthrough
+
+```
+Shell { session_id, command }                  // client, owner or driver
+```
+
+Runs one command where the session's tools run, under the same approval
+policy and permission rules as a model-issued `bash` call, and appends
+the labelled output to the transcript. Refused for a busy session.
+Status: the frame and its refusals exist; execution answers "shell
+passthrough is not available yet" until the engine exposes an entry
+point for a user-issued tool call.
+
 ## 8. Host and handoff (C6)
 
 ```

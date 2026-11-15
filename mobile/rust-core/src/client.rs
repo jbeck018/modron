@@ -27,10 +27,10 @@ use crate::view::{
     PendingApprovalView, PendingPlanView, SessionViewModel, ViewModelSnapshot,
 };
 use modron_protocol::{
-    ConfigPatch, ContextGaugeWire, Decision, Frame, Payload, PlanDecision, WireDelta, DEFAULT_PORT,
-    PROTOCOL_VERSION,
+    ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, Payload, PlanDecision,
+    WireDelta, DEFAULT_PORT, PROTOCOL_VERSION,
 };
-use modron_types::{Effort, Phase, ToolActivity};
+use modron_types::{Attachment, Effort, Phase, SandboxPolicy, ToolActivity};
 use modron_view::TranscriptEntry;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -156,6 +156,114 @@ fn is_loopback_host(host: &str) -> bool {
     host.parse::<std::net::IpAddr>()
         .map(|ip| ip.is_loopback())
         .unwrap_or(false)
+}
+
+/// The token query parameter a ws(s) target may carry
+/// (`ws://host:7699/?token=...`), and the environment fallback
+/// [`device_token_from_env`] reads (the names the terminal client uses,
+/// crates/modron-tui/src/remote.rs).
+const TOKEN_PARAM: &str = "token";
+/// The environment variable [`device_token_from_env`] reads.
+pub const DEVICE_TOKEN_ENV: &str = "MODRON_DEVICE_TOKEN";
+
+/// Split a `token` query parameter off a ws(s) target. Returns the target
+/// without that parameter (safe to show or log) and the token, if one was
+/// given and is not empty. Other targets (unix sockets) pass through
+/// untouched. The token is never part of the URL the client dials.
+pub fn split_url_token(url: &str) -> (String, Option<String>) {
+    let is_ws = url.starts_with("ws://") || url.starts_with("wss://");
+    let Some((base, query)) = url.split_once('?').filter(|_| is_ws) else {
+        return (url.to_string(), None);
+    };
+    let mut token = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| match pair.split_once('=') {
+            Some((TOKEN_PARAM, value)) => {
+                if !value.is_empty() {
+                    token = Some(value.to_string());
+                }
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    let stripped = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (stripped, token)
+}
+
+/// The device token from `MODRON_DEVICE_TOKEN`, when set and non-empty.
+/// Not read implicitly: a shell passes the result to `connect` as the
+/// explicit token. Precedence in `connect`: the explicit argument, then the
+/// URL's `?token=`.
+pub fn device_token_from_env() -> Option<String> {
+    std::env::var(DEVICE_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+/// True for the unix-socket targets: `unix` (the default socket),
+/// `unix:<path>` and `unix:///abs/path`.
+fn is_unix_target(url: &str) -> bool {
+    url == "unix" || url.starts_with("unix:")
+}
+
+/// The default local socket: `~/.modron/serve.sock` (the terminal client's
+/// default; `.` stands in when no home is known, as there).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_socket_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".modron").join("serve.sock")
+}
+
+/// The socket a unix target names. `Ok(None)` for a ws(s) target. An empty
+/// path is refused.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn unix_socket_path(url: &str) -> Result<Option<std::path::PathBuf>, ClientError> {
+    if !is_unix_target(url) {
+        return Ok(None);
+    }
+    let path = if url == "unix" {
+        default_socket_path()
+    } else {
+        let explicit = url
+            .strip_prefix("unix://")
+            .or_else(|| url.strip_prefix("unix:"))
+            .unwrap_or("");
+        std::path::PathBuf::from(explicit)
+    };
+    if path.as_os_str().is_empty() {
+        return Err(ClientError::Connect("unix socket path is empty".into()));
+    }
+    Ok(Some(path))
+}
+
+/// Accept a target before any dial: a ws(s) URL under the loopback/LAN rule
+/// ([`validate_ws_url`]), or a unix socket (native only).
+fn validate_target(url: &str, allow_insecure: bool) -> Result<(), ClientError> {
+    if is_unix_target(url) {
+        return validate_unix_target(url);
+    }
+    validate_ws_url(url, allow_insecure)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_unix_target(url: &str) -> Result<(), ClientError> {
+    unix_socket_path(url).map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn validate_unix_target(_url: &str) -> Result<(), ClientError> {
+    Err(ClientError::Connect(
+        "unix sockets are not available in the browser; use ws:// or wss://".into(),
+    ))
 }
 
 /// Runtime-agnostic deadline wrapper. Native: futures-timer polls a
@@ -372,16 +480,25 @@ impl RemoteClient {
 
     /// [`Self::connect`] with explicit options: the LAN `ws://` opt-in
     /// (`allow_insecure`), the connect deadline, and the keepalive timing.
+    ///
+    /// `url` may be `ws://`, `wss://`, or a unix socket (`unix`,
+    /// `unix:<path>`, `unix:///path`, native only; `allow_insecure` does not
+    /// apply to it). A `?token=` on a ws(s) URL is taken out before the dial
+    /// and used when `token` is `None`; the token never reaches the wire
+    /// URL or an error message. [`device_token_from_env`] supplies the
+    /// environment fallback explicitly.
     pub fn connect_with_options(
         url: &str,
         token: Option<&str>,
         options: ConnectOptions,
     ) -> Result<Self, ClientError> {
-        validate_ws_url(url, options.allow_insecure)?;
+        let (url, url_token) = split_url_token(url);
+        validate_target(&url, options.allow_insecure)?;
         let client = Self {
             shared: Arc::new(Shared::new(options)),
         };
-        client.spin_up(url, token, None);
+        let token = token.map(str::to_string).or(url_token);
+        client.spin_up(&url, token.as_deref(), None);
         Ok(client)
     }
 
@@ -407,12 +524,14 @@ impl RemoteClient {
         token: Option<&str>,
         allow_insecure: bool,
     ) -> Result<(), ClientError> {
-        validate_ws_url(url, allow_insecure)?;
+        let (url, url_token) = split_url_token(url);
+        validate_target(&url, allow_insecure)?;
         let last_seq = {
             let st = self.shared.state.lock().unwrap();
             st.vm.last_seq
         };
-        self.spin_up(url, token, Some((session_id, last_seq)));
+        let token = token.map(str::to_string).or(url_token);
+        self.spin_up(&url, token.as_deref(), Some((session_id, last_seq)));
         Ok(())
     }
 
@@ -531,12 +650,24 @@ impl RemoteClient {
         session_id: Option<Uuid>,
         task: impl Into<String>,
     ) -> Result<(), ClientError> {
+        self.submit_with(session_id, task, Vec::new())
+    }
+
+    /// [`Self::submit`] carrying attachments (images from
+    /// [`crate::attach::attachment_from_bytes`]). The server runs the task
+    /// with them as multimodal input.
+    pub fn submit_with(
+        &self,
+        session_id: Option<Uuid>,
+        task: impl Into<String>,
+        attachments: Vec<Attachment>,
+    ) -> Result<(), ClientError> {
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Submit {
                 session_id,
                 task: task.into(),
-                attachments: Vec::new(),
+                attachments,
             },
         ))
     }
@@ -603,17 +734,32 @@ impl RemoteClient {
     /// otherwise it is a submit (a new run, or a new session when none is
     /// attached).
     pub fn send_message(&self, text: impl Into<String>) -> Result<(), ClientError> {
+        self.send_message_with(text, Vec::new())
+    }
+
+    /// [`Self::send_message`] with attachments. Attachments ride only on a
+    /// submit: while the attached session runs, a message with attachments
+    /// is refused (the steer frame has no attachment field), so nothing is
+    /// dropped silently. Wait for the turn to finish, then send again.
+    pub fn send_message_with(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<Attachment>,
+    ) -> Result<(), ClientError> {
         let text = text.into();
         let (session_id, running) = {
             let st = self.shared.state.lock().unwrap();
             (st.vm.session_id, st.vm.running)
         };
         match (running, session_id) {
+            (true, Some(_)) if !attachments.is_empty() => Err(ClientError::Request(
+                "attachments can only be sent when the session is idle".into(),
+            )),
             (true, Some(session_id)) => self.send_frame(Frame::request(
                 self.next_request_id(),
                 Payload::Steer { session_id, text },
             )),
-            _ => self.submit(session_id, text),
+            _ => self.submit_with(session_id, text, attachments),
         }
     }
 
@@ -657,6 +803,26 @@ impl RemoteClient {
             Payload::KillAgent {
                 session_id,
                 agent: agent.into(),
+            },
+        ))
+    }
+
+    /// Run `command` in the attached session's shell: the terminal's
+    /// `!command` passthrough, executed on the server host under the same
+    /// approval and permission rules as a model `bash` call. The answer
+    /// (labelled output, or a refusal) arrives as a note or an error. An
+    /// empty command and a missing session fail here, nothing is sent.
+    pub fn shell(&self, command: impl Into<String>) -> Result<(), ClientError> {
+        let command = command.into();
+        if command.trim().is_empty() {
+            return Err(ClientError::Request("usage: !<shell command>".into()));
+        }
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Shell {
+                session_id,
+                command,
             },
         ))
     }
@@ -724,6 +890,56 @@ impl RemoteClient {
     pub fn set_phase(&self, phase: Phase) -> Result<(), ClientError> {
         self.set_config(ConfigPatch {
             phase: Some(phase),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Approval mode for future runs (`ask`, `yolo` = `ApproveAll`, `deny`).
+    /// The terminal's `--yolo` startup flag sends `ApproveAll`.
+    pub fn set_approval_mode(&self, mode: ApprovalModeWire) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            approval_mode: Some(mode),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Sandbox policy for future tool runs (`--sandbox`). The server refuses
+    /// a policy its platform cannot enforce.
+    pub fn set_sandbox(&self, policy: SandboxPolicy) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            sandbox: Some(policy),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Standing goal prepended to submitted tasks (`--goal`, `/goal`). An
+    /// empty string clears it (the server treats it as no goal).
+    pub fn set_goal(&self, goal: impl Into<String>) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            goal: Some(goal.into()),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Persona switch (`--agent`, `/agent`). The server refuses a name that
+    /// is not configured.
+    pub fn set_persona(&self, persona: impl Into<String>) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            persona: Some(persona.into()),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Tool allow and deny lists for future runs (`--allow`, `--deny`). `None`
+    /// leaves that list alone; `Some(vec![])` clears it.
+    pub fn set_tool_lists(
+        &self,
+        allow: Option<Vec<String>>,
+        deny: Option<Vec<String>>,
+    ) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            allow,
+            deny,
             ..ConfigPatch::default()
         })
     }
