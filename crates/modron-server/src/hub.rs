@@ -607,6 +607,13 @@ impl SessionHandle {
                     call: call.clone(),
                 },
             );
+            self.publish_locked(
+                &mut seq,
+                Payload::Notify {
+                    kind: NotifyKind::Approval,
+                    text: notify_approval_text(&call.name),
+                },
+            );
         }
         drop(order_guard);
         // The whole round-trip is blocking inside an async context:
@@ -730,17 +737,38 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// The session's title from the store, for the done `Notify`. An async
+    /// read: callers must hold no hub lock. `None` when the store has no
+    /// such session or the read fails (the done text then uses the id).
+    pub async fn notify_title(&self) -> Option<String> {
+        match self.shared_store.list().await {
+            Ok(metas) => metas
+                .into_iter()
+                .find(|meta| meta.id == self.id)
+                .map(|meta| meta.title),
+            Err(error) => {
+                tracing::warn!(session = %self.id, %error, "notify title read failed");
+                None
+            }
+        }
+    }
+
     /// The run task calls this after its engine future settles. Whoever
     /// successfully takes the run slot owns the terminal frame; if
     /// [`interrupt`](Self::interrupt) already took it, TurnAborted was
-    /// published there and this is a no-op.
+    /// published there and this is a no-op. `title` is the session title
+    /// read by [`notify_title`](Self::notify_title) before the slot is taken.
     ///
     /// Returns the front queued message when the run SUCCEEDED and the queue
     /// was non-empty (it is popped and `QueueChanged` is published under the
     /// same locks as TurnDone). The caller must start it after this returns:
     /// every lock and the run slot are released by then. Failed and aborted
     /// runs return `None` and leave the queue intact.
-    pub fn complete(&self, result: modron_core::Result<RunSummary>) -> Option<String> {
+    pub fn complete(
+        &self,
+        result: modron_core::Result<RunSummary>,
+        title: Option<String>,
+    ) -> Option<String> {
         let mut slot = lock(&self.run);
         // Interrupted: the slot (and the terminal frame) went to the interrupt.
         slot.take()?;
@@ -766,7 +794,7 @@ impl SessionHandle {
                     &mut seq,
                     Payload::Notify {
                         kind: NotifyKind::Done,
-                        text: notify_done_text(self.id),
+                        text: notify_done_text(self.id, title.as_deref()),
                     },
                 );
                 // A plan-phase run that produced a plan waits for its
@@ -1436,9 +1464,16 @@ impl SessionHub {
             // (success or failure) before the terminal frame. An abort never
             // reaches this point; interrupt refreshes on its own path.
             owner.refresh_context().await;
+            // The done Notify names the session: the title is read here,
+            // with no hub lock held, and only for a successful run.
+            let title = if result.is_ok() {
+                owner.notify_title().await
+            } else {
+                None
+            };
             // `complete` returns only after its run-slot and seq guards are
             // dropped, so the starter may take the slot itself.
-            if let Some(next) = owner.complete(result) {
+            if let Some(next) = owner.complete(result, title) {
                 hub.start_queued(owner.id, next);
             }
         });
@@ -1566,11 +1601,29 @@ const NOTIFY_FAILED_CHARS: usize = 120;
 /// Characters of a wake's prompt kept in its `Notify`.
 const NOTIFY_WAKE_CHARS: usize = 80;
 
-/// Notify text for a finished run: `done: <short session id>`. Every
-/// `Notify` text is built here, so the wording lives in one place (H5a).
-pub(crate) fn notify_done_text(session: SessionId) -> String {
-    let id = session.to_string();
-    format!("done: {}", &id[..8])
+/// Characters of a session title kept in a done `Notify`.
+const NOTIFY_TITLE_CHARS: usize = 60;
+
+/// Notify text for a finished run: `done: <title>` cut to 60 chars, or
+/// `done: <short session id>` when the session has no title. Every `Notify`
+/// text is built here, so the wording lives in one place (H5a).
+pub(crate) fn notify_done_text(session: SessionId, title: Option<&str>) -> String {
+    match title.map(str::trim).filter(|title| !title.is_empty()) {
+        Some(title) => format!(
+            "done: {}",
+            title.chars().take(NOTIFY_TITLE_CHARS).collect::<String>()
+        ),
+        None => {
+            let id = session.to_string();
+            format!("done: {}", &id[..8])
+        }
+    }
+}
+
+/// Notify text for a pending approval: `approval needed: <tool name>`. The
+/// tool's arguments never go here: the text becomes a phone push.
+pub(crate) fn notify_approval_text(tool: &str) -> String {
+    format!("approval needed: {tool}")
 }
 
 /// Notify text for a failed run: its first error line, cut to 120 chars.
@@ -1809,12 +1862,54 @@ mod tests {
         done.send(()).unwrap();
         let frames = until_notify(&mut rx, "done").await;
         assert!(frames.iter().any(|f| f["type"] == "turn_done"));
-        let expected = notify_done_text(id);
+        let expected = notify_done_text(id, None);
         assert_eq!(
             notify_pairs(&frames),
             vec![("done".to_string(), expected.clone())]
         );
         assert!(expected.starts_with("done: ") && expected.len() == "done: ".len() + 8);
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_names_the_session_by_title() {
+        let store: Arc<dyn modron_core::SessionStore> = Arc::new(InMemoryStore::new());
+        let hub = SessionHub::empty();
+        hub.set_engine(Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: Default::default(),
+            tools: Arc::new(ToolRegistry::new()),
+            store: store.clone(),
+            config: EngineConfig {
+                default_model: "mock-model".into(),
+                default_provider: "mock".into(),
+                ..EngineConfig::default()
+            },
+        });
+        let title = "x".repeat(80);
+        let id = store.create_session(&title).await.unwrap().id;
+        let handle = hub.ensure_session(id, None);
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        let mut rx = handle.subscribe();
+        done.send(()).unwrap();
+        let frames = until_notify(&mut rx, "done").await;
+        assert_eq!(
+            notify_pairs(&frames),
+            vec![("done".to_string(), format!("done: {}", "x".repeat(60)))]
+        );
+        assert_eq!(handle.notify_title().await.as_deref(), Some(title.as_str()));
+    }
+
+    #[test]
+    fn done_text_uses_the_title_when_present_and_the_id_otherwise() {
+        let id = SessionId::new_v4();
+        let short = &id.to_string()[..8];
+        assert_eq!(notify_done_text(id, None), format!("done: {short}"));
+        assert_eq!(notify_done_text(id, Some("   ")), format!("done: {short}"));
+        assert_eq!(
+            notify_done_text(id, Some("fix the parser")),
+            "done: fix the parser"
+        );
     }
 
     #[tokio::test]
@@ -1873,7 +1968,7 @@ mod tests {
         assert_eq!(
             notify_pairs(&frames),
             vec![
-                ("done".to_string(), notify_done_text(id)),
+                ("done".to_string(), notify_done_text(id, None)),
                 ("plan".to_string(), NOTIFY_PLAN_TEXT.to_string()),
             ]
         );

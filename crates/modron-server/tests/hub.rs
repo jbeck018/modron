@@ -1,9 +1,12 @@
 //! Hub unit tests: seq monotonicity, the LiveState projection, and the
 //! approval gate round-trip (park -> resolve -> sticky allow-rest).
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{assert_approval_notify, next_live_frame};
 use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
     ApprovalMode, ApprovalPolicy, Engine, EngineConfig, SandboxPolicy, SessionEvent, SessionId,
@@ -225,6 +228,8 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
         }
         other => panic!("expected approval_requested, got {other:?}"),
     };
+    // The approval Notify follows the request, before the resolution.
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
     // It is visible in the live projection while pending.
     let live = handle.live_state();
     assert!(live.pending_approval.is_some());
@@ -259,6 +264,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
         Payload::ApprovalRequested { request_id, .. } => request_id,
         other => panic!("expected approval_requested, got {other:?}"),
     };
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
     handle.resolve(&request_id, Decision::AllowAll).unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(2), gate)
         .await
@@ -324,6 +330,46 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     handle.interrupt();
 }
 
+/// Each approval request publishes exactly one approval Notify, right after
+/// the request, naming only the tool: the arguments never reach the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_request_publishes_one_notify_without_arguments() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    let mut rx = handle.subscribe();
+    let call = ToolCall {
+        id: "c1".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": "rm -rf /secret/path"}),
+    };
+    let gate = {
+        let parked = Arc::clone(&handle);
+        let call = call.clone();
+        tokio::spawn(async move { parked.approve_gate(&call) })
+    };
+    let request_id = match next_live_frame(&mut rx).await.payload {
+        Payload::ApprovalRequested { request_id, .. } => request_id,
+        other => panic!("expected approval_requested, got {other:?}"),
+    };
+    let notify = next_live_frame(&mut rx).await;
+    assert_approval_notify(&notify, "bash");
+    let raw = serde_json::to_string(&notify).unwrap();
+    assert!(!raw.contains("secret"), "arguments leaked: {raw}");
+
+    handle.resolve(&request_id, Decision::Deny).unwrap();
+    // Exactly one Notify per request: the rest of the flow is the echo.
+    let resolved = next_live_frame(&mut rx).await;
+    assert!(matches!(resolved.payload, Payload::ApprovalResolved { .. }));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(!tokio::time::timeout(Duration::from_secs(2), gate)
+        .await
+        .unwrap()
+        .unwrap());
+}
+
 /// Interrupt: a run occupying the slot is aborted, a parked approver
 /// releases (denied), TurnAborted is published exactly once, and the slot
 /// frees.
@@ -369,6 +415,7 @@ async fn interrupt_unblocks_a_parked_approver_and_aborts_the_run() {
         Payload::ApprovalRequested { request_id, .. } => request_id,
         other => panic!("expected approval_requested, got {other:?}"),
     };
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
 
     assert!(handle.interrupt());
     // The parked approver returned (denied by the interrupt drain).
@@ -499,6 +546,7 @@ async fn approval_timeout_publishes_a_deny_resolution() {
         .map(parse_live)
         .unwrap();
     assert!(matches!(frame.payload, Payload::ApprovalRequested { .. }));
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
 
     let denied = tokio::time::timeout(Duration::from_secs(2), gate)
         .await

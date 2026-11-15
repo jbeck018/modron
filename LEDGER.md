@@ -1423,7 +1423,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | H2 | Enforced plan phase, approve step, per-turn plan re-injection | TODO | |
 | H3 | Sub-agents: approvals to parent, live counters, completion events, cap | TODO | |
 | H4 | Reviewer role + verdict event + non-LLM claim checks | TODO | |
-| H5 | Scheduled wakeups, pause reasons, completion/block notifications | ACTIVE | H5a DONE: Wake / CancelWake / WakeChanged, LiveState.wake, persisted and re-armed at start; Notify for done, failed, plan, wake. Open: H5b Notify for approval requests (three server tests assert ApprovalRequested is followed directly by ApprovalResolved; update them), SessionEvent::Paused, session title in the done text |
+| H5 | Scheduled wakeups, pause reasons, completion/block notifications | ACTIVE | H5a DONE: Wake / CancelWake / WakeChanged, LiveState.wake, persisted and re-armed at start; Notify for done, failed, plan, wake. H5b DONE: Notify for approval requests (tool name only, never arguments), done text uses the session title. Open: SessionEvent::Paused; push delivery is the relay (C5) |
 | H6 | Hash-anchored line edits, measured with modron bench | ACTIVE | H6a edit_lines tool + read(line_hashes) DONE, on-demand, approval-gated, edit allow/deny entries cover it. Open: modron bench comparison before any default change |
 | H7 | Reasoning-effort parameter and named model roles | TODO | |
 | H8 | Command and path permission rules + explain command | DONE | H8a matcher, H8b engine gate + [permissions] config, H8c rules reach serve/daemon/acp sessions (shared build path), ConfigPatch.rules / LiveState.rules / ExplainRule. Evals stay rule-free |
@@ -1497,3 +1497,4 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 - 2026-11-15: wave 7. C3b and H5a landed. Gates (root workspace):
   fmt clean, clippy clean, 1093 tests pass. wasm32 target is not
   installed here, so the client core wasm check did not run.
+- 2026-11-15: H5b landed. Gates: fmt clean, clippy clean, 1096 tests.

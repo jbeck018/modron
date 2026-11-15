@@ -311,3 +311,40 @@ impl WsClient {
         }
     }
 }
+
+/// The next frame off a session's live broadcast, parsed. Bounded at 2s.
+pub async fn next_live_frame(
+    rx: &mut tokio::sync::broadcast::Receiver<modron_server::hub::LiveFrame>,
+) -> Frame {
+    let live = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a live frame")
+        .expect("channel open");
+    serde_json::from_str(&live.json).expect("live frame json parses")
+}
+
+/// The next frame that is not a `Notify`. The approval flow publishes a
+/// Notify right after `ApprovalRequested`; tests that follow the flow skip
+/// it here and assert it explicitly with [`assert_approval_notify`].
+pub async fn next_non_notify(
+    rx: &mut tokio::sync::broadcast::Receiver<modron_server::hub::LiveFrame>,
+) -> Frame {
+    loop {
+        let frame = next_live_frame(rx).await;
+        if !matches!(frame.payload, Payload::Notify { .. }) {
+            return frame;
+        }
+    }
+}
+
+/// Asserts `frame` is the approval Notify for `tool`: kind approval and the
+/// exact text `approval needed: <tool>` (no tool arguments in it).
+pub fn assert_approval_notify(frame: &Frame, tool: &str) {
+    match &frame.payload {
+        Payload::Notify { kind, text } => {
+            assert_eq!(*kind, modron_protocol::NotifyKind::Approval);
+            assert_eq!(text, &format!("approval needed: {tool}"));
+        }
+        other => panic!("expected the approval notify, got {other:?}"),
+    }
+}
