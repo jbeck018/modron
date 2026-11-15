@@ -43,6 +43,7 @@ mod terminal {
         startup::{self, Args, Plan, ServerChild, ServerSpec},
         App,
     };
+    use modron_mobile_core::{default_socket_path, device_token_from_env};
     use nsh_platform_tui::{
         run_app, AppOptions, AppView, CacheOptions, Input, Modifiers, Root, RunEvent,
     };
@@ -205,18 +206,25 @@ mod terminal {
             return ExitCode::SUCCESS;
         }
         let env_url = std::env::var("MODRON_URL").ok().filter(|s| !s.is_empty());
-        let plan = startup::decide(&args, env_url.as_deref(), startup::probe_ws, || {
+        let env = startup::Env { url: env_url.clone(), socket: default_socket_path() };
+        let plan = startup::decide(&args, &env, startup::probe_ws, startup::probe_unix, || {
             let env_bin = std::env::var("MODRON_BIN").ok();
             let path = std::env::var("PATH").ok();
             startup::find_bin(env_bin.as_deref(), exe_dir().as_deref(), path.as_deref(), |p| {
                 p.is_file()
             })
         });
+        let device = device_token_from_env();
+        let token = startup::resolve_token(
+            args.token.as_deref(),
+            args.url.as_deref().or(env_url.as_deref()),
+            device.as_deref(),
+        );
         install_panic_hook();
         let log = log_path();
         let (live, mut server) = match plan {
             Plan::Demo => (None, None),
-            Plan::Connect { url, .. } => (Some(connect(&args, url)), None),
+            Plan::Connect { url, .. } => (Some(connect(&args, url, token)), None),
             Plan::Spawn { url, listen, bin } => {
                 let spec = ServerSpec {
                     bin,
@@ -226,9 +234,11 @@ mod terminal {
                     log: log.clone(),
                     dir: None,
                     home: None,
+                    working_dir: args.working_dir.clone(),
+                    sessions_dir: args.sessions_dir.clone(),
                 };
                 match ServerChild::start(&spec, startup::START_TIMEOUT) {
-                    Ok(child) => (Some(connect(&args, url)), Some(child)),
+                    Ok(child) => (Some(connect(&args, url, token)), Some(child)),
                     Err(reason) => return fatal(&reason, &log),
                 }
             }
@@ -271,13 +281,15 @@ mod terminal {
         ExitCode::FAILURE
     }
 
-    fn connect(args: &Args, url: String) -> Live {
+    fn connect(args: &Args, url: String, token: Option<String>) -> Live {
         session::spawn(LiveOptions {
             url,
-            token: args.token.clone(),
+            token,
             session: args.session,
             resume: startup::resume_of(args),
             cwd: current_dir(),
+            insecure_lan: args.insecure_lan,
+            startup: startup::startup_patches(args),
         })
         .unwrap_or_else(|e| panic!("cannot start the session driver: {e}"))
     }

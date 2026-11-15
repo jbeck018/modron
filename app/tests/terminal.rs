@@ -98,6 +98,8 @@ fn spec(bin: PathBuf, listen: &str) -> ServerSpec {
         log: PathBuf::from(HOME).join("serve.log"),
         dir: Some(REPO.into()),
         home: Some(HOME.into()),
+        working_dir: None,
+        sessions_dir: None,
     }
 }
 
@@ -151,9 +153,14 @@ fn a_running_server_is_reused_and_not_stopped() {
         .expect("external server starts");
     let pid = external.pid();
 
-    let plan = startup::decide(&Args::default(), Some(&url), startup::probe_ws, || {
-        panic!("a running server must not be looked up as a binary")
-    });
+    let env = startup::Env { url: Some(url.clone()), socket: PathBuf::from(HOME).join("no.sock") };
+    let plan = startup::decide(
+        &Args::default(),
+        &env,
+        startup::probe_ws,
+        |_| false,
+        || panic!("a running server must not be looked up as a binary"),
+    );
     assert_eq!(plan, Plan::Connect { url: url.clone(), source: Source::Running });
 
     let mut live = session::spawn(LiveOptions { url, ..Default::default() }).expect("driver");

@@ -27,8 +27,8 @@ use std::{
 };
 
 use modron_mobile_core::{
-    approval_mode_next, connection_label, sandbox_next, ClientError, ConfigPatch, ConnectionState,
-    RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
+    approval_mode_next, connection_label, sandbox_next, ClientError, ConfigPatch, ConnectOptions,
+    ConnectionState, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
 };
 use modron_protocol::SessionMetaWire;
 use tokio::sync::mpsc::{
@@ -64,7 +64,7 @@ pub enum Resume {
 }
 
 /// Where the live driver connects, and which session it attaches to.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct LiveOptions {
     pub url: String,
     pub token: Option<String>,
@@ -75,6 +75,11 @@ pub struct LiveOptions {
     /// The folder `Resume::Latest` matches against (the session's
     /// `working_dir`).
     pub cwd: Option<String>,
+    /// The LAN `ws://` opt-in (`--insecure-lan`).
+    pub insecure_lan: bool,
+    /// The config the startup flags ask for, sent in order once a session is
+    /// attached (and again after a reconnect), so it applies to future turns.
+    pub startup: Vec<ConfigPatch>,
 }
 
 impl LiveOptions {
@@ -296,6 +301,8 @@ pub struct Driver {
     retry_at: Option<Instant>,
     attempts: u32,
     last: String,
+    /// The startup config went out for the current connection.
+    startup_sent: bool,
 }
 
 impl Driver {
@@ -307,7 +314,11 @@ impl Driver {
         actions: UnboundedReceiver<UiAction>,
         out: UnboundedSender<ViewModelSnapshot>,
     ) -> Option<Self> {
-        match RemoteClient::connect(&options.url, options.token.as_deref()) {
+        match RemoteClient::connect_with_options(
+            &options.url,
+            options.token.as_deref(),
+            connect_options(&options),
+        ) {
             Ok(client) => Some(Self {
                 client,
                 options,
@@ -320,6 +331,7 @@ impl Driver {
                 retry_at: None,
                 attempts: 0,
                 last: String::new(),
+                startup_sent: false,
             }),
             Err(e) => {
                 let _ = out.send(ViewModelSnapshot {
@@ -364,6 +376,7 @@ impl Driver {
             ConnectionState::Connecting => {}
             ConnectionState::Disconnected => {
                 self.linked = false;
+                self.startup_sent = false;
                 self.status.reconnecting.store(true, Ordering::SeqCst);
                 let due = *self
                     .retry_at
@@ -390,7 +403,19 @@ impl Driver {
                         self.status.fail(no_session_to_continue(&self.options.url));
                         return false;
                     }
+                    None if !self.options.startup.is_empty() => {
+                        let _ = self.client.new_session(None);
+                    }
                     None => {}
+                }
+            }
+        }
+        // The startup config waits for a session: SetConfig needs one attached.
+        if !self.startup_sent && state.session_id.is_some() {
+            self.startup_sent = true;
+            for patch in self.options.startup.clone() {
+                if let Err(error) = self.client.set_config(patch) {
+                    self.client.note_local_error(error.to_string());
                 }
             }
         }
@@ -429,6 +454,9 @@ impl Driver {
         if self.options.resume != Resume::New {
             let _ = self.client.list_sessions();
             self.stage = Stage::Listing(Instant::now() + LIST_WAIT);
+        } else if !self.options.startup.is_empty() {
+            // Startup flags need a session to configure: start one now.
+            let _ = self.client.new_session(None);
         }
     }
 
@@ -438,10 +466,19 @@ impl Driver {
         let token = self.options.token.as_deref();
         match self.resume {
             Some(session) => {
-                let _ = self.client.reconnect(&self.options.url, session, token);
+                let _ = self.client.reconnect_with_options(
+                    &self.options.url,
+                    session,
+                    token,
+                    self.options.insecure_lan,
+                );
             }
             None => {
-                if let Ok(client) = RemoteClient::connect(&self.options.url, token) {
+                if let Ok(client) = RemoteClient::connect_with_options(
+                    &self.options.url,
+                    token,
+                    connect_options(&self.options),
+                ) {
                     self.client = client;
                 }
             }
@@ -491,6 +528,7 @@ fn apply(client: &RemoteClient, action: UiAction) {
             Ok(())
         }
         UiAction::Compact => client.compact(),
+        UiAction::Shell(command) => client.shell(command),
         UiAction::ListSessions => client.list_sessions(),
         UiAction::Attach(session) => client.attach(session, 0),
         UiAction::NewSession => client.new_session(None),
@@ -537,6 +575,7 @@ fn apply(client: &RemoteClient, action: UiAction) {
         // Navigation is applied by the host, and the owner portal's actions
         // are the web host's (`Host::take_portal`); neither reaches here.
         UiAction::Nav(_)
+        | UiAction::Tools(_)
         | UiAction::SignIn(_)
         | UiAction::SignOut
         | UiAction::RefreshPortal
@@ -549,6 +588,11 @@ fn apply(client: &RemoteClient, action: UiAction) {
     if let Err(error) = result {
         client.note_local_error(error.to_string());
     }
+}
+
+/// The core's connect options for these live options (the LAN opt-in).
+fn connect_options(options: &LiveOptions) -> ConnectOptions {
+    ConnectOptions { allow_insecure: options.insecure_lan, ..ConnectOptions::default() }
 }
 
 /// The title of a shared transcript page (`/share`).

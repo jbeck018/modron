@@ -593,6 +593,26 @@ async function testEffortTapSendsConfig(browser, base) {
   }
 }
 
+// Packet D1. Ctrl+T with no tool activity shows the note and opens nothing;
+// "!ls" sends a shell frame and never a submit.
+async function testCtrlTAndShellPassthrough(browser, base) {
+  const ws = await startWsServer();
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.keyboard.press('Control+t');
+    await page.waitForFunction(() => document.body.innerText.includes('no tool activity yet'), null, { timeout: TIMEOUT });
+    await page.keyboard.type('!ls');
+    await page.keyboard.press('Enter');
+    const frame = await waitFrame(ws, 'shell', (f) => f.command === 'ls');
+    if (frame.command !== 'ls') throw new Error('shell command was ' + frame.command);
+    if (ws.received.includes('submit')) throw new Error('a shell line was submitted: ' + ws.received.join(','));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // Packet C3f. Typing "/co" in the composer shows the compact suggestion.
 async function testSlashSuggestions(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
@@ -716,6 +736,7 @@ async function testAgentSteerAndKill(browser, base) {
       const s = await portalSite('on'); try { await testPortalSignOut(browser, s); } finally { s.close(); } }],
     ['(p4) settings share: a viewer invite is created, shown and revoked', async () => {
       const s = await portalSite('on'); try { await testInviteFromSettings(browser, s); } finally { s.close(); } }],
+    ['(d1) ctrl+t note, and "!ls" sends a shell frame (no submit)', () => testCtrlTAndShellPassthrough(browser, base)],
   ];
   more.push(...portal);
   for (const [name, run] of more) {

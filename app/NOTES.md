@@ -121,3 +121,33 @@ Literal copy still in app/src, not from the core or modron-view:
   `y a n` / `y r` and their `   ` joiner (terminal only).
 - demo.rs: demo fixture rows and `running` / `idle` (the core has the same
   words inline in view.rs, with no shared constant).
+
+# Parity packet D1 (terminal daily-use gaps)
+
+- Tool detail panel (Ctrl+T) and the composer cap: the panel is a fixed
+  window of 12 rows plus a title, the transcript height subtracts the panel
+  and the composer's growth (`chat::transcript_px`). The composer's cap is NSH
+  `max_h` on the multiline input (the style's `maxHeight`), with the cap
+  computed from 6 lines of 18 logical pixels. Not visually checked on the
+  terminal grid (px to rows conversion): the headless test checks only the
+  arithmetic.
+- `!command` is a `UiAction::Shell` through the core's `shell`. The old TUI
+  echoes `❯ !cmd` into the transcript and prints the output as dim rows; the
+  app does not echo (the core's answer arrives as a note or an error).
+- `@file` is terminal only. On the web `@` stays plain text: the browser has
+  no access to the server's workspace. The walk is `files.rs` (native only,
+  `ignore` crate as in the root workspace). The index is built once per
+  process from the current directory, so a file added later is not listed
+  until restart. The first `@` shows an empty list until the walk ends (about
+  a keystroke later).
+- Shared suggestion list: `suggest::for_draft` yields the names and rows for
+  both kinds; the view and the router call the same function, so the list and
+  the keys cannot drift.
+- Unix socket: the default socket is probed with `UnixStream::connect`, and
+  only when `MODRON_URL` is unset (an explicit URL keeps its own probe).
+- Startup config is sent as `SetConfig` frames after attach, in the flag
+  order (approval, sandbox, effort, goal, persona, tool lists). With no
+  session yet, the app creates one first; that is a change from `--new`'s
+  lazy start, and only happens when a config flag is given.
+- Strings with no shared home yet: "no tool activity yet" (Ctrl+T note), and
+  the `!`, `@file` and Ctrl+T help rows.

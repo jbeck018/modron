@@ -176,6 +176,8 @@ pub struct NavView {
     /// Whether the composer's command suggestions are hidden (Esc).
     pub slash_hidden: bool,
     pub slash_selected: usize,
+    /// The tool detail panel's first visible row, while it is open.
+    pub tool_panel: Option<usize>,
     /// A completed composer text, with a sequence number so the view applies
     /// each one once.
     pub completion: (u64, String),
@@ -218,7 +220,7 @@ pub struct Nav {
     agent_row: Option<AgentRowView>,
     pending: Option<Pending>,
     /// The command names the composer's suggestions show, in order.
-    slash_items: Vec<&'static str>,
+    slash_items: Vec<String>,
     slash_sel: usize,
     slash_hidden: bool,
     completion: (u64, String),
@@ -409,7 +411,7 @@ impl Nav {
 
     /// The command names the composer's text suggests now. The host sets
     /// this before every key, and the selection stays inside it.
-    pub fn set_slash(&mut self, items: Vec<&'static str>) {
+    pub fn set_slash(&mut self, items: Vec<String>) {
         self.slash_items = items;
         self.slash_sel = self.slash_sel.min(self.slash_items.len().saturating_sub(1));
     }
@@ -561,8 +563,8 @@ impl Nav {
             }
             NavStep::SlashHide => self.slash_hidden = true,
             NavStep::CompleteSelected => {
-                if let Some(name) = self.slash_items.get(self.slash_sel).copied() {
-                    self.complete(name);
+                if let Some(name) = self.slash_items.get(self.slash_sel).cloned() {
+                    self.complete(&name);
                 }
             }
             NavStep::Complete(name) => self.complete(&name),
@@ -589,6 +591,7 @@ impl Nav {
             confirm: self.pending.as_ref().map(|p| p.text.clone()),
             slash_hidden: self.slash_hidden,
             slash_selected: self.slash_sel,
+            tool_panel: None,
             completion: self.completion.clone(),
             scroll_seq: 0,
             scroll_offset: 0,

@@ -35,6 +35,9 @@ serde_json = "1"
 # Terminal host only (the web build must not link any of these).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 nsh-platform-tui = { version = "=0.5.1", features = ["run-app"] }
+# @file completion walks the workspace: .gitignore respect for free (the
+# same crate and version as the modron root workspace).
+ignore = "0.4"
 ratatui = "=0.30.2"
 crossterm = "=0.29.0"
 

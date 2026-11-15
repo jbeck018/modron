@@ -14,29 +14,44 @@ client core (`mobile/rust-core`), with two hosts.
 
 With no flags the app picks its server in this order:
 
-1. `MODRON_URL` (default `ws://127.0.0.1:7699`) answers a websocket
+1. The default unix socket (`~/.modron/serve.sock`, the old terminal's
+   default) accepts a connection, when `MODRON_URL` is unset: connect to it.
+2. `MODRON_URL` (default `ws://127.0.0.1:7699`) answers a websocket
    handshake within 500 ms: connect to it.
-2. Nothing answers and the address is loopback: start `modron serve
+3. Nothing answers and the address is loopback: start `modron serve
    --listen 127.0.0.1:<port>` as a child of the app, wait up to 5 s for the
    port, connect. The app stops that child on exit (SIGTERM, SIGKILL after
    2 s), also on Ctrl+C and on panic. A server that was already running is
    never touched.
-3. Otherwise (remote address, or no binary): a full-screen message with the
+4. Otherwise (remote address, or no binary): a full-screen message with the
    reason and the two ways out. Any key exits non-zero.
 
-`--url` connects to that server without probing; `--demo` plays the demo.
+`--url` connects to that server without probing; `--socket PATH` connects to
+a unix socket; `--demo` plays the demo.
 
 Flags:
 
-- `--token T`: device token for the server (any mode that connects).
-- `--session UUID`: attach to that session.
+- `--url`, `--socket`: connect with no probe. A plain `ws://` to a
+  non-loopback host is refused unless `--insecure-lan` is given (trusted LAN
+  only); the reason is shown on the message screen.
+- `--token T`: device token for the server (any mode that connects). Without
+  it the token comes from a `?token=` in `--url`, else `MODRON_DEVICE_TOKEN`.
+- `--session UUID` (alias `--resume UUID`): attach to that session.
 - `--new`: attach to nothing; the first submit starts a new session.
 - Default (no session flag): the most recently updated session whose folder
   is the current directory; with none, a new session on the first submit.
 - `--continue`: the most recently updated session of any folder; with none,
   a message screen that exits non-zero.
 - `--provider P`, `--model M`: passed to a server the app starts.
+- `--working-dir DIR`, `--sessions-dir DIR`: passed to a server the app
+  starts (`modron serve` takes both); refused when attaching to a server that
+  is already running.
 - `--keep-server`: leave a server the app started running after exit.
+- Config flags, sent to the attached session after attach (future turns
+  only): `--yolo` (alias `--approve-all`), `--effort low|medium|high|xhigh|max`,
+  `--goal TEXT`, `--agent NAME`, `--sandbox off|seatbelt|bwrap`, `--allow TOOL`
+  and `--deny TOOL` (both repeatable). With no session attached yet, the app
+  starts a new one so the config has a session to apply to.
 
 Environment:
 
@@ -53,6 +68,27 @@ words), then the address, then `started by modron-app` when the app started
 the server. If the connection drops, the app shows `disconnected`, retries
 every 2 s (doubling, capped at 30 s) and re-attaches to the same session.
 Esc or Ctrl+C leaves while it retries.
+
+Tool detail: Ctrl+T opens a panel with this turn's tool rows (the last
+group's when the live turn has none), verbatim from the snapshot, scrolled to
+the newest row. While it is open Up/Down move a row, PageUp/PageDown a page,
+Home/End jump, and Esc or Ctrl+T closes it. On the web, a tap on the turn
+summary toggles it.
+
+Shell passthrough: a composer line starting with `!` runs the rest of the
+line on the server (through the core's `shell` call, under the usual approval
+rules) and never reaches the model. A bare `!` is the server's usage refusal.
+Refusals and output arrive through the status line's note or error.
+
+`@file` completion (terminal only): an `@` that starts a token opens the
+suggestion list with workspace paths that contain the text typed after it
+(case-insensitive). Up/Down choose, Tab replaces the token with `@path `,
+Esc hides the list, Enter sends as typed. The walk starts at the app's working
+directory, respects `.gitignore`, skips hidden entries, `target` and
+`node_modules`, keeps 200 paths and stops after 400 ms, on a background thread.
+
+The multi-line composer grows to 6 lines and then scrolls inside itself; the
+transcript shrinks to match.
 
 Keys (the same on web, where the router sees DOM keys): Enter sends;
 Shift+Enter, Ctrl+J, or a line ending in `\` adds a line (the `\` is

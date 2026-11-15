@@ -6,6 +6,8 @@
 
 pub mod chat;
 pub mod demo;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod files;
 pub mod help;
 pub mod nav;
 pub mod portal;
@@ -14,6 +16,7 @@ pub mod session;
 pub mod slash;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod startup;
+pub mod suggest;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

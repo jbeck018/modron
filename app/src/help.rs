@@ -6,7 +6,7 @@ use modron_mobile_core::view::{HELP_COMMANDS_HEADING, HELP_KEYS_HEADING};
 use modron_view::slash::slash_help_lines;
 use uuid::Uuid;
 
-use crate::chat::{Key, KeyFacts, Routed, ScrollStep, UiAction};
+use crate::chat::{Key, KeyFacts, Routed, ScrollStep, ToolsStep, UiAction};
 use crate::nav::{NavStep, Screen};
 use crate::slash;
 
@@ -40,6 +40,52 @@ fn session_id() -> Uuid {
 /// Every binding the app has, in help order.
 pub fn bindings() -> Vec<Binding> {
     vec![
+        Binding {
+            label: "ctrl+t",
+            what: "tool detail panel: this turn's tool rows (esc or ctrl+t closes)",
+            key: Key::Char('t'),
+            chord: true,
+            alt: false,
+            facts: chat,
+            draft: "",
+            expect: || Routed::Tools(ToolsStep::Toggle),
+        },
+        Binding {
+            label: "esc (tool panel)",
+            what: "close the tool detail panel; up/down, pgup/pgdn, home/end scroll it",
+            key: Key::Escape,
+            chord: false,
+            alt: false,
+            facts: || with(|f| f.tool_panel = true),
+            draft: "",
+            expect: || Routed::Tools(ToolsStep::Close),
+        },
+        Binding {
+            label: "tab (@file)",
+            what:
+                "complete the selected @path (terminal only; the list is the same as for /commands)",
+            key: Key::Tab,
+            chord: false,
+            alt: false,
+            facts: || {
+                with(|f| {
+                    f.slash_len = 1;
+                    f.file_mode = true;
+                })
+            },
+            draft: "@ma",
+            expect: || Routed::CompleteFile,
+        },
+        Binding {
+            label: "!command",
+            what: "run the rest of the line in the shell (not the model); bare ! is a usage line",
+            key: Key::Enter,
+            chord: false,
+            alt: false,
+            facts: chat,
+            draft: "!ls",
+            expect: || Routed::Composer,
+        },
         Binding {
             label: "enter",
             what: "send (steers while a run is active)",

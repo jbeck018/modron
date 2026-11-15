@@ -36,6 +36,7 @@ use uuid::Uuid;
 use crate::nav::{InviteLine, Nav, NavStep, NavView, Screen};
 use crate::portal::PortalRow;
 use crate::slash;
+use crate::suggest;
 use std::collections::VecDeque;
 
 /// What the user asked the client to do. The host or the view sends these;
@@ -117,6 +118,28 @@ pub enum UiAction {
     CreateInvite(String),
     RevokeInvite(String),
     CopyInvite(String),
+    /// `!command`: run the command in the attached session's shell (the
+    /// core's `shell`). Never sent to the model; the bare `!` gives the
+    /// core's usage refusal.
+    Shell(String),
+    /// The tool detail panel: Ctrl+T, or a tap on the turn summary (web).
+    Tools(ToolsStep),
+}
+
+/// One step of the tool detail panel. The panel owns the keyboard while it
+/// is open (as the old TUI's ctrl+t panel does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolsStep {
+    /// Ctrl+T: open at the newest row, or close. Opening with no tool
+    /// activity leaves the panel closed and sends a note instead.
+    Toggle,
+    /// Esc.
+    Close,
+    /// Up and Down move one row; PageUp and PageDown move a page.
+    Move(isize),
+    /// Home and End.
+    Top,
+    Bottom,
 }
 
 impl UiAction {
@@ -197,8 +220,10 @@ pub(crate) fn set_window_height(h: f32) {
 /// The transcript's height for the window: the window's height less the
 /// chrome, clamped to the limits. Reads the bound signal, so a view that
 /// calls it re-lays out when the window changes.
-pub(crate) fn transcript_height(window: Signal<f32>) -> f32 {
-    fit_transcript_height(window.get())
+pub(crate) fn transcript_px(window: f32, panel_open: bool, composer_lines: usize) -> f32 {
+    let panel = if panel_open { TOOL_PANEL_H } else { 0.0 };
+    let growth = (composer_lines.clamp(1, COMPOSER_MAX_LINES) - 1) as f32 * COMPOSER_LINE_H;
+    fit_transcript_height(window - panel - growth)
 }
 
 /// The transcript height for a window of `window` logical pixels.
@@ -217,6 +242,18 @@ const SWARM_SLOTS: usize = 4;
 /// Visible slots for the command suggestions (table rows, then local rows).
 const SLASH_SLOTS: usize = 16;
 const NOTE_SLOTS: usize = 2;
+/// Rows of the tool detail panel shown at once (its title is one more row).
+const TOOL_PANEL_SLOTS: usize = 12;
+/// The panel's height in logical pixels: its title and rows, at the row size.
+const TOOL_PANEL_H: f32 = (TOOL_PANEL_SLOTS + 1) as f32 * COMPOSER_LINE_H;
+/// The composer grows one row per line up to this many lines, then scrolls
+/// inside itself (NSH `max_h`, the same as the transcript's clamp).
+pub const COMPOSER_MAX_LINES: usize = 6;
+/// One composer line in logical pixels.
+const COMPOSER_LINE_H: f32 = 18.0;
+/// The note Ctrl+T sends when there is no tool activity yet (app copy: the
+/// old TUI's "no tool activity yet" toast; no shared home yet).
+const NO_TOOLS_NOTE: &str = "no tool activity yet";
 
 /// The composer text, mirrored from the view so the host can read it for a
 /// revise note (the host filters keys before the composer sees them).
@@ -372,6 +409,10 @@ pub struct KeyFacts {
     pub recalling: bool,
     /// How many sent inputs can be recalled.
     pub history_len: usize,
+    /// The tool detail panel is open (it owns the keyboard).
+    pub tool_panel: bool,
+    /// The suggestions are `@file` completions.
+    pub file_mode: bool,
 }
 
 /// One transcript scroll step (the keys PageUp, PageDown, Home, End).
@@ -397,6 +438,10 @@ pub enum Routed {
     /// The key is a screen step (Sessions, Settings, and the Ctrl+O / F2
     /// openers).
     Nav(NavStep),
+    /// Ctrl+T, and the panel's keys (see [`ToolsStep`]).
+    Tools(ToolsStep),
+    /// Tab on an `@file` suggestion: the selected path replaces the token.
+    CompleteFile,
     /// A key the open screen has no use for: consumed, nothing happens.
     Ignored,
 }
@@ -424,6 +469,9 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     if matches!(facts.screen, Screen::SignIn | Screen::Portal) {
         return route_portal_key(key, chord, &facts);
     }
+    if facts.tool_panel && facts.screen == Screen::Chat {
+        return route_tool_panel_key(key, chord);
+    }
     if facts.confirming && !chord {
         return match key {
             Key::Char('y') => Routed::Nav(NavStep::Confirm),
@@ -434,6 +482,9 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     match key {
         Key::F2 => return Routed::Nav(NavStep::Open(Screen::Settings)),
         Key::F1 => return Routed::Nav(NavStep::Open(Screen::Help)),
+        Key::Char('t') if chord && facts.screen == Screen::Chat => {
+            return Routed::Tools(ToolsStep::Toggle)
+        }
         Key::Char('o') if chord => return Routed::Nav(NavStep::Open(Screen::Sessions)),
         Key::Char('a') if chord && facts.screen == Screen::Chat => {
             return match facts.first_agent.clone() {
@@ -452,11 +503,12 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     match key {
         Key::Escape if chord => return composer,
         Key::Escape => return escape_route(&facts),
-        Key::Enter if suggesting && !facts.slash_exact => {
+        Key::Enter if suggesting && !facts.slash_exact && !facts.file_mode => {
             return Routed::Nav(NavStep::CompleteSelected)
         }
         Key::Enter if alt => return queue_route(draft),
         Key::Enter => return composer,
+        Key::Tab if suggesting && facts.file_mode => return Routed::CompleteFile,
         Key::Tab if suggesting => return Routed::Nav(NavStep::CompleteSelected),
         Key::Up if suggesting => return Routed::Nav(NavStep::SlashMove(-1)),
         Key::Down if suggesting => return Routed::Nav(NavStep::SlashMove(1)),
@@ -514,6 +566,48 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
         }
     }
     composer
+}
+
+/// The keys while the tool detail panel is open: Ctrl+T and Esc close it,
+/// Up and Down move a row, PageUp and PageDown a page, Home and End jump.
+/// Any other key is consumed.
+fn route_tool_panel_key(key: Key, chord: bool) -> Routed {
+    if chord {
+        return match key {
+            Key::Char('t') => Routed::Tools(ToolsStep::Toggle),
+            _ => Routed::Ignored,
+        };
+    }
+    match key {
+        Key::Escape => Routed::Tools(ToolsStep::Close),
+        Key::Up => Routed::Tools(ToolsStep::Move(-1)),
+        Key::Down => Routed::Tools(ToolsStep::Move(1)),
+        Key::PageUp => Routed::Tools(ToolsStep::Move(-(SCROLL_PAGE as isize))),
+        Key::PageDown => Routed::Tools(ToolsStep::Move(SCROLL_PAGE as isize)),
+        Key::Home => Routed::Tools(ToolsStep::Top),
+        Key::End => Routed::Tools(ToolsStep::Bottom),
+        _ => Routed::Ignored,
+    }
+}
+
+/// The action a submitted composer line means. A slash command runs its
+/// command; `!command` is a shell command (see [`shell_command`]); anything
+/// else is a task.
+pub fn submit_action(task: &str) -> UiAction {
+    if task.starts_with('/') {
+        return slash::run(task);
+    }
+    match shell_command(task) {
+        Some(command) => UiAction::Shell(command),
+        None => UiAction::Send(task.to_string()),
+    }
+}
+
+/// `!command` detection: everything after the leading `!`, trimmed (the old
+/// TUI's rule, crates/modron-tui `shell_passthrough`). `Some("")` for a bare
+/// `!`. None for a task.
+pub fn shell_command(task: &str) -> Option<String> {
+    task.strip_prefix('!').map(|rest| rest.trim().to_string())
 }
 
 /// Esc, in precedence order: a pending approval is denied (its last option,
@@ -732,6 +826,10 @@ pub struct Model {
     pub reasoning: String,
     /// The short session id (the first eight characters), or empty.
     pub session: String,
+    /// The tool detail rows (the live turn's, else the last group's) and
+    /// their title, verbatim from the snapshot.
+    pub tool_detail: Vec<String>,
+    pub tool_title: String,
 }
 
 impl Model {
@@ -764,6 +862,8 @@ impl Model {
             } else {
                 String::new()
             },
+            tool_detail: s.tool_detail.clone(),
+            tool_title: s.tool_detail_title.clone(),
             session: s
                 .session_id
                 .map(|id| id.to_string().chars().take(8).collect())
@@ -835,6 +935,10 @@ pub struct Host {
     nav: Nav,
     /// The owner portal's actions, taken by the web host (`take_portal`).
     portal: VecDeque<UiAction>,
+    /// Rows of the tool detail the snapshot held at the last push.
+    tool_len: usize,
+    /// The tool detail panel's first visible row, while it is open.
+    tool_panel: Option<usize>,
 }
 
 /// Creates the two ends of the link. Also resets the composer mirror, so a
@@ -865,6 +969,8 @@ pub fn link() -> (Host, Client) {
             seen_rows: 0,
             nav: Nav::default(),
             portal: VecDeque::new(),
+            tool_len: 0,
+            tool_panel: None,
         },
         Client { snapshots: snap_rx, actions: act_tx, nav: nav_rx },
     )
@@ -878,6 +984,10 @@ impl Host {
         self.plan_pending = snapshot.plan_pending.is_some();
         self.queued = snapshot.queued.len();
         self.running = snapshot.running;
+        self.tool_len = snapshot.tool_detail.len();
+        if self.tool_len == 0 {
+            self.tool_panel = None;
+        }
         let rows = snapshot.history.len();
         if rows > self.seen_rows && scroll_offset() > 0 {
             NEW_BELOW.store(true, Ordering::SeqCst);
@@ -894,6 +1004,7 @@ impl Host {
         loop {
             match self.actions.try_recv().ok()? {
                 UiAction::Nav(step) => self.nav_step(step),
+                UiAction::Tools(step) => self.tools_step(step),
                 action if action.is_portal() => self.portal.push_back(action),
                 action => return Some(action),
             }
@@ -986,8 +1097,8 @@ impl Host {
     /// when the composer gets it.
     pub fn route(&mut self, key: Key, alt: bool, chord: bool) -> bool {
         let draft = draft_text();
-        let items = slash::suggestions_for(&draft);
-        self.nav.set_slash(items.iter().map(|e| e.name).collect());
+        let items = suggest::for_draft(&draft);
+        self.nav.set_slash(items.names.clone());
         let facts = KeyFacts {
             approval_options: self.pending,
             plan_pending: self.plan_pending,
@@ -996,7 +1107,9 @@ impl Host {
             filter_active: !self.nav.filter().is_empty(),
             selected_session: self.nav.selected_session(),
             enter_setting: self.nav.enter_setting(),
-            slash_len: if self.nav.suggestions_shown() { items.len() } else { 0 },
+            slash_len: if self.nav.suggestions_shown() { items.names.len() } else { 0 },
+            file_mode: items.file,
+            tool_panel: self.tool_panel.is_some(),
             slash_exact: slash::is_exact(&draft),
             selected_index: self.nav.selected(),
             selected_model: self.nav.selected_model(),
@@ -1037,6 +1150,20 @@ impl Host {
             }
             Routed::Nav(step) => {
                 self.nav_step(step);
+                true
+            }
+            Routed::Tools(step) => {
+                self.tools_step(step);
+                true
+            }
+            Routed::CompleteFile => {
+                let selected = self.nav.view().slash_selected;
+                if let Some(text) =
+                    items.names.get(selected).and_then(|path| suggest::splice_file(&draft, path))
+                {
+                    self.nav.set_text(&text);
+                    self.notify();
+                }
                 true
             }
             Routed::Ignored => true,
@@ -1098,8 +1225,31 @@ impl Host {
         self.notify();
     }
 
+    /// The tool detail panel: Toggle opens it at the newest row (or sends the
+    /// no-activity note), Close and a second Toggle close it, and the moves
+    /// stay within the rows the snapshot holds.
+    fn tools_step(&mut self, step: ToolsStep) {
+        let last = self.tool_len.saturating_sub(TOOL_PANEL_SLOTS);
+        self.tool_panel = match (step, self.tool_panel) {
+            (ToolsStep::Toggle, Some(_)) | (ToolsStep::Close, _) => None,
+            (ToolsStep::Toggle, None) if self.tool_len == 0 => {
+                self.act(UiAction::Notice(NO_TOOLS_NOTE.to_string()));
+                None
+            }
+            (ToolsStep::Toggle, None) => Some(last),
+            (_, None) => None,
+            (ToolsStep::Move(delta), Some(top)) => {
+                Some((top as isize + delta).clamp(0, last as isize) as usize)
+            }
+            (ToolsStep::Top, Some(_)) => Some(0),
+            (ToolsStep::Bottom, Some(_)) => Some(last),
+        };
+        self.notify();
+    }
+
     fn notify(&self) {
         let mut view = self.nav.view();
+        view.tool_panel = self.tool_panel;
         view.scroll_seq = SCROLL_SEQ.load(Ordering::SeqCst);
         view.scroll_offset = scroll_offset();
         view.new_below = NEW_BELOW.load(Ordering::SeqCst);
@@ -1347,15 +1497,50 @@ fn note_rows(m: &Model) -> Vec<String> {
 
 /// The live tool strip: the turn summary line, then the latest tool rows.
 /// Shown while the turn has tool activity; the committed `ToolSummary` row
-/// takes over in the transcript once the turn ends.
-fn tool_strip(model: Signal<Model>) -> impl IntoElement {
-    view()
-        .flex_col()
-        .child(
-            text(move || model.with(|m| m.turn_summary.clone().unwrap_or_default()))
-                .text_color(move || token_ink(tool_token(""))),
-        )
-        .child(row_slots(model, TOOL_SLOTS, tool_rows, tool_row_token, false))
+/// takes over in the transcript once the turn ends. On the web the summary
+/// line is a button that opens the tool detail panel.
+fn tool_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let line = text(move || model.with(|m| m.turn_summary.clone().unwrap_or_default()))
+        .text_color(move || token_ink(tool_token("")));
+    let head = if WEB_CONTROLS {
+        view()
+            .role(AccessibilityRole::Button)
+            .on_press(move || {
+                let _ = actions.send(UiAction::Tools(ToolsStep::Toggle));
+            })
+            .child(line)
+    } else {
+        view().child(line)
+    };
+    view().flex_col().child(head).child(row_slots(
+        model,
+        TOOL_SLOTS,
+        tool_rows,
+        tool_row_token,
+        false,
+    ))
+}
+
+/// The tool detail panel (Ctrl+T): the title, then up to TOOL_PANEL_SLOTS
+/// rows of the snapshot's `tool_detail` from the panel's top row, verbatim.
+fn tool_panel(model: Signal<Model>, nav: Signal<NavView>) -> impl IntoElement {
+    let top = move || nav.with(|n| n.tool_panel.unwrap_or(0));
+    let mut column = view().flex_col().child(
+        text(move || model.with(|m| m.tool_title.clone()))
+            .text_color(move || token_ink(tool_token(""))),
+    );
+    for i in 0..TOOL_PANEL_SLOTS {
+        column = column.child(when(
+            move || model.with(|m| m.tool_detail.len() > top() + i),
+            move || {
+                let row = move || {
+                    model.with(|m| m.tool_detail.get(top() + i).cloned().unwrap_or_default())
+                };
+                text(row).text_color(move || token_ink(tool_row_token(&row())))
+            },
+        ));
+    }
+    column
 }
 
 /// `y approve   r revise`: the key hint and the core's label per option.
@@ -1537,6 +1722,7 @@ pub fn screen(
         // Shift+Enter and Ctrl+J add a line (NSH's multiline input), and a
         // pasted block lands whole in the composer.
         .multiline(true)
+        .max_h(px(COMPOSER_MAX_LINES as f32 * COMPOSER_LINE_H))
         .submit_behavior(SubmitBehavior::Submit)
         .placeholder(COMPOSER_PLACEHOLDER)
         .value(move || draft.get())
@@ -1568,8 +1754,7 @@ pub fn screen(
             if !task.is_empty() {
                 record_sent(&task);
             }
-            let action =
-                if task.starts_with('/') { slash::run(&task) } else { UiAction::Send(task) };
+            let action = submit_action(&task);
             if !action_is_empty(&action) {
                 let _ = submit_actions.send(action);
             }
@@ -1595,7 +1780,13 @@ pub fn screen(
             // in NSH 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4). On the
             // web it follows the window, so the composer and the Stop
             // control stay on screen (the page itself does not scroll).
-            .h(move || px(transcript_height(window_h))),
+            .h(move || {
+                px(transcript_px(
+                    window_h.get(),
+                    nav.with(|n| n.tool_panel.is_some()),
+                    draft.with(|d| d.matches('\n').count() + 1),
+                ))
+            }),
         )
         .child(when(
             move || nav.with(|n| n.new_below && n.scroll_offset > 0),
@@ -1603,7 +1794,11 @@ pub fn screen(
                 text("new output below · end to follow").text_color(move || token_ink("warning"))
             },
         ))
-        .child(when(move || model.with(|m| m.turn_summary.is_some()), move || tool_strip(model)))
+        .child(when(move || nav.with(|n| n.tool_panel.is_some()), move || tool_panel(model, nav)))
+        .child(when(move || model.with(|m| m.turn_summary.is_some()), {
+            let actions = actions.clone();
+            move || tool_strip(model, actions.clone())
+        }))
         .child(swarm_slots(model, nav, actions.clone()))
         .child(row_slots(model, NOTE_SLOTS, note_rows, dim_token, true))
         .child(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true))
@@ -1668,34 +1863,42 @@ fn swarm_slots(
     column
 }
 
-/// The command suggestions above the composer: one row per matching command
-/// (`usage - about`, the help line), the selected one marked with `> `. Esc
-/// hides them. On the web a tap completes the command.
+/// The suggestions above the composer: command suggestions (`usage - about`)
+/// or `@file` paths, the selected one marked with `> `, a window of
+/// SLASH_SLOTS rows around the selection. Esc hides them. On the web a tap
+/// completes a command.
 fn slash_list(
     draft: Signal<String>,
     nav: Signal<NavView>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
-    let items = move || slash::suggestions_for(&draft.get());
+    let items = move || suggest::for_draft(&draft.get());
+    let start = move || {
+        let len = items().names.len();
+        let selected = nav.with(|n| n.slash_selected);
+        if len <= SLASH_SLOTS {
+            0
+        } else {
+            selected.saturating_sub(SLASH_SLOTS - 1).min(len - SLASH_SLOTS)
+        }
+    };
     let mut column = view().flex_col();
     for i in 0..SLASH_SLOTS {
         let actions = actions.clone();
         column = column.child(when(
-            move || !nav.with(|n| n.slash_hidden) && items().len() > i,
+            move || !nav.with(|n| n.slash_hidden) && items().names.len().min(SLASH_SLOTS) > i,
             move || {
                 let press = actions.clone();
                 let label = move || {
-                    let marker = if nav.with(|n| n.slash_selected) == i { "> " } else { "  " };
-                    items()
-                        .get(i)
-                        .map(|e| format!("{marker}{} - {}", e.usage, e.about))
-                        .unwrap_or_default()
+                    let at = start() + i;
+                    let marker = if nav.with(|n| n.slash_selected) == at { "> " } else { "  " };
+                    items().rows.get(at).map(|r| format!("{marker}{r}")).unwrap_or_default()
                 };
                 let row = view()
                     .child(text(label).text_color(move || token_ink(style_token(Style::Plain))));
                 if WEB_CONTROLS {
                     row.role(AccessibilityRole::Button).on_press(move || {
-                        if let Some(name) = items().get(i).map(|e| e.name.to_string()) {
+                        if let Some(name) = items().names.get(start() + i).cloned() {
                             let _ = press.send(UiAction::Nav(NavStep::Complete(name)));
                         }
                     })
@@ -1736,6 +1939,8 @@ mod tests {
         running: false,
         recalling: false,
         history_len: 0,
+        tool_panel: false,
+        file_mode: false,
     };
 
     fn approval(options: usize) -> KeyFacts {
@@ -1781,6 +1986,15 @@ mod tests {
         assert_eq!(fit_transcript_height(720.0), 390.0);
         assert!(fit_transcript_height(720.0) + CHROME_RESERVE_H <= 720.0);
         assert_eq!(fit_transcript_height(1200.0), TRANSCRIPT_MAX_H);
+        // The open tool panel and a growing composer (up to its cap) give the
+        // transcript less room; the composer's cap holds the growth.
+        assert_eq!(transcript_px(930.0, false, 1), fit_transcript_height(930.0));
+        assert_eq!(transcript_px(930.0, true, 1), fit_transcript_height(930.0 - TOOL_PANEL_H));
+        assert_eq!(
+            transcript_px(930.0, false, 40),
+            transcript_px(930.0, false, COMPOSER_MAX_LINES),
+            "the composer stops growing at its cap"
+        );
         assert_eq!(fit_transcript_height(100.0), TRANSCRIPT_MIN_H);
     }
 
