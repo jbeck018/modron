@@ -1,0 +1,13 @@
+[package]
+name = "nsh-tui-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace root: independent of the modron root workspace.
+[workspace]
+
+[dependencies]
+nsh-core = "=0.5.1"
+nsh-platform-tui = "=0.5.1"
+ratatui = "=0.30.2"

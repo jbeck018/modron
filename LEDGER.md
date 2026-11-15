@@ -1405,7 +1405,8 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | ID | Packet | Status | Evidence / blocker |
 |---|---|---|---|
 | S1 | NSH web target in Rust: one transcript screen over the wasm client core; measure bundle size, load time, input | TODO | |
-| S2 | NSH terminal target: startup time, streaming at token rate, scrollback | TODO | |
+| S2 | NSH terminal target: startup time, streaming at token rate, scrollback | DONE | spikes/nsh-tui/RESULTS.md. Renders headless via ratatui TestBackend; first frame ~1.9 ms in-process; 2,000-token stream mean 1.4-2.7 ms/frame; virtual_list pages 5,000 rows at ~0.8 ms. Open risks: 45 MB stripped binary (modron is ~4 MB), default features pull QuickJS (no-JS build not compiled yet), no Rust API found for pushing outside data into a running app (tokens were fed as paste input), Enter drops input focus |
+| S2b | NSH follow-up: compile without default features (no QuickJS), measure size; find the Rust API for feeding external events (signals + wake callback) | TODO | |
 | S3 | furrow snapshot/restore over R2 from a container | BLOCKED | Needs an R2 bucket and credentials (owner) |
 
 ### Protocol
@@ -1444,7 +1445,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | C6 | Cloud runs: container runs modron serve; sleep/restore; handoff | TODO | Depends on S3; deploy needs the owner's Cloudflare login |
 | C7 | Terminal target from the NSH app | TODO | Depends on S2 |
 | C8 | Phone packaging (iOS, Android) | BLOCKED | Needs macOS/Xcode and signing (owner) |
-| C9 | Delete modron-tui views, modron-desktop, mobile/app TSX, bridge inline viewer; rewrite the AGENTS.md parity contract | TODO | After C3, C7 |
+| C9 | Delete modron-tui views, modron-desktop, mobile/app TSX, bridge inline viewer; rewrite the AGENTS.md parity contract | ACTIVE | C9a DONE (eedc245): modron-desktop removed, assets in app/assets. Open: TUI views, mobile/app TSX, bridge inline viewer, AGENTS.md contract rewrite - after C3/C7 |
 | C10 | CI: nsh check / nsh test; drop the gpui exclusion | TODO | |
 
 ## Log
@@ -1471,3 +1472,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   match and is compiled on macOS CI); NOT compiled here (gpui needs GUI
   libraries this container lacks) - needs a macOS CI pass. Gates on
   Linux excluding modron-desktop: fmt clean, clippy clean, 985 tests.
+- 2026-11-15: C9a (desktop removed) and S2 (terminal spike) closed. S2
+  verdict: the NSH terminal backend is fast enough; the blockers to
+  retire before C7 are binary size, a no-JS feature set that compiles,
+  and an external-event path into the reactive graph (S2b).
