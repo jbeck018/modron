@@ -327,6 +327,8 @@ Decisions made under this rule:
 | Does the terminal app capture the mouse (wheel, click, drag-copy)? | No: it leaves selection and copy to the terminal | Mixed; fullscreen with its own handling | No capture. The terminal's own selection and copy keep working, which is what users expect from Claude Code; scrolling is PgUp/PgDn/Home/End. Revisit only if users ask |
 | Keep `/issues`? | No equivalent | No equivalent | Not carried over. It reads a server-side file through the old in-process UI; no client can serve it without a new frame, and neither reference has it |
 | Esc on an idle composer | Clears the draft (double Esc) | Clears the draft | Esc clears the draft when nothing else claims the key (approval, plan, suggestions, running) |
+| Theme switching | /theme offers several themes (dark, light, colour-blind variants, ANSI) | Themes are selectable | Offer a /theme picker with what exists: Oculus dark, Oculus light and "system" (follow the terminal or browser appearance). No custom theme files for now; NSH can swap tokens at runtime, so a further palette is a data change |
+| Removing a saved credential | /logout | /logout | Add it: a client can remove a provider credential it could have added. Local connections only, like adding one |
 
 ### 10.3 What survives, what goes
 
