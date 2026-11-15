@@ -13,7 +13,6 @@ members = [
     "crates/modron-protocol",
     "crates/modron-view",
     "crates/modron-server",
-    "crates/modron-desktop",
     "mobile/rust-core",
 ]
 

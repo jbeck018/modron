@@ -20,6 +20,15 @@ LEDGER.md; frozen cross-crate contracts live in crates/modron-core/src/lib.rs.
 
 ## UI/UX parity contract (TUI <-> desktop <-> mobile)
 
+Status 2026-11-15 (Program U, PLAN.md section 10): every client is being
+rebuilt as ONE NSH app under `app/`. `crates/modron-desktop` has been
+removed (its brand assets live in `app/assets/`, the tokens in
+`app/theme/oculus.json`). The TUI and `mobile/app` are frozen: no new
+features, shared logic only. Until the NSH app lands, read "desktop" below
+as the NSH app's desktop target; the invariants and the divergence table
+still bind the TUI, mobile, and the new app. New protocol frames follow
+docs/PROTOCOL_V2.md.
+
 The TUI (crates/modron-tui), the desktop app (crates/modron-desktop), and the
 mobile clients (mobile/) are views over the same session state. Where they
 CAN match, they MUST match; agents keep them in sync by rule, not by memory.

@@ -2,9 +2,9 @@
 
 `oculus.json` is the NSH theme file for the unified client app. It is derived
 from the desktop brand theme in
-`crates/modron-desktop/assets/oculus-theme.json` (gpui-kit ThemeSet, "Oculus
+`app/assets/oculus-theme.source.json` (gpui-kit ThemeSet, "Oculus
 Dark" and "Oculus Light") and the type scale in
-`crates/modron-desktop/src/brand.rs`. Every colour is a source hex, copied
+the retired desktop crate's `brand.rs` (see git history before C9a). Every colour is a source hex, copied
 unchanged in case. No oklch conversion and no new colours.
 
 ## Schema
@@ -27,7 +27,7 @@ path must be adjusted.
 
 ## Token mapping
 
-| token | dark | light | source role in oculus-theme.json |
+| token | dark | light | source role in oculus-theme.source.json |
 |---|---|---|---|
 | background | #000000 | #FFFFFF | background |
 | foreground | #E2E2E2 | #000000 | foreground |
@@ -77,7 +77,7 @@ Theme section (both appearances):
 
 ## Type scale
 
-From `crates/modron-desktop/src/brand.rs`, `text` module. The theme file
+From the retired desktop crate's `brand.rs` (git history), `text` module. The theme file
 carries no font sizes; clients take these constants.
 
 | name | size (pt) | use |

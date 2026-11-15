@@ -24,7 +24,7 @@ jobs:
         with:
           key: release-gate
       - name: Tests (offline — the mock provider is the acceptance harness)
-        run: cargo test --workspace --exclude modron-desktop
+        run: cargo test --workspace
 
   build:
     name: build ${{ matrix.target }}
@@ -54,7 +54,6 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
-      # -p modron-cli: ship the CLI, not the desktop crate (macOS-only gpui).
       - name: Build release binary
         env:
           TARGET: ${{ matrix.target }}

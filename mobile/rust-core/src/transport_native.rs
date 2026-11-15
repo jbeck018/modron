@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 /// Largest whole message accepted: the server sends a full snapshot in one
-/// frame. Same limits as the desktop client (`modron-desktop` wire.rs), so a
+/// frame. Same limits as the desktop client (the retired desktop wire.rs), so a
 /// session that opens on desktop opens here.
 const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
