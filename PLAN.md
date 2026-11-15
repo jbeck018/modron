@@ -310,6 +310,21 @@ and no code is copied (dirge is GPL-3.0).
 | Idle cloud | Snapshot, sleep, restore on the next message or wakeup |
 | Old clients | Delete and rebuild; keep the theme and main functionality |
 
+### 10.2a Standing rule for product decisions (owner, 2026-11-15)
+
+When a behaviour question comes up that the plan does not settle, the
+lead compares how Claude Code and oh-my-pi handle it, picks the better
+option for Modron, records the decision and the reason in LEDGER.md, and
+proceeds. The owner is told, not asked.
+
+Decisions made under this rule:
+
+| Question | Claude Code | oh-my-pi / pi | Decision |
+|---|---|---|---|
+| Does the model see `!command` output? | Yes: bash-mode output joins the conversation | `!cmd` yes, `!!cmd` no | `!cmd` is added to the conversation; `!!cmd` runs and shows its output but never reaches the model |
+| Does a user-typed command need approval? | No: the user typed it | No | No prompt for the owner's own command. It still runs in the sandbox and still honours the deny list, deny rules and pre_tool hooks (the owner's own hard limits). Approval mode, ask rules and the plan phase restrict the model, not the user. Guests cannot send it |
+| What does saving a model from the picker do? | The /model choice becomes the default for later sessions | The choice is kept as the default; roles are separate config | Selecting a model changes the current session only; an explicit save (Shift+S, or a control) writes default model + provider to the server config, as the old terminal UI did. Explicit, because one server feeds several devices and a silent default change from a phone would surprise the laptop |
+
 ### 10.3 What survives, what goes
 
 Keep: modron-protocol, modron-view, modron-server, mobile/rust-core (becomes
