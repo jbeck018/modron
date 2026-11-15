@@ -54,6 +54,16 @@ const REGISTRY_DO = "__pages__"; // DO name holding the page-id -> key registry
 const KEY_RE = /^[a-z0-9-]{1,64}$/; // share keys are 8 lowercase hex chars; stay permissive
 const ID_RE = /^[0-9a-f-]{1,64}$/i; // page ids are crypto.randomUUID()
 
+// True exactly once per viewer socket: the first call marks it and returns
+// true, later calls return false. Survives DO hibernation via the socket
+// attachment.
+function claimFirstHello(ws: WebSocket): boolean {
+  const att = ws.deserializeAttachment() as { helloSeen?: boolean } | null;
+  if (att?.helloSeen === true) return false;
+  ws.serializeAttachment({ helloSeen: true });
+  return true;
+}
+
 // Sequence numbers are zero-padded so lexical order of the per-frame
 // storage keys equals numeric order (replay + trim rely on this).
 const frameKey = (seq: number) => "frame:" + String(seq).padStart(12, "0");
@@ -63,6 +73,9 @@ interface Env {
   // Wrangler secret (`npx wrangler secret put PUBLISH_TOKEN`). Unset means
   // publishing is disabled (503). Never put its value in wrangler.jsonc.
   PUBLISH_TOKEN?: string;
+  // Workers Static Assets (wrangler.jsonc `assets`): the web app bundle
+  // under public/app/. Requests reach the Worker first (run_worker_first).
+  ASSETS: Fetcher;
 }
 
 // Constant-time string equality for the publish token. Compares UTF-8
@@ -113,6 +126,42 @@ interface RegistryEntry {
 }
 
 import { DurableObject } from "cloudflare:workers";
+
+// --- web app (/app/*, static assets) ---
+
+// Where GET /s/<viewer key> sends a browser: the unified web app, pointed at
+// the viewer websocket on the same host. The scheme mirrors the request
+// (https -> wss). The host comes from the parsed request URL and the key is
+// already checked against KEY_RE, so neither can carry a character that
+// would need escaping in the query string.
+export function appRedirectLocation(requestUrl: URL, key: string): string {
+  const wsScheme = requestUrl.protocol === "https:" ? "wss:" : "ws:";
+  return "/app/?url=" + wsScheme + "//" + requestUrl.host + "/ws/" + key;
+}
+
+// Hashed bundle files (e.g. nsh.c30214878b.wasm) are immutable; anything
+// else, including index.html, must be revalidated on every load so a new
+// bundle is picked up at once.
+export function appCacheControl(path: string): string {
+  return /\.[0-9a-f]{8,}\.[A-Za-z0-9]+$/.test(path)
+    ? "public, max-age=31536000, immutable"
+    : "no-cache";
+}
+
+// Serve one file of the bundle from static assets, with the MIME type and
+// cache policy the app needs. The Worker only sets headers; it never
+// rewrites the body.
+export async function serveApp(request: Request, env: Env): Promise<Response> {
+  const path = new URL(request.url).pathname;
+  const asset = await env.ASSETS.fetch(request);
+  if (!asset.ok) return asset;
+  const headers = new Headers(asset.headers);
+  // Browsers only compile wasm via instantiateStreaming when it is served
+  // as application/wasm; some asset paths otherwise come back as octet-stream.
+  if (path.endsWith(".wasm")) headers.set("content-type", "application/wasm");
+  headers.set("cache-control", appCacheControl(path));
+  return new Response(asset.body, { status: asset.status, headers });
+}
 
 export class SessionBridge extends DurableObject {
   state: DurableObjectState;
@@ -392,10 +441,17 @@ export class SessionBridge extends DurableObject {
       // forwarded to the agent verbatim.
       let parsed: { type?: unknown } | null = null;
       try { parsed = JSON.parse(message) as { type?: unknown }; } catch { /* not json */ }
-      if (parsed !== null && typeof parsed === "object" && parsed.type === "sync") {
+      // The web app (app/, via mobile/rust-core) opens with a protocol
+      // `hello` and never sends `sync`, so its FIRST hello on a socket gets
+      // the same replay. The hello itself is still forwarded below so the
+      // agent answers with `welcome`. Only the first one replays, which
+      // bounds the replay work per socket.
+      const isSync = parsed !== null && typeof parsed === "object" && parsed.type === "sync";
+      const isFirstHello = parsed !== null && typeof parsed === "object" && parsed.type === "hello" && claimFirstHello(ws);
+      if (isSync || isFirstHello) {
         const frames = await this.state.storage.list<StoredFrame>({ prefix: "frame:", limit: MAX_BUFFER });
         for (const frame of frames.values()) { try { ws.send(frame.text); } catch { break; } }
-        return;
+        if (isSync) return;
       }
       const now = Date.now();
       await this.state.storage.put("seen:viewer", now);
@@ -484,6 +540,12 @@ const router: ExportedHandler<Env> = {
       return env.BRIDGE.get(env.BRIDGE.idFromName(REGISTRY_DO)).fetch(request);
     }
     if (path === "/") return new Response("modron remote-control bridge - open a /s/<key> share link from modron");
+    // The unified web app (static assets). Anything not in the bundle is a
+    // plain 404 from the assets binding.
+    if (path === "/app" || path.startsWith("/app/")) {
+      if (path === "/app") return Response.redirect(new URL(request.url).origin + "/app/", 301);
+      return serveApp(request, env);
+    }
     // The agent tunnel: /agent/<agent key>, routed to the DO named by the
     // derived viewer key (see viewerKeyOf).
     if ((m = path.match(/^\/agent\/([^/]+)$/))) {
@@ -491,8 +553,20 @@ const router: ExportedHandler<Env> = {
       const viewerKey = await viewerKeyOf(m[1]);
       return env.BRIDGE.get(env.BRIDGE.idFromName(viewerKey)).fetch(request);
     }
-    // Viewers: /s/<viewer key> (page) and /ws/<viewer key> (socket).
-    if ((m = path.match(/^\/s\/([^/]+)$/)) || (m = path.match(/^\/ws\/([^/]+)$/))) {
+    // Viewers: /s/<viewer key> redirects to the web app; /s/<key>?classic=1
+    // keeps the old inline viewer page as a fallback; /ws/<viewer key> is
+    // the viewer socket.
+    if ((m = path.match(/^\/s\/([^/]+)$/))) {
+      if (!validKey(m[1])) return new Response("invalid key", { status: 400 });
+      if (new URL(request.url).searchParams.get("classic") === "1") {
+        return env.BRIDGE.get(env.BRIDGE.idFromName(m[1])).fetch(request);
+      }
+      return new Response(null, {
+        status: 302,
+        headers: { location: appRedirectLocation(new URL(request.url), m[1]) },
+      });
+    }
+    if ((m = path.match(/^\/ws\/([^/]+)$/))) {
       if (!validKey(m[1])) return new Response("invalid key", { status: 400 });
       return env.BRIDGE.get(env.BRIDGE.idFromName(m[1])).fetch(request);
     }
