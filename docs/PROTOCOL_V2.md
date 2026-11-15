@@ -150,7 +150,7 @@ is never rendered in the transcript.
 
 ## 7. Effort and roles (H7), permissions (H8), context (H9b)
 
-- `ConfigPatch.effort: Option<Effort>` (`low | medium | high`); status
+- `ConfigPatch.effort: Option<Effort>` (`low | medium | high | xhigh | max`; `clear_effort` returns to the provider default); status
   surface shows it next to the model.
 - `ConfigPatch.roles: Option<Map<Role, String>>` for `plan`, `subagent`,
   `critic`, `summary` models.
