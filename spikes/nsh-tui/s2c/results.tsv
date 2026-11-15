@@ -1,0 +1,8 @@
+C0_base	0	17081600	343	pass	
+C1_ratatui_nodef	219	17081536	322	pass	
+C2_plus_no_highlight	220	15498712	311	pass	
+C3_plus_no_net	129	15279016	305	pass	
+C4_plus_no_nbase_extras	121	11359432	298	pass	
+P1_C4_plus_no_nbase_extras_opt_s_abort	194	12706696	298	pass	
+P2_C4_plus_no_nbase_extras_opt_z_unwind	188	13017800	298	pass	
+P3_C4_plus_no_nbase_extras_app_s_deps_z	236	11383160	298	pass	

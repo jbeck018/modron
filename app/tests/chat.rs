@@ -253,3 +253,64 @@ fn streaming_text_appears_and_clears() {
     h.push(&snapshot);
     h.wait_for("streaming text cleared", |s| !s.contains("Migrating the router now"));
 }
+
+/// A live turn: two tool rows, the turn summary, one sub-agent row and a note.
+fn live_activity(snapshot: &mut ViewModelSnapshot) {
+    snapshot.turn_summary_line =
+        Some("\u{23fa} 2 tools \u{b7} read \u{d7}1 \u{b7} bash \u{d7}1".into());
+    snapshot.tool_lines =
+        vec!["\u{2713} read \u{2014} 2.1 KB".into(), "\u{25cf} bash \u{2026}".into()];
+    snapshot.subagent_rows =
+        vec!["\u{23f5} [reviewer] running \u{b7} 1 turns \u{b7} 300 tok \u{b7} last: read".into()];
+    snapshot.last_note = Some("compacted 12 events: older turns".into());
+}
+
+#[test]
+fn live_tool_strip_swarm_rows_and_notes_render_verbatim() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    live_activity(&mut snapshot);
+    h.push(&snapshot);
+    h.wait_for("live activity", |s| s.contains("compacted 12 events"));
+    let screen = h.screen();
+    let wanted = [
+        "\u{23fa} 2 tools \u{b7} read \u{d7}1 \u{b7} bash \u{d7}1",
+        "\u{2713} read \u{2014} 2.1 KB",
+        "\u{25cf} bash \u{2026}",
+        "\u{23f5} [reviewer] running \u{b7} 1 turns \u{b7} 300 tok \u{b7} last: read",
+        "compacted 12 events: older turns",
+    ];
+    let mut at = 0;
+    for text in wanted {
+        let found = screen[at..]
+            .find(text)
+            .unwrap_or_else(|| panic!("missing or out of order: {text:?}\n{screen}"));
+        at += found + text.len();
+    }
+}
+
+#[test]
+fn turn_summary_and_tool_rows_leave_with_the_turn() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    live_activity(&mut snapshot);
+    h.push(&snapshot);
+    h.wait_for("live tool rows", |s| s.contains("bash"));
+    snapshot.turn_summary_line = None;
+    snapshot.tool_lines.clear();
+    snapshot.subagent_rows.clear();
+    h.push(&snapshot);
+    h.wait_for("rows cleared", |s| !s.contains("2 tools"));
+    assert!(!h.screen().contains("reviewer"));
+}
+
+#[test]
+fn prompt_marker_takes_a_theme_colour() {
+    let mut h = Harness::new();
+    h.push(&fixture());
+    h.wait_for("task row", |s| s.contains("fix the router crate"));
+    let buf = h.term.backend().buffer();
+    let cell =
+        buf.content.iter().find(|c| c.symbol() == "\u{276f}").expect("prompt marker on screen");
+    assert_ne!(cell.fg, ratatui::style::Color::Reset, "primary token not applied");
+}

@@ -13,8 +13,42 @@ pub mod web;
 use std::sync::Mutex;
 
 use chat::{Client, Model};
+use nsh_core::element::{AdaptiveColor, Tokens};
 use nsh_core::prelude::*;
 use tokio::sync::mpsc::unbounded_channel;
+
+/// The Oculus theme file (`theme/oculus.json`). The web build reads it from
+/// `nsh.json` (`"theme"`) through the packager; the terminal has no packager.
+pub const THEME_JSON: &str = include_str!("../theme/oculus.json");
+
+/// Installs [`THEME_JSON`] as the app's design tokens (light and dark
+/// values, as the theme file gives them). `App` calls this on the terminal,
+/// so the semantic token names resolve there too; the terminal then draws
+/// them through its own palette.
+pub fn install_theme() {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(THEME_JSON) else {
+        return;
+    };
+    let (Some(light), Some(dark)) =
+        (doc["cssVars"]["light"].as_object(), doc["cssVars"]["dark"].as_object())
+    else {
+        return;
+    };
+    let mut tokens = Tokens::default();
+    for (name, value) in light {
+        let Some(light) = value.as_str().and_then(parse_hex) else {
+            continue;
+        };
+        let dark = dark.get(name).and_then(|v| v.as_str()).and_then(parse_hex).unwrap_or(light);
+        tokens.set_color(name, AdaptiveColor { light, dark });
+    }
+    set_tokens(tokens);
+}
+
+fn parse_hex(hex: &str) -> Option<nsh_core::color::Hsla> {
+    let rgba = nsh_core::color::Rgba::try_from(hex).ok()?;
+    Some(AdaptiveColor::from(rgba).light)
+}
 
 /// The view's end of the link. The host sets it before the view loads; `App`
 /// takes it on mount. A web page with no host set up starts its own (see
@@ -42,6 +76,10 @@ fn default_client() -> Option<Client> {
 
 #[component]
 pub fn App() -> impl IntoElement {
+    // The terminal has no packager to read `nsh.json`'s theme: the app
+    // installs the Oculus tokens itself, on the engine thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    install_theme();
     let model = signal(Model::default());
     let draft = signal(String::new());
     let client = CLIENT.lock().ok().and_then(|mut slot| slot.take()).or_else(default_client);

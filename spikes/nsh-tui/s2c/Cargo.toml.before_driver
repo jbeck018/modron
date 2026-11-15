@@ -1,0 +1,27 @@
+[package]
+name = "nsh-tui-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace root: independent of the modron root workspace.
+[workspace]
+
+[dependencies]
+nsh-core = "=0.5.1"
+# S2b: no JavaScript engine. nsh-platform-tui's `js` feature (default) is the
+# only switch that pulls nsh-engine/js -> nsh-js -> quickjs-jit-sys.
+nsh-platform-tui = { version = "=0.5.1", default-features = false }
+ratatui = "=0.30.2"
+# S2b: `sync` for tokio::sync::mpsc (runtime-agnostic receiver used by the
+# external-event bridge). nsh-core already depends on tokio with rt + time.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+
+# S2c attribution build: size-optimised, NOT stripped (temporary).
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false

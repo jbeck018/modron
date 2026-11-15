@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "224d9a795c7ac9d10d75750de9351adac5549675"
+  },
+  "path_in_vcs": "crates/nsh-platform-tui"
+}

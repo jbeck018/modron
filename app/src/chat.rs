@@ -5,18 +5,26 @@
 //! splits multi-line transcript rows into one visual line each. Nothing is
 //! re-formatted here (AGENTS.md shared invariants).
 //!
-//! Keys: the host routes keys through [`Host::filter`] before the NSH view
-//! sees them. NSH on a terminal has no global key hook, so these are taken
-//! there: Esc (Interrupt), y / a / n (approval decisions), y / r (plan
-//! decisions, while no approval waits) and Alt+Enter (queue). Everything
-//! else reaches the composer. Enter sends (steers while a run is active).
+//! Keys: both hosts route keys through [`Host::route`] (the terminal via
+//! [`Host::filter`], the web via a document keydown listener) before the NSH
+//! view sees them. The rule is one function, [`route_key`]: Esc interrupts;
+//! y / a / n decide a pending approval; y / r decide a pending plan; Alt+Enter
+//! queues; everything else reaches the composer. Enter sends (steers while a
+//! run is active).
+//!
+//! Controls: the web host also shows tappable controls (Stop while running,
+//! the approval and plan options, Queue beside the composer), because phones
+//! have no Esc or Alt keys. The terminal shows the same options as text.
+//!
+//! Colour: every colour is a token of `theme/oculus.json` ([`token_ink`]).
+//! The terminal maps those through NSH's own palette; the web draws them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use modron_mobile_core::{RenderedRow, ViewModelSnapshot};
 use modron_view::TranscriptEntry;
-use nsh_core::element::input;
+use nsh_core::element::{input, AdaptiveColor};
 use nsh_core::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use nsh_platform_tui::{Input, Modifiers};
@@ -29,7 +37,8 @@ pub enum UiAction {
     /// Composer submit: a submit when idle, a steer while a run is active
     /// (the core's `send_message`).
     Send(String),
-    /// Alt+Enter: hold the message for the session's next run.
+    /// Alt+Enter (or the web Queue control): hold the message for the
+    /// session's next run.
     Queue(String),
     /// Remove one queued message by position (0 = next to run).
     Dequeue(usize),
@@ -52,11 +61,19 @@ const DECISION_KEYS: [&str; 3] = ["y", "a", "n"];
 /// Key hints for the plan options, in protocol order (approve, revise).
 const PLAN_KEYS: [&str; 2] = ["y", "r"];
 
-/// Visible slots for queue chips, steer echoes and plan lines. Fixed slot
-/// counts keep NSH's cell layout static (see the transcript note below).
+/// True on the web host: tappable controls are drawn there only. The
+/// terminal keeps its key hints as text (AGENTS.md divergence table).
+const WEB_CONTROLS: bool = cfg!(target_arch = "wasm32");
+
+/// Visible slots for queue chips, steer echoes, plan lines and the live
+/// activity rows. Fixed slot counts keep NSH's cell layout static (see the
+/// transcript note below).
 const QUEUE_SLOTS: usize = 4;
 const STEER_SLOTS: usize = 3;
 const PLAN_LINE_SLOTS: usize = 12;
+const TOOL_SLOTS: usize = 6;
+const SWARM_SLOTS: usize = 4;
+const NOTE_SLOTS: usize = 2;
 
 /// The composer text, mirrored from the view so the host can read it for a
 /// revise note (the host filters keys before the composer sees them).
@@ -75,12 +92,122 @@ fn set_draft(text: &str) {
     }
 }
 
-/// The plain text styles for now; colour comes with the theme.
+fn draft_text() -> String {
+    DRAFT.lock().map(|d| d.clone()).unwrap_or_default()
+}
+
+/// A key the host routes, named without any target's key type. The
+/// terminal maps its key names with [`key_of`]; the web maps DOM keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Enter,
+    Escape,
+    /// One printable character, as the key produced it.
+    Char(char),
+    /// Any other key (arrows, Backspace, dead keys): always the composer's.
+    Other,
+}
+
+/// Maps a key name (the terminal's and the DOM's `KeyboardEvent.key`) to a
+/// [`Key`]. A single character is [`Key::Char`]; every other name that is
+/// not one of the three special keys is [`Key::Other`].
+pub fn key_of(name: &str) -> Key {
+    match name {
+        "Enter" => Key::Enter,
+        "Escape" => Key::Escape,
+        _ => {
+            let mut chars = name.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Key::Char(c),
+                _ => Key::Other,
+            }
+        }
+    }
+}
+
+/// The snapshot facts key routing needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyFacts {
+    /// Option count of the pending approval, when one is pending.
+    pub approval_options: Option<usize>,
+    /// Whether a proposed plan waits for a decision.
+    pub plan_pending: bool,
+}
+
+/// Where a key goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Routed {
+    /// The composer gets the key. `queue` is Alt on an Enter.
+    Composer { queue: bool },
+    /// The key became an action.
+    Action(UiAction),
+}
+
+/// The one key-to-action rule, shared by every host. Pure: the composer's
+/// text is passed in, so the rule is testable without a view.
+///
+/// Order: Enter always reaches the composer (Alt marks a queue); a chord
+/// passes; Esc interrupts; with an approval pending, y / a / n decide its
+/// options and every other key is the composer's; with a plan pending, y
+/// approves and r revises with the trimmed composer text as the note.
+pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str) -> Routed {
+    let composer = Routed::Composer { queue: false };
+    match key {
+        Key::Enter => return Routed::Composer { queue: alt },
+        Key::Other => return composer,
+        _ if chord => return composer,
+        Key::Escape => return Routed::Action(UiAction::Interrupt),
+        Key::Char(_) => {}
+    }
+    let Key::Char(c) = key else { return composer };
+    let name = c.to_string();
+    if let Some(count) = facts.approval_options {
+        return match DECISION_KEYS.iter().position(|k| *k == name) {
+            Some(index) if index < count => Routed::Action(UiAction::Decide(index)),
+            _ => composer,
+        };
+    }
+    if facts.plan_pending {
+        if name == PLAN_KEYS[0] {
+            return Routed::Action(UiAction::DecidePlan { approve: true, note: None });
+        }
+        if name == PLAN_KEYS[1] {
+            return Routed::Action(plan_answer_for(false, draft));
+        }
+    }
+    composer
+}
+
+/// The plan answer for `approve`. A revise carries the trimmed draft as its
+/// note (None when empty).
+fn plan_answer_for(approve: bool, draft: &str) -> UiAction {
+    let note = draft.trim();
+    let note = (!approve && !note.is_empty()).then(|| note.to_string());
+    UiAction::DecidePlan { approve, note }
+}
+
+/// The plan answer the user gave now (key or tap). A revise with a note
+/// arms the composer clear for the next snapshot where the plan is resolved.
+pub fn plan_answer(approve: bool) -> UiAction {
+    let action = plan_answer_for(approve, &draft_text());
+    arm_plan_clear(&action);
+    action
+}
+
+fn arm_plan_clear(action: &UiAction) {
+    if let UiAction::DecidePlan { note: Some(_), .. } = action {
+        CLEAR_DRAFT.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The visual style of a transcript row kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
     Plain,
     Bold,
     Meta,
+    /// Tool activity and sub-agent rows.
+    Tool,
 }
 
 /// One visual line of the transcript.
@@ -112,6 +239,8 @@ pub struct Model {
     pub connection: String,
     pub provider: String,
     pub running: String,
+    /// Whether a turn is running (the Stop control shows then).
+    pub is_running: bool,
     /// The core's full status line (model, tokens, cache, mode, phase, context).
     pub status_line: String,
     pub lines: Vec<Line>,
@@ -122,6 +251,14 @@ pub struct Model {
     /// Steers accepted but not yet persisted as tasks (dim echoes).
     pub pending_steers: Vec<String>,
     pub plan: Option<PlanBlock>,
+    /// The live turn summary (`⏺ 21 tools · glob ×9 …`), when tools ran.
+    pub turn_summary: Option<String>,
+    /// The live turn's tool rows, one per event, oldest first.
+    pub tool_rows: Vec<String>,
+    /// The live sub-agent rows (`⏵ [label] running · …`).
+    pub swarm_rows: Vec<String>,
+    /// The core's last note and last error, in that order.
+    pub notes: Vec<String>,
 }
 
 impl Model {
@@ -130,6 +267,7 @@ impl Model {
             connection: s.connection_label.clone(),
             provider: s.provider.clone(),
             running: s.running_label.clone(),
+            is_running: s.running,
             status_line: s.status_line.clone(),
             lines: transcript_lines(&s.history),
             streaming: s.streaming_text.clone(),
@@ -144,6 +282,10 @@ impl Model {
                 lines: p.lines.clone(),
                 labels: p.options.iter().map(|o| o.label.clone()).collect(),
             }),
+            turn_summary: s.turn_summary_line.clone(),
+            tool_rows: s.tool_lines.clone(),
+            swarm_rows: s.subagent_rows.clone(),
+            notes: s.last_note.iter().chain(s.last_error.iter()).cloned().collect(),
         }
     }
 }
@@ -152,9 +294,8 @@ impl Model {
 pub fn style_of(entry: &TranscriptEntry) -> Style {
     match entry {
         TranscriptEntry::Task { .. } => Style::Bold,
-        TranscriptEntry::ToolSummary { .. }
-        | TranscriptEntry::Swarm { .. }
-        | TranscriptEntry::Model { .. }
+        TranscriptEntry::ToolSummary { .. } | TranscriptEntry::Swarm { .. } => Style::Tool,
+        TranscriptEntry::Model { .. }
         | TranscriptEntry::Usage { .. }
         | TranscriptEntry::Compaction { .. } => Style::Meta,
         TranscriptEntry::User { .. }
@@ -176,7 +317,7 @@ pub fn transcript_lines(history: &[RenderedRow]) -> Vec<Line> {
         .collect()
 }
 
-/// The host's end of the link: pushes snapshots, takes actions, and filters
+/// The host's end of the link: pushes snapshots, takes actions, and routes
 /// the keys that the view must not see.
 pub struct Host {
     snapshots: UnboundedSender<ViewModelSnapshot>,
@@ -215,7 +356,7 @@ pub fn link() -> (Host, Client) {
 }
 
 impl Host {
-    /// Sends a snapshot to the view and records what the key filter needs:
+    /// Sends a snapshot to the view and records what the key routing needs:
     /// whether an approval or a plan waits.
     pub fn push(&mut self, snapshot: &ViewModelSnapshot) {
         self.pending = snapshot.pending_approval.as_ref().map(|p| p.options.len());
@@ -235,67 +376,41 @@ impl Host {
         let Input::Key { key, modifiers, release: false } = &input else {
             return Some(input);
         };
-        if self.take_key(key, modifiers.alt, has_chord(modifiers)) {
+        if self.route(key_of(key), modifiers.alt, has_chord(modifiers)) {
             None
         } else {
             Some(input)
         }
     }
 
-    /// Routes a key by name, the same rules on every host: Enter always
-    /// reaches the composer (`alt` marks a queue), chords pass, Esc
-    /// interrupts, `y`/`a`/`n` decide a pending approval, and `y`/`r` decide
-    /// a pending plan. Returns true when the key became an action here.
+    /// Routes a key by name: [`Host::route`] with [`key_of`].
     pub fn take_key(&self, key: &str, alt: bool, chord: bool) -> bool {
-        if key == "Enter" {
-            // The flag tells the composer's submit whether this was Alt+Enter.
-            QUEUE_NEXT.store(alt, Ordering::SeqCst);
-            return false;
-        }
-        if chord {
-            return false;
-        }
-        if key == "Escape" {
-            self.act(UiAction::Interrupt);
-            return true;
-        }
-        if let Some(count) = self.pending {
-            return match DECISION_KEYS.iter().position(|k| *k == key) {
-                Some(index) if index < count => {
-                    self.act(UiAction::Decide(index));
-                    true
+        self.route(key_of(key), alt, chord)
+    }
+
+    /// Routes one key, the same on every host. Returns true when the key
+    /// became an action here (the host then consumes it); false when the
+    /// composer gets it.
+    pub fn route(&self, key: Key, alt: bool, chord: bool) -> bool {
+        let facts = KeyFacts { approval_options: self.pending, plan_pending: self.plan_pending };
+        match route_key(key, alt, chord, facts, &draft_text()) {
+            Routed::Composer { queue } => {
+                if key == Key::Enter {
+                    // The flag tells the composer's submit whether this was Alt+Enter.
+                    QUEUE_NEXT.store(queue, Ordering::SeqCst);
                 }
-                _ => false,
-            };
-        }
-        if self.plan_pending {
-            if let Some(action) = plan_action(key) {
+                false
+            }
+            Routed::Action(action) => {
+                arm_plan_clear(&action);
                 self.act(action);
-                return true;
+                true
             }
         }
-        false
     }
 
     fn act(&self, action: UiAction) {
         let _ = self.loopback.send(action);
-    }
-}
-
-/// The plan decision for a key: `y` approves; `r` revises with the composer
-/// text as the note (no note when the composer is empty).
-fn plan_action(key: &str) -> Option<UiAction> {
-    match key {
-        k if k == PLAN_KEYS[0] => Some(UiAction::DecidePlan { approve: true, note: None }),
-        k if k == PLAN_KEYS[1] => {
-            let note = DRAFT.lock().map(|d| d.trim().to_string()).unwrap_or_default();
-            let note = (!note.is_empty()).then_some(note);
-            if note.is_some() {
-                CLEAR_DRAFT.store(true, Ordering::SeqCst);
-            }
-            Some(UiAction::DecidePlan { approve: false, note })
-        }
-        _ => None,
     }
 }
 
@@ -313,6 +428,34 @@ fn has_chord(m: &Modifiers) -> bool {
     m.ctrl || m.alt || m.cmd
 }
 
+/// A theme colour by its `theme/oculus.json` token name. Read reactively,
+/// so a new theme reaches the text that reads it.
+fn token_ink(name: &str) -> AdaptiveColor {
+    tokens().color(name).unwrap_or_else(|| AdaptiveColor::from(nsh_core::color::black()))
+}
+
+/// The theme token each row style is drawn with.
+fn style_token(style: Style) -> &'static str {
+    match style {
+        Style::Bold => "primary",
+        Style::Plain => "foreground",
+        Style::Meta => "muted-foreground",
+        Style::Tool => "tool",
+    }
+}
+
+/// The colour token of a tool row, by its shared status mark: `✓` success,
+/// `✗` destructive, anything else (`● name …`) the tool colour.
+fn tool_row_token(line: &str) -> &'static str {
+    if line.starts_with('\u{2713}') {
+        "success"
+    } else if line.starts_with('\u{2717}') {
+        "destructive"
+    } else {
+        "tool"
+    }
+}
+
 fn is_style(model: Signal<Model>, at: Position, want: Style) -> bool {
     model.with(|m| m.lines.get(at.index()).is_some_and(|l| l.style == want))
 }
@@ -321,38 +464,63 @@ fn line_text(model: Signal<Model>, at: Position) -> String {
     model.with(|m| m.lines.get(at.index()).map(|l| l.text.clone()).unwrap_or_default())
 }
 
+/// One transcript line in its row style.
+fn styled_line(model: Signal<Model>, at: Position, style: Style) -> impl IntoElement {
+    let line = text(move || line_text(model, at)).text_color(move || token_ink(style_token(style)));
+    match style {
+        Style::Bold => line.font_weight(FontWeight::BOLD),
+        Style::Meta => line.italic(),
+        Style::Plain | Style::Tool => line,
+    }
+}
+
 /// One transcript cell. Cells are recycled, so each region reads the row
 /// position reactively and shows only while its style matches.
 fn transcript_row(model: Signal<Model>, at: Position) -> impl IntoElement {
     view()
         .child(when(
             move || is_style(model, at, Style::Bold),
-            move || text(move || line_text(model, at)).font_weight(FontWeight::BOLD),
+            move || styled_line(model, at, Style::Bold),
         ))
         .child(when(
             move || is_style(model, at, Style::Meta),
-            move || text(move || line_text(model, at)).italic(),
+            move || styled_line(model, at, Style::Meta),
         ))
         .child(when(
             move || is_style(model, at, Style::Plain),
-            move || text(move || line_text(model, at)),
+            move || styled_line(model, at, Style::Plain),
+        ))
+        .child(when(
+            move || is_style(model, at, Style::Tool),
+            move || styled_line(model, at, Style::Tool),
         ))
 }
 
 fn header(model: Signal<Model>) -> impl IntoElement {
     view()
         .flex_row()
-        .child(text(move || model.with(|m| m.connection.clone())))
-        .child(text(move || model.with(|m| m.provider.clone())))
-        .child(text(move || model.with(|m| m.running.clone())))
+        .child(
+            text(move || model.with(|m| m.connection.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
+        .child(
+            text(move || model.with(|m| m.provider.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
+        .child(
+            text(move || model.with(|m| m.running.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
 }
 
 /// Up to `max` rows of `rows(model)`, one text element per slot. A slot
-/// shows only while its row exists, so the layout stays fixed.
+/// shows only while its row exists, so the layout stays fixed. `token` picks
+/// each row's colour token from its text.
 fn row_slots(
     model: Signal<Model>,
     max: usize,
     rows: fn(&Model) -> Vec<String>,
+    token: fn(&str) -> &'static str,
     italic: bool,
 ) -> impl IntoElement {
     let mut column = view().flex_col();
@@ -361,7 +529,12 @@ fn row_slots(
             move || model.with(|m| rows(m).len() > i),
             move || {
                 let line =
-                    text(move || model.with(|m| rows(m).get(i).cloned().unwrap_or_default()));
+                    text(move || model.with(|m| rows(m).get(i).cloned().unwrap_or_default()))
+                        .text_color(move || {
+                            token_ink(token(
+                                &model.with(|m| rows(m).get(i).cloned().unwrap_or_default()),
+                            ))
+                        });
                 if italic {
                     line.italic()
                 } else {
@@ -371,6 +544,18 @@ fn row_slots(
         ));
     }
     column
+}
+
+fn plain_token(_: &str) -> &'static str {
+    style_token(Style::Plain)
+}
+
+fn dim_token(_: &str) -> &'static str {
+    style_token(Style::Meta)
+}
+
+fn tool_token(_: &str) -> &'static str {
+    style_token(Style::Tool)
 }
 
 fn queue_rows(m: &Model) -> Vec<String> {
@@ -385,6 +570,33 @@ fn plan_line_rows(m: &Model) -> Vec<String> {
     m.plan.as_ref().map(|p| p.lines.clone()).unwrap_or_default()
 }
 
+/// The last `TOOL_SLOTS` tool rows: the live strip shows the latest activity.
+fn tool_rows(m: &Model) -> Vec<String> {
+    let start = m.tool_rows.len().saturating_sub(TOOL_SLOTS);
+    m.tool_rows[start..].to_vec()
+}
+
+fn swarm_rows(m: &Model) -> Vec<String> {
+    m.swarm_rows.clone()
+}
+
+fn note_rows(m: &Model) -> Vec<String> {
+    m.notes.clone()
+}
+
+/// The live tool strip: the turn summary line, then the latest tool rows.
+/// Shown while the turn has tool activity; the committed `ToolSummary` row
+/// takes over in the transcript once the turn ends.
+fn tool_strip(model: Signal<Model>) -> impl IntoElement {
+    view()
+        .flex_col()
+        .child(
+            text(move || model.with(|m| m.turn_summary.clone().unwrap_or_default()))
+                .text_color(move || token_ink(tool_token(""))),
+        )
+        .child(row_slots(model, TOOL_SLOTS, tool_rows, tool_row_token, false))
+}
+
 /// `y approve   r revise`: the key hint and the core's label per option.
 fn plan_option_row(labels: &[String]) -> String {
     labels
@@ -395,25 +607,85 @@ fn plan_option_row(labels: &[String]) -> String {
         .join("   ")
 }
 
-fn plan_block(model: Signal<Model>) -> impl IntoElement {
-    view().flex_col().child(row_slots(model, PLAN_LINE_SLOTS, plan_line_rows, false)).child(text(
-        move || {
-            model.with(|m| m.plan.as_ref().map(|p| plan_option_row(&p.labels)).unwrap_or_default())
-        },
-    ))
+/// One option of a decision: a text line on the terminal (key hint and the
+/// core's label), a tappable button on the web (the core's label only).
+fn option_cell(
+    label: impl Fn() -> String + 'static,
+    token: &'static str,
+    actions: UnboundedSender<UiAction>,
+    action: impl Fn() -> UiAction + 'static,
+) -> impl IntoElement {
+    let cell = view().child(text(label).text_color(move || token_ink(token)));
+    if WEB_CONTROLS {
+        cell.role(AccessibilityRole::Button).px(px(8.0)).on_press(move || {
+            let action = action();
+            arm_plan_clear(&action);
+            let _ = actions.send(action);
+        })
+    } else {
+        cell
+    }
 }
 
-fn approval_strip(model: Signal<Model>) -> impl IntoElement {
+fn plan_block(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
     let option = move |i: usize| {
-        text(move || {
+        let label = move || {
+            model.with(|m| {
+                let label =
+                    m.plan.as_ref().and_then(|p| p.labels.get(i).cloned()).unwrap_or_default();
+                if WEB_CONTROLS {
+                    label
+                } else {
+                    plan_option_row(&[label])
+                }
+            })
+        };
+        let token = if i == 0 { style_token(Style::Bold) } else { style_token(Style::Plain) };
+        let actions = actions.clone();
+        option_cell(label, token, actions, move || plan_answer(i == 0))
+    };
+    let lines = view().flex_col().child(row_slots(
+        model,
+        PLAN_LINE_SLOTS,
+        plan_line_rows,
+        plain_token,
+        false,
+    ));
+    let row = if WEB_CONTROLS {
+        view().flex_row().child(option(0)).child(option(1))
+    } else {
+        view().child(text(move || {
+            model.with(|m| m.plan.as_ref().map(|p| plan_option_row(&p.labels)).unwrap_or_default())
+        }))
+    };
+    lines.child(row)
+}
+
+fn approval_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let option = move |i: usize| {
+        let label = move || {
             model.with(|m| {
                 m.approval
                     .as_ref()
                     .and_then(|a| a.labels.get(i))
-                    .map(|label| format!("{} {label}", DECISION_KEYS[i]))
+                    .map(|label| {
+                        if WEB_CONTROLS {
+                            label.clone()
+                        } else {
+                            format!("{} {label}", DECISION_KEYS[i])
+                        }
+                    })
                     .unwrap_or_default()
             })
-        })
+        };
+        // Deny is the third option: the destructive token marks it.
+        let token = match i {
+            0 => style_token(Style::Bold),
+            2 => "destructive",
+            _ => style_token(Style::Plain),
+        };
+        let actions = actions.clone();
+        option_cell(label, token, actions, move || UiAction::Decide(i))
     };
     view()
         .flex_col()
@@ -426,14 +698,55 @@ fn approval_strip(model: Signal<Model>) -> impl IntoElement {
         .child(view().flex_row().child(option(0)).child(option(1)).child(option(2)))
 }
 
+/// The web-only composer controls: Queue beside the composer (queues the
+/// composer text, as Alt+Enter does), and Stop while a turn runs.
+fn composer_controls(
+    model: Signal<Model>,
+    draft: Signal<String>,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let queue_actions = actions.clone();
+    let queue = move || {
+        let queue_actions = queue_actions.clone();
+        view()
+            .role(AccessibilityRole::Button)
+            .px(px(8.0))
+            .on_press(move || {
+                let task = draft_text().trim().to_string();
+                if task.is_empty() {
+                    return;
+                }
+                set_draft("");
+                draft.set(String::new());
+                let _ = queue_actions.send(UiAction::Queue(task));
+            })
+            .child(text("queue").text_color(move || token_ink(style_token(Style::Plain))))
+    };
+    let stop = move || {
+        let stop_actions = actions.clone();
+        view()
+            .role(AccessibilityRole::Button)
+            .px(px(8.0))
+            .on_press(move || {
+                let _ = stop_actions.send(UiAction::Interrupt);
+            })
+            .child(text("stop").text_color(move || token_ink("warning")))
+    };
+    view()
+        .flex_row()
+        .child(when(move || WEB_CONTROLS, queue))
+        .child(when(move || WEB_CONTROLS && model.with(|m| m.is_running), stop))
+}
+
 /// The chat screen. `actions` receives the composer's own actions (Send,
-/// Queue, Compact); decisions, interrupts and plan answers come from the
-/// host's key filter.
+/// Queue, Compact) and the web controls' actions; decisions, interrupts and
+/// plan answers from the keys come from the host's key routing.
 pub fn screen(
     model: Signal<Model>,
     draft: Signal<String>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
+    let submit_actions = actions.clone();
     let composer = input()
         .auto_focus(true)
         // Enter sends and keeps focus, so the next line can be typed at once.
@@ -458,14 +771,17 @@ pub fn screen(
                 UiAction::Send(task)
             };
             if !action_is_empty(&action) {
-                let _ = actions.send(action);
+                let _ = submit_actions.send(action);
             }
         });
     view()
         .flex_col()
         .size_full()
         .child(header(model))
-        .child(text(move || model.with(|m| m.status_line.clone())))
+        .child(
+            text(move || model.with(|m| m.status_line.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
         .child(
             virtual_list(
                 move || model.with(|m| m.lines.len()),
@@ -475,18 +791,164 @@ pub fn screen(
             // in NSH 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4).
             .h(px(600.0)),
         )
-        .child(row_slots(model, STEER_SLOTS, steer_rows, true))
+        .child(when(move || model.with(|m| m.turn_summary.is_some()), move || tool_strip(model)))
+        .child(row_slots(model, SWARM_SLOTS, swarm_rows, tool_token, false))
+        .child(row_slots(model, NOTE_SLOTS, note_rows, dim_token, true))
+        .child(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true))
         .child(when(
             move || model.with(|m| !m.streaming.is_empty()),
-            move || text(move || model.with(|m| m.streaming.clone())),
+            move || {
+                text(move || model.with(|m| m.streaming.clone()))
+                    .text_color(move || token_ink("foreground"))
+            },
         ))
-        .child(when(move || model.with(|m| m.approval.is_some()), move || approval_strip(model)))
-        .child(when(move || model.with(|m| m.plan.is_some()), move || plan_block(model)))
-        .child(row_slots(model, QUEUE_SLOTS, queue_rows, false))
+        .child(when(move || model.with(|m| m.approval.is_some()), {
+            let actions = actions.clone();
+            move || approval_strip(model, actions.clone())
+        }))
+        .child(when(move || model.with(|m| m.plan.is_some()), {
+            let actions = actions.clone();
+            move || plan_block(model, actions.clone())
+        }))
+        .child(row_slots(model, QUEUE_SLOTS, queue_rows, plain_token, false))
         .child(composer)
+        .child(composer_controls(model, draft, actions))
 }
 
 /// An empty send is dropped; every other action goes to the driver.
 fn action_is_empty(action: &UiAction) -> bool {
     matches!(action, UiAction::Send(t) | UiAction::Queue(t) if t.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NONE: KeyFacts = KeyFacts { approval_options: None, plan_pending: false };
+
+    fn approval(options: usize) -> KeyFacts {
+        KeyFacts { approval_options: Some(options), plan_pending: false }
+    }
+
+    fn plan() -> KeyFacts {
+        KeyFacts { approval_options: None, plan_pending: true }
+    }
+
+    fn composer() -> Routed {
+        Routed::Composer { queue: false }
+    }
+
+    #[test]
+    fn key_names_map_to_keys() {
+        assert_eq!(key_of("Enter"), Key::Enter);
+        assert_eq!(key_of("Escape"), Key::Escape);
+        assert_eq!(key_of("y"), Key::Char('y'));
+        assert_eq!(key_of(" "), Key::Char(' '));
+        assert_eq!(key_of("Backspace"), Key::Other);
+        assert_eq!(key_of("ArrowLeft"), Key::Other);
+        assert_eq!(key_of(""), Key::Other);
+    }
+
+    #[test]
+    fn letters_reach_the_composer_when_nothing_is_pending() {
+        for c in ['y', 'a', 'n', 'r', 'x', ' '] {
+            assert_eq!(route_key(Key::Char(c), false, false, NONE, ""), composer(), "{c}");
+        }
+        assert_eq!(route_key(Key::Other, false, false, plan(), ""), composer());
+    }
+
+    #[test]
+    fn escape_interrupts_whatever_is_pending() {
+        let want = Routed::Action(UiAction::Interrupt);
+        assert_eq!(route_key(Key::Escape, false, false, NONE, ""), want);
+        assert_eq!(route_key(Key::Escape, false, false, approval(3), ""), want);
+        assert_eq!(route_key(Key::Escape, false, false, plan(), ""), want);
+    }
+
+    #[test]
+    fn enter_reaches_the_composer_and_alt_marks_a_queue() {
+        assert_eq!(
+            route_key(Key::Enter, false, false, approval(3), "x"),
+            Routed::Composer { queue: false }
+        );
+        assert_eq!(route_key(Key::Enter, true, true, NONE, ""), Routed::Composer { queue: true });
+    }
+
+    #[test]
+    fn chords_pass_to_the_composer() {
+        assert_eq!(route_key(Key::Char('a'), false, true, approval(3), ""), composer());
+        assert_eq!(route_key(Key::Escape, false, true, NONE, ""), composer());
+    }
+
+    #[test]
+    fn approval_keys_decide_their_options_in_order() {
+        assert_eq!(
+            route_key(Key::Char('y'), false, false, approval(3), ""),
+            Routed::Action(UiAction::Decide(0))
+        );
+        assert_eq!(
+            route_key(Key::Char('a'), false, false, approval(3), ""),
+            Routed::Action(UiAction::Decide(1))
+        );
+        assert_eq!(
+            route_key(Key::Char('n'), false, false, approval(3), ""),
+            Routed::Action(UiAction::Decide(2))
+        );
+    }
+
+    #[test]
+    fn an_approval_key_beyond_the_option_count_is_the_composers() {
+        assert_eq!(route_key(Key::Char('n'), false, false, approval(2), ""), composer());
+    }
+
+    #[test]
+    fn an_approval_takes_precedence_over_a_plan() {
+        let both = KeyFacts { approval_options: Some(3), plan_pending: true };
+        assert_eq!(
+            route_key(Key::Char('y'), false, false, both, ""),
+            Routed::Action(UiAction::Decide(0))
+        );
+        assert_eq!(route_key(Key::Char('r'), false, false, both, "note"), composer());
+    }
+
+    #[test]
+    fn plan_keys_approve_and_revise_with_the_draft_as_note() {
+        assert_eq!(
+            route_key(Key::Char('y'), false, false, plan(), "ignored"),
+            Routed::Action(UiAction::DecidePlan { approve: true, note: None })
+        );
+        assert_eq!(
+            route_key(Key::Char('r'), false, false, plan(), "  split the crate  "),
+            Routed::Action(UiAction::DecidePlan {
+                approve: false,
+                note: Some("split the crate".into())
+            })
+        );
+    }
+
+    #[test]
+    fn a_revise_with_an_empty_draft_has_no_note() {
+        assert_eq!(
+            route_key(Key::Char('r'), false, false, plan(), "   "),
+            Routed::Action(UiAction::DecidePlan { approve: false, note: None })
+        );
+    }
+
+    #[test]
+    fn plan_pending_leaves_other_letters_to_the_composer() {
+        assert_eq!(route_key(Key::Char('a'), false, false, plan(), ""), composer());
+        assert_eq!(route_key(Key::Char('n'), false, false, plan(), ""), composer());
+    }
+
+    #[test]
+    fn plan_answer_for_matches_the_key_rule() {
+        assert_eq!(
+            plan_answer_for(true, "note"),
+            UiAction::DecidePlan { approve: true, note: None }
+        );
+        assert_eq!(
+            plan_answer_for(false, " fix "),
+            UiAction::DecidePlan { approve: false, note: Some("fix".into()) }
+        );
+    }
 }

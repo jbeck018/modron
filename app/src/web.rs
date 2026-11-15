@@ -5,10 +5,12 @@
 //! The page address selects the mode: `?url=<ws url>[&token=<t>][&session=<uuid>]`
 //! attaches to a live server; with no `url` the built-in demo plays.
 
+use std::{cell::RefCell, rc::Rc};
+
 use wasm_bindgen::{prelude::*, JsCast};
 
 use crate::{
-    chat::{link, Client, Host},
+    chat::{key_of, link, Client, Host},
     demo::Player,
     session::{Driver, Live, LiveOptions, TICK},
 };
@@ -60,9 +62,11 @@ pub fn start() -> Client {
             Feed::Demo { player: Player::default(), started: js_sys::Date::now() }
         }
     };
-    let mut web = Web { host, feed };
+    let web = Rc::new(RefCell::new(Web { host, feed }));
+    listen_keys(web.clone());
     if let Some(window) = web_sys::window() {
-        let tick = Closure::<dyn FnMut()>::new(move || web.tick());
+        let web = web.clone();
+        let tick = Closure::<dyn FnMut()>::new(move || web.borrow_mut().tick());
         let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
             tick.as_ref().unchecked_ref(),
             TICK.as_millis() as i32,
@@ -71,4 +75,28 @@ pub fn start() -> Client {
         tick.forget();
     }
     client
+}
+
+/// Routes the page's keys the terminal's way, before the composer sees them
+/// (capture phase, so the key is decided first). A consumed key is
+/// cancelled, so no character lands in the composer.
+fn listen_keys(web: Rc<RefCell<Web>>) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let on_key =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |event: web_sys::KeyboardEvent| {
+            let key = key_of(&event.key());
+            let chord = event.ctrl_key() || event.meta_key() || event.alt_key();
+            if web.borrow().host.route(key, event.alt_key(), chord) {
+                event.prevent_default();
+            }
+        });
+    let _ = document.add_event_listener_with_callback_and_bool(
+        "keydown",
+        on_key.as_ref().unchecked_ref(),
+        true,
+    );
+    // The page keeps the listener for its whole life.
+    on_key.forget();
 }

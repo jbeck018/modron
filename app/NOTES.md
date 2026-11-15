@@ -57,3 +57,42 @@ the crate's `Input` (E0308 in tests/chat.rs and tests/live.rs).
   Installed with `cargo install wasm-bindgen-cli --version 0.2.130 --locked
   --root /tmp/claude-0/wbg` and pointed `NSH_WASM_BINDGEN` at it.
 - Cold build times: the crate 1m 11s, the web runtime 4m 55s.
+
+# Packet C3d: web keys, activity rows, theme
+
+## Keys
+
+One rule, `chat::route_key` (pure, unit-tested), shared by both hosts. The
+terminal calls it from `Host::filter`; the web calls it from a capture-phase
+`keydown` listener on `document` (`web::listen_keys`). A consumed key is
+`preventDefault`ed so it does not reach the composer. Letters reach the
+composer whenever no approval or plan is pending.
+
+The web also shows tappable controls (`WEB_CONTROLS` in `chat.rs`, web only):
+Stop while `running`, the approval and plan options (labels from the core),
+and Queue beside the composer. Each is `role("button")` with `on_press`.
+
+New user-visible string on web: "stop" (Stop control) and "queue" (Queue
+control). Neither exists in the core or modron-view; both need a shared home.
+
+## Activity rows
+
+Rendered verbatim from the snapshot, in core order: the live turn summary
+(`turn_summary_line`) and the latest tool rows (`tool_lines`, last 6), then
+sub-agent rows (`subagent_rows`), then `last_note` and `last_error`. Tool
+rows are coloured by their status mark (success / destructive / tool).
+
+## Theme
+
+`theme/oculus.json` reaches both targets:
+
+- Web: the packager applies `nsh.json` `"theme"`. `web-test.js` (f) reads the
+  task row's computed colour and gets the oculus primary, rgb(217, 165, 32),
+  with no install from the app. The app does not install tokens on web.
+- Terminal: `nsh.json` is not read, so `App` calls `lib::install_theme()`
+  (native only) on the engine thread. Tokens are then drawn through NSH's
+  terminal palette (`palette::ink`), so no ANSI is hard-coded. The headless
+  test `prompt_marker_takes_a_theme_colour` checks the marker is not Reset.
+
+Semantic names used in code: foreground, muted-foreground, primary, tool,
+success, warning, destructive, border (where used).
