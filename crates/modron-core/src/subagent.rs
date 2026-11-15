@@ -284,6 +284,9 @@ pub(crate) fn child_config(
             non_interactive: parent.approvals.non_interactive,
             allow: persona.map(|p| p.allow.clone()).unwrap_or_default(),
             deny,
+            // Rules are inherited unchanged: a child can never escape a
+            // parent `ask` or `deny` rule by running as a subagent.
+            rules: parent.approvals.rules.clone(),
         },
         sandbox: parent.sandbox,
         hooks: parent.hooks.clone(),
@@ -404,6 +407,7 @@ mod tests {
                 non_interactive: false,
                 allow: vec!["diagnostics".into()],
                 deny: vec!["bash".into()],
+                rules: Default::default(),
             },
             hooks: HookConfig {
                 pre_tool: Some("true".into()),

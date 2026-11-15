@@ -11,6 +11,7 @@ use crate::budget::BudgetGovernor;
 use crate::compact;
 use crate::context;
 use crate::hooks;
+use crate::permissions::{RuleEffect, RuleSet, Verdict};
 use crate::speculative;
 use crate::{
     estimate_tokens, judge, ActionKind, ApprovalMode, Engine, Error, JudgeMode, Message,
@@ -905,7 +906,13 @@ impl Engine {
                     // hooks, the on_tool_event sink, and the --deny list
                     // all must keep seeing every execution
                     // ([`speculative::allowed_for`]).
-                    if speculative::allowed_for(&self.config) {
+                    // The driver runs read-only tools before the gate sees
+                    // them, so it is disarmed whenever any permission rule
+                    // exists: a rule's `ask`/`deny` must never be bypassed by
+                    // a speculative read.
+                    if speculative::allowed_for(&self.config)
+                        && self.config.approvals.rules == RuleSet::default()
+                    {
                         let driver = speculative::SpeculativeDriver::spawn(
                             Arc::new(self.clone()),
                             session_id,
@@ -1034,14 +1041,27 @@ impl Engine {
         // actually prompt; under ApproveAll or an allow-list entry it keeps
         // the concurrency it had before the gate widened (parallel
         // delegates).
-        let prompts = |name: &str| {
-            is_gated(name)
+        // A rule verdict decides first: `ask` prompts even for an ungated
+        // tool, `allow` never prompts. With no verdict, the gate rules apply.
+        let prompts = |call: &ToolCall| {
+            match self
+                .config
+                .approvals
+                .rules
+                .evaluate(&call.name, &call.arguments)
+                .map(|v| v.effect)
+            {
+                Some(RuleEffect::Ask) => return true,
+                Some(RuleEffect::Allow) => return false,
+                Some(RuleEffect::Deny) | None => {}
+            }
+            is_gated(&call.name)
                 && self.config.approvals.mode != ApprovalMode::ApproveAll
-                && !self.config.approvals.allow.iter().any(|a| a == name)
+                && !self.config.approvals.allow.iter().any(|a| a == &call.name)
         };
         let all_read_only = tool_calls
             .iter()
-            .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(&c.name));
+            .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(c));
         // A speculative result was computed mid-stream, before this turn's
         // calls ran. It is only valid for a call when no file-mutating call
         // precedes it in this turn; otherwise `[edit X, read X]` would reuse
@@ -1478,6 +1498,17 @@ impl Engine {
     /// path, then Ask-with-approver (a prompt), otherwise refused. Pure rules:
     /// model-issued calls and the finish gate both route through here.
     fn admission(&self, name: &str) -> Admission {
+        self.admission_under(name, None)
+    }
+
+    /// [`Engine::admission`] for one concrete call: the permission rules are
+    /// evaluated against its arguments (see `ApprovalPolicy::rules`).
+    fn admission_for_call(&self, name: &str, args: &serde_json::Value) -> Admission {
+        let verdict = self.config.approvals.rules.evaluate(name, args);
+        self.admission_under(name, verdict)
+    }
+
+    fn admission_under(&self, name: &str, verdict: Option<Verdict>) -> Admission {
         // `edit_lines` is the same capability as `edit`: an allow or deny
         // entry for `edit` covers both, so an existing `--deny edit` is
         // not bypassed by the anchored variant.
@@ -1487,6 +1518,38 @@ impl Engine {
         };
         if listed(&self.config.approvals.deny) {
             return Admission::Refused(format!("tool `{name}` denied by configuration (--deny)"));
+        }
+        // Permission rules come after the deny list and before the mode
+        // fast path. No verdict, or an `allow` in Deny mode, falls through.
+        if let Some(verdict) = verdict {
+            match verdict.effect {
+                RuleEffect::Deny => {
+                    return Admission::Refused(format!(
+                        "tool `{name}` denied by rule `{}`",
+                        verdict.rule
+                    ));
+                }
+                // Deny mode stays the ceiling: an ask rule never lets a
+                // gated tool reach the approver there (falls through to
+                // the mode's refusal).
+                RuleEffect::Ask
+                    if self.config.approvals.mode == ApprovalMode::Deny && is_gated(name) => {}
+                RuleEffect::Ask => {
+                    // Forced to the approver even when ungated, allow-listed
+                    // or ApproveAll. Without an approver it cannot be asked.
+                    if self.config.approver.is_some() {
+                        return Admission::Ask;
+                    }
+                    return Admission::Refused(format!(
+                        "tool `{name}` requires approval by rule `{}`",
+                        verdict.rule
+                    ));
+                }
+                RuleEffect::Allow if self.config.approvals.mode != ApprovalMode::Deny => {
+                    return Admission::Run;
+                }
+                RuleEffect::Allow => {}
+            }
         }
         let explicitly_allowed = listed(&self.config.approvals.allow);
         if !is_gated(name)
@@ -1554,7 +1617,7 @@ impl Engine {
             );
         };
 
-        match self.admission(&call.name) {
+        match self.admission_for_call(&call.name, &call.arguments) {
             Admission::Run => {}
             Admission::Ask => {
                 // Ask mode with an interactive approver (Phase-1c I2): a
@@ -3562,6 +3625,286 @@ mod tests {
             "done\n\n[verification skipped: verify is not permitted in this approval mode]"
         );
         assert_eq!(summary.turns, 2, "the skip ends the run, no feedback turn");
+    }
+
+    /// Tool that counts its executions under a fixed name (rule tests).
+    struct CountingTool {
+        name: &'static str,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "counting tool".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutcome::ok("ran"))
+        }
+    }
+
+    fn call_with(name: &str, arguments: serde_json::Value) -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("c-{name}"),
+                name: name.into(),
+                arguments,
+            }],
+            usage: Default::default(),
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    /// Engine over the given tools with an explicit config.
+    fn engine_over(
+        script: Vec<TurnResponse>,
+        config: EngineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Engine {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(tool);
+        }
+        let mock = Arc::new(crate::testing::MockProvider::with_script(script));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), mock as Arc<dyn ModelProvider>);
+        Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config,
+        }
+    }
+
+    /// An approver that counts its calls and answers `answer`.
+    fn counting_approver(
+        answer: bool,
+    ) -> (Arc<crate::Approver>, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let approver: Arc<crate::Approver> = Arc::new(move |_call: &ToolCall| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer
+        });
+        (approver, asked)
+    }
+
+    /// Comparable form of an admission verdict.
+    fn admission_tag(admission: &Admission) -> String {
+        match admission {
+            Admission::Run => "run".to_string(),
+            Admission::Ask => "ask".to_string(),
+            Admission::Refused(message) => format!("refused: {message}"),
+        }
+    }
+
+    fn rules_of(specs: &[(crate::permissions::RuleEffect, &str)]) -> crate::permissions::RuleSet {
+        crate::permissions::RuleSet::new(
+            specs
+                .iter()
+                .map(|(effect, spec)| crate::permissions::Rule::parse(*effect, spec).unwrap())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn rule_deny_refuses_even_under_approve_all() {
+        use crate::permissions::RuleEffect::Deny;
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                rules: rules_of(&[(Deny, "bash(rm -rf*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = engine_over(Vec::new(), config, Vec::new());
+        let admission = engine.admission_for_call("bash", &json!({"command": "rm -rf /tmp/x"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: tool `bash` denied by rule `deny bash(rm -rf*)`"
+        );
+        // A non-matching call still gets the mode's verdict.
+        let ok = engine.admission_for_call("bash", &json!({"command": "ls"}));
+        assert_eq!(admission_tag(&ok), "run");
+    }
+
+    #[tokio::test]
+    async fn rule_ask_forces_an_ungated_tool_to_the_approver() {
+        use crate::permissions::RuleEffect::Ask;
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (approver, asked) = counting_approver(true);
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                rules: rules_of(&[(Ask, "read(.env*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            approver: Some(approver),
+            ..EngineConfig::default()
+        };
+        let read = Arc::new(CountingTool {
+            name: "read",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call_with("read", json!({"path": ".env"})), text("done")],
+            config,
+            vec![read as Arc<dyn Tool>],
+        );
+        let admission = engine.admission_for_call("read", &json!({"path": ".env"}));
+        assert_eq!(admission_tag(&admission), "ask");
+        // Other paths stay on the ungated fast path.
+        let plain = engine.admission_for_call("read", &json!({"path": "src/lib.rs"}));
+        assert_eq!(admission_tag(&plain), "run");
+
+        engine.run_task("read the secrets").await.unwrap();
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "approved once"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_ask_without_an_approver_refuses_the_call() {
+        use crate::permissions::RuleEffect::Ask;
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                rules: rules_of(&[(Ask, "read(.env*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let read = Arc::new(CountingTool {
+            name: "read",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call_with("read", json!({"path": ".env"})), text("done")],
+            config,
+            vec![read as Arc<dyn Tool>],
+        );
+        let admission = engine.admission_for_call("read", &json!({"path": ".env"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: tool `read` requires approval by rule `ask read(.env*)`"
+        );
+        engine.run_task("read the secrets").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rule_allow_runs_a_gated_tool_without_prompting() {
+        use crate::permissions::RuleEffect::Allow;
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The approver would refuse, so any prompt would block the write.
+        let (approver, asked) = counting_approver(false);
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::Ask,
+                rules: rules_of(&[(Allow, "write(src/**)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            approver: Some(approver),
+            ..EngineConfig::default()
+        };
+        let write = Arc::new(CountingTool {
+            name: "write",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![
+                call_with("write", json!({"path": "src/a.rs"})),
+                text("done"),
+            ],
+            config,
+            vec![write as Arc<dyn Tool>],
+        );
+        let admission = engine.admission_for_call("write", &json!({"path": "src/a.rs"}));
+        assert_eq!(admission_tag(&admission), "run");
+        engine.run_task("edit").await.unwrap();
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rule_allow_keeps_deny_mode_blocking() {
+        use crate::permissions::RuleEffect::Allow;
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::Deny,
+                rules: rules_of(&[(Allow, "write")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = engine_over(Vec::new(), config, Vec::new());
+        let admission = engine.admission_for_call("write", &json!({"path": "a"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: blocked by approval mode: deny"
+        );
+    }
+
+    #[test]
+    fn deny_list_beats_an_allow_rule() {
+        use crate::permissions::RuleEffect::Allow;
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                deny: vec!["bash".into()],
+                rules: rules_of(&[(Allow, "bash(cargo*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = engine_over(Vec::new(), config, Vec::new());
+        let admission = engine.admission_for_call("bash", &json!({"command": "cargo test"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: tool `bash` denied by configuration (--deny)"
+        );
+    }
+
+    #[test]
+    fn no_rules_leaves_admission_unchanged() {
+        let cases = [
+            (ApprovalMode::Ask, vec![], vec![]),
+            (ApprovalMode::Deny, vec![], vec![]),
+            (ApprovalMode::ApproveAll, vec![], vec![]),
+            (ApprovalMode::Ask, vec!["write".to_string()], vec![]),
+            (ApprovalMode::Ask, vec![], vec!["read".to_string()]),
+        ];
+        for (mode, allow, deny) in cases {
+            let config = EngineConfig {
+                approvals: crate::ApprovalPolicy {
+                    mode,
+                    allow: allow.clone(),
+                    deny: deny.clone(),
+                    ..crate::ApprovalPolicy::default()
+                },
+                ..EngineConfig::default()
+            };
+            let engine = engine_over(Vec::new(), config, Vec::new());
+            for name in ["read", "write", "bash", "edit_lines", "mcp__fs__x"] {
+                let args = json!({"path": "src/a.rs", "command": "ls"});
+                assert_eq!(
+                    admission_tag(&engine.admission_for_call(name, &args)),
+                    admission_tag(&engine.admission(name)),
+                    "{name} under {mode:?} allow={allow:?} deny={deny:?}"
+                );
+            }
+        }
     }
 
     /// A tool-call turn that also carries non-empty assistant text.

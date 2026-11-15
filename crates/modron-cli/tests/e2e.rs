@@ -77,6 +77,7 @@ fn mock_engine(
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },

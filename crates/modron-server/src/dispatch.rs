@@ -198,7 +198,9 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
         Payload::Hello { .. } | Payload::Ping {} | Payload::Approve { .. } | Payload::Detach {} => {
             Ok(())
         }
-        Payload::Attach { session_id, .. } | Payload::Interrupt { session_id } => {
+        Payload::Attach { session_id, .. }
+        | Payload::Interrupt { session_id }
+        | Payload::Steer { session_id, .. } => {
             if *session_id == scope {
                 Ok(())
             } else {
@@ -637,6 +639,20 @@ pub async fn handle_frame(
                         modron_protocol::ErrorKind::NotFound,
                     ),
                 ),
+            }
+        }
+        Payload::Steer { session_id, text } => {
+            if text.trim().is_empty() {
+                send(ctx, error(request_id, "steer text is empty"));
+            } else if let Err(message) = state.hub.steer(session_id, text) {
+                // An unknown session is NotFound; a known idle one is a
+                // conflict with live state (submit instead).
+                let kind = if state.hub.handle(&session_id).is_none() {
+                    modron_protocol::ErrorKind::NotFound
+                } else {
+                    modron_protocol::ErrorKind::Conflict
+                };
+                send(ctx, error_kind(request_id, message, kind));
             }
         }
         Payload::Approve {
@@ -1427,6 +1443,8 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Detach {} => "detach",
         Payload::Submit { .. } => "submit",
         Payload::Interrupt { .. } => "interrupt",
+        Payload::Steer { .. } => "steer",
+        Payload::Steered { .. } => "steered",
         Payload::Approve { .. } => "approve",
         Payload::SetConfig { .. } => "set_config",
         Payload::Fork { .. } => "fork",

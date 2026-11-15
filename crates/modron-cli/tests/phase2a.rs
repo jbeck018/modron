@@ -139,6 +139,7 @@ async fn verify_tool_runs_through_the_engine() {
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },
@@ -179,6 +180,7 @@ async fn verify_failure_is_visible_to_the_model() {
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },

@@ -168,6 +168,7 @@ pub async fn spawn_server_with(
             non_interactive: false,
             allow: vec![],
             deny: vec![],
+            ..Default::default()
         },
         self_check_on_finish: false,
         ..EngineConfig::default()

@@ -112,6 +112,7 @@ async fn mutating_tool_gated_per_mode() {
         let engine = engine(
             provider.clone(),
             ApprovalPolicy {
+                rules: Default::default(),
                 mode,
                 non_interactive: true,
                 allow: Vec::new(),
@@ -167,6 +168,7 @@ async fn read_only_tool_unaffected_by_every_mode() {
         let engine = engine(
             provider.clone(),
             ApprovalPolicy {
+                rules: Default::default(),
                 mode,
                 non_interactive: true,
                 allow: Vec::new(),
@@ -202,6 +204,7 @@ async fn model_adapts_after_block() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         },
         tools,
     );
@@ -242,6 +245,7 @@ async fn resume_unaffected_by_blocks() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         },
         Arc::clone(&tools),
     );
@@ -269,6 +273,7 @@ async fn resume_unaffected_by_blocks() {
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },
@@ -345,6 +350,7 @@ fn checkpoints(events: &[SessionEvent]) -> Vec<SessionEvent> {
 
 fn policy(mode: ApprovalMode) -> ApprovalPolicy {
     ApprovalPolicy {
+        rules: Default::default(),
         mode,
         non_interactive: false,
         allow: Vec::new(),

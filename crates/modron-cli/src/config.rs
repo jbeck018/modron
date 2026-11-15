@@ -68,6 +68,46 @@ pub struct Config {
     /// Session lifecycle (Phase 6a): auto-vacuum TTL.
     #[serde(default)]
     pub sessions: Option<SessionsConfig>,
+    /// `[permissions]`: `allow` / `ask` / `deny` rules such as
+    /// `bash(cargo test*)` or `read(.env*)`. Validated at startup by
+    /// [`PermissionsConfig::rule_set`], not while loading, so a bad rule is a
+    /// startup error rather than a silently ignored file.
+    #[serde(default)]
+    pub permissions: Option<PermissionsConfig>,
+}
+
+/// `[permissions]` section: rule text lists, one list per effect. Stored as
+/// raw strings so a malformed rule cannot make the whole file fall back to
+/// defaults; [`PermissionsConfig::rule_set`] parses them.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct PermissionsConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl PermissionsConfig {
+    /// Parse every rule. The error names the first rule that is invalid.
+    pub fn rule_set(&self) -> Result<modron_core::permissions::RuleSet, String> {
+        use modron_core::permissions::{Rule, RuleEffect, RuleSet};
+        let groups = [
+            (RuleEffect::Allow, &self.allow),
+            (RuleEffect::Ask, &self.ask),
+            (RuleEffect::Deny, &self.deny),
+        ];
+        let mut rules = Vec::new();
+        for (effect, specs) in groups {
+            for spec in specs {
+                let rule = Rule::parse(effect, spec)
+                    .map_err(|err| format!("invalid permission rule `{spec}`: {err}"))?;
+                rules.push(rule);
+            }
+        }
+        Ok(RuleSet::new(rules))
+    }
 }
 
 /// `[sessions]` section (Phase 6a). `ttl_days` enables auto-vacuum at
@@ -428,6 +468,51 @@ mod tests {
             },
         );
         assert_eq!(config.default_provider, None);
+    }
+
+    #[test]
+    fn permissions_section_parses_into_rules() {
+        use modron_core::permissions::RuleEffect;
+        use serde_json::json;
+        let src = "[permissions]\nallow = [\"bash(cargo test*)\"]\nask = [\"bash(git push*)\"]\ndeny = [\"read(.env*)\"]\n";
+        let config = parse_config(src).expect("valid config");
+        let rules = config
+            .permissions
+            .expect("section present")
+            .rule_set()
+            .expect("valid rules");
+        let eval = |tool: &str, args: serde_json::Value| {
+            rules.evaluate(tool, &args).map(|v| (v.effect, v.rule))
+        };
+        assert_eq!(
+            eval("bash", json!({"command": "cargo test --workspace"})),
+            Some((RuleEffect::Allow, "allow bash(cargo test*)".to_string()))
+        );
+        assert_eq!(
+            eval("bash", json!({"command": "git push origin"})),
+            Some((RuleEffect::Ask, "ask bash(git push*)".to_string()))
+        );
+        assert_eq!(
+            eval("read", json!({"path": ".env.local"})),
+            Some((RuleEffect::Deny, "deny read(.env*)".to_string()))
+        );
+        // A file without the section yields no rules at all.
+        assert!(parse_config("default_model = \"m\"\n")
+            .expect("valid config")
+            .permissions
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_permission_rule_is_a_startup_error_naming_the_rule() {
+        let config = parse_config("[permissions]\ndeny = [\"bash(cargo\"]\n")
+            .expect("the file itself is valid TOML");
+        let err = config
+            .permissions
+            .unwrap_or_default()
+            .rule_set()
+            .expect_err("unbalanced rule must be rejected");
+        assert!(err.contains("bash(cargo"), "error names the rule: {err}");
     }
 
     #[test]

@@ -1052,7 +1052,7 @@ in a turn concurrently); what was missing was visibility.
 
 | ID | Item | Status | Evidence |
 |---|---|---|---|
-| H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | DONE | core lib.rs + subagent.rs |
+| H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | ACTIVE | H1a engine SteerInbox and H1b Steer/Steered frames + server hub DONE. Open: H1c queue (Enqueue/Dequeue/QueueChanged), actor on frames, LiveState.steer_pending |
 | H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | DONE | App.subagents + view; run.rs clears |
 | H3 | ACP: subagent events surface as tool_call / status notifications to the editor | DONE | acp.rs update mapping |
 | H4 | Parallel delegates verified: two delegate calls in ONE turn run concurrently (read-only dispatch), results land in transcript in call order, each child under its persona's forced model | DONE | interactivity::parallel_delegates_run_concurrently |
@@ -1425,7 +1425,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | H5 | Scheduled wakeups, pause reasons, completion/block notifications | TODO | |
 | H6 | Hash-anchored line edits, measured with modron bench | ACTIVE | H6a edit_lines tool + read(line_hashes) DONE, on-demand, approval-gated, edit allow/deny entries cover it. Open: modron bench comparison before any default change |
 | H7 | Reasoning-effort parameter and named model roles | TODO | |
-| H8 | Command and path permission rules + explain command | ACTIVE | H8a core::permissions matcher DONE (17 tests). Open: H8b engine wiring + config + explain command |
+| H8 | Command and path permission rules + explain command | ACTIVE | H8a matcher and H8b engine gate + [permissions] config DONE (rules apply to `modron` CLI runs). Open: H8c rules for serve/acp sessions, ConfigPatch.rules, explain command |
 | H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | DONE | stub and delegate_status descriptions fixed |
 | H9b | Real compact command and true context occupancy over the protocol | TODO | |
 | H9c | Hooks: turn-end and session-start events | TODO | |
@@ -1437,7 +1437,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | ID | Packet | Status | Evidence / blocker |
 |---|---|---|---|
 | C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | DONE | 16ac999; labels in modron-protocol / modron-view, client core delegates |
-| C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | TODO | |
+| C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | DONE | 43c3dbe; app/theme/oculus.json + check.py. Owner to confirm: chart colours, mono font, tool colour, large radius |
 | C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | TODO | Depends on S1 |
 | C4 | Portal: Worker serves the web build; owner sign-in; linked GitHub accounts; session directory; invite links | TODO | Deploy needs the owner's Cloudflare login |
 | C5 | Tandem: multi-device attach, replay on reconnect, push for approvals | TODO | |
@@ -1460,3 +1460,9 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 - NSH crates are published at 0.5.1 on crates.io (nsh-core, nsh-base,
   nsh-engine, nsh-testing, nsh-platform-tui); this container has glibc
   2.39, so S2 can run here.
+- 2026-11-15: wave 2. H1b, H8b, C2 landed. Lead changes: an ask rule
+  no longer lets a gated tool reach the approver in Deny mode; test
+  struct literals outside the worker's file list repaired. The
+  speculative read driver is disarmed whenever a rule set is present
+  (it runs reads before the gate). PROTOCOL_VERSION stays 1 until the
+  v2 set is complete. Gates: fmt clean, clippy clean, 969 tests pass.

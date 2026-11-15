@@ -555,6 +555,12 @@ pub struct ApprovalPolicy {
     /// Tools always blocked, whatever the mode says (any tool class).
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Permission rules (`allow` / `ask` / `deny` patterns, see
+    /// [`permissions`]). Evaluated per call with its arguments, after the
+    /// deny list and before the mode fast path. Not serialized: the CLI builds
+    /// it from the `[permissions]` config table at startup.
+    #[serde(default, skip)]
+    pub rules: permissions::RuleSet,
 }
 
 /// Pricing hook for USD spend caps (Phase-1b A3): given a model name, return

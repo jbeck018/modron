@@ -191,6 +191,7 @@ async fn approver_allows_mutating_tool_in_ask_mode() {
                 non_interactive: false,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             approver: Some(always_allow()),
             ..EngineConfig::default()
@@ -228,6 +229,7 @@ async fn approver_denial_blocks_with_message() {
                 non_interactive: false,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             approver: Some(always_deny()),
             ..EngineConfig::default()
@@ -752,6 +754,7 @@ async fn run_single_named_call(
         config: EngineConfig {
             working_dir: dir.path().to_path_buf(),
             approvals: ApprovalPolicy {
+                rules: Default::default(),
                 mode,
                 non_interactive: false,
                 allow,

@@ -136,6 +136,11 @@ pub enum Payload {
     /// Abort the session's active run (JoinHandle-abort parity with the
     /// TUI's Esc).
     Interrupt { session_id: Uuid },
+    /// Send a message to a RUNNING session: it is injected at the next safe
+    /// boundary (between model turns, after pending tool results) and the
+    /// run continues. An idle session refuses it (submit instead). Replies
+    /// `Steered` on success; the injected text persists as a `Task` event.
+    Steer { session_id: Uuid, text: String },
     /// Answer a pending approval (first responder wins).
     Approve {
         request_id: String,
@@ -242,6 +247,11 @@ pub enum Payload {
         request_id: String,
         decision: Decision,
     },
+    /// A steer was accepted and queued for injection into the active run.
+    /// UI effect: show `text` as a pending (dim) task echo until its
+    /// persisted `Event { event: SessionEvent::Task }` arrives with the same
+    /// text, which replaces the pending echo in transcript order.
+    Steered { text: String },
     /// Config mutated (echo of the applied patch).
     ConfigChanged { patch: ConfigPatch },
     /// Answer to `list_sessions`.
@@ -906,6 +916,36 @@ mod tests {
                 frame.payload
             );
         }
+    }
+
+    /// Steer (client) and Steered (server) carry their text and round-trip
+    /// with the snake_case tags the other clients use.
+    #[test]
+    fn steer_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let steer = Frame::request(
+            9,
+            Payload::Steer {
+                session_id: session,
+                text: "use the other crate".into(),
+            },
+        );
+        assert_roundtrip(&steer);
+        let json = serde_json::to_value(&steer).unwrap();
+        assert_eq!(json["type"], "steer");
+        assert_eq!(json["text"], "use the other crate");
+
+        let steered = Frame::event(
+            Some(session),
+            10,
+            Payload::Steered {
+                text: "use the other crate".into(),
+            },
+        );
+        assert_roundtrip(&steered);
+        let json = serde_json::to_value(&steered).unwrap();
+        assert_eq!(json["type"], "steered");
+        assert_eq!(json["text"], "use the other crate");
     }
 
     #[test]

@@ -1212,7 +1212,15 @@ fn build_agent_with(
                 non_interactive: !interactive,
                 allow: cli.allow.clone(),
                 deny: cli.deny.clone(),
+                rules: Default::default(),
             };
+            // `[permissions]` from config.toml: an invalid rule stops startup.
+            approvals.rules = cfg
+                .permissions
+                .clone()
+                .unwrap_or_default()
+                .rule_set()
+                .map_err(anyhow::Error::msg)?;
             if let Some(p) = persona.as_ref() {
                 approvals.allow.extend(p.allow.clone().unwrap_or_default());
                 approvals.deny.extend(p.deny.clone().unwrap_or_default());

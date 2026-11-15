@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use modron_core::{
-    Engine, RunSummary, SessionEvent, SessionId, SessionMeta, SessionStore, StreamDelta,
-    ToolActivity, ToolCall, Usage,
+    Engine, RunSummary, SessionEvent, SessionId, SessionMeta, SessionStore, SteerInbox,
+    StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval, WireDelta,
@@ -240,6 +240,9 @@ impl SessionStore for PinnedCreateStore {
 /// variant to drive for this run).
 pub type RunFuture = Pin<Box<dyn Future<Output = modron_core::Result<RunSummary>> + Send>>;
 
+/// Error text for a steer sent while the session has no active run.
+pub const STEER_IDLE: &str = "session idle - submit instead";
+
 /// One fanned-out live frame: identity plus the JSON already serialized
 /// once at publish (every attached connection sends the same bytes).
 #[derive(Clone, Debug)]
@@ -317,6 +320,9 @@ pub struct SessionHandle {
     /// [`SessionHub::ensure_session`]). Mutex-guarded so a concurrent
     /// SetConfig can never interleave with a Submit cloning it.
     engine: Mutex<Engine>,
+    /// Steer messages waiting for the run loop (the same inbox as
+    /// `engine.config.steer`). Created with the handle; never replaced.
+    steer: Arc<SteerInbox>,
 }
 
 impl SessionHandle {
@@ -632,6 +638,9 @@ impl SessionHandle {
         // sees the empty run slot and publishes nothing (cycle-3 F3).
         let order_guard = lock(&self.gate_order);
         self.aborted.store(true, Ordering::Relaxed);
+        // An interrupt discards undelivered steers (the queue, if any, is
+        // a separate concept and is not kept here).
+        let _discarded = self.steer.drain();
         let mut seq = lock(&self.seq);
         let pending = lock(&self.pending).drain().collect::<Vec<_>>();
         for (request_id, respond) in pending {
@@ -652,6 +661,22 @@ impl SessionHandle {
         drop(order_guard);
         drop(slot);
         had_run
+    }
+
+    /// Queue a steer for the active run and echo it to subscribers. Holds
+    /// the run slot across the push and the publish, so an interrupt either
+    /// sees the message (and discards it) or the steer sees no run.
+    pub fn steer_message(&self, text: String) -> Result<(), String> {
+        let slot = lock(&self.run);
+        if slot.is_none() {
+            return Err(STEER_IDLE.to_string());
+        }
+        self.steer.push(text.clone());
+        let mut seq = lock(&self.seq);
+        self.publish_locked(&mut seq, Payload::Steered { text });
+        drop(seq);
+        drop(slot);
+        Ok(())
     }
 
     /// The run task calls this after its engine future settles. Whoever
@@ -977,6 +1002,11 @@ impl SessionHub {
         if let Some(dir) = working_dir {
             config.working_dir = dir;
         }
+        // One steer inbox per session, owned by the handle. The engine
+        // drains it between model turns; `SetConfig` clones this config
+        // (apply_config), so the inbox survives config patches.
+        let steer = Arc::new(SteerInbox::new());
+        config.steer = Some(Arc::clone(&steer));
         engine.config = config;
 
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -1002,6 +1032,7 @@ impl SessionHub {
             provider: Mutex::new(engine.config.default_provider.clone()),
             goal: Mutex::new(String::new()),
             engine: Mutex::new(engine),
+            steer,
         });
         sessions.insert(id, Arc::clone(&handle));
         handle
@@ -1035,6 +1066,10 @@ impl SessionHub {
             let _order = lock(&handle.gate_order);
             handle.aborted.store(false, Ordering::Relaxed);
         }
+        // The steer inbox is NOT cleared here. A steer that raced the end of
+        // the previous run (pushed while its slot was still held, after the
+        // engine's last drain) waits in the inbox and is injected at the
+        // start of this run. Only an interrupt discards pending steers.
         // "Allow all" is sticky for the rest of the RUN only (AGENTS.md
         // interaction semantics): a new run starts un-approved.
         handle.allow_rest.store(false, Ordering::Relaxed);
@@ -1046,6 +1081,16 @@ impl SessionHub {
         *slot = Some(task);
         handle.busy.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Steer a session's active run (see [`SessionHandle::steer_message`]).
+    /// Errors: no such session, or the session has no active run (submit
+    /// instead).
+    pub fn steer(&self, id: SessionId, text: String) -> Result<(), String> {
+        let handle = self
+            .handle(&id)
+            .ok_or_else(|| format!("no such session {id}"))?;
+        handle.steer_message(text)
     }
 
     /// Start deleting a session. Fails while a run holds its slot. Until
@@ -1119,5 +1164,99 @@ pub fn task_with_goal(goal: &str, task: &str) -> String {
             "{task}\n\n(Goal for this run: {goal}. Keep working across turns until it \
              is met, then end your final message with the exact line: GOAL COMPLETE)"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use modron_core::testing::{InMemoryStore, StaticSelector};
+    use modron_core::{EngineConfig, ToolRegistry};
+    use std::time::Duration;
+
+    fn test_hub() -> SessionHub {
+        let hub = SessionHub::empty();
+        hub.set_engine(Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: Default::default(),
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::new(InMemoryStore::new()),
+            config: EngineConfig {
+                default_model: "mock-model".into(),
+                default_provider: "mock".into(),
+                ..EngineConfig::default()
+            },
+        });
+        hub
+    }
+
+    /// A run that parks until the test interrupts it.
+    fn parked_run(id: SessionId) -> RunFuture {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(RunSummary {
+                session_id: id,
+                answer: "unreachable".into(),
+                turns: 0,
+                tool_calls: 0,
+                usage: Default::default(),
+                models_used: vec![],
+            })
+        })
+    }
+
+    /// The handle's engine config carries the handle's own inbox.
+    #[test]
+    fn session_engine_config_carries_the_handle_steer_inbox() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let config_inbox = lock(&handle.engine)
+            .config
+            .steer
+            .clone()
+            .expect("steer wired");
+        assert!(Arc::ptr_eq(&config_inbox, &handle.steer));
+    }
+
+    #[test]
+    fn steer_on_an_idle_session_is_refused() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        hub.ensure_session(id, None);
+        let err = hub.steer(id, "change course".into()).unwrap_err();
+        assert_eq!(err, STEER_IDLE);
+        assert!(hub.handle(&id).unwrap().steer.is_empty());
+        assert!(hub.steer(SessionId::new_v4(), "x".into()).is_err());
+    }
+
+    #[tokio::test]
+    async fn steer_on_a_busy_session_queues_and_publishes_steered() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let mut rx = handle.tx.subscribe();
+        hub.start_run(id, parked_run(id)).unwrap();
+        hub.steer(id, "use the other crate".into()).unwrap();
+        assert_eq!(
+            handle.steer.drain(),
+            vec!["use the other crate".to_string()]
+        );
+        let frame = rx.recv().await.expect("live frame");
+        let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+        assert_eq!(json["type"], "steered");
+        assert_eq!(json["text"], "use the other crate");
+        handle.interrupt();
+    }
+
+    #[tokio::test]
+    async fn interrupt_discards_pending_steers() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        hub.start_run(id, parked_run(id)).unwrap();
+        hub.steer(id, "first".into()).unwrap();
+        assert!(handle.interrupt());
+        assert!(handle.steer.is_empty());
     }
 }
