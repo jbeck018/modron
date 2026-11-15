@@ -1,11 +1,14 @@
 //! The built-in demo script for the TUI host: snapshots built from the client
 //! core's own types (`entry_lines`, `DECISION_LABELS`), played over time.
 
+use modron_mobile_core::view::AgentRowView;
 use modron_mobile_core::{
     connection_label, entry_lines, session_row, ConnectionState, DecisionOption,
     PendingApprovalView, RenderedRow, SessionMetaWire, ViewModelSnapshot, DECISION_LABELS,
 };
-use modron_view::TranscriptEntry;
+use modron_protocol::RouterDefaults;
+use modron_types::AgentState;
+use modron_view::{SwarmRow, TranscriptEntry};
 use uuid::Uuid;
 
 use crate::chat::Host;
@@ -27,6 +30,37 @@ fn demo_sessions() -> Vec<SessionMetaWire> {
         meta(0xd2, "write the release notes", 14, false),
         meta(0xd3, "triage flaky tests", 3, false),
     ]
+}
+
+/// The demo's sub-agents: one running, one finished, so both states show.
+fn demo_agents() -> Vec<AgentRowView> {
+    let row = |id: &str, label: &str, turns: u32, state: AgentState| {
+        AgentRowView::from_row(&SwarmRow {
+            id: id.into(),
+            label: label.into(),
+            turns,
+            tokens: 1_200,
+            last_tool: Some("read".into()),
+            done: None,
+            started_ms: None,
+            state,
+        })
+    };
+    vec![
+        row("agent-review", "reviewer", 3, AgentState::Running),
+        row("agent-notes", "notes", 2, AgentState::Done),
+    ]
+}
+
+/// The demo's router defaults: what the model picker lists.
+fn demo_router() -> RouterDefaults {
+    RouterDefaults {
+        authed: vec!["anthropic".into()],
+        recommended_cheap: Some("claude-haiku-5-5".into()),
+        recommended_strong: Some("claude-opus-5".into()),
+        cheap_fallback: vec!["claude-sonnet-5".into()],
+        strong_fallback: vec!["claude-sonnet-5".into()],
+    }
 }
 
 fn row(entry: TranscriptEntry) -> RenderedRow {
@@ -52,6 +86,8 @@ fn snap(
             .map(|(decision, label)| DecisionOption { decision: *decision, label: (*label).into() })
             .collect(),
     };
+    let agents = demo_agents();
+    let subagent_rows = agents.iter().map(|a| a.text.clone()).collect();
     let sessions = demo_sessions();
     let session_rows =
         sessions.iter().map(|meta| session_row(meta, meta.task_state.is_some())).collect();
@@ -71,6 +107,9 @@ fn snap(
         history,
         sessions,
         session_rows,
+        agents,
+        subagent_rows,
+        router_defaults: Some(demo_router()),
         ..Default::default()
     }
 }

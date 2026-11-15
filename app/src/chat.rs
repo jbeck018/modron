@@ -34,6 +34,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 use crate::nav::{Nav, NavStep, NavView, Screen};
+use crate::slash;
 
 /// What the user asked the client to do. The host or the view sends these;
 /// the session driver (`crate::session`) turns them into core calls.
@@ -73,6 +74,30 @@ pub enum UiAction {
     /// A screen-navigation step: from a key (through `Host::route`) or a tap
     /// (the web header). The host applies it; it never reaches the driver.
     Nav(NavStep),
+    /// `/model <name>`: switch the model (the core's `select_model`).
+    SelectModel(String),
+    /// The model picker opened: ask the server for the router defaults.
+    ListModels,
+    /// `/mode` with no argument: the next approval mode.
+    CycleMode,
+    /// `/sandbox` with no argument: the next sandbox policy.
+    CycleSandbox,
+    /// `/fork`, `/tasks`, `/share`, `/remote-control <url>`.
+    Fork,
+    TaskStatus,
+    Share,
+    RemoteControl(String),
+    /// The sessions confirmation said yes.
+    DeleteSession(Uuid),
+    /// The agent screen's steer (Enter) and the confirmed kill.
+    SteerAgent {
+        agent: String,
+        text: String,
+    },
+    KillAgent(String),
+    /// A local message (unknown command, a usage line), shown as the
+    /// snapshot's last error, as a refused call is.
+    Notice(String),
 }
 
 /// Key hints for the approval options, in protocol order. Keys are TUI
@@ -152,6 +177,8 @@ const STEER_SLOTS: usize = 3;
 const PLAN_LINE_SLOTS: usize = 12;
 const TOOL_SLOTS: usize = 6;
 const SWARM_SLOTS: usize = 4;
+/// Visible slots for the command suggestions (table rows, then local rows).
+const SLASH_SLOTS: usize = 16;
 const NOTE_SLOTS: usize = 2;
 
 /// The composer text, mirrored from the view so the host can read it for a
@@ -164,7 +191,7 @@ static QUEUE_NEXT: AtomicBool = AtomicBool::new(false);
 /// been resolved (see [`after_snapshot`]), so a refused revise keeps its note.
 static CLEAR_DRAFT: AtomicBool = AtomicBool::new(false);
 
-fn set_draft(text: &str) {
+pub(crate) fn set_draft(text: &str) {
     if let Ok(mut draft) = DRAFT.lock() {
         draft.clear();
         draft.push_str(text);
@@ -189,6 +216,10 @@ pub enum Key {
     Down,
     /// F2: opens Settings from any screen.
     F2,
+    /// F1: help from any screen.
+    F1,
+    /// Tab: completes the selected command suggestion.
+    Tab,
     /// Any other key (dead keys, Tab): always the composer's.
     Other,
 }
@@ -219,6 +250,8 @@ pub fn host_key(name: &str) -> Key {
         "ArrowUp" => Key::Up,
         "ArrowDown" => Key::Down,
         "F2" => Key::F2,
+        "F1" => Key::F1,
+        "Tab" => Key::Tab,
         _ => key_of(name),
     }
 }
@@ -240,6 +273,20 @@ pub struct KeyFacts {
     pub selected_session: Option<Uuid>,
     /// The action Enter would send for the selected settings row.
     pub enter_setting: Option<UiAction>,
+    /// Packet C3f: the number of command suggestions shown (0 when none).
+    pub slash_len: usize,
+    /// The composer text is exactly a command word.
+    pub slash_exact: bool,
+    /// The selected row index of the open list (Sessions, Models, Settings).
+    pub selected_index: usize,
+    /// The model Enter would switch to (Models only).
+    pub selected_model: Option<String>,
+    /// The sub-agent Ctrl+A opens.
+    pub first_agent: Option<String>,
+    /// Whether the open agent still takes a steer or a kill (Agent only).
+    pub agent_live: bool,
+    /// Whether a confirmation waits for y or n.
+    pub confirming: bool,
 }
 
 /// Where a key goes.
@@ -258,35 +305,65 @@ pub enum Routed {
 
 /// The one key-to-action rule, shared by every host.
 ///
-/// Order: F2 opens Settings and Ctrl+O opens Sessions (from any screen);
-/// on Sessions and Settings every other key is the screen's
-/// ([`route_screen_key`]); on Chat, Enter always reaches the composer (Alt
-/// marks a queue); Backspace on an empty composer with messages queued
-/// removes the last one; a chord passes; Esc interrupts; with an approval
-/// pending, y / a / n decide its options and every other key is the
-/// composer's; with a plan pending, y approves and r revises with the
-/// trimmed composer text as the note.
+/// Order: a pending confirmation takes y / n (other keys are consumed). F2
+/// opens Settings, F1 opens Help, Ctrl+O opens Sessions and Ctrl+A opens the
+/// first sub-agent, from any screen. On the other screens every key is the
+/// screen's ([`route_screen_key`]). On Chat, while the command suggestions
+/// show, Up / Down / Tab / Esc / Enter drive them. `?` on an empty composer
+/// opens Help. Enter otherwise reaches the composer (Alt marks a queue);
+/// Backspace on an empty composer with messages queued removes the last one;
+/// a chord passes; Esc interrupts; with an approval pending, y / a / n decide
+/// its options and every other key is the composer's; with a plan pending, y
+/// approves and r revises with the trimmed composer text as the note.
 ///
-/// Esc precedence: on Sessions, Esc clears a non-empty filter first and
-/// closes the screen second; on Settings it closes the screen; on Chat it
+/// Esc precedence: on Sessions and Models, Esc clears a non-empty filter
+/// first and closes the screen second; on Settings, Help and Agent it closes
+/// the screen; on Chat it hides the suggestions if they show, and otherwise
 /// interrupts. The composer's text is passed in, so the rule is testable
 /// without a view.
 pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str) -> Routed {
     let composer = Routed::Composer { queue: false };
+    if facts.confirming && !chord {
+        return match key {
+            Key::Char('y') => Routed::Nav(NavStep::Confirm),
+            Key::Char('n') | Key::Escape => Routed::Nav(NavStep::Cancel),
+            _ => Routed::Ignored,
+        };
+    }
     match key {
         Key::F2 => return Routed::Nav(NavStep::Open(Screen::Settings)),
+        Key::F1 => return Routed::Nav(NavStep::Open(Screen::Help)),
         Key::Char('o') if chord => return Routed::Nav(NavStep::Open(Screen::Sessions)),
+        Key::Char('a') if chord && facts.screen == Screen::Chat => {
+            return match facts.first_agent.clone() {
+                Some(id) => Routed::Nav(NavStep::OpenAgent(id)),
+                None => composer,
+            };
+        }
         _ => {}
     }
     if facts.screen != Screen::Chat {
-        return route_screen_key(key, chord, &facts);
+        return route_screen_key(key, chord, &facts, draft);
     }
+    let suggesting = facts.slash_len > 0;
     match key {
+        Key::Enter if suggesting && !facts.slash_exact => {
+            return Routed::Nav(NavStep::CompleteSelected)
+        }
         Key::Enter => return Routed::Composer { queue: alt },
+        Key::Tab if suggesting => return Routed::Nav(NavStep::CompleteSelected),
+        Key::Up if suggesting => return Routed::Nav(NavStep::SlashMove(-1)),
+        Key::Down if suggesting => return Routed::Nav(NavStep::SlashMove(1)),
+        Key::Escape if suggesting => return Routed::Nav(NavStep::SlashHide),
+        Key::Char('?') if !chord && draft.is_empty() => {
+            return Routed::Nav(NavStep::Open(Screen::Help))
+        }
         Key::Backspace if !chord && draft.is_empty() && facts.queued > 0 => {
             return Routed::Action(UiAction::Dequeue(facts.queued - 1));
         }
-        Key::Other | Key::Backspace | Key::Up | Key::Down | Key::F2 => return composer,
+        Key::Other | Key::Backspace | Key::Up | Key::Down | Key::Tab | Key::F1 | Key::F2 => {
+            return composer
+        }
         _ if chord => return composer,
         Key::Escape => return Routed::Action(UiAction::Interrupt),
         Key::Char(_) => {}
@@ -310,13 +387,50 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     composer
 }
 
-/// Keys on the Sessions and Settings screens. There is no composer there,
-/// so these keys are the screen's: arrows move, Enter activates, Esc backs
-/// out, and on Sessions the printable keys type the filter (`n` and j / k
-/// act only while the filter is empty). A chord still passes.
-fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts) -> Routed {
+/// Keys on the screens above Chat. Help closes on Esc. Models filters by
+/// typing and picks on Enter. Agent takes the steer text (the composer), and
+/// `k` on an empty draft asks to kill a live agent. Sessions and Settings
+/// have no composer: arrows move, Enter activates, Esc backs out, and on
+/// Sessions the printable keys type the filter (`n`, `j`, `k` and `d` act
+/// only while the filter is empty). A chord still passes.
+fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Routed {
+    let composer = Routed::Composer { queue: false };
     if chord {
-        return Routed::Composer { queue: false };
+        return composer;
+    }
+    match facts.screen {
+        Screen::Help => {
+            return match key {
+                Key::Escape => Routed::Nav(NavStep::Back),
+                _ => Routed::Ignored,
+            };
+        }
+        Screen::Agent => {
+            return match key {
+                Key::Escape => Routed::Nav(NavStep::Back),
+                // An ended agent takes no steer and no kill: its keys are consumed.
+                _ if !facts.agent_live => Routed::Ignored,
+                Key::Char('k') if draft.is_empty() => Routed::Nav(NavStep::AskKill),
+                Key::Enter | Key::Char(_) | Key::Backspace | Key::Other => composer,
+                _ => Routed::Ignored,
+            };
+        }
+        Screen::Models => {
+            return match key {
+                Key::Escape if facts.filter_active => Routed::Nav(NavStep::ClearFilter),
+                Key::Escape => Routed::Nav(NavStep::Back),
+                Key::Enter => match &facts.selected_model {
+                    Some(model) => Routed::Nav(NavStep::PickModel(model.clone())),
+                    None => Routed::Ignored,
+                },
+                Key::Up => Routed::Nav(NavStep::Move(-1)),
+                Key::Down => Routed::Nav(NavStep::Move(1)),
+                Key::Backspace => Routed::Nav(NavStep::FilterBack),
+                Key::Char(c) => Routed::Nav(NavStep::Filter(c)),
+                _ => Routed::Ignored,
+            };
+        }
+        Screen::Chat | Screen::Sessions | Screen::Settings => {}
     }
     let sessions = facts.screen == Screen::Sessions;
     match key {
@@ -334,6 +448,9 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts) -> Routed {
         Key::Down => Routed::Nav(NavStep::Move(1)),
         Key::Backspace => Routed::Nav(NavStep::FilterBack),
         Key::Char('n') if sessions && !facts.filter_active => Routed::Nav(NavStep::NewSession),
+        Key::Char('d') if sessions && !facts.filter_active => {
+            Routed::Nav(NavStep::AskDelete(facts.selected_index))
+        }
         Key::Char('j') if sessions && !facts.filter_active => Routed::Nav(NavStep::Move(1)),
         Key::Char('k') if sessions && !facts.filter_active => Routed::Nav(NavStep::Move(-1)),
         Key::Char(c) if sessions => Routed::Nav(NavStep::Filter(c)),
@@ -576,6 +693,9 @@ impl Host {
     /// consumes the key (an action, a screen step, or an ignored key); false
     /// when the composer gets it.
     pub fn route(&mut self, key: Key, alt: bool, chord: bool) -> bool {
+        let draft = draft_text();
+        let items = slash::suggestions_for(&draft);
+        self.nav.set_slash(items.iter().map(|e| e.name).collect());
         let facts = KeyFacts {
             approval_options: self.pending,
             plan_pending: self.plan_pending,
@@ -584,8 +704,23 @@ impl Host {
             filter_active: !self.nav.filter().is_empty(),
             selected_session: self.nav.selected_session(),
             enter_setting: self.nav.enter_setting(),
+            slash_len: if self.nav.suggestions_shown() { items.len() } else { 0 },
+            slash_exact: slash::is_exact(&draft),
+            selected_index: self.nav.selected(),
+            selected_model: self.nav.selected_model(),
+            first_agent: self.nav.first_agent(),
+            agent_live: self.nav.agent_live(),
+            confirming: self.nav.confirming(),
         };
-        match route_key(key, alt, chord, facts, &draft_text()) {
+        let routed = route_key(key, alt, chord, facts, &draft);
+        // Typing or deleting changes the text: the suggestions show again.
+        if matches!(routed, Routed::Composer { .. })
+            && matches!(key, Key::Char(_) | Key::Backspace)
+            && self.nav.reopen()
+        {
+            self.notify();
+        }
+        match routed {
             Routed::Composer { queue } => {
                 if key == Key::Enter {
                     // The flag tells the composer's submit whether this was Alt+Enter.
@@ -814,10 +949,6 @@ fn tool_rows(m: &Model) -> Vec<String> {
     m.tool_rows[start..].to_vec()
 }
 
-fn swarm_rows(m: &Model) -> Vec<String> {
-    m.swarm_rows.clone()
-}
-
 fn note_rows(m: &Model) -> Vec<String> {
     m.notes.clone()
 }
@@ -984,6 +1115,7 @@ fn composer_controls(
 pub fn screen(
     model: Signal<Model>,
     draft: Signal<String>,
+    nav: Signal<NavView>,
     window_h: Signal<f32>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
@@ -1004,8 +1136,17 @@ pub fn screen(
             draft.set(String::new());
             // The host set this on the Enter that produced the submit.
             let queue = QUEUE_NEXT.swap(false, Ordering::SeqCst);
-            let action = if task == "/compact" {
-                UiAction::Compact
+            if nav.with(|n| n.screen == Screen::Agent) {
+                // The agent screen's composer steers the open agent (while it runs).
+                let agent =
+                    nav.with(|n| n.agent.as_ref().filter(|a| a.running).map(|a| a.id.clone()));
+                if let (Some(agent), false) = (agent, task.is_empty()) {
+                    let _ = submit_actions.send(UiAction::SteerAgent { agent, text: task });
+                }
+                return;
+            }
+            let action = if task.starts_with('/') {
+                slash::run(&task)
             } else if queue {
                 UiAction::Queue(task)
             } else {
@@ -1018,6 +1159,10 @@ pub fn screen(
     view()
         .flex_col()
         .size_full()
+        .child(when(move || nav.with(|n| n.screen == Screen::Agent), {
+            let actions = actions.clone();
+            move || crate::screens::agent_panel(nav, actions.clone())
+        }))
         .child(
             virtual_list(
                 move || model.with(|m| m.lines.len()),
@@ -1030,7 +1175,7 @@ pub fn screen(
             .h(move || px(transcript_height(window_h))),
         )
         .child(when(move || model.with(|m| m.turn_summary.is_some()), move || tool_strip(model)))
-        .child(row_slots(model, SWARM_SLOTS, swarm_rows, tool_token, false))
+        .child(swarm_slots(model, nav, actions.clone()))
         .child(row_slots(model, NOTE_SLOTS, note_rows, dim_token, true))
         .child(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true))
         .child(when(
@@ -1048,9 +1193,83 @@ pub fn screen(
             let actions = actions.clone();
             move || plan_block(model, actions.clone())
         }))
+        .child(slash_list(draft, nav, actions.clone()))
         .child(queue_chips(model, actions.clone()))
         .child(composer)
         .child(composer_controls(model, draft, actions))
+}
+
+/// The live sub-agent rows. On the web each row is a button that opens its
+/// agent screen; the terminal opens the first agent with Ctrl+A.
+fn swarm_slots(
+    model: Signal<Model>,
+    nav: Signal<NavView>,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let mut column = view().flex_col();
+    for i in 0..SWARM_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || model.with(|m| m.swarm_rows.len() > i),
+            move || {
+                let press = actions.clone();
+                let line =
+                    text(move || model.with(|m| m.swarm_rows.get(i).cloned().unwrap_or_default()))
+                        .text_color(move || token_ink(tool_token("")));
+                let row = view().child(line);
+                if WEB_CONTROLS {
+                    row.role(AccessibilityRole::Button).on_press(move || {
+                        if let Some(id) = nav.with(|n| n.agents.get(i).map(|a| a.id.clone())) {
+                            let _ = press.send(UiAction::Nav(NavStep::OpenAgent(id)));
+                        }
+                    })
+                } else {
+                    row
+                }
+            },
+        ));
+    }
+    column
+}
+
+/// The command suggestions above the composer: one row per matching command
+/// (`usage - about`, the help line), the selected one marked with `> `. Esc
+/// hides them. On the web a tap completes the command.
+fn slash_list(
+    draft: Signal<String>,
+    nav: Signal<NavView>,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let items = move || slash::suggestions_for(&draft.get());
+    let mut column = view().flex_col();
+    for i in 0..SLASH_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || !nav.with(|n| n.slash_hidden) && items().len() > i,
+            move || {
+                let press = actions.clone();
+                let label = move || {
+                    let marker = if nav.with(|n| n.slash_selected) == i { "> " } else { "  " };
+                    items()
+                        .get(i)
+                        .map(|e| format!("{marker}{} - {}", e.usage, e.about))
+                        .unwrap_or_default()
+                };
+                let row = view()
+                    .child(text(label).text_color(move || token_ink(style_token(Style::Plain))));
+                if WEB_CONTROLS {
+                    row.role(AccessibilityRole::Button).on_press(move || {
+                        if let Some(name) = items().get(i).map(|e| e.name.to_string()) {
+                            let _ = press.send(UiAction::Nav(NavStep::Complete(name)));
+                        }
+                    })
+                } else {
+                    row
+                }
+            },
+        ));
+    }
+    column
 }
 
 /// An empty send is dropped; every other action goes to the driver.
@@ -1071,6 +1290,13 @@ mod tests {
         filter_active: false,
         selected_session: None,
         enter_setting: None,
+        slash_len: 0,
+        slash_exact: false,
+        selected_index: 0,
+        selected_model: None,
+        first_agent: None,
+        agent_live: false,
+        confirming: false,
     };
 
     fn approval(options: usize) -> KeyFacts {

@@ -23,6 +23,8 @@ nsh-core = "=0.5.1"
 # No JavaScript engine (spikes/nsh-tui/RESULTS.md, Follow-up S2b).
 modron-mobile-core = { path = "../mobile/rust-core", version = "0.1.3" }
 modron-view = { path = "../crates/modron-view", version = "0.1.3" }
+modron-protocol = { path = "../crates/modron-protocol", version = "0.1.3" }
+modron-types = { path = "../crates/modron-types", version = "0.1.3" }
 # sync only: the channels between the driver and the view. No runtime here:
 # the core owns its own on native and uses spawn_local on wasm.
 tokio = { version = "1", default-features = false, features = ["sync"] }
@@ -44,7 +46,6 @@ web-sys = { version = "0.3", features = ["Window", "Location", "console", "Docum
 [dev-dependencies]
 # The scripted server for tests/live.rs: the same crates the core's own
 # tests use (tokio-tungstenite 0.28), plus the protocol types.
-modron-protocol = { path = "../crates/modron-protocol", version = "0.1.3" }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync"] }
 tokio-tungstenite = "0.28"

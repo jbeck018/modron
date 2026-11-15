@@ -112,6 +112,9 @@ function startWsServer(opts = {}) {
           (opts.after || []).forEach((extra, i) => send({ session: SESSION, seq: 2 + i, ...extra }));
         } else if (frame.type === 'submit') {
           onSubmit(frame);
+        } else if (frame.type === 'router_defaults_req') {
+          // The model picker's source: the router's defaults.
+          send({ session: SESSION, seq: 4, type: 'router_defaults', authed: ['anthropic'], recommended_cheap: 'claude-haiku-5-5', recommended_strong: 'claude-opus-5', cheap_fallback: [], strong_fallback: ['claude-sonnet-5'] });
         } else if (frame.type === 'list_sessions') {
           // The sessions screen's refresh: answer with the scripted rows.
           send({ session: SESSION, seq: 3, type: 'sessions', sessions: opts.sessions || [] });
@@ -360,6 +363,86 @@ async function testEffortTapSendsConfig(browser, base) {
     ws.close();
   }
 }
+
+// Packet C3f. Typing "/co" in the composer shows the compact suggestion.
+async function testSlashSuggestions(browser, base) {
+  const { page, errors } = await openPage(browser, base + '/');
+  await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
+  await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+  await page.keyboard.type('/co');
+  await page.waitForFunction(() => document.body.innerText.includes("/compact - compact the session"), null, { timeout: TIMEOUT });
+  if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  await page.close();
+}
+
+// The model picker: /model opens it, a tap on a row sends set_config with that model.
+async function testModelPickerSendsConfig(browser, base) {
+  const ws = await startWsServer();
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.keyboard.type('/model');
+    await page.waitForFunction(() => document.activeElement.value === '/model', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('claude-haiku-5-5 (recommended cheap)'), null, { timeout: TIMEOUT });
+    await page.getByText('claude-haiku-5-5', { exact: false }).first().click();
+    const frame = await waitFrame(ws, 'set_config', (f) => f.patch && f.patch.model === 'claude-haiku-5-5');
+    if (frame.patch.model !== 'claude-haiku-5-5') throw new Error('model patch was ' + JSON.stringify(frame.patch));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Delete asks inline; the yes control sends delete_session for that row.
+async function testDeleteAfterConfirmation(browser, base) {
+  const other = '9c2d7e10-1a2b-4c3d-8e4f-5a6b7c8d9e0f';
+  const ws = await startWsServer({ sessions: [{ id: other, title: 'other work', created_at: '', updated_at: '', message_count: 2 }] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await tapLabel(page, 'sessions');
+    await page.waitForFunction(() => document.body.innerText.includes('other work'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'delete');
+    await page.waitForFunction(() => document.body.innerText.includes('delete other work? y / n'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'y');
+    const frame = await waitFrame(ws, 'delete_session', (f) => f.session_id === other);
+    if (frame.session_id !== other) throw new Error('delete carried ' + frame.session_id);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// The agent screen: a tap on the sub-agent row opens it; Enter steers; kill asks, then y.
+async function testAgentSteerAndKill(browser, base) {
+  const agent = { id: 'agent-review', label: 'reviewer', turns: 2, tokens: 900, last_tool: 'read', done: null, state: 'running' };
+  const ws = await startWsServer({ live: { running: true, subagents: [agent] } });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('[reviewer] running'), null, { timeout: TIMEOUT });
+    await page.getByText('[reviewer] running', { exact: false }).first().click();
+    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.keyboard.type('focus tests');
+    await page.waitForFunction(() => document.activeElement.value === 'focus tests', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    const steer = await waitFrame(ws, 'steer_agent', (f) => f.text === 'focus tests');
+    if (steer.agent !== 'agent-review') throw new Error('steer carried ' + steer.agent);
+    await tapLabel(page, 'kill');
+    await page.waitForFunction(() => document.body.innerText.includes('kill reviewer? y / n'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'y');
+    const kill = await waitFrame(ws, 'kill_agent', (f) => f.agent === 'agent-review');
+    if (kill.agent !== 'agent-review') throw new Error('kill carried ' + kill.agent);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 (async () => {
   const staticPort = await freePort();
   const staticServer = await startStatic(staticPort);
@@ -385,6 +468,10 @@ async function testEffortTapSendsConfig(browser, base) {
     ['(i) header controls open the sessions and settings screens', () => testHeaderOpensScreens(browser, base)],
     ['(j) session row tap sends attach', () => testSessionRowAttaches(browser, base)],
     ['(k) effort tap sends set_config', () => testEffortTapSendsConfig(browser, base)],
+    ['(l) typing /co shows the compact suggestion', () => testSlashSuggestions(browser, base)],
+    ['(m) model picker row sends set_config with the model', () => testModelPickerSendsConfig(browser, base)],
+    ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
+    ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
   ];
   for (const [name, run] of more) {
     try {

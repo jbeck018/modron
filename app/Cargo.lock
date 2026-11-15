@@ -2199,6 +2199,7 @@ dependencies = [
  "js-sys",
  "modron-mobile-core",
  "modron-protocol",
+ "modron-types",
  "modron-view",
  "nsh-core",
  "nsh-platform-tui",

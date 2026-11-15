@@ -13,11 +13,12 @@
 //! and stops after the connection goes `Disconnected` (reconnect is out of
 //! scope): that final snapshot carries the core's `disconnected` label.
 
+use modron_mobile_core::view::NO_SESSION_LABEL;
 use std::time::Duration;
 
 use modron_mobile_core::{
-    connection_label, ConfigPatch, ConnectionState, RemoteClient, ViewModelSnapshot,
-    PLAN_DECISION_LABELS,
+    approval_mode_next, connection_label, sandbox_next, ClientError, ConfigPatch, ConnectionState,
+    RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
 };
 use tokio::sync::mpsc::{
     error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender,
@@ -276,11 +277,59 @@ fn apply(client: &RemoteClient, action: UiAction) {
         UiAction::SetSandbox(policy) => {
             client.set_config(ConfigPatch { sandbox: Some(policy), ..Default::default() })
         }
+        UiAction::SelectModel(model) => client.select_model(model),
+        UiAction::ListModels => client.router_defaults(),
+        UiAction::CycleMode => {
+            let mode = approval_mode_next(client.state().approval_mode);
+            client.set_config(ConfigPatch { approval_mode: Some(mode), ..Default::default() })
+        }
+        UiAction::CycleSandbox => {
+            let policy = sandbox_next(client.state().sandbox_policy);
+            client.set_config(ConfigPatch { sandbox: Some(policy), ..Default::default() })
+        }
+        UiAction::Fork => with_session(client, |s| client.fork_session(s)),
+        UiAction::TaskStatus => with_session(client, |s| client.task_status(s)),
+        UiAction::Share => with_session(client, |s| {
+            let content = client
+                .state()
+                .history
+                .iter()
+                .map(|row| row.lines.join("\n"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            client.publish_page(s, SHARE_TITLE, content)
+        }),
+        UiAction::RemoteControl(url) => with_session(client, |s| client.remote_control(s, &url)),
+        UiAction::DeleteSession(id) => client.delete_session(id),
+        UiAction::SteerAgent { agent, text } => client.steer_agent(agent, text),
+        UiAction::KillAgent(agent) => client.kill_agent(agent),
+        UiAction::Notice(text) => {
+            client.note_local_error(text);
+            Ok(())
+        }
         // Navigation is applied by the host before an action reaches here.
         UiAction::Nav(_) => Ok(()),
     };
     if let Err(error) = result {
         client.note_local_error(error.to_string());
+    }
+}
+
+/// The title of a shared transcript page (`/share`).
+const SHARE_TITLE: &str = "modron session";
+
+/// Runs a call that needs the attached session. With none, the shared
+/// no-session word is the snapshot's error (the call is refused locally).
+fn with_session(
+    client: &RemoteClient,
+    call: impl FnOnce(Uuid) -> Result<(), ClientError>,
+) -> Result<(), ClientError> {
+    match client.state().session_id {
+        Some(session) => call(session),
+        None => {
+            client.note_local_error(NO_SESSION_LABEL);
+            Ok(())
+        }
     }
 }
 

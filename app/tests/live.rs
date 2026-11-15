@@ -241,7 +241,12 @@ fn slash_compact_sends_compact_instead_of_text() {
     h.push(&fixture());
     h.wait_for("transcript", None, |s| s.contains("fix the router crate"));
     h.type_text("/compact");
-    h.wait_for("typed compact", None, |s| s.contains("/compact"));
+    // The suggestion row shows "/compact" while the composer may still hold
+    // a prefix, so let the composer settle before Enter (Packet C3f).
+    for _ in 0..30 {
+        h.draw();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     h.send(key("Enter"));
     assert_eq!(h.action(), Some(UiAction::Compact));
 }

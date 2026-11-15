@@ -6,9 +6,11 @@
 
 pub mod chat;
 pub mod demo;
+pub mod help;
 pub mod nav;
 pub mod screens;
 pub mod session;
+pub mod slash;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
@@ -103,7 +105,16 @@ pub fn App() -> impl IntoElement {
         // The host's navigation state: the screen, the sessions filter and
         // rows, the settings rows.
         spawn(async move {
+            // The composer's completed text (Tab, Enter on a partial command,
+            // a tap on a suggestion) is applied once per sequence number.
+            let mut applied = 0u64;
             while let Some(view) = rx.recv().await {
+                let (seq, text) = view.completion.clone();
+                if seq != applied {
+                    applied = seq;
+                    chat::set_draft(&text);
+                    draft.set(text);
+                }
                 nav.set(view);
             }
         });

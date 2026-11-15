@@ -151,6 +151,46 @@ pub const SETTING_COMPACT_LABEL: &str = "compact";
 pub const EFFORT_UNSET_LABEL: &str = "unset";
 pub const RULES_NONE_LABEL: &str = "none";
 
+// Packet C3f: the shared words of the slash commands, help, the model
+// picker, confirmations and the sub-agent screen. Every client shows these.
+
+/// Shown for a slash command the table does not know.
+pub const SLASH_UNKNOWN_LABEL: &str = "unknown command - try /help";
+/// Shown for `/remote-control` with no bridge URL; the usage follows.
+pub const SLASH_NEEDS_ARG_PREFIX: &str = "use ";
+/// The title of the help screen and its two section headings.
+pub const HELP_TITLE: &str = "help";
+pub const HELP_KEYS_HEADING: &str = "keys";
+pub const HELP_COMMANDS_HEADING: &str = "slash commands";
+/// The model picker: row roles and the empty state.
+pub const MODELS_EMPTY_LABEL: &str = "no models listed yet";
+pub const MODEL_ROLE_CURRENT: &str = "current";
+pub const MODEL_ROLE_CHEAP: &str = "recommended cheap";
+pub const MODEL_ROLE_STRONG: &str = "recommended strong";
+pub const MODEL_ROLE_FALLBACK: &str = "fallback";
+/// Confirmation answers (the inline `y / n` line).
+pub const CONFIRM_YES_LABEL: &str = "y";
+pub const CONFIRM_NO_LABEL: &str = "n";
+/// The sub-agent screen: its controls and states.
+pub const AGENT_KILL_LABEL: &str = "kill";
+pub const AGENT_STEER_PLACEHOLDER: &str = "steer this agent";
+pub const AGENT_ENDED_LABEL: &str = "ended";
+pub const AGENT_NONE_LABEL: &str = "no agent";
+/// Shown when a session call runs with no session attached.
+pub const NO_SESSION_LABEL: &str = "no session attached";
+/// The sessions screen's delete control (Packet C3f).
+pub const DELETE_LABEL: &str = "delete";
+
+/// The inline confirmation for deleting a session.
+pub fn delete_confirm_text(title: &str) -> String {
+    format!("delete {title}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
+/// The inline confirmation for killing a sub-agent.
+pub fn kill_confirm_text(label: &str) -> String {
+    format!("{AGENT_KILL_LABEL} {label}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
 /// One sessions-list row: the title (the short id when untitled), the
 /// running/idle word and the message count. Shells show it verbatim.
 pub fn session_row(meta: &SessionMetaWire, running: bool) -> String {
@@ -498,6 +538,39 @@ impl SessionViewModel {
 
 /// Cheap clone of the view state plus every string a shell renders
 /// verbatim (TSX displays `status_line`/`tool_lines`/rows as-is).
+/// One sub-agent row as the screens need it (Packet C3f): the row's id
+/// (what `steer_agent` / `kill_agent` name), its label, the shared summary
+/// text (`SwarmRow::summary`), and its lifecycle state with the shared
+/// state word. `running` is true while the agent can still take a steer or
+/// a kill; a finished row (done, failed, killed) is final.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRowView {
+    pub id: String,
+    pub label: String,
+    pub text: String,
+    pub state: modron_types::AgentState,
+    pub state_word: String,
+    pub running: bool,
+}
+
+impl AgentRowView {
+    /// The view of one folded swarm row.
+    pub fn from_row(row: &SwarmRow) -> Self {
+        let state = row.effective_state();
+        Self {
+            id: row.id.clone(),
+            label: row.label.clone(),
+            text: row.summary(),
+            state,
+            state_word: modron_view::agent_state_word(state).to_string(),
+            running: matches!(
+                state,
+                modron_types::AgentState::Running | modron_types::AgentState::WaitingApproval
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ViewModelSnapshot {
     pub connection: ConnectionState,
@@ -521,6 +594,9 @@ pub struct ViewModelSnapshot {
     pub turn_summary_line: Option<String>,
     /// Live swarm rows (`⏵ [label] done · 3 turns · …`).
     pub subagent_rows: Vec<String>,
+    /// The same sub-agents as structured rows (Packet C3f): ids for steer
+    /// and kill, and the final state once an agent ends.
+    pub agents: Vec<AgentRowView>,
     pub pending_approval: Option<PendingApprovalView>,
     pub approval_mode: Option<ApprovalModeWire>,
     /// `ask` / `yolo` / `deny`.
@@ -619,6 +695,7 @@ impl ViewModelSnapshot {
             tool_lines: vm.turn_tools.iter().map(ToolEvent::summary).collect(),
             turn_summary_line: vm.turn_summary_line(),
             subagent_rows: vm.subagents.iter().map(SwarmRow::summary).collect(),
+            agents: vm.subagents.iter().map(AgentRowView::from_row).collect(),
             pending_approval: vm.pending_approvals.front().cloned(),
             approval_mode: vm.approval_mode,
             approval_mode_label: approval_mode_label(vm.approval_mode).to_string(),
@@ -1724,5 +1801,53 @@ mod copy_tests {
             snap.session_rows,
             vec!["task \u{b7} running \u{b7} 1 messages".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod c3f_tests {
+    use super::*;
+    use modron_types::AgentState;
+
+    fn row(state: AgentState, done: Option<bool>) -> SwarmRow {
+        SwarmRow {
+            id: "a1".into(),
+            label: "reviewer".into(),
+            turns: 3,
+            tokens: 1200,
+            last_tool: Some("read".into()),
+            done,
+            started_ms: None,
+            state,
+        }
+    }
+
+    #[test]
+    fn agent_rows_carry_id_text_and_state_word() {
+        let view = AgentRowView::from_row(&row(AgentState::Running, None));
+        assert_eq!(view.id, "a1");
+        assert_eq!(view.text, row(AgentState::Running, None).summary());
+        assert_eq!(view.state_word, "running");
+        assert!(view.running);
+    }
+
+    #[test]
+    fn finished_agents_are_not_running_and_keep_their_word() {
+        let killed = AgentRowView::from_row(&row(AgentState::Killed, Some(false)));
+        assert_eq!(killed.state_word, "killed");
+        assert!(!killed.running);
+        // An older peer's row (no state) reads done from its done flag.
+        let old = AgentRowView::from_row(&row(AgentState::Running, Some(true)));
+        assert_eq!(old.state_word, "done");
+        assert!(!old.running);
+    }
+
+    #[test]
+    fn confirmation_copy_is_the_shared_wording() {
+        assert_eq!(
+            delete_confirm_text("fix router"),
+            "delete fix router? y / n"
+        );
+        assert_eq!(kill_confirm_text("reviewer"), "kill reviewer? y / n");
     }
 }
