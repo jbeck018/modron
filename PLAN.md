@@ -324,6 +324,9 @@ Decisions made under this rule:
 | Does the model see `!command` output? | Yes: bash-mode output joins the conversation | `!cmd` yes, `!!cmd` no | `!cmd` is added to the conversation; `!!cmd` runs and shows its output but never reaches the model |
 | Does a user-typed command need approval? | No: the user typed it | No | No prompt for the owner's own command. It still runs in the sandbox and still honours the deny list, deny rules and pre_tool hooks (the owner's own hard limits). Approval mode, ask rules and the plan phase restrict the model, not the user. Guests cannot send it |
 | What does saving a model from the picker do? | The /model choice becomes the default for later sessions | The choice is kept as the default; roles are separate config | Selecting a model changes the current session only; an explicit save (Shift+S, or a control) writes default model + provider to the server config, as the old terminal UI did. Explicit, because one server feeds several devices and a silent default change from a phone would surprise the laptop |
+| Does the terminal app capture the mouse (wheel, click, drag-copy)? | No: it leaves selection and copy to the terminal | Mixed; fullscreen with its own handling | No capture. The terminal's own selection and copy keep working, which is what users expect from Claude Code; scrolling is PgUp/PgDn/Home/End. Revisit only if users ask |
+| Keep `/issues`? | No equivalent | No equivalent | Not carried over. It reads a server-side file through the old in-process UI; no client can serve it without a new frame, and neither reference has it |
+| Esc on an idle composer | Clears the draft (double Esc) | Clears the draft | Esc clears the draft when nothing else claims the key (approval, plan, suggestions, running) |
 
 ### 10.3 What survives, what goes
 
