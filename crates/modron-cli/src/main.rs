@@ -1298,6 +1298,7 @@ fn build_agent_with(
         on_tool_event: sinks.on_tool_event,
         personas: Default::default(),
         background_subagents: Default::default(),
+        roles: config::model_roles(cfg),
     };
 
     if !engine_config.working_dir.is_dir() {
@@ -1430,6 +1431,23 @@ fn build_agent_with(
     let authed: Vec<String> = providers.keys().cloned().collect();
     let (router, mut tier_fallbacks) =
         build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()), &authed)?;
+    // A persona's forced model is a pin (H7c precedence: pin > role >
+    // router): wrap the router so `ModelSelector::pinned` holds and the
+    // `[roles]` table cannot override it.
+    let router: Arc<dyn modron_core::ModelSelector> =
+        match persona.as_ref().and_then(|p| p.model.clone()) {
+            Some(model) => {
+                let provider = persona
+                    .as_ref()
+                    .and_then(|p| p.provider.clone())
+                    .or_else(|| modron_router::lookup(&model).map(|i| i.provider.clone()))
+                    .unwrap_or_else(|| "anthropic".to_string());
+                Arc::new(modron_core::subagent::ForcedSelector::new(
+                    router, model, provider,
+                ))
+            }
+            None => router,
+        };
     let selector = match &cli.provider {
         // An explicitly chosen provider PINS every turn there — the
         // router would otherwise override it with its own cheap/strong
@@ -1442,8 +1460,10 @@ fn build_agent_with(
             // An explicit --provider pin is an explicit choice: the tier
             // fallback must never silently swap it.
             tier_fallbacks = None;
-            Arc::new(modron_core::testing::StaticSelector::new(
-                &engine_config.default_model,
+            // A pin (H7c): roles yield to it, exactly like a persona model.
+            Arc::new(modron_core::subagent::ForcedSelector::pin(
+                router,
+                engine_config.default_model.clone(),
                 choice.id(),
             )) as Arc<dyn modron_core::ModelSelector>
         }

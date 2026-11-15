@@ -454,6 +454,41 @@ impl std::str::FromStr for Effort {
     }
 }
 
+/// Named model roles (H7c): one optional model id per kind of work, so a
+/// run can pin different work to different models. `None` = the role is
+/// unset and the router decides as before. Precedence (see the engine):
+/// a pin (`--provider`, a persona's forced model) > a role > the router.
+/// Model ids resolve through the run's selector provider, the same way the
+/// escalation and reviewer turns do; an unresolvable id falls back to the
+/// router with a warning.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRoles {
+    /// Main-loop turns while the run phase is `plan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Default model for `delegate` children without a persona model.
+    /// `explore` is not affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
+    /// Independent reviewer pass model. Setting it enables one review round
+    /// when no explicit reviewer is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critic: Option<String>,
+    /// Compaction summary model (instead of the cheap-tier route).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl ModelRoles {
+    /// True when no role is set (the router decides everything).
+    pub fn is_empty(&self) -> bool {
+        self.plan.is_none()
+            && self.subagent.is_none()
+            && self.critic.is_none()
+            && self.summary.is_none()
+    }
+}
+
 /// Lifecycle state of one sub-agent (PROTOCOL_V2 section 4, H3d). Snake case
 /// on the wire. `Running` is the default, so older rows without the field
 /// read as running until their finish arrives.

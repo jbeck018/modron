@@ -18,8 +18,8 @@
 pub mod client;
 
 use modron_types::{
-    AgentState, Attachment, Effort, Phase, PlanItem, RunSummary, SandboxPolicy, SessionEvent,
-    StreamDelta, ToolActivity, ToolCall, Usage,
+    AgentState, Attachment, Effort, ModelRoles, Phase, PlanItem, RunSummary, SandboxPolicy,
+    SessionEvent, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_view::ToolEvent;
 use serde::{Deserialize, Serialize};
@@ -576,6 +576,14 @@ pub struct ConfigPatch {
     /// `effort` when both are sent. Absent or false leaves it alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clear_effort: bool,
+    /// The named model roles for future turns (H7c: `plan`, `subagent`,
+    /// `critic`, `summary`). Present REPLACES the whole set; an all-unset
+    /// value clears it. Absent leaves the roles alone. Echoed in
+    /// `ConfigChanged`; `LiveState.roles` reports the result. UI effect
+    /// (ConfigChanged, every client): the settings list shows the four roles
+    /// and their model ids, with unset roles shown as `router`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Box<ModelRoles>>,
 }
 
 /// The approval-mode knob (`ask`/`yolo`/`deny`), mirrored because the core
@@ -754,6 +762,11 @@ pub struct LiveState {
     /// and no label. Older peers omit it and still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// The named model roles in force (H7c). UI effect: the settings list
+    /// shows each role and its model id, unset roles as `router`. Omitted
+    /// when every role is unset; older peers omit it and still parse.
+    #[serde(default, skip_serializing_if = "ModelRoles::is_empty")]
+    pub roles: ModelRoles,
     /// A proposed plan awaits a decision (see `PlanProposed`). UI effect:
     /// shows the plan decision block on attach. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2254,6 +2267,57 @@ mod tests {
         let back: Payload = serde_json::from_value(top).unwrap();
         let reserialized = serde_json::to_value(&back).unwrap();
         assert!(reserialized.get("agent").is_none(), "absent when None");
+    }
+
+    /// H7c: the roles fields round-trip, unset roles stay off the wire, an
+    /// empty roles value clears, and older peers' JSON (no roles) parses.
+    #[test]
+    fn roles_fields_round_trip_and_stay_optional_on_the_wire() {
+        let roles = ModelRoles {
+            plan: Some("plan-model".into()),
+            subagent: None,
+            critic: None,
+            summary: Some("summary-model".into()),
+        };
+        let patch = ConfigPatch {
+            roles: Some(Box::new(roles.clone())),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["roles"]["plan"], "plan-model");
+        assert!(
+            json["roles"].get("critic").is_none(),
+            "unset roles are omitted"
+        );
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back.roles, Some(Box::new(roles.clone())));
+
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(
+            unset.get("roles").is_none(),
+            "absent roles stay off the wire"
+        );
+        let clear = serde_json::to_value(ConfigPatch {
+            roles: Some(Box::new(ModelRoles::default())),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+        assert_eq!(clear["roles"], serde_json::json!({}));
+        let old: ConfigPatch = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+        assert_eq!(old.roles, None);
+
+        let empty_live = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty_live.get("roles").is_none());
+        let filled = LiveState {
+            roles,
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["roles"]["summary"], "summary-model");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.roles.summary.as_deref(), Some("summary-model"));
+        let old_live: LiveState = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old_live.roles.is_empty());
     }
 
     /// H7a: the effort fields round-trip, an unset patch stays off the wire,

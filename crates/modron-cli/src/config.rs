@@ -48,6 +48,10 @@ pub struct Config {
     /// Fix rounds the reviewer may request per run (default 1).
     #[serde(default)]
     pub review_max_rounds: Option<u32>,
+    /// Named model roles (H7c): `[roles] plan / subagent / critic / summary`,
+    /// each an optional model id. See [`model_roles`].
+    #[serde(default)]
+    pub roles: Option<RolesConfig>,
     /// Lifecycle hooks around tool calls (Phase-1c I4): `pre_tool` may veto
     /// (non-zero exit blocks the tool), `post_tool` observes. Shell commands
     /// receiving the `MODRON_TOOL_*` env contract.
@@ -248,6 +252,33 @@ impl std::fmt::Debug for KevConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("mode", &self.mode)
             .finish()
+    }
+}
+
+/// `[roles]` section (H7c): one optional model id per kind of work. Blank
+/// values count as unset (see [`model_roles`]).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct RolesConfig {
+    /// Main-loop turns while the run phase is `plan`.
+    pub plan: Option<String>,
+    /// Default model for `delegate` children without a persona model.
+    pub subagent: Option<String>,
+    /// Reviewer model; setting it enables one review round.
+    pub critic: Option<String>,
+    /// Compaction summary model.
+    pub summary: Option<String>,
+}
+
+/// The engine's [`modron_core::ModelRoles`] from `[roles]`. Blank or
+/// whitespace-only values are unset, so an empty table changes nothing.
+pub fn model_roles(cfg: &Config) -> modron_core::ModelRoles {
+    let roles = cfg.roles.clone().unwrap_or_default();
+    let clean = |raw: Option<String>| raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    modron_core::ModelRoles {
+        plan: clean(roles.plan),
+        subagent: clean(roles.subagent),
+        critic: clean(roles.critic),
+        summary: clean(roles.summary),
     }
 }
 
@@ -774,5 +805,28 @@ mod tests {
         }
         let flag_err = resolve_effort(Some(""), None).unwrap_err();
         assert!(flag_err.contains("--effort"), "{flag_err}");
+    }
+}
+
+#[cfg(test)]
+mod roles_config_tests {
+    //! H7c: the `[roles]` table loads per role, and blank values are unset.
+    use super::*;
+
+    #[test]
+    fn roles_table_loads_per_role_and_blank_values_are_unset() {
+        let config = parse_config("[roles]\nplan = 'plan-m'\ncritic = '   '\nsummary = 'sum-m'\n")
+            .expect("the file parses");
+        let roles = model_roles(&config);
+        assert_eq!(roles.plan.as_deref(), Some("plan-m"));
+        assert_eq!(roles.subagent, None);
+        assert_eq!(roles.critic, None, "whitespace counts as unset");
+        assert_eq!(roles.summary.as_deref(), Some("sum-m"));
+    }
+
+    #[test]
+    fn no_roles_table_means_no_roles() {
+        let config = parse_config("default_model = 'm'\n").expect("the file parses");
+        assert!(model_roles(&config).is_empty());
     }
 }

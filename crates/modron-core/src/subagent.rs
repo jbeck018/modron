@@ -178,26 +178,59 @@ pub struct ForcedSelector {
     inner: Arc<dyn ModelSelector>,
     model: String,
     provider: String,
+    /// Reason-string label: `persona`, `pin` or `role` (audit trail).
+    label: &'static str,
 }
 
 impl std::fmt::Debug for ForcedSelector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForcedSelector")
             .field("model", &self.model)
+            .field("label", &self.label)
             .finish()
     }
 }
 
 impl ForcedSelector {
+    /// A persona's forced model (the default label). Pins routing.
     pub fn new(
         inner: Arc<dyn ModelSelector>,
         model: impl Into<String>,
         provider: impl Into<String>,
     ) -> Self {
+        Self::labeled(inner, model, provider, "persona")
+    }
+
+    /// An explicit pin (`--provider`): pins routing like a persona does.
+    pub fn pin(
+        inner: Arc<dyn ModelSelector>,
+        model: impl Into<String>,
+        provider: impl Into<String>,
+    ) -> Self {
+        Self::labeled(inner, model, provider, "pin")
+    }
+
+    /// A configured [`crate::ModelRoles`] model forced onto a child. Does
+    /// not pin: the reason string says `role`.
+    pub fn role(
+        inner: Arc<dyn ModelSelector>,
+        model: impl Into<String>,
+        provider: impl Into<String>,
+    ) -> Self {
+        Self::labeled(inner, model, provider, "role")
+    }
+
+    fn labeled(
+        inner: Arc<dyn ModelSelector>,
+        model: impl Into<String>,
+        provider: impl Into<String>,
+        label: &'static str,
+    ) -> Self {
         Self {
             inner,
             model: model.into(),
             provider: provider.into(),
+            label,
         }
     }
 }
@@ -207,9 +240,20 @@ impl ModelSelector for ForcedSelector {
         let mut choice = self.inner.select(req);
         choice.model = self.model.clone();
         choice.provider = self.provider.clone();
-        choice.reason = format!("persona: forced model {} — {}", self.model, choice.reason);
+        // A forced model's window is not the inner choice's window.
+        if self.label != "persona" {
+            choice.context_window = None;
+        }
+        choice.reason = format!(
+            "{}: forced model {} — {}",
+            self.label, self.model, choice.reason
+        );
         choice.confident = true;
         choice
+    }
+
+    fn pinned(&self) -> bool {
+        self.label != "role"
     }
 }
 
@@ -226,13 +270,16 @@ pub struct ExploreReport {
 
 /// Run one explore subagent (read-only, cheap tier, no persona).
 pub async fn explore(parent: &Engine, task: &str, budget_tokens: u64) -> Result<ExploreReport> {
-    delegate(
+    // `explore` opts out of the `subagent` role (H7c): it stays on the router.
+    delegate_owned_inner(
+        ChildOwner::default(),
         parent,
         task,
         None,
         Some(&EXPLORE_TOOLS.map(str::to_string)),
         budget_tokens,
         None,
+        false,
     )
     .await
 }
@@ -424,6 +471,32 @@ pub async fn delegate_owned(
     budget_tokens: u64,
     working_dir: Option<&std::path::Path>,
 ) -> Result<ExploreReport> {
+    delegate_owned_inner(
+        owner,
+        parent,
+        task,
+        persona,
+        tool_filter,
+        budget_tokens,
+        working_dir,
+        true,
+    )
+    .await
+}
+
+/// [`delegate_owned`] with the `subagent` model role switchable off
+/// (`subagent_role = false` for `explore`, H7c).
+#[allow(clippy::too_many_arguments)]
+async fn delegate_owned_inner(
+    owner: ChildOwner,
+    parent: &Engine,
+    task: &str,
+    persona: Option<&crate::PersonaSpec>,
+    tool_filter: Option<&[String]>,
+    budget_tokens: u64,
+    working_dir: Option<&std::path::Path>,
+    subagent_role: bool,
+) -> Result<ExploreReport> {
     let subagent_id = uuid::Uuid::new_v4().to_string();
     let label = if persona.is_some() {
         "persona".to_string()
@@ -447,6 +520,7 @@ pub async fn delegate_owned(
             tool_filter,
             budget_tokens,
             working_dir,
+            subagent_role,
         )
         .await
     }
@@ -480,6 +554,7 @@ async fn run_child(
     tool_filter: Option<&[String]>,
     budget_tokens: u64,
     working_dir: Option<&std::path::Path>,
+    subagent_role: bool,
 ) -> Result<ExploreReport> {
     let subagent_id = subagent_id.to_string();
     let label = label.to_string();
@@ -506,13 +581,41 @@ async fn run_child(
         }
     }
 
+    // Precedence (H7c): a persona's forced model > the `subagent` role >
+    // the parent's routing. The role is resolved like the escalation turn:
+    // the parent's selector provider, the role's model id, and a warning
+    // plus the parent's routing when it does not resolve.
     let selector: Arc<dyn ModelSelector> = match persona {
         Some(p) if p.model.is_some() => Arc::new(ForcedSelector::new(
             Arc::clone(&parent.selector),
             p.model.clone().unwrap_or_default(),
             p.provider.clone().unwrap_or_default(),
         )),
-        _ => Arc::clone(&parent.selector),
+        _ => match parent
+            .config
+            .roles
+            .subagent
+            .as_deref()
+            .filter(|_| subagent_role && !parent.selector.pinned())
+        {
+            Some(model) => {
+                let base = parent.selector.select(&SelectRequest {
+                    task: task.to_string(),
+                    action: ActionKind::Chat,
+                    context_tokens: crate::estimate_tokens(task),
+                    budget_remaining_usd: None,
+                });
+                match parent.role_choice(base, model, "subagent") {
+                    Some(choice) => Arc::new(ForcedSelector::role(
+                        Arc::clone(&parent.selector),
+                        model,
+                        choice.provider,
+                    )),
+                    None => Arc::clone(&parent.selector),
+                }
+            }
+            None => Arc::clone(&parent.selector),
+        },
     };
 
     // Subagent identity + parent event plumbing (Phase 5h): the child's

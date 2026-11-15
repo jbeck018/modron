@@ -62,7 +62,7 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 pub use modron_types::{
-    AgentState, Attachment, Effort, Message, PlanItem, Role, RunSummary, SandboxPolicy,
+    AgentState, Attachment, Effort, Message, ModelRoles, PlanItem, Role, RunSummary, SandboxPolicy,
     SessionEvent, SessionId, SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall,
     ToolOutcome, ToolSpec, Usage,
 };
@@ -407,6 +407,13 @@ pub struct ModelChoice {
 /// embedder router (Phase 3) and the Jev adapter plug in.
 pub trait ModelSelector: Send + Sync {
     fn select(&self, req: &SelectRequest) -> ModelChoice;
+
+    /// True when every selection is an explicit pin (a `--provider` pin or a
+    /// persona's forced model). Configured [`ModelRoles`] yield to a pin
+    /// (H7c precedence: pin > role > router). Default `false`.
+    fn pinned(&self) -> bool {
+        false
+    }
 }
 
 /// Verdict of an async decision model (Phase-3b M0): which tier should take
@@ -847,6 +854,9 @@ pub struct EngineConfig {
     /// default `None` = provider default). Not sent on compaction, reviewer
     /// or router/judge requests. Sub-agents inherit it from the parent.
     pub effort: Option<Effort>,
+    /// Named model roles (H7c, additive; default empty = the router decides
+    /// everything). See [`ModelRoles`] for each role's semantics.
+    pub roles: ModelRoles,
 }
 
 /// Per-tier ordered fallback candidates for [`EngineConfig::tier_fallbacks`].
@@ -918,6 +928,7 @@ impl Default for EngineConfig {
             steer: None,
             phase: Phase::Build,
             effort: None,
+            roles: ModelRoles::default(),
         }
     }
 }
@@ -952,6 +963,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("async_router", &self.async_router.is_some())
             .field("personas", &self.personas.keys().collect::<Vec<_>>())
             .field("effort", &self.effort)
+            .field("roles", &self.roles)
             .field("tier_fallbacks", &self.tier_fallbacks.is_some())
             .field(
                 "background_subagents",

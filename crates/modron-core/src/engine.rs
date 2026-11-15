@@ -1018,6 +1018,7 @@ impl Engine {
                 .max_cost_usd
                 .map(|cap| (cap - state.spend_usd).max(0.0)),
         });
+        choice = self.with_role(choice, self.plan_role(), "plan");
         let effective_cap = choice
             .context_window
             .unwrap_or(self.config.max_input_tokens)
@@ -1056,6 +1057,7 @@ impl Engine {
                         .max_cost_usd
                         .map(|cap| (cap - state.spend_usd).max(0.0)),
                 });
+                choice = self.with_role(choice, self.plan_role(), "plan");
             }
         }
 
@@ -1086,7 +1088,7 @@ impl Engine {
                     };
                     let mut re = self.selector.select(&synthetic);
                     re.reason = format!("async-router: {verdict:?} → {}", re.reason);
-                    choice = re;
+                    choice = self.with_role(re, self.plan_role(), "plan");
                 }
             }
         }
@@ -1657,6 +1659,81 @@ impl Engine {
             })
     }
 
+    /// Resolve a configured model role (H7c) onto `base` (a selector choice
+    /// whose provider is kept): the role's model id swapped in, resolved
+    /// through [`Self::resolve_provider`] exactly like the escalation and
+    /// reviewer turns. `None` (with one warning) when the id does not resolve
+    /// to itself, so the caller keeps today's routing.
+    pub(crate) fn role_choice(
+        &self,
+        base: crate::ModelChoice,
+        model: &str,
+        role: &str,
+    ) -> Option<crate::ModelChoice> {
+        let mut choice = base;
+        choice.model = model.to_string();
+        choice.reason = format!("role {role}: {model}");
+        choice.confident = true;
+        // The role's model has its own window, which the router's choice
+        // does not know: leave it unset so the global cap applies.
+        choice.context_window = None;
+        match self.resolve_provider(&choice) {
+            Ok((_, resolved)) if resolved == model => Some(choice),
+            _ => {
+                tracing::warn!(
+                    role,
+                    model,
+                    "model role did not resolve; falling back to default routing"
+                );
+                None
+            }
+        }
+    }
+
+    /// Apply a role to a routed `choice` unless the selector is a pin (H7c
+    /// precedence: pin > role > router). Returns `choice` unchanged when the
+    /// role is unset or does not resolve.
+    fn with_role(
+        &self,
+        choice: crate::ModelChoice,
+        role_model: Option<&str>,
+        role: &str,
+    ) -> crate::ModelChoice {
+        match role_model {
+            Some(model) if !self.selector.pinned() => self
+                .role_choice(choice.clone(), model, role)
+                .unwrap_or(choice),
+            _ => choice,
+        }
+    }
+
+    /// The `plan` role, live only while the run phase is `plan`.
+    fn plan_role(&self) -> Option<&str> {
+        if self.config.phase == Phase::Plan {
+            self.config.roles.plan.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// The `critic` role as a reviewer (H7c): one review round on the role's
+    /// model when no explicit `reviewer` is configured. Unresolvable = `None`
+    /// (today's behaviour: no reviewer).
+    fn critic_reviewer(&self, task: &str) -> Option<crate::ReviewerConfig> {
+        let model = self.config.roles.critic.clone()?;
+        let base = self.selector.select(&SelectRequest {
+            task: task.to_string(),
+            action: ActionKind::Chat,
+            context_tokens: estimate_tokens(task),
+            budget_remaining_usd: None,
+        });
+        self.role_choice(base, &model, "critic")?;
+        Some(crate::ReviewerConfig {
+            model,
+            max_rounds: 1,
+        })
+    }
+
     fn resolve_provider(&self, choice: &ModelChoice) -> Result<(Arc<dyn ModelProvider>, String)> {
         if let Some(provider) = self.providers.get(&choice.provider) {
             return Ok((provider.clone(), choice.model.clone()));
@@ -2196,7 +2273,13 @@ impl Engine {
         state: &mut RunLoopState,
     ) -> Result<bool> {
         let claims = self.run_claim_findings(state);
-        let Some(reviewer) = self.config.reviewer.clone() else {
+        // An explicit reviewer wins over the `critic` role (H7c).
+        let reviewer = self
+            .config
+            .reviewer
+            .clone()
+            .or_else(|| self.critic_reviewer(task));
+        let Some(reviewer) = reviewer else {
             self.record_claims_only(session_id, claims).await?;
             return Ok(false);
         };
@@ -2739,6 +2822,7 @@ impl Engine {
             context_tokens: estimate_tokens(&older_text),
             budget_remaining_usd: None,
         });
+        let choice = self.with_role(choice, self.config.roles.summary.as_deref(), "summary");
         let (provider, model) = self.resolve_provider(&choice)?;
 
         let request = std::sync::Arc::new(TurnRequest {
@@ -6009,6 +6093,265 @@ mod delegate_approval_tests {
             asked.load(Ordering::SeqCst),
             0,
             "starting a delegate asks nobody; its children do"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_role_tests {
+    //! H7c model roles against the scripted mock. Every provider call goes to
+    //! one recording mock, so each request's `model` shows which role or
+    //! route answered the turn.
+    use super::*;
+    use crate::subagent::ForcedSelector;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalMode, ApprovalPolicy, CompactionPolicy, EngineConfig, ModelRoles, ReviewDiffSource,
+        ReviewerConfig, Tool, ToolRegistry,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+
+    /// A file-mutating tool (so the reviewer pass has something to review).
+    struct RoleWriteTool;
+
+    #[async_trait]
+    impl Tool for RoleWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "test write".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::ok("wrote"))
+        }
+    }
+
+    const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\n+let x = 1;\n";
+
+    fn text(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    fn write_turn(id: &str, text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "write".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    /// Engine on the mock provider ("mock", routed as `mock-model`), with
+    /// the default model `mock-default` for provider fallbacks.
+    fn role_engine(
+        script: Vec<TurnResponse>,
+        configure: impl FnOnce(&mut EngineConfig),
+    ) -> (Engine, Arc<MockProvider>) {
+        let mock = Arc::new(MockProvider::with_script(script));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RoleWriteTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let mut config = EngineConfig {
+            working_dir: std::env::temp_dir(),
+            default_provider: "mock".into(),
+            default_model: "mock-default".into(),
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                ..ApprovalPolicy::default()
+            },
+            compaction: CompactionPolicy {
+                enabled: false,
+                tail_messages: 2,
+                ..CompactionPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        configure(&mut config);
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config,
+        };
+        (engine, mock)
+    }
+
+    fn roles(plan: Option<&str>, critic: Option<&str>) -> ModelRoles {
+        ModelRoles {
+            plan: plan.map(String::from),
+            critic: critic.map(String::from),
+            ..ModelRoles::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_roles_send_the_router_model_as_before() {
+        let (engine, mock) = role_engine(vec![text("answer")], |_| {});
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "no extra calls");
+        assert_eq!(requests[0].model, "mock-model");
+    }
+
+    #[tokio::test]
+    async fn plan_role_applies_only_in_the_plan_phase() {
+        let (build, build_mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+        });
+        build.run_task("task").await.unwrap();
+        assert_eq!(build_mock.requests()[0].model, "mock-model");
+
+        let (plan, plan_mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+            c.phase = Phase::Plan;
+        });
+        plan.run_task("task").await.unwrap();
+        assert_eq!(plan_mock.requests()[0].model, "plan-model");
+    }
+
+    #[tokio::test]
+    async fn a_pin_beats_the_plan_role() {
+        let (mut engine, mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+            c.phase = Phase::Plan;
+        });
+        engine.selector = Arc::new(ForcedSelector::pin(
+            Arc::new(StaticSelector::new("mock-model", "mock")),
+            "pinned-model",
+            "mock",
+        ));
+        engine.run_task("task").await.unwrap();
+        assert_eq!(mock.requests()[0].model, "pinned-model");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_plan_role_falls_back_and_the_run_succeeds() {
+        let (mut engine, mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+            c.phase = Phase::Plan;
+        });
+        // The selector's provider is not registered: the router's own turn
+        // rides the default provider, and the role cannot resolve to itself.
+        engine.selector = Arc::new(StaticSelector::new("mock-model", "missing"));
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        assert_eq!(mock.requests()[0].model, "mock-default");
+    }
+
+    #[tokio::test]
+    async fn critic_role_alone_enables_one_review_call_on_its_model() {
+        let (engine, mock) = role_engine(
+            vec![write_turn("w1", ""), text("done"), text("looks fine")],
+            |c| {
+                c.roles = roles(None, Some("critic-model"));
+                c.review_diff_source =
+                    Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+            },
+        );
+        engine.run_task("task").await.unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3, "main, main, one reviewer call");
+        assert_eq!(requests[2].model, "critic-model");
+        assert!(requests[2].tools.is_empty(), "the reviewer is tool-less");
+    }
+
+    #[tokio::test]
+    async fn explicit_reviewer_model_wins_over_the_critic_role() {
+        let (engine, mock) = role_engine(
+            vec![write_turn("w1", ""), text("done"), text("looks fine")],
+            |c| {
+                c.reviewer = Some(ReviewerConfig {
+                    model: "rev-model".into(),
+                    max_rounds: 1,
+                });
+                c.roles = roles(None, Some("critic-model"));
+                c.review_diff_source =
+                    Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+            },
+        );
+        engine.run_task("task").await.unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].model, "rev-model");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_critic_role_means_no_review() {
+        let (mut engine, mock) = role_engine(vec![write_turn("w1", ""), text("done")], |c| {
+            c.roles = roles(None, Some("critic-model"));
+            c.review_diff_source =
+                Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+        });
+        engine.selector = Arc::new(StaticSelector::new("mock-model", "missing"));
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "done");
+        assert_eq!(mock.requests().len(), 2, "no reviewer call");
+    }
+
+    #[tokio::test]
+    async fn subagent_role_reaches_delegate_but_not_explore() {
+        let (engine, mock) = role_engine(vec![text("child answer"), text("explore answer")], |c| {
+            c.roles = ModelRoles {
+                subagent: Some("sub-model".into()),
+                ..ModelRoles::default()
+            };
+        });
+        crate::subagent::delegate(&engine, "do a thing", None, None, 50_000, None)
+            .await
+            .unwrap();
+        crate::subagent::explore(&engine, "look around", 50_000)
+            .await
+            .unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests[0].model, "sub-model", "delegate child");
+        assert_eq!(
+            requests[1].model, "mock-model",
+            "explore stays on the router"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_role_drives_the_compaction_summary() {
+        let long = "chatty analysis of the login module. ".repeat(200);
+        let (engine, mock) = role_engine(
+            vec![
+                write_turn("w1", &long),
+                write_turn("w2", &long),
+                write_turn("w3", &long),
+                text("final answer"),
+                text("summary of earlier work"),
+            ],
+            |c| {
+                c.roles = ModelRoles {
+                    summary: Some("summary-model".into()),
+                    ..ModelRoles::default()
+                };
+            },
+        );
+        let run = engine.run_task("task").await.unwrap();
+        let outcome = engine.compact_session(run.session_id).await.unwrap();
+        assert!(outcome.compacted, "long history compacts: {outcome:?}");
+        let requests = mock.requests();
+        assert_eq!(requests[0].model, "mock-model", "run turns use the router");
+        assert_eq!(
+            requests.last().unwrap().model,
+            "summary-model",
+            "the summarizer uses the summary role"
         );
     }
 }

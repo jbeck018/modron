@@ -478,6 +478,7 @@ impl SessionHandle {
             rules,
             phase,
             effort,
+            roles: self.engine_cell().config.roles.clone(),
             plan_pending: self.plan_pending.load(Ordering::Relaxed),
             running: self.busy.load(Ordering::Relaxed),
             streaming_text: lock(&self.text).clone(),
@@ -1209,6 +1210,10 @@ impl SessionHandle {
             config.effort = None;
         } else if let Some(effort) = patch.effort {
             config.effort = Some(effort);
+        }
+        // H7c: a roles patch replaces the whole set (all-unset clears it).
+        if let Some(roles) = &patch.roles {
+            config.roles = (**roles).clone();
         }
         if let Some(allow) = &patch.allow {
             config.approvals.allow = allow.clone();
@@ -2375,6 +2380,45 @@ mod tests {
             })
             .unwrap();
         assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
+    }
+
+    /// H7c: a roles patch replaces the engine's roles and reaches the live
+    /// state; a patch without roles leaves them alone; an empty value clears.
+    #[test]
+    fn roles_patch_reaches_the_engine_config_and_live_state() {
+        use modron_core::ModelRoles;
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        assert!(handle.live_state().roles.is_empty());
+        let roles = ModelRoles {
+            plan: Some("plan-model".into()),
+            critic: Some("critic-model".into()),
+            ..ModelRoles::default()
+        };
+        handle
+            .apply_config(&ConfigPatch {
+                roles: Some(Box::new(roles.clone())),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.roles, roles);
+        assert_eq!(handle.live_state().roles, roles);
+        handle
+            .apply_config(&ConfigPatch {
+                model: Some("other-model".into()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.roles, roles);
+        handle
+            .apply_config(&ConfigPatch {
+                roles: Some(Box::new(ModelRoles::default())),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert!(handle.engine_cell().config.roles.is_empty());
+        assert!(handle.live_state().roles.is_empty());
     }
 
     /// H7a: an effort patch reaches the engine config (future turns) and the
