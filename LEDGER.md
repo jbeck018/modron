@@ -1404,7 +1404,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 
 | ID | Packet | Status | Evidence / blocker |
 |---|---|---|---|
-| S1 | NSH web target in Rust: one transcript screen over the wasm client core; measure bundle size, load time, input | TODO | |
+| S1 | NSH web target in Rust: one transcript screen over the wasm client core; measure bundle size, load time, input | DONE | spikes/nsh-web/RESULTS.md. Rust-only app builds with `nsh package --target web` (nsh CLI 0.5.1, wasm32-unknown-unknown on the pinned toolchain). wasm 5.4 MB raw, 1.95 MB gzip, 1.40 MB brotli. Real DOM with a real text input, no canvas. First row at ~165 ms median in headless Chromium (desktop and iPhone 13 viewports, local server). 2,000-token stream holds 16.7 ms frames. modron-mobile-core type-checks for wasm32. Not tested: real phones, real soft keyboard, slow networks. Only one ARIA role present (accessibility gap) |
 | S2 | NSH terminal target: startup time, streaming at token rate, scrollback | DONE | spikes/nsh-tui/RESULTS.md. Renders headless via ratatui TestBackend; first frame ~1.9 ms in-process; 2,000-token stream mean 1.4-2.7 ms/frame; virtual_list pages 5,000 rows at ~0.8 ms. Open risks: 45 MB stripped binary (modron is ~4 MB), default features pull QuickJS (no-JS build not compiled yet), no Rust API found for pushing outside data into a running app (tokens were fed as paste input), Enter drops input focus |
 | S2b | NSH follow-up: compile without default features (no QuickJS), measure size; find the Rust API for feeding external events (signals + wake callback) | DONE | spikes/nsh-tui/RESULTS.md "Follow-up S2b". No-JS: `nsh-platform-tui` with default-features = false (0 quickjs crates, 343 packages); 34.1 MB stripped, 17.1 MB with opt-level z + fat LTO + cgu 1 + panic abort. External events: `nsh_core::element::spawn` awaiting a tokio mpsc receiver; wake callback drives every frame (2,000 tokens: draw mean 1.37 ms, send-to-visible p95 10 ms). Focus: `SubmitBehavior::Submit` keeps it. Remaining gap: 17 MB vs ~4 MB today |
 | S3 | furrow snapshot/restore over R2 from a container | BLOCKED | Needs an R2 bucket and credentials (owner) |
@@ -1503,3 +1503,6 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   plus `modron-app-tui --url ws://127.0.0.1:7711` under a pty: connected,
   a typed task was submitted, the mock run reached a bash approval and
   the app showed the three decision labels.
+- 2026-11-15: S1 closed: the NSH web target is viable for the portal
+  (C4) in Rust. Open questions moved to C4: accessibility roles, real
+  device testing, load over a real network (1.4 MB brotli wasm).
