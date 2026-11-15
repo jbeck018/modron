@@ -84,6 +84,14 @@ pub fn App() -> impl IntoElement {
     #[cfg(not(target_arch = "wasm32"))]
     install_theme();
     let model = signal(Model::default());
+    let window_h = signal(chat::window_height_default());
+    // The page's inner height, applied on the engine thread.
+    let mut window_rx = chat::window_height_feed();
+    spawn(async move {
+        while let Some(h) = window_rx.recv().await {
+            window_h.set(h);
+        }
+    });
     let draft = signal(String::new());
     let nav = signal(NavView::default());
     let client = CLIENT.lock().ok().and_then(|mut slot| slot.take()).or_else(default_client);
@@ -110,5 +118,5 @@ pub fn App() -> impl IntoElement {
             }
         });
     }
-    screens::frame(model, draft, nav, actions)
+    screens::frame(model, draft, nav, window_h, actions)
 }

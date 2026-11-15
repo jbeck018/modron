@@ -33,6 +33,7 @@ pub fn frame(
     model: Signal<Model>,
     draft: Signal<String>,
     nav: Signal<NavView>,
+    window_h: Signal<f32>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
     view()
@@ -43,7 +44,7 @@ pub fn frame(
         .child(nav_bar(actions.clone()))
         .child(when(move || nav.with(|n| n.screen == Screen::Chat), {
             let actions = actions.clone();
-            move || chat::screen(model, draft, actions.clone())
+            move || chat::screen(model, draft, window_h, actions.clone())
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Sessions), {
             let actions = actions.clone();

@@ -29,6 +29,11 @@ struct Web {
 
 impl Web {
     fn tick(&mut self) {
+        if let Some(h) =
+            web_sys::window().and_then(|w| w.inner_height().ok()).and_then(|v| v.as_f64())
+        {
+            crate::chat::set_window_height(h as f32);
+        }
         match &mut self.feed {
             Feed::Live { live, driver } => {
                 live.pump(&mut self.host);

@@ -125,10 +125,17 @@ function startWsServer(opts = {}) {
   }));
 }
 
+// Page errors and console errors both count: a logged wasm panic is a failure
+// even when the page keeps running.
+function watchErrors(page, errors) {
+  page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('console', (m) => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
+}
+
 async function openPage(browser, url) {
   const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
   const errors = [];
-  page.on('pageerror', (e) => errors.push(String(e)));
+  watchErrors(page, errors);
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   return { page, errors };
 }
@@ -138,6 +145,7 @@ async function testDemo(browser, base) {
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   const text = await page.evaluate(() => document.body.innerText);
   if (!/claude-opus-5 · 0 tok/.test(text)) throw new Error('status line missing:\n' + text);
+  if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   await page.close();
 }
@@ -272,7 +280,7 @@ async function testShareLinkSubmit(browser, base) {
   try {
     const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
     const errors = [];
-    page.on('pageerror', (e) => errors.push(String(e)));
+    watchErrors(page, errors);
     await page.goto(base + '/?url=' + encodeURIComponent(ws.url), { waitUntil: 'domcontentloaded' });
     await page.waitForFunction((s) => document.body.innerText.includes(s), STREAM, { timeout: TIMEOUT });
     await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });

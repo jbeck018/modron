@@ -1410,7 +1410,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | S2c | Terminal binary size: attribution and trimming | DONE | spikes/nsh-tui/RESULTS.md "Follow-up S2c". 17.1 MB -> 11.4 MB stripped by turning off nsh-base highlight/editor/plot/rich-editor/emoji-picker/term and nsh-engine net (needs a small vendored nsh-platform-tui patch, in spikes/nsh-tui/vendor) plus ratatui default features. Download size: 4.8 MB gzip, 3.6 MB xz. Reference: ratatui-only app 0.46 MB. Caveats: measured on the headless build (no crossterm backend); turning off engine net must be re-checked against the app, which uses its own websocket client; upstreaming the feature gates would remove the vendored patch |
 | S3 | furrow snapshot/restore over R2 from a container | BLOCKED | Needs an R2 bucket and credentials (owner) |
 
-| E2E | Whole chain, real pieces: modron serve (mock) -> bridge (local wrangler dev) -> web app in headless Chromium | ACTIVE | e2e/run.mjs, e2e/FINDINGS.md. First run 2 of 11; it exposed that the remote-control tunnel never subscribed to its session, that share URLs carried a ws scheme, and that late viewers lost history over 96 KB. All three fixed in rc.rs by the lead; now 9 of 11. Open: stop from the browser (S4), approver invite approving (S7d), a wasm closure error on load (F3) |
+| E2E | Whole chain, real pieces: modron serve (mock) -> bridge (local wrangler dev) -> web app in headless Chromium | ACTIVE | e2e/run.mjs, e2e/FINDINGS.md. First run 2 of 11; it exposed that the remote-control tunnel never subscribed to its session, that share URLs carried a ws scheme, and that late viewers lost history over 96 KB. All three fixed in rc.rs by the lead; then 11 of 11 after an app layout fix: a fixed 600 pt transcript pushed the approval and stop controls below the viewport; the transcript now follows the window height. Console-error capture is on for every scenario. Open: the wasm closure error on load (F3) has not reproduced since and its first panic is unidentified |
 
 ### Protocol
 
@@ -1545,3 +1545,5 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   clippy, wasm32 check clean; 71 tests pass; web-test.js 11 of 11. The
   app is 2,713 source lines for chat, sessions and settings on two
   targets.
+- 2026-11-15: e2e 11 of 11. App gates against committed crates: fmt,
+  clippy, wasm32 check clean; 72 tests pass.

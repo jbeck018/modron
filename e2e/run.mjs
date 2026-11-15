@@ -31,10 +31,25 @@ async function scenario(id, title, body) {
   } catch (e) {
     s.fails.push('exception: ' + e.message);
   }
+  checkConsole(s);
   const ok = s.fails.length === 0;
   results.push({ id, title, ok, fails: s.fails });
   console.log(`${ok ? 'PASS' : 'FAIL'} ${id}${ok ? '' : ' -- ' + s.fails.join(' | ')}`);
   if (!ok) dumpEvidence(id, s);
+}
+
+// Every viewer's console errors and page errors fail the step that observed
+// them. Each distinct message is reported once per step.
+const seenErrors = new Set();
+function checkConsole(s) {
+  for (const v of viewers) {
+    for (const e of v.errors) {
+      const key = `${v.label}|${e}`;
+      if (seenErrors.has(key)) continue;
+      seenErrors.add(key);
+      s.fails.push(`console error in ${v.label}: ${e.slice(0, 200)}`);
+    }
+  }
 }
 
 // Soft wait: a timeout becomes a check failure instead of ending the step.

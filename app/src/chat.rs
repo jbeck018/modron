@@ -86,6 +86,64 @@ const PLAN_KEYS: [&str; 2] = ["y", "r"];
 /// terminal keeps its key hints as text (AGENTS.md divergence table).
 pub(crate) const WEB_CONTROLS: bool = cfg!(target_arch = "wasm32");
 
+/// The transcript's height limits in logical pixels: it never shrinks below
+/// the minimum, and on a window taller than the maximum plus the chrome it
+/// stays at the maximum.
+const TRANSCRIPT_MAX_H: f32 = 600.0;
+const TRANSCRIPT_MIN_H: f32 = 240.0;
+/// The rows below the transcript (status strips, approval, queue, composer,
+/// controls) plus the header, at their usual size.
+const CHROME_RESERVE_H: f32 = 330.0;
+
+thread_local! {
+    /// The sender for the page's inner height; `App` binds it and drains
+    /// the receiver on the engine thread (a signal may not be set from the
+    /// page's timer, which runs outside the reactive runtime).
+    static WINDOW_TX: std::cell::RefCell<Option<UnboundedSender<f32>>> = const { std::cell::RefCell::new(None) };
+    /// The last height sent, so the feed carries changes only.
+    static WINDOW_LAST: std::cell::Cell<f32> = const { std::cell::Cell::new(f32::NAN) };
+}
+
+/// The initial window height (the terminal's default: the maximum
+/// transcript plus the chrome).
+pub(crate) fn window_height_default() -> f32 {
+    TRANSCRIPT_MAX_H + CHROME_RESERVE_H
+}
+
+/// Opens the window height feed: returns its receiver, which `App` drains
+/// into the signal the transcript height reads.
+pub(crate) fn window_height_feed() -> UnboundedReceiver<f32> {
+    let (tx, rx) = unbounded_channel();
+    WINDOW_TX.with(|c| *c.borrow_mut() = Some(tx));
+    WINDOW_LAST.with(|c| c.set(f32::NAN));
+    rx
+}
+
+/// Records the page's inner height (the web host's timer calls this). Only
+/// a change is sent; the engine applies it to the layout.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_window_height(h: f32) {
+    if !h.is_finite() || h <= 0.0 || WINDOW_LAST.with(|c| c.get()) == h {
+        return;
+    }
+    WINDOW_LAST.with(|c| c.set(h));
+    if let Some(tx) = WINDOW_TX.with(|c| c.borrow().clone()) {
+        let _ = tx.send(h);
+    }
+}
+
+/// The transcript's height for the window: the window's height less the
+/// chrome, clamped to the limits. Reads the bound signal, so a view that
+/// calls it re-lays out when the window changes.
+pub(crate) fn transcript_height(window: Signal<f32>) -> f32 {
+    fit_transcript_height(window.get())
+}
+
+/// The transcript height for a window of `window` logical pixels.
+pub(crate) fn fit_transcript_height(window: f32) -> f32 {
+    (window - CHROME_RESERVE_H).clamp(TRANSCRIPT_MIN_H, TRANSCRIPT_MAX_H)
+}
+
 /// Visible slots for queue chips, steer echoes, plan lines and the live
 /// activity rows. Fixed slot counts keep NSH's cell layout static (see the
 /// transcript note below).
@@ -926,6 +984,7 @@ fn composer_controls(
 pub fn screen(
     model: Signal<Model>,
     draft: Signal<String>,
+    window_h: Signal<f32>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
     let submit_actions = actions.clone();
@@ -965,8 +1024,10 @@ pub fn screen(
                 move |at: Position| transcript_row(model, at),
             )
             // An explicit height: a flex-grown virtual list gets zero rows
-            // in NSH 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4).
-            .h(px(600.0)),
+            // in NSH 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4). On the
+            // web it follows the window, so the composer and the Stop
+            // control stay on screen (the page itself does not scroll).
+            .h(move || px(transcript_height(window_h))),
         )
         .child(when(move || model.with(|m| m.turn_summary.is_some()), move || tool_strip(model)))
         .child(row_slots(model, SWARM_SLOTS, swarm_rows, tool_token, false))
@@ -1046,6 +1107,16 @@ mod tests {
             assert_eq!(route_key(Key::Char(c), false, false, NONE, ""), composer(), "{c}");
         }
         assert_eq!(route_key(Key::Other, false, false, plan(), ""), composer());
+    }
+
+    #[test]
+    fn transcript_leaves_the_controls_on_a_short_window() {
+        // At 720 px the transcript is 390 px, so the composer and the
+        // approval and Stop rows fit below it (e2e S4 and S7d).
+        assert_eq!(fit_transcript_height(720.0), 390.0);
+        assert!(fit_transcript_height(720.0) + CHROME_RESERVE_H <= 720.0);
+        assert_eq!(fit_transcript_height(1200.0), TRANSCRIPT_MAX_H);
+        assert_eq!(fit_transcript_height(100.0), TRANSCRIPT_MIN_H);
     }
 
     #[test]
