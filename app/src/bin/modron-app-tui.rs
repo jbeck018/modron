@@ -6,7 +6,9 @@
 //! as its own child and stops it on exit (`--keep-server` leaves it running).
 //! `--url <ws url>` connects to that server, `--demo` plays the built-in
 //! script. See `modron_app::startup` for the order and the flags.
-//! Ctrl+C exits; Esc also exits while the connection is being retried.
+//! Ctrl+C interrupts a running turn; a second Ctrl+C within two seconds, or
+//! Ctrl+C when idle, exits. Esc also exits while the connection is being
+//! retried. Bracketed paste is on, so a pasted block arrives as one input.
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
@@ -25,11 +27,12 @@ mod terminal {
         path::{Path, PathBuf},
         process::ExitCode,
         sync::{mpsc, Arc},
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     use crossterm::{
         event::{self, Event, KeyCode as K, KeyEvent, KeyEventKind, KeyModifiers as M},
+        event::{DisableBracketedPaste, EnableBracketedPaste},
         execute,
         terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -44,21 +47,50 @@ mod terminal {
         run_app, AppOptions, AppView, CacheOptions, Input, Modifiers, Root, RunEvent,
     };
     use ratatui::{backend::CrosstermBackend, widgets::Paragraph, Terminal};
+    use uuid::Uuid;
 
-    fn key_input(key: KeyEvent) -> Input {
-        let name = match key.code {
+    /// Ctrl+J (a raw line feed) and Ctrl+Enter are the newline keys: they
+    /// reach the composer as Shift+Enter, which NSH's multiline input breaks
+    /// the line on.
+    fn is_newline_chord(key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(M::CONTROL);
+        ctrl && matches!(key.code, K::Char('j' | 'J') | K::Enter)
+    }
+
+    /// The key name NSH's keymap reads for a crossterm key. Keys the app has
+    /// no use for are `Unknown`, which the keymap ignores.
+    fn key_name(code: K, shift: bool) -> String {
+        match code {
             K::Char(c) => c.to_string(),
             K::Enter => "Enter".into(),
             K::Esc => "Escape".into(),
             K::Backspace => "Backspace".into(),
+            K::Tab if shift => "BackTab".into(),
+            K::Tab => "Tab".into(),
+            K::BackTab => "BackTab".into(),
             K::Up => "ArrowUp".into(),
             K::Down => "ArrowDown".into(),
-            K::F(2) => "F2".into(),
+            K::Left => "ArrowLeft".into(),
+            K::Right => "ArrowRight".into(),
+            K::Home => "Home".into(),
+            K::End => "End".into(),
+            K::Delete => "Delete".into(),
+            K::PageUp => "PageUp".into(),
+            K::PageDown => "PageDown".into(),
+            K::F(n @ 1..=12) => format!("F{n}"),
             _ => "Unknown".into(),
-        };
-        let m = key.modifiers;
+        }
+    }
+
+    fn key_input(key: KeyEvent) -> Input {
+        let mut m = key.modifiers;
+        let (code, newline) = (key.code, is_newline_chord(&key));
+        if newline {
+            m.insert(M::SHIFT);
+        }
+        let name = if newline { "Enter".to_string() } else { key_name(code, m.contains(M::SHIFT)) };
         let modifiers = Modifiers {
-            ctrl: m.contains(M::CONTROL),
+            ctrl: m.contains(M::CONTROL) && !newline,
             alt: m.contains(M::ALT),
             shift: m.contains(M::SHIFT),
             cmd: m.contains(M::SUPER),
@@ -66,10 +98,36 @@ mod terminal {
         Input::Key { key: name, modifiers, release: false }
     }
 
+    /// What Ctrl+C does: the first press during a turn interrupts it; a press
+    /// when idle, or a second one within [`CTRL_C_WINDOW`], exits.
+    #[derive(Debug, PartialEq, Eq)]
+    enum CtrlC {
+        Interrupt,
+        Exit,
+    }
+
+    const CTRL_C_WINDOW: Duration = Duration::from_secs(2);
+    const CTRL_C_HINT: &str = "press ctrl+c again to quit";
+
+    fn ctrl_c(running: bool, last: Option<Instant>, now: Instant) -> CtrlC {
+        let again = last.is_some_and(|t| now.saturating_duration_since(t) <= CTRL_C_WINDOW);
+        if running && !again {
+            CtrlC::Interrupt
+        } else {
+            CtrlC::Exit
+        }
+    }
+
+    /// The line printed after the terminal is restored, so the session can
+    /// be reopened.
+    fn resume_hint(id: Uuid) -> String {
+        format!("session: {id} - resume with modron-app-tui --session {id}")
+    }
+
     /// Raw mode off and the alternate screen left. Safe to call more than once,
     /// and on every exit path (the panic hook calls it too).
     fn restore_terminal() {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 
@@ -187,6 +245,14 @@ mod terminal {
         }
         // The app's own server stops here (unless --keep-server).
         drop(server);
+        let (outcome, session) = match outcome {
+            Ok((reason, session)) => (Ok(reason), session),
+            Err(e) => (Err(e), None),
+        };
+        // The terminal is restored by now: the hint lands in the normal buffer.
+        if let Some(id) = session {
+            println!("{}", resume_hint(id));
+        }
         match outcome {
             Ok(None) => ExitCode::SUCCESS,
             Ok(Some(reason)) => fatal(&reason, &log),
@@ -217,8 +283,9 @@ mod terminal {
     }
 
     /// Runs the UI until Ctrl+C, Esc during a reconnect, or the driver's own
-    /// stop. `Ok(Some(reason))` when the driver stopped with a reason.
-    fn run(live: Option<Live>) -> io::Result<Option<String>> {
+    /// stop. `Ok(Some(reason))` when the driver stopped with a reason; the
+    /// session the app was on, for the resume hint.
+    fn run(live: Option<Live>) -> io::Result<(Option<String>, Option<Uuid>)> {
         let status: Arc<Status> =
             live.as_ref().map(|live| Arc::clone(&live.status)).unwrap_or_default();
         let (mut host, client) = link();
@@ -235,8 +302,9 @@ mod terminal {
 
         let mut live = live;
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         let (start, mut demo) = (Instant::now(), Player::default());
+        let mut last_ctrl_c: Option<Instant> = None;
         let result = (|| -> io::Result<()> {
             let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
             run_app(&mut term, &mut view, |wait| {
@@ -257,7 +325,16 @@ mod terminal {
                                 && k.code == K::Char('c')
                                 && k.modifiers.contains(M::CONTROL) =>
                         {
-                            RunEvent::Exit
+                            let now = Instant::now();
+                            match ctrl_c(host.running(), last_ctrl_c, now) {
+                                CtrlC::Interrupt => {
+                                    last_ctrl_c = Some(now);
+                                    host.interrupt();
+                                    status.set_note(CTRL_C_HINT);
+                                    RunEvent::Redraw
+                                }
+                                CtrlC::Exit => RunEvent::Exit,
+                            }
                         }
                         // Esc leaves while the connection is down: there is
                         // nothing to interrupt, and the retry has no end.
@@ -279,8 +356,104 @@ mod terminal {
                 Ok(if redraw { RunEvent::Redraw } else { RunEvent::Idle })
             })
         })();
+        let session = host.session();
         restore_terminal();
         result?;
-        Ok(status.fatal())
+        Ok((status.fatal(), session))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn press(code: K, mods: M) -> KeyEvent {
+            KeyEvent::new(code, mods)
+        }
+
+        /// (crossterm key, expected key name, ctrl, alt, shift).
+        #[test]
+        fn key_map_forwards_the_keys_the_app_uses() {
+            let table: &[(K, M, &str, bool, bool, bool)] = &[
+                (K::Tab, M::NONE, "Tab", false, false, false),
+                (K::Tab, M::SHIFT, "BackTab", false, false, true),
+                (K::BackTab, M::SHIFT, "BackTab", false, false, true),
+                (K::F(1), M::NONE, "F1", false, false, false),
+                (K::F(2), M::NONE, "F2", false, false, false),
+                (K::F(12), M::NONE, "F12", false, false, false),
+                (K::F(13), M::NONE, "Unknown", false, false, false),
+                (K::Left, M::NONE, "ArrowLeft", false, false, false),
+                (K::Right, M::ALT, "ArrowRight", false, true, false),
+                (K::Left, M::CONTROL, "ArrowLeft", true, false, false),
+                (K::Home, M::NONE, "Home", false, false, false),
+                (K::End, M::SHIFT, "End", false, false, true),
+                (K::Delete, M::NONE, "Delete", false, false, false),
+                (K::PageUp, M::NONE, "PageUp", false, false, false),
+                (K::PageDown, M::ALT, "PageDown", false, true, false),
+                (K::Up, M::NONE, "ArrowUp", false, false, false),
+                (K::Down, M::NONE, "ArrowDown", false, false, false),
+                (K::Esc, M::NONE, "Escape", false, false, false),
+                (K::Backspace, M::NONE, "Backspace", false, false, false),
+                (K::Enter, M::NONE, "Enter", false, false, false),
+                (K::Enter, M::SHIFT, "Enter", false, false, true),
+                (K::Enter, M::ALT, "Enter", false, true, false),
+                (K::Char('x'), M::ALT, "x", false, true, false),
+                (K::Char('a'), M::CONTROL, "a", true, false, false),
+                (K::Null, M::NONE, "Unknown", false, false, false),
+            ];
+            for &(code, mods, name, ctrl, alt, shift) in table {
+                let Input::Key { key, modifiers, release } = key_input(press(code, mods)) else {
+                    panic!("not a key: {code:?}");
+                };
+                assert_eq!(key, name, "{code:?} {mods:?}");
+                assert_eq!(
+                    (modifiers.ctrl, modifiers.alt, modifiers.shift),
+                    (ctrl, alt, shift),
+                    "{code:?} {mods:?}"
+                );
+                assert!(!release);
+            }
+        }
+
+        #[test]
+        fn ctrl_j_and_ctrl_enter_are_shift_enter() {
+            for code in [K::Char('j'), K::Char('J'), K::Enter] {
+                let Input::Key { key, modifiers, .. } = key_input(press(code, M::CONTROL)) else {
+                    panic!("not a key");
+                };
+                assert_eq!(key, "Enter");
+                assert!(modifiers.shift && !modifiers.ctrl, "{code:?}");
+            }
+            // A plain j is a letter.
+            let Input::Key { key, .. } = key_input(press(K::Char('j'), M::NONE)) else {
+                panic!("not a key");
+            };
+            assert_eq!(key, "j");
+        }
+
+        #[test]
+        fn ctrl_c_interrupts_once_mid_turn_and_exits_otherwise() {
+            let t0 = Instant::now();
+            // Idle: exit at once.
+            assert_eq!(ctrl_c(false, None, t0), CtrlC::Exit);
+            // Running: the first press interrupts.
+            assert_eq!(ctrl_c(true, None, t0), CtrlC::Interrupt);
+            // A second press within two seconds exits, still running.
+            let t1 = t0 + Duration::from_millis(1500);
+            assert_eq!(ctrl_c(true, Some(t0), t1), CtrlC::Exit);
+            // After the window the press interrupts again.
+            let t2 = t0 + Duration::from_secs(3);
+            assert_eq!(ctrl_c(true, Some(t0), t2), CtrlC::Interrupt);
+            // Idle after an interrupt: exit.
+            assert_eq!(ctrl_c(false, Some(t0), t1), CtrlC::Exit);
+        }
+
+        #[test]
+        fn resume_hint_names_the_session_and_the_command() {
+            let id = Uuid::from_u128(0xabc);
+            assert_eq!(
+                resume_hint(id),
+                format!("session: {id} - resume with modron-app-tui --session {id}")
+            );
+        }
     }
 }

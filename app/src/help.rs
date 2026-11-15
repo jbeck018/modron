@@ -6,7 +6,7 @@ use modron_mobile_core::view::{HELP_COMMANDS_HEADING, HELP_KEYS_HEADING};
 use modron_view::slash::slash_help_lines;
 use uuid::Uuid;
 
-use crate::chat::{Key, KeyFacts, Routed, UiAction};
+use crate::chat::{Key, KeyFacts, Routed, ScrollStep, UiAction};
 use crate::nav::{NavStep, Screen};
 use crate::slash;
 
@@ -48,7 +48,7 @@ pub fn bindings() -> Vec<Binding> {
             alt: false,
             facts: chat,
             draft: "hi",
-            expect: || Routed::Composer { queue: false },
+            expect: || Routed::Composer,
         },
         Binding {
             label: "alt+enter",
@@ -58,17 +58,67 @@ pub fn bindings() -> Vec<Binding> {
             alt: true,
             facts: chat,
             draft: "hi",
-            expect: || Routed::Composer { queue: true },
+            expect: || Routed::Action(UiAction::Queue("hi".into())),
         },
         Binding {
             label: "esc",
-            what: "interrupt the run",
+            what: "deny the pending approval, else interrupt the run",
             key: Key::Escape,
+            chord: false,
+            alt: false,
+            facts: || with(|f| f.running = true),
+            draft: "",
+            expect: || Routed::Action(UiAction::Interrupt),
+        },
+        Binding {
+            label: "shift+enter",
+            what: "new line in the composer (ctrl+j too; a line ending in \\ does the same)",
+            key: Key::Enter,
+            chord: false,
+            alt: false,
+            facts: chat,
+            draft: "first line",
+            expect: || Routed::Composer,
+        },
+        Binding {
+            label: "up / down (empty composer)",
+            what: "recall the last sent input; down past the newest restores the draft",
+            key: Key::Up,
+            chord: false,
+            alt: false,
+            facts: || with(|f| f.history_len = 2),
+            draft: "",
+            expect: || Routed::Recall { up: true },
+        },
+        Binding {
+            label: "shift+tab",
+            what: "flip the approval mode (ask / yolo)",
+            key: Key::BackTab,
             chord: false,
             alt: false,
             facts: chat,
             draft: "",
-            expect: || Routed::Action(UiAction::Interrupt),
+            expect: || Routed::Action(UiAction::CycleMode),
+        },
+        Binding {
+            label: "pgup / pgdn",
+            what: "page the transcript; new output does not move a scrolled view",
+            key: Key::PageUp,
+            chord: false,
+            alt: false,
+            facts: chat,
+            draft: "",
+            expect: || Routed::Scroll(ScrollStep::Up),
+        },
+        Binding {
+            label: "home / end (empty composer)",
+            what: "jump to the top of the transcript / back to the newest row",
+            key: Key::Home,
+            chord: false,
+            alt: false,
+            facts: chat,
+            draft: "",
+            expect: || Routed::Scroll(ScrollStep::Top),
         },
         Binding {
             label: "y / a / n",
@@ -265,9 +315,15 @@ pub fn bindings() -> Vec<Binding> {
 
 /// The help body, as rendered lines: the keys section, then the slash
 /// commands (the shared table rows, then the app's local rows).
+/// Bindings the terminal host handles before the router. Help lists them;
+/// the routing test does not (it cannot name a key event the router sees).
+pub const HOST_BINDINGS: &[(&str, &str)] =
+    &[("ctrl+c", "interrupt the running turn; a second press within 2 s, or when idle, quits")];
+
 pub fn help_lines() -> Vec<String> {
     let mut lines = vec![HELP_KEYS_HEADING.to_string()];
     lines.extend(bindings().iter().map(|b| format!("{}   {}", b.label, b.what)));
+    lines.extend(HOST_BINDINGS.iter().map(|(label, what)| format!("{label}   {what}")));
     lines.push(HELP_COMMANDS_HEADING.to_string());
     lines.extend(slash_help_lines());
     lines.extend(slash::LOCAL.iter().map(|e| format!("{} - {}", e.usage, e.about)));

@@ -82,6 +82,16 @@ impl Harness {
         }
     }
 
+    /// Draws for a short while, so the engine applies what the host sent
+    /// (a recalled entry arrives in the composer a frame after the key).
+    fn settle(&mut self) {
+        let end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < end {
+            self.draw();
+            let _ = self.wake.recv_timeout(Duration::from_millis(20));
+        }
+    }
+
     /// Routes a key the way the real host does: the link's filter first,
     /// then the NSH view.
     fn send(&mut self, input: Input) {
@@ -313,4 +323,105 @@ fn prompt_marker_takes_a_theme_colour() {
     let cell =
         buf.content.iter().find(|c| c.symbol() == "\u{276f}").expect("prompt marker on screen");
     assert_ne!(cell.fg, ratatui::style::Color::Reset, "primary token not applied");
+}
+
+fn shifted(name: &str) -> Input {
+    Input::Key {
+        key: name.to_string(),
+        modifiers: Modifiers { shift: true, ..Modifiers::default() },
+        release: false,
+    }
+}
+
+#[test]
+fn shift_enter_adds_a_line_and_enter_submits_the_whole_draft() {
+    let mut h = Harness::new();
+    h.push(&fixture());
+    h.wait_for("transcript", |s| s.contains("fix the router crate"));
+    h.type_text("a");
+    h.wait_for("typed a", |s| s.contains('a'));
+    h.send(shifted("Enter"));
+    assert_eq!(h.action(), None, "shift+enter must not submit");
+    h.type_text("b");
+    h.wait_for("typed b", |s| s.contains('b'));
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::Send("a\nb".into())));
+}
+
+#[test]
+fn a_pasted_block_lands_whole_and_nothing_submits() {
+    let mut h = Harness::new();
+    h.push(&fixture());
+    h.wait_for("transcript", |s| s.contains("fix the router crate"));
+    h.send(Input::Paste("one\ntwo\nthree".into()));
+    assert_eq!(h.action(), None, "a paste must not submit");
+    h.wait_for("pasted lines", |s| s.contains("one") && s.contains("three"));
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::Send("one\ntwo\nthree".into())));
+}
+
+#[test]
+fn a_trailing_backslash_continues_the_line_and_does_not_submit() {
+    let mut h = Harness::new();
+    h.push(&fixture());
+    h.wait_for("transcript", |s| s.contains("fix the router crate"));
+    h.type_text("first\\");
+    h.wait_for("typed the backslash", |s| s.contains("first\\"));
+    h.send(key("Enter"));
+    assert_eq!(h.action(), None, "a backslash line must not submit");
+    h.type_text("second");
+    h.wait_for("typed second", |s| s.contains("second"));
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::Send("first\nsecond".into())));
+}
+
+#[test]
+fn up_recalls_the_last_sent_input_and_down_restores_the_draft() {
+    let mut h = Harness::new();
+    h.push(&fixture());
+    h.wait_for("transcript", |s| s.contains("fix the router crate"));
+    h.type_text("one");
+    h.wait_for("typed one", |s| s.contains("one"));
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::Send("one".into())));
+    h.send(key("ArrowUp"));
+    h.settle();
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::Send("one".into())), "recalled text submits");
+    h.settle();
+    h.type_text("dr");
+    h.wait_for("typed draft", |s| s.contains("dr"));
+    h.send(key("ArrowUp"));
+    h.settle();
+    h.send(key("ArrowDown"));
+    h.settle();
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::Send("dr".into())));
+}
+
+#[test]
+fn esc_denies_a_pending_approval_instead_of_interrupting() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    pending(&mut snapshot);
+    h.push(&snapshot);
+    h.wait_for("approval", |s| s.contains("allow all"));
+    h.send(key("Escape"));
+    assert_eq!(h.action(), Some(UiAction::Decide(2)));
+}
+
+#[test]
+fn paging_keys_scroll_without_touching_the_composer() {
+    let mut h = Harness::new();
+    h.push(&fixture());
+    h.wait_for("transcript", |s| s.contains("fix the router crate"));
+    h.send(key("PageUp"));
+    h.send(key("PageDown"));
+    h.send(key("Home"));
+    h.send(key("End"));
+    assert_eq!(h.action(), None, "paging is the host's, not an action");
+    h.type_text("z");
+    h.wait_for("typed after paging", |s| s.contains('z'));
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::Send("z".into())));
 }

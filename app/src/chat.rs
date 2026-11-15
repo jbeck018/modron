@@ -19,7 +19,7 @@
 //! Colour: every colour is a token of `theme/oculus.json` ([`token_ink`]).
 //! The terminal maps those through NSH's own palette; the web draws them.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use modron_mobile_core::{
@@ -82,6 +82,9 @@ pub enum UiAction {
     ListModels,
     /// `/mode` with no argument: the next approval mode.
     CycleMode,
+    /// `/reasoning`: show or hide streamed reasoning (the core's
+    /// `set_show_reasoning`, toggled from the snapshot's flag).
+    ToggleReasoning,
     /// `/sandbox` with no argument: the next sandbox policy.
     CycleSandbox,
     /// `/fork`, `/tasks`, `/share`, `/remote-control <url>`.
@@ -218,9 +221,28 @@ const NOTE_SLOTS: usize = 2;
 /// The composer text, mirrored from the view so the host can read it for a
 /// revise note (the host filters keys before the composer sees them).
 static DRAFT: Mutex<String> = Mutex::new(String::new());
-/// Set by the host on every Enter: the composer's next submit is a queue
-/// when this is true (Alt+Enter).
-static QUEUE_NEXT: AtomicBool = AtomicBool::new(false);
+/// Sent inputs, oldest first (this app session, the last [`HISTORY_MAX`]).
+/// The view appends on submit; the host recalls with Up / Down.
+static HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The recalled entry's index, or None while the draft is live.
+static HISTORY_POS: Mutex<Option<usize>> = Mutex::new(None);
+/// The draft kept while an entry is recalled, restored by Down past newest.
+static HISTORY_DRAFT: Mutex<String> = Mutex::new(String::new());
+/// Lines the transcript is scrolled up from the newest row (0 = at the
+/// bottom, following). Set by the host's PageUp / PageDown / Home / End.
+static SCROLL_OFFSET: Mutex<usize> = Mutex::new(0);
+/// Bumped on every scroll step, so the view scrolls once per step.
+static SCROLL_SEQ: AtomicU64 = AtomicU64::new(0);
+/// True when rows arrived while the view was scrolled up.
+static NEW_BELOW: AtomicBool = AtomicBool::new(false);
+/// The transcript's line count, as the view last laid it out (the host
+/// needs it to place the top of the transcript).
+static LINE_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Sent inputs kept for recall.
+pub const HISTORY_MAX: usize = 200;
+/// Transcript lines a PageUp or PageDown moves.
+pub const SCROLL_PAGE: usize = 10;
 /// Set when a revise note was sent: the composer clears once the plan has
 /// been resolved (see [`after_snapshot`]), so a refused revise keeps its note.
 static CLEAR_DRAFT: AtomicBool = AtomicBool::new(false);
@@ -254,7 +276,22 @@ pub enum Key {
     F1,
     /// Tab: completes the selected command suggestion.
     Tab,
-    /// Any other key (dead keys, Tab): always the composer's.
+    /// Shift+Tab: flips the approval mode.
+    BackTab,
+    /// Left and Right arrows: the composer's caret.
+    Left,
+    Right,
+    /// Home and End: the transcript's top and bottom when the composer is
+    /// empty, the caret's line start and end otherwise.
+    Home,
+    End,
+    /// Delete: always the composer's.
+    Delete,
+    /// PageUp and PageDown: page the transcript.
+    PageUp,
+    PageDown,
+    /// Any other key (dead keys, F-keys other than F1 and F2): always the
+    /// composer's.
     Other,
 }
 
@@ -286,6 +323,14 @@ pub fn host_key(name: &str) -> Key {
         "F2" => Key::F2,
         "F1" => Key::F1,
         "Tab" => Key::Tab,
+        "BackTab" => Key::BackTab,
+        "ArrowLeft" => Key::Left,
+        "ArrowRight" => Key::Right,
+        "Home" => Key::Home,
+        "End" => Key::End,
+        "Delete" => Key::Delete,
+        "PageUp" => Key::PageUp,
+        "PageDown" => Key::PageDown,
         _ => key_of(name),
     }
 }
@@ -321,13 +366,32 @@ pub struct KeyFacts {
     pub agent_live: bool,
     /// Whether a confirmation waits for y or n.
     pub confirming: bool,
+    /// Whether a turn is running (Esc interrupts it).
+    pub running: bool,
+    /// Whether a sent input is recalled into the composer.
+    pub recalling: bool,
+    /// How many sent inputs can be recalled.
+    pub history_len: usize,
+}
+
+/// One transcript scroll step (the keys PageUp, PageDown, Home, End).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollStep {
+    Up,
+    Down,
+    Top,
+    Bottom,
 }
 
 /// Where a key goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Routed {
-    /// The composer gets the key. `queue` is Alt on an Enter.
-    Composer { queue: bool },
+    /// The composer gets the key.
+    Composer,
+    /// Up or Down recalls a sent input (the host keeps the history).
+    Recall { up: bool },
+    /// PageUp, PageDown, Home or End moves the transcript.
+    Scroll(ScrollStep),
     /// The key became an action.
     Action(UiAction),
     /// The key is a screen step (Sessions, Settings, and the Ctrl+O / F2
@@ -356,7 +420,7 @@ pub enum Routed {
 /// interrupts. The composer's text is passed in, so the rule is testable
 /// without a view.
 pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str) -> Routed {
-    let composer = Routed::Composer { queue: false };
+    let composer = Routed::Composer;
     if matches!(facts.screen, Screen::SignIn | Screen::Portal) {
         return route_portal_key(key, chord, &facts);
     }
@@ -383,26 +447,54 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
         return route_screen_key(key, chord, &facts, draft);
     }
     let suggesting = facts.slash_len > 0;
+    let single_line = !draft.contains('\n');
+    let recall = !suggesting && single_line && (draft.is_empty() || facts.recalling);
     match key {
+        Key::Escape if chord => return composer,
+        Key::Escape => return escape_route(&facts),
         Key::Enter if suggesting && !facts.slash_exact => {
             return Routed::Nav(NavStep::CompleteSelected)
         }
-        Key::Enter => return Routed::Composer { queue: alt },
+        Key::Enter if alt => return queue_route(draft),
+        Key::Enter => return composer,
         Key::Tab if suggesting => return Routed::Nav(NavStep::CompleteSelected),
         Key::Up if suggesting => return Routed::Nav(NavStep::SlashMove(-1)),
         Key::Down if suggesting => return Routed::Nav(NavStep::SlashMove(1)),
-        Key::Escape if suggesting => return Routed::Nav(NavStep::SlashHide),
+        Key::Up if recall => {
+            return if facts.history_len == 0 && !facts.recalling {
+                Routed::Ignored
+            } else {
+                Routed::Recall { up: true }
+            }
+        }
+        Key::Down if recall => return Routed::Recall { up: false },
         Key::Char('?') if !chord && draft.is_empty() => {
             return Routed::Nav(NavStep::Open(Screen::Help))
         }
         Key::Backspace if !chord && draft.is_empty() && facts.queued > 0 => {
             return Routed::Action(UiAction::Dequeue(facts.queued - 1));
         }
-        Key::Other | Key::Backspace | Key::Up | Key::Down | Key::Tab | Key::F1 | Key::F2 => {
-            return composer
-        }
+        Key::PageUp if !chord => return Routed::Scroll(ScrollStep::Up),
+        Key::PageDown if !chord => return Routed::Scroll(ScrollStep::Down),
+        Key::Home if !chord && draft.is_empty() => return Routed::Scroll(ScrollStep::Top),
+        Key::End if !chord && draft.is_empty() => return Routed::Scroll(ScrollStep::Bottom),
+        Key::BackTab if !chord => return Routed::Action(UiAction::CycleMode),
+        Key::Other
+        | Key::Backspace
+        | Key::Up
+        | Key::Down
+        | Key::Tab
+        | Key::F1
+        | Key::F2
+        | Key::Left
+        | Key::Right
+        | Key::Delete
+        | Key::Home
+        | Key::End
+        | Key::PageUp
+        | Key::PageDown
+        | Key::BackTab => return composer,
         _ if chord => return composer,
-        Key::Escape => return Routed::Action(UiAction::Interrupt),
         Key::Char(_) => {}
     }
     let Key::Char(c) = key else { return composer };
@@ -424,12 +516,44 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     composer
 }
 
+/// Esc, in precedence order: a pending approval is denied (its last option,
+/// the third decision); a pending plan stays pending; open command suggestions
+/// close; a running turn is interrupted; otherwise nothing happens.
+fn escape_route(facts: &KeyFacts) -> Routed {
+    if let Some(count) = facts.approval_options {
+        return match count {
+            0 => Routed::Ignored,
+            n => Routed::Action(UiAction::Decide(n.min(DECISION_KEYS.len()) - 1)),
+        };
+    }
+    if facts.plan_pending {
+        return Routed::Ignored;
+    }
+    if facts.slash_len > 0 {
+        return Routed::Nav(NavStep::SlashHide);
+    }
+    if facts.running {
+        return Routed::Action(UiAction::Interrupt);
+    }
+    Routed::Ignored
+}
+
+/// Alt+Enter: queue the composer text for the next run. An empty draft, or a
+/// command (commands never queue), is consumed without effect.
+fn queue_route(draft: &str) -> Routed {
+    let text = draft.trim();
+    if text.is_empty() || text.starts_with('/') {
+        return Routed::Ignored;
+    }
+    Routed::Action(UiAction::Queue(text.to_string()))
+}
+
 /// Keys on the portal screens. The sign-in input is the page's own input, so
 /// its keys (the token, Enter, paste) go to the composer; Esc backs out of
 /// nothing there. The list types a filter, arrows move, Enter opens the
 /// selected row and Esc clears the filter. Chords always reach the page.
 fn route_portal_key(key: Key, chord: bool, facts: &KeyFacts) -> Routed {
-    let composer = Routed::Composer { queue: false };
+    let composer = Routed::Composer;
     if chord {
         return composer;
     }
@@ -458,7 +582,7 @@ fn route_portal_key(key: Key, chord: bool, facts: &KeyFacts) -> Routed {
 /// Sessions the printable keys type the filter (`n`, `j`, `k` and `d` act
 /// only while the filter is empty). A chord still passes.
 fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Routed {
-    let composer = Routed::Composer { queue: false };
+    let composer = Routed::Composer;
     if chord {
         return composer;
     }
@@ -603,6 +727,11 @@ pub struct Model {
     pub swarm_rows: Vec<String>,
     /// The core's last note and last error, in that order.
     pub notes: Vec<String>,
+    /// The live reasoning tail (the last two lines), when reasoning display
+    /// is on; empty otherwise.
+    pub reasoning: String,
+    /// The short session id (the first eight characters), or empty.
+    pub session: String,
 }
 
 impl Model {
@@ -630,8 +759,23 @@ impl Model {
             tool_rows: s.tool_lines.clone(),
             swarm_rows: s.subagent_rows.clone(),
             notes: s.last_note.iter().chain(s.last_error.iter()).cloned().collect(),
+            reasoning: if s.show_reasoning {
+                reasoning_tail(&s.streaming_reasoning, 2)
+            } else {
+                String::new()
+            },
+            session: s
+                .session_id
+                .map(|id| id.to_string().chars().take(8).collect())
+                .unwrap_or_default(),
         }
     }
+}
+
+/// The last `count` lines of `text` (the live reasoning tail).
+fn reasoning_tail(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
 /// The visual style of a transcript row kind.
@@ -684,6 +828,10 @@ pub struct Host {
     plan_pending: bool,
     /// Messages held for the next run (the queue chips).
     queued: usize,
+    /// Whether a turn is running (Esc interrupts it).
+    running: bool,
+    /// Rows the snapshot held at the last push (new output while scrolled).
+    seen_rows: usize,
     nav: Nav,
     /// The owner portal's actions, taken by the web host (`take_portal`).
     portal: VecDeque<UiAction>,
@@ -693,8 +841,14 @@ pub struct Host {
 /// new view starts from an empty draft.
 pub fn link() -> (Host, Client) {
     set_draft("");
-    QUEUE_NEXT.store(false, Ordering::SeqCst);
     CLEAR_DRAFT.store(false, Ordering::SeqCst);
+    if let Ok(mut history) = HISTORY.lock() {
+        history.clear();
+    }
+    set_history_pos(None);
+    set_scroll_offset(0);
+    NEW_BELOW.store(false, Ordering::SeqCst);
+    LINE_TOTAL.store(0, Ordering::SeqCst);
     let (snap_tx, snap_rx) = unbounded_channel();
     let (act_tx, act_rx) = unbounded_channel();
     let (nav_tx, nav_rx) = unbounded_channel();
@@ -707,6 +861,8 @@ pub fn link() -> (Host, Client) {
             pending: None,
             plan_pending: false,
             queued: 0,
+            running: false,
+            seen_rows: 0,
             nav: Nav::default(),
             portal: VecDeque::new(),
         },
@@ -721,6 +877,12 @@ impl Host {
         self.pending = snapshot.pending_approval.as_ref().map(|p| p.options.len());
         self.plan_pending = snapshot.plan_pending.is_some();
         self.queued = snapshot.queued.len();
+        self.running = snapshot.running;
+        let rows = snapshot.history.len();
+        if rows > self.seen_rows && scroll_offset() > 0 {
+            NEW_BELOW.store(true, Ordering::SeqCst);
+        }
+        self.seen_rows = rows;
         self.nav.observe(snapshot);
         let _ = self.snapshots.send(snapshot.clone());
         self.notify();
@@ -809,6 +971,16 @@ impl Host {
         self.route(host_key(key), alt, chord)
     }
 
+    /// Whether a turn is running (the host's interrupt goes out only then).
+    pub fn running(&self) -> bool {
+        self.running
+    }
+
+    /// Aborts the running turn (the terminal's first Ctrl+C).
+    pub fn interrupt(&mut self) {
+        self.act(UiAction::Interrupt);
+    }
+
     /// Routes one key, the same on every host. Returns true when the host
     /// consumes the key (an action, a screen step, or an ignored key); false
     /// when the composer gets it.
@@ -831,25 +1003,35 @@ impl Host {
             first_agent: self.nav.first_agent(),
             agent_live: self.nav.agent_live(),
             confirming: self.nav.confirming(),
+            running: self.running,
+            recalling: history_pos().is_some(),
+            history_len: HISTORY.lock().map(|h| h.len()).unwrap_or(0),
         };
         let routed = route_key(key, alt, chord, facts, &draft);
         // Typing or deleting changes the text: the suggestions show again.
-        if matches!(routed, Routed::Composer { .. })
+        if matches!(routed, Routed::Composer)
             && matches!(key, Key::Char(_) | Key::Backspace)
             && self.nav.reopen()
         {
             self.notify();
         }
         match routed {
-            Routed::Composer { queue } => {
-                if key == Key::Enter {
-                    // The flag tells the composer's submit whether this was Alt+Enter.
-                    QUEUE_NEXT.store(queue, Ordering::SeqCst);
-                }
-                false
+            Routed::Composer => false,
+            Routed::Recall { up } => {
+                self.recall(up);
+                true
+            }
+            Routed::Scroll(step) => {
+                self.scroll(step);
+                true
             }
             Routed::Action(action) => {
                 arm_plan_clear(&action);
+                if matches!(action, UiAction::Queue(_)) {
+                    // The text moved to the queue: the composer empties.
+                    self.nav.set_text("");
+                    self.notify();
+                }
                 self.act(action);
                 true
             }
@@ -859,6 +1041,52 @@ impl Host {
             }
             Routed::Ignored => true,
         }
+    }
+
+    /// Up / Down through the sent inputs. The live draft is kept while an
+    /// entry is recalled and restored by Down past the newest entry.
+    fn recall(&mut self, up: bool) {
+        let history = HISTORY.lock().map(|h| h.clone()).unwrap_or_default();
+        let next = match (history_pos(), up) {
+            (None, true) if !history.is_empty() => {
+                if let Ok(mut saved) = HISTORY_DRAFT.lock() {
+                    *saved = draft_text();
+                }
+                history.len() - 1
+            }
+            (Some(at), true) => at.saturating_sub(1),
+            (Some(at), false) if at + 1 < history.len() => at + 1,
+            (Some(_), false) => {
+                set_history_pos(None);
+                let live = HISTORY_DRAFT.lock().map(|d| d.clone()).unwrap_or_default();
+                self.nav.set_text(&live);
+                self.notify();
+                return;
+            }
+            _ => return,
+        };
+        set_history_pos(Some(next));
+        self.nav.set_text(&history[next]);
+        self.notify();
+    }
+
+    /// PageUp, PageDown, Home and End: moves the transcript's offset from
+    /// the newest row. The view scrolls to it once per step (SCROLL_SEQ).
+    fn scroll(&mut self, step: ScrollStep) {
+        let total = LINE_TOTAL.load(Ordering::SeqCst);
+        let current = scroll_offset();
+        let next = match step {
+            ScrollStep::Up => current.saturating_add(SCROLL_PAGE).min(total.saturating_sub(1)),
+            ScrollStep::Down => current.saturating_sub(SCROLL_PAGE),
+            ScrollStep::Top => total.saturating_sub(1),
+            ScrollStep::Bottom => 0,
+        };
+        set_scroll_offset(next);
+        if next == 0 {
+            NEW_BELOW.store(false, Ordering::SeqCst);
+        }
+        SCROLL_SEQ.fetch_add(1, Ordering::SeqCst);
+        self.notify();
     }
 
     /// Applies a screen step now (so the next key sees its result), sends
@@ -871,12 +1099,52 @@ impl Host {
     }
 
     fn notify(&self) {
-        let _ = self.navs.send(self.nav.view());
+        let mut view = self.nav.view();
+        view.scroll_seq = SCROLL_SEQ.load(Ordering::SeqCst);
+        view.scroll_offset = scroll_offset();
+        view.new_below = NEW_BELOW.load(Ordering::SeqCst);
+        let _ = self.navs.send(view);
     }
 
     fn act(&self, action: UiAction) {
         let _ = self.loopback.send(action);
     }
+}
+
+fn history_pos() -> Option<usize> {
+    HISTORY_POS.lock().map(|p| *p).unwrap_or(None)
+}
+
+fn set_history_pos(pos: Option<usize>) {
+    if let Ok(mut p) = HISTORY_POS.lock() {
+        *p = pos;
+    }
+}
+
+fn scroll_offset() -> usize {
+    SCROLL_OFFSET.lock().map(|o| *o).unwrap_or(0)
+}
+
+fn set_scroll_offset(offset: usize) {
+    if let Ok(mut o) = SCROLL_OFFSET.lock() {
+        *o = offset;
+    }
+}
+
+/// Records a sent input for Up / Down recall (the view calls this on submit)
+/// and leaves recall, so the next Up starts from the newest entry.
+pub(crate) fn record_sent(text: &str) {
+    if let Ok(mut history) = HISTORY.lock() {
+        history.push(text.to_string());
+        let excess = history.len().saturating_sub(HISTORY_MAX);
+        history.drain(..excess);
+    }
+    set_history_pos(None);
+}
+
+/// The view reports how many lines the transcript holds now.
+pub(crate) fn set_line_total(lines: usize) {
+    LINE_TOTAL.store(lines, Ordering::SeqCst);
 }
 
 /// Clears the composer after a revise note went out, once the plan is no
@@ -974,6 +1242,10 @@ pub(crate) fn header(model: Signal<Model>) -> impl IntoElement {
         )
         .child(
             text(move || model.with(|m| m.running.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
+        .child(
+            text(move || model.with(|m| m.session.clone()))
                 .text_color(move || token_ink("muted-foreground")),
         )
 }
@@ -1240,9 +1512,31 @@ pub fn screen(
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
     let submit_actions = actions.clone();
+    let list_ref = element_ref();
+    // The last scroll step the view applied (SCROLL_SEQ).
+    let applied_scroll = std::cell::Cell::new(0u64);
+    effect(move || {
+        let lines = model.with(|m| m.lines.len());
+        set_line_total(lines);
+        let (seq, offset) = nav.with(|n| (n.scroll_seq, n.scroll_offset));
+        if seq == applied_scroll.get() {
+            return;
+        }
+        applied_scroll.set(seq);
+        if offset == 0 {
+            list_ref.scroll_to_end(false);
+        } else {
+            // The row `offset` lines above the newest sits at the bottom edge.
+            let index = (lines.saturating_sub(1)).saturating_sub(offset);
+            list_ref.scroll_to_index(index as u32, Percentage(1.0), Points(0.0), false);
+        }
+    });
     let composer = input()
         .auto_focus(true)
         // Enter sends and keeps focus, so the next line can be typed at once.
+        // Shift+Enter and Ctrl+J add a line (NSH's multiline input), and a
+        // pasted block lands whole in the composer.
+        .multiline(true)
         .submit_behavior(SubmitBehavior::Submit)
         .placeholder(COMPOSER_PLACEHOLDER)
         .value(move || draft.get())
@@ -1251,11 +1545,17 @@ pub fn screen(
             draft.set(s.to_string());
         })
         .on_submit(move |s: &str| {
+            // The old TUI's line continuation: a line ending in a backslash
+            // turns the backslash into a line break and does not submit.
+            if let Some(head) = s.strip_suffix('\\') {
+                let next = format!("{head}\n");
+                set_draft(&next);
+                draft.set(next);
+                return;
+            }
             let task = s.trim().to_string();
             set_draft("");
             draft.set(String::new());
-            // The host set this on the Enter that produced the submit.
-            let queue = QUEUE_NEXT.swap(false, Ordering::SeqCst);
             if nav.with(|n| n.screen == Screen::Agent) {
                 // The agent screen's composer steers the open agent (while it runs).
                 let agent =
@@ -1265,13 +1565,11 @@ pub fn screen(
                 }
                 return;
             }
-            let action = if task.starts_with('/') {
-                slash::run(&task)
-            } else if queue {
-                UiAction::Queue(task)
-            } else {
-                UiAction::Send(task)
-            };
+            if !task.is_empty() {
+                record_sent(&task);
+            }
+            let action =
+                if task.starts_with('/') { slash::run(&task) } else { UiAction::Send(task) };
             if !action_is_empty(&action) {
                 let _ = submit_actions.send(action);
             }
@@ -1288,16 +1586,34 @@ pub fn screen(
                 move || model.with(|m| m.lines.len()),
                 move |at: Position| transcript_row(model, at),
             )
+            .element_ref(&list_ref)
+            // Opens at the newest row and stays there while it is at the end;
+            // scrolled up, what is visible stays put as rows arrive.
+            .initial_scroll_at_end()
+            .follow_end(px(24.0))
             // An explicit height: a flex-grown virtual list gets zero rows
             // in NSH 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4). On the
             // web it follows the window, so the composer and the Stop
             // control stay on screen (the page itself does not scroll).
             .h(move || px(transcript_height(window_h))),
         )
+        .child(when(
+            move || nav.with(|n| n.new_below && n.scroll_offset > 0),
+            move || {
+                text("new output below · end to follow").text_color(move || token_ink("warning"))
+            },
+        ))
         .child(when(move || model.with(|m| m.turn_summary.is_some()), move || tool_strip(model)))
         .child(swarm_slots(model, nav, actions.clone()))
         .child(row_slots(model, NOTE_SLOTS, note_rows, dim_token, true))
         .child(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true))
+        .child(when(
+            move || model.with(|m| !m.reasoning.is_empty()),
+            move || {
+                text(move || model.with(|m| m.reasoning.clone()))
+                    .text_color(move || token_ink("muted-foreground"))
+            },
+        ))
         .child(when(
             move || model.with(|m| !m.streaming.is_empty()),
             move || {
@@ -1417,6 +1733,9 @@ mod tests {
         first_agent: None,
         agent_live: false,
         confirming: false,
+        running: false,
+        recalling: false,
+        history_len: 0,
     };
 
     fn approval(options: usize) -> KeyFacts {
@@ -1432,7 +1751,7 @@ mod tests {
     }
 
     fn composer() -> Routed {
-        Routed::Composer { queue: false }
+        Routed::Composer
     }
 
     #[test]
@@ -1465,21 +1784,123 @@ mod tests {
         assert_eq!(fit_transcript_height(100.0), TRANSCRIPT_MIN_H);
     }
 
-    #[test]
-    fn escape_interrupts_whatever_is_pending() {
-        let want = Routed::Action(UiAction::Interrupt);
-        assert_eq!(route_key(Key::Escape, false, false, NONE, ""), want);
-        assert_eq!(route_key(Key::Escape, false, false, approval(3), ""), want);
-        assert_eq!(route_key(Key::Escape, false, false, plan(), ""), want);
+    fn running() -> KeyFacts {
+        KeyFacts { running: true, ..NONE }
     }
 
     #[test]
-    fn enter_reaches_the_composer_and_alt_marks_a_queue() {
+    fn escape_with_an_approval_denies_it_before_anything_else() {
+        // Deny is the third decision ("n"), the last option in protocol order.
+        let deny = Routed::Action(UiAction::Decide(2));
+        assert_eq!(route_key(Key::Escape, false, false, approval(3), ""), deny);
         assert_eq!(
-            route_key(Key::Enter, false, false, approval(3), "x"),
-            Routed::Composer { queue: false }
+            route_key(Key::Escape, false, false, KeyFacts { running: true, ..approval(3) }, ""),
+            deny
         );
-        assert_eq!(route_key(Key::Enter, true, true, NONE, ""), Routed::Composer { queue: true });
+        let two = route_key(Key::Escape, false, false, approval(2), "");
+        assert_eq!(two, Routed::Action(UiAction::Decide(1)));
+        let no_options = route_key(Key::Escape, false, false, approval(0), "");
+        assert_eq!(no_options, Routed::Ignored);
+    }
+
+    #[test]
+    fn escape_with_a_plan_pending_does_nothing_destructive() {
+        assert_eq!(route_key(Key::Escape, false, false, plan(), ""), Routed::Ignored);
+        let both = KeyFacts { running: true, slash_len: 2, ..plan() };
+        assert_eq!(route_key(Key::Escape, false, false, both, "/"), Routed::Ignored);
+    }
+
+    #[test]
+    fn escape_closes_open_suggestions_before_it_interrupts() {
+        let open = KeyFacts { slash_len: 2, ..running() };
+        assert_eq!(
+            route_key(Key::Escape, false, false, open, "/"),
+            Routed::Nav(NavStep::SlashHide)
+        );
+    }
+
+    #[test]
+    fn escape_interrupts_a_running_turn_and_does_nothing_idle() {
+        assert_eq!(
+            route_key(Key::Escape, false, false, running(), ""),
+            Routed::Action(UiAction::Interrupt)
+        );
+        assert_eq!(route_key(Key::Escape, false, false, NONE, ""), Routed::Ignored);
+    }
+
+    #[test]
+    fn alt_enter_queues_the_draft_and_empty_or_command_drafts_do_not() {
+        assert_eq!(
+            route_key(Key::Enter, true, true, NONE, "  next task  "),
+            Routed::Action(UiAction::Queue("next task".into()))
+        );
+        assert_eq!(route_key(Key::Enter, true, true, NONE, "   "), Routed::Ignored);
+        assert_eq!(route_key(Key::Enter, true, true, NONE, "/help"), Routed::Ignored);
+    }
+
+    #[test]
+    fn enter_reaches_the_composer_so_shift_enter_can_add_a_line() {
+        assert_eq!(route_key(Key::Enter, false, false, approval(3), "x"), Routed::Composer);
+        assert_eq!(route_key(Key::Enter, false, false, NONE, "a\nb"), Routed::Composer);
+    }
+
+    #[test]
+    fn up_and_down_recall_only_on_an_empty_or_recalled_single_line() {
+        let saved = KeyFacts { history_len: 2, ..NONE };
+        assert_eq!(
+            route_key(Key::Up, false, false, saved.clone(), ""),
+            Routed::Recall { up: true }
+        );
+        // Empty history: nothing to recall.
+        assert_eq!(route_key(Key::Up, false, false, NONE, ""), Routed::Ignored);
+        // A typed draft is not replaced.
+        assert_eq!(route_key(Key::Up, false, false, saved.clone(), "typing"), composer());
+        // A recalled entry keeps the arrows, and Down returns to the draft.
+        let recalled = KeyFacts { recalling: true, history_len: 2, ..NONE };
+        assert_eq!(
+            route_key(Key::Up, false, false, recalled.clone(), "old"),
+            Routed::Recall { up: true }
+        );
+        assert_eq!(
+            route_key(Key::Down, false, false, recalled.clone(), "edited"),
+            Routed::Recall { up: false }
+        );
+        // Multi-line input moves between its lines.
+        assert_eq!(route_key(Key::Up, false, false, saved.clone(), "a\nb"), composer());
+        assert_eq!(route_key(Key::Down, false, false, recalled, "a\nb"), composer());
+        // Suggestions keep the arrows while they show.
+        let suggest = KeyFacts { slash_len: 2, ..saved };
+        assert_eq!(
+            route_key(Key::Up, false, false, suggest, "/"),
+            Routed::Nav(NavStep::SlashMove(-1))
+        );
+    }
+
+    #[test]
+    fn page_keys_scroll_and_home_end_scroll_only_on_an_empty_composer() {
+        assert_eq!(route_key(Key::PageUp, false, false, NONE, "x"), Routed::Scroll(ScrollStep::Up));
+        assert_eq!(
+            route_key(Key::PageDown, false, false, NONE, ""),
+            Routed::Scroll(ScrollStep::Down)
+        );
+        assert_eq!(route_key(Key::Home, false, false, NONE, ""), Routed::Scroll(ScrollStep::Top));
+        assert_eq!(route_key(Key::End, false, false, NONE, ""), Routed::Scroll(ScrollStep::Bottom));
+        // With text, Home and End move the caret.
+        assert_eq!(route_key(Key::Home, false, false, NONE, "x"), composer());
+        assert_eq!(route_key(Key::End, false, false, NONE, "x"), composer());
+        // A chord passes to the composer.
+        assert_eq!(route_key(Key::PageUp, false, true, NONE, ""), composer());
+    }
+
+    #[test]
+    fn shift_tab_flips_the_approval_mode_and_caret_keys_stay_in_the_composer() {
+        assert_eq!(
+            route_key(Key::BackTab, false, false, NONE, ""),
+            Routed::Action(UiAction::CycleMode)
+        );
+        for key in [Key::Left, Key::Right, Key::Delete] {
+            assert_eq!(route_key(key, false, false, NONE, "x"), composer());
+        }
     }
 
     #[test]
@@ -1629,7 +2050,11 @@ mod tests {
         assert_eq!(host_key("ArrowDown"), Key::Down);
         assert_eq!(host_key("F2"), Key::F2);
         assert_eq!(host_key("Enter"), Key::Enter);
-        assert_eq!(host_key("ArrowLeft"), Key::Other);
+        assert_eq!(host_key("ArrowLeft"), Key::Left);
+        assert_eq!(host_key("PageDown"), Key::PageDown);
+        assert_eq!(host_key("BackTab"), Key::BackTab);
+        assert_eq!(host_key("F1"), Key::F1);
+        assert_eq!(host_key("F5"), Key::Other);
     }
 
     #[test]
@@ -1651,7 +2076,7 @@ mod tests {
             Routed::Nav(NavStep::Back)
         );
         assert_eq!(
-            route_key(Key::Escape, false, false, NONE, ""),
+            route_key(Key::Escape, false, false, running(), ""),
             Routed::Action(UiAction::Interrupt)
         );
     }
@@ -1737,22 +2162,13 @@ mod tests {
 
     #[test]
     fn a_chord_passes_to_the_composer_on_every_screen() {
-        assert_eq!(
-            route_key(Key::Char('a'), false, true, sessions(false), ""),
-            Routed::Composer { queue: false }
-        );
-        assert_eq!(
-            route_key(Key::Escape, false, true, settings(None), ""),
-            Routed::Composer { queue: false }
-        );
+        assert_eq!(route_key(Key::Char('a'), false, true, sessions(false), ""), Routed::Composer);
+        assert_eq!(route_key(Key::Escape, false, true, settings(None), ""), Routed::Composer);
     }
 
     #[test]
     fn chat_keys_are_unchanged_by_the_new_screens() {
-        assert_eq!(route_key(Key::Up, false, false, NONE, ""), Routed::Composer { queue: false });
-        assert_eq!(
-            route_key(Key::Char('n'), false, false, NONE, ""),
-            Routed::Composer { queue: false }
-        );
+        assert_eq!(route_key(Key::Up, false, false, NONE, ""), Routed::Ignored);
+        assert_eq!(route_key(Key::Char('n'), false, false, NONE, ""), Routed::Composer);
     }
 }

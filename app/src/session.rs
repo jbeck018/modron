@@ -485,6 +485,11 @@ fn apply(client: &RemoteClient, action: UiAction) {
             Some(session) => client.interrupt(session),
             None => Ok(()),
         },
+        UiAction::ToggleReasoning => {
+            let shown = client.state().show_reasoning;
+            client.set_show_reasoning(!shown);
+            Ok(())
+        }
         UiAction::Compact => client.compact(),
         UiAction::ListSessions => client.list_sessions(),
         UiAction::Attach(session) => client.attach(session, 0),

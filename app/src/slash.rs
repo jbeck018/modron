@@ -135,6 +135,7 @@ pub fn run(line: &str) -> UiAction {
             "off" | "unset" => UiAction::SetEffort(None),
             _ => usage("effort"),
         },
+        "reasoning" | "thinking" => UiAction::ToggleReasoning,
         "plan" => UiAction::SetPhase(Phase::Plan),
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,

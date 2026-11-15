@@ -148,6 +148,12 @@ pub struct ShareView {
 /// What the view renders.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct NavView {
+    /// Bumped by every transcript scroll step; the view scrolls once per step.
+    pub scroll_seq: u64,
+    /// Lines the transcript is scrolled up from the newest row (0 = following).
+    pub scroll_offset: usize,
+    /// Rows arrived while scrolled up.
+    pub new_below: bool,
     pub screen: Screen,
     pub filter: String,
     pub selected: usize,
@@ -452,6 +458,12 @@ impl Nav {
         self.completion = (self.completion.0 + 1, slash::complete_text(name));
     }
 
+    /// Replaces the composer text (recall, or an empty composer after a
+    /// queue). The view applies it once per call.
+    pub fn set_text(&mut self, text: &str) {
+        self.completion = (self.completion.0 + 1, text.to_string());
+    }
+
     /// Performs one step and returns the core calls it implies. The host
     /// sends those and then sends the view its new [`NavView`].
     pub fn apply(&mut self, step: NavStep) -> Vec<UiAction> {
@@ -578,6 +590,9 @@ impl Nav {
             slash_hidden: self.slash_hidden,
             slash_selected: self.slash_sel,
             completion: self.completion.clone(),
+            scroll_seq: 0,
+            scroll_offset: 0,
+            new_below: false,
             portal: self.visible_portal().into_iter().cloned().collect(),
             portal_total: self.portal.len(),
             signin_error: self.signin_error.clone(),
@@ -882,14 +897,8 @@ mod portal_tests {
         assert_eq!(view.screen, Screen::SignIn);
         assert_eq!(view.signin_error.as_deref(), Some("wrong token"));
         let facts = KeyFacts { screen: Screen::SignIn, ..Default::default() };
-        assert_eq!(
-            route_key(Key::Char('x'), false, false, facts.clone(), ""),
-            Routed::Composer { queue: false }
-        );
-        assert_eq!(
-            route_key(Key::Enter, false, false, facts.clone(), ""),
-            Routed::Composer { queue: false }
-        );
+        assert_eq!(route_key(Key::Char('x'), false, false, facts.clone(), ""), Routed::Composer);
+        assert_eq!(route_key(Key::Enter, false, false, facts.clone(), ""), Routed::Composer);
         assert_eq!(route_key(Key::Escape, false, false, facts, ""), Routed::Ignored);
     }
 

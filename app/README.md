@@ -54,8 +54,18 @@ the server. If the connection drops, the app shows `disconnected`, retries
 every 2 s (doubling, capped at 30 s) and re-attaches to the same session.
 Esc or Ctrl+C leaves while it retries.
 
-Keys: Ctrl+C exits. Esc interrupts; y/a/n decide approvals; Enter sends,
-Alt+Enter queues; `/compact` compacts.
+Keys (the same on web, where the router sees DOM keys): Enter sends;
+Shift+Enter, Ctrl+J, or a line ending in `\` adds a line (the `\` is
+replaced by the line break). A pasted block arrives as one input and never
+submits. Alt+Enter queues. Esc denies a pending approval, else closes
+suggestions, else interrupts a running turn. y/a/n decide approvals. Up/Down
+recall sent inputs (last 200) on an empty or recalled one-line composer.
+PageUp/PageDown page the transcript; Home/End jump when the composer is
+empty; a scrolled view stays put and shows "new output below". Shift+Tab
+flips the approval mode. Ctrl+C interrupts a running turn; a second press
+within two seconds, or Ctrl+C when idle, quits. On exit the app prints the
+session id and the `modron-app-tui --session` command to resume it. The
+full table is `src/help.rs`; `/reasoning` shows the live reasoning tail.
 
 ## Web bundle
 

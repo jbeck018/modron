@@ -248,7 +248,7 @@ async function testPortalSignIn(browser, site) {
   const { context, page, errors } = await openIsolated(browser, site.base + '/app/');
   try {
     await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT });
-    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
     await page.keyboard.type('wrong-token');
     await page.waitForFunction(() => document.activeElement.value === 'wrong-token', null, { timeout: TIMEOUT });
     await page.waitForTimeout(300);
@@ -349,7 +349,7 @@ async function testLive(browser, base, wsUrl, ws) {
   if (!text.includes('connected')) throw new Error('connection label missing:\n' + text);
   // The composer is an <input>; wait for it to take focus and for the typed
   // text to land before Enter, so no key is lost to a page still settling.
-  await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+  await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
   await page.keyboard.type('hi');
   await page.waitForFunction(() => document.activeElement.value === 'hi', null, { timeout: TIMEOUT });
   // NSH applies the change on its next engine turn; Enter must come after it.
@@ -474,7 +474,7 @@ async function testShareLinkSubmit(browser, base) {
     watchErrors(page, errors);
     await page.goto(base + '/?url=' + encodeURIComponent(ws.url), { waitUntil: 'domcontentloaded' });
     await page.waitForFunction((s) => document.body.innerText.includes(s), STREAM, { timeout: TIMEOUT });
-    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
     await page.keyboard.type('hi');
     await page.waitForFunction(() => document.activeElement.value === 'hi', null, { timeout: TIMEOUT });
     await page.waitForTimeout(300);
@@ -482,6 +482,47 @@ async function testShareLinkSubmit(browser, base) {
     const frame = await waitFrame(ws, 'submit', (f) => f.task === 'hi');
     if (frame.session_id !== SESSION) throw new Error('submit carried ' + frame.session_id + ', want the adopted session');
     if (ws.received.includes('attach')) throw new Error('page sent an attach on a share link');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Shift+Enter adds a line without submitting; a later Enter submits both lines.
+async function testShiftEnterNewline(browser, base) {
+  const ws = await startWsServer({});
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.keyboard.type('hi');
+    await page.waitForFunction(() => document.activeElement.value === 'hi', null, { timeout: TIMEOUT });
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('Enter');
+    await page.keyboard.up('Shift');
+    await page.keyboard.type('there');
+    await page.waitForFunction(() => document.activeElement.value.includes('there'), null, { timeout: TIMEOUT });
+    await page.waitForTimeout(400);
+    if (ws.frames.some((f) => f.type === 'submit')) throw new Error('shift+enter submitted');
+    await page.keyboard.press('Enter');
+    const frame = await waitFrame(ws, 'submit', (f) => f.task === 'hi\nthere');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+    return frame;
+  } finally {
+    ws.close();
+  }
+}
+
+// Esc on a pending approval denies it (the third decision), it does not interrupt.
+async function testEscDeniesApproval(browser, base) {
+  const ws = await startWsServer({ after: [APPROVAL] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('allow once'), null, { timeout: TIMEOUT });
+    await page.keyboard.press('Escape');
+    const frame = await waitFrame(ws, 'approve');
+    if (frame.decision !== 'deny') throw new Error('esc decision was ' + frame.decision);
+    if (ws.frames.some((f) => f.type === 'interrupt')) throw new Error('esc interrupted instead of denying');
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     await page.close();
   } finally {
@@ -556,7 +597,7 @@ async function testEffortTapSendsConfig(browser, base) {
 async function testSlashSuggestions(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
-  await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+  await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
   await page.keyboard.type('/co');
   await page.waitForFunction(() => document.body.innerText.includes("/compact - compact this session"), null, { timeout: TIMEOUT });
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -568,7 +609,7 @@ async function testModelPickerSendsConfig(browser, base) {
   const ws = await startWsServer();
   try {
     const { page, errors } = await openLive(browser, base, ws);
-    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
     await page.keyboard.type('/model');
     await page.waitForFunction(() => document.activeElement.value === '/model', null, { timeout: TIMEOUT });
     await page.waitForTimeout(300);
@@ -612,7 +653,7 @@ async function testAgentSteerAndKill(browser, base) {
     const { page, errors } = await openLive(browser, base, ws);
     await page.waitForFunction(() => document.body.innerText.includes('[reviewer] running'), null, { timeout: TIMEOUT });
     await page.getByText('[reviewer] running', { exact: false }).first().click();
-    await page.waitForFunction(() => document.activeElement && document.activeElement.tagName === 'INPUT', null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
     await page.keyboard.type('focus tests');
     await page.waitForFunction(() => document.activeElement.value === 'focus tests', null, { timeout: TIMEOUT });
     await page.waitForTimeout(300);
@@ -662,6 +703,8 @@ async function testAgentSteerAndKill(browser, base) {
     ['(m) model picker row sends set_config with the model', () => testModelPickerSendsConfig(browser, base)],
     ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
+    ['(q) shift+enter adds a line and does not submit', () => testShiftEnterNewline(browser, base)],
+    ['(r) esc on a pending approval sends deny', () => testEscDeniesApproval(browser, base)],
   ];
   // The portal cases: each on its own site (its own state) and context.
   const portal = [

@@ -371,7 +371,13 @@ fn listen_keys(web: Rc<RefCell<Web>>) {
     };
     let on_key =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |event: web_sys::KeyboardEvent| {
-            let key = host_key(&event.key());
+            // Shift+Tab reaches the router as BackTab (the terminal host does the same).
+            let name = if event.key() == "Tab" && event.shift_key() {
+                "BackTab".to_string()
+            } else {
+                event.key()
+            };
+            let key = host_key(&name);
             let chord = event.ctrl_key() || event.meta_key() || event.alt_key();
             if web.borrow_mut().host.route(key, event.alt_key(), chord) {
                 event.prevent_default();
