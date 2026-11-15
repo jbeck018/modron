@@ -1447,7 +1447,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | C7 | Terminal target from the NSH app | TODO | Depends on S2 |
 | C8 | Phone packaging (iOS, Android) | BLOCKED | Needs macOS/Xcode and signing (owner) |
 | C9 | Delete modron-tui views, modron-desktop, mobile/app TSX, bridge inline viewer; rewrite the AGENTS.md parity contract | ACTIVE | C9a DONE (eedc245): modron-desktop removed, assets in app/assets. Open: TUI views, mobile/app TSX, bridge inline viewer, AGENTS.md contract rewrite - after C3/C7 |
-| C10 | CI: nsh check / nsh test; drop the gpui exclusion | TODO | |
+| C10 | CI: nsh check / nsh test; drop the gpui exclusion | ACTIVE | CI job `app` added: fmt, clippy, test and a wasm32 type-check in app/ (not yet seen green in CI). Open: build the web bundle and run web-test.js in CI (needs the nsh CLI and wasm-bindgen CLI), mobile/app |
 
 ## Log
 
@@ -1521,3 +1521,5 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   check clean; 34 tests pass; web-test.js 6 of 6 cases (lead reran
   twice). S2c: the size floor found is 11.4 MB stripped; the NSH
   runtime itself (nsh_core + nsh_base) is about 46 percent of it.
+- 2026-11-15: docs/PORTAL.md (owner sign-in, session directory, invite
+  links, linked GitHub, push) and the `app` CI job added.
