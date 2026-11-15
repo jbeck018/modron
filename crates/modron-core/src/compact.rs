@@ -124,6 +124,23 @@ fn render_events<'a>(
             SessionEvent::Task { text } => {
                 push_line(&mut out, &format!("[TASK] {text}"));
             }
+            SessionEvent::UserShell {
+                command,
+                output,
+                private,
+                ..
+            } => {
+                // A private `!!` command never reaches the summarizer.
+                if !private {
+                    push_line(
+                        &mut out,
+                        &format!(
+                            "[USER] {}",
+                            crate::engine::user_shell_transcript(command, output)
+                        ),
+                    );
+                }
+            }
             SessionEvent::Plan { items } => {
                 // The latest plan survives compaction as its status table
                 // (the run's tracked state must not vanish mid-goal).
@@ -221,7 +238,10 @@ pub fn split_older_tail(
 fn is_transcript_item(event: &SessionEvent) -> bool {
     matches!(
         event,
-        SessionEvent::Task { .. } | SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
+        SessionEvent::Task { .. }
+            | SessionEvent::Message { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::UserShell { private: false, .. }
     )
 }
 

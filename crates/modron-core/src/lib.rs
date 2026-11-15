@@ -1043,8 +1043,9 @@ pub struct UserShellOutcome {
     /// The bash tool reported an error (non-zero exit, timeout), or the
     /// command was refused.
     pub is_error: bool,
-    /// Why the command did not run: a deny rule, the approval mode, a
-    /// vetoing hook, a missing bash tool, or an empty command.
+    /// Why the command did not run: the deny list or a deny rule, a vetoing
+    /// hook, a missing bash tool, or an empty command. Approval mode, ask
+    /// rules and the plan phase never refuse a user-typed command.
     pub refused_reason: Option<String>,
 }
 

@@ -2001,6 +2001,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
         ctx: &ToolCtx,
+        user_typed: bool,
     ) -> Result<(ToolOutcome, bool)> {
         let hook_envs = |exit: Option<u8>| {
             let mut envs: Vec<(String, String)> = vec![
@@ -2036,7 +2037,7 @@ impl Engine {
                 call_id: call_id.clone(),
             });
         }
-        let (executed, ran) = self.execute_tool(session_id, call, ctx).await;
+        let (executed, ran) = self.execute_tool(session_id, call, ctx, user_typed).await;
         if let Some(sink) = self.config.on_tool_event.as_ref() {
             sink(ToolActivity::Done {
                 name: call.name.clone(),
@@ -2070,6 +2071,24 @@ impl Engine {
     fn admission_for_call(&self, name: &str, args: &serde_json::Value) -> Admission {
         let verdict = self.config.approvals.rules.evaluate(name, args);
         self.admission_under(name, verdict)
+    }
+
+    /// The only gates a user-typed `!` / `!!` command passes (decision 2).
+    /// The owner's own hard limits: the deny list and a DENY permission
+    /// rule (checked against each `;` / `&&` / `|` segment too, via
+    /// `RuleSet::evaluate`). Approval mode, ASK and ALLOW rules, the plan
+    /// phase and the approver restrict the model, not the user, so they are
+    /// not consulted here. Returns the refusal message, or `None` to run.
+    fn user_shell_refusal(&self, name: &str, args: &serde_json::Value) -> Option<String> {
+        if self.config.approvals.deny.iter().any(|entry| entry == name) {
+            return Some(format!("tool `{name}` denied by configuration (--deny)"));
+        }
+        match self.config.approvals.rules.evaluate(name, args) {
+            Some(verdict) if verdict.effect == RuleEffect::Deny => {
+                Some(format!("tool `{name}` denied by rule `{}`", verdict.rule))
+            }
+            _ => None,
+        }
     }
 
     fn admission_under(&self, name: &str, verdict: Option<Verdict>) -> Admission {
@@ -2178,6 +2197,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
         ctx: &ToolCtx,
+        user_typed: bool,
     ) -> (ToolOutcome, bool) {
         let Some(tool) = self.tools.get(&call.name).cloned() else {
             let available = self
@@ -2196,7 +2216,17 @@ impl Engine {
             );
         };
 
-        match self.admission_for_call(&call.name, &call.arguments) {
+        // A user-typed command is never prompted: it passes only the
+        // owner's hard limits (see `user_shell_refusal`).
+        let admission = if user_typed {
+            match self.user_shell_refusal(&call.name, &call.arguments) {
+                Some(message) => Admission::Refused(message),
+                None => Admission::Run,
+            }
+        } else {
+            self.admission_for_call(&call.name, &call.arguments)
+        };
+        match admission {
             Admission::Run => {}
             Admission::Ask => {
                 // Ask mode with an interactive approver (Phase-1c I2): a
@@ -2237,21 +2267,24 @@ impl Engine {
         (outcome, true)
     }
 
-    /// Run one user-issued `!command` in the session's workspace (PARITY-C).
+    /// Run one user-issued `!command` (or private `!!command`) in the
+    /// session's workspace (PARITY-C, decision 1 and 2 of PLAN.md 10.2a).
     ///
-    /// The command is a `bash` call built from the user's text and taken
-    /// through the SAME path as a model-issued call: the pre_tool hook, the
-    /// deny list, permission rules, approval mode, Plan phase, the
-    /// interactive approver on Ask, the pre-mutation checkpoint, the sandbox
-    /// policy, the bash timeout and output cap. A user is never more
-    /// privileged than the model. When the command runs, its output is
-    /// persisted as a `Task` event (see [`user_shell_transcript`]), so the
-    /// next turn's transcript carries it. A refused command persists nothing.
+    /// The command is a `bash` call built from the user's text. It runs
+    /// through the sandbox policy, the bash timeout, the output cap, the
+    /// pre_tool and post_tool hooks and the pre-mutation checkpoint, like a
+    /// model call. It does NOT go through the approval gate: no approval
+    /// mode, approver, ASK rule or plan phase applies. It is refused only by
+    /// the owner's hard limits (see [`Engine::user_shell_refusal`]), a
+    /// vetoing pre_tool hook, a missing bash tool or an empty command. A
+    /// refused command persists nothing. A command that ran is persisted as
+    /// a `UserShell` event; `private` ones are never sent to the model.
     /// The finish gate is not armed: no model run is in progress.
     pub async fn run_user_shell(
         &self,
         session_id: SessionId,
         command: &str,
+        private: bool,
     ) -> Result<UserShellOutcome> {
         let command = command.trim();
         if command.is_empty() {
@@ -2262,10 +2295,16 @@ impl Engine {
                 "no `bash` tool is registered; shell passthrough needs it",
             ));
         }
+        let args = serde_json::json!({ "command": command });
+        // Checked before any hook runs, so a refused command never reaches
+        // the hook either. `execute_tool` repeats the same check.
+        if let Some(reason) = self.user_shell_refusal("bash", &args) {
+            return Ok(UserShellOutcome::refused(reason));
+        }
         let call = ToolCall {
             id: format!("user-shell-{}", uuid::Uuid::new_v4()),
             name: "bash".into(),
-            arguments: serde_json::json!({ "command": command }),
+            arguments: args,
         };
         let ctx = ToolCtx {
             sandbox: self.config.sandbox,
@@ -2273,10 +2312,13 @@ impl Engine {
             engine: Some(Arc::new(self.clone())),
             session_id: Some(session_id),
         };
-        // The same entry a model-issued call takes: hooks, then the gate
-        // (inside execute_tool), then the tool. `ran` is false for every
-        // refusal, so only a command that really executed is persisted.
-        let (outcome, ran) = match self.execute_tool_with_hooks(session_id, &call, &ctx).await {
+        // `ran` is false for every refusal (a pre_tool veto, the gate, a
+        // failed checkpoint), so only a command that really executed is
+        // persisted.
+        let (outcome, ran) = match self
+            .execute_tool_with_hooks(session_id, &call, &ctx, true)
+            .await
+        {
             Ok(pair) => pair,
             Err(err) => (ToolOutcome::err(err.to_string()), false),
         };
@@ -2287,8 +2329,11 @@ impl Engine {
         self.store
             .append(
                 session_id,
-                &SessionEvent::Task {
-                    text: user_shell_transcript(command, &output),
+                &SessionEvent::UserShell {
+                    command: command.to_string(),
+                    output: output.clone(),
+                    is_error: outcome.is_error,
+                    private,
                 },
             )
             .await?;
@@ -2951,7 +2996,7 @@ impl Engine {
                 tracing::warn!(tool = %call.name, "speculative placeholder left by a panicked task - re-executing");
             }
         }
-        self.execute_tool_with_hooks(session_id, call, ctx)
+        self.execute_tool_with_hooks(session_id, call, ctx, false)
             .await
             .unwrap_or_else(|err| (ToolOutcome::err(err.to_string()), false))
     }
@@ -3219,7 +3264,10 @@ fn compact_state_message(summary: &str) -> Message {
 fn is_transcript_item(event: &SessionEvent) -> bool {
     matches!(
         event,
-        SessionEvent::Task { .. } | SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
+        SessionEvent::Task { .. }
+            | SessionEvent::Message { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::UserShell { private: false, .. }
     )
 }
 
@@ -3316,6 +3364,18 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
         match event {
             SessionEvent::TurnTrace { .. } => {}
             SessionEvent::Task { text } => messages.push(Message::user(text.clone())),
+            SessionEvent::UserShell {
+                command,
+                output,
+                private,
+                ..
+            } => {
+                // A private `!!` command is shown to the user only: it is
+                // skipped here, so it never reaches a TurnRequest.
+                if !private {
+                    messages.push(Message::user(user_shell_transcript(command, output)));
+                }
+            }
             SessionEvent::Message { message, .. } => messages.push(message.clone()),
             SessionEvent::ToolResult { call_id, outcome } => {
                 messages.push(Message::tool_result(call_id.clone(), outcome));
@@ -6872,7 +6932,8 @@ mod user_shell_tests {
     }
 
     /// An engine with a fake `bash` tool (unless `with_bash` is false) and
-    /// an approver that answers `approve`.
+    /// an approver that answers `approve`. The approver counts its calls, so
+    /// a test can prove a user-typed command never asks.
     async fn fixture(
         config: EngineConfig,
         output: &str,
@@ -6939,6 +7000,24 @@ mod user_shell_tests {
         }
     }
 
+    async fn persisted_shell(f: &Fixture) -> Vec<(String, String, bool, bool)> {
+        f.store
+            .load(f.session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::UserShell {
+                    command,
+                    output,
+                    is_error,
+                    private,
+                } => Some((command, output, is_error, private)),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn persisted_tasks(f: &Fixture) -> Vec<String> {
         f.store
             .load(f.session)
@@ -6959,7 +7038,7 @@ mod user_shell_tests {
         let f = fixture(config, "hello\nexit code: 0", true, true).await;
         let outcome = f
             .engine
-            .run_user_shell(f.session, "  echo hello  ")
+            .run_user_shell(f.session, "  echo hello  ", false)
             .await
             .unwrap();
         assert!(outcome.allowed);
@@ -6972,12 +7051,34 @@ mod user_shell_tests {
             *f.sandbox_seen.lock().unwrap(),
             Some(SandboxPolicy::Bubblewrap)
         );
-        // Persisted as the labelled user message the next turn carries.
+        // Persisted as a shared UserShell event (decision 1).
         assert_eq!(
-            persisted_tasks(&f).await,
-            vec![user_shell_transcript("echo hello", "hello\nexit code: 0")]
+            persisted_shell(&f).await,
+            vec![(
+                "echo hello".to_string(),
+                "hello\nexit code: 0".to_string(),
+                false,
+                false
+            )]
         );
+        assert!(persisted_tasks(&f).await.is_empty());
         assert_eq!(f.asked.load(Ordering::SeqCst), 0, "ApproveAll never asks");
+    }
+
+    #[tokio::test]
+    async fn private_command_runs_and_persists_as_private() {
+        let f = fixture(approve_all(), "secret=1", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "env", true)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            persisted_shell(&f).await,
+            vec![("env".to_string(), "secret=1".to_string(), false, true)]
+        );
     }
 
     #[tokio::test]
@@ -6991,7 +7092,7 @@ mod user_shell_tests {
         .await;
         let outcome = f
             .engine
-            .run_user_shell(f.session, "rm -rf /tmp/x")
+            .run_user_shell(f.session, "rm -rf /tmp/x", false)
             .await
             .unwrap();
         assert!(!outcome.allowed);
@@ -7000,57 +7101,92 @@ mod user_shell_tests {
             Some("tool `bash` denied by rule `deny bash(rm -rf*)`")
         );
         assert_eq!(f.runs.load(Ordering::SeqCst), 0);
-        assert!(persisted_tasks(&f).await.is_empty());
+        assert!(persisted_shell(&f).await.is_empty());
     }
 
     #[tokio::test]
-    async fn ask_rule_goes_to_the_approver_and_respects_a_denial() {
+    async fn compound_command_hitting_a_deny_rule_in_a_later_segment_is_refused() {
         let f = fixture(
-            with_rules(ApprovalMode::ApproveAll, RuleEffect::Ask, "bash(*)"),
+            with_rules(ApprovalMode::ApproveAll, RuleEffect::Deny, "bash(rm -rf*)"),
             "out",
+            true,
+            true,
+        )
+        .await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls && rm -rf /tmp/x", false)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed, "{outcome:?}");
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        assert!(persisted_shell(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deny_list_refuses_the_bash_tool() {
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                deny: vec!["bash".into()],
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let f = fixture(config, "out", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.refused_reason.as_deref(),
+            Some("tool `bash` denied by configuration (--deny)")
+        );
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        assert!(persisted_shell(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_rule_runs_without_asking_the_approver() {
+        let f = fixture(
+            with_rules(ApprovalMode::Ask, RuleEffect::Ask, "bash(*)"),
+            "listing",
             true,
             false,
         )
         .await;
-        let outcome = f.engine.run_user_shell(f.session, "ls").await.unwrap();
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
         assert_eq!(
             f.asked.load(Ordering::SeqCst),
-            1,
-            "the rule forces a prompt"
+            0,
+            "the owner is never prompted"
         );
-        assert!(!outcome.allowed);
-        assert_eq!(f.runs.load(Ordering::SeqCst), 0, "a denial never runs");
-        assert!(persisted_tasks(&f).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn ask_rule_runs_when_the_approver_allows() {
-        let f = fixture(
-            with_rules(ApprovalMode::ApproveAll, RuleEffect::Ask, "bash(*)"),
-            "listing",
-            true,
-            true,
-        )
-        .await;
-        let outcome = f.engine.run_user_shell(f.session, "ls").await.unwrap();
-        assert_eq!(f.asked.load(Ordering::SeqCst), 1);
-        assert!(outcome.allowed);
         assert_eq!(f.runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn plan_phase_refuses_even_under_approve_all() {
+    async fn plan_phase_does_not_block_the_owners_command() {
         let mut config = approve_all();
         config.phase = Phase::Plan;
         let f = fixture(config, "out", true, true).await;
-        let outcome = f.engine.run_user_shell(f.session, "ls").await.unwrap();
-        assert!(!outcome.allowed);
-        assert_eq!(outcome.refused_reason.as_deref(), Some(PLAN_PHASE_REFUSAL));
-        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed, "{outcome:?}");
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn deny_mode_refuses_the_command() {
+    async fn deny_mode_does_not_block_the_owners_command() {
         let config = EngineConfig {
             approvals: ApprovalPolicy {
                 mode: ApprovalMode::Deny,
@@ -7059,10 +7195,34 @@ mod user_shell_tests {
             ..EngineConfig::default()
         };
         let f = fixture(config, "out", true, true).await;
-        let outcome = f.engine.run_user_shell(f.session, "ls").await.unwrap();
-        assert!(!outcome.allowed);
-        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
         assert_eq!(f.asked.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ask_mode_runs_the_command_without_a_prompt() {
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::Ask,
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let f = fixture(config, "out", true, false).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(f.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -7070,7 +7230,11 @@ mod user_shell_tests {
         let mut config = approve_all();
         config.hooks.pre_tool = Some("exit 1".into());
         let f = fixture(config, "out", true, true).await;
-        let outcome = f.engine.run_user_shell(f.session, "ls").await.unwrap();
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
         assert!(!outcome.allowed);
         assert!(
             outcome
@@ -7081,13 +7245,58 @@ mod user_shell_tests {
             "{outcome:?}"
         );
         assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        assert!(persisted_shell(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn private_and_shared_output_stay_out_of_model_context_and_compaction() {
+        let f = fixture(approve_all(), "TOPSECRET", true, true).await;
+        f.engine
+            .run_user_shell(f.session, "cat .env", true)
+            .await
+            .unwrap();
+        // A shared entry with its own output (the fake bash answers the same
+        // text to every call, so the shared one is seeded directly).
+        f.store
+            .append(
+                f.session,
+                &SessionEvent::UserShell {
+                    command: "git status".into(),
+                    output: "On branch main".into(),
+                    is_error: false,
+                    private: false,
+                },
+            )
+            .await
+            .unwrap();
+        let events = f.store.load(f.session).await.unwrap();
+
+        // The model's transcript (what every TurnRequest is built from).
+        let transcript = reconstruct_transcript(&events, 0);
+        let rendered: String = transcript.iter().map(|m| m.content.as_str()).collect();
+        assert!(!rendered.contains("cat .env"), "{rendered}");
+        assert!(!rendered.contains("TOPSECRET"), "{rendered}");
+        assert!(
+            rendered.contains("$ git status\nOn branch main"),
+            "{rendered}"
+        );
+
+        // The compaction summarizer's input.
+        let older = crate::compact::older_transcript_text(&events, 0);
+        assert!(!older.contains("cat .env"), "{older}");
+        assert!(!older.contains("TOPSECRET"), "{older}");
+        assert!(older.contains("On branch main"), "{older}");
     }
 
     #[tokio::test]
     async fn output_is_capped_keeping_the_tail() {
         let big = format!("{}TAILMARK", "x".repeat(50_000));
         let f = fixture(approve_all(), &big, true, true).await;
-        let outcome = f.engine.run_user_shell(f.session, "cat big").await.unwrap();
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "cat big", false)
+            .await
+            .unwrap();
         assert!(outcome.allowed);
         assert!(
             outcome.output.len() <= USER_SHELL_MAX_BYTES + 32,
@@ -7101,12 +7310,20 @@ mod user_shell_tests {
     #[tokio::test]
     async fn missing_bash_tool_and_empty_command_are_refused() {
         let f = fixture(approve_all(), "out", false, true).await;
-        let outcome = f.engine.run_user_shell(f.session, "ls").await.unwrap();
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
         assert!(!outcome.allowed);
         assert!(outcome.refused_reason.unwrap().contains("no `bash` tool"));
 
         let f = fixture(approve_all(), "out", true, true).await;
-        let outcome = f.engine.run_user_shell(f.session, "   ").await.unwrap();
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "   ", true)
+            .await
+            .unwrap();
         assert!(!outcome.allowed);
         assert_eq!(
             outcome.refused_reason.as_deref(),

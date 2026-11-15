@@ -469,6 +469,13 @@ pub fn entry_lines(entry: &TranscriptEntry) -> Vec<String> {
         TranscriptEntry::Assistant { text } => vec![text.clone()],
         TranscriptEntry::ToolSummary { line, .. } => vec![line.clone()],
         TranscriptEntry::Swarm { lines } => lines.clone(),
+        // `$ <command>` then the output rows, through the shared formatter.
+        TranscriptEntry::Shell {
+            command,
+            lines,
+            private,
+            ..
+        } => modron_view::shell_rows(command, lines, *private),
         TranscriptEntry::Model { model, reason } => vec![format!("model: {model} ({reason})")],
         TranscriptEntry::Usage { usage, .. } => {
             // Same arithmetic and words as the TUI's per-turn usage note
@@ -1707,6 +1714,24 @@ mod tests {
         let snap = ViewModelSnapshot::from_vm(&vm);
         assert_eq!(snap.status_line, "gpt-5.6-sol · 400 tok · cache 33% · yolo");
         assert_eq!(snap.running_label, "idle");
+    }
+
+    #[test]
+    fn shell_entries_render_through_the_shared_rows() {
+        let rows = entry_lines(&TranscriptEntry::Shell {
+            command: "ls".into(),
+            lines: vec!["a.rs".into()],
+            is_error: false,
+            private: false,
+        });
+        assert_eq!(rows, vec!["$ ls", "a.rs"]);
+        let rows = entry_lines(&TranscriptEntry::Shell {
+            command: "env".into(),
+            lines: vec![],
+            is_error: false,
+            private: true,
+        });
+        assert_eq!(rows, vec!["$ env [private]"]);
     }
 
     #[test]

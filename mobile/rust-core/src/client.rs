@@ -813,7 +813,16 @@ impl RemoteClient {
     /// (labelled output, or a refusal) arrives as a note or an error. An
     /// empty command and a missing session fail here, nothing is sent.
     pub fn shell(&self, command: impl Into<String>) -> Result<(), ClientError> {
-        let command = command.into();
+        self.send_shell(command.into(), false)
+    }
+
+    /// Run a `!!` command: shown in the transcript, never sent to the model
+    /// (see [`parse_shell_input`] for the composer rule that picks this).
+    pub fn shell_private(&self, command: impl Into<String>) -> Result<(), ClientError> {
+        self.send_shell(command.into(), true)
+    }
+
+    fn send_shell(&self, command: String, private: bool) -> Result<(), ClientError> {
         if command.trim().is_empty() {
             return Err(ClientError::Request("usage: !<shell command>".into()));
         }
@@ -823,6 +832,7 @@ impl RemoteClient {
             Payload::Shell {
                 session_id,
                 command,
+                private,
             },
         ))
     }
@@ -1176,6 +1186,19 @@ impl RemoteClient {
                 strong: strong.into(),
                 cheap_fallback: cheap_fallback.map(Into::into),
                 strong_fallback: strong_fallback.map(Into::into),
+            },
+        ))
+    }
+
+    /// Save a default model and provider for FUTURE sessions on the server
+    /// (written to its config.toml). The current session keeps its model.
+    /// Answered by a correlated note, or an error for a refused pair.
+    pub fn persist_default_model(&self, model: &str, provider: &str) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::PersistDefaultModel {
+                model: model.into(),
+                provider: provider.into(),
             },
         ))
     }
@@ -1652,6 +1675,33 @@ fn apply_config(vm: &mut SessionViewModel, patch: &ConfigPatch) {
     if let Some(rules) = &patch.rules {
         vm.rules = rules.clone();
     }
+}
+
+/// A composer line read as a shell command (decision 1, PLAN.md 10.2a).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellInput {
+    /// The command, trimmed. Empty when the user typed only `!` or `!!`.
+    pub command: String,
+    /// `true` for `!!`: the output is shown but never reaches the model.
+    pub private: bool,
+}
+
+/// The one composer rule for shell input, shared by every client. Text
+/// starting with `!!` is a private command, `!` is a shared one; the rest is
+/// trimmed. Anything else is not shell input (`None`). An empty command is
+/// `Some` with an empty `command`, so the caller can show the usage line.
+pub fn parse_shell_input(text: &str) -> Option<ShellInput> {
+    if let Some(rest) = text.strip_prefix("!!") {
+        return Some(ShellInput {
+            command: rest.trim().to_string(),
+            private: true,
+        });
+    }
+    let rest = text.strip_prefix('!')?;
+    Some(ShellInput {
+        command: rest.trim().to_string(),
+        private: false,
+    })
 }
 
 #[cfg(test)]
@@ -2131,5 +2181,43 @@ mod tests {
         // The flag only relaxes ws://; a malformed URL is still refused.
         assert!(validate_ws_url("ws://", true).is_err());
         assert!(validate_ws_url("http://example.com", true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shell_input_tests {
+    use super::*;
+
+    fn shell(command: &str, private: bool) -> Option<ShellInput> {
+        Some(ShellInput {
+            command: command.into(),
+            private,
+        })
+    }
+
+    #[test]
+    fn single_bang_is_a_shared_command_and_double_bang_is_private() {
+        assert_eq!(parse_shell_input("!ls -la"), shell("ls -la", false));
+        assert_eq!(parse_shell_input("!!env"), shell("env", true));
+        assert_eq!(
+            parse_shell_input("!  cargo test  "),
+            shell("cargo test", false)
+        );
+        assert_eq!(parse_shell_input("!! pwd "), shell("pwd", true));
+    }
+
+    #[test]
+    fn bare_bangs_parse_to_an_empty_command_for_the_usage_line() {
+        assert_eq!(parse_shell_input("!"), shell("", false));
+        assert_eq!(parse_shell_input("!!"), shell("", true));
+        assert_eq!(parse_shell_input("!   "), shell("", false));
+    }
+
+    #[test]
+    fn anything_else_is_not_shell_input() {
+        assert_eq!(parse_shell_input("ls"), None);
+        assert_eq!(parse_shell_input(""), None);
+        assert_eq!(parse_shell_input(" !ls"), None);
+        assert_eq!(parse_shell_input("fix the ! bug"), None);
     }
 }

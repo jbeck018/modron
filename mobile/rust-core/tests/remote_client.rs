@@ -2377,9 +2377,11 @@ async fn shell_needs_an_attached_session_and_surfaces_the_server_refusal() {
             Payload::Shell {
                 session_id,
                 command,
+                private,
             } => {
                 assert_eq!(session_id, session);
                 assert_eq!(command, "ls -la");
+                assert!(!private, "a plain `!` command is shared");
             }
             other => panic!("expected shell, got {other:?}"),
         }
@@ -2454,4 +2456,52 @@ async fn startup_flags_send_their_config_patches() {
     assert_eq!(patches[4].deny, Some(Vec::new()), "an empty list clears");
     // Each patch carries only its own field.
     assert!(patches[0].goal.is_none() && patches[0].sandbox.is_none());
+}
+
+#[tokio::test]
+async fn shell_private_and_persist_default_model_send_their_frames() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let attach = read_frame(&mut ws).await;
+        assert!(matches!(attach.payload, Payload::Attach { .. }));
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, Vec::new(), LiveState::default()),
+        )
+        .await;
+        match read_frame(&mut ws).await.payload {
+            Payload::Shell {
+                session_id,
+                command,
+                private,
+            } => {
+                assert_eq!(session_id, session);
+                assert_eq!(command, "env");
+                assert!(private, "`!!` is sent as a private command");
+            }
+            other => panic!("expected shell, got {other:?}"),
+        }
+        match read_frame(&mut ws).await.payload {
+            Payload::PersistDefaultModel { model, provider } => {
+                assert_eq!(model, "gpt-5.6-sol");
+                assert_eq!(provider, "openai");
+            }
+            other => panic!("expected persist_default_model, got {other:?}"),
+        }
+        let _ = ws.next().await;
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    client.shell_private("env").expect("private shell frame");
+    client
+        .persist_default_model("gpt-5.6-sol", "openai")
+        .expect("persist frame");
+    server.await.expect("server task");
+    client.disconnect();
 }

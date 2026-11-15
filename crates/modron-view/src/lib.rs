@@ -75,6 +75,24 @@ impl ToolEvent {
 }
 
 /// `2.1 KB`-style byte sizes for tool panels and summaries.
+/// The shared marker word on a private (`!!`) shell row. The row is shown
+/// in every client but never sent to the model.
+pub const PRIVATE_SHELL_MARK: &str = "private";
+
+/// The shared row text of a shell entry: the `$ <command>` header, then one
+/// row per output line. A private entry's header carries
+/// [`PRIVATE_SHELL_MARK`]. Every client renders shell rows through this.
+pub fn shell_rows(command: &str, lines: &[String], private: bool) -> Vec<String> {
+    let header = if private {
+        format!("$ {command} [{PRIVATE_SHELL_MARK}]")
+    } else {
+        format!("$ {command}")
+    };
+    std::iter::once(header)
+        .chain(lines.iter().cloned())
+        .collect()
+}
+
 pub fn human_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -466,6 +484,15 @@ pub enum TranscriptEntry {
     },
     /// A committed subagent-swarm block.
     Swarm { lines: Vec<String> },
+    /// A `!` / `!!` shell command the user ran (not a model tool call).
+    /// `lines` are the output lines; `private` marks a `!!` command that
+    /// never reaches the model ([`shell_rows`] is the shared row text).
+    Shell {
+        command: String,
+        lines: Vec<String>,
+        is_error: bool,
+        private: bool,
+    },
     /// Model-selection note.
     Model { model: String, reason: String },
     /// Usage accounting for one turn.
@@ -577,6 +604,20 @@ impl ReplayFolder {
                 self.flush_tools();
                 self.entries
                     .push(TranscriptEntry::Task { text: text.clone() });
+            }
+            SessionEvent::UserShell {
+                command,
+                output,
+                is_error,
+                private,
+            } => {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Shell {
+                    command: command.clone(),
+                    lines: output.lines().map(str::to_string).collect(),
+                    is_error: *is_error,
+                    private: *private,
+                });
             }
             SessionEvent::Plan { items } => {
                 self.flush_tools();
@@ -1055,6 +1096,7 @@ mod tests {
                 TranscriptEntry::Assistant { .. } => "assistant",
                 TranscriptEntry::ToolSummary { .. } => "tools",
                 TranscriptEntry::Swarm { .. } => "swarm",
+                TranscriptEntry::Shell { .. } => "shell",
                 TranscriptEntry::Model { .. } => "model",
                 TranscriptEntry::Usage { .. } => "usage",
                 TranscriptEntry::Compaction { .. } => "compaction",
@@ -1290,5 +1332,67 @@ mod tests {
             4,
             "one row per Review event after the message"
         );
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn shell_rows_show_header_then_output_with_the_private_marker() {
+        let lines = vec!["hello".to_string(), "exit code: 0".to_string()];
+        assert_eq!(
+            shell_rows("echo hello", &lines, false),
+            vec!["$ echo hello", "hello", "exit code: 0"]
+        );
+        assert_eq!(
+            shell_rows("echo hello", &lines, true),
+            vec!["$ echo hello [private]", "hello", "exit code: 0"]
+        );
+        assert_eq!(shell_rows("true", &[], false), vec!["$ true"]);
+    }
+
+    #[test]
+    fn replay_turns_a_user_shell_event_into_a_shell_entry() {
+        let events = vec![
+            SessionEvent::UserShell {
+                command: "ls".into(),
+                output: "a.rs\nb.rs\n".into(),
+                is_error: false,
+                private: false,
+            },
+            SessionEvent::UserShell {
+                command: "cat .env".into(),
+                output: "SECRET=1".into(),
+                is_error: true,
+                private: true,
+            },
+        ];
+        let entries = replay(&events);
+        assert_eq!(
+            entries,
+            vec![
+                TranscriptEntry::Shell {
+                    command: "ls".into(),
+                    lines: vec!["a.rs".into(), "b.rs".into()],
+                    is_error: false,
+                    private: false,
+                },
+                TranscriptEntry::Shell {
+                    command: "cat .env".into(),
+                    lines: vec!["SECRET=1".into()],
+                    is_error: true,
+                    private: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn old_task_encoded_shell_text_still_replays_as_a_task() {
+        let text = "Shell command run by the user with `!` (not a model tool call):\n$ ls\nx";
+        let entries = replay(&[SessionEvent::Task { text: text.into() }]);
+        assert!(matches!(&entries[..], [TranscriptEntry::Task { .. }]));
     }
 }

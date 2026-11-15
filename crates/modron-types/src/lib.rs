@@ -236,6 +236,20 @@ pub enum SessionEvent {
     Task {
         text: String,
     },
+    /// A shell command the user ran with `!` or `!!` (not a model tool
+    /// call). A non-private entry joins the model context as a labelled user
+    /// message. A `private` entry (`!!`) is shown in the transcript but never
+    /// reaches the model, the compaction summary, or any other context
+    /// builder. Additive variant: older logs carry such commands as `Task`
+    /// text and load unchanged.
+    UserShell {
+        command: String,
+        output: String,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default)]
+        private: bool,
+    },
     Message {
         parent_id: Option<u64>,
         message: Message,

@@ -283,8 +283,9 @@ const SERVER_WIDE: &str = "this request is not available through a remote-contro
 /// Refused for every role: list / delete / create sessions and tasks,
 /// submit that starts a new session or names another one, attach to another
 /// session, merge_task (it writes the repository's base branch), automations,
-/// remote_control, publish_page, auth_start, auth_set_key and persist_router
-/// (server-wide settings and credentials).
+/// remote_control, publish_page, auth_start, auth_set_key, persist_router and
+/// persist_default_model (server-wide settings and credentials). Shell is
+/// Owner-only: the owner's own `!` command, never a guest's.
 pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTier, &'static str> {
     use RelayTier::*;
     let own = |id: &SessionId| *id == scope;
@@ -345,7 +346,8 @@ pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTie
         | Payload::PublishPage { .. }
         | Payload::AuthStart { .. }
         | Payload::AuthSetKey { .. }
-        | Payload::PersistRouter { .. } => Err(SERVER_WIDE),
+        | Payload::PersistRouter { .. }
+        | Payload::PersistDefaultModel { .. } => Err(SERVER_WIDE),
         Payload::Welcome { .. }
         | Payload::Snapshot { .. }
         | Payload::Event { .. }
@@ -757,6 +759,9 @@ async fn dispatch_frame(
                 reply(request_id, None, Payload::AuthProviders { rows }),
             );
         }
+        Payload::PersistDefaultModel { model, provider } => {
+            handle_persist_default_model(state, ctx, request_id, model, provider);
+        }
         Payload::PersistRouter {
             cheap,
             strong,
@@ -889,6 +894,7 @@ async fn dispatch_frame(
         Payload::Shell {
             session_id,
             command,
+            private,
         } => {
             if command.trim().is_empty() {
                 send(ctx, error(request_id, "usage: !<shell command>"));
@@ -912,10 +918,9 @@ async fn dispatch_frame(
                     ),
                     Some(handle) => {
                         let engine = handle.engine_cell().clone();
-                        let run: crate::hub::ShellRunFuture =
-                            Box::pin(
-                                async move { engine.run_user_shell(session_id, &command).await },
-                            );
+                        let run: crate::hub::ShellRunFuture = Box::pin(async move {
+                            engine.run_user_shell(session_id, &command, private).await
+                        });
                         match state.hub.start_shell_run(session_id, run) {
                             Err(message) => send(ctx, error(request_id, message)),
                             Ok(()) => {
@@ -1765,6 +1770,65 @@ async fn handle_auth_set_key(
     }
 }
 
+/// Why a default model/provider pair cannot be saved, or `None` when it can.
+/// Both strings must be non-empty and free of control characters, and the
+/// provider must be one the server knows: a provider in the auth registry
+/// or a provider a catalog model names (the same sources `models_req` and
+/// `auth_set_key` read).
+pub(crate) fn default_model_problem(model: &str, provider: &str) -> Option<String> {
+    for (label, value) in [("model", model), ("provider", provider)] {
+        if value.trim().is_empty() {
+            return Some(format!("default {label} is empty"));
+        }
+        if value.chars().any(char::is_control) {
+            return Some(format!("default {label} contains a control character"));
+        }
+    }
+    let registered = modron_core::auth::provider_registry()
+        .iter()
+        .any(|info| info.provider_id == provider);
+    let catalogued = modron_router::catalog()
+        .iter()
+        .any(|info| info.provider == provider);
+    if registered || catalogued {
+        None
+    } else {
+        Some(format!("unknown provider {provider}"))
+    }
+}
+
+/// PersistDefaultModel (decision 3, PLAN.md 10.2a): write the server's
+/// default model and provider to config.toml, then apply them to the engine
+/// template future sessions start from. The current session is untouched.
+fn handle_persist_default_model(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    model: String,
+    provider: String,
+) {
+    if let Some(problem) = default_model_problem(&model, &provider) {
+        send(ctx, error(request_id, problem));
+        return;
+    }
+    match crate::tasks::persist_default_model_toml(&model, &provider) {
+        Ok(()) => {
+            state.hub.apply_default_model(&model, &provider);
+            send(
+                ctx,
+                reply(
+                    request_id,
+                    None,
+                    Payload::Note {
+                        text: format!("default model saved: {model} ({provider}) for new sessions"),
+                    },
+                ),
+            );
+        }
+        Err(e) => send(ctx, error(request_id, e.to_string())),
+    }
+}
+
 async fn handle_persist_router(
     state: &Arc<ServerState>,
     ctx: &mut ConnCtx,
@@ -2113,6 +2177,7 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::AuthSetKey { .. } => "auth_set_key",
         Payload::AuthProviders { .. } | Payload::AuthProvidersReq {} => "auth_providers",
         Payload::PersistRouter { .. } => "persist_router",
+        Payload::PersistDefaultModel { .. } => "persist_default_model",
         Payload::CreateTask { .. } => "create_task",
         Payload::GetTaskStatus { .. } => "get_task_status",
         Payload::RemoteControl { .. } => "remote_control",
@@ -2302,7 +2367,7 @@ mod tests {
     }
 
     /// PARITY-C: `Shell` on an idle session runs the command in the run
-    /// slot, persists its output as a user Task event, and ends with the
+    /// slot, persists its output as a shared UserShell event, and ends with the
     /// normal TurnDone frame and no Notify.
     #[tokio::test]
     async fn shell_on_an_idle_session_runs_and_ends_with_turn_done() {
@@ -2322,6 +2387,7 @@ mod tests {
                 Payload::Shell {
                     session_id: id,
                     command: "echo hi".into(),
+                    private: false,
                 },
             ),
         )
@@ -2331,24 +2397,23 @@ mod tests {
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!state.hub.handle(&id).unwrap().is_busy(), "slot released");
 
-        let tasks: Vec<String> = state
+        let shell: Vec<modron_core::SessionEvent> = state
             .store
             .load(id)
             .await
             .unwrap()
             .into_iter()
-            .filter_map(|event| match event {
-                modron_core::SessionEvent::Task { text } => Some(text),
-                _ => None,
-            })
+            .filter(|event| matches!(event, modron_core::SessionEvent::UserShell { .. }))
             .collect();
-        assert_eq!(
-            tasks,
-            vec![modron_core::engine::user_shell_transcript(
-                "echo hi",
-                "hi\nexit code: 0"
-            )]
-        );
+        assert!(matches!(
+            &shell[..],
+            [modron_core::SessionEvent::UserShell {
+                command,
+                output,
+                private: false,
+                ..
+            }] if command == "echo hi" && output == "hi\nexit code: 0"
+        ));
     }
 
     /// A `!command` the approval policy denies ends its run with a Note
@@ -2374,6 +2439,7 @@ mod tests {
                 Payload::Shell {
                     session_id: id,
                     command: "ls".into(),
+                    private: false,
                 },
             ),
         )
@@ -2402,6 +2468,7 @@ mod tests {
                 Payload::Shell {
                     session_id: id,
                     command: "sleep 5".into(),
+                    private: false,
                 },
             ),
         )
@@ -2425,11 +2492,12 @@ mod tests {
         assert!(!state.hub.handle(&id).unwrap().is_busy());
     }
 
-    /// Under Ask with no standing allow, the policy's prompt is published to
-    /// the attached client; a Deny decision refuses the command.
+    /// PLAN.md 10.2a decision 2: the owner's own `!` command is never
+    /// approval-prompted, even under Ask with no standing allow. It runs,
+    /// and no approval_requested frame is published.
     #[tokio::test(flavor = "multi_thread")]
-    async fn shell_publishes_the_approval_request_when_the_policy_asks() {
-        let (tool, runs) = stub_bash("never", Duration::ZERO);
+    async fn shell_runs_without_an_approval_prompt_under_ask() {
+        let (tool, runs) = stub_bash("listed", Duration::ZERO);
         let policy = modron_core::ApprovalPolicy {
             mode: modron_core::ApprovalMode::Ask,
             ..Default::default()
@@ -2448,38 +2516,43 @@ mod tests {
                 Payload::Shell {
                     session_id: id,
                     command: "ls".into(),
-                },
-            ),
-        )
-        .await;
-        let request_id = loop {
-            let outbound = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("frames before the timeout")
-                .expect("channel open");
-            if let Outbound::Live(live) = outbound {
-                let json: serde_json::Value = serde_json::from_str(&live.json).unwrap();
-                if json["type"] == "approval_requested" {
-                    break json["request_id"].as_str().unwrap().to_string();
-                }
-            }
-        };
-        handle_frame(
-            &state,
-            &mut ctx,
-            true,
-            Frame::request(
-                2,
-                Payload::Approve {
-                    request_id,
-                    decision: modron_protocol::Decision::Deny,
+                    private: false,
                 },
             ),
         )
         .await;
         let types = collect_live_types_until(&mut rx, "turn_done").await;
-        assert!(types.contains(&"note".to_string()), "{types:?}");
-        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            !types.contains(&"approval_requested".to_string()),
+            "{types:?}"
+        );
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The default-model problem check: empty, control characters and an
+    /// unknown provider are refused; a registered provider and a catalog
+    /// provider pass.
+    #[test]
+    fn default_model_validation_refuses_bad_values() {
+        assert!(default_model_problem("", "anthropic")
+            .unwrap()
+            .contains("model is empty"));
+        assert!(default_model_problem("m", "  ")
+            .unwrap()
+            .contains("provider is empty"));
+        assert!(default_model_problem("m\n", "anthropic")
+            .unwrap()
+            .contains("control character"));
+        assert!(default_model_problem("m", "no-such-provider")
+            .unwrap()
+            .contains("unknown provider"));
+        assert_eq!(default_model_problem("m", "anthropic"), None);
+        let catalog = modron_router::catalog();
+        let catalogued = catalog.first().expect("catalog is not empty");
+        assert_eq!(
+            default_model_problem(&catalogued.name, &catalogued.provider),
+            None
+        );
     }
 
     /// A scoped (share or tunnel guest) connection may not run `!`, even in
@@ -2491,6 +2564,7 @@ mod tests {
         let shell = Payload::Shell {
             session_id: own,
             command: "ls".into(),
+            private: false,
         };
         assert!(scoped_gate(own, &shell).is_err());
     }
@@ -2594,6 +2668,7 @@ mod tests {
                 Payload::Shell {
                     session_id: own,
                     command: "ls".into(),
+                    private: false,
                 },
                 [false, true, false, false],
             ),
@@ -2789,6 +2864,14 @@ mod tests {
                 [false, false, false, false],
             ),
             (
+                "persist_default_model",
+                Payload::PersistDefaultModel {
+                    model: "m".into(),
+                    provider: "anthropic".into(),
+                },
+                [false, false, false, false],
+            ),
+            (
                 "router_defaults_req",
                 Payload::RouterDefaultsReq {},
                 [false, true, false, false],
@@ -2841,6 +2924,7 @@ mod tests {
         "ping",
         "router_defaults_req",
         "models_req",
+        "persist_default_model",
     ];
 
     #[test]
@@ -2917,6 +3001,7 @@ mod tests {
             Payload::Shell {
                 session_id: id,
                 command: "ls".into(),
+                private: false,
             },
         ] {
             let mut frame = Frame::request(4, payload);
@@ -2969,6 +3054,7 @@ mod tests {
                 Payload::Shell {
                     session_id: id,
                     command: "ls".into(),
+                    private: false,
                 },
             );
             shell.role = Some(role);
@@ -2984,6 +3070,7 @@ mod tests {
             Payload::Shell {
                 session_id: id,
                 command: "ls".into(),
+                private: false,
             },
         );
         owner_shell.role = Some(modron_protocol::RelayRole::Owner);
@@ -3144,6 +3231,7 @@ mod tests {
         let run = |command: &str| Payload::Shell {
             session_id: id,
             command: command.into(),
+            private: false,
         };
         handle_frame(&state, &mut ctx, true, Frame::request(1, run("   "))).await;
         assert!(error_message(next_outbound(&mut rx).await).contains("usage: !"));
@@ -3157,6 +3245,7 @@ mod tests {
                 Payload::Shell {
                     session_id: SessionId::new_v4(),
                     command: "ls".into(),
+                    private: false,
                 },
             ),
         )

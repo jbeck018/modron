@@ -1394,6 +1394,20 @@ impl SessionHub {
 
     /// Install the template engine. Its store must already be the hub's
     /// [`BroadcastingStore`] so every session's appends fan out.
+    /// Apply a saved default model and provider (PersistDefaultModel) to the
+    /// engine template that FUTURE sessions start from. Existing sessions
+    /// keep their model, as with `apply_config`. The template's selector is
+    /// pinned to the saved model, the same as a `/model` switch.
+    pub fn apply_default_model(&self, model: &str, provider: &str) {
+        let Some(mut template) = lock(&self.inner.template).clone() else {
+            return;
+        };
+        template.config.default_model = model.to_string();
+        template.config.default_provider = provider.to_string();
+        template.selector = Arc::new(modron_core::testing::StaticSelector::new(model, provider));
+        self.set_engine(template);
+    }
+
     /// Apply explicit router defaults (onboarding/settings): rebuild the
     /// template selector (heuristic over the chosen tiers) and set the
     /// tier fallbacks. Existing sessions keep their pins.

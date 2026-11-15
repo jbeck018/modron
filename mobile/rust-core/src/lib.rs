@@ -55,8 +55,8 @@ pub use attach::attachment_from_bytes;
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::default_socket_path;
 pub use client::{
-    default_url, device_token_from_env, split_url_token, ConnectOptions, KeepaliveConfig,
-    RemoteClient, CLIENT_NAME, DEVICE_TOKEN_ENV, UNDECODABLE_NOTE,
+    default_url, device_token_from_env, parse_shell_input, split_url_token, ConnectOptions,
+    KeepaliveConfig, RemoteClient, ShellInput, CLIENT_NAME, DEVICE_TOKEN_ENV, UNDECODABLE_NOTE,
 };
 pub use error::ClientError;
 pub use modron_protocol::{ApprovalModeWire, ConfigPatch, SessionMetaWire};

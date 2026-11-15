@@ -434,6 +434,47 @@ pub fn persist_router_toml(
     cheap_fallback: Option<&str>,
     strong_fallback: Option<&str>,
 ) -> Result<()> {
+    let _ = (cheap_fallback, strong_fallback); // fallback keys land with the tier-fallback config surface
+    edit_config_toml(&config_toml_path()?, |table| {
+        let router = table
+            .entry("router")
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        if let Some(router_table) = router.as_table_mut() {
+            router_table.insert("cheap_model".into(), toml::Value::String(cheap.to_string()));
+            router_table.insert(
+                "strong_model".into(),
+                toml::Value::String(strong.to_string()),
+            );
+        }
+        Ok(())
+    })
+}
+
+/// Persist the top-level `default_model` / `default_provider` keys (the
+/// server's default for FUTURE sessions; PersistDefaultModel). The same file
+/// and writer as [`persist_router_toml`].
+pub fn persist_default_model_toml(model: &str, provider: &str) -> Result<()> {
+    persist_default_model_at(&config_toml_path()?, model, provider)
+}
+
+/// [`persist_default_model_toml`] for an explicit file.
+pub fn persist_default_model_at(path: &Path, model: &str, provider: &str) -> Result<()> {
+    edit_config_toml(path, |table| {
+        table.insert(
+            "default_model".into(),
+            toml::Value::String(model.to_string()),
+        );
+        table.insert(
+            "default_provider".into(),
+            toml::Value::String(provider.to_string()),
+        );
+        Ok(())
+    })
+}
+
+/// The config file: `$MODRON_CONFIG` (a directory, or the file itself), else
+/// `<config dir>/modron/config.toml`.
+fn config_toml_path() -> Result<PathBuf> {
     let mut dir = match std::env::var("MODRON_CONFIG") {
         Ok(v) => PathBuf::from(v),
         Err(_) => dirs::config_dir()
@@ -443,29 +484,48 @@ pub fn persist_router_toml(
     if !dir.ends_with("config.toml") {
         dir = dir.join("config.toml");
     }
-    if let Some(parent) = dir.parent() {
+    Ok(dir)
+}
+
+/// Read-modify-write one config.toml. Every key `edit` does not touch is
+/// kept. The result is written to a sibling temp file and renamed over the
+/// original, so a crash never leaves a half-written config. A file that
+/// exists but does not parse is an error: it is never overwritten.
+pub fn edit_config_toml(
+    path: &Path,
+    edit: impl FnOnce(&mut toml::value::Table) -> Result<()>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing = std::fs::read_to_string(&dir).unwrap_or_default();
-    let mut value: toml::Value =
-        toml::from_str(&existing).unwrap_or_else(|_| toml::Value::Table(Default::default()));
-    if !value.is_table() {
-        value = toml::Value::Table(Default::default());
-    }
-    let table = value.as_table_mut().unwrap();
-    let router = table
-        .entry("router")
-        .or_insert_with(|| toml::Value::Table(Default::default()));
-    if let Some(router_table) = router.as_table_mut() {
-        router_table.insert("cheap_model".into(), toml::Value::String(cheap.to_string()));
-        router_table.insert(
-            "strong_model".into(),
-            toml::Value::String(strong.to_string()),
-        );
-    }
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
+    let mut value: toml::Value = if existing.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&existing).with_context(|| {
+            format!(
+                "{} is not valid TOML; fix or move it before saving defaults",
+                path.display()
+            )
+        })?
+    };
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("{} is not a TOML table", path.display()))?;
+    edit(table)?;
     let rendered = toml::to_string_pretty(&value)?;
-    std::fs::write(&dir, rendered)?;
-    let _ = (cheap_fallback, strong_fallback); // fallback keys land with the tier-fallback config surface
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("config path has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    std::fs::write(&tmp, rendered)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -569,5 +629,47 @@ mod tests {
                 "{bad:?}: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod config_writer_tests {
+    use super::*;
+
+    #[test]
+    fn default_model_write_keeps_other_keys_and_the_router_table() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "theme = 'oculus'\ndefault_model = 'old'\n[router]\ncheap_model = 'c1'\nstrong_model = 's1'\n",
+        )
+        .unwrap();
+        persist_default_model_at(&path, "gpt-5-mini", "openai-compat").unwrap();
+        let value: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["default_model"].as_str(), Some("gpt-5-mini"));
+        assert_eq!(value["default_provider"].as_str(), Some("openai-compat"));
+        assert_eq!(value["theme"].as_str(), Some("oculus"));
+        assert_eq!(value["router"]["cheap_model"].as_str(), Some("c1"));
+        assert_eq!(value["router"]["strong_model"].as_str(), Some("s1"));
+        assert!(!root.path().join("config.toml.tmp").exists());
+    }
+
+    #[test]
+    fn a_missing_file_is_created_and_an_unparsable_one_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let fresh = root.path().join("new").join("config.toml");
+        persist_default_model_at(&fresh, "m", "p").unwrap();
+        assert!(std::fs::read_to_string(&fresh)
+            .unwrap()
+            .contains("default_model"));
+
+        let broken = root.path().join("broken.toml");
+        std::fs::write(&broken, "default_model = [oops").unwrap();
+        assert!(persist_default_model_at(&broken, "m", "p").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&broken).unwrap(),
+            "default_model = [oops"
+        );
     }
 }

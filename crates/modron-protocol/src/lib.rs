@@ -165,8 +165,16 @@ pub enum Payload {
     /// model-issued `bash` call; it is never a model turn. Refused for a
     /// busy session (Conflict). Client effect: none until the server
     /// answers; the server's reply is an `Error` or a `Note` with the
-    /// labelled output, and the output is not part of the model transcript.
-    Shell { session_id: Uuid, command: String },
+    /// labelled output. `private` (`!!`) output is never sent to the model;
+    /// shared (`!`) output joins the conversation. See PROTOCOL_V2 section
+    /// 7b for who may send it and what is and is not checked.
+    Shell {
+        session_id: Uuid,
+        command: String,
+        /// `!!`: shown but never reaches the model (additive, default false).
+        #[serde(default)]
+        private: bool,
+    },
     /// Steer one live sub-agent of a RUNNING session (PROTOCOL_V2 section 4,
     /// H3d): `text` joins that child's own transcript at its next safe
     /// boundary, so its next model turn carries it. `agent` is the swarm
@@ -324,6 +332,14 @@ pub enum Payload {
         cheap_fallback: Option<String>,
         strong_fallback: Option<String>,
     },
+    /// Save a default model and provider to the server's config.toml
+    /// (`default_model` / `default_provider`) for FUTURE sessions. The
+    /// session the user is in keeps its own model; an explicit save is the
+    /// only way a default changes (decision 3, PLAN.md 10.2a). Local
+    /// connections only. Answered by a correlated `note`, or an `error`
+    /// when either value is empty, has a control character, or names a
+    /// provider the server does not know.
+    PersistDefaultModel { model: String, provider: String },
     /// Liveness check (answered by `pong`).
     Ping {},
 

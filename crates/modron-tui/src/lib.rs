@@ -2312,6 +2312,22 @@ impl App {
                         }
                     }
                 }
+                TranscriptEntry::Shell {
+                    command,
+                    lines,
+                    private,
+                    ..
+                } => {
+                    // The shared `$ <command>` row and output rows, verbatim.
+                    let plain = Style::default();
+                    for line in modron_view::shell_rows(&command, &lines, private) {
+                        for row in wrap_line(&Line::from(line).style(plain), self.hist_wrap_width())
+                        {
+                            self.history.push(row);
+                        }
+                    }
+                    self.history.push(Line::from(""));
+                }
                 TranscriptEntry::Review {
                     summary, findings, ..
                 } => {

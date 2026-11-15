@@ -167,24 +167,78 @@ is never rendered in the transcript.
 ModelsReq {}                                   // client
 Models { models: Vec<ModelWire> }              // server
 ModelWire { id, provider, label, context_window, available, tier }
+PersistDefaultModel { model, provider }        // client, local only
 ```
 
-Answered from the router catalog; `available` is true when the model's
-provider is signed in. UI effect: the model picker lists these rows;
-unavailable rows are shown but cannot be selected.
+`ModelsReq` is answered from the router catalog; `available` is true when
+the model's provider is signed in. UI effect: the model picker lists these
+rows; unavailable rows are shown but cannot be selected.
+
+Selecting a model changes the current session only. An explicit save
+(`PersistDefaultModel`) writes the server's default model and provider.
+It is answered by a correlated `note`, or by an `error` when:
+
+- `model` or `provider` is empty or contains a control character;
+- `provider` is unknown: it names neither an auth-registry provider nor a
+  provider any catalog model uses (`unknown provider <name>`).
+
+What the save does: `default_model` and `default_provider` are written as
+top-level keys of the server's config.toml (`$MODRON_CONFIG` or the
+user config directory). The file is read, those two keys are set, and
+the rest of the file is kept. The result goes to a sibling temp file that
+is renamed over the original, so a crash never leaves a half-written
+config. A config file that exists but does not parse is an error and is
+not overwritten. The engine template that FUTURE sessions start from is
+updated in memory, with its selector pinned to the saved model as a
+`/model` switch is. Sessions that already exist keep their model.
+
+Who may send it: local connections only. It is refused for every relayed
+role (owner, approver, viewer) over a remote-control tunnel, like
+`PersistRouter`. UI effect: none until the `note` arrives.
 
 ## 7b. Shell passthrough
 
 ```
-Shell { session_id, command }                  // client, owner or driver
+Shell { session_id, command, private }         // client, owner only
 ```
 
-Runs one command where the session's tools run, under the same approval
-policy and permission rules as a model-issued `bash` call, and appends
-the labelled output to the transcript. Refused for a busy session.
-It occupies the session's run slot (busy, interruptible) and ends with
-the same terminal frame as a turn. A refusal is a `note` followed by
-`turn_done`. Share-link connections cannot send it.
+The composer's `!` and `!!` (`parse_shell_input` in the client core, the one
+shared rule) send this frame. `private` is `false` for `!cmd` and `true`
+for `!!cmd`; it defaults to `false` when absent.
+
+- `!cmd`: the labelled output joins the conversation. The next model turn
+  sees it as a user message: the label "Shell command run by the user
+  with !, not a model tool call", then "$ <command>" and the output.
+- `!!cmd`: the command runs and its output is shown in the transcript with
+  the shared `[private]` marker, but it never reaches the model. It is
+  skipped when a model turn's context is built, and it is excluded from
+  the input of compaction.
+
+The persisted entry is a `UserShell { command, output, is_error, private }`
+event. Logs written before this change hold the shared output as a `Task`
+event with the same text; those still replay and reach the model as before.
+
+Who may send it: the owner, on a local connection or a trusted owner
+tunnel frame. Guests (approver, viewer) and share links cannot send it.
+Refused for a missing session, an empty command, or a busy session (a run
+is active, Conflict).
+
+What is checked, and only this (PLAN.md 10.2a, decision 2):
+
+- the `bash` tool must be registered;
+- `bash` must not be on the deny list (`approvals.deny`), refused with
+  `tool bash denied by configuration (--deny)`;
+- no permission DENY rule may match the command, including a `;`, `&&`
+  or `|` segment, refused with `tool bash denied by rule <rule>`;
+- no `pre_tool` hook may veto it.
+
+What is not checked: approval mode (Ask, Deny, ApproveAll), approver
+prompts, ASK and ALLOW rules, and the plan phase. The owner is never
+prompted. The command still runs in the sandbox policy, with the bash
+timeout and output cap, the `post_tool` hook and the pre-mutation
+checkpoint. A refused command persists nothing and ends with a `note`
+carrying the reason, followed by `turn_done`. A command that ran ends
+with `turn_done` and no `notify`.
 
 ## 8. Host and handoff (C6)
 
