@@ -849,6 +849,31 @@ impl std::fmt::Debug for EngineConfig {
     }
 }
 
+/// The session's context occupancy (H9b): what the NEXT provider request
+/// would carry, against the effective per-turn input window. `used` is the
+/// pre-flight estimate (system prompt + tool specs + the transcript a resume
+/// would rebuild); `window` is the cap the compaction trigger uses
+/// (the selected model's window, never above `max_input_tokens`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextGauge {
+    pub used: u64,
+    pub window: u64,
+}
+
+/// Result of a manual compaction ([`Engine::compact_session`]). `compacted`
+/// is false when there was nothing older than the kept tail to summarize;
+/// nothing is written in that case. `usage` is the summarizer call's
+/// provider-reported usage (zero when no call was made); it is also
+/// persisted as a `Usage` event.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompactOutcome {
+    pub compacted: bool,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub usage: Usage,
+    pub note: String,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pub selector: Arc<dyn ModelSelector>,

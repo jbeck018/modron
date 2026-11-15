@@ -1428,10 +1428,10 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 | H7 | Reasoning-effort parameter and named model roles | TODO | |
 | H8 | Command and path permission rules + explain command | DONE | H8a matcher, H8b engine gate + [permissions] config, H8c rules reach serve/daemon/acp sessions (shared build path), ConfigPatch.rules / LiveState.rules / ExplainRule. Evals stay rule-free |
 | H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | DONE | stub and delegate_status descriptions fixed |
-| H9b | Real compact command and true context occupancy over the protocol | TODO | |
+| H9b | Real compact command and true context occupancy over the protocol | DONE | Engine compact_session + context_gauge; Compact frame, ContextChanged, LiveState.context. Known: Compact vs Submit is check-then-act; the gauge is None until the first run or compaction in a server process |
 | H9c | Hooks: turn-end and session-start events | DONE | session_start and turn_end hooks: observe-only, never block; do not disable speculative reads |
 | H9d | MCP over HTTP | TODO | |
-| H9e | Web fetch tool | TODO | |
+| H9e | Web fetch tool | DONE | webfetch tool: on-demand, approval-gated, SSRF checks with a pinned resolved address, no redirects, refused under a sandbox, body wrapped in untrusted-content markers. Ignores HTTP proxies by design (a proxy would bypass the address pin) |
 
 ### Client
 
@@ -1485,3 +1485,8 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   with a no-JS build; binary size (17 MB at best) is the accepted cost
   unless the owner objects. Docs mismatch noted: `SurfaceOptions.runtime`
   does not exist in 0.5.1.
+- 2026-11-15: wave 6. H9b and H9e landed. The container ran out of
+  disk mid-wave (build caches): the H9b worker stopped with one test
+  type error, which the lead fixed; .gitignore was found truncated to
+  zero bytes and was restored from the index. Gates: fmt clean, clippy
+  clean, 1063 tests pass.

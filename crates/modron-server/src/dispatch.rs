@@ -205,6 +205,7 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
         Payload::Attach { session_id, .. }
         | Payload::Interrupt { session_id }
         | Payload::Steer { session_id, .. }
+        | Payload::Compact { session_id, .. }
         | Payload::ExplainRule { session_id, .. }
         | Payload::Enqueue { session_id, .. }
         | Payload::Dequeue { session_id, .. }
@@ -634,10 +635,13 @@ pub async fn handle_frame(
         Payload::Interrupt { session_id } => {
             match state.hub.handle(&session_id) {
                 Some(handle) => {
-                    if !handle.interrupt() {
+                    if handle.interrupt() {
+                        // Success announces itself as TurnAborted. The aborted
+                        // run never reached its own gauge refresh (H9b).
+                        handle.refresh_context_detached();
+                    } else {
                         send(ctx, error(request_id, "no active run in this session"));
                     }
-                    // Success announces itself as TurnAborted.
                 }
                 None => send(
                     ctx,
@@ -662,6 +666,9 @@ pub async fn handle_frame(
                 };
                 send(ctx, error_kind(request_id, message, kind));
             }
+        }
+        Payload::Compact { session_id } => {
+            compact(state, ctx, request_id, session_id).await;
         }
         Payload::Enqueue { session_id, text } => {
             if text.trim().is_empty() {
@@ -791,6 +798,53 @@ pub async fn handle_frame(
         }
     }
     Flow::Continue
+}
+
+/// `Compact` (H9b): the engine's compaction routine on an idle session. A
+/// busy session is refused outright (the run owns the transcript). The
+/// reply is the correlated Note; the gauge refresh (which publishes
+/// `ContextChanged`) follows it, on success and failure alike.
+async fn compact(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    request_id: Option<u64>,
+    session_id: SessionId,
+) {
+    let Some(handle) = state.hub.handle(&session_id) else {
+        send(
+            ctx,
+            error_kind(
+                request_id,
+                format!("no such session {session_id}"),
+                modron_protocol::ErrorKind::NotFound,
+            ),
+        );
+        return;
+    };
+    if handle.is_busy() {
+        send(
+            ctx,
+            error_kind(
+                request_id,
+                "session busy - compact when idle",
+                modron_protocol::ErrorKind::Conflict,
+            ),
+        );
+        return;
+    }
+    let engine = handle.engine_cell().clone();
+    match engine.compact_session(session_id).await {
+        Ok(outcome) => send(
+            ctx,
+            reply(
+                request_id,
+                Some(session_id),
+                Payload::Note { text: outcome.note },
+            ),
+        ),
+        Err(e) => send(ctx, error(request_id, e.to_string())),
+    }
+    handle.refresh_context().await;
 }
 
 async fn handle_router_defaults_req(
@@ -1646,7 +1700,9 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Steered { .. } => "steered",
         Payload::Enqueue { .. } => "enqueue",
         Payload::Dequeue { .. } => "dequeue",
+        Payload::Compact { .. } => "compact",
         Payload::QueueChanged { .. } => "queue_changed",
+        Payload::ContextChanged { .. } => "context_changed",
         Payload::Approve { .. } => "approve",
         Payload::DecidePlan { .. } => "decide_plan",
         Payload::PlanProposed { .. } => "plan_proposed",
@@ -1752,6 +1808,74 @@ mod tests {
                 models_used: vec![],
             })
         })
+    }
+
+    /// H9b: `Compact` on a busy session is refused with a conflict error; the
+    /// active run keeps the transcript.
+    #[tokio::test]
+    async fn compact_on_a_busy_session_errors() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("busy").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        state.hub.start_run(id, parked_run(id)).unwrap();
+
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(1, Payload::Compact { session_id: id }),
+        )
+        .await;
+        match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => match frame.payload {
+                Payload::Error { message, .. } => {
+                    assert!(message.contains("compact when idle"), "{message}");
+                }
+                other => panic!("expected an error, got {other:?}"),
+            },
+            other => panic!("expected a reply, got {other:?}"),
+        }
+        state.hub.handle(&id).unwrap().interrupt();
+    }
+
+    /// H9b: `Compact` on an idle session replies with a correlated Note, then
+    /// publishes the refreshed gauge; LiveState carries it from then on.
+    #[tokio::test]
+    async fn compact_on_an_idle_session_replies_with_a_note_and_publishes_context() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("idle").await.unwrap().id;
+        let handle = state.hub.ensure_session(id, None);
+        let mut live = handle.subscribe();
+
+        let (mut ctx, mut rx) = authed_ctx();
+        handle_frame(
+            &state,
+            &mut ctx,
+            true,
+            Frame::request(2, Payload::Compact { session_id: id }),
+        )
+        .await;
+        match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => match frame.payload {
+                Payload::Note { text } => {
+                    assert!(text.contains("nothing to compact"), "{text}");
+                }
+                other => panic!("expected a note, got {other:?}"),
+            },
+            other => panic!("expected a reply, got {other:?}"),
+        }
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), live.recv())
+            .await
+            .expect("a live frame")
+            .expect("channel open");
+        let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+        assert_eq!(json["type"], "context_changed");
+        assert!(json["used"].as_u64().unwrap() > 0, "system prompt counts");
+        let context = handle.live_state().context.expect("gauge in live state");
+        assert_eq!(context.used, json["used"].as_u64().unwrap());
+        assert_eq!(context.window, json["window"].as_u64().unwrap());
     }
 
     /// LG-b: deleting a session removes its share key, its live tunnel and

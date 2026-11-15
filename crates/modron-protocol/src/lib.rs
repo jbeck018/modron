@@ -151,6 +151,13 @@ pub enum Payload {
     /// Remove one queued message by its position (0 = next to run). Replies
     /// `QueueChanged`; an out-of-range index is an error.
     Dequeue { session_id: Uuid, index: u32 },
+    /// Compact an IDLE session now (H9b, `/compact`): the older transcript is
+    /// summarized by the same routine autocompaction uses, ignoring the
+    /// threshold and the min-interval rule. Refused while a run is active
+    /// (error "session busy - compact when idle"). Replies with a correlated
+    /// `Note` (`compacted: N -> M tokens`, or the nothing-to-compact note),
+    /// then `ContextChanged` with the refreshed gauge.
+    Compact { session_id: Uuid },
     /// Answer a pending approval (first responder wins).
     Approve {
         request_id: String,
@@ -292,6 +299,14 @@ pub enum Payload {
     /// (an empty list clears them). Snapshot's `LiveState.queued` resets
     /// them the same way on attach.
     QueueChanged { queued: Vec<String> },
+    /// The session's context occupancy was recomputed: after every run ends
+    /// (success, failure or abort) and after a `Compact`. `used` is the
+    /// estimated size of the next request in tokens; `window` is the
+    /// effective per-turn input window it is measured against.
+    /// UI effect: SET the status surface's context meter to `used / window`.
+    /// This is the context figure; cumulative tokens are not context.
+    /// Snapshot's `LiveState.context` shows the last value on attach.
+    ContextChanged { used: u64, window: u64 },
     /// Config mutated (echo of the applied patch).
     /// UI effect: a `phase` in the patch updates the phase label on the
     /// status surface (`plan` / `build`); a `rules` list replaces the
@@ -567,6 +582,15 @@ pub struct AuthProviderWire {
     pub oauth_capable: bool,
 }
 
+/// The session's context occupancy on the wire (H9b): the estimated size of
+/// the next request (`used`) and the effective window it is measured
+/// against (`window`), both in tokens. Mirror of core `ContextGauge`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextGaugeWire {
+    pub used: u64,
+    pub window: u64,
+}
+
 /// The live (non-persisted) half of a snapshot: what a fresh attach needs
 /// to render the in-flight state a late joiner would otherwise miss.
 ///
@@ -616,6 +640,12 @@ pub struct LiveState {
     /// them. Omitted on the wire when empty (older peers never send it).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<String>,
+    /// The session's context occupancy (see `ContextChanged`). UI effect:
+    /// sets the context meter on the status surface (`used / window`);
+    /// absent until the session has run or been compacted on this server,
+    /// and the client keeps its meter hidden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextGaugeWire>,
     /// The server's approval mode (see the struct docs: sets the label).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<ApprovalModeWire>,
@@ -1095,6 +1125,67 @@ mod tests {
         let json = serde_json::to_value(&changed).unwrap();
         assert_eq!(json["type"], "queue_changed");
         assert_eq!(json["queued"], serde_json::json!(["a", "b"]));
+    }
+
+    /// Compact (client) and ContextChanged (server) round-trip with snake_case
+    /// tags and carry their fields by name.
+    #[test]
+    fn compact_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let compact = Frame::request(
+            14,
+            Payload::Compact {
+                session_id: session,
+            },
+        );
+        assert_roundtrip(&compact);
+        let json = serde_json::to_value(&compact).unwrap();
+        assert_eq!(json["type"], "compact");
+        assert_eq!(json["session_id"], session.to_string());
+
+        let changed = Frame::event(
+            Some(session),
+            15,
+            Payload::ContextChanged {
+                used: 41_000,
+                window: 128_000,
+            },
+        );
+        assert_roundtrip(&changed);
+        let json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(json["type"], "context_changed");
+        assert_eq!(json["used"], 41_000);
+        assert_eq!(json["window"], 128_000);
+    }
+
+    #[test]
+    fn live_state_context_is_omitted_when_none_and_optional_on_read() {
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("context").is_none());
+
+        let filled = LiveState {
+            context: Some(ContextGaugeWire {
+                used: 6_000,
+                window: 200_000,
+            }),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["context"]["used"], 6_000);
+        assert_eq!(json["context"]["window"], 200_000);
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.context,
+            Some(ContextGaugeWire {
+                used: 6_000,
+                window: 200_000,
+            })
+        );
+
+        // A LiveState from an older peer (no `context` key) still loads.
+        let old: LiveState =
+            serde_json::from_str(r#"{"running":false,"model":"m"}"#).expect("old live state loads");
+        assert!(old.context.is_none());
     }
 
     #[test]

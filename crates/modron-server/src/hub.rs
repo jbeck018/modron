@@ -22,12 +22,13 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use async_trait::async_trait;
 use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
-    Engine, Phase, PlanItem, RunSummary, SessionEvent, SessionId, SessionMeta, SessionStore,
-    SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
+    ContextGauge, Engine, Phase, PlanItem, RunSummary, SessionEvent, SessionId, SessionMeta,
+    SessionStore, SteerInbox, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_protocol::{
-    ApprovalModeWire, ConfigPatch, Decision, Frame, LiveState, Payload, PendingApproval,
-    PlanDecision, RuleWire, WireDelta, WireRunSummary, WireSwarmRow, WireToolActivity,
+    ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, LiveState, Payload,
+    PendingApproval, PlanDecision, RuleWire, WireDelta, WireRunSummary, WireSwarmRow,
+    WireToolActivity,
 };
 use modron_view::ActivityTracker;
 use tokio::sync::broadcast;
@@ -348,6 +349,10 @@ pub struct SessionHandle {
     /// A proposed plan awaits a decision (H2b). Set when a plan-phase run
     /// completes with a plan; cleared only by `decide_plan`.
     plan_pending: AtomicBool,
+    /// The last context gauge computed for this session (H9b). `None`
+    /// until a run or a `Compact` on this handle computes one. Written
+    /// under the seq lock together with its `ContextChanged` frame.
+    context: Mutex<Option<ContextGauge>>,
 }
 
 impl SessionHandle {
@@ -488,6 +493,10 @@ impl SessionHandle {
             provider: lock(&self.provider).clone(),
             goal: lock(&self.goal).clone(),
             queued: lock(&self.queue).iter().cloned().collect(),
+            context: lock(&self.context).map(|gauge| ContextGaugeWire {
+                used: gauge.used,
+                window: gauge.window,
+            }),
         }
     }
 
@@ -821,6 +830,44 @@ impl SessionHandle {
         self.plan_pending.store(true, Ordering::Relaxed);
         self.publish_locked(seq, Payload::PlanProposed { items });
         true
+    }
+
+    /// Store a computed context gauge and publish `ContextChanged` (H9b).
+    /// Stored and published under the seq lock, like every other sink.
+    fn set_context(&self, gauge: ContextGauge) {
+        let mut seq = lock(&self.seq);
+        *lock(&self.context) = Some(gauge);
+        self.publish_locked(
+            &mut seq,
+            Payload::ContextChanged {
+                used: gauge.used,
+                window: gauge.window,
+            },
+        );
+    }
+
+    /// Recompute the context gauge from the session's log and publish it
+    /// (H9b). The engine is cloned under its lock, and that lock is released
+    /// before the await, so no hub lock is held across the store read. A
+    /// failed read keeps the previous gauge and logs; it never fails a run.
+    pub async fn refresh_context(&self) {
+        let engine = self.engine_cell().clone();
+        match engine.context_gauge(self.id).await {
+            Ok(gauge) => self.set_context(gauge),
+            Err(error) => {
+                tracing::warn!(session = %self.id, %error, "context gauge refresh failed");
+            }
+        }
+    }
+
+    /// [`Self::refresh_context`] without awaiting it, for paths that cannot
+    /// await: interrupt aborts the run task, so the run's own refresh never
+    /// runs. Does nothing outside a tokio runtime.
+    pub fn refresh_context_detached(self: &Arc<Self>) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let handle = Arc::clone(self);
+            runtime.spawn(async move { handle.refresh_context().await });
+        }
     }
 
     /// Whether a proposed plan awaits a decision (H2b).
@@ -1236,6 +1283,7 @@ impl SessionHub {
             queue: Mutex::new(VecDeque::new()),
             plan: Mutex::new(Vec::new()),
             plan_pending: AtomicBool::new(false),
+            context: Mutex::new(None),
         });
         sessions.insert(id, Arc::clone(&handle));
         handle
@@ -1280,6 +1328,10 @@ impl SessionHub {
         let hub = self.clone();
         let task = tokio::spawn(async move {
             let result = run.await;
+            // H9b: the context gauge is recomputed for every run outcome
+            // (success or failure) before the terminal frame. An abort never
+            // reaches this point; interrupt refreshes on its own path.
+            owner.refresh_context().await;
             // `complete` returns only after its run-slot and seq guards are
             // dropped, so the starter may take the slot itself.
             if let Some(next) = owner.complete(result) {
@@ -1511,6 +1563,57 @@ mod tests {
         hub.steer(id, "first".into()).unwrap();
         assert!(handle.interrupt());
         assert!(handle.steer.is_empty());
+    }
+
+    /// H9b: a finished run publishes `ContextChanged` before its `TurnDone`,
+    /// and the gauge rides `LiveState` (what an attach snapshot carries).
+    #[tokio::test]
+    async fn a_finished_run_publishes_and_reports_the_context_gauge() {
+        let store = Arc::new(InMemoryStore::new());
+        let hub = SessionHub::empty();
+        hub.set_engine(Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: Default::default(),
+            tools: Arc::new(ToolRegistry::new()),
+            store: store.clone(),
+            config: EngineConfig {
+                default_model: "mock-model".into(),
+                default_provider: "mock".into(),
+                ..EngineConfig::default()
+            },
+        });
+        let id = store.create_session("gauge").await.unwrap().id;
+        let handle = hub.ensure_session(id, None);
+        assert!(
+            handle.live_state().context.is_none(),
+            "no gauge before a run"
+        );
+
+        let mut rx = handle.tx.subscribe();
+        let (done, gate) = tokio::sync::oneshot::channel();
+        hub.start_run(id, gated_run(id, gate)).unwrap();
+        done.send(()).unwrap();
+
+        let mut saw_gauge = false;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a live frame")
+                .expect("channel open");
+            let json: serde_json::Value = serde_json::from_str(&frame.json).unwrap();
+            match json["type"].as_str() {
+                Some("context_changed") => saw_gauge = true,
+                Some("turn_done") => break,
+                _ => {}
+            }
+        }
+        assert!(saw_gauge, "ContextChanged precedes TurnDone");
+        let context = handle.live_state().context.expect("gauge in live state");
+        assert!(
+            context.used > 0,
+            "system prompt and tool specs always count"
+        );
+        assert!(context.window > 0, "the window is never zero");
     }
 
     /// A run that finishes successfully when the test sends on `done`.

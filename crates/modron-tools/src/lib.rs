@@ -39,6 +39,7 @@ mod skill;
 mod tool_search;
 pub mod validate;
 mod verify;
+mod webfetch;
 mod write;
 
 pub use bash::BashTool;
@@ -56,6 +57,7 @@ pub use remember::RememberTool;
 pub use skill::SkillTool;
 pub use validate::validate_args;
 pub use verify::VerifyTool;
+pub use webfetch::WebFetchTool;
 pub use write::WriteTool;
 
 use modron_core::ToolRegistry;
@@ -88,6 +90,7 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
         memory_root,
     )));
     registry.register(Arc::new(crate::minify::ReadMinifiedTool));
+    registry.register(Arc::new(crate::webfetch::WebFetchTool));
     registry.register(Arc::new(crate::tool_search::ToolSearchTool));
     registry.register(Arc::new(crate::diagnostics::DiagnosticsTool));
     registry.register(Arc::new(crate::interact::InteractTool::new()));
@@ -178,7 +181,7 @@ mod tests {
                 spec.name
             );
         }
-        for hidden in ["remember", "read_minified", "edit_lines"] {
+        for hidden in ["remember", "read_minified", "edit_lines", "webfetch"] {
             assert!(
                 registry.specs().iter().any(|s| s.name == hidden),
                 "{hidden} stays registered"
@@ -207,6 +210,7 @@ mod tests {
                 "read_minified",
                 "remember",
                 "tool_search",
+                "webfetch",
                 "write"
             ],
             "sorted spec names"

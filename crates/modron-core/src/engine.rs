@@ -15,10 +15,10 @@ use crate::permissions::{RuleEffect, RuleSet, Verdict};
 use crate::review;
 use crate::speculative;
 use crate::{
-    estimate_tokens, judge, ActionKind, ApprovalMode, Engine, Error, JudgeMode, Message,
-    ModelChoice, ModelProvider, Phase, Result, Role, RunSummary, SelectRequest, SessionEvent,
-    SessionId, StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome, ToolSpec,
-    TurnRequest, TurnResponse, Usage,
+    estimate_tokens, judge, ActionKind, ApprovalMode, CompactOutcome, ContextGauge, Engine, Error,
+    JudgeMode, Message, ModelChoice, ModelProvider, Phase, Result, Role, RunSummary, SelectRequest,
+    SessionEvent, SessionId, StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome,
+    ToolSpec, TurnRequest, TurnResponse, Usage,
 };
 use modron_types::ReviewVerdict;
 use std::sync::Arc;
@@ -34,7 +34,8 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 ///
 /// Every new tool needs an explicit gated/ungated decision here: a tool that
 /// is not added to this list runs without approval.
-const MUTATING_TOOLS: [&str; 8] = [
+const MUTATING_TOOLS: [&str; 9] = [
+    "webfetch",
     "bash",
     "write",
     "edit",
@@ -2495,18 +2496,37 @@ impl Engine {
         task: &str,
         next_model: &str,
     ) -> Result<Option<CompactionOutcome>> {
+        let events = self.rewound_events(session_id).await?;
+        self.compact_events(session_id, task, &events, next_model)
+            .await
+    }
+
+    /// The session's event log as a resume sees it: the rewind view applied,
+    /// so a rewound range is never summarized back into context.
+    async fn rewound_events(&self, session_id: SessionId) -> Result<Vec<SessionEvent>> {
         let events = self.store.load(session_id).await?;
-        // Same view as a resume: a rewound range must not be summarized
-        // back into context by a later compaction.
-        let events = rewind_view(
+        Ok(rewind_view(
             &events,
             self.config.resume_from_event,
             self.config.resume_skip_end,
             &self.config.resume_skip_ranges,
         )
-        .into_owned();
-        let (older, tail) =
-            compact::split_older_tail(&events, self.config.compaction.tail_messages);
+        .into_owned())
+    }
+
+    /// The shared compaction routine (autocompaction and `compact_session`):
+    /// summarize everything in `events` older than the kept tail, persist the
+    /// `Compaction` and `Usage` events, and return the rebuilt transcript.
+    /// `events` is the rewound log. `Ok(None)` writes nothing and calls no
+    /// provider when there is nothing older than the tail.
+    async fn compact_events(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        events: &[SessionEvent],
+        next_model: &str,
+    ) -> Result<Option<CompactionOutcome>> {
+        let (older, tail) = compact::split_older_tail(events, self.config.compaction.tail_messages);
         let summarized_count = older
             .iter()
             .filter(|event| is_transcript_item(event))
@@ -2519,7 +2539,7 @@ impl Engine {
         // Only what the previous compaction did not already cover (A7),
         // capped so the summarizer request cannot outgrow its window.
         let older_text =
-            compact::incremental_transcript_text(&events, self.config.compaction.tail_messages);
+            compact::incremental_transcript_text(events, self.config.compaction.tail_messages);
 
         // Route the summarization (cheap model for Summarize per PLAN §4.3).
         let choice = self.selector.select(&SelectRequest {
@@ -2608,6 +2628,88 @@ impl Engine {
         }
         bitmap_compact::render_text_bitmap(older_text, bitmap_compact::COMPACT_BITMAP_WIDTH_PX)
     }
+
+    /// Manual compaction (H9b, the `Compact` command) for an IDLE session:
+    /// the same routine autocompaction runs ([`Self::compact_events`]), with
+    /// the threshold and min-interval rule ignored. The starting context is
+    /// rebuilt exactly as a resume would rebuild it (rewind view, orphan
+    /// prune, compaction-aware reconstruction), so `tokens_before` is the
+    /// occupancy the next request would carry. Too little history (nothing
+    /// older than the kept tail) is a no-op: nothing is written.
+    ///
+    /// The caller must ensure no run is active on the session; this method
+    /// does not take a run lock.
+    pub async fn compact_session(&self, session_id: SessionId) -> Result<CompactOutcome> {
+        let events = self.rewound_events(session_id).await?;
+        let tool_specs = self.tools.specs_prompt();
+        let system = self.assemble_system(&tool_specs);
+        let tokens_before = estimate_context_tokens(
+            &system,
+            &tool_specs,
+            &resumed_transcript(&events, self.config.compaction.tail_messages),
+        );
+        // The next turn's model decides the bitmap gate; the default model
+        // is the session's model when no run has selected another.
+        let next_model = self.config.default_model.clone();
+        match self
+            .compact_events(session_id, "", &events, &next_model)
+            .await?
+        {
+            None => Ok(CompactOutcome {
+                compacted: false,
+                tokens_before,
+                tokens_after: tokens_before,
+                usage: Usage::default(),
+                note: "nothing to compact: history fits in the kept tail".into(),
+            }),
+            Some(done) => {
+                let tokens_after = estimate_context_tokens(&system, &tool_specs, &done.transcript);
+                Ok(CompactOutcome {
+                    compacted: true,
+                    tokens_before,
+                    tokens_after,
+                    usage: done.usage,
+                    note: format!("compacted: {tokens_before} -> {tokens_after} tokens"),
+                })
+            }
+        }
+    }
+
+    /// The session's context occupancy (H9b). `used` is the pre-flight
+    /// estimate of the next request: system prompt, tool specs and the
+    /// transcript a resume rebuilds. `window` is the cap the compaction
+    /// trigger uses for the default model: the selector's `context_window`
+    /// (falling back to `max_input_tokens`), never above `max_input_tokens`.
+    /// Read-only: nothing is persisted.
+    pub async fn context_gauge(&self, session_id: SessionId) -> Result<ContextGauge> {
+        let events = self.rewound_events(session_id).await?;
+        let tool_specs = self.tools.specs_prompt();
+        let system = self.assemble_system(&tool_specs);
+        let used = estimate_context_tokens(
+            &system,
+            &tool_specs,
+            &resumed_transcript(&events, self.config.compaction.tail_messages),
+        );
+        let choice = self.selector.select(&SelectRequest {
+            task: String::new(),
+            action: ActionKind::Chat,
+            context_tokens: used,
+            budget_remaining_usd: None,
+        });
+        let window = choice
+            .context_window
+            .unwrap_or(self.config.max_input_tokens)
+            .min(self.config.max_input_tokens);
+        Ok(ContextGauge { used, window })
+    }
+}
+
+/// The transcript a resume rebuilds from a (rewound) event log: orphaned
+/// tool calls pruned, then the compaction-aware reconstruction. Shared by
+/// [`Engine::compact_session`] and [`Engine::context_gauge`].
+fn resumed_transcript(events: &[SessionEvent], tail_messages: usize) -> Vec<Message> {
+    let pruned = prune_unanswered_tool_calls(events);
+    reconstruct_transcript(&pruned, tail_messages)
 }
 
 /// Result of one compaction pass: the rebuilt in-memory transcript plus the
@@ -5020,5 +5122,224 @@ mod review_pass_tests {
             SessionEvent::Usage { model, usage: u } if model == "rev-model" && u.input_tokens == 100
         )));
         assert!(summary.models_used.contains(&"rev-model".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        CompactionPolicy, Engine, EngineConfig, ModelProvider, Result, Role, SessionEvent,
+        SessionStore, StopReason, Tool, ToolCall, ToolCtx, ToolOutcome, ToolRegistry, ToolSpec,
+        TurnResponse, Usage,
+    };
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    const TASK: &str = "Review the login module end to end and list the auth edge cases.";
+    const SUMMARY: &str = "TASK: review login module. DECISIONS: none. EDITS: none. \
+OPEN ITEMS: write the fix.";
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "echo_tool".into(),
+                description: "Echoes a short confirmation.".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::ok("echo ok"))
+        }
+    }
+
+    fn config() -> EngineConfig {
+        EngineConfig {
+            working_dir: PathBuf::from("/nonexistent/modron-context-test"),
+            system: "You are a test agent.".into(),
+            compaction: CompactionPolicy {
+                // Autocompaction stays out of the way: only the manual
+                // command compacts in these tests.
+                enabled: false,
+                threshold_frac: 0.8,
+                min_interval_turns: 2,
+                tail_messages: 2,
+                summary_max_bytes: 2048,
+                bitmap_compaction: false,
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    fn engine(provider: Arc<MockProvider>, store: Arc<InMemoryStore>) -> Engine {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), provider);
+        Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store,
+            config: config(),
+        }
+    }
+
+    fn tool_call(id: &str, text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "echo_tool".into(),
+                arguments: json!({}),
+            }],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    fn text_reply(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: vec![],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    /// Three tool-call turns with a long chatty middle turn, then a final
+    /// answer: the history a manual compaction has real work to do on.
+    fn long_run_script() -> Vec<TurnResponse> {
+        let long = "chatty analysis of the login module. ".repeat(200);
+        vec![
+            tool_call("call_1", ""),
+            tool_call("call_2", &long),
+            tool_call("call_3", "short note"),
+            text_reply("finished the sweep"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn compact_session_on_long_history_writes_one_compaction_and_resume_starts_from_summary()
+    {
+        let mut script = long_run_script();
+        // The summarizer call comes next, then the resumed run's answer.
+        script.push(text_reply(SUMMARY));
+        script.push(text_reply("resumed answer"));
+        let provider = Arc::new(MockProvider::with_script(script));
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine(Arc::clone(&provider), Arc::clone(&store));
+
+        let summary = engine.run_task(TASK).await.unwrap();
+        let id = summary.session_id;
+
+        let outcome = engine.compact_session(id).await.unwrap();
+        assert!(outcome.compacted, "long history compacts: {outcome:?}");
+        assert!(
+            outcome.tokens_after < outcome.tokens_before,
+            "compaction shrinks the context: {outcome:?}"
+        );
+        assert!(outcome.note.starts_with("compacted:"), "{}", outcome.note);
+        assert_eq!(outcome.usage.input_tokens, 10, "summarizer usage returned");
+
+        let events = store.load(id).await.unwrap();
+        let compactions: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Compaction { summary, .. } => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compactions.len(), 1, "exactly one Compaction event");
+        assert_eq!(compactions[0], SUMMARY);
+
+        let resumed = engine.run_task_resuming(id, "keep going").await.unwrap();
+        assert_eq!(resumed.answer, "resumed answer");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 6, "4 run turns + summarizer + resumed turn");
+        let messages = &requests[5].messages;
+        assert_eq!(
+            messages[0].content,
+            format!("Conversation compacted; summary of earlier work:\n{SUMMARY}"),
+            "resume starts from the compact state"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("chatty analysis")),
+            "the summarized middle turn is not replayed"
+        );
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content, "keep going");
+    }
+
+    #[tokio::test]
+    async fn compact_session_on_short_history_is_a_noop() {
+        let provider = Arc::new(MockProvider::with_script(vec![text_reply("hi")]));
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine(Arc::clone(&provider), Arc::clone(&store));
+
+        let summary = engine.run_task(TASK).await.unwrap();
+        let id = summary.session_id;
+        let before = store.load(id).await.unwrap().len();
+
+        let outcome = engine.compact_session(id).await.unwrap();
+        assert!(!outcome.compacted, "two items fit in the kept tail");
+        assert_eq!(outcome.tokens_after, outcome.tokens_before);
+        assert!(!outcome.note.is_empty());
+        assert_eq!(
+            store.load(id).await.unwrap().len(),
+            before,
+            "nothing written"
+        );
+        assert_eq!(provider.requests().len(), 1, "no summarizer call");
+    }
+
+    #[tokio::test]
+    async fn context_gauge_grows_with_history_and_drops_after_compaction() {
+        let mut script = long_run_script();
+        script.push(text_reply(SUMMARY));
+        let provider = Arc::new(MockProvider::with_script(script));
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine(Arc::clone(&provider), Arc::clone(&store));
+
+        let empty_id = store.create_session("empty").await.unwrap().id;
+        let empty = engine.context_gauge(empty_id).await.unwrap();
+        assert!(empty.used > 0, "system and tool specs always count");
+        assert_eq!(
+            empty.window, engine.config.max_input_tokens,
+            "no model window: the global cap"
+        );
+
+        let id = engine.run_task(TASK).await.unwrap().session_id;
+        let grown = engine.context_gauge(id).await.unwrap();
+        assert!(
+            grown.used > empty.used,
+            "history grows the gauge: {grown:?} vs {empty:?}"
+        );
+        assert!(grown.window <= engine.config.max_input_tokens);
+
+        engine.compact_session(id).await.unwrap();
+        let compacted = engine.context_gauge(id).await.unwrap();
+        assert!(
+            compacted.used < grown.used,
+            "compaction drops the gauge: {compacted:?} vs {grown:?}"
+        );
     }
 }
