@@ -262,6 +262,48 @@ fn rewind_view<'a>(
     }
 }
 
+/// A model id from a config string (`roles`, `review_model`,
+/// `escalate_on_check_failure`): a bare model id, or `provider::model` naming
+/// the provider explicitly. The double colon is the separator because single
+/// colons and slashes occur inside real model ids (`llama3:8b`,
+/// `anthropic/claude-x`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelRef<'a> {
+    Bare(&'a str),
+    Explicit { provider: &'a str, model: &'a str },
+}
+
+/// Parse a config model string. Empty parts are rejected, never guessed.
+pub(crate) fn parse_model_ref(spec: &str) -> std::result::Result<ModelRef<'_>, String> {
+    match spec.split_once("::") {
+        None if spec.is_empty() => Err("the model id is empty".into()),
+        None => Ok(ModelRef::Bare(spec)),
+        Some((provider, model)) if provider.is_empty() || model.is_empty() => Err(format!(
+            "`{spec}` needs both a provider and a model around `::`"
+        )),
+        Some((provider, model)) => Ok(ModelRef::Explicit { provider, model }),
+    }
+}
+
+/// The model part of a config string: what is sent on the wire and recorded.
+fn model_part(spec: &str) -> &str {
+    match parse_model_ref(spec) {
+        Ok(ModelRef::Explicit { model, .. }) => model,
+        _ => spec,
+    }
+}
+
+/// Log a configuration warning once per process: a role that cannot resolve
+/// would otherwise warn on every turn.
+fn warn_once(key: String, message: String) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert(key) {
+        tracing::warn!("{message}");
+    }
+}
+
 /// One reviewer outcome ready to record (H4b): the verdict and findings the
 /// reviewer gave, or `Skipped` when the review could not run.
 struct ReviewedDiff {
@@ -1670,15 +1712,19 @@ impl Engine {
         model: &str,
         role: &str,
     ) -> Option<crate::ModelChoice> {
+        // The provider that serves the role's model (explicit `provider::`,
+        // then the catalog lookup, then the router's provider).
+        let (provider, wire_model) = self.resolve_model_ref(model, &base.provider)?;
         let mut choice = base;
-        choice.model = model.to_string();
+        choice.provider = provider;
+        choice.model = wire_model.clone();
         choice.reason = format!("role {role}: {model}");
         choice.confident = true;
         // The role's model has its own window, which the router's choice
         // does not know: leave it unset so the global cap applies.
         choice.context_window = None;
         match self.resolve_provider(&choice) {
-            Ok((_, resolved)) if resolved == model => Some(choice),
+            Ok((_, resolved)) if resolved == wire_model => Some(choice),
             _ => {
                 tracing::warn!(
                     role,
@@ -1688,6 +1734,68 @@ impl Engine {
                 None
             }
         }
+    }
+
+    /// The provider serving a model id named by a config setting: the
+    /// `provider_lookup` answer only when that provider is registered in
+    /// `self.providers`, otherwise `fallback_provider` (the selector's
+    /// provider for the turn, as before the lookup existed).
+    fn resolve_model_provider(&self, model: &str, fallback_provider: &str) -> String {
+        let looked_up = self
+            .config
+            .provider_lookup
+            .as_ref()
+            .and_then(|lookup| lookup(model));
+        match looked_up {
+            Some(provider) if self.providers.contains_key(&provider) => provider,
+            Some(provider) => {
+                tracing::debug!(
+                    model,
+                    provider = %provider,
+                    "catalog provider is not registered; keeping the turn's provider"
+                );
+                fallback_provider.to_string()
+            }
+            None => fallback_provider.to_string(),
+        }
+    }
+
+    /// Resolve a config model string to `(provider, wire model)`. An explicit
+    /// `provider::model` wins when that provider is registered; an
+    /// unregistered one is warned about once and the model part resolves as
+    /// a bare id. `None` for an unparsable string (warned once): the caller
+    /// treats the setting as unresolved.
+    pub(crate) fn resolve_model_ref(
+        &self,
+        spec: &str,
+        fallback_provider: &str,
+    ) -> Option<(String, String)> {
+        let model = match parse_model_ref(spec) {
+            Ok(ModelRef::Explicit { provider, model }) if self.providers.contains_key(provider) => {
+                return Some((provider.to_string(), model.to_string()));
+            }
+            Ok(ModelRef::Explicit { provider, model }) => {
+                warn_once(
+                    format!("unregistered:{spec}"),
+                    format!(
+                        "model `{spec}` names provider `{provider}`, which is not registered; using the routed provider"
+                    ),
+                );
+                model
+            }
+            Ok(ModelRef::Bare(model)) => model,
+            Err(why) => {
+                warn_once(
+                    format!("invalid:{spec}"),
+                    format!("invalid model setting: {why}"),
+                );
+                return None;
+            }
+        };
+        Some((
+            self.resolve_model_provider(model, fallback_provider),
+            model.to_string(),
+        ))
     }
 
     /// Apply a role to a routed `choice` unless the selector is a pin (H7c
@@ -2379,14 +2487,17 @@ impl Engine {
             return Ok(None);
         }
 
-        let model = reviewer.model.clone();
+        // Only the model part of `provider::model` reaches the wire and the
+        // records; the provider is resolved below.
+        let model = model_part(&reviewer.model).to_string();
         let Some(diff) = self.collect_review_diff().await else {
             return Ok(Some(ReviewedDiff::skipped(model)));
         };
 
-        // Provider resolution mirrors the escalation turn: the selector's
-        // provider with the reviewer model swapped in; a model that does not
-        // resolve to itself is not silently run elsewhere (Skipped).
+        // Provider resolution mirrors the escalation turn: the reviewer model's
+        // provider (explicit, catalog, else the selector's), the model swapped
+        // in; a model that does not resolve to itself is not silently run
+        // elsewhere (Skipped).
         let prompt = review::build_review_prompt(task, &diff);
         let context_tokens = estimate_tokens(review::REVIEWER_SYSTEM) + estimate_tokens(&prompt);
         let mut choice = self.selector.select(&SelectRequest {
@@ -2398,6 +2509,11 @@ impl Engine {
                 .max_cost_usd
                 .map(|cap| (cap - state.spend_usd).max(0.0)),
         });
+        let Some((provider_id, _)) = self.resolve_model_ref(&reviewer.model, &choice.provider)
+        else {
+            return Ok(Some(ReviewedDiff::skipped(model.clone())));
+        };
+        choice.provider = provider_id;
         choice.model = model.clone();
         choice.reason = format!("review: independent reviewer → {model}");
         choice.confident = true;
@@ -2539,12 +2655,10 @@ impl Engine {
                 )
             })?;
 
-        // Provider resolution mirrors the persona path (subagent.rs
-        // ForcedSelector → resolve_provider): keep the selector's provider
-        // for a Chat action and swap only the model, so the registered-
-        // provider → default-provider fallback ladder applies unchanged. A
-        // model id from another provider rides the run's provider — a
-        // mismatch surfaces as a provider error and degrades below.
+        // The escalation model's provider (explicit `provider::`, catalog,
+        // else the selector's for a Chat action), then the usual
+        // resolve_provider ladder. Unresolvable = keep the pre-escalation
+        // answer, as every other escalation failure does.
         let context_tokens = estimate_context_tokens(system, &[], &state.transcript);
         let mut choice = self.selector.select(&SelectRequest {
             task: task.to_string(),
@@ -2555,7 +2669,13 @@ impl Engine {
                 .max_cost_usd
                 .map(|cap| (cap - state.spend_usd).max(0.0)),
         });
-        choice.model = escalation_model.clone();
+        let Some((provider_id, escalation_wire)) =
+            self.resolve_model_ref(&escalation_model, &choice.provider)
+        else {
+            return Ok(());
+        };
+        choice.provider = provider_id;
+        choice.model = escalation_wire.clone();
         choice.reason = format!(
             "escalation: verification failed after {MAX_VERIFY_ROUNDS} rounds → {escalation_model}"
         );
@@ -2565,7 +2685,7 @@ impl Engine {
         // provider is unregistered — an escalation that silently runs on
         // default_model would lie about "the escalation model re-checked
         // this". Abort the escalation instead; the old answer survives.
-        if model != escalation_model {
+        if model != escalation_wire {
             tracing::warn!(
                 requested = %escalation_model,
                 resolved = %model,
@@ -4345,6 +4465,71 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert!(requests[..4].iter().all(|r| r.model == "m"));
         assert_eq!(summary.turns, 5);
+    }
+
+    /// The escalation harness with a second provider `other`: the main loop
+    /// runs on `mock`, and the escalation model (`other-*`) is served by
+    /// `other` through the provider lookup.
+    fn escalation_on_other_provider(
+        mock_script: Vec<TurnResponse>,
+        other_script: Vec<TurnResponse>,
+        escalate: &str,
+    ) -> (
+        Engine,
+        std::sync::Arc<crate::testing::MockProvider>,
+        std::sync::Arc<crate::testing::MockProvider>,
+    ) {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        registry.register(std::sync::Arc::new(AlwaysFailVerifyTool));
+        let mock = std::sync::Arc::new(crate::testing::MockProvider::with_script(mock_script));
+        let other = std::sync::Arc::new(crate::testing::MockProvider::with_script(other_script));
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::clone(&mock) as std::sync::Arc<dyn ModelProvider>,
+        );
+        providers.insert(
+            "other".into(),
+            std::sync::Arc::clone(&other) as std::sync::Arc<dyn ModelProvider>,
+        );
+        let lookup: std::sync::Arc<crate::ProviderLookup> = std::sync::Arc::new(|model: &str| {
+            model.starts_with("other-").then(|| "other".to_string())
+        });
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                escalate_on_check_failure: Some(escalate.to_string()),
+                approvals: approve_all(),
+                provider_lookup: Some(lookup),
+                ..EngineConfig::default()
+            },
+        };
+        (engine, mock, other)
+    }
+
+    #[tokio::test]
+    async fn escalation_follows_the_lookup_to_its_provider() {
+        let (engine, mock, other) = escalation_on_other_provider(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                text("attempt 2"),
+                text("attempt 3"),
+            ],
+            vec![text("ESCALATED ANSWER")],
+            "other-escalated",
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "ESCALATED ANSWER");
+        assert_eq!(mock.requests().len(), 4, "main turns stay on the router");
+        let escalated = other.requests();
+        assert_eq!(escalated.len(), 1, "one escalation turn");
+        assert_eq!(escalated[0].model, "other-escalated");
     }
 
     #[tokio::test]
@@ -6353,5 +6538,193 @@ mod model_role_tests {
             "summary-model",
             "the summarizer uses the summary role"
         );
+    }
+
+    /// Two distinct mock providers: `mock` (the router's, serving
+    /// `mock-model`) and `other`. Each records only the requests it served.
+    /// The lookup maps every `other-*` model id to `other`.
+    fn two_provider_engine(
+        mock_script: Vec<TurnResponse>,
+        other_script: Vec<TurnResponse>,
+        configure: impl FnOnce(&mut EngineConfig),
+    ) -> (Engine, Arc<MockProvider>, Arc<MockProvider>) {
+        let mock = Arc::new(MockProvider::with_script(mock_script));
+        let other = Arc::new(MockProvider::with_script(other_script));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RoleWriteTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        providers.insert("other".into(), Arc::clone(&other) as Arc<dyn ModelProvider>);
+        let mut config = EngineConfig {
+            working_dir: std::env::temp_dir(),
+            default_provider: "mock".into(),
+            default_model: "mock-default".into(),
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                ..ApprovalPolicy::default()
+            },
+            compaction: CompactionPolicy {
+                enabled: false,
+                tail_messages: 2,
+                ..CompactionPolicy::default()
+            },
+            provider_lookup: Some(Arc::new(|model: &str| {
+                model.starts_with("other-").then(|| "other".to_string())
+            }) as Arc<crate::ProviderLookup>),
+            ..EngineConfig::default()
+        };
+        configure(&mut config);
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config,
+        };
+        (engine, mock, other)
+    }
+
+    #[test]
+    fn model_refs_parse_bare_and_explicit_forms() {
+        use super::parse_model_ref;
+        use super::ModelRef::{Bare, Explicit};
+        assert_eq!(
+            parse_model_ref("claude-opus-5-5"),
+            Ok(Bare("claude-opus-5-5"))
+        );
+        assert_eq!(
+            parse_model_ref("anthropic::claude-opus-5-5"),
+            Ok(Explicit {
+                provider: "anthropic",
+                model: "claude-opus-5-5"
+            })
+        );
+        // Single colons and slashes belong to the model id, not a separator.
+        assert_eq!(parse_model_ref("llama3:8b"), Ok(Bare("llama3:8b")));
+        assert_eq!(
+            parse_model_ref("anthropic/claude-x"),
+            Ok(Bare("anthropic/claude-x"))
+        );
+        assert_eq!(
+            parse_model_ref("openai-compat::llama3:8b"),
+            Ok(Explicit {
+                provider: "openai-compat",
+                model: "llama3:8b"
+            })
+        );
+        assert_eq!(
+            parse_model_ref("openai-compat::anthropic/claude-x"),
+            Ok(Explicit {
+                provider: "openai-compat",
+                model: "anthropic/claude-x"
+            })
+        );
+        // Empty parts are rejected, never guessed.
+        assert!(parse_model_ref("").is_err());
+        assert!(parse_model_ref("::model").is_err());
+        assert!(parse_model_ref("provider::").is_err());
+        assert!(parse_model_ref("::").is_err());
+    }
+
+    #[tokio::test]
+    async fn lookup_sends_the_plan_role_to_its_provider() {
+        let (engine, mock, other) = two_provider_engine(vec![], vec![text("answer")], |c| {
+            c.roles = roles(Some("other-plan"), None);
+            c.phase = Phase::Plan;
+        });
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        assert!(
+            mock.requests().is_empty(),
+            "the router's provider is not used"
+        );
+        let requests = other.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "other-plan");
+    }
+
+    #[tokio::test]
+    async fn explicit_prefix_beats_the_lookup() {
+        let (engine, mock, other) = two_provider_engine(vec![text("answer")], vec![], |c| {
+            c.roles = roles(Some("mock::other-plan"), None);
+            c.phase = Phase::Plan;
+        });
+        engine.run_task("task").await.unwrap();
+        assert!(other.requests().is_empty(), "the lookup would pick `other`");
+        assert_eq!(
+            mock.requests()[0].model,
+            "other-plan",
+            "the prefix is stripped on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_prefix_falls_back_and_the_run_succeeds() {
+        let (engine, mock, other) = two_provider_engine(vec![text("answer")], vec![], |c| {
+            c.roles = roles(Some("nope::mock-plan"), None);
+            c.phase = Phase::Plan;
+        });
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        assert!(other.requests().is_empty());
+        assert_eq!(mock.requests()[0].model, "mock-plan");
+    }
+
+    #[tokio::test]
+    async fn without_a_lookup_a_role_stays_on_the_turn_provider() {
+        let (engine, mock, other) = two_provider_engine(vec![text("answer")], vec![], |c| {
+            c.roles = roles(Some("other-plan"), None);
+            c.phase = Phase::Plan;
+            c.provider_lookup = None;
+        });
+        engine.run_task("task").await.unwrap();
+        assert!(other.requests().is_empty());
+        assert_eq!(mock.requests()[0].model, "other-plan");
+    }
+
+    #[tokio::test]
+    async fn reviewer_call_follows_the_lookup() {
+        let (engine, mock, other) = two_provider_engine(
+            vec![write_turn("w1", ""), text("done")],
+            vec![text("looks fine")],
+            |c| {
+                c.reviewer = Some(ReviewerConfig {
+                    model: "other-review".into(),
+                    max_rounds: 1,
+                });
+                c.review_diff_source =
+                    Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+            },
+        );
+        engine.run_task("task").await.unwrap();
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "the main turns stay on the router"
+        );
+        let reviewed = other.requests();
+        assert_eq!(reviewed.len(), 1, "one reviewer call");
+        assert_eq!(reviewed[0].model, "other-review");
+        assert!(reviewed[0].tools.is_empty(), "the reviewer is tool-less");
+    }
+
+    #[tokio::test]
+    async fn subagent_role_child_runs_on_the_resolved_provider() {
+        let (engine, mock, other) = two_provider_engine(vec![], vec![text("child answer")], |c| {
+            c.roles = ModelRoles {
+                subagent: Some("other-sub".into()),
+                ..ModelRoles::default()
+            };
+        });
+        crate::subagent::delegate(&engine, "do a thing", None, None, 50_000, None)
+            .await
+            .unwrap();
+        assert!(
+            mock.requests().is_empty(),
+            "the child is not routed to the router's provider"
+        );
+        let requests = other.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "other-sub");
     }
 }

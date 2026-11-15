@@ -5,12 +5,24 @@
 // Each method has no await between its reads and writes, so it is atomic
 // with respect to other RPCs on this instance (the ticket redeem relies on
 // that: read, delete, then decide).
+//
+// Time: every method that depends on the clock takes `now` (epoch ms) from
+// the router, which reads it once per request (requestNow in src/index.ts;
+// the x-test-now override exists only under MODRON_TEST_HOOKS).
+//
+// Stale sessions: a registration older than SESSION_GC_MS (30 days) is
+// deleted by a lazy sweep at the start of every session read or write
+// (listSessions, upsertSession, getSession, deleteSession, issueTicket). No
+// alarm is armed, so nothing needs re-arming. A session that is stale for 5
+// minutes is still stored; listSessions reports it offline (portal.ts
+// sessionView).
 
 import { DurableObject } from "cloudflare:workers";
 import {
   AUTH_MAX_ATTEMPTS,
   AUTH_WINDOW_MS,
   OWNER_TTL_MS,
+  SESSION_GC_MS,
   TICKET_TTL_MS,
   randomHex,
 } from "./portal";
@@ -122,7 +134,14 @@ export class Directory extends DurableObject<object> {
 
   // --- session directory ---
 
-  async upsertSession(row: SessionRow): Promise<void> {
+  // Deletes registrations not refreshed for SESSION_GC_MS. Runs first in
+  // every session-touching method, so a sweep happens on the next access.
+  private sweepSessions(now: number): void {
+    this.sql.exec("DELETE FROM sessions WHERE updated_at <= ?", now - SESSION_GC_MS);
+  }
+
+  async upsertSession(row: SessionRow, now: number): Promise<void> {
+    this.sweepSessions(now);
     this.sql.exec(
       `INSERT OR REPLACE INTO sessions (id, title, host_label, host_kind, viewer_key, state, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -130,17 +149,20 @@ export class Directory extends DurableObject<object> {
     );
   }
 
-  async deleteSession(id: string): Promise<boolean> {
+  async deleteSession(id: string, now: number): Promise<boolean> {
+    this.sweepSessions(now);
     const existed = this.sql.exec("SELECT 1 AS one FROM sessions WHERE id = ?", id).toArray().length > 0;
     this.sql.exec("DELETE FROM sessions WHERE id = ?", id);
     return existed;
   }
 
-  async getSession(id: string): Promise<SessionRow | null> {
+  async getSession(id: string, now: number): Promise<SessionRow | null> {
+    this.sweepSessions(now);
     return this.sql.exec<SessionRow>("SELECT * FROM sessions WHERE id = ?", id).toArray()[0] ?? null;
   }
 
-  async listSessions(): Promise<SessionRow[]> {
+  async listSessions(now: number): Promise<SessionRow[]> {
+    this.sweepSessions(now);
     return this.sql.exec<SessionRow>("SELECT * FROM sessions ORDER BY updated_at DESC, rowid DESC").toArray();
   }
 
@@ -171,6 +193,7 @@ export class Directory extends DurableObject<object> {
   // the invite is unknown, revoked, expired, or its session is no longer
   // registered. The ticket carries the role and the session's viewer key.
   async issueTicket(inviteId: string, now: number): Promise<IssuedTicket | null> {
+    this.sweepSessions(now);
     const invite = this.sql.exec<InviteRow>("SELECT * FROM invites WHERE id = ?", inviteId).toArray()[0];
     if (!invite || invite.revoked !== 0 || invite.expires_at <= now) return null;
     const session = this.sql

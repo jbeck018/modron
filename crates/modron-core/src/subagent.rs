@@ -605,10 +605,13 @@ async fn run_child(
                     context_tokens: crate::estimate_tokens(task),
                     budget_remaining_usd: None,
                 });
+                // The child carries the role's resolved provider and wire
+                // model (a `provider::model` prefix is stripped), exactly as
+                // a persona's forced provider is passed.
                 match parent.role_choice(base, model, "subagent") {
                     Some(choice) => Arc::new(ForcedSelector::role(
                         Arc::clone(&parent.selector),
-                        model,
+                        choice.model,
                         choice.provider,
                     )),
                     None => Arc::clone(&parent.selector),
@@ -850,6 +853,7 @@ pub(crate) fn child_config(
         hooks: parent.hooks.clone(),
         max_cost_usd: parent.max_cost_usd,
         price_lookup: parent.price_lookup.clone(),
+        provider_lookup: parent.provider_lookup.clone(),
         on_tool_event,
         // Sub-agents inherit the parent's reasoning effort (H7a); no
         // delegate or persona argument overrides it yet.

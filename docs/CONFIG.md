@@ -243,6 +243,12 @@ One optional model id per kind of work. A blank value counts as unset.
 A pinned run ignores the `plan`, `subagent` and `summary` roles. A pin comes from
 `--provider` or from a persona with `model`.
 
+Each role model runs on the provider that serves it: the model catalog
+maps the id to a provider you are signed in to, falling back to the
+turn's provider when the id is unknown. To name the provider yourself,
+write `provider::model` (for example `anthropic::claude-opus-5-5`). The
+same form works for `review_model` and `escalate_on_check_failure`.
+
 ## Environment variables
 
 Variables the binary reads, grouped by purpose. A variable that is not listed

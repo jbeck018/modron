@@ -1,7 +1,8 @@
 // Portal checks against real local Workers (`wrangler dev --local`, miniflare
-// on this machine; no Cloudflare account is touched). Two instances:
-//   A: OWNER_TOKEN + HOST_TOKEN set, MODRON_TEST_HOOKS=1 (expiry hook).
+// on this machine; no Cloudflare account is touched). Three instances:
+//   A: OWNER_TOKEN + HOST_TOKEN set, MODRON_TEST_HOOKS=1 (expiry and clock hooks).
 //   B: no portal secrets (the legacy share-link deployment).
+//   C: OWNER_TOKEN + HOST_TOKEN set, no test hooks (the hooks must be inert).
 // Secrets are random per run and passed as `--var`; each instance gets its
 // own persist directory under the gitignored .wrangler/, deleted afterwards.
 // Run from cloud/bridge:  node test/portal.mjs
@@ -63,7 +64,9 @@ async function startDev(label, vars) {
   let ready = false;
   while (Date.now() < end && !ready) {
     try {
-      ready = (await fetch(base + "/", { redirect: "manual" })).status === 200;
+      // Any HTTP answer means the Worker serves (with OWNER_TOKEN set, / is a 302).
+      await fetch(base + "/", { redirect: "manual" });
+      ready = true;
     } catch { /* not listening yet */ }
     if (!ready) await sleep(500);
   }
@@ -112,11 +115,15 @@ const viewerKey = createHash("sha256").update("modron-viewer:" + agentKey).diges
 const sid = randomUUID();
 const ipBad = "198.51.100.10"; // rate-limit bucket for failing sign-ins
 const ipGood = "198.51.100.20"; // bucket for the good sign-in
+const ipHooksOff = "198.51.100.30"; // bucket for instance C
+const DAY = 24 * 3600 * 1000;
+const MIN = 60 * 1000;
 const zeros = "0".repeat(64);
 
 mkdirSync(stateRoot, { recursive: true });
 const A = await startDev("portal", { OWNER_TOKEN: OWNER, HOST_TOKEN: HOST, MODRON_TEST_HOOKS: "1" });
 const B = await startDev("legacy", {});
+const C = await startDev("hooks-off", { OWNER_TOKEN: OWNER, HOST_TOKEN: HOST });
 const sockets = [];
 try {
   // ---------------- instance A: portal on ----------------
@@ -174,6 +181,67 @@ try {
     listed.length === 2 && listed[1].id === sid && listed[1].viewer_key === viewerKey && listed[1].title === "demo session",
     JSON.stringify(listed));
   check("/api/sessions is newest first", listed[0].id === sid2, "first is " + listed[0]?.id);
+
+  // Row shape: updated_at is ISO 8601, online is a bool, open_url is the app path.
+  const fresh = listed.find((r) => r.id === sid);
+  check("fresh heartbeat row is online with its own state and ISO updated_at",
+    fresh && fresh.online === true && fresh.state === "idle" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(fresh.updated_at),
+    JSON.stringify(fresh));
+  const innerOf = (row) => decodeURIComponent(row.open_url.slice("/app/?url=".length));
+  check("open_url is /app/?url=<encoded ws url of /ws/<viewer key>>",
+    fresh && fresh.open_url.startsWith("/app/?url=") &&
+    innerOf(fresh) === `ws://127.0.0.1:${A.port}/ws/${viewerKey}`, fresh && fresh.open_url);
+
+  // Staleness: a session last seen 6 minutes ago is offline, and the list's
+  // clock (x-test-now) sets the threshold: 5 minutes is still online, 5 min 1 ms is not.
+  const staleSid = randomUUID();
+  const staleVk = createHash("sha256").update("stale:" + staleSid).digest("hex").slice(0, 32);
+  const staleAt = Date.now() - 6 * MIN;
+  const putStale = await fetch(a + "/api/host/sessions/" + staleSid, json(
+    { ...hostBody, title: "stale", viewer_key: staleVk },
+    { method: "PUT", headers: { ...hostAuth, "x-test-now": String(staleAt) } }));
+  check("host PUT with a backdated x-test-now is 204 under the hook", putStale.status === 204, "status " + putStale.status);
+  const listAt = async (ms) => (await fetch(a + "/api/sessions", { headers: { ...withCookie, "x-test-now": String(ms) } })).json();
+  const rowOf = (rows, id) => rows.find((r) => r.id === id);
+  const stale6 = rowOf(await listAt(Date.now()), staleSid);
+  check("a session 6 minutes without a heartbeat is offline",
+    stale6 && stale6.online === false && stale6.state === "offline" && stale6.updated_at === new Date(staleAt).toISOString(),
+    JSON.stringify(stale6));
+  const at4 = rowOf(await listAt(staleAt + 4 * MIN), staleSid);
+  check("4 minutes after the last heartbeat it is still online", at4 && at4.online === true && at4.state === "idle");
+  const at5 = rowOf(await listAt(staleAt + 5 * MIN), staleSid);
+  check("exactly 5 minutes after the last heartbeat it is still online", at5 && at5.online === true);
+  const at5p = rowOf(await listAt(staleAt + 5 * MIN + 1), staleSid);
+  check("5 minutes and 1 ms after the last heartbeat it is offline", at5p && at5p.online === false && at5p.state === "offline");
+  // A new heartbeat brings it back online with its new state.
+  await fetch(a + "/api/host/sessions/" + staleSid, json(
+    { ...hostBody, title: "stale", viewer_key: staleVk, state: "running" }, { method: "PUT", headers: hostAuth }));
+  const revived = rowOf(await listAt(Date.now()), staleSid);
+  check("a fresh heartbeat makes an offline session online again", revived && revived.online === true && revived.state === "running");
+  await fetch(a + "/api/host/sessions/" + staleSid, { method: "DELETE", headers: hostAuth });
+
+  // GC: a registration older than 30 days is removed by the next access.
+  const oldSid = randomUUID();
+  const oldPut = await fetch(a + "/api/host/sessions/" + oldSid, json(
+    { ...hostBody, title: "ancient", viewer_key: createHash("sha256").update("old:" + oldSid).digest("hex").slice(0, 32) },
+    { method: "PUT", headers: { ...hostAuth, "x-test-now": String(Date.now() - 31 * DAY) } }));
+  check("a 31-day-old registration is accepted (204) before the sweep", oldPut.status === 204, "status " + oldPut.status);
+  const afterSweep = await (await fetch(a + "/api/sessions", { headers: withCookie })).json();
+  check("the next /api/sessions read removes a registration older than 30 days", !afterSweep.some((r) => r.id === oldSid));
+  const reput = await fetch(a + "/api/host/sessions/" + sid, json(hostBody, { method: "PUT", headers: hostAuth }));
+  check("current registrations survive the sweep", reput.status === 204 && afterSweep.some((r) => r.id === sid));
+
+  // /api/me: 200 with the owner cookie, 401 without it.
+  const meNo = await fetch(a + "/api/me");
+  check("GET /api/me without a cookie is 401", meNo.status === 401, "status " + meNo.status);
+  const meYes = await fetch(a + "/api/me", { headers: withCookie });
+  check("GET /api/me with the owner cookie is 200 {owner: true}",
+    meYes.status === 200 && JSON.stringify(await meYes.json()) === '{"owner":true}');
+
+  // Root: with OWNER_TOKEN the root is a redirect to the app.
+  const rootA = await fetch(a + "/", { redirect: "manual" });
+  check("GET / with OWNER_TOKEN set is 302 to /app/", rootA.status === 302 && rootA.headers.get("location") === "/app/",
+    "status " + rootA.status + " location " + rootA.headers.get("location"));
 
   // Invite links.
   const invUrl = a + "/api/invites";
@@ -288,6 +356,21 @@ try {
   owner.ws.send(JSON.stringify({ type: "submit", id: 9, task: "owner may submit" }));
   check("owner submit reaches the agent", await waitUntil(() => agentFrames().some((f) => f.type === "submit" && f.id === 9)));
 
+  // open_url: the owner's browser opens the inner ws url on the same origin,
+  // so the cookie rides on the upgrade. That socket is unfiltered.
+  const openInner = innerOf(listed.find((r) => r.id === sid));
+  const openOwner = connect(openInner, withCookie);
+  sockets.push(openOwner.ws);
+  check("the open_url socket with the owner cookie opens", await openOwner.opened);
+  openOwner.ws.send(JSON.stringify({ type: "submit", id: 10, task: "from open_url" }));
+  check("a submit on the open_url socket is relayed to the agent unfiltered",
+    await waitUntil(() => agentFrames().some((f) => f.type === "submit" && f.id === 10)));
+  const openNoCookie = connect(openInner);
+  sockets.push(openNoCookie.ws);
+  check("the same open_url without the cookie is refused", !(await openNoCookie.opened));
+  const openHttp = await fetch(openInner.replace(/^ws:/, "http:"));
+  check("the same open_url without the cookie is 401 over HTTP", openHttp.status === 401, "status " + openHttp.status);
+
   // Bare share-key socket is refused once the portal is on.
   const bareHttp = await fetch(`${a}/ws/${viewerKey}`);
   check("bare /ws/<key> with no cookie or ticket is 401", bareHttp.status === 401, "status " + bareHttp.status);
@@ -316,8 +399,12 @@ try {
     (await fetch(b + "/auth", json({ token: "x" }))).status,
     (await fetch(b + "/i/" + "a".repeat(32) + "." + "b".repeat(64), { redirect: "manual" })).status,
     (await fetch(b + "/api/host/sessions/" + sid, json(hostBody, { method: "PUT", headers: hostAuth }))).status,
+    (await fetch(b + "/api/me")).status,
   ];
   check("portal routes answer 503 without OWNER_TOKEN", offStatus.every((s) => s === 503), offStatus.join(","));
+  const rootB = await fetch(b + "/", { redirect: "manual" });
+  check("GET / without OWNER_TOKEN keeps the plain text answer",
+    rootB.status === 200 && (await rootB.text()).startsWith("modron remote-control bridge"));
   const legacyAgentHttp = await fetch(`${b}/agent/${agentKey}`);
   check("agent tunnel without HOST_TOKEN is not gated", legacyAgentHttp.status !== 401, "status " + legacyAgentHttp.status);
   const share = await fetch(`${b}/s/${viewerKey}`, { redirect: "manual" });
@@ -333,12 +420,36 @@ try {
     await waitUntil(() => legacyAgent.got.some((s) => s.includes('"task":"legacy"'))));
   const legacyTicket = await fetch(`${b}/ws/${viewerKey}?ticket=${zeros}`);
   check("a ticket is refused when the portal is off (403)", legacyTicket.status === 403, "status " + legacyTicket.status);
+  // ---------------- instance C: portal on, test hooks OFF ----------------
+  // The clock header and the ttl_seconds field must do nothing here.
+  const c = C.base;
+  const cSignIn = await fetch(c + "/auth", json({ token: OWNER }, { headers: { "cf-connecting-ip": ipHooksOff } }));
+  const cCookieLine = cSignIn.headers.getSetCookie().find((x) => x.startsWith("modron_owner=")) || "";
+  const cCookie = { cookie: cCookieLine.split(";")[0] };
+  check("instance C signs in", cSignIn.status === 200 && cCookie.cookie.length > "modron_owner=".length);
+  const cMe = await fetch(c + "/api/me", { headers: cCookie });
+  check("instance C GET /api/me is 200 with the cookie", cMe.status === 200);
+  const cSid = randomUUID();
+  const cVk = createHash("sha256").update("c:" + cSid).digest("hex").slice(0, 32);
+  const cPut = await fetch(c + "/api/host/sessions/" + cSid, json(
+    { ...hostBody, title: "hooks off", viewer_key: cVk },
+    { method: "PUT", headers: { ...hostAuth, "x-test-now": String(Date.now() - 31 * DAY) } }));
+  check("instance C registers a session (204)", cPut.status === 204, "status " + cPut.status);
+  const cRows = await (await fetch(c + "/api/sessions", { headers: { ...cCookie, "x-test-now": String(Date.now() - 31 * DAY) } })).json();
+  const cRow = cRows.find((r) => r.id === cSid);
+  check("without test hooks x-test-now is ignored: the row is online and was not swept",
+    cRow !== undefined && cRow.online === true, JSON.stringify(cRow));
+  const cTtl = await fetch(c + "/api/invites", json({ session_id: cSid, role: "viewer", ttl_seconds: 1 }, { headers: cCookie }));
+  check("without test hooks ttl_seconds is refused (400)", cTtl.status === 400, "status " + cTtl.status);
+  const cBadClock = await fetch(c + "/api/sessions", { headers: { ...cCookie, "x-test-now": "abc" } });
+  check("a non-numeric x-test-now is ignored (200)", cBadClock.status === 200);
 } catch (err) {
-  check("portal test run", false, String(err && err.message ? err.message : err));
+  check("portal test run", false, String(err && err.stack ? err.stack : err).split("\n").slice(0, 4).join(" | "));
 } finally {
   for (const s of sockets) { try { s.close(); } catch { /* closed */ } }
   A.stop();
   B.stop();
+  C.stop();
   await sleep(500);
   rmSync(stateRoot, { recursive: true, force: true });
   if (madePlaceholder) rmSync(appDir, { recursive: true, force: true });

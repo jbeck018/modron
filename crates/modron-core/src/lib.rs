@@ -676,6 +676,13 @@ pub struct ApprovalPolicy {
 /// with a warning, never a made-up number.
 pub type PriceLookup = dyn Fn(&str) -> Option<(f64, f64)> + Send + Sync;
 
+/// Model-to-provider lookup for the configured model roles (`roles`,
+/// `review_model`, `escalate_on_check_failure`): given a model id, return the
+/// provider id that serves it. The CLI wires the router catalog, so modron-core
+/// never depends on modron-router. `None` from the lookup keeps the provider
+/// the selector chose for the turn. See [`EngineConfig::provider_lookup`].
+pub type ProviderLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
+
 /// Messages typed while a run is active. The engine drains this at safe
 /// boundaries (between model turns) and appends each as a user message.
 #[derive(Default)]
@@ -764,6 +771,12 @@ pub struct EngineConfig {
     /// tokens). `None` = no pricing known; caps cannot trip (with a warning
     /// if a cap was requested).
     pub price_lookup: Option<Arc<PriceLookup>>,
+    /// Which provider serves a configured model role (`roles`, the reviewer
+    /// and the escalation model). `None` (default) keeps every role on the
+    /// turn's provider, as before. Precedence: an explicit `provider::model`
+    /// in the config string > this lookup (only when that provider is
+    /// registered) > the turn's provider.
+    pub provider_lookup: Option<Arc<ProviderLookup>>,
     /// Lifecycle hooks around every tool call (Phase-1b H1, additive).
     /// `None` commands = no hooks, no behavior change.
     pub hooks: hooks::HookConfig,
@@ -909,6 +922,7 @@ impl Default for EngineConfig {
             approvals: ApprovalPolicy::default(),
             max_cost_usd: None,
             price_lookup: None,
+            provider_lookup: None,
             hooks: hooks::HookConfig::default(),
             resume_from_event: None,
             resume_skip_end: None,
@@ -949,6 +963,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("approvals", &self.approvals)
             .field("max_cost_usd", &self.max_cost_usd)
             .field("price_lookup", &self.price_lookup.is_some())
+            .field("provider_lookup", &self.provider_lookup.is_some())
             .field("hooks", &self.hooks)
             .field("resume_from_event", &self.resume_from_event)
             .field("resume_skip_end", &self.resume_skip_end)

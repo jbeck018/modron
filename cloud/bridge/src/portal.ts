@@ -19,6 +19,11 @@ export const OWNER_TTL_MS = OWNER_MAX_AGE_S * 1000;
 export const TICKET_TTL_MS = 60 * 1000;
 export const AUTH_WINDOW_MS = 60 * 1000;
 export const AUTH_MAX_ATTEMPTS = 5;
+// Hosts re-PUT every 60 s (crates/modron-server/src/rc.rs). A session whose
+// last PUT is older than 5 minutes (5 missed heartbeats) is reported offline,
+// and a registration older than 30 days is deleted outright.
+export const SESSION_STALE_MS = 5 * 60 * 1000;
+export const SESSION_GC_MS = 30 * 24 * 3600 * 1000;
 
 const enc = new TextEncoder();
 const INVITE_SALT = "modron-portal-v1";
@@ -176,6 +181,55 @@ export function parseHostSession(body: Record<string, unknown>): Check<HostSessi
     viewer_key,
     state,
   });
+}
+
+// --- session rows as the owner sees them (GET /api/sessions) ---
+
+// The stored row (see directory.ts SessionRow), with updated_at in ms.
+export interface StoredSession {
+  id: string;
+  title: string;
+  host_label: string;
+  host_kind: string;
+  viewer_key: string;
+  state: string;
+  updated_at: number;
+}
+
+export interface SessionView {
+  id: string;
+  title: string;
+  host_label: string;
+  host_kind: string;
+  viewer_key: string;
+  // "offline" when the last heartbeat is stale; the stored state otherwise.
+  state: string;
+  updated_at: string;
+  online: boolean;
+  // Path the owner's browser opens for this session (same origin, so the
+  // owner cookie rides along on the viewer websocket).
+  open_url: string;
+}
+
+// `wsOrigin` is the websocket origin of the request, e.g. wss://bridge.example
+// or ws://127.0.0.1:8787. The inner url is URL-encoded in the query string.
+export function sessionOpenUrl(wsOrigin: string, viewerKey: string): string {
+  return "/app/?url=" + encodeURIComponent(wsOrigin + "/ws/" + viewerKey);
+}
+
+export function sessionView(row: StoredSession, now: number, wsOrigin: string): SessionView {
+  const online = now - row.updated_at <= SESSION_STALE_MS;
+  return {
+    id: row.id,
+    title: row.title,
+    host_label: row.host_label,
+    host_kind: row.host_kind,
+    viewer_key: row.viewer_key,
+    state: online ? row.state : "offline",
+    updated_at: new Date(row.updated_at).toISOString(),
+    online,
+    open_url: sessionOpenUrl(wsOrigin, row.viewer_key),
+  };
 }
 
 // --- invites (POST /api/invites) ---

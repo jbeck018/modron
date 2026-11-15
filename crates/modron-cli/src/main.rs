@@ -1241,6 +1241,8 @@ fn build_agent_with(
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),
+        // Set below, once the providers that built are known (see `authed`).
+        provider_lookup: None,
         // Honors a prior `modron rewind` of this session (C2): the
         // abandoned range `[cut, end)` stays in the log but never re-enters
         // context; events appended after the rewind (index >= end) do.
@@ -1429,6 +1431,10 @@ fn build_agent_with(
     // mode, bad overrides) must surface regardless of the provider choice.
     // Tiers derive from the providers that actually built (keys/sign-ins).
     let authed: Vec<String> = providers.keys().cloned().collect();
+    // Model roles (`roles`, reviewer, escalation) follow the catalog's
+    // provider, as `/model` does. Precedence in the engine: an explicit
+    // `provider::model` in the config > this lookup > the turn's provider.
+    engine_config.provider_lookup = Some(catalog_provider_lookup(&authed));
     let (router, mut tier_fallbacks) =
         build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()), &authed)?;
     // A persona's forced model is a pin (H7c precedence: pin > role >
@@ -1952,6 +1958,18 @@ type SelectorWithFallbacks = (
 /// Default mode is `learned` (corpus centroids + heuristic fallback — the
 /// fallback preserves budget/overflow rules, so learned is a strict
 /// refinement of the rules).
+/// The `provider_lookup` the engine uses for model roles: a model's catalog
+/// provider, but only one the user is authenticated with (`authed` = the
+/// providers that built), the same set auto tiers draw from.
+pub(crate) fn catalog_provider_lookup(authed: &[String]) -> Arc<modron_core::ProviderLookup> {
+    let authed: Vec<String> = authed.to_vec();
+    Arc::new(move |model: &str| {
+        modron_router::lookup(model)
+            .map(|info| info.provider.clone())
+            .filter(|provider| authed.contains(provider))
+    })
+}
+
 fn build_selector(
     cfg: &config::Config,
     persona_model: Option<String>,
@@ -3765,5 +3783,15 @@ mod tests {
             .rules
             .evaluate("bash", &serde_json::json!({"command": "rm -rf x"}));
         assert_eq!(verdict.map(|v| v.effect), Some(RuleEffect::Deny));
+    }
+
+    #[test]
+    fn catalog_lookup_maps_a_known_model_to_its_provider() {
+        let lookup = catalog_provider_lookup(&["anthropic".to_string()]);
+        assert_eq!(lookup("claude-opus-5-5").as_deref(), Some("anthropic"));
+        // Unknown ids and providers the user is not signed in to: no answer.
+        assert_eq!(lookup("no-such-model"), None);
+        let unauthed = catalog_provider_lookup(&["openai-compat".to_string()]);
+        assert_eq!(unauthed("claude-opus-5-5"), None);
     }
 }

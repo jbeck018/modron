@@ -37,7 +37,8 @@ A single `Directory` Durable Object (SQLite):
 
 - `sessions(id, title, host_label, host_kind, viewer_key, state,
   updated_at)`; upserted by hosts over the tunnel (`HOST_TOKEN`), removed
-  on host request or after 30 days without a heartbeat.
+  on host request or after 30 days without a heartbeat; a session with
+  no heartbeat for 5 minutes is listed as offline.
 - `owner_sessions(cookie_id, created_at, last_seen)`.
 - `invites(id, session_id, role, expires_at, revoked, created_at, uses)`.
 - `identities(id, kind, login, scopes, token_enc, created_at)`.

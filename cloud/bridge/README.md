@@ -114,7 +114,7 @@ npx wrangler dev    # serves on localhost:8787
 node test/local.mjs # starts wrangler dev --local on a free port and checks
                     # the redirect, the classic viewer, /app/ headers and
                     # the viewer hello replay (no Cloudflare account used)
-node test/portal.mjs # portal checks against two local Workers (see Portal)
+node test/portal.mjs # portal checks against three local Workers (see Tests)
 ```
 
 If `public/app/index.html` is absent, the test writes a placeholder bundle
@@ -124,9 +124,10 @@ there and removes it afterwards.
 
 Design: `docs/PORTAL.md`. Step 1 of that plan is in this Worker: the
 secrets, the `Directory` object, owner sign-in, host registration,
-`/api/sessions`, invite links and role enforcement on viewer sockets. Still
-to come: the app's sessions screen (C4d), linked GitHub accounts (C4e),
-heartbeat-based removal of stale sessions (C5), and passkeys (v2).
+`/api/sessions`, `/api/me`, invite links, role enforcement on viewer sockets,
+the app's sessions screen (the list opens each session through `open_url`),
+and heartbeat-based staleness and removal (see "Staleness" below). Still to
+come: linked GitHub accounts (C4e), web push (C5), and passkeys (v2).
 
 ### Secrets
 
@@ -158,7 +159,9 @@ stored in the Directory as SHA-256 hashes.
 |---|---|---|
 | `POST /auth` `{ "token" }` | anyone | 200 + `modron_owner` cookie; 401 wrong; 429 after 5 attempts a minute per client IP (`CF-Connecting-IP`), counted before the token is compared; 400 for unknown fields |
 | `POST /auth/logout` | anyone | 204, revokes the presented cookie and clears it |
-| `GET /api/sessions` | owner cookie | 200, list of sessions, newest first (includes `viewer_key`) |
+| `GET /` | anyone | 302 to `/app/` when `OWNER_TOKEN` is set; the plain text answer when it is not |
+| `GET /api/me` | owner cookie | 200 `{ "owner": true }`; 401 without a live cookie; 503 portal off |
+| `GET /api/sessions` | owner cookie | 200, list of sessions, newest first. Each row: `id`, `title`, `host_label`, `host_kind`, `viewer_key`, `state` (`"offline"` when stale), `updated_at` (ISO 8601, last heartbeat), `online` (bool), `open_url` (see below) |
 | `POST /api/invites` `{ session_id, role, ttl_hours }` | owner | 201 `{ id, url, expires_at }` (`expires_at` ISO 8601) |
 | `GET /api/invites[?session_id=]` | owner | 200, list with `url`, `revoked`, `uses` |
 | `DELETE /api/invites/<id>` | owner | 204 (revoke; repeating it is also 204) |
@@ -177,9 +180,8 @@ never be silently ignored).
 
 1. Dial `wss://<bridge>/agent/<agent key>` with the header
    `Authorization: Bearer <HOST_TOKEN>` (the agent key still derives the
-   viewer key, see above). Today `crates/modron-server/src/rc.rs` calls
-   `connect_async` with no headers, so it needs a header-carrying request
-   before a `HOST_TOKEN` bridge accepts it.
+   viewer key, see above). `crates/modron-server/src/rc.rs` sends that bearer
+   on the upgrade, and on every portal PUT and DELETE below.
 2. Register each session it serves:
    `PUT /api/host/sessions/<session uuid, lowercase>` with the bearer and
    `Content-Type: application/json`:
@@ -194,9 +196,36 @@ never be silently ignored).
    }
    ```
 
-   Refresh it at least every few minutes while the session lives. Remove it
-   with `DELETE` when the session ends. (Stale-entry removal after 30 days
-   without a heartbeat is not implemented yet.)
+   rc.rs PUTs on open, on every running-state change, and every 60 seconds
+   (the heartbeat). Remove it with `DELETE` when the session ends.
+
+### Staleness
+
+- A session whose last PUT is more than 5 minutes old (five missed
+  heartbeats) is listed with `"online": false` and `"state": "offline"`. Its
+  stored state is kept, so the next heartbeat brings it back.
+- A registration not refreshed for 30 days is deleted from the Directory.
+- Both are computed on access. Every session read or write in the Directory
+  first deletes registrations older than 30 days, so no alarm is armed and
+  nothing needs re-arming. An offline session can still be invited, and an
+  invite for a removed session answers 410.
+
+### `open_url` and the owner's browser
+
+Each `/api/sessions` row carries `open_url`, a same-origin path such as
+`/app/?url=wss%3A%2F%2Fbridge.example%2Fws%2F<viewer key>` (the inner
+websocket URL is URL-encoded, with the scheme from the request). The owner
+opens it in the same browser: the owner cookie rides on the websocket
+upgrade to the same origin, and the socket is unfiltered. Without the cookie
+the same URL is 401 (when `OWNER_TOKEN` is set). Clients should use
+`open_url` rather than build the URL themselves.
+
+### Test clock (tests only)
+
+Under `MODRON_TEST_HOOKS=1` an `x-test-now: <epoch ms>` header replaces the
+clock for `PUT`/`DELETE /api/host/sessions/*` and for `GET /api/sessions`
+(staleness and the 30-day sweep). Without the hook var the header is never
+read, and a non-numeric value is ignored. No production client sends it.
 
 ### Viewer roles
 
@@ -233,14 +262,18 @@ Redeeming it deletes it whether or not it matches.
 
 ### Tests
 
-`node test/portal.mjs` starts two `wrangler dev --local` instances (no
-Cloudflare account): one with random `OWNER_TOKEN` and `HOST_TOKEN` passed as
-`--var`, and `MODRON_TEST_HOOKS=1`; one with no portal secrets. It checks the
-rate limit, cookie attributes, the 503 answers and legacy relay, host
-registration and ordering, invite signatures, revocation, expiry, ticket
-single use, role filtering fed through a fake agent socket, the owner socket,
-and logout. Each instance uses a fresh persist directory under `.wrangler/`,
-removed afterwards.
+`node test/portal.mjs` starts three `wrangler dev --local` instances (no
+Cloudflare account): A with random `OWNER_TOKEN` and `HOST_TOKEN` passed as
+`--var`, and `MODRON_TEST_HOOKS=1`; B with no portal secrets; C with the two
+secrets but no test hooks. It checks the rate limit, cookie attributes, the
+503 answers and legacy relay, host registration and ordering, heartbeat
+staleness (offline after 5 minutes, the exact boundary), the 30-day sweep,
+`/api/me`, the root redirect, `open_url` (the owner cookie opens it and its
+submit reaches a fake agent; without the cookie it is refused), invite
+signatures, revocation, expiry, ticket single use, role filtering fed through
+a fake agent socket, the owner socket, and logout. C checks that the clock
+header and `ttl_seconds` are inert without the hook var. Each instance uses a
+fresh persist directory under `.wrangler/`, removed afterwards.
 
 Expiry: invites are normally at least one hour (`ttl_hours`). With
 `MODRON_TEST_HOOKS=1` (set only by the test, never in a deployment)

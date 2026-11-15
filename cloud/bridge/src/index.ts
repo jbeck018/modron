@@ -144,6 +144,7 @@ import {
   randomHex,
   readCookie,
   readJsonObject,
+  sessionView,
   sha256Hex,
 } from "./portal";
 
@@ -501,6 +502,19 @@ export class SessionBridge extends DurableObject {
       // the same replay. The hello itself is still forwarded below so the
       // agent answers with `welcome`. Only the first one replays, which
       // bounds the replay work per socket.
+      //
+      // Ordering (see cloud/bridge/NOTES.md "Replay and ordering"):
+      // - The replay is written with ws.send BEFORE agent.send(hello). The
+      //   agent's answers (welcome, then the Attach snapshot rc.rs sends on
+      //   every hello) arrive as later events, so they reach this viewer
+      //   after the replay.
+      // - storage.list runs under the object's input gate, so the replay is
+      //   one consistent prefix of the stored agent stream: no append is
+      //   half-done and no later frame is mixed in.
+      // - A live frame that reached this socket before its hello is not held
+      //   back, so the replay may repeat it. The snapshot that follows the
+      //   hello resets the client, so the repeat is transient and cannot
+      //   leave a stale view behind.
       const isSync = parsed !== null && typeof parsed === "object" && parsed.type === "sync";
       const isFirstHello = parsed !== null && typeof parsed === "object" && parsed.type === "hello" && claimFirstHello(ws);
       if (isSync || isFirstHello) {
@@ -610,6 +624,24 @@ function bearerMatches(request: Request, expected: string): boolean {
   return constantTimeEquals(presented, expected);
 }
 
+// The clock for one portal request: Date.now(), except that under
+// MODRON_TEST_HOOKS an `x-test-now: <epoch ms>` header stands in for it, so
+// test/portal.mjs can register a host that stopped heartbeating or one whose
+// registration is past the 30-day sweep. Without the hook var the header is
+// never read. Digits only; anything else is ignored.
+export function requestNow(request: Request, env: Env): number {
+  const header = env.MODRON_TEST_HOOKS ? request.headers.get("x-test-now") : null;
+  if (header !== null && /^\d{1,15}$/.test(header)) return Number(header);
+  return Date.now();
+}
+
+// Websocket origin of this request (wss for https, ws otherwise), the same
+// scheme rule as appRedirectLocation.
+function wsOriginOf(requestUrl: URL): string {
+  const wsScheme = requestUrl.protocol === "https:" ? "wss:" : "ws:";
+  return wsScheme + "//" + requestUrl.host;
+}
+
 // True when the request carries a live owner cookie (and refreshes it).
 async function ownerCookieLive(request: Request, env: Env): Promise<boolean> {
   const cookie = readCookie(request, OWNER_COOKIE);
@@ -664,8 +696,9 @@ async function handleHostSession(request: Request, env: Env, id: string): Promis
   if (!bearerMatches(request, env.HOST_TOKEN)) return plainResponse(401, "unauthorized");
   const sid = id.toLowerCase();
   if (!UUID_RE.test(sid)) return plainResponse(400, "invalid session id");
+  const now = requestNow(request, env);
   if (request.method === "DELETE") {
-    await directory(env).deleteSession(sid);
+    await directory(env).deleteSession(sid, now);
     return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
   }
   if (request.method !== "PUT") return plainResponse(405, "method not allowed");
@@ -673,14 +706,28 @@ async function handleHostSession(request: Request, env: Env, id: string): Promis
   if (!parsed.ok) return parsed.response;
   const input = parseHostSession(parsed.body);
   if (!input.ok) return plainResponse(400, input.message);
-  await directory(env).upsertSession({ id: sid, ...input.value, updated_at: Date.now() });
+  await directory(env).upsertSession({ id: sid, ...input.value, updated_at: now }, now);
   return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 }
 
-// GET /api/sessions (owner), newest first.
+// GET /api/sessions (owner), newest first. Each row carries online (a
+// heartbeat within 5 minutes), updated_at as ISO 8601, and open_url: the
+// path the owner's browser opens to attach to that session.
 async function handleOwnerSessions(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return plainResponse(405, "method not allowed");
-  return jsonResponse(200, await directory(env).listSessions());
+  const now = requestNow(request, env);
+  const origin = wsOriginOf(new URL(request.url));
+  const rows = await directory(env).listSessions(now);
+  return jsonResponse(200, rows.map((row) => sessionView(row, now, origin)));
+}
+
+// GET /api/me (owner): { "owner": true } with a live owner cookie, else 401.
+// The portal-off 503 is answered by the router before this runs.
+async function handleMe(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return plainResponse(405, "method not allowed");
+  const denied = await requireOwner(request, env);
+  if (denied) return denied;
+  return jsonResponse(200, { owner: true });
 }
 
 // POST /api/invites, GET /api/invites[?session_id=], DELETE /api/invites/<id>.
@@ -707,8 +754,8 @@ async function handleInvites(request: Request, env: Env, path: string): Promise<
       if (!parsed.ok) return parsed.response;
       const input = parseInvite(parsed.body, hooks);
       if (!input.ok) return plainResponse(400, input.message);
-      const now = Date.now();
-      if ((await dir.getSession(input.value.session_id)) === null) return plainResponse(404, "session is not registered");
+      const now = requestNow(request, env);
+      if ((await dir.getSession(input.value.session_id, now)) === null) return plainResponse(404, "session is not registered");
       const id = randomHex(16);
       const expires_at = now + input.value.ttl_ms;
       await dir.createInvite({
@@ -822,6 +869,13 @@ const router: ExportedHandler<Env> = {
     if ((m = path.match(/^\/p\/([^/]+)$/)) && request.method === "GET") {
       return env.BRIDGE.get(env.BRIDGE.idFromName(REGISTRY_DO)).fetch(request);
     }
+    // With the portal on, the root is the app (sign-in or the session list).
+    // Without it, the plain text answer stays as it was.
+    if (path === "/" && (request.method === "GET" || request.method === "HEAD")) {
+      if (env.OWNER_TOKEN) {
+        return new Response(null, { status: 302, headers: { location: "/app/", "cache-control": "no-store" } });
+      }
+    }
     if (path === "/") return new Response("modron remote-control bridge - open a /s/<key> share link from modron");
     // The unified web app (static assets). Anything not in the bundle is a
     // plain 404 from the assets binding.
@@ -839,6 +893,7 @@ const router: ExportedHandler<Env> = {
     if (path === "/auth/logout") {
       return request.method === "POST" ? handleLogout(request, env) : plainResponse(405, "method not allowed");
     }
+    if (path === "/api/me") return handleMe(request, env);
     if (path === "/api/sessions") {
       const denied = await requireOwner(request, env);
       if (denied) return denied;
