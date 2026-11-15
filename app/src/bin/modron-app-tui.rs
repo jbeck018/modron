@@ -108,7 +108,7 @@ mod terminal {
     }
 
     const CTRL_C_WINDOW: Duration = Duration::from_secs(2);
-    const CTRL_C_HINT: &str = "press ctrl+c again to quit";
+    use modron_mobile_core::view::CTRL_C_QUIT_HINT as CTRL_C_HINT;
 
     fn ctrl_c(running: bool, last: Option<Instant>, now: Instant) -> CtrlC {
         let again = last.is_some_and(|t| now.saturating_duration_since(t) <= CTRL_C_WINDOW);
@@ -320,7 +320,7 @@ mod terminal {
         let result = (|| -> io::Result<()> {
             let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
             run_app(&mut term, &mut view, |wait| {
-                if status.fatal().is_some() {
+                if status.fatal().is_some() || modron_app::chat::quit_requested() {
                     return Ok(RunEvent::Exit);
                 }
                 let mut redraw = wake_rx.try_iter().count() > 0;

@@ -148,6 +148,12 @@ pub struct ConnCtx {
     /// every session-addressed frame must name `id`. `None` is an ordinary
     /// connection, unchanged.
     pub scope: Option<SessionId>,
+    /// True only for a remote-control tunnel that authenticated to its
+    /// bridge with the host token (`MODRON_HOST_TOKEN`). Such a tunnel
+    /// trusts the `role` each relayed frame carries (see
+    /// [`handle_relayed_frame`] and [`relay_gate`]). Every other connection
+    /// ignores `Frame::role`.
+    pub trusted_relay: bool,
 }
 
 impl ConnCtx {
@@ -158,6 +164,7 @@ impl ConnCtx {
             authed: false,
             subscription: None,
             scope: None,
+            trusted_relay: false,
         }
     }
 
@@ -170,6 +177,7 @@ impl ConnCtx {
             authed: false,
             subscription: None,
             scope: None,
+            trusted_relay: false,
         }
     }
 
@@ -182,7 +190,16 @@ impl ConnCtx {
             authed: true,
             subscription: None,
             scope: Some(session),
+            trusted_relay: false,
         }
+    }
+
+    /// A tunnel that authenticated to its bridge with the host token: its
+    /// relayed frames carry a trusted `role`, judged by [`relay_gate`].
+    pub fn trusted_tunnel(out: mpsc::UnboundedSender<Outbound>, session: SessionId) -> Self {
+        let mut ctx = Self::scoped(out, session);
+        ctx.trusted_relay = true;
+        ctx
     }
 
     /// Queue one outbound frame on this connection.
@@ -233,6 +250,173 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
     }
 }
 
+/// The least role a relayed frame needs on a trusted tunnel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayTier {
+    /// Connection plumbing and reads of this session: any role.
+    Viewer,
+    /// Answers to this session's prompts: approver or owner.
+    Approver,
+    /// Anything that acts on this session: owner only.
+    Owner,
+}
+
+const OTHER_SESSION: &str = "this connection is scoped to another session";
+const SERVER_WIDE: &str = "this request is not available through a remote-control tunnel";
+
+/// The tier of every client-to-server payload on a trusted tunnel pinned to
+/// `scope`. Exhaustive on purpose, with no wildcard: a new `Payload` variant
+/// does not compile until it has a decision here. Server-to-client payloads
+/// are refused (protocol misuse).
+///
+/// Owner (everything this session's local owner may do, nothing else):
+/// interrupt, submit to this session, steer / steer_agent / kill_agent,
+/// enqueue / dequeue, compact, wake / cancel_wake, set_config (the attached
+/// session, which is `scope`), explain_rule, fork of this session,
+/// get_task_status of this session, shell, and the read requests models,
+/// router_defaults and auth_providers.
+///
+/// Approver: approve (resolved only inside `scope`) and decide_plan.
+///
+/// Viewer: hello, ping, detach and attach to `scope`.
+///
+/// Refused for every role: list / delete / create sessions and tasks,
+/// submit that starts a new session or names another one, attach to another
+/// session, merge_task (it writes the repository's base branch), automations,
+/// remote_control, publish_page, auth_start, auth_set_key and persist_router
+/// (server-wide settings and credentials).
+pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTier, &'static str> {
+    use RelayTier::*;
+    let own = |id: &SessionId| *id == scope;
+    match payload {
+        Payload::Hello { .. } | Payload::Ping {} | Payload::Detach {} => Ok(Viewer),
+        Payload::Attach { session_id, .. } => {
+            if own(session_id) {
+                Ok(Viewer)
+            } else {
+                Err(OTHER_SESSION)
+            }
+        }
+        Payload::Approve { .. } => Ok(Approver),
+        Payload::DecidePlan { session_id, .. } => {
+            if own(session_id) {
+                Ok(Approver)
+            } else {
+                Err(OTHER_SESSION)
+            }
+        }
+        Payload::Submit { session_id, .. } => match session_id {
+            Some(id) if own(id) => Ok(Owner),
+            Some(_) => Err(OTHER_SESSION),
+            None => Err("a new session cannot be started through a remote-control tunnel"),
+        },
+        Payload::Interrupt { session_id }
+        | Payload::Shell { session_id, .. }
+        | Payload::SteerAgent { session_id, .. }
+        | Payload::KillAgent { session_id, .. }
+        | Payload::Steer { session_id, .. }
+        | Payload::Enqueue { session_id, .. }
+        | Payload::Dequeue { session_id, .. }
+        | Payload::Compact { session_id }
+        | Payload::Wake { session_id, .. }
+        | Payload::CancelWake { session_id }
+        | Payload::ExplainRule { session_id, .. }
+        | Payload::Fork { session_id }
+        | Payload::GetTaskStatus { session_id } => {
+            if own(session_id) {
+                Ok(Owner)
+            } else {
+                Err(OTHER_SESSION)
+            }
+        }
+        Payload::SetConfig { .. }
+        | Payload::RouterDefaultsReq {}
+        | Payload::ModelsReq {}
+        | Payload::AuthProvidersReq {} => Ok(Owner),
+        Payload::NewSession { .. }
+        | Payload::ListSessions {}
+        | Payload::DeleteSession { .. }
+        | Payload::CreateTask { .. }
+        | Payload::MergeTask { .. }
+        | Payload::AutomationsList {}
+        | Payload::AutomationAdd { .. }
+        | Payload::AutomationRemove { .. }
+        | Payload::RemoteControl { .. }
+        | Payload::PublishPage { .. }
+        | Payload::AuthStart { .. }
+        | Payload::AuthSetKey { .. }
+        | Payload::PersistRouter { .. } => Err(SERVER_WIDE),
+        Payload::Welcome { .. }
+        | Payload::Snapshot { .. }
+        | Payload::Event { .. }
+        | Payload::Delta { .. }
+        | Payload::Tool { .. }
+        | Payload::ApprovalRequested { .. }
+        | Payload::ApprovalResolved { .. }
+        | Payload::Steered { .. }
+        | Payload::QueueChanged { .. }
+        | Payload::ContextChanged { .. }
+        | Payload::WakeChanged { .. }
+        | Payload::Notify { .. }
+        | Payload::AgentFinished { .. }
+        | Payload::ConfigChanged { .. }
+        | Payload::PlanProposed { .. }
+        | Payload::PlanDecided { .. }
+        | Payload::Sessions { .. }
+        | Payload::TaskCreated { .. }
+        | Payload::TaskStatus { .. }
+        | Payload::TaskMerged { .. }
+        | Payload::RemoteControlStarted { .. }
+        | Payload::Automations { .. }
+        | Payload::PagePublished { .. }
+        | Payload::AuthProviders { .. }
+        | Payload::TurnDone { .. }
+        | Payload::TurnFailed { .. }
+        | Payload::TurnAborted {}
+        | Payload::OAuthProgress { .. }
+        | Payload::RouterDefaults { .. }
+        | Payload::Models { .. }
+        | Payload::Note { .. }
+        | Payload::Pong {}
+        | Payload::Error { .. } => Err("frames of this type are server-to-client"),
+    }
+}
+
+/// Whether a role on a trusted tunnel may send a frame of `tier`.
+pub(crate) fn role_allows(role: modron_protocol::RelayRole, tier: RelayTier) -> bool {
+    use modron_protocol::RelayRole::*;
+    matches!(
+        (role, tier),
+        (_, RelayTier::Viewer)
+            | (Owner | Approver, RelayTier::Approver)
+            | (Owner, RelayTier::Owner)
+    )
+}
+
+/// The per-frame decision for a relayed frame on a TRUSTED tunnel pinned to
+/// `scope`. A frame without a role is refused: the portal bridge always
+/// sets one. The role is trusted only because the tunnel authenticated with
+/// the host token (see [`ConnCtx::trusted_tunnel`]).
+pub(crate) fn relay_gate(
+    scope: SessionId,
+    role: Option<modron_protocol::RelayRole>,
+    payload: &Payload,
+) -> Result<(), &'static str> {
+    let tier = relay_tier(scope, payload)?;
+    let Some(role) = role else {
+        return Err("this relayed frame carries no role");
+    };
+    if role_allows(role, tier) {
+        Ok(())
+    } else {
+        Err(match tier {
+            RelayTier::Owner => "this request is only for the owner",
+            RelayTier::Approver => "this request needs the approver role or the owner",
+            RelayTier::Viewer => "this role may not send this request",
+        })
+    }
+}
+
 impl Drop for ConnCtx {
     fn drop(&mut self) {
         if let Some(sub) = self.subscription.take() {
@@ -254,6 +438,7 @@ fn reply(id: Option<u64>, session: Option<SessionId>, payload: Payload) -> Frame
         id,
         session,
         seq: 0,
+        role: None,
         payload,
     }
 }
@@ -287,22 +472,59 @@ pub(crate) fn send(ctx: &ConnCtx, frame: Frame) {
 }
 
 /// Handle one client frame. Returns [`Flow::Close`] on auth failures.
+///
+/// Server-generated frames (the tunnel's own hello, attach and ping) and
+/// local connections come through here. A scoped connection passes the
+/// legacy [`scoped_gate`] first; `Frame::role` is never read on this path.
 pub async fn handle_frame(
     state: &Arc<ServerState>,
     ctx: &mut ConnCtx,
     trusted: bool,
     frame: Frame,
 ) -> Flow {
-    let request_id = frame.id;
     if let Some(scope) = ctx.scope {
         if let Err(message) = scoped_gate(scope, &frame.payload) {
             send(
                 ctx,
-                error_kind(request_id, message, modron_protocol::ErrorKind::Forbidden),
+                error_kind(frame.id, message, modron_protocol::ErrorKind::Forbidden),
             );
             return Flow::Continue;
         }
     }
+    dispatch_frame(state, ctx, trusted, frame).await
+}
+
+/// Handle one frame relayed by a remote-control tunnel from its bridge.
+///
+/// A tunnel without the host token (the legacy share-link relay) is handled
+/// exactly as before: `frame.role` is ignored. A trusted tunnel decides per
+/// frame with [`relay_gate`] on the relayed role, and the legacy scope gate
+/// does not apply to a frame that passes it.
+pub async fn handle_relayed_frame(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    frame: Frame,
+) -> Flow {
+    let Some(scope) = ctx.scope.filter(|_| ctx.trusted_relay) else {
+        return handle_frame(state, ctx, true, frame).await;
+    };
+    if let Err(message) = relay_gate(scope, frame.role, &frame.payload) {
+        send(
+            ctx,
+            error_kind(frame.id, message, modron_protocol::ErrorKind::Forbidden),
+        );
+        return Flow::Continue;
+    }
+    dispatch_frame(state, ctx, true, frame).await
+}
+
+async fn dispatch_frame(
+    state: &Arc<ServerState>,
+    ctx: &mut ConnCtx,
+    trusted: bool,
+    frame: Frame,
+) -> Flow {
+    let request_id = frame.id;
     match frame.payload {
         Payload::Hello {
             protocol, token, ..
@@ -1773,6 +1995,7 @@ async fn attach(
         id: request_id,
         session: Some(session_id),
         seq: watermark,
+        role: None,
         payload: Payload::Snapshot {
             session_id,
             last_seq: watermark,
@@ -2270,6 +2493,512 @@ mod tests {
             command: "ls".into(),
         };
         assert!(scoped_gate(own, &shell).is_err());
+    }
+
+    /// One sample per client-to-server payload shape, with the decision the
+    /// tunnel gives it: `[legacy scope gate, trusted owner, trusted approver,
+    /// trusted viewer]`. Adding a client variant without a row fails
+    /// `relay_table_covers_every_client_variant`, and the exhaustive match in
+    /// `relay_tier` fails to compile first.
+    fn relay_rows(own: SessionId, other: SessionId) -> Vec<(&'static str, Payload, [bool; 4])> {
+        use modron_protocol::{Decision, PlanDecision};
+        let text = || "text".to_string();
+        vec![
+            (
+                "hello",
+                Payload::Hello {
+                    client: "c".into(),
+                    protocol: PROTOCOL_VERSION,
+                    token: None,
+                },
+                [true, true, true, true],
+            ),
+            ("ping", Payload::Ping {}, [true, true, true, true]),
+            ("detach", Payload::Detach {}, [true, true, true, true]),
+            (
+                "attach own",
+                Payload::Attach {
+                    session_id: own,
+                    last_seq: 0,
+                },
+                [true, true, true, true],
+            ),
+            (
+                "attach other",
+                Payload::Attach {
+                    session_id: other,
+                    last_seq: 0,
+                },
+                [false, false, false, false],
+            ),
+            (
+                "approve",
+                Payload::Approve {
+                    request_id: "r".into(),
+                    decision: Decision::AllowOnce,
+                },
+                [true, true, true, false],
+            ),
+            (
+                "decide_plan own",
+                Payload::DecidePlan {
+                    session_id: own,
+                    decision: PlanDecision::Approve,
+                    note: None,
+                },
+                [true, true, true, false],
+            ),
+            (
+                "decide_plan other",
+                Payload::DecidePlan {
+                    session_id: other,
+                    decision: PlanDecision::Approve,
+                    note: None,
+                },
+                [false, false, false, false],
+            ),
+            (
+                "submit own",
+                Payload::Submit {
+                    session_id: Some(own),
+                    task: text(),
+                    attachments: vec![],
+                },
+                [true, true, false, false],
+            ),
+            (
+                "submit other",
+                Payload::Submit {
+                    session_id: Some(other),
+                    task: text(),
+                    attachments: vec![],
+                },
+                [false, false, false, false],
+            ),
+            (
+                "submit new session",
+                Payload::Submit {
+                    session_id: None,
+                    task: text(),
+                    attachments: vec![],
+                },
+                [false, false, false, false],
+            ),
+            (
+                "interrupt own",
+                Payload::Interrupt { session_id: own },
+                [true, true, false, false],
+            ),
+            (
+                "shell own",
+                Payload::Shell {
+                    session_id: own,
+                    command: "ls".into(),
+                },
+                [false, true, false, false],
+            ),
+            (
+                "steer_agent own",
+                Payload::SteerAgent {
+                    session_id: own,
+                    agent: "a".into(),
+                    text: text(),
+                },
+                [true, true, false, false],
+            ),
+            (
+                "kill_agent own",
+                Payload::KillAgent {
+                    session_id: own,
+                    agent: "a".into(),
+                },
+                [true, true, false, false],
+            ),
+            (
+                "steer own",
+                Payload::Steer {
+                    session_id: own,
+                    text: text(),
+                },
+                [true, true, false, false],
+            ),
+            (
+                "enqueue own",
+                Payload::Enqueue {
+                    session_id: own,
+                    text: text(),
+                },
+                [true, true, false, false],
+            ),
+            (
+                "dequeue own",
+                Payload::Dequeue {
+                    session_id: own,
+                    index: 0,
+                },
+                [true, true, false, false],
+            ),
+            (
+                "compact own",
+                Payload::Compact { session_id: own },
+                [true, true, false, false],
+            ),
+            (
+                "wake own",
+                Payload::Wake {
+                    session_id: own,
+                    after_minutes: Some(5),
+                    every_minutes: None,
+                    prompt: text(),
+                },
+                [true, true, false, false],
+            ),
+            (
+                "cancel_wake own",
+                Payload::CancelWake { session_id: own },
+                [true, true, false, false],
+            ),
+            (
+                "set_config",
+                Payload::SetConfig {
+                    patch: Default::default(),
+                },
+                [false, true, false, false],
+            ),
+            (
+                "explain_rule own",
+                Payload::ExplainRule {
+                    session_id: own,
+                    tool: "bash".into(),
+                    args: serde_json::Value::Null,
+                },
+                [true, true, false, false],
+            ),
+            (
+                "fork own",
+                Payload::Fork { session_id: own },
+                [false, true, false, false],
+            ),
+            (
+                "fork other",
+                Payload::Fork { session_id: other },
+                [false, false, false, false],
+            ),
+            (
+                "new_session",
+                Payload::NewSession { title: None },
+                [false, false, false, false],
+            ),
+            (
+                "list_sessions",
+                Payload::ListSessions {},
+                [false, false, false, false],
+            ),
+            (
+                "delete_session own",
+                Payload::DeleteSession { session_id: own },
+                [false, false, false, false],
+            ),
+            (
+                "create_task",
+                Payload::CreateTask {
+                    title: text(),
+                    base: None,
+                },
+                [false, false, false, false],
+            ),
+            (
+                "get_task_status own",
+                Payload::GetTaskStatus { session_id: own },
+                [false, true, false, false],
+            ),
+            (
+                "merge_task own",
+                Payload::MergeTask {
+                    session_id: own,
+                    message: None,
+                },
+                [false, false, false, false],
+            ),
+            (
+                "automations_list",
+                Payload::AutomationsList {},
+                [false, false, false, false],
+            ),
+            (
+                "automation_add",
+                Payload::AutomationAdd {
+                    name: "n".into(),
+                    prompt: text(),
+                    interval_minutes: 5,
+                },
+                [false, false, false, false],
+            ),
+            (
+                "automation_remove",
+                Payload::AutomationRemove { name: "n".into() },
+                [false, false, false, false],
+            ),
+            (
+                "remote_control",
+                Payload::RemoteControl {
+                    session_id: own,
+                    bridge_url: "https://b".into(),
+                },
+                [false, false, false, false],
+            ),
+            (
+                "publish_page",
+                Payload::PublishPage {
+                    session_id: own,
+                    title: text(),
+                    content_md: text(),
+                },
+                [false, false, false, false],
+            ),
+            (
+                "auth_providers_req",
+                Payload::AuthProvidersReq {},
+                [false, true, false, false],
+            ),
+            (
+                "auth_start",
+                Payload::AuthStart {
+                    session_id: own,
+                    provider: "p".into(),
+                },
+                [false, false, false, false],
+            ),
+            (
+                "auth_set_key",
+                Payload::AuthSetKey {
+                    session_id: own,
+                    provider: "p".into(),
+                    key: "k".into(),
+                },
+                [false, false, false, false],
+            ),
+            (
+                "persist_router",
+                Payload::PersistRouter {
+                    cheap: "a".into(),
+                    strong: "b".into(),
+                    cheap_fallback: None,
+                    strong_fallback: None,
+                },
+                [false, false, false, false],
+            ),
+            (
+                "router_defaults_req",
+                Payload::RouterDefaultsReq {},
+                [false, true, false, false],
+            ),
+            (
+                "models_req",
+                Payload::ModelsReq {},
+                [false, true, false, false],
+            ),
+        ]
+    }
+
+    /// Every client-to-server frame name the protocol has, and therefore every
+    /// name the table above must cover.
+    const CLIENT_FRAME_NAMES: &[&str] = &[
+        "hello",
+        "attach",
+        "detach",
+        "submit",
+        "interrupt",
+        "shell",
+        "steer_agent",
+        "kill_agent",
+        "steer",
+        "enqueue",
+        "dequeue",
+        "compact",
+        "wake",
+        "cancel_wake",
+        "approve",
+        "decide_plan",
+        "set_config",
+        "explain_rule",
+        "fork",
+        "new_session",
+        "list_sessions",
+        "delete_session",
+        "create_task",
+        "get_task_status",
+        "merge_task",
+        "automations_list",
+        "automation_add",
+        "automation_remove",
+        "remote_control",
+        "publish_page",
+        "auth_providers",
+        "auth_start",
+        "auth_set_key",
+        "persist_router",
+        "ping",
+        "router_defaults_req",
+        "models_req",
+    ];
+
+    #[test]
+    fn relay_table_covers_every_client_variant() {
+        let own = SessionId::new_v4();
+        let other = SessionId::new_v4();
+        let rows = relay_rows(own, other);
+        let mut seen: Vec<&str> = rows.iter().map(|(_, p, _)| variant_name(p)).collect();
+        seen.sort();
+        seen.dedup();
+        let mut expected: Vec<&str> = CLIENT_FRAME_NAMES.to_vec();
+        expected.sort();
+        assert_eq!(seen, expected, "every client frame needs a row");
+    }
+
+    #[test]
+    fn relay_gate_decides_every_row_for_every_role() {
+        use modron_protocol::RelayRole::*;
+        let own = SessionId::new_v4();
+        let other = SessionId::new_v4();
+        for (label, payload, [legacy, owner, approver, viewer]) in relay_rows(own, other) {
+            assert_eq!(
+                scoped_gate(own, &payload).is_ok(),
+                legacy,
+                "legacy scope gate: {label}"
+            );
+            assert!(
+                relay_gate(own, None, &payload).is_err(),
+                "a relayed frame without a role is refused: {label}"
+            );
+            for (role, want) in [(Owner, owner), (Approver, approver), (Viewer, viewer)] {
+                assert_eq!(
+                    relay_gate(own, Some(role), &payload).is_ok(),
+                    want,
+                    "trusted {role:?}: {label}"
+                );
+            }
+        }
+    }
+
+    /// A local connection ignores `role`: a viewer-tagged frame from a local
+    /// socket still runs the server-wide request it names.
+    #[tokio::test]
+    async fn local_connection_ignores_relayed_role() {
+        let (state, _dir) = test_state();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut local = ConnCtx::new(tx);
+        local.authed = true;
+        let mut frame = Frame::request(3, Payload::ListSessions {});
+        frame.role = Some(modron_protocol::RelayRole::Viewer);
+        handle_frame(&state, &mut local, false, frame).await;
+        match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => assert!(
+                matches!(frame.payload, Payload::Sessions { .. }),
+                "{:?}",
+                frame.payload
+            ),
+            other => panic!("expected a reply, got {other:?}"),
+        }
+    }
+
+    /// A tunnel without the host token is the legacy share-link relay: a
+    /// frame claiming `role: owner` gains nothing, and shell stays refused.
+    #[tokio::test]
+    async fn untrusted_tunnel_frame_claiming_owner_gains_nothing() {
+        let (state, _dir) = test_state();
+        let id = SessionId::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut link = ConnCtx::scoped(tx, id);
+        for payload in [
+            Payload::SetConfig {
+                patch: Default::default(),
+            },
+            Payload::Shell {
+                session_id: id,
+                command: "ls".into(),
+            },
+        ] {
+            let mut frame = Frame::request(4, payload);
+            frame.role = Some(modron_protocol::RelayRole::Owner);
+            handle_relayed_frame(&state, &mut link, frame).await;
+            match next_outbound(&mut rx).await {
+                Outbound::Reply(frame) => match frame.payload {
+                    Payload::Error { kind, .. } => {
+                        assert_eq!(kind, Some(modron_protocol::ErrorKind::Forbidden))
+                    }
+                    other => panic!("expected an error, got {other:?}"),
+                },
+                other => panic!("expected a reply, got {other:?}"),
+            }
+        }
+    }
+
+    /// On a trusted tunnel the relayed role decides: a viewer may ping but
+    /// not configure, an approver may not run a shell, the owner passes the
+    /// gate and reaches the session (NotFound: the session does not exist).
+    #[tokio::test]
+    async fn trusted_tunnel_applies_the_relayed_role() {
+        let (state, _dir) = test_state();
+        let id = SessionId::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tunnel = ConnCtx::trusted_tunnel(tx, id);
+        tunnel.authed = true;
+
+        let mut ping = Frame::request(10, Payload::Ping {});
+        ping.role = Some(modron_protocol::RelayRole::Viewer);
+        handle_relayed_frame(&state, &mut tunnel, ping).await;
+        match next_outbound(&mut rx).await {
+            Outbound::Reply(frame) => assert!(matches!(frame.payload, Payload::Pong {})),
+            other => panic!("expected a reply, got {other:?}"),
+        }
+
+        let kind_of = |outbound: Outbound| match outbound {
+            Outbound::Reply(frame) => match frame.payload {
+                Payload::Error { kind, .. } => kind,
+                _ => None,
+            },
+            _ => None,
+        };
+        for role in [
+            modron_protocol::RelayRole::Approver,
+            modron_protocol::RelayRole::Viewer,
+        ] {
+            let mut shell = Frame::request(
+                11,
+                Payload::Shell {
+                    session_id: id,
+                    command: "ls".into(),
+                },
+            );
+            shell.role = Some(role);
+            handle_relayed_frame(&state, &mut tunnel, shell).await;
+            assert_eq!(
+                kind_of(next_outbound(&mut rx).await),
+                Some(modron_protocol::ErrorKind::Forbidden),
+                "{role:?} shell"
+            );
+        }
+        let mut owner_shell = Frame::request(
+            12,
+            Payload::Shell {
+                session_id: id,
+                command: "ls".into(),
+            },
+        );
+        owner_shell.role = Some(modron_protocol::RelayRole::Owner);
+        handle_relayed_frame(&state, &mut tunnel, owner_shell).await;
+        assert_eq!(
+            kind_of(next_outbound(&mut rx).await),
+            Some(modron_protocol::ErrorKind::NotFound),
+            "owner shell passes the gate"
+        );
+        // A relayed frame with no role on a trusted tunnel is refused.
+        handle_relayed_frame(&state, &mut tunnel, Frame::request(13, Payload::Ping {})).await;
+        assert_eq!(
+            kind_of(next_outbound(&mut rx).await),
+            Some(modron_protocol::ErrorKind::Forbidden)
+        );
     }
 
     fn parked_run(id: SessionId) -> RunFuture {

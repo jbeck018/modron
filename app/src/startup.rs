@@ -942,3 +942,35 @@ mod tests {
         assert!(!probe_ws(&format!("ws://127.0.0.1:{port}")));
     }
 }
+
+#[cfg(test)]
+mod stale_socket_tests {
+    use super::*;
+
+    /// A unix socket file whose server is gone: bound, then dropped. The
+    /// file stays on disk and nothing listens on it.
+    #[test]
+    fn a_stale_socket_file_is_not_a_probe_hit_and_startup_falls_through() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("stale-socket-test");
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let socket = dir.join("serve.sock");
+        let _ = std::fs::remove_file(&socket);
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        assert!(socket.exists(), "the stale file is on disk");
+        assert!(!probe_unix(&socket), "a stale socket must not count as running");
+
+        let env = Env { socket: socket.clone(), url: None };
+        let plan = decide(
+            &parse_args(Vec::<String>::new()).expect("args"),
+            &env,
+            |_| false,
+            probe_unix,
+            || Some(PathBuf::from("modron")),
+        );
+        assert!(
+            matches!(plan, Plan::Spawn { .. }),
+            "no server answers, so the app starts one instead of connecting to the stale socket: {plan:?}"
+        );
+        let _ = std::fs::remove_file(&socket);
+    }
+}

@@ -137,6 +137,7 @@ import {
   inviteSignature,
   isLocalDev,
   judgeViewerFrame,
+  stampRelayRole,
   ownerCookieHeader,
   parseHostSession,
   parseInvite,
@@ -483,7 +484,7 @@ export class SessionBridge extends DurableObject {
     if (role !== "agent") {
       // Invite and approver sockets are filtered before anything is
       // forwarded: malformed frames are dropped, frames outside the role's
-      // list get a forbidden error. Owner and legacy sockets are unchanged.
+      // list get a forbidden error. Owner and legacy sockets are not filtered.
       const grant = this.grantOf(ws);
       if (grant === "viewer" || grant === "approver") {
         const verdict = judgeViewerFrame(grant, message);
@@ -492,6 +493,16 @@ export class SessionBridge extends DurableObject {
           try { ws.send(forbiddenFrame(verdict.id)); } catch { /* gone */ }
           return;
         }
+      }
+      // Every frame carries the socket's role to the serve, and no client
+      // value survives: a tagged socket's non-object frame is dropped, a
+      // legacy socket's `role` key is removed (see stampRelayRole).
+      const relayedRole = grant === "owner" || grant === "viewer" || grant === "approver" ? grant : null;
+      const outbound = stampRelayRole(message, relayedRole);
+      if (outbound === null) return;
+      if (outbound.length > limit) {
+        try { ws.send(JSON.stringify({ type: "note", text: "frame too large (96KB limit) - dropped" })); } catch { /* gone */ }
+        return;
       }
       // Viewer: {"type":"sync"} replays the buffer; anything else is
       // forwarded to the agent verbatim.
@@ -525,7 +536,7 @@ export class SessionBridge extends DurableObject {
       const now = Date.now();
       await this.state.storage.put("seen:viewer", now);
       const agent = this.agentSocket();
-      try { agent?.send(message); } catch { /* gone */ }
+      try { agent?.send(outbound); } catch { /* gone */ }
       return;
     }
     // Keepalive pongs are not history: storing one every 30 s would evict

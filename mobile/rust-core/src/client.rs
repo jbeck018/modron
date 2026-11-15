@@ -28,9 +28,9 @@ use crate::view::{
 };
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, Payload, PlanDecision,
-    WireDelta, DEFAULT_PORT, PROTOCOL_VERSION,
+    WireDelta, WireToolActivity, DEFAULT_PORT, PROTOCOL_VERSION,
 };
-use modron_types::{Attachment, Effort, Phase, SandboxPolicy, ToolActivity};
+use modron_types::{Attachment, Effort, Phase, SandboxPolicy, SessionEvent, ToolActivity};
 use modron_view::TranscriptEntry;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1413,6 +1413,31 @@ fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
 // Frame folding (one defined effect per payload, per modron-protocol docs)
 // ---------------------------------------------------------------------------
 
+/// Whether a live frame can only come from a run in progress. The server
+/// announces a run's start with no frame of its own (its `busy` flag is set
+/// at spawn, and a snapshot carries it only to a client that attaches
+/// later), so a client attached before the run learns of it from the first
+/// frame that the run sends. Until a terminal frame clears `running` (see
+/// the view fold), that frame keeps the session running, and an approval
+/// wait counts as running too: the run is still live and accepts a steer.
+///
+/// Tool completions, reasoning-done markers and persisted events other
+/// than a task echo are left out, because they can trail a run's end.
+fn implies_run(payload: &Payload) -> bool {
+    match payload {
+        Payload::Event { event } => matches!(event, SessionEvent::Task { .. }),
+        Payload::Delta { delta } => {
+            matches!(delta, WireDelta::Text { .. } | WireDelta::Reasoning { .. })
+        }
+        Payload::Tool { activity } => matches!(
+            activity,
+            WireToolActivity::Start { .. } | WireToolActivity::SubagentStarted { .. }
+        ),
+        Payload::ApprovalRequested { .. } => true,
+        _ => false,
+    }
+}
+
 fn fold_frame(shared: &Shared, frame: Frame) {
     let mut st = shared.state.lock().unwrap();
     let CoreState { vm, fold, adopted } = &mut *st;
@@ -1426,6 +1451,9 @@ fn fold_frame(shared: &Shared, frame: Frame) {
     // Any session-scoped sequenced frame advances the resume cursor.
     if frame.session.is_some() && frame.seq > vm.last_seq {
         vm.last_seq = frame.seq;
+    }
+    if implies_run(&frame.payload) {
+        vm.running = true;
     }
 
     match frame.payload {
@@ -1666,6 +1694,7 @@ mod tests {
             id: None,
             session: None,
             seq: 0,
+            role: None,
             payload: Payload::ConfigChanged {
                 patch: ConfigPatch {
                     model: Some("claude-haiku-4-5".into()),
@@ -1678,6 +1707,7 @@ mod tests {
             id: Some(7),
             session: None,
             seq: 0,
+            role: None,
             payload: Payload::Models {
                 models: vec![
                     row("claude-haiku-4-5", "anthropic", 200_000, true),

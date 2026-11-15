@@ -421,7 +421,13 @@ fn start_server(session: Uuid, script: Script) -> (String, mpsc::Receiver<Payloa
             )
             .await;
 
-            let request = read_frame(&mut ws).await;
+            // The connect also sends auth_providers and list_sessions; skip them.
+            let request = loop {
+                let frame = read_frame(&mut ws).await;
+                if !matches!(frame.payload, Payload::AuthProvidersReq { .. } | Payload::ListSessions {}) {
+                    break frame;
+                }
+            };
             report_tx.send(request.payload).expect("report request");
             if let Some(message) = script.refusal {
                 send_frame(
@@ -458,7 +464,7 @@ fn next_request(h: &mut Harness, live: &mut Live, reports: &mpsc::Receiver<Paylo
 }
 
 #[test]
-fn driver_renders_the_stream_and_sends_a_typed_message_as_submit() {
+fn driver_renders_the_stream_and_steers_a_typed_message() {
     let session = Uuid::new_v4();
     let (url, reports) = start_server(session, Script::default());
     let mut live = session::spawn(LiveOptions {
@@ -477,18 +483,20 @@ fn driver_renders_the_stream_and_sends_a_typed_message_as_submit() {
     h.wait_for("typed hi", Some(&mut live), |s| s.contains("hi"));
     h.send(key("Enter"));
     match next_request(&mut h, &mut live, &reports) {
-        Payload::Submit { session_id, task, .. } => {
-            assert_eq!(session_id, Some(session));
-            assert_eq!(task, "hi");
+        // A delta is streaming, so the session is running: the composer
+        // steers (PROTOCOL_V2 section 2) instead of submitting.
+        Payload::Steer { session_id, text } => {
+            assert_eq!(session_id, session);
+            assert_eq!(text, "hi");
         }
-        other => panic!("expected submit, got {other:?}"),
+        other => panic!("expected steer, got {other:?}"),
     }
 }
 
 #[test]
 fn a_share_link_adopts_the_session_its_snapshot_names() {
     // No session in the options and no attach: the snapshot names it, and
-    // the typed message is a submit for that session.
+    // the typed message goes to that session.
     let session = Uuid::new_v4();
     let script = Script { share_link: true, ..Script::default() };
     let (url, reports) = start_server(session, script);
@@ -502,11 +510,13 @@ fn a_share_link_adopts_the_session_its_snapshot_names() {
     h.wait_for("typed hi", Some(&mut live), |s| s.contains("hi"));
     h.send(key("Enter"));
     match next_request(&mut h, &mut live, &reports) {
-        Payload::Submit { session_id, task, .. } => {
-            assert_eq!(session_id, Some(session));
-            assert_eq!(task, "hi");
+        // The stream implies a running session, so this is a steer for
+        // the adopted session.
+        Payload::Steer { session_id, text } => {
+            assert_eq!(session_id, session);
+            assert_eq!(text, "hi");
         }
-        other => panic!("expected submit for the adopted session, got {other:?}"),
+        other => panic!("expected steer for the adopted session, got {other:?}"),
     }
 }
 

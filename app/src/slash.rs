@@ -13,7 +13,10 @@
 //! `every_table_command_is_mapped` iterates the table, so a new command
 //! cannot be dropped silently.
 
-use modron_mobile_core::view::{SLASH_NEEDS_ARG_PREFIX, SLASH_UNKNOWN_LABEL};
+use modron_mobile_core::view::{
+    btw_task, learn_task, plan_task, AGENT_USAGE, BTW_USAGE, REVIEW_TASK, SLASH_NEEDS_ARG_PREFIX,
+    SLASH_UNKNOWN_LABEL,
+};
 use modron_mobile_core::{ApprovalModeWire, Effort, Phase, SandboxPolicy};
 use modron_view::slash::{slash_lookup, suggestions, SLASH_COMMANDS};
 
@@ -31,7 +34,14 @@ pub struct Entry {
 /// Commands this app serves beyond the shared table. Empty: `/sessions`,
 /// `/compact`, `/effort`, `/plan` and `/build` moved into
 /// `modron_view::slash::SLASH_COMMANDS`, so every client lists them.
-pub const LOCAL: &[Entry] = &[];
+pub const LOCAL: &[Entry] = &[
+    Entry { name: "review", usage: "/review", about: "review the working diff" },
+    Entry { name: "btw", usage: "/btw <quick question>", about: "quick side question, no tools" },
+    Entry { name: "learn", usage: "/learn [title]", about: "distill this session into a SKILL.md" },
+    Entry { name: "goal", usage: "/goal [condition]", about: "stop condition for long runs" },
+    Entry { name: "agent", usage: "/agent <name>", about: "switch persona" },
+    Entry { name: "exit", usage: "/exit", about: "leave the app" },
+];
 
 /// Every command: the shared table in its order, then [`LOCAL`].
 pub fn all() -> Vec<Entry> {
@@ -108,7 +118,10 @@ pub fn run(line: &str) -> UiAction {
         "new" => UiAction::NewSession,
         "compact" => UiAction::Compact,
         "sessions" => UiAction::Nav(NavStep::Open(Screen::Sessions)),
-        "settings" | "auth" => UiAction::Nav(NavStep::Open(Screen::Settings)),
+        "settings" => UiAction::Nav(NavStep::Open(Screen::Settings)),
+        "login" => UiAction::Nav(NavStep::Open(Screen::Auth)),
+        "compress" => UiAction::Compact,
+        "auth" => UiAction::Nav(NavStep::Open(Screen::Auth)),
         "help" => UiAction::Nav(NavStep::Open(Screen::Help)),
         "model" if args.is_empty() => UiAction::Nav(NavStep::Open(Screen::Models)),
         "model" => UiAction::SelectModel(args.to_string()),
@@ -136,13 +149,22 @@ pub fn run(line: &str) -> UiAction {
             _ => usage("effort"),
         },
         "reasoning" | "thinking" => UiAction::ToggleReasoning,
-        "plan" => UiAction::SetPhase(Phase::Plan),
+        "plan" if args.is_empty() => UiAction::SetPhase(Phase::Plan),
+        "plan" => UiAction::Plan(plan_task(args)),
+        "review" | "code-review" => UiAction::Send(REVIEW_TASK.to_string()),
+        "btw" if args.is_empty() => UiAction::Notice(BTW_USAGE.to_string()),
+        "btw" => UiAction::Send(btw_task(args)),
+        "learn" => UiAction::Send(learn_task(args)),
+        "goal" => UiAction::SetGoal(args.to_string()),
+        "agent" | "persona" if args.is_empty() => UiAction::Notice(AGENT_USAGE.to_string()),
+        "agent" | "persona" => UiAction::SetPersona(args.to_string()),
+        "exit" | "quit" | "q" => UiAction::Exit,
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,
         "tasks" => UiAction::TaskStatus,
-        "share" => UiAction::Share,
-        "remote-control" if args.is_empty() => usage("remote-control"),
-        "remote-control" => UiAction::RemoteControl(args.to_string()),
+        "share" | "publish" => UiAction::Share,
+        "remote-control" | "rc" if args.is_empty() => usage("remote-control"),
+        "remote-control" | "rc" => UiAction::RemoteControl(args.to_string()),
         _ => UiAction::Notice(SLASH_UNKNOWN_LABEL.to_string()),
     }
 }
@@ -203,6 +225,19 @@ mod tests {
         assert_eq!(run("/mode"), UiAction::CycleMode);
         assert_eq!(run("/effort max"), UiAction::SetEffort(Some(Effort::Max)));
         assert_eq!(run("/build"), UiAction::SetPhase(Phase::Build));
+        assert_eq!(run("/exit"), UiAction::Exit);
+        assert_eq!(run("/q"), UiAction::Exit);
+        assert_eq!(run("/login"), UiAction::Nav(NavStep::Open(Screen::Auth)));
+        assert_eq!(run("/rc ws://x"), UiAction::RemoteControl("ws://x".into()));
+        assert_eq!(run("/goal ship it"), UiAction::SetGoal("ship it".into()));
+        assert_eq!(run("/goal"), UiAction::SetGoal(String::new()));
+        assert_eq!(run("/agent reviewer"), UiAction::SetPersona("reviewer".into()));
+        assert_eq!(run("/review"), UiAction::Send(REVIEW_TASK.into()));
+        assert_eq!(run("/plan add tests"), UiAction::Plan(plan_task("add tests")));
+        assert_eq!(run("/plan"), UiAction::SetPhase(Phase::Plan));
+        assert_eq!(run("/btw why"), UiAction::Send(btw_task("why")));
+        assert_eq!(run("/btw"), UiAction::Notice(BTW_USAGE.into()));
+        assert_eq!(run("/learn Fix Parser"), UiAction::Send(learn_task("Fix Parser")));
         assert_eq!(run("/remote-control ws://x"), UiAction::RemoteControl("ws://x".into()));
     }
 

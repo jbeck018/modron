@@ -23,12 +23,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use modron_mobile_core::{
     approval_mode_next, connection_label, sandbox_next, ClientError, ConfigPatch, ConnectOptions,
-    ConnectionState, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
+    ConnectionState, Phase, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
 };
 use modron_protocol::SessionMetaWire;
 use tokio::sync::mpsc::{
@@ -37,6 +37,7 @@ use tokio::sync::mpsc::{
 use uuid::Uuid;
 
 use crate::chat::{Host, UiAction};
+use crate::clock::Instant;
 
 /// How often the driver is stepped.
 pub const TICK: Duration = Duration::from_millis(20);
@@ -45,6 +46,16 @@ pub const TICK: Duration = Duration::from_millis(20);
 /// `sessions`, and an empty list looks the same as a late one, so the wait
 /// is bounded.
 pub const LIST_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a connection may stay `Connecting` before the driver tries
+/// again (with the reconnect backoff). The core's connect is fire-and-forget,
+/// so a silent failure would otherwise leave the header on "connecting".
+pub const CONNECT_STALL: Duration = Duration::from_secs(3);
+
+/// Whether a connect started at `since` has stalled by `now`.
+pub fn connect_stalled(since: Instant, now: Instant) -> bool {
+    now >= since + CONNECT_STALL
+}
 
 /// The first reconnect delay; each failed try doubles it up to the cap.
 pub const RETRY_FIRST: Duration = Duration::from_secs(2);
@@ -277,7 +288,7 @@ pub fn retry_delay(attempts: u32) -> Duration {
 }
 
 /// Where the driver is in the session choice after a connect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Stage {
     Ready,
     /// A session list was requested; choose by this deadline at the latest.
@@ -299,6 +310,8 @@ pub struct Driver {
     resume: Option<Uuid>,
     /// When the next reconnect try runs, and how many have run.
     retry_at: Option<Instant>,
+    /// When the current `Connecting` state began (None when not connecting).
+    connecting_since: Option<Instant>,
     attempts: u32,
     last: String,
     /// The startup config went out for the current connection.
@@ -329,6 +342,7 @@ impl Driver {
                 stage: Stage::Ready,
                 resume: None,
                 retry_at: None,
+                connecting_since: None,
                 attempts: 0,
                 last: String::new(),
                 startup_sent: false,
@@ -366,14 +380,28 @@ impl Driver {
         match state.connection {
             ConnectionState::Connected => {
                 self.status.reconnecting.store(false, Ordering::SeqCst);
+                self.connecting_since = None;
                 if !self.linked {
                     self.linked = true;
                     self.attempts = 0;
                     self.retry_at = None;
                     self.link_up();
+                    // The credentials rows, for the first-run check (Nav::first_run),
+                    // and the session list, whatever the resume mode (the
+                    // Sessions screen shows it; a live page with no session
+                    // parameter would otherwise never ask).
+                    let _ = self.client.auth_providers();
+                    let _ = self.client.list_sessions();
                 }
             }
-            ConnectionState::Connecting => {}
+            ConnectionState::Connecting => {
+                let since = *self.connecting_since.get_or_insert_with(Instant::now);
+                if connect_stalled(since, Instant::now()) {
+                    self.connecting_since = None;
+                    self.attempts = self.attempts.saturating_add(1);
+                    self.reconnect();
+                }
+            }
             ConnectionState::Disconnected => {
                 self.linked = false;
                 self.startup_sent = false;
@@ -568,6 +596,19 @@ fn apply(client: &RemoteClient, action: UiAction) {
         UiAction::DeleteSession(id) => client.delete_session(id),
         UiAction::SteerAgent { agent, text } => client.steer_agent(agent, text),
         UiAction::KillAgent(agent) => client.kill_agent(agent),
+        UiAction::ListAuth => client.auth_providers(),
+        UiAction::Plan(task) => match client.set_phase(Phase::Plan) {
+            Ok(()) => client.send_message(task),
+            Err(error) => Err(error),
+        },
+        UiAction::SetGoal(goal) => client.set_goal(goal),
+        UiAction::SetPersona(name) => client.set_persona(name),
+        // The host sets the quit flag and never forwards it.
+        UiAction::Exit => Ok(()),
+        UiAction::AuthStart(provider) => with_session(client, |s| client.auth_start(s, &provider)),
+        UiAction::SetKey(secret) => {
+            with_session(client, |s| client.auth_set_key(s, &secret.provider, &secret.key))
+        }
         UiAction::Notice(text) => {
             client.note_local_error(text);
             Ok(())
@@ -690,5 +731,20 @@ mod tests {
         let secs: Vec<u64> = (0..7).map(|n| retry_delay(n).as_secs()).collect();
         assert_eq!(secs, vec![2, 4, 8, 16, 30, 30, 30]);
         assert_eq!(retry_delay(u32::MAX), RETRY_MAX);
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    #[test]
+    fn a_connect_is_stalled_only_after_the_stall_window() {
+        let since = Instant::now();
+        assert!(!connect_stalled(
+            since,
+            since + Duration::from_millis(CONNECT_STALL.as_millis() as u64 - 1)
+        ));
+        assert!(connect_stalled(since, since + CONNECT_STALL));
     }
 }

@@ -295,3 +295,29 @@ export function forbiddenFrame(id?: number): string {
   const base = { type: "error", message: "not permitted for this invite", kind: "forbidden" };
   return JSON.stringify(id === undefined ? base : { ...base, id });
 }
+
+// --- relayed role (the frame field the serve trusts on a host-authenticated tunnel) ---
+
+// The role a socket was granted, as the serve reads it. `legacy` (no
+// grant: the portal is off) and an absent role both mean "no role".
+export type RelayedRole = "owner" | "approver" | "viewer";
+
+// The text the bridge forwards to the agent for one client frame.
+//  - A client-sent `role` is ALWAYS removed: a client never chooses its role.
+//  - A tagged socket (owner | approver | viewer) gets `role` set to its grant.
+//  - A legacy socket (role null) gets no role. A frame that already had no
+//    `role` key is forwarded byte for byte.
+//  - A tagged socket's frame that is not a JSON object is dropped (null).
+//    A legacy socket's non-object text is forwarded as it was received.
+export function stampRelayRole(message: string, role: RelayedRole | null): string | null {
+  let parsed: unknown;
+  try { parsed = JSON.parse(message); } catch { return role === null ? message : null; }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return role === null ? message : null;
+  }
+  const frame = parsed as Record<string, unknown>;
+  if (role === null && !("role" in frame)) return message;
+  delete frame.role;
+  if (role !== null) frame.role = role;
+  return JSON.stringify(frame);
+}

@@ -548,6 +548,74 @@ async fn approval_pending_then_resolved() {
     server.abort();
 }
 
+/// A run that started while this client was attached: its first live frame
+/// is an approval request, with no delta and no snapshot saying it runs. The
+/// session is still running (it waits on the approval), so a message must be
+/// a steer, not a submit (which the server refuses as busy).
+#[tokio::test]
+async fn approval_wait_without_a_delta_still_steers() {
+    let listener = bind_server().await;
+    let url = url_of(&listener).await;
+    let session = session_id();
+
+    let server = tokio::spawn(async move {
+        let mut ws = accept_ws(&listener).await;
+        greet(&mut ws).await;
+        let _attach = read_frame(&mut ws).await;
+        send_frame(
+            &mut ws,
+            &snapshot_frame(session, 0, vec![], LiveState::default()),
+        )
+        .await;
+        send_frame(
+            &mut ws,
+            &Frame::event(
+                Some(session),
+                1,
+                Payload::ApprovalRequested {
+                    request_id: "req-7".into(),
+                    call: modron_types::ToolCall {
+                        id: "c7".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                    },
+                    agent: None,
+                },
+            ),
+        )
+        .await;
+        let sent = read_frame(&mut ws).await;
+        match sent.payload {
+            Payload::Steer { session_id, text } => {
+                assert_eq!(session_id, session);
+                assert_eq!(text, "use the staging db");
+            }
+            other => panic!("expected steer, got {other:?}"),
+        }
+    });
+
+    let client = connect_client(&url).await;
+    client.attach(session, 0).expect("attach");
+    wait_attached(&client, session).await;
+    loop {
+        if client.state().pending_approval.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        client.state().running,
+        "an approval wait is a running session"
+    );
+    client
+        .send_message("use the staging db")
+        .expect("send_message");
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("the server saw the frame")
+        .expect("server task");
+}
+
 #[tokio::test]
 async fn interrupt_aborts_and_discards_the_buffer() {
     let listener = bind_server().await;
@@ -1328,6 +1396,7 @@ async fn answered_keepalive_pings_keep_a_quiet_connection_alive() {
                         id: frame.id,
                         session: None,
                         seq: 0,
+                        role: None,
                         payload: Payload::Pong {},
                     },
                 )

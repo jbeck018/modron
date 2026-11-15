@@ -50,8 +50,28 @@ pub struct Frame {
     pub session: Option<Uuid>,
     #[serde(default)]
     pub seq: u64,
+    /// The role of the person behind a relayed client frame. It is set ONLY
+    /// by a trusted relay (the cloud/bridge worker, for a connection it
+    /// authenticated: the owner cookie, or a redeemed invite ticket). The
+    /// relay overwrites any value the client sent. A server ignores it on
+    /// every connection that is not an authenticated tunnel (local sockets,
+    /// unix sockets, legacy share-link tunnels). Clients never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<RelayRole>,
     #[serde(flatten)]
     pub payload: Payload,
+}
+
+/// Who a relayed client frame speaks for (see [`Frame::role`]). `Owner`
+/// is the portal owner, `Approver` an invite with the approve right,
+/// `Viewer` a read-only invite. UI effect: none (a routing and
+/// authorization field; no client renders it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayRole {
+    Owner,
+    Approver,
+    Viewer,
 }
 
 impl Frame {
@@ -61,6 +81,7 @@ impl Frame {
             id: Some(id),
             session: None,
             seq: 0,
+            role: None,
             payload,
         }
     }
@@ -71,6 +92,7 @@ impl Frame {
             id: None,
             session,
             seq,
+            role: None,
             payload,
         }
     }
@@ -1165,6 +1187,7 @@ mod tests {
             id: Some(5),
             session: None,
             seq: 0,
+            role: None,
             payload: Payload::Models {
                 models: vec![
                     row.clone(),
@@ -1193,6 +1216,35 @@ mod tests {
         }
     }
 
+    /// The relayed role is optional and omitted when unset, so frames from
+    /// older clients (no `role` key) parse unchanged and new frames without a
+    /// role serialize exactly as before.
+    #[test]
+    fn relay_role_roundtrips_and_is_absent_when_unset() {
+        let old: Frame = serde_json::from_str(r#"{"type":"ping","id":3}"#).unwrap();
+        assert_eq!(old.role, None);
+        assert!(matches!(old.payload, Payload::Ping {}));
+
+        let plain = Frame::request(3, Payload::Ping {});
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("role").is_none(), "{json}");
+
+        for (text, role) in [
+            ("owner", RelayRole::Owner),
+            ("approver", RelayRole::Approver),
+            ("viewer", RelayRole::Viewer),
+        ] {
+            let parsed: Frame =
+                serde_json::from_str(&format!(r#"{{"type":"ping","id":4,"role":"{text}"}}"#))
+                    .unwrap();
+            assert_eq!(parsed.role, Some(role));
+            let back = roundtrip(&parsed);
+            assert_eq!(back.role, Some(role));
+        }
+        let bad = serde_json::from_str::<Frame>(r#"{"type":"ping","role":"admin"}"#);
+        assert!(bad.is_err(), "an unknown role is not a frame");
+    }
+
     /// `forbidden` is a wire name clients can branch on: it serializes as
     /// the bare string and round-trips inside an error frame.
     #[test]
@@ -1205,6 +1257,7 @@ mod tests {
             id: Some(9),
             session: None,
             seq: 0,
+            role: None,
             payload: Payload::Error {
                 message: "not allowed on a share link".into(),
                 kind: Some(ErrorKind::Forbidden),
@@ -1747,6 +1800,7 @@ mod tests {
                 id: Some(4),
                 session: None,
                 seq: 0,
+                role: None,
                 payload: Payload::Error {
                     message: "no such session".into(),
                     kind: None,

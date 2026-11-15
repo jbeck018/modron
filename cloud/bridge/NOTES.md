@@ -24,6 +24,16 @@ What the unified web app (app/, via mobile/rust-core) sends on
    whether or not it attached (`fold_frame`, mobile/rust-core/src/client.rs), so
    streaming output shows.
 
+## Relayed role (what the serve may trust)
+
+Each client frame forwarded to the agent carries `role` (owner, approver or
+viewer) for a tagged socket and no `role` for a legacy socket. The bridge
+removes any client-sent `role` first (`stampRelayRole`, src/portal.ts), so
+the field is only ever what the bridge granted. The serve trusts it only on
+a tunnel that sent the host token. Frames that are not JSON objects are
+dropped for tagged sockets (also for owner sockets, which used to pass them
+through unchanged). Test: test/portal.mjs, "relayed role" checks.
+
 ## Replay and ordering (current behaviour)
 
 The bridge keeps the last 200 agent frames (each up to 96 KB) per session.

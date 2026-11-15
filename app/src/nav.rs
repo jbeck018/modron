@@ -7,8 +7,9 @@
 //! table.
 
 use modron_mobile_core::view::{
-    delete_confirm_text, kill_confirm_text, AgentRowView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT,
-    MODEL_ROLE_FALLBACK, MODEL_ROLE_STRONG,
+    auth_is_signed_in, auth_row_line, delete_confirm_text, kill_confirm_text, AgentRowView,
+    OAuthProgressView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT, MODEL_ROLE_FALLBACK,
+    MODEL_ROLE_STRONG, SETTING_AUTH_LABEL,
 };
 use modron_mobile_core::{
     approval_mode_next, effort_next, phase_next, sandbox_next, ViewModelSnapshot,
@@ -40,6 +41,9 @@ pub enum Screen {
     SignIn,
     /// The owner's session list (web, portal mode).
     Portal,
+    /// Credentials (`/auth`, the Settings auth row): the provider rows, the
+    /// sign-in progress, and the masked key entry.
+    Auth,
 }
 
 /// One navigation step. Keys and taps both become steps; [`Nav::apply`]
@@ -87,6 +91,32 @@ pub enum NavStep {
     CompleteSelected,
     /// A tap on a suggestion row: complete that command.
     Complete(String),
+    /// Enter on the selected credentials row: start the browser sign-in
+    /// (OAuth-capable provider) or open the masked key entry.
+    Activate,
+    /// A tap on a credentials row (web): select it, then as [`NavStep::Activate`].
+    ActivateRow(usize),
+    /// Esc during the key entry: close it, the typed text is dropped.
+    AuthCancelKey,
+    /// The key entry was submitted: close it (the view has sent the key).
+    AuthKeyDone,
+}
+
+/// One credentials row: the core's label and status (shown verbatim), and
+/// whether Enter starts the browser sign-in or opens the key entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthRow {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub oauth_capable: bool,
+}
+
+impl AuthRow {
+    /// The row as the screen shows it: `label: status`.
+    pub fn line(&self) -> String {
+        auth_row_line(&self.label, &self.status)
+    }
 }
 
 /// One sessions row: the id to attach, the title (for confirmations) and
@@ -119,6 +149,20 @@ impl SettingRow {
     }
 }
 
+/// The credentials rows from the snapshot's provider list, in the core's
+/// order. A row is OAuth-capable when the core says so.
+pub fn auth_rows(s: &ViewModelSnapshot) -> Vec<AuthRow> {
+    s.providers
+        .iter()
+        .map(|p| AuthRow {
+            id: p.id.clone(),
+            label: p.label.clone(),
+            status: p.status.clone(),
+            oauth_capable: p.oauth_capable,
+        })
+        .collect()
+}
+
 /// One model picker row: the model name and its line (`model (role)`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelRow {
@@ -126,6 +170,9 @@ pub struct ModelRow {
     pub text: String,
     /// Catalog rows that the server cannot run are dim and not selectable.
     pub available: bool,
+    /// The session's current model: marked, and preselected when the picker
+    /// opens.
+    pub current: bool,
 }
 
 /// One invite row of the Settings share section.
@@ -189,6 +236,12 @@ pub struct NavView {
     pub signin_error: Option<String>,
     /// The share section, when the owner is connected to a session.
     pub share: Option<ShareView>,
+    /// The credentials rows (Auth screen).
+    pub auth: Vec<AuthRow>,
+    /// The provider whose key entry is open (masked input), if any.
+    pub auth_key: Option<String>,
+    /// The latest browser sign-in progress from the snapshot.
+    pub auth_progress: Option<OAuthProgressView>,
 }
 
 impl NavView {
@@ -234,6 +287,12 @@ pub struct Nav {
     invites: Vec<InviteLine>,
     created: Option<String>,
     share_note: Option<String>,
+    auth: Vec<AuthRow>,
+    auth_progress: Option<OAuthProgressView>,
+    /// The provider whose masked key entry is open.
+    auth_key: Option<String>,
+    /// The first-run check ran (see [`Nav::first_run`]).
+    first_run_done: bool,
 }
 
 impl Nav {
@@ -284,6 +343,11 @@ impl Nav {
         self.share_note = note;
     }
 
+    /// Whether the credentials screen has a key entry open.
+    pub fn auth_keying(&self) -> bool {
+        self.top() == Screen::Auth && self.auth_key.is_some()
+    }
+
     /// The session the page is attached to (from the latest snapshot).
     pub fn session(&self) -> Option<Uuid> {
         self.session
@@ -328,6 +392,8 @@ impl Nav {
             .collect();
         self.session = snapshot.session_id;
         self.settings = settings_rows(snapshot);
+        self.auth = auth_rows(snapshot);
+        self.auth_progress = snapshot.oauth.clone();
         self.models = model_rows(snapshot);
         self.agents = snapshot.agents.clone();
         if let Some(id) = &self.agent_id {
@@ -426,9 +492,31 @@ impl Nav {
         changed
     }
 
+    /// The first-run check, once per process: the first snapshot that
+    /// carries provider rows (the driver requests them on connect). When
+    /// nothing is signed in and Chat is showing, the credentials screen
+    /// opens once. Returns the core calls to send.
+    pub fn first_run(&mut self, snapshot: &ViewModelSnapshot) -> Vec<UiAction> {
+        if self.first_run_done || snapshot.providers.is_empty() {
+            return Vec::new();
+        }
+        self.first_run_done = true;
+        let none = snapshot.providers.iter().all(|p| !auth_is_signed_in(&p.status));
+        // Only on a blank session: a session with history or a run in
+        // progress (a share link, a resumed session, a local provider that
+        // needs no sign-in) must not be covered by the credentials screen.
+        let blank = snapshot.history.is_empty() && !snapshot.running;
+        if none && blank && self.top() == Screen::Chat {
+            self.apply(NavStep::Open(Screen::Auth))
+        } else {
+            Vec::new()
+        }
+    }
+
     fn list_len(&self) -> usize {
         match self.top() {
             Screen::Chat | Screen::Help | Screen::Agent | Screen::SignIn => 0,
+            Screen::Auth => self.auth.len(),
             Screen::Portal => self.visible_portal().len(),
             Screen::Sessions => self.visible().len(),
             Screen::Models => self.visible_models().len(),
@@ -454,6 +542,7 @@ impl Nav {
         self.pending = None;
         self.agent_id = None;
         self.agent_row = None;
+        self.auth_key = None;
     }
 
     fn complete(&mut self, name: &str) {
@@ -477,8 +566,13 @@ impl Nav {
                 self.push(screen);
                 match screen {
                     Screen::Sessions => return vec![UiAction::ListSessions],
-                    Screen::Models => return vec![UiAction::ListModels],
+                    Screen::Models => {
+                        // Preselect the current model (the first row when none).
+                        self.selected = self.models.iter().position(|r| r.current).unwrap_or(0);
+                        return vec![UiAction::ListModels];
+                    }
                     Screen::Settings if self.share_active() => return vec![UiAction::ListInvites],
+                    Screen::Auth => return vec![UiAction::ListAuth],
                     _ => {}
                 }
             }
@@ -494,6 +588,7 @@ impl Nav {
                     self.agent_id = None;
                     self.agent_row = None;
                 }
+                self.auth_key = None;
                 self.stack.pop();
                 self.filter.clear();
                 self.selected = 0;
@@ -551,6 +646,19 @@ impl Nav {
                     });
                 }
             }
+            NavStep::Activate if self.top() == Screen::Auth && self.auth_key.is_none() => {
+                if let Some(row) = self.auth.get(self.selected).cloned() {
+                    if row.oauth_capable {
+                        return vec![UiAction::AuthStart(row.id)];
+                    }
+                    self.auth_key = Some(row.id);
+                }
+            }
+            NavStep::ActivateRow(index) if self.top() == Screen::Auth => {
+                self.selected = index.min(self.auth.len().saturating_sub(1));
+                return self.apply(NavStep::Activate);
+            }
+            NavStep::AuthCancelKey | NavStep::AuthKeyDone => self.auth_key = None,
             NavStep::Confirm => {
                 return self.pending.take().map(|p| p.actions).unwrap_or_default();
             }
@@ -604,6 +712,9 @@ impl Nav {
                 created: self.created.clone(),
                 note: self.share_note.clone(),
             }),
+            auth: self.auth.clone(),
+            auth_key: self.auth_key.clone(),
+            auth_progress: self.auth_progress.clone(),
         }
     }
 }
@@ -622,7 +733,15 @@ pub fn model_rows(s: &ViewModelSnapshot) -> Vec<ModelRow> {
         return s
             .models
             .iter()
-            .map(|m| ModelRow { model: m.id.clone(), text: m.text.clone(), available: m.available })
+            .map(|m| {
+                let current = m.current;
+                let text = if current {
+                    format!("{} ({MODEL_ROLE_CURRENT})", m.text)
+                } else {
+                    m.text.clone()
+                };
+                ModelRow { model: m.id.clone(), text, available: m.available, current }
+            })
             .collect();
     }
     let mut rows: Vec<ModelRow> = Vec::new();
@@ -632,6 +751,7 @@ pub fn model_rows(s: &ViewModelSnapshot) -> Vec<ModelRow> {
                 model: model.to_string(),
                 text: format!("{model} ({role})"),
                 available: true,
+                current: model == s.model,
             });
         }
     };
@@ -687,6 +807,7 @@ pub fn settings_rows(s: &ViewModelSnapshot) -> Vec<SettingRow> {
         ),
         row(SETTING_CONTEXT_LABEL, s.context_label.clone(), None),
         row(SETTING_COMPACT_LABEL, String::new(), Some(UiAction::Compact)),
+        row(SETTING_AUTH_LABEL, String::new(), Some(UiAction::Nav(NavStep::Open(Screen::Auth)))),
     ];
     if s.rules.is_empty() {
         rows.push(row(SETTING_RULES_LABEL, RULES_NONE_LABEL.to_string(), None));
@@ -948,7 +1069,7 @@ mod portal_tests {
         };
         let rows = model_rows(&snapshot);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].text, "claude-opus-5 - anthropic");
+        assert_eq!(rows[0].text, "claude-opus-5 - anthropic (current)");
         assert!(!rows[1].available);
         let mut nav = Nav::default();
         nav.observe(&snapshot);
@@ -966,5 +1087,202 @@ mod portal_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "claude-opus-5 (current)");
         assert!(rows[0].available);
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use modron_protocol::AuthProviderWire;
+
+    fn provider(id: &str, label: &str, status: &str, oauth: bool) -> AuthProviderWire {
+        AuthProviderWire {
+            id: id.into(),
+            label: label.into(),
+            status: status.into(),
+            oauth_capable: oauth,
+        }
+    }
+
+    fn snapshot(providers: Vec<AuthProviderWire>) -> ViewModelSnapshot {
+        ViewModelSnapshot { providers, ..Default::default() }
+    }
+
+    fn auth_nav(snap: &ViewModelSnapshot) -> Nav {
+        let mut nav = Nav::default();
+        nav.observe(snap);
+        nav.apply(NavStep::Open(Screen::Auth));
+        nav
+    }
+
+    #[test]
+    fn the_rows_show_the_core_label_and_status_verbatim() {
+        let snap = snapshot(vec![
+            provider("anthropic", "Anthropic", "subscription (oauth)", true),
+            provider("openai", "OpenAI", "not configured", false),
+        ]);
+        let nav = auth_nav(&snap);
+        let view = nav.view();
+        assert_eq!(view.screen, Screen::Auth);
+        let lines: Vec<String> = view.auth.iter().map(AuthRow::line).collect();
+        assert_eq!(lines, vec!["Anthropic: subscription (oauth)", "OpenAI: not configured"]);
+    }
+
+    #[test]
+    fn opening_the_screen_asks_for_the_provider_rows_and_settings_opens_it() {
+        let snap = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        let mut nav = Nav::default();
+        nav.observe(&snap);
+        assert_eq!(nav.apply(NavStep::Open(Screen::Auth)), vec![UiAction::ListAuth]);
+        let settings = settings_rows(&snap);
+        let auth_row = settings.iter().find(|r| r.label == "auth").expect("auth row");
+        assert_eq!(auth_row.action, Some(UiAction::Nav(NavStep::Open(Screen::Auth))));
+    }
+
+    #[test]
+    fn enter_on_an_oauth_row_starts_the_sign_in_and_keeps_no_entry() {
+        let snap = snapshot(vec![provider("anthropic", "Anthropic", "not configured", true)]);
+        let mut nav = auth_nav(&snap);
+        assert_eq!(nav.apply(NavStep::Activate), vec![UiAction::AuthStart("anthropic".into())]);
+        assert_eq!(nav.view().auth_key, None);
+    }
+
+    #[test]
+    fn enter_on_a_key_row_opens_the_entry_and_the_submit_or_escape_closes_it() {
+        let snap = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        let mut nav = auth_nav(&snap);
+        assert!(nav.apply(NavStep::Activate).is_empty());
+        assert_eq!(nav.view().auth_key.as_deref(), Some("openai"));
+        assert!(nav.auth_keying());
+        // Enter again does not reopen or act while the entry is open.
+        assert!(nav.apply(NavStep::Activate).is_empty());
+        nav.apply(NavStep::AuthCancelKey);
+        assert_eq!(nav.view().auth_key, None);
+        nav.apply(NavStep::Activate);
+        nav.apply(NavStep::AuthKeyDone);
+        assert!(!nav.auth_keying());
+    }
+
+    #[test]
+    fn a_tap_selects_the_row_then_acts_on_it() {
+        let snap = snapshot(vec![
+            provider("anthropic", "Anthropic", "not configured", true),
+            provider("openai", "OpenAI", "not configured", false),
+        ]);
+        let mut nav = auth_nav(&snap);
+        assert!(nav.apply(NavStep::ActivateRow(1)).is_empty());
+        assert_eq!(nav.view().auth_key.as_deref(), Some("openai"));
+        assert_eq!(nav.selected(), 1);
+    }
+
+    #[test]
+    fn back_drops_an_open_entry_with_the_screen() {
+        let snap = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        let mut nav = auth_nav(&snap);
+        nav.apply(NavStep::Activate);
+        nav.apply(NavStep::Back);
+        assert_eq!(nav.top(), Screen::Chat);
+        assert_eq!(nav.view().auth_key, None);
+    }
+
+    #[test]
+    fn the_progress_block_carries_the_snapshot_fields() {
+        let mut snap = snapshot(vec![provider("openai", "OpenAI", "not configured", true)]);
+        snap.oauth = Some(OAuthProgressView {
+            provider: "openai".into(),
+            stage: "waiting".into(),
+            message: "enter the code".into(),
+            url: Some("https://auth.openai.com".into()),
+            user_code: Some("ABCD-1234".into()),
+        });
+        let nav = auth_nav(&snap);
+        let progress = nav.view().auth_progress.expect("progress");
+        assert_eq!(progress.stage, "waiting");
+        assert_eq!(progress.user_code.as_deref(), Some("ABCD-1234"));
+    }
+
+    #[test]
+    fn first_run_asks_once_and_opens_the_screen_only_when_nothing_is_signed_in() {
+        let mut nav = Nav::default();
+        let empty = ViewModelSnapshot::default();
+        assert!(nav.first_run(&empty).is_empty(), "rows not in yet");
+        let none = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        assert_eq!(nav.first_run(&none), vec![UiAction::ListAuth]);
+        assert_eq!(nav.top(), Screen::Auth);
+        assert!(nav.first_run(&none).is_empty());
+    }
+
+    #[test]
+    fn first_run_stays_quiet_on_a_session_that_is_running() {
+        let mut nav = Nav::default();
+        let mut busy = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        busy.running = true;
+        assert!(nav.first_run(&busy).is_empty());
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+
+    #[test]
+    fn first_run_stays_quiet_when_a_provider_is_signed_in() {
+        let mut nav = Nav::default();
+        let signed = snapshot(vec![
+            provider("openai", "OpenAI", "not configured", false),
+            provider("anthropic", "Anthropic", "api key", false),
+        ]);
+        assert!(nav.first_run(&signed).is_empty());
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+}
+
+#[cfg(test)]
+mod model_mark_tests {
+    use super::*;
+    use modron_mobile_core::view::model_row;
+    use modron_protocol::ModelWire;
+
+    /// A catalog row as the core builds it: `current` is the session's model.
+    fn model(id: &str, available: bool, current: &str) -> modron_mobile_core::view::ModelRowView {
+        let wire = ModelWire {
+            id: id.into(),
+            provider: "anthropic".into(),
+            label: id.into(),
+            context_window: None,
+            available,
+            tier: None,
+        };
+        model_row(&wire, current, "")
+    }
+
+    #[test]
+    fn the_current_model_is_marked_and_preselected_when_the_picker_opens() {
+        let snap = ViewModelSnapshot {
+            model: "beta".into(),
+            models: vec![
+                model("alpha", true, "beta"),
+                model("beta", true, "beta"),
+                model("gamma", false, "beta"),
+            ],
+            ..Default::default()
+        };
+        let mut nav = Nav::default();
+        nav.observe(&snap);
+        nav.apply(NavStep::Open(Screen::Models));
+        let view = nav.view();
+        assert_eq!(view.selected, 1);
+        assert!(view.models[1].text.ends_with("(current)"), "{}", view.models[1].text);
+        assert!(!view.models[0].text.contains("current"));
+        assert!(!view.models[2].available, "gamma stays dim");
+    }
+
+    #[test]
+    fn the_picker_starts_on_the_first_row_when_no_current_model_is_listed() {
+        let snap = ViewModelSnapshot {
+            model: "zeta".into(),
+            models: vec![model("alpha", true, "zeta"), model("beta", true, "zeta")],
+            ..Default::default()
+        };
+        let mut nav = Nav::default();
+        nav.observe(&snap);
+        nav.apply(NavStep::Open(Screen::Models));
+        assert_eq!(nav.view().selected, 0);
     }
 }

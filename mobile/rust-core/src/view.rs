@@ -203,6 +203,101 @@ pub const COPIED_LABEL: &str = "copied";
 pub const REVOKE_LABEL: &str = "revoke";
 pub const NO_INVITES_LABEL: &str = "no invites";
 
+/// Parity D2: the credentials screen (`/auth`, and the Settings auth row).
+/// The row label and the first-run hint are the old TUI's words
+/// (crates/modron-tui/src/lib.rs, the auth manager and the idle hints).
+pub const SETTING_AUTH_LABEL: &str = "auth";
+pub const AUTH_TITLE_LABEL: &str = "auth";
+/// The provider status the core reports for a provider with no credentials
+/// (crates/modron-protocol AuthProviderWire.status).
+pub const AUTH_NOT_CONFIGURED: &str = "not configured";
+/// Shown on the first run when no provider is signed in (the old TUI's
+/// idle hint, lib.rs HINTS, with an ASCII dash).
+pub const AUTH_FIRST_RUN_HINT: &str = "try /auth: sign in or reuse existing logins";
+pub const AUTH_NO_PROVIDERS_LABEL: &str = "no providers listed yet";
+/// Row hints: an OAuth-capable provider signs in through the browser on the
+/// server; a key-only provider takes a pasted key (old TUI AuthMethod labels).
+pub const AUTH_SIGN_IN_HINT: &str = "sign in (browser)";
+pub const AUTH_KEY_HINT: &str = "paste an API key";
+pub const AUTH_KEY_SAVE_HINT: &str = "enter save - esc back";
+pub const AUTH_KEY_PLACEHOLDER: &str = "paste an API key";
+pub const AUTH_WAITING_LABEL: &str = "waiting for the sign-in... esc backs out";
+pub const AUTH_CODE_LABEL: &str = "code";
+pub const AUTH_VISIT_LABEL: &str = "open";
+
+/// Parity D2: the task text the old TUI submitted for its task commands
+/// (crates/modron-tui/src/lib.rs, `SlashCommand::{CodeReview, Btw, Plan,
+/// Learn}`), copied here so every client sends the same words. The old TUI
+/// should import these before it is deleted. ASCII dashes replace its em
+/// dashes.
+pub const REVIEW_TASK: &str = "Review the working tree: run `git diff` (and `git status`), then report findings only - bugs, risks, and gaps, each with file:line references. Do not fix anything.";
+pub const BTW_USAGE: &str = "use /btw <quick question>";
+pub const PLAN_USAGE: &str = "use /plan <task>";
+pub const AGENT_USAGE: &str = "use /agent <name>";
+pub const BTW_SUFFIX: &str =
+    "(Quick side question: answer directly from what you already know - do not use tools.)";
+pub const PLAN_SUFFIX: &str = "(Plan first: produce a concrete, step-by-step plan with file references. Do NOT edit any files yet - wait for approval.)";
+
+/// Parity D2: app copy moved here so every client shares it. The Ctrl+T
+/// note with no tool rows, the scrolled-up marker, and the second-Ctrl+C
+/// hint of the terminal host (crates/modron-tui shows the same words).
+pub const NO_TOOLS_NOTE: &str = "no tool activity yet";
+pub const NEW_OUTPUT_BELOW_LABEL: &str = "new output below - end to follow";
+pub const CTRL_C_QUIT_HINT: &str = "press ctrl+c again to quit";
+
+/// `/btw <question>`: the question with the no-tools suffix.
+pub fn btw_task(question: &str) -> String {
+    format!("{question}\n\n{BTW_SUFFIX}")
+}
+
+/// `/plan <task>`: the task with the plan-first suffix.
+pub fn plan_task(task: &str) -> String {
+    format!("{task}\n\n{PLAN_SUFFIX}")
+}
+
+/// The skill-name slug `/learn` uses: ASCII letters and digits lowercased,
+/// runs of anything else collapsed to one dash, trimmed, at most 48 chars.
+pub fn skill_slug(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').chars().take(48).collect()
+}
+
+/// `/learn [title]`: distil the session into a skill file (the old TUI's
+/// wording; an empty title names it `session-skill`).
+pub fn learn_task(title: &str) -> String {
+    let slug = skill_slug_or_default(title);
+    format!(
+        "Distill this session into a reusable skill. Write the file .modron/skills/{slug}/SKILL.md with `---` frontmatter (name: {slug}, description: one line) followed by a concise, step-by-step workflow capturing what actually worked here (commands, file paths, pitfalls). Create the directories. Then reply with just the path you wrote."
+    )
+}
+
+fn skill_slug_or_default(title: &str) -> String {
+    skill_slug(if title.is_empty() {
+        "session-skill"
+    } else {
+        title
+    })
+}
+
+/// One credentials row: the core's label and status, verbatim, joined by
+/// `: ` (the same shape as the settings rows).
+pub fn auth_row_line(label: &str, status: &str) -> String {
+    format!("{label}: {status}")
+}
+
+/// Whether a provider status counts as signed in (anything but the core's
+/// not-configured word).
+pub fn auth_is_signed_in(status: &str) -> bool {
+    status != AUTH_NOT_CONFIGURED
+}
+
 /// The inline confirmation for deleting a session.
 pub fn delete_confirm_text(title: &str) -> String {
     format!("delete {title}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
@@ -2098,5 +2193,66 @@ mod portal_copy_tests {
             invite_row("viewer", "2026-11-16T10:20:30Z"),
             "viewer \u{b7} expires 2026-11-16 10:20"
         );
+    }
+}
+
+#[cfg(test)]
+mod task_copy_tests {
+    use super::*;
+
+    #[test]
+    fn btw_and_plan_wrap_the_task_with_the_old_tui_suffix() {
+        assert_eq!(btw_task("why?"), format!("why?\n\n{BTW_SUFFIX}"));
+        assert_eq!(
+            plan_task("add tests"),
+            format!("add tests\n\n{PLAN_SUFFIX}")
+        );
+    }
+
+    #[test]
+    fn learn_names_the_skill_file_with_the_slug() {
+        let text = learn_task("Fix the Parser!");
+        assert!(text.contains(".modron/skills/fix-the-parser/SKILL.md"));
+        assert!(text.contains("(name: fix-the-parser, description: one line)"));
+        assert!(learn_task("").contains(".modron/skills/session-skill/SKILL.md"));
+    }
+
+    #[test]
+    fn the_slug_collapses_separators_and_is_capped() {
+        assert_eq!(skill_slug("  a -- b  "), "a-b");
+        assert_eq!(skill_slug(&"x".repeat(80)).len(), 48);
+    }
+
+    #[test]
+    fn the_app_copy_words_are_shared_constants() {
+        assert_eq!(NO_TOOLS_NOTE, "no tool activity yet");
+        assert!(NEW_OUTPUT_BELOW_LABEL.starts_with("new output below"));
+        assert_eq!(CTRL_C_QUIT_HINT, "press ctrl+c again to quit");
+    }
+
+    #[test]
+    fn the_review_task_is_the_old_tui_text() {
+        assert!(REVIEW_TASK.starts_with("Review the working tree: run `git diff`"));
+        assert!(REVIEW_TASK.ends_with("Do not fix anything."));
+    }
+}
+
+#[cfg(test)]
+mod auth_copy_tests {
+    use super::*;
+
+    #[test]
+    fn auth_rows_join_the_core_label_and_status_with_a_colon() {
+        assert_eq!(
+            auth_row_line("Anthropic", "subscription (oauth)"),
+            "Anthropic: subscription (oauth)"
+        );
+    }
+
+    #[test]
+    fn only_the_not_configured_status_counts_as_unsigned() {
+        assert!(!auth_is_signed_in(AUTH_NOT_CONFIGURED));
+        assert!(auth_is_signed_in("api key"));
+        assert!(auth_is_signed_in("subscription (oauth)"));
     }
 }

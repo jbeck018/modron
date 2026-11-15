@@ -371,6 +371,24 @@ try {
   const openHttp = await fetch(openInner.replace(/^ws:/, "http:"));
   check("the same open_url without the cookie is 401 over HTTP", openHttp.status === 401, "status " + openHttp.status);
 
+  // Relayed role: the bridge sets `role` from the socket's grant on every
+  // frame and drops whatever the client sent. The serve trusts it only on a
+  // host-authenticated tunnel, so a client must never choose it.
+  const agentFrame = (id) => agentFrames().find((f) => f.id === id);
+  owner.ws.send("owner not json");
+  v.ws.send(JSON.stringify({ type: "ping", id: 21, role: "owner" }));
+  ap.ws.send(JSON.stringify({ type: "approve", id: 22, role: "owner", request_id: "r2", decision: "allow_once" }));
+  owner.ws.send(JSON.stringify({ type: "ping", id: 23, role: "viewer" }));
+  await waitUntil(() => agentFrame(23) !== undefined);
+  check("a viewer frame claiming role owner reaches the agent as viewer",
+    agentFrame(21)?.role === "viewer", JSON.stringify(agentFrame(21)));
+  check("an approver frame claiming role owner reaches the agent as approver",
+    agentFrame(22)?.role === "approver", JSON.stringify(agentFrame(22)));
+  check("an owner frame claiming role viewer reaches the agent as owner",
+    agentFrame(23)?.role === "owner", JSON.stringify(agentFrame(23)));
+  check("a non-JSON frame from the owner socket is dropped",
+    !agent.got.includes("owner not json"));
+
   // Bare share-key socket is refused once the portal is on.
   const bareHttp = await fetch(`${a}/ws/${viewerKey}`);
   check("bare /ws/<key> with no cookie or ticket is 401", bareHttp.status === 401, "status " + bareHttp.status);
@@ -418,6 +436,12 @@ try {
   legacyViewer.ws.send(JSON.stringify({ type: "submit", id: 1, task: "legacy" }));
   check("legacy viewer submit is relayed unfiltered",
     await waitUntil(() => legacyAgent.got.some((s) => s.includes('"task":"legacy"'))));
+  // A legacy (untagged) socket gets no role, even one it claims.
+  legacyViewer.ws.send(JSON.stringify({ type: "ping", id: 31, role: "owner" }));
+  await waitUntil(() => legacyAgent.got.some((s) => s.includes('"id":31')));
+  const legacyPing = JSON.parse(legacyAgent.got.find((s) => s.includes('"id":31')) || "{}");
+  check("a legacy socket's frame reaches the agent with no role key",
+    legacyPing.type === "ping" && !("role" in legacyPing), JSON.stringify(legacyPing));
   const legacyTicket = await fetch(`${b}/ws/${viewerKey}?ticket=${zeros}`);
   check("a ticket is refused when the portal is off (403)", legacyTicket.status === 403, "status " + legacyTicket.status);
   // ---------------- instance C: portal on, test hooks OFF ----------------

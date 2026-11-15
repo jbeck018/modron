@@ -290,7 +290,7 @@ async fn send_frame(ws: &mut WebSocketStream<TcpStream>, frame: &Frame) {
 #[test]
 fn startup_config_is_forwarded_in_order_right_after_attach() {
     let session = Uuid::from_u128(0xd1);
-    let (url, reports) = start_server(session, 2);
+    let (url, reports) = start_server(session, 4);
     let patches = vec![
         ConfigPatch { effort: Some(Effort::High), ..ConfigPatch::default() },
         ConfigPatch { goal: Some("ship".into()), ..ConfigPatch::default() },
@@ -306,8 +306,12 @@ fn startup_config_is_forwarded_in_order_right_after_attach() {
     let deadline = Instant::now() + TIMEOUT;
     while got.len() < 2 {
         assert!(Instant::now() < deadline, "server saw {got:?}");
+        // The connect also sends auth_providers (the first-run check); only
+        // the config frames are counted here.
         if let Ok(payload) = reports.recv_timeout(Duration::from_millis(20)) {
-            got.push(payload);
+            if matches!(payload, Payload::SetConfig { .. }) {
+                got.push(payload);
+            }
         }
     }
     let sent: Vec<ConfigPatch> = got

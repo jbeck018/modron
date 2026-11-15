@@ -31,7 +31,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::dispatch::{handle_frame, ConnCtx, Flow, ServerState};
+use crate::dispatch::{handle_frame, handle_relayed_frame, ConnCtx, Flow, ServerState};
 use modron_core::SessionId;
 
 /// The key that goes into a share link: a one-way hash of the agent's
@@ -481,7 +481,14 @@ pub async fn run_tunnel_with(
     // The tunnel is authenticated by construction (its key was minted by
     // this server) and pinned to its one session (D5): the relay's frames
     // get the scoped allowlist, never the server-wide one.
-    let mut ctx = ConnCtx::scoped(out_tx, session);
+    // With the host token the bridge's relayed `role` is trusted (see
+    // `ConnCtx::trusted_tunnel`); without it this is the legacy share-link
+    // relay and the role field is ignored.
+    let mut ctx = if host_token.is_some() {
+        ConnCtx::trusted_tunnel(out_tx, session)
+    } else {
+        ConnCtx::scoped(out_tx, session)
+    };
 
     // Handshake + eager subscribe before handing the sink to the writer.
     let hello = modron_protocol::Frame::request(
@@ -546,7 +553,7 @@ pub async fn run_tunnel_with(
     // Relay loop: every frame from the bridge goes through the SAME
     // dispatch as local clients, under the tunnel's scope (see ConnCtx::scoped).
     loop {
-        let frame = tokio::select! {
+        let relayed = tokio::select! {
             frame = stream.next() => match frame {
                 Some(Ok(WsMessage::Text(text))) => serde_json::from_str::<
                     modron_protocol::Frame,
@@ -555,13 +562,18 @@ pub async fn run_tunnel_with(
                 _ => break,
             },
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                Some(modron_protocol::Frame::request(
+                // The keepalive is the server's own frame, not a relayed one.
+                let ping = modron_protocol::Frame::request(
                     0,
                     modron_protocol::Payload::Ping {},
-                ))
+                );
+                if handle_frame(&state, &mut ctx, true, ping).await == Flow::Close {
+                    break;
+                }
+                continue;
             }
         };
-        let Some(frame) = frame else {
+        let Some(frame) = relayed else {
             continue;
         };
         // A viewer that just joined says hello and may not know the session
@@ -571,7 +583,7 @@ pub async fn run_tunnel_with(
         // on what the relay happened to buffer. A snapshot resets a client's
         // view, so viewers already attached are unaffected.
         let joined = matches!(frame.payload, modron_protocol::Payload::Hello { .. });
-        if handle_frame(&state, &mut ctx, true, frame).await == Flow::Close {
+        if handle_relayed_frame(&state, &mut ctx, frame).await == Flow::Close {
             break;
         }
         if joined {

@@ -398,6 +398,7 @@ impl RemoteClient {
             id: Some(id),
             session: Some(session),
             seq: 0,
+            role: None,
             payload: Payload::Attach {
                 session_id: session,
                 last_seq,
@@ -492,6 +493,7 @@ mod tests {
                         id: Some(attach.id.unwrap()),
                         session: Some(session_id),
                         seq: 3,
+                        role: None,
                         payload: Payload::Snapshot {
                             session_id,
                             last_seq: 3,

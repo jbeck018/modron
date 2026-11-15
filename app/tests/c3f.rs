@@ -25,6 +25,21 @@ use uuid::Uuid;
 const COLS: u16 = 120;
 const ROWS: u16 = 40;
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The host's next action, polled for up to [`TIMEOUT`]: the action is
+/// produced on the driver's side, so one read can race under load.
+fn poll_action(mut next: impl FnMut() -> Option<UiAction>) -> Option<UiAction> {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        if let Some(action) = next() {
+            return Some(action);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 /// The composer's placeholder: on screen only when the Chat body is.
 const CHAT_MARK: &str = "Message";
 
@@ -254,7 +269,7 @@ fn model_picker_filters_and_enter_switches_the_model() {
     let mut h = chat_with(vec![]);
     h.type_text("/model");
     h.key("Enter");
-    assert_eq!(h.action(), Some(UiAction::ListModels));
+    assert_eq!(poll_action(|| h.action()), Some(UiAction::ListModels));
     h.wait_for("picker rows", |s| s.contains("claude-haiku-5-5 (recommended cheap)"));
     h.type_text("haiku");
     h.wait_for("filtered", |s| {
@@ -270,7 +285,7 @@ fn esc_clears_the_model_filter_before_closing_the_picker() {
     let mut h = chat_with(vec![]);
     h.type_text("/model");
     h.key("Enter");
-    assert_eq!(h.action(), Some(UiAction::ListModels));
+    assert_eq!(poll_action(|| h.action()), Some(UiAction::ListModels));
     h.wait_for("picker", |s| s.contains("claude-opus-5 (current)"));
     h.type_text("zz");
     h.wait_for("no match", |s| s.contains("filter: zz"));

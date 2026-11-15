@@ -245,6 +245,31 @@ A frame outside the list is not forwarded. The sender gets
 tagged socket is dropped with no reply, and oversized frames are dropped
 under the existing size limits.
 
+### Relayed role (`role` on frames to the serve)
+
+Every client frame the bridge forwards to the agent carries a top-level
+`role` field that names the socket's grant: `owner` (owner cookie),
+`approver` or `viewer` (redeemed invite ticket). Legacy sockets (portal
+off, share key only) get no `role` at all.
+
+- Who sets it: only this bridge (`stampRelayRole` in src/portal.ts, called
+  from `SessionBridge.webSocketMessage`). It first deletes any `role` the
+  client sent, so a client can never choose or raise its role. A
+  tagged socket's frame that is not a JSON object is dropped.
+- Who trusts it: `modron serve` (crates/modron-server, `handle_relayed_frame`
+  and `relay_gate` in dispatch.rs), and only on a tunnel that authenticated
+  to this bridge with the host token (`MODRON_HOST_TOKEN` set on the
+  serve, so `/agent/<key>` carried the bearer). Any other tunnel ignores
+  `role`. The serve's per-role decisions are listed there.
+- Trust rule in one line: the bridge is the only writer of `role`, and the
+  serve reads it only from a host-authenticated tunnel. Bridge deployments
+  without `HOST_TOKEN` accept any agent tunnel, so the serve should only
+  be pointed at a bridge that has `HOST_TOKEN` set.
+
+Tested in test/portal.mjs: a viewer frame claiming `role: "owner"` reaches
+the agent as `viewer`, an owner frame claiming `viewer` arrives as `owner`,
+and a legacy socket's frame arrives with no `role` key.
+
 Ticket: 64 hex characters, 60 seconds, single use, bound to the viewer key.
 Redeeming it deletes it whether or not it matches.
 

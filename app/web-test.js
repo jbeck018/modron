@@ -147,6 +147,7 @@ function textFrame(text) {
 // snapshot and stream unprompted after the welcome, as a share link's
 // server does (no attach). `frames` keeps every client frame, parsed.
 function startWsServer(opts = {}) {
+  let dropped = false;
   const received = [];
   const frames = [];
   let onSubmit;
@@ -175,14 +176,30 @@ function startWsServer(opts = {}) {
             send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
           }
         } else if (frame.type === 'attach') {
+          // Forced drop (opts.dropOnce): the page must reconnect and re-attach.
+          if (opts.dropOnce && !dropped) {
+            dropped = true;
+            setTimeout(() => socket.destroy(), 1500);
+          }
           send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: opts.live || {} });
           send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
           (opts.after || []).forEach((extra, i) => send({ session: SESSION, seq: 2 + i, ...extra }));
         } else if (frame.type === 'submit') {
           onSubmit(frame);
+        } else if (frame.type === 'steer') {
+          // The scripted stream leaves the session running, so the composer
+          // steers (PROTOCOL_V2 section 2). The cases below only care that
+          // the typed text reaches this session: record the steer in the
+          // submit shape they read.
+          const delivered = { type: 'submit', task: frame.text, session_id: frame.session_id, steer: true };
+          frames.push(delivered);
+          onSubmit(delivered);
         } else if (frame.type === 'router_defaults_req') {
           // The model picker's source: the router's defaults.
           send({ session: SESSION, seq: 4, type: 'router_defaults', authed: ['anthropic'], recommended_cheap: 'claude-haiku-5-5', recommended_strong: 'claude-opus-5', cheap_fallback: [], strong_fallback: ['claude-sonnet-5'] });
+        } else if (frame.type === 'auth_providers_req') {
+          // The credentials screen's rows (the first-run check reads them too).
+          send({ session: SESSION, seq: 5, type: 'auth_providers', rows: opts.providers || [] });
         } else if (frame.type === 'list_sessions') {
           // The sessions screen's refresh: answer with the scripted rows.
           send({ session: SESSION, seq: 3, type: 'sessions', sessions: opts.sessions || [] });
@@ -645,6 +662,67 @@ async function testModelPickerSendsConfig(browser, base) {
   }
 }
 
+// A forced disconnect and reconnect (the path that panicked on wasm32 when the
+// driver read std time): no page error or console error, before or after it.
+async function testNoErrorsAcrossReconnect(browser, base) {
+  const ws = await startWsServer({ dropOnce: true });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForTimeout(4000);
+    for (let i = 0; i < 250 && ws.received.filter((t) => t === 'attach').length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (ws.received.filter((t) => t === 'attach').length < 2) throw new Error('no re-attach after the forced drop');
+    await page.waitForTimeout(3000);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Credentials: the screen opens on the first run (nothing signed in). Enter on
+// the OAuth row sends auth_start; on the key row the masked entry sends
+// auth_set_key with the typed key, and the key leaves the page afterwards.
+async function testCredentialsScreen(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'not configured', oauth_capable: true },
+    { id: 'openai', label: 'OpenAI', status: 'not configured', oauth_capable: false },
+  ];
+  const ws = await startWsServer({ providers });
+  try {
+    // The first run opens this screen only on a blank, idle session. The
+    // scripted session is streaming, so open the screen with /auth.
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: TIMEOUT });
+
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    const started = await waitFrame(ws, 'auth_start', (f) => f.provider === 'anthropic');
+    if (started.provider !== 'anthropic') throw new Error('auth_start was ' + JSON.stringify(started));
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: paste an API key'), null, { timeout: TIMEOUT });
+    await page.keyboard.type('sk-test-123');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Enter');
+    const saved = await waitFrame(ws, 'auth_set_key', (f) => f.provider === 'openai');
+    if (saved.key !== 'sk-test-123') throw new Error('auth_set_key sent the wrong key');
+    await page.waitForFunction(() => !document.body.innerText.includes('OpenAI: paste an API key'), null, { timeout: TIMEOUT });
+    const html = await page.content();
+    if (html.includes('sk-test-123')) throw new Error('the key stayed on the page');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // Delete asks inline; the yes control sends delete_session for that row.
 async function testDeleteAfterConfirmation(browser, base) {
   const other = '9c2d7e10-1a2b-4c3d-8e4f-5a6b7c8d9e0f';
@@ -722,6 +800,8 @@ async function testAgentSteerAndKill(browser, base) {
     ['(l) typing /co shows the compact suggestion', () => testSlashSuggestions(browser, base)],
     ['(m) model picker row sends set_config with the model', () => testModelPickerSendsConfig(browser, base)],
     ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
+    ['(t) no page or console error for a few seconds and across a forced reconnect', () => testNoErrorsAcrossReconnect(browser, base)],
+    ['(s) credentials: /auth opens it, OAuth sends auth_start, a typed key is sent once and leaves the page', () => testCredentialsScreen(browser, base)],
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
     ['(q) shift+enter adds a line and does not submit', () => testShiftEnterNewline(browser, base)],
     ['(r) esc on a pending approval sends deny', () => testEscDeniesApproval(browser, base)],

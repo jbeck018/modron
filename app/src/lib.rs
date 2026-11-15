@@ -5,6 +5,7 @@
 //! host ([`web`], wasm32 only).
 
 pub mod chat;
+pub mod clock;
 pub mod demo;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod files;

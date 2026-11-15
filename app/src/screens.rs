@@ -5,10 +5,12 @@
 //! or the shared table.
 
 use modron_mobile_core::view::{
-    AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL, CONFIRM_NO_LABEL,
-    CONFIRM_YES_LABEL, COPIED_LABEL, COPY_LABEL, DELETE_LABEL, HELP_COMMANDS_HEADING,
-    HELP_KEYS_HEADING, HELP_TITLE, MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL,
-    REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL, SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
+    AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL, AUTH_CODE_LABEL,
+    AUTH_KEY_HINT, AUTH_KEY_PLACEHOLDER, AUTH_KEY_SAVE_HINT, AUTH_NO_PROVIDERS_LABEL,
+    AUTH_VISIT_LABEL, AUTH_WAITING_LABEL, CONFIRM_NO_LABEL, CONFIRM_YES_LABEL, COPIED_LABEL,
+    COPY_LABEL, DELETE_LABEL, HELP_COMMANDS_HEADING, HELP_KEYS_HEADING, HELP_TITLE,
+    MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL, REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL,
+    SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
 };
 use modron_mobile_core::{
     FILTER_LABEL, NEW_SESSION_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL, SESSIONS_NO_MATCH_LABEL,
@@ -18,7 +20,7 @@ use nsh_core::element::{input, AdaptiveColor};
 use nsh_core::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::chat::{self, style_token, token_ink, Model, Style, UiAction, WEB_CONTROLS};
+use crate::chat::{self, style_token, token_ink, Model, SecretKey, Style, UiAction, WEB_CONTROLS};
 use crate::help;
 use crate::nav::{NavStep, NavView, Screen};
 
@@ -26,6 +28,7 @@ use crate::nav::{NavStep, NavView, Screen};
 /// body's notes). Rows past the slot count are not shown.
 const SESSION_SLOTS: usize = 12;
 const SETTING_SLOTS: usize = 24;
+const AUTH_SLOTS: usize = 12;
 const MODEL_SLOTS: usize = 16;
 const PORTAL_SLOTS: usize = 24;
 const INVITE_SLOTS: usize = 8;
@@ -91,7 +94,169 @@ fn chat_frame(
             let actions = actions.clone();
             move || models_body(nav, actions.clone())
         }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Auth), {
+            let actions = actions.clone();
+            move || auth_body(nav, actions.clone())
+        }))
         .child(when(move || nav.with(|n| n.screen == Screen::Help), help_body))
+}
+
+/// The credentials screen (parity D2): the core's provider rows (label and
+/// status verbatim), the browser sign-in progress, and the masked key
+/// entry for a key-only provider. Enter (terminal) or a tap (web) starts
+/// the sign-in or opens the entry.
+fn auth_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column.child(when(
+        move || nav.with(|n| n.auth.is_empty()),
+        move || text(AUTH_NO_PROVIDERS_LABEL).text_color(muted()),
+    ));
+    for i in 0..AUTH_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.auth.len() > i),
+            move || auth_row(nav, i, actions.clone()),
+        ));
+    }
+    column = column
+        .child(when(move || nav.with(|n| n.auth_progress.is_some()), move || auth_progress(nav)));
+    column.child(when(
+        move || nav.with(|n| n.auth_key.is_some()),
+        move || auth_key_entry(nav, actions.clone()),
+    ))
+}
+
+/// One credentials row: `label: status`, marked when selected. Its hint
+/// (sign in or paste a key) shows on the selected row.
+fn auth_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let selected = move || nav.with(|n| n.selected == i);
+    let line = move || {
+        nav.with(|n| {
+            let line = n.auth.get(i).map(|r| r.line()).unwrap_or_default();
+            if n.selected == i {
+                format!("> {line}")
+            } else {
+                line
+            }
+        })
+    };
+    let row = view().flex_col().child(text(line).text_color(move || {
+        token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+    }));
+    if WEB_CONTROLS {
+        row.role(AccessibilityRole::Button).on_press(move || {
+            let _ = actions.send(UiAction::Nav(NavStep::ActivateRow(i)));
+        })
+    } else {
+        row
+    }
+}
+
+/// The browser sign-in progress: the stage, the message, the URL to open
+/// and the device code, from the snapshot's `oauth` (the core's words).
+fn auth_progress(nav: Signal<NavView>) -> impl IntoElement {
+    let head = move || {
+        nav.with(|n| {
+            n.auth_progress
+                .as_ref()
+                .map(|p| format!("{}: {}", p.provider, p.stage))
+                .unwrap_or_default()
+        })
+    };
+    let message = move || {
+        nav.with(|n| n.auth_progress.as_ref().map(|p| p.message.clone()).unwrap_or_default())
+    };
+    view()
+        .flex_col()
+        .child(text(head).font_weight(FontWeight::BOLD))
+        .child(text(message))
+        .child(when(
+            move || nav.with(|n| n.auth_progress.as_ref().and_then(|p| p.url.as_ref()).is_some()),
+            move || {
+                text(move || {
+                    nav.with(|n| {
+                        let url = n.auth_progress.as_ref().and_then(|p| p.url.clone());
+                        format!("{AUTH_VISIT_LABEL}: {}", url.unwrap_or_default())
+                    })
+                })
+            },
+        ))
+        .child(when(
+            move || {
+                nav.with(|n| n.auth_progress.as_ref().and_then(|p| p.user_code.as_ref()).is_some())
+            },
+            move || {
+                text(move || {
+                    nav.with(|n| {
+                        let code = n.auth_progress.as_ref().and_then(|p| p.user_code.clone());
+                        format!("{AUTH_CODE_LABEL}: {}", code.unwrap_or_default())
+                    })
+                })
+            },
+        ))
+        .child(text(AUTH_WAITING_LABEL).text_color(muted()))
+}
+
+/// The masked key entry for the open provider (`input().masked(true)`, the
+/// same widget as the owner sign-in). The field is a view signal that is
+/// cleared on every submit and dropped when the entry closes, so the key
+/// is never kept by the app. Enter sends the key, then closes the entry.
+fn auth_key_entry(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let key = signal(String::new());
+    let submit = actions.clone();
+    let press = actions.clone();
+    let field = input()
+        .masked(true)
+        .auto_focus(true)
+        .submit_behavior(SubmitBehavior::Submit)
+        .placeholder(AUTH_KEY_PLACEHOLDER)
+        .value(move || key.get())
+        .on_change(move |s: &str| key.set(s.to_string()))
+        .on_submit(move |s: &str| {
+            send_key(&submit, nav, s);
+            key.set(String::new());
+        });
+    let save = view()
+        .role(AccessibilityRole::Button)
+        .px(px(8.0))
+        .on_press(move || {
+            let value = key.get();
+            key.set(String::new());
+            send_key(&press, nav, &value);
+        })
+        .child(text(AUTH_KEY_SAVE_HINT).text_color(move || token_ink(style_token(Style::Bold))));
+    view()
+        .flex_col()
+        .child(text(move || {
+            nav.with(|n| {
+                let label = n
+                    .auth_key
+                    .as_ref()
+                    .and_then(|id| n.auth.iter().find(|r| &r.id == id))
+                    .map(|r| r.label.clone())
+                    .unwrap_or_default();
+                format!("{label}: {AUTH_KEY_HINT}")
+            })
+        }))
+        .child(field)
+        .child(save)
+}
+
+/// Sends the key for the open provider and closes the entry. An empty key
+/// sends nothing and keeps the entry open.
+fn send_key(actions: &UnboundedSender<UiAction>, nav: Signal<NavView>, value: &str) {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return;
+    }
+    if let Some(provider) = nav.with(|n| n.auth_key.clone()) {
+        let _ = actions.send(UiAction::SetKey(SecretKey { provider, key: value }));
+        let _ = actions.send(UiAction::Nav(NavStep::AuthKeyDone));
+    }
 }
 
 /// The openers: pressable on the web, a hint line in the terminal.
@@ -311,8 +476,14 @@ fn model_row(
             }
         })
     };
+    // An unavailable model (its provider is not signed in) is dim.
+    let dim = move || nav.with(|n| n.models.get(i).is_some_and(|r| !r.available));
     let row = view().child(text(line).text_color(move || {
-        token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+        if dim() {
+            muted()()
+        } else {
+            token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+        }
     }));
     if WEB_CONTROLS {
         row.role(AccessibilityRole::Button).on_press(move || {

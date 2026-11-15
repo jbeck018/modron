@@ -103,6 +103,22 @@ within two seconds, or Ctrl+C when idle, quits. On exit the app prints the
 session id and the `modron-app-tui --session` command to resume it. The
 full table is `src/help.rs`; `/reasoning` shows the live reasoning tail.
 
+Credentials (`/auth`, or the Settings auth row): the provider rows from the
+core, label and status verbatim. Enter on an OAuth-capable provider starts
+the server-side browser sign-in and shows its progress (stage, the URL, the
+device code). Enter on a key-only provider opens a masked input; Enter saves
+the key through `auth_set_key` and closes the entry, Esc closes it unsent.
+The keys are never logged (`SecretKey` prints redacted) or kept. On the first
+snapshot after connect, the screen opens once when no provider is signed in.
+Sign-in needs a session on the server: with none attached, the call is refused.
+
+Task commands: `/review`, `/btw <text>`, `/learn [title]` and `/plan <task>`
+submit the canned task text the old terminal sent (shared in
+`mobile/rust-core` `view.rs`); `/plan <task>` switches to the plan phase and
+submits. `/goal <text>` sets the stop condition; `/goal` alone clears it.
+`/agent <name>` sets the persona. `/exit`, `/quit` and `/q` leave the
+terminal app.
+
 ## Web bundle
 
 Needs the NSH CLI (0.5.1), the wasm32 target, and the wasm-bindgen CLI at

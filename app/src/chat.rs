@@ -22,6 +22,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use modron_mobile_core::view::{NEW_OUTPUT_BELOW_LABEL, NO_TOOLS_NOTE};
 use modron_mobile_core::{
     ApprovalModeWire, Effort, Phase, RenderedRow, SandboxPolicy, ViewModelSnapshot,
 };
@@ -124,6 +125,48 @@ pub enum UiAction {
     Shell(String),
     /// The tool detail panel: Ctrl+T, or a tap on the turn summary (web).
     Tools(ToolsStep),
+    /// Credentials: the core's `auth_providers` (the rows arrive in the
+    /// snapshot).
+    ListAuth,
+    /// Credentials: start the server-side browser sign-in for a provider.
+    AuthStart(String),
+    /// Credentials: save a pasted API key. The key never appears in logs:
+    /// [`SecretKey`] prints redacted.
+    SetKey(SecretKey),
+    /// `/plan <task>`: switch to the plan phase, then submit the task.
+    Plan(String),
+    /// `/goal <text>`: the stop condition for future turns; empty clears it.
+    SetGoal(String),
+    /// `/agent <name>`: switch persona for future turns.
+    SetPersona(String),
+    /// `/exit`, `/quit`, `/q`: leave the app. The host sets the quit flag
+    /// ([`quit_requested`]) and the terminal loop exits; never sent on.
+    Exit,
+}
+
+/// Set by `/exit` (see [`UiAction::Exit`]); the terminal loop checks it.
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Whether `/exit` was run. Only the terminal host reads it.
+pub fn quit_requested() -> bool {
+    QUIT.load(Ordering::SeqCst)
+}
+
+/// A pasted API key and its provider, for `auth_set_key`. Its `Debug` is
+/// redacted, so a logged action never shows the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretKey {
+    pub provider: String,
+    pub key: String,
+}
+
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretKey")
+            .field("provider", &self.provider)
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One step of the tool detail panel. The panel owns the keyboard while it
@@ -251,9 +294,6 @@ const TOOL_PANEL_H: f32 = (TOOL_PANEL_SLOTS + 1) as f32 * COMPOSER_LINE_H;
 pub const COMPOSER_MAX_LINES: usize = 6;
 /// One composer line in logical pixels.
 const COMPOSER_LINE_H: f32 = 18.0;
-/// The note Ctrl+T sends when there is no tool activity yet (app copy: the
-/// old TUI's "no tool activity yet" toast; no shared home yet).
-const NO_TOOLS_NOTE: &str = "no tool activity yet";
 
 /// The composer text, mirrored from the view so the host can read it for a
 /// revise note (the host filters keys before the composer sees them).
@@ -413,6 +453,8 @@ pub struct KeyFacts {
     pub tool_panel: bool,
     /// The suggestions are `@file` completions.
     pub file_mode: bool,
+    /// The credentials screen has a key entry open (Esc closes it first).
+    pub auth_keying: bool,
 }
 
 /// One transcript scroll step (the keys PageUp, PageDown, Home, End).
@@ -712,6 +754,18 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
                 _ => Routed::Ignored,
             };
         }
+        Screen::Auth => {
+            return match key {
+                Key::Escape if facts.auth_keying => Routed::Nav(NavStep::AuthCancelKey),
+                Key::Escape => Routed::Nav(NavStep::Back),
+                // The masked key input has the focus: its keys are its own.
+                _ if facts.auth_keying => composer,
+                Key::Enter => Routed::Nav(NavStep::Activate),
+                Key::Up => Routed::Nav(NavStep::Move(-1)),
+                Key::Down => Routed::Nav(NavStep::Move(1)),
+                _ => Routed::Ignored,
+            };
+        }
         Screen::Chat | Screen::Sessions | Screen::Settings | Screen::SignIn | Screen::Portal => {}
     }
     let sessions = facts.screen == Screen::Sessions;
@@ -994,6 +1048,9 @@ impl Host {
         }
         self.seen_rows = rows;
         self.nav.observe(snapshot);
+        for action in self.nav.first_run(snapshot) {
+            self.act(action);
+        }
         let _ = self.snapshots.send(snapshot.clone());
         self.notify();
     }
@@ -1005,6 +1062,7 @@ impl Host {
             match self.actions.try_recv().ok()? {
                 UiAction::Nav(step) => self.nav_step(step),
                 UiAction::Tools(step) => self.tools_step(step),
+                UiAction::Exit => QUIT.store(true, Ordering::SeqCst),
                 action if action.is_portal() => self.portal.push_back(action),
                 action => return Some(action),
             }
@@ -1119,6 +1177,7 @@ impl Host {
             running: self.running,
             recalling: history_pos().is_some(),
             history_len: HISTORY.lock().map(|h| h.len()).unwrap_or(0),
+            auth_keying: self.nav.auth_keying(),
         };
         let routed = route_key(key, alt, chord, facts, &draft);
         // Typing or deleting changes the text: the suggestions show again.
@@ -1790,9 +1849,7 @@ pub fn screen(
         )
         .child(when(
             move || nav.with(|n| n.new_below && n.scroll_offset > 0),
-            move || {
-                text("new output below · end to follow").text_color(move || token_ink("warning"))
-            },
+            move || text(NEW_OUTPUT_BELOW_LABEL).text_color(move || token_ink("warning")),
         ))
         .child(when(move || nav.with(|n| n.tool_panel.is_some()), move || tool_panel(model, nav)))
         .child(when(move || model.with(|m| m.turn_summary.is_some()), {
@@ -1941,6 +1998,7 @@ mod tests {
         history_len: 0,
         tool_panel: false,
         file_mode: false,
+        auth_keying: false,
     };
 
     fn approval(options: usize) -> KeyFacts {
@@ -2384,5 +2442,75 @@ mod tests {
     fn chat_keys_are_unchanged_by_the_new_screens() {
         assert_eq!(route_key(Key::Up, false, false, NONE, ""), Routed::Ignored);
         assert_eq!(route_key(Key::Char('n'), false, false, NONE, ""), Routed::Composer);
+    }
+}
+
+#[cfg(test)]
+mod auth_key_tests {
+    use super::*;
+
+    fn auth(keying: bool) -> KeyFacts {
+        KeyFacts { screen: Screen::Auth, auth_keying: keying, ..Default::default() }
+    }
+
+    #[test]
+    fn enter_activates_a_row_and_esc_backs_out_unless_a_key_is_being_typed() {
+        assert_eq!(
+            route_key(Key::Enter, false, false, auth(false), ""),
+            Routed::Nav(NavStep::Activate)
+        );
+        assert_eq!(
+            route_key(Key::Escape, false, false, auth(false), ""),
+            Routed::Nav(NavStep::Back)
+        );
+        assert_eq!(
+            route_key(Key::Escape, false, false, auth(true), ""),
+            Routed::Nav(NavStep::AuthCancelKey)
+        );
+    }
+
+    #[test]
+    fn while_a_key_is_typed_its_keys_go_to_the_masked_input() {
+        for key in [Key::Char('s'), Key::Enter, Key::Backspace, Key::Up] {
+            assert_eq!(route_key(key, false, false, auth(true), ""), Routed::Composer, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_secret_key_never_prints() {
+        let secret = SecretKey { provider: "openai".into(), key: "sk-live-1234".into() };
+        let shown = format!("{secret:?}");
+        assert!(shown.contains("openai"));
+        assert!(!shown.contains("sk-live"), "{shown}");
+        let action = UiAction::SetKey(secret);
+        assert!(!format!("{action:?}").contains("sk-live"));
+    }
+}
+
+#[cfg(test)]
+mod first_run_tests {
+    use super::*;
+    use modron_mobile_core::view::AUTH_NOT_CONFIGURED;
+    use modron_mobile_core::ViewModelSnapshot;
+    use modron_protocol::AuthProviderWire;
+
+    /// The first-run screen opens over Chat on the first snapshot with rows,
+    /// and Esc closes it on the terminal host's route (no connection needed).
+    #[test]
+    fn esc_closes_the_first_run_credentials_screen() {
+        let (mut host, _client) = link();
+        let snapshot = ViewModelSnapshot {
+            providers: vec![AuthProviderWire {
+                id: "openai".into(),
+                label: "OpenAI".into(),
+                status: AUTH_NOT_CONFIGURED.into(),
+                oauth_capable: false,
+            }],
+            ..Default::default()
+        };
+        host.push(&snapshot);
+        assert_eq!(host.screen(), Screen::Auth);
+        host.route(Key::Escape, false, false);
+        assert_eq!(host.screen(), Screen::Chat);
     }
 }
