@@ -62,9 +62,9 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 pub use modron_types::{
-    Attachment, Effort, Message, PlanItem, Role, RunSummary, SandboxPolicy, SessionEvent,
-    SessionId, SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec,
-    Usage,
+    AgentState, Attachment, Effort, Message, PlanItem, Role, RunSummary, SandboxPolicy,
+    SessionEvent, SessionId, SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall,
+    ToolOutcome, ToolSpec, Usage,
 };
 
 /// Context handed to a tool execution.
@@ -559,6 +559,13 @@ pub struct RunToken {
     run: u64,
 }
 
+impl RunToken {
+    /// The session this run belongs to (H3d: sub-agents register under it).
+    pub fn session(&self) -> SessionId {
+        self.session
+    }
+}
+
 /// H3c: the registry of live top-level runs. It is process-wide rather than
 /// held on `EngineConfig`: the server clones one template config into every
 /// session, so an engine-held handle would be shared across sessions. Runs
@@ -867,6 +874,13 @@ pub enum BackgroundStatus {
         tokens: u64,
         turns: u32,
         is_error: bool,
+    },
+    /// Stopped by a user `KillAgent` (H3d): `delegate_status` reports it as
+    /// killed, with the tokens and turns it spent before the stop.
+    Killed {
+        brief: String,
+        tokens: u64,
+        turns: u32,
     },
 }
 

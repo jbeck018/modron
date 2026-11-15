@@ -922,6 +922,7 @@ async fn snapshot_seeds_live_tools_and_subagents() {
                         tokens: 500,
                         last_tool: Some("grep".into()),
                         done: None,
+                        state: modron_types::AgentState::Running,
                     }],
                     ..LiveState::default()
                 },

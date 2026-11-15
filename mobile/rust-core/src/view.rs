@@ -809,6 +809,7 @@ impl FoldState {
                     last_tool: row.last_tool.clone(),
                     done: row.done,
                     started_ms: None,
+                    state: row.state,
                 })
                 .collect(),
         };

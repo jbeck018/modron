@@ -630,6 +630,37 @@ impl RemoteClient {
         ))
     }
 
+    /// Steer one live sub-agent of the attached session (PROTOCOL_V2 section
+    /// 4, H3d). `agent` is the swarm row's id.
+    pub fn steer_agent(
+        &self,
+        agent: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::SteerAgent {
+                session_id,
+                agent: agent.into(),
+                text: text.into(),
+            },
+        ))
+    }
+
+    /// Stop one live sub-agent of the attached session (H3d). Only that
+    /// child ends; its row turns killed in place.
+    pub fn kill_agent(&self, agent: impl Into<String>) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::KillAgent {
+                session_id,
+                agent: agent.into(),
+            },
+        ))
+    }
+
     /// Hold a message for the session's next run (the alternate submit).
     pub fn enqueue(&self, text: impl Into<String>) -> Result<(), ClientError> {
         let session_id = self.require_session()?;
@@ -1296,6 +1327,17 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         Payload::TurnFailed { error } => fold_turn_unfinished(vm, fold, Some(error)),
         Payload::TurnAborted {} => fold_turn_unfinished(vm, fold, None),
         Payload::Note { text } => vm.last_note = Some(text),
+        // H3d: a background sub-agent settled. The shared view wording goes
+        // to the last-note line; the label comes from its swarm row.
+        Payload::AgentFinished { agent, ok, .. } => {
+            let label = vm
+                .subagents
+                .iter()
+                .find(|row| row.id == agent)
+                .map(|row| row.label.clone())
+                .unwrap_or_else(|| agent.chars().take(8).collect());
+            vm.last_note = Some(modron_view::agent_finished_text(&label, ok));
+        }
         Payload::OAuthProgress {
             provider,
             stage,
@@ -1387,6 +1429,50 @@ mod tests {
         fold_frame(&shared, frame);
         let st = shared.state.lock().unwrap();
         ViewModelSnapshot::from_vm(&st.vm)
+    }
+
+    /// H3d: a background settlement folds into last_note with the shared
+    /// wording, labelled from the swarm row when the row is live.
+    #[test]
+    fn agent_finished_folds_into_the_last_note_with_the_row_label() {
+        let session = Uuid::new_v4();
+        let snap = folded_all(vec![
+            Frame::event(
+                Some(session),
+                1,
+                Payload::Tool {
+                    activity: modron_protocol::WireToolActivity::SubagentStarted {
+                        id: "agent-1".into(),
+                        label: "delegate".into(),
+                    },
+                },
+            ),
+            Frame::event(
+                Some(session),
+                2,
+                Payload::AgentFinished {
+                    agent: "agent-1".into(),
+                    ok: true,
+                    brief: "all good".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            snap.last_note.as_deref(),
+            Some("sub-agent delegate finished")
+        );
+
+        // No live row for the id: the note falls back to a short id.
+        let snap = folded(Frame::event(
+            Some(session),
+            3,
+            Payload::AgentFinished {
+                agent: "zz".into(),
+                ok: false,
+                brief: "stopped by the user".into(),
+            },
+        ));
+        assert_eq!(snap.last_note.as_deref(), Some("sub-agent zz failed"));
     }
 
     #[test]

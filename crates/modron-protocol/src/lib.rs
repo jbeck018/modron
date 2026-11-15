@@ -18,8 +18,8 @@
 pub mod client;
 
 use modron_types::{
-    Attachment, Effort, Phase, PlanItem, RunSummary, SandboxPolicy, SessionEvent, StreamDelta,
-    ToolActivity, ToolCall, Usage,
+    AgentState, Attachment, Effort, Phase, PlanItem, RunSummary, SandboxPolicy, SessionEvent,
+    StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_view::ToolEvent;
 use serde::{Deserialize, Serialize};
@@ -137,6 +137,24 @@ pub enum Payload {
     /// Abort the session's active run (JoinHandle-abort parity with the
     /// TUI's Esc).
     Interrupt { session_id: Uuid },
+    /// Steer one live sub-agent of a RUNNING session (PROTOCOL_V2 section 4,
+    /// H3d): `text` joins that child's own transcript at its next safe
+    /// boundary, so its next model turn carries it. `agent` is the swarm
+    /// row's `id`. Errors (requester only) when no such live child exists.
+    /// No broadcast on success: the swarm row is unchanged, the child's
+    /// transcript shows the message. UI effect: a composer action on a row.
+    SteerAgent {
+        session_id: Uuid,
+        agent: String,
+        text: String,
+    },
+    /// Stop one live sub-agent (PROTOCOL_V2 section 4, H3d). Only that child
+    /// ends: its parent run and siblings continue. The row turns `killed` in
+    /// place (a `tool` frame), and the parent's `delegate` call (or
+    /// `delegate_status`) reports the stop. Errors (requester only) when no
+    /// such live child exists. A kill while an approval ask of that child is
+    /// pending takes effect when the ask is answered or times out.
+    KillAgent { session_id: Uuid, agent: String },
     /// Send a message to a RUNNING session: it is injected at the next safe
     /// boundary (between model turns, after pending tool results) and the
     /// run continues. An idle session refuses it (submit instead). Replies
@@ -346,6 +364,20 @@ pub enum Payload {
     /// never for an interrupt. Approval requests are not notified yet (the
     /// `approval` kind is reserved).
     Notify { kind: NotifyKind, text: String },
+    /// A BACKGROUND sub-agent settled (PROTOCOL_V2 section 4, H3d): `agent`
+    /// is its swarm-row id, `ok` is false for a failure or a user kill, and
+    /// `brief` is the first 200 chars of its result. It comes with a
+    /// `Notify` (`done` or `failed`, text `sub-agent <label> finished` or
+    /// `... failed`). UI effect: the matching swarm row already shows its
+    /// final state; an attached client raises a toast when that agent is not
+    /// the focused view, and the last-note line takes the notify text.
+    /// Foreground sub-agents never send it. `delegate_status` polling stays
+    /// for the model.
+    AgentFinished {
+        agent: String,
+        ok: bool,
+        brief: String,
+    },
     /// Config mutated (echo of the applied patch).
     /// UI effect: a `phase` in the patch updates the phase label on the
     /// status surface (`plan` / `build`); a `rules` list replaces the
@@ -843,6 +875,20 @@ pub enum WireToolActivity {
         turns: u32,
         is_error: bool,
     },
+    /// Mirror of core `ToolActivity::SubagentState` (H3d): the row's state
+    /// word updates in place.
+    SubagentState {
+        id: String,
+        label: String,
+        state: AgentState,
+    },
+    /// Mirror of core `ToolActivity::BackgroundFinished` (H3d).
+    BackgroundFinished {
+        id: String,
+        label: String,
+        ok: bool,
+        brief: String,
+    },
 }
 
 impl From<&ToolActivity> for WireToolActivity {
@@ -893,6 +939,22 @@ impl From<&ToolActivity> for WireToolActivity {
                 turns: *turns,
                 is_error: *is_error,
             },
+            ToolActivity::SubagentState { id, label, state } => Self::SubagentState {
+                id: id.clone(),
+                label: label.clone(),
+                state: *state,
+            },
+            ToolActivity::BackgroundFinished {
+                id,
+                label,
+                ok,
+                brief,
+            } => Self::BackgroundFinished {
+                id: id.clone(),
+                label: label.clone(),
+                ok: *ok,
+                brief: brief.clone(),
+            },
         }
     }
 }
@@ -938,6 +1000,20 @@ impl From<WireToolActivity> for ToolActivity {
                 tokens,
                 turns,
                 is_error,
+            },
+            WireToolActivity::SubagentState { id, label, state } => {
+                Self::SubagentState { id, label, state }
+            }
+            WireToolActivity::BackgroundFinished {
+                id,
+                label,
+                ok,
+                brief,
+            } => Self::BackgroundFinished {
+                id,
+                label,
+                ok,
+                brief,
             },
         }
     }
@@ -991,6 +1067,11 @@ pub struct WireSwarmRow {
     pub last_tool: Option<String>,
     /// `None` = still running.
     pub done: Option<bool>,
+    /// Lifecycle state (H3d): `running`, `waiting_approval`, `done`,
+    /// `failed` or `killed`. Absent from older servers, where it reads as
+    /// running (the `done` flag still decides done and failed).
+    #[serde(default)]
+    pub state: AgentState,
 }
 
 #[cfg(test)]
@@ -1640,6 +1721,17 @@ mod tests {
                 turns: 3,
                 is_error: false,
             },
+            ToolActivity::SubagentState {
+                id: "a".into(),
+                label: "explore".into(),
+                state: AgentState::WaitingApproval,
+            },
+            ToolActivity::BackgroundFinished {
+                id: "a".into(),
+                label: "explore".into(),
+                ok: false,
+                brief: "stopped".into(),
+            },
         ];
         for v in &variants {
             let wire = WireToolActivity::from(v);
@@ -1712,6 +1804,103 @@ mod tests {
         assert_eq!(back.session_id, summary.session_id);
         assert_eq!(back.answer, summary.answer);
         assert_eq!(back.turns, summary.turns);
+    }
+
+    #[test]
+    fn agent_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let steer = Frame::request(
+            3,
+            Payload::SteerAgent {
+                session_id: session,
+                agent: "a1".into(),
+                text: "narrow it".into(),
+            },
+        );
+        assert_roundtrip(&steer);
+        let json = serde_json::to_value(&steer).unwrap();
+        assert_eq!(json["type"], "steer_agent");
+        assert_eq!(json["agent"], "a1");
+
+        let kill = Frame::request(
+            4,
+            Payload::KillAgent {
+                session_id: session,
+                agent: "a1".into(),
+            },
+        );
+        assert_roundtrip(&kill);
+        assert_eq!(serde_json::to_value(&kill).unwrap()["type"], "kill_agent");
+
+        let finished = Frame::event(
+            Some(session),
+            7,
+            Payload::AgentFinished {
+                agent: "a1".into(),
+                ok: false,
+                brief: "stopped".into(),
+            },
+        );
+        assert_roundtrip(&finished);
+        let json = serde_json::to_value(&finished).unwrap();
+        assert_eq!(json["type"], "agent_finished");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["brief"], "stopped");
+    }
+
+    #[test]
+    fn swarm_row_state_is_additive_on_the_wire() {
+        let row = WireSwarmRow {
+            id: "a1".into(),
+            label: "delegate".into(),
+            turns: 0,
+            tokens: 0,
+            last_tool: None,
+            done: None,
+            state: AgentState::WaitingApproval,
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["state"], "waiting_approval");
+        assert_eq!(
+            serde_json::from_value::<WireSwarmRow>(json).unwrap(),
+            row,
+            "round trip"
+        );
+
+        // A row from an older server has no state: it reads as running and
+        // keeps its done flag.
+        let old: WireSwarmRow = serde_json::from_value(serde_json::json!({
+            "id": "a1",
+            "label": "explore",
+            "turns": 2,
+            "tokens": 5,
+            "done": true
+        }))
+        .expect("old row loads");
+        assert_eq!(old.state, AgentState::Running);
+        assert_eq!(old.done, Some(true));
+    }
+
+    #[test]
+    fn killed_state_and_background_settlement_serialize_snake_case() {
+        let killed = WireToolActivity::SubagentState {
+            id: "a1".into(),
+            label: "delegate".into(),
+            state: AgentState::Killed,
+        };
+        let json = serde_json::to_value(&killed).unwrap();
+        assert_eq!(json["kind"], "subagent_state");
+        assert_eq!(json["state"], "killed");
+        let settled = WireToolActivity::BackgroundFinished {
+            id: "a1".into(),
+            label: "delegate".into(),
+            ok: true,
+            brief: "ok".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&settled).unwrap()["kind"],
+            "background_finished"
+        );
     }
 
     #[test]

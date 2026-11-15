@@ -205,6 +205,8 @@ fn scoped_gate(scope: SessionId, payload: &Payload) -> Result<(), &'static str> 
         Payload::Attach { session_id, .. }
         | Payload::Interrupt { session_id }
         | Payload::Steer { session_id, .. }
+        | Payload::SteerAgent { session_id, .. }
+        | Payload::KillAgent { session_id, .. }
         | Payload::Compact { session_id, .. }
         | Payload::Wake { session_id, .. }
         | Payload::CancelWake { session_id }
@@ -667,6 +669,30 @@ pub async fn handle_frame(
                     modron_protocol::ErrorKind::Conflict
                 };
                 send(ctx, error_kind(request_id, message, kind));
+            }
+        }
+        // H3d: a sub-agent steer or stop. Errors go to the requester only;
+        // success needs no reply (the row or the child's transcript shows it).
+        Payload::SteerAgent {
+            session_id,
+            agent,
+            text,
+        } => {
+            if text.trim().is_empty() {
+                send(ctx, error(request_id, "steer text is empty"));
+            } else if let Err(message) = state.hub.steer_agent(session_id, &agent, text) {
+                send(
+                    ctx,
+                    error_kind(request_id, message, modron_protocol::ErrorKind::NotFound),
+                );
+            }
+        }
+        Payload::KillAgent { session_id, agent } => {
+            if let Err(message) = state.hub.kill_agent(session_id, &agent) {
+                send(
+                    ctx,
+                    error_kind(request_id, message, modron_protocol::ErrorKind::NotFound),
+                );
             }
         }
         Payload::Compact { session_id } => {
@@ -1734,6 +1760,9 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::Submit { .. } => "submit",
         Payload::Interrupt { .. } => "interrupt",
         Payload::Steer { .. } => "steer",
+        Payload::SteerAgent { .. } => "steer_agent",
+        Payload::KillAgent { .. } => "kill_agent",
+        Payload::AgentFinished { .. } => "agent_finished",
         Payload::Steered { .. } => "steered",
         Payload::Enqueue { .. } => "enqueue",
         Payload::Dequeue { .. } => "dequeue",
@@ -1964,6 +1993,55 @@ mod tests {
             other => panic!("expected a reply, got {other:?}"),
         }
         state.hub.handle(&id).unwrap().interrupt();
+    }
+
+    /// H3d: a sub-agent steer or stop that cannot land is refused to the
+    /// requester: an unknown agent, or an empty steer.
+    #[tokio::test]
+    async fn steer_and_kill_agent_refuse_unknown_agents_and_empty_steers() {
+        let (state, _dir) = test_state();
+        let id = state.store.create_session("agents").await.unwrap().id;
+        state.hub.ensure_session(id, None);
+        let (mut ctx, mut rx) = authed_ctx();
+        let requests = [
+            Payload::KillAgent {
+                session_id: id,
+                agent: "nobody".into(),
+            },
+            Payload::SteerAgent {
+                session_id: id,
+                agent: "nobody".into(),
+                text: "x".into(),
+            },
+            Payload::SteerAgent {
+                session_id: id,
+                agent: "nobody".into(),
+                text: "   ".into(),
+            },
+        ];
+        let expected = [
+            "no live sub-agent",
+            "no live sub-agent",
+            "steer text is empty",
+        ];
+        for (n, payload) in requests.into_iter().enumerate() {
+            handle_frame(
+                &state,
+                &mut ctx,
+                true,
+                Frame::request(n as u64 + 1, payload),
+            )
+            .await;
+            match next_outbound(&mut rx).await {
+                Outbound::Reply(frame) => match frame.payload {
+                    Payload::Error { message, .. } => {
+                        assert!(message.contains(expected[n]), "{message}");
+                    }
+                    other => panic!("expected an error, got {other:?}"),
+                },
+                other => panic!("expected a reply, got {other:?}"),
+            }
+        }
     }
 
     /// H9b: `Compact` on an idle session replies with a correlated Note, then

@@ -454,6 +454,22 @@ impl std::str::FromStr for Effort {
     }
 }
 
+/// Lifecycle state of one sub-agent (PROTOCOL_V2 section 4, H3d). Snake case
+/// on the wire. `Running` is the default, so older rows without the field
+/// read as running until their finish arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    #[default]
+    Running,
+    /// The child's approval ask is pending with the parent's approver.
+    WaitingApproval,
+    Done,
+    Failed,
+    /// Stopped by a user `KillAgent`. Sticky: a later finish keeps it.
+    Killed,
+}
+
 /// Tool-activity notification (Phase-1d T0, additive): fired around every
 /// tool execution so UIs can render `● Bash …` lines live.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -491,6 +507,23 @@ pub enum ToolActivity {
         tokens: u64,
         turns: u32,
         is_error: bool,
+    },
+    /// A subagent's state changed (H3d): `WaitingApproval` while its ask is
+    /// pending, `Running` once answered, `Killed` just before a user stop's
+    /// finish. Row UI effect: the swarm row's state word updates in place.
+    SubagentState {
+        id: String,
+        label: String,
+        state: AgentState,
+    },
+    /// A BACKGROUND subagent settled (H3d): `ok` is false for a failure and
+    /// for a kill. `brief` is the first 200 chars of its result. Drives the
+    /// `AgentFinished` push and its `Notify`; a foreground child never sends it.
+    BackgroundFinished {
+        id: String,
+        label: String,
+        ok: bool,
+        brief: String,
     },
 }
 

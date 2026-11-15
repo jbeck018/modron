@@ -31,13 +31,20 @@ struct ChildMeter {
 struct MeterState {
     session: Option<SessionId>,
     turns: u32,
-    tokens: u64,
+    /// Every usage event the child wrote, summed (its `total()` is the
+    /// token meter the heartbeat reports).
+    usage: crate::Usage,
 }
 
 impl ChildMeter {
     fn snapshot(&self) -> (u32, u64) {
         let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        (s.turns, s.tokens)
+        (s.turns, s.usage.total())
+    }
+
+    /// The child's usage so far (a killed child reports what it spent).
+    fn usage(&self) -> crate::Usage {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).usage
     }
 }
 
@@ -59,7 +66,13 @@ impl MeteredStore {
         for event in events {
             match event {
                 SessionEvent::Usage { usage, .. } => {
-                    s.tokens = s.tokens.saturating_add(usage.total());
+                    s.usage.input_tokens = s.usage.input_tokens.saturating_add(usage.input_tokens);
+                    s.usage.output_tokens =
+                        s.usage.output_tokens.saturating_add(usage.output_tokens);
+                    s.usage.cached_input_tokens = s
+                        .usage
+                        .cached_input_tokens
+                        .saturating_add(usage.cached_input_tokens);
                 }
                 SessionEvent::TurnTrace { turn, .. } => s.turns = s.turns.max(*turn),
                 _ => {}
@@ -205,6 +218,10 @@ pub struct ExploreReport {
     pub brief: String,
     pub usage: crate::Usage,
     pub turns: u32,
+    /// H3d: a user stopped the child with `kill_agent`. `brief` then says so,
+    /// and `usage` / `turns` are what it spent before the stop (the parent
+    /// still charges them).
+    pub killed: bool,
 }
 
 /// Run one explore subagent (read-only, cheap tier, no persona).
@@ -237,7 +254,7 @@ pub async fn delegate(
     working_dir: Option<&std::path::Path>,
 ) -> Result<ExploreReport> {
     delegate_owned(
-        None,
+        ChildOwner::default(),
         parent,
         task,
         persona,
@@ -248,12 +265,158 @@ pub async fn delegate(
     .await
 }
 
-/// H3c: [`delegate`] for a child that belongs to a known parent run. Take
-/// `token` (see [`crate::RunScope::token`]) while the spawning run is live,
-/// before any background spawn, so the child's asks are forwarded only while
-/// that run lasts. `None` (no run) refuses every ask the child makes.
+/// Who a child belongs to (H3c, H3d). `session` is the session the child is
+/// addressed under by [`steer_agent`] and [`kill_agent`]. `token` is the run
+/// of that session that is live when the child is spawned: the child's asks
+/// reach the parent approver only while that run lasts (`None` refuses every
+/// ask). `background` marks a detached child, which pushes
+/// `ToolActivity::BackgroundFinished` when it settles.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChildOwner {
+    pub session: Option<SessionId>,
+    pub token: Option<crate::RunToken>,
+    pub background: bool,
+}
+
+impl ChildOwner {
+    /// A foreground child of `session`, approval-scoped to that session's
+    /// live run (if any). Call it during the spawning tool call: a background
+    /// child must capture the run before it is spawned.
+    pub fn for_session(session: Option<SessionId>) -> Self {
+        Self {
+            session,
+            token: session.and_then(|s| crate::run_scope().token(s)),
+            background: false,
+        }
+    }
+
+    /// The same child, detached (see [`ChildOwner::background`]).
+    pub fn detached(self) -> Self {
+        Self {
+            background: true,
+            ..self
+        }
+    }
+}
+
+/// Characters of a settled child's brief kept in `BackgroundFinished`.
+const FINISHED_BRIEF_CHARS: usize = 200;
+
+/// How a child's run ended: its own result, or a user kill (H3d).
+enum Ended {
+    Finished(Result<crate::RunSummary>),
+    Killed,
+}
+
+/// Live children, keyed by swarm-row id (the child's `subagent_id`). The
+/// registry is process-wide, like the run scope: the server clones one
+/// template config into every session, so an engine-held map would be
+/// shared, and a process-wide map keyed by session keeps lookups free of
+/// engine locks. An entry lives exactly as long as its child run.
+struct LiveChild {
+    session: SessionId,
+    steer: Arc<crate::SteerInbox>,
+    /// Taken by the first kill; sending it ends the child's run.
+    kill: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+static LIVE_CHILDREN: std::sync::Mutex<std::collections::BTreeMap<String, LiveChild>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn live_children() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, LiveChild>>
+{
+    LIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Removes its child from the registry when dropped, so every exit path
+/// (normal end, error, kill, task abort) leaves no stale entry behind.
+struct ChildGuard(String);
+
+impl ChildGuard {
+    fn register(
+        id: String,
+        session: SessionId,
+        steer: Arc<crate::SteerInbox>,
+        kill: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        live_children().insert(
+            id.clone(),
+            LiveChild {
+                session,
+                steer,
+                kill: Some(kill),
+            },
+        );
+        Self(id)
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        live_children().remove(&self.0);
+    }
+}
+
+fn no_live_agent(agent: &str) -> String {
+    format!("no live sub-agent `{agent}` in this session")
+}
+
+/// H3d: queue a steer message into a live child's inbox. The child's run
+/// loop drains it at its next safe boundary, so its next model turn carries
+/// it. Errors when `agent` is not a live child of `session`.
+pub fn steer_agent(
+    session: SessionId,
+    agent: &str,
+    text: String,
+) -> std::result::Result<(), String> {
+    let children = live_children();
+    match children.get(agent).filter(|child| child.session == session) {
+        Some(child) => {
+            child.steer.push(text);
+            Ok(())
+        }
+        None => Err(no_live_agent(agent)),
+    }
+}
+
+/// H3d: stop one live child. Only that child's run ends (its parent run and
+/// siblings continue); its tool call or `delegate_status` entry reports it as
+/// stopped. Errors when `agent` is not a live child of `session`, or when a
+/// stop is already under way.
+pub fn kill_agent(session: SessionId, agent: &str) -> std::result::Result<(), String> {
+    let mut children = live_children();
+    let child = children
+        .get_mut(agent)
+        .filter(|child| child.session == session)
+        .ok_or_else(|| no_live_agent(agent))?;
+    match child.kill.take() {
+        Some(kill) => {
+            // The receiver lives in the child's own task; a send only fails
+            // when that task already ended, which the guard prevents.
+            let _ = kill.send(());
+            Ok(())
+        }
+        None => Err(format!("sub-agent `{agent}` is already being stopped")),
+    }
+}
+
+/// H3d: the ids of `session`'s live children (swarm-row ids).
+pub fn live_agents(session: SessionId) -> Vec<String> {
+    live_children()
+        .iter()
+        .filter(|(_, child)| child.session == session)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// H3c: [`delegate`] for a child that belongs to a known parent run. `owner`
+/// carries the run whose asks it may make (see [`ChildOwner`]); with no run
+/// every ask the child makes is refused. A detached owner reports the child
+/// through `BackgroundFinished` when it settles.
 pub async fn delegate_owned(
-    token: Option<crate::RunToken>,
+    owner: ChildOwner,
     parent: &Engine,
     task: &str,
     persona: Option<&crate::PersonaSpec>,
@@ -261,13 +424,65 @@ pub async fn delegate_owned(
     budget_tokens: u64,
     working_dir: Option<&std::path::Path>,
 ) -> Result<ExploreReport> {
-    if task.trim().is_empty() {
-        return Err(Error::Config(
-            "empty delegate task".into(),
-            "pass a task".into(),
-        ));
+    let subagent_id = uuid::Uuid::new_v4().to_string();
+    let label = if persona.is_some() {
+        "persona".to_string()
+    } else {
+        "delegate".to_string()
+    };
+    let outcome: Result<ExploreReport> = async {
+        if task.trim().is_empty() {
+            return Err(Error::Config(
+                "empty delegate task".into(),
+                "pass a task".into(),
+            ));
+        }
+        run_child(
+            &owner,
+            &subagent_id,
+            &label,
+            parent,
+            task,
+            persona,
+            tool_filter,
+            budget_tokens,
+            working_dir,
+        )
+        .await
     }
+    .await;
+    if owner.background {
+        if let Some(sink) = parent.config.on_tool_event.as_ref() {
+            let (ok, brief) = match &outcome {
+                Ok(report) => (!report.killed, report.brief.clone()),
+                Err(e) => (false, e.to_string()),
+            };
+            sink(crate::ToolActivity::BackgroundFinished {
+                id: subagent_id.clone(),
+                label: label.clone(),
+                ok,
+                brief: brief.chars().take(FINISHED_BRIEF_CHARS).collect(),
+            });
+        }
+    }
+    outcome
+}
 
+/// The child run behind [`delegate_owned`] (its id and label already fixed).
+#[allow(clippy::too_many_arguments)]
+async fn run_child(
+    owner: &ChildOwner,
+    subagent_id: &str,
+    label: &str,
+    parent: &Engine,
+    task: &str,
+    persona: Option<&crate::PersonaSpec>,
+    tool_filter: Option<&[String]>,
+    budget_tokens: u64,
+    working_dir: Option<&std::path::Path>,
+) -> Result<ExploreReport> {
+    let subagent_id = subagent_id.to_string();
+    let label = label.to_string();
     let mut registry = ToolRegistry::new();
     for spec in parent.tools.specs() {
         if spec.name == "delegate" {
@@ -303,12 +518,6 @@ pub async fn delegate_owned(
     // Subagent identity + parent event plumbing (Phase 5h): the child's
     // tool activity is re-emitted through the parent's sink as tagged
     // heartbeats, and start/finish events bracket the run.
-    let subagent_id = uuid::Uuid::new_v4().to_string();
-    let label = if persona.is_some() {
-        "persona".to_string()
-    } else {
-        "delegate".to_string()
-    };
     let parent_sink = parent.config.on_tool_event.clone();
     if let Some(sink) = &parent_sink {
         sink(crate::ToolActivity::SubagentStarted {
@@ -321,7 +530,7 @@ pub async fn delegate_owned(
     let progress_label = label.clone();
     let progress_meter = Arc::clone(&meter);
     let progress_sink: Option<Arc<dyn Fn(crate::ToolActivity) + Send + Sync>> =
-        parent_sink.map(|parent| {
+        parent_sink.clone().map(|parent| {
             let sink: Arc<dyn Fn(crate::ToolActivity) + Send + Sync> =
                 Arc::new(move |activity: crate::ToolActivity| {
                     let heartbeat = match &activity {
@@ -350,20 +559,69 @@ pub async fn delegate_owned(
         progress_sink,
     );
     // H3b/H3c: the child asks through the parent's approver, tagged with the
-    // child's label, and only while the parent run that spawned it is live.
-    config.approver = child_approver(parent.config.approver.as_ref(), token, &label);
+    // child's label, and only while the owning run is live. H3d: each ask is
+    // bracketed by `WaitingApproval` / `Running` state events.
+    config.approver = with_approval_state(
+        child_approver(parent.config.approver.as_ref(), owner.token, &label),
+        parent_sink.clone(),
+        subagent_id.clone(),
+        label.clone(),
+    );
+    // H3d: the child's own steer inbox (the parent's is never inherited).
+    // `steer_agent` pushes into it; the run loop drains it between turns.
+    let steer = Arc::new(crate::SteerInbox::new());
+    config.steer = Some(Arc::clone(&steer));
     let child = Engine {
         selector,
         providers: parent.providers.clone(),
         tools: Arc::new(registry),
         store: Arc::new(MeteredStore {
             inner: Arc::clone(&parent.store),
-            meter,
+            meter: Arc::clone(&meter),
         }),
         config,
     };
-    let run = child.run_task(task).await;
-    if let Some(sink) = parent.config.on_tool_event.as_ref() {
+    // H3d: an owned child is addressable under its session until it ends.
+    // The kill sender lives in the registry entry, so the receiver only
+    // fires on a real kill; an unowned child has no kill arm.
+    let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+    let guard = owner
+        .session
+        .map(|session| ChildGuard::register(subagent_id.clone(), session, steer, kill_tx));
+    let ended = tokio::select! {
+        result = child.run_task(task) => Ended::Finished(result),
+        _ = &mut kill_rx, if guard.is_some() => Ended::Killed,
+    };
+    let run = match ended {
+        Ended::Finished(run) => run,
+        Ended::Killed => {
+            // A stop: the child's spend so far still counts for the parent.
+            let (turns, _) = meter.snapshot();
+            let usage = meter.usage();
+            if let Some(sink) = &parent_sink {
+                sink(crate::ToolActivity::SubagentState {
+                    id: subagent_id.clone(),
+                    label: label.clone(),
+                    state: crate::AgentState::Killed,
+                });
+                sink(crate::ToolActivity::SubagentFinished {
+                    id: subagent_id.clone(),
+                    label: label.clone(),
+                    tokens: usage.total(),
+                    turns,
+                    is_error: true,
+                });
+            }
+            drop(guard);
+            return Ok(ExploreReport {
+                brief: format!("sub-agent {label} was stopped by the user"),
+                usage,
+                turns,
+                killed: true,
+            });
+        }
+    };
+    if let Some(sink) = parent_sink.as_ref() {
         let (tokens, turns, is_error) = match &run {
             Ok(summary) => (summary.usage.total(), summary.turns, false),
             Err(_) => (0, 0, true),
@@ -386,7 +644,37 @@ pub async fn delegate_owned(
         brief: answer,
         usage,
         turns,
+        killed: false,
     })
+}
+
+/// H3d: wrap a child's approver so each ask is bracketed by a
+/// `WaitingApproval` state (before) and `Running` (after) event through the
+/// parent's sink. A child with no approver keeps `None`.
+fn with_approval_state(
+    inner: Option<Arc<crate::Approver>>,
+    sink: Option<Arc<crate::ToolActivitySink>>,
+    id: String,
+    label: String,
+) -> Option<Arc<crate::Approver>> {
+    let inner = inner?;
+    let Some(sink) = sink else {
+        return Some(inner);
+    };
+    Some(Arc::new(move |ask: &crate::ApprovalAsk<'_>| {
+        sink(crate::ToolActivity::SubagentState {
+            id: id.clone(),
+            label: label.clone(),
+            state: crate::AgentState::WaitingApproval,
+        });
+        let allowed = inner(ask);
+        sink(crate::ToolActivity::SubagentState {
+            id: id.clone(),
+            label: label.clone(),
+            state: crate::AgentState::Running,
+        });
+        allowed
+    }))
 }
 
 /// H3c: the approver a child asks through. An ask is forwarded to the
@@ -851,10 +1139,10 @@ mod approval_tests {
     async fn run_child(engine: &Engine) -> ExploreReport {
         let session = uuid::Uuid::new_v4();
         let _run = crate::run_scope().begin(session);
-        let token = crate::run_scope().token(session);
+        let owner = ChildOwner::for_session(Some(session));
         let filter = ["write".to_string()];
         delegate_owned(
-            token,
+            owner,
             engine,
             "write the file",
             None,
@@ -1095,5 +1383,376 @@ mod approval_tests {
             0,
             "no approver, no prompt, no run"
         );
+    }
+}
+
+/// H3d: live addressing (steer / kill), the child registry, the waiting-approval
+/// state, and the background finish event.
+#[cfg(test)]
+mod h3d_tests {
+    use super::*;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        AgentState, ApprovalAsk, ApprovalMode, Role, StopReason, Tool, ToolActivity, ToolCtx,
+        ToolOutcome, ToolSpec, TurnResponse, Usage,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    /// A `read` tool that announces it started and blocks until `release`.
+    struct PauseTool {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for PauseTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "read".into(),
+                description: "pauses until released".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(ToolOutcome::ok("released"))
+        }
+    }
+
+    fn pause_engine(
+        provider: Arc<dyn crate::ModelProvider>,
+        started: &Arc<Notify>,
+        release: &Arc<Notify>,
+    ) -> Engine {
+        let mut providers: HashMap<String, Arc<dyn crate::ModelProvider>> = HashMap::new();
+        providers.insert("anthropic".into(), provider);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(PauseTool {
+            started: Arc::clone(started),
+            release: Arc::clone(release),
+        }));
+        Engine {
+            selector: Arc::new(StaticSelector::new("claude-haiku-4-5", "anthropic")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config: EngineConfig {
+                working_dir: std::env::temp_dir(),
+                default_provider: "anthropic".into(),
+                default_model: "claude-haiku-4-5".into(),
+                ..EngineConfig::default()
+            },
+        }
+    }
+
+    /// Captures every tool-activity event the parent's sink receives.
+    fn capture(engine: &mut Engine) -> Arc<Mutex<Vec<ToolActivity>>> {
+        let events: Arc<Mutex<Vec<ToolActivity>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&events);
+        let sink: Arc<crate::ToolActivitySink> = Arc::new(move |activity: ToolActivity| {
+            sink_events.lock().unwrap().push(activity);
+        });
+        engine.config.on_tool_event = Some(sink);
+        events
+    }
+
+    fn started_id(events: &Mutex<Vec<ToolActivity>>) -> Option<String> {
+        events.lock().unwrap().iter().find_map(|e| match e {
+            ToolActivity::SubagentStarted { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+    }
+
+    fn state_events(events: &Mutex<Vec<ToolActivity>>) -> Vec<AgentState> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                ToolActivity::SubagentState { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn read_filter() -> Vec<String> {
+        vec!["read".to_string()]
+    }
+
+    /// A `read` call that spent 1000 in + 50 out before it blocks.
+    fn spending_read_call() -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![crate::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: Usage {
+                input_tokens: 1_000,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_a_running_child_reaches_its_next_turn() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mock = Arc::new(
+            MockProvider::new()
+                .then_tool_call("c1", "read", serde_json::json!({}))
+                .then_text("answer"),
+        );
+        let engine = Arc::new(pause_engine(mock.clone(), &started, &release));
+        let session = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let owner = ChildOwner::for_session(Some(session));
+        let task = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let filter = read_filter();
+                delegate_owned(
+                    owner,
+                    &engine,
+                    "find it",
+                    None,
+                    Some(&filter),
+                    100_000,
+                    None,
+                )
+                .await
+            })
+        };
+        started.notified().await;
+        let ids = live_agents(session);
+        assert_eq!(ids.len(), 1, "the running child is addressable");
+        assert!(
+            steer_agent(other, &ids[0], "wrong session".into()).is_err(),
+            "a steer names the child's own session"
+        );
+        steer_agent(session, &ids[0], "use the other crate".into()).unwrap();
+        release.notify_one();
+        task.await.unwrap().unwrap();
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "the steer did not add a turn of its own");
+        assert!(
+            reqs[1]
+                .messages
+                .iter()
+                .any(|m| m.content == "use the other crate" && matches!(m.role, Role::User)),
+            "the next turn carries the steer"
+        );
+    }
+
+    #[tokio::test]
+    async fn killing_a_foreground_child_returns_the_stop_and_counts_its_tokens() {
+        let started = Arc::new(Notify::new());
+        // Never released: the child stays parked until it is killed.
+        let release = Arc::new(Notify::new());
+        let mock = Arc::new(MockProvider::new().then_response(spending_read_call()));
+        let mut engine = pause_engine(mock, &started, &release);
+        let events = capture(&mut engine);
+        let engine = Arc::new(engine);
+        let session = uuid::Uuid::new_v4();
+        let owner = ChildOwner::for_session(Some(session));
+        let task = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let filter = read_filter();
+                delegate_owned(
+                    owner,
+                    &engine,
+                    "find it",
+                    None,
+                    Some(&filter),
+                    100_000,
+                    None,
+                )
+                .await
+            })
+        };
+        started.notified().await;
+        let ids = live_agents(session);
+        assert_eq!(ids.len(), 1);
+        kill_agent(session, &ids[0]).unwrap();
+        let report = task.await.unwrap().unwrap();
+
+        assert!(report.killed);
+        assert!(
+            report.brief.contains("was stopped by the user"),
+            "{}",
+            report.brief
+        );
+        assert_eq!(
+            report.usage.total(),
+            1_050,
+            "tokens spent before the stop still count"
+        );
+        assert!(
+            live_agents(session).is_empty(),
+            "the registry entry is gone"
+        );
+        assert!(
+            kill_agent(session, &ids[0]).is_err(),
+            "a stopped child is gone"
+        );
+        assert_eq!(state_events(&events), vec![AgentState::Killed]);
+    }
+
+    /// A gated `write` the child calls; counts the calls that really ran.
+    struct GatedWrite {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for GatedWrite {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "gated write".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutcome::ok("wrote"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_ask_is_waiting_approval_until_answered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = Arc::new(AtomicUsize::new(0));
+        let events: Arc<Mutex<Vec<ToolActivity>>> = Arc::new(Mutex::new(Vec::new()));
+        // The state the parent approver sees at the moment it is asked.
+        let seen_at_ask: Arc<Mutex<Option<AgentState>>> = Arc::new(Mutex::new(None));
+        let ask_events = Arc::clone(&events);
+        let ask_seen = Arc::clone(&seen_at_ask);
+        let approver: Arc<crate::Approver> = Arc::new(move |_ask: &ApprovalAsk<'_>| {
+            let state = state_events(&ask_events).last().copied();
+            *ask_seen.lock().unwrap() = state;
+            true
+        });
+        let mut providers: HashMap<String, Arc<dyn crate::ModelProvider>> = HashMap::new();
+        providers.insert(
+            "anthropic".into(),
+            Arc::new(
+                MockProvider::new()
+                    .then_tool_call("w1", "write", serde_json::json!({"path": "x"}))
+                    .then_text("wrote it"),
+            ),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(GatedWrite {
+            runs: Arc::clone(&runs),
+        }));
+        let sink_events = Arc::clone(&events);
+        let sink: Arc<crate::ToolActivitySink> = Arc::new(move |activity: ToolActivity| {
+            sink_events.lock().unwrap().push(activity);
+        });
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("claude-haiku-4-5", "anthropic")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config: EngineConfig {
+                working_dir: std::env::temp_dir(),
+                default_provider: "anthropic".into(),
+                default_model: "claude-haiku-4-5".into(),
+                approvals: crate::ApprovalPolicy {
+                    mode: ApprovalMode::Ask,
+                    ..crate::ApprovalPolicy::default()
+                },
+                approver: Some(approver),
+                on_tool_event: Some(sink),
+                ..EngineConfig::default()
+            },
+        };
+        // The child's asks reach the parent approver only inside a live run.
+        let session = uuid::Uuid::new_v4();
+        let _run = crate::run_scope().begin(session);
+        let filter = ["write".to_string()];
+        delegate_owned(
+            ChildOwner::for_session(Some(session)),
+            &engine,
+            "write the file",
+            None,
+            Some(&filter),
+            100_000,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *seen_at_ask.lock().unwrap(),
+            Some(AgentState::WaitingApproval)
+        );
+        assert_eq!(
+            state_events(&events),
+            vec![AgentState::WaitingApproval, AgentState::Running],
+            "the ask is bracketed by waiting and running"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "approved call ran");
+    }
+
+    #[tokio::test]
+    async fn the_registry_is_empty_after_children_end_and_unknown_agents_error() {
+        let session = uuid::Uuid::new_v4();
+        assert!(steer_agent(session, "missing", "x".into())
+            .unwrap_err()
+            .contains("no live sub-agent"));
+        assert!(kill_agent(session, "missing").is_err());
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mock = Arc::new(MockProvider::new().then_text("done"));
+        let mut engine = pause_engine(mock, &started, &release);
+        let events = capture(&mut engine);
+        let owner = ChildOwner::for_session(Some(session));
+        delegate_owned(owner, &engine, "task", None, None, 100_000, None)
+            .await
+            .unwrap();
+        let id = started_id(&events).expect("the child announced itself");
+        assert!(
+            live_agents(session).is_empty(),
+            "no live child after the run"
+        );
+        assert!(steer_agent(session, &id, "late".into()).is_err());
+        assert!(kill_agent(session, &id).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_background_child_reports_its_settlement_once() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mock = Arc::new(MockProvider::new().then_text("the brief"));
+        let mut engine = pause_engine(mock, &started, &release);
+        let events = capture(&mut engine);
+        let session = uuid::Uuid::new_v4();
+        let owner = ChildOwner::for_session(Some(session)).detached();
+        let report = delegate_owned(owner, &engine, "task", None, None, 100_000, None)
+            .await
+            .unwrap();
+        assert_eq!(report.brief, "the brief");
+        let finished: Vec<(bool, String)> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                ToolActivity::BackgroundFinished { ok, brief, .. } => Some((*ok, brief.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished, vec![(true, "the brief".to_string())]);
+        assert!(live_agents(session).is_empty());
     }
 }

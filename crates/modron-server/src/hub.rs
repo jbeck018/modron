@@ -493,6 +493,7 @@ impl SessionHandle {
                     tokens: row.tokens,
                     last_tool: row.last_tool.clone(),
                     done: row.done,
+                    state: row.state,
                 })
                 .collect(),
             pending_approval: lock(&self.live_approval).front().cloned(),
@@ -555,6 +556,36 @@ impl SessionHandle {
     pub fn on_tool_activity(&self, activity: ToolActivity) {
         let mut seq = lock(&self.seq);
         lock(&self.tracker).on_tool(&activity);
+        // H3d: a background child's settlement is pushed (AgentFinished plus
+        // its Notify) instead of being a swarm-row change.
+        if let ToolActivity::BackgroundFinished {
+            id,
+            label,
+            ok,
+            brief,
+        } = &activity
+        {
+            self.publish_locked(
+                &mut seq,
+                Payload::AgentFinished {
+                    agent: id.clone(),
+                    ok: *ok,
+                    brief: brief.clone(),
+                },
+            );
+            self.publish_locked(
+                &mut seq,
+                Payload::Notify {
+                    kind: if *ok {
+                        NotifyKind::Done
+                    } else {
+                        NotifyKind::Failed
+                    },
+                    text: notify_agent_text(label, *ok),
+                },
+            );
+            return;
+        }
         self.publish_locked(
             &mut seq,
             Payload::Tool {
@@ -739,6 +770,18 @@ impl SessionHandle {
         drop(order_guard);
         drop(slot);
         had_run
+    }
+
+    /// Steer one of this session's live sub-agents (H3d; see
+    /// [`modron_core::subagent::steer_agent`]). Errors when `agent` is not live.
+    pub fn steer_agent(&self, agent: &str, text: String) -> Result<(), String> {
+        modron_core::subagent::steer_agent(self.id, agent, text)
+    }
+
+    /// Stop one of this session's live sub-agents (H3d; see
+    /// [`modron_core::subagent::kill_agent`]). Errors when `agent` is not live.
+    pub fn kill_agent(&self, agent: &str) -> Result<(), String> {
+        modron_core::subagent::kill_agent(self.id, agent)
     }
 
     /// Queue a steer for the active run and echo it to subscribers. Holds
@@ -1592,6 +1635,22 @@ impl SessionHub {
         handle.steer_message(text)
     }
 
+    /// Steer a live sub-agent of `id` (see [`SessionHandle::steer_agent`]).
+    pub fn steer_agent(&self, id: SessionId, agent: &str, text: String) -> Result<(), String> {
+        let handle = self
+            .handle(&id)
+            .ok_or_else(|| format!("no such session {id}"))?;
+        handle.steer_agent(agent, text)
+    }
+
+    /// Stop a live sub-agent of `id` (see [`SessionHandle::kill_agent`]).
+    pub fn kill_agent(&self, id: SessionId, agent: &str) -> Result<(), String> {
+        let handle = self
+            .handle(&id)
+            .ok_or_else(|| format!("no such session {id}"))?;
+        handle.kill_agent(agent)
+    }
+
     /// Start deleting a session. Fails while a run holds its slot. Until
     /// [`finish_delete`](Self::finish_delete) or
     /// [`cancel_delete`](Self::cancel_delete), no run may start: the busy
@@ -1678,6 +1737,12 @@ pub(crate) fn notify_failed_text(error: &str) -> String {
         "failed: {}",
         first.chars().take(NOTIFY_FAILED_CHARS).collect::<String>()
     )
+}
+
+/// Notify text for a finished background sub-agent (H3d): the shared view
+/// wording, `sub-agent <label> finished` or `... failed`.
+pub(crate) fn notify_agent_text(label: &str, ok: bool) -> String {
+    modron_view::agent_finished_text(label, ok)
 }
 
 /// Notify text for a fired wake: the first 80 chars of its prompt.
@@ -1894,6 +1959,79 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// H3d: a background child's settlement pushes `AgentFinished` and its
+    /// `Notify` (done for success, failed for a failure or a kill), in that
+    /// order, and no raw `tool` frame.
+    #[tokio::test]
+    async fn a_background_child_finish_pushes_agent_finished_and_notify() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let mut rx = handle.subscribe();
+        handle.on_tool_activity(ToolActivity::BackgroundFinished {
+            id: "a1".into(),
+            label: "delegate".into(),
+            ok: true,
+            brief: "all good".into(),
+        });
+        handle.on_tool_activity(ToolActivity::BackgroundFinished {
+            id: "a2".into(),
+            label: "persona".into(),
+            ok: false,
+            brief: "stopped by the user".into(),
+        });
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("frame arrives")
+                .expect("live frame");
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame.json).unwrap());
+        }
+        assert_eq!(frames[0]["type"], "agent_finished");
+        assert_eq!(frames[0]["agent"], "a1");
+        assert_eq!(frames[0]["ok"], true);
+        assert_eq!(frames[0]["brief"], "all good");
+        assert_eq!(frames[1]["type"], "notify");
+        assert_eq!(frames[2]["type"], "agent_finished");
+        assert_eq!(frames[2]["ok"], false);
+        assert_eq!(
+            notify_pairs(&frames),
+            vec![
+                (
+                    "done".to_string(),
+                    "sub-agent delegate finished".to_string()
+                ),
+                ("failed".to_string(), "sub-agent persona failed".to_string()),
+            ]
+        );
+        assert!(
+            frames.iter().all(|f| f["type"] != "tool"),
+            "a settlement is a push, not a tool frame"
+        );
+    }
+
+    /// H3d: steering or stopping an agent that is not live is refused with the
+    /// requester's error, and an unknown session is refused too.
+    #[tokio::test]
+    async fn steer_and_kill_agent_refuse_unknown_agents_and_sessions() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        hub.ensure_session(id, None);
+        assert!(hub
+            .steer_agent(id, "nobody", "x".into())
+            .unwrap_err()
+            .contains("no live sub-agent"));
+        assert!(hub
+            .kill_agent(id, "nobody")
+            .unwrap_err()
+            .contains("no live sub-agent"));
+        assert!(hub
+            .kill_agent(SessionId::new_v4(), "nobody")
+            .unwrap_err()
+            .contains("no such session"));
     }
 
     #[tokio::test]

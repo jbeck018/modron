@@ -44,7 +44,7 @@ pub use gen_ui::{
     GenUi,
 };
 
-use modron_types::{SessionEvent, ToolActivity, Usage};
+use modron_types::{AgentState, SessionEvent, ToolActivity, Usage};
 use serde::{Deserialize, Serialize};
 
 /// One grouped tool event for the collapsed tool view (lifted from the
@@ -208,6 +208,29 @@ pub struct SwarmRow {
     /// rows rebuilt from the wire snapshot (the clock restarts there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_ms: Option<u64>,
+    /// Lifecycle state (PROTOCOL_V2 section 4). Rows from older peers have
+    /// none and read as running; see [`SwarmRow::effective_state`].
+    #[serde(default)]
+    pub state: AgentState,
+}
+
+/// The state word a swarm row shows (shared by every client). `running`
+/// and `done` keep their historic text.
+pub fn agent_state_word(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Running => "running",
+        AgentState::WaitingApproval => "waiting approval",
+        AgentState::Done => "done",
+        AgentState::Failed => "failed",
+        AgentState::Killed => "killed",
+    }
+}
+
+/// The Notify / toast / last-note text for a finished background sub-agent
+/// (PROTOCOL_V2 section 4): `sub-agent <label> finished` or `... failed`.
+pub fn agent_finished_text(label: &str, ok: bool) -> String {
+    let verdict = if ok { "finished" } else { "failed" };
+    format!("sub-agent {label} {verdict}")
 }
 
 /// Wall-clock epoch milliseconds (elapsed-time rendering without
@@ -220,18 +243,23 @@ pub fn now_epoch_ms() -> Option<u64> {
 }
 
 impl SwarmRow {
+    /// The state the row shows. A row from an older peer carries no state,
+    /// so its `done` flag decides between done and failed.
+    pub fn effective_state(&self) -> AgentState {
+        match (self.state, self.done) {
+            (AgentState::Running, Some(true)) => AgentState::Done,
+            (AgentState::Running, Some(false)) => AgentState::Failed,
+            (state, _) => state,
+        }
+    }
+
     /// The display row, e.g. `⏵ [reviewer] done · 3 turns · 1.2k tok ·
     /// last: read`.
     pub fn summary(&self) -> String {
-        let mark = match self.done {
-            Some(true) => "done",
-            Some(false) => "failed",
-            None => "running",
-        };
         format!(
             "⏵ [{}] {} · {} turns · {} tok · last: {}",
             self.label,
-            mark,
+            agent_state_word(self.effective_state()),
             self.turns,
             self.tokens,
             self.last_tool.as_deref().unwrap_or("-")
@@ -299,6 +327,7 @@ impl ActivityTracker {
                     last_tool: None,
                     done: None,
                     started_ms: now_epoch_ms(),
+                    state: AgentState::Running,
                 });
             }
             ToolActivity::SubagentProgress {
@@ -325,8 +354,30 @@ impl ActivityTracker {
                     row.turns = row.turns.max(*turns);
                     row.tokens = row.tokens.max(*tokens);
                     row.done = Some(!*is_error);
+                    // A kill is sticky: its finish keeps the killed state.
+                    if row.state != AgentState::Killed {
+                        row.state = if *is_error {
+                            AgentState::Failed
+                        } else {
+                            AgentState::Done
+                        };
+                    }
                 }
             }
+            ToolActivity::SubagentState { id, state, .. } => {
+                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == *id) {
+                    // Only a live row changes state; a settled one keeps its
+                    // finish.
+                    if row.done.is_none() {
+                        row.state = *state;
+                        if *state == AgentState::Killed {
+                            row.done = Some(false);
+                        }
+                    }
+                }
+            }
+            // Background settlement is a push (AgentFinished), not a row change.
+            ToolActivity::BackgroundFinished { .. } => {}
         }
     }
 
@@ -839,6 +890,105 @@ mod tests {
         assert_eq!(lines.len(), 2, "header + one row");
         assert!(lines[0].starts_with("⎇ swarm: 1 agent(s), 700 tok"));
         assert!(t.take_swarm_summary().is_empty(), "cleared after commit");
+    }
+
+    #[test]
+    fn swarm_rows_show_waiting_approval_and_killed_states() {
+        let mut t = ActivityTracker::new();
+        t.on_tool(&ToolActivity::SubagentStarted {
+            id: "k1".into(),
+            label: "delegate".into(),
+        });
+        t.on_tool(&ToolActivity::SubagentState {
+            id: "k1".into(),
+            label: "delegate".into(),
+            state: AgentState::WaitingApproval,
+        });
+        assert!(t.subagents[0].summary().contains("] waiting approval "));
+        t.on_tool(&ToolActivity::SubagentState {
+            id: "k1".into(),
+            label: "delegate".into(),
+            state: AgentState::Running,
+        });
+        assert_eq!(t.subagents[0].state, AgentState::Running, "the ask settled");
+        assert!(t.subagents[0].summary().contains("] running "));
+
+        t.on_tool(&ToolActivity::SubagentState {
+            id: "k1".into(),
+            label: "delegate".into(),
+            state: AgentState::Killed,
+        });
+        t.on_tool(&ToolActivity::SubagentFinished {
+            id: "k1".into(),
+            label: "delegate".into(),
+            tokens: 1_050,
+            turns: 1,
+            is_error: true,
+        });
+        assert_eq!(t.subagents[0].state, AgentState::Killed, "a kill is sticky");
+        assert!(t.subagents[0].summary().contains("] killed "));
+
+        t.on_tool(&ToolActivity::SubagentStarted {
+            id: "f1".into(),
+            label: "persona".into(),
+        });
+        t.on_tool(&ToolActivity::SubagentFinished {
+            id: "f1".into(),
+            label: "persona".into(),
+            tokens: 0,
+            turns: 0,
+            is_error: true,
+        });
+        assert!(t.subagents[1].summary().contains("] failed "));
+    }
+
+    #[test]
+    fn background_settlement_is_not_a_row_change() {
+        let mut t = ActivityTracker::new();
+        t.on_tool(&ToolActivity::SubagentStarted {
+            id: "b1".into(),
+            label: "delegate".into(),
+        });
+        t.on_tool(&ToolActivity::BackgroundFinished {
+            id: "b1".into(),
+            label: "delegate".into(),
+            ok: true,
+            brief: "done".into(),
+        });
+        assert_eq!(t.subagents[0].done, None, "the push is not the finish");
+        assert_eq!(t.subagents[0].state, AgentState::Running);
+    }
+
+    #[test]
+    fn rows_from_older_peers_read_their_done_flag_and_shared_words_hold() {
+        let row = SwarmRow {
+            id: "o".into(),
+            label: "explore".into(),
+            turns: 2,
+            tokens: 9,
+            last_tool: None,
+            done: Some(true),
+            started_ms: None,
+            state: AgentState::Running,
+        };
+        assert!(row.summary().contains("] done "));
+        let failed = SwarmRow {
+            done: Some(false),
+            ..row.clone()
+        };
+        assert!(failed.summary().contains("] failed "));
+        assert_eq!(
+            agent_state_word(AgentState::WaitingApproval),
+            "waiting approval"
+        );
+        assert_eq!(
+            agent_finished_text("delegate", true),
+            "sub-agent delegate finished"
+        );
+        assert_eq!(
+            agent_finished_text("persona", false),
+            "sub-agent persona failed"
+        );
     }
 
     fn fixture_events() -> Vec<SessionEvent> {

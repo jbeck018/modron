@@ -328,6 +328,10 @@ pub fn update_to_line(
                     .to_string(),
             )
         }
+        // Sub-agent state changes and background completions have no ACP
+        // counterpart yet; the row itself is updated by Progress/Finished.
+        AcUpdate::Tool(ToolActivity::SubagentState { .. })
+        | AcUpdate::Tool(ToolActivity::BackgroundFinished { .. }) => None,
         AcUpdate::Tool(ToolActivity::SubagentStarted { id, label }) => Some(
             tool_call_notification(session_id, id, &format!("subagent: {label}"), "in_progress")
                 .to_string(),
