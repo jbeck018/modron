@@ -333,6 +333,9 @@ pub struct Driver {
     traced: String,
     attempts: u32,
     last: String,
+    /// The staged chip labels the last snapshot carried. The chips are read
+    /// into the view at publish time, so a change to them publishes too.
+    staged: Vec<String>,
     /// The startup config went out for the current connection.
     startup_sent: bool,
 }
@@ -366,6 +369,7 @@ impl Driver {
                 connecting_since: None,
                 attempts: 0,
                 last: String::new(),
+                staged: Vec::new(),
                 startup_sent: false,
             }),
             Err(e) => {
@@ -479,8 +483,12 @@ impl Driver {
         snapshot.connection_label = self.label(&snapshot.connection_label);
         // Snapshots carry no PartialEq; the JSON form is the change test.
         let json = serde_json::to_string(&snapshot).unwrap_or_default();
-        if json != self.last {
+        // A submit that clears the staged image chips changes nothing in the
+        // core, so the chips are compared here too (the view copies them).
+        let staged = crate::chat::staged_labels();
+        if publish_due(&json, &self.last, &staged, &self.staged) {
             self.last = json;
+            self.staged = staged;
             if self.out.send(snapshot).is_err() {
                 return false;
             }
@@ -550,6 +558,12 @@ impl Drop for Driver {
     }
 }
 
+/// Whether the driver publishes a snapshot: the core state changed, or the
+/// staged chips changed (a submit that clears them changes no core state).
+fn publish_due(json: &str, last: &str, staged: &[String], last_staged: &[String]) -> bool {
+    json != last || staged != last_staged
+}
+
 /// Maps one UI action to its core call. A call the core refuses (no session
 /// attached, a closed link) is shown as the snapshot's error, so the user
 /// sees why nothing happened. Server refusals arrive as `Payload::Error` and
@@ -564,6 +578,8 @@ fn apply(client: &RemoteClient, action: UiAction) {
             let result = client.send_message_with(text, staged);
             if result.is_ok() && had_images {
                 crate::chat::clear_staged();
+                // The "attached ..." notice referred to this message.
+                client.clear_local_error();
             }
             result
         }
@@ -574,8 +590,12 @@ fn apply(client: &RemoteClient, action: UiAction) {
             Ok(())
         }
         UiAction::Paste => {
+            // Clipboard text is offered to the composer (no note); an empty
+            // note means nothing to show.
             let note = paste_clipboard();
-            client.note_local_error(note);
+            if !note.is_empty() {
+                client.note_local_error(note);
+            }
             Ok(())
         }
         UiAction::Queue(text) => client.enqueue(text),
@@ -686,6 +706,29 @@ fn apply(client: &RemoteClient, action: UiAction) {
         UiAction::SetKey(secret) => {
             with_session(client, |s| client.auth_set_key(s, &secret.provider, &secret.key))
         }
+        UiAction::ListAutomations => client.list_automations(),
+        UiAction::AddAutomation { name, prompt, interval_minutes } => {
+            client.add_automation(name, prompt, interval_minutes)
+        }
+        UiAction::RemoveAutomation(name) => client.remove_automation(name),
+        UiAction::TaskStatusOf(session) => client.task_status(session),
+        UiAction::MergeTask(session) => client.merge_task(session, None),
+        UiAction::AttachFile { name, mime, bytes } => {
+            // The same chip as Ctrl+V; a refusal from the core's type check is
+            // the note (the chip is not staged).
+            match modron_mobile_core::attachment_from_bytes(&name, &mime, &bytes) {
+                Ok(wire) => {
+                    let size = bytes.len() as u64;
+                    let label = crate::chat::chip_label(&name, size);
+                    crate::chat::stage(crate::chat::Staged { name, bytes: size, wire });
+                    client.note_local_error(format!(
+                        "attached {label} (goes with your next message)"
+                    ));
+                }
+                Err(reason) => client.note_local_error(reason),
+            }
+            Ok(())
+        }
         UiAction::Notice(text) => {
             client.note_local_error(text);
             Ok(())
@@ -701,7 +744,9 @@ fn apply(client: &RemoteClient, action: UiAction) {
         | UiAction::ListInvites
         | UiAction::CreateInvite(_)
         | UiAction::RevokeInvite(_)
-        | UiAction::CopyInvite(_) => Ok(()),
+        | UiAction::CopyInvite(_)
+        | UiAction::Clear
+        | UiAction::Context => Ok(()),
     };
     if let Err(error) = result {
         client.note_local_error(error.to_string());
@@ -734,6 +779,15 @@ fn with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cleared_chip_publishes_even_when_the_core_state_is_unchanged() {
+        let chip = vec!["[img shot.png \u{b7} 2.0 KB]".to_string()];
+        assert!(!publish_due("{}", "{}", &chip, &chip));
+        assert!(publish_due("{}", "{}", &[], &chip));
+        assert!(publish_due("{}", "{}", &chip, &[]));
+        assert!(publish_due("{\"a\":1}", "{}", &[], &[]));
+    }
 
     #[test]
     fn query_without_url_is_the_demo() {
@@ -828,7 +882,8 @@ mod stall_tests {
 
 /// Shown when a clipboard image is removed with Backspace.
 const ATTACH_REMOVED_NOTE: &str = "image removed";
-/// The clipboard holds text, not an image: the terminal's own paste carries it.
+/// The web host has no clipboard read: Ctrl+V there says so.
+#[cfg(target_arch = "wasm32")]
 const CLIPBOARD_TEXT_NOTE: &str = "clipboard has text, not an image: paste it with the terminal";
 #[cfg(not(target_arch = "wasm32"))]
 const CLIPBOARD_EMPTY_NOTE: &str = "clipboard is empty";
@@ -852,7 +907,10 @@ fn paste_clipboard() -> String {
                     Err(reason) => reason,
                 }
             }
-            Harvest::Text(_) => CLIPBOARD_TEXT_NOTE.to_string(),
+            Harvest::Text(text) => {
+                crate::chat::offer_text(text);
+                String::new()
+            }
             Harvest::Empty => CLIPBOARD_EMPTY_NOTE.to_string(),
         }
     }

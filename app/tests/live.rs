@@ -95,15 +95,42 @@ impl Harness {
 
     /// Routes a key the way the real host does: the link's filter first,
     /// then the NSH view.
-    fn send(&mut self, input: Input) {
+    /// Returns true when the view got the key (the host did not consume it).
+    fn send(&mut self, input: Input) -> bool {
         if let Some(input) = self.host.filter(input) {
             self.view.handle(input);
+            true
+        } else {
+            false
         }
     }
 
+    /// Waits until the engine has applied `want` as the composer text. The
+    /// host routes Enter from that text, so the next key must not race it.
+    fn wait_draft(&mut self, want: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            self.draw();
+            if modron_app::chat::composer_text() == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for composer text {want:?}\n{}",
+                self.screen()
+            );
+            let _ = self.wake.recv_timeout(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Types one key at a time; a key the composer gets waits until the
+    /// engine has applied it (Enter after the text reads the whole text).
     fn type_text(&mut self, text: &str) {
         for c in text.chars() {
-            self.send(key(&c.to_string()));
+            let want = format!("{}{c}", modron_app::chat::composer_text());
+            if self.send(key(&c.to_string())) {
+                self.wait_draft(&want);
+            }
         }
     }
 
@@ -242,11 +269,8 @@ fn slash_compact_sends_compact_instead_of_text() {
     h.wait_for("transcript", None, |s| s.contains("fix the router crate"));
     h.type_text("/compact");
     // The suggestion row shows "/compact" while the composer may still hold
-    // a prefix, so let the composer settle before Enter (Packet C3f).
-    for _ in 0..30 {
-        h.draw();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // a prefix, so wait until the engine has applied the whole word.
+    h.wait_draft("/compact");
     h.send(key("Enter"));
     assert_eq!(h.action(), Some(UiAction::Compact));
 }

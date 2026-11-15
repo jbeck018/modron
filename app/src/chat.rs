@@ -171,6 +171,32 @@ pub enum UiAction {
     /// `/exit`, `/quit`, `/q`: leave the app. The host sets the quit flag
     /// ([`quit_requested`]) and the terminal loop exits; never sent on.
     Exit,
+    /// The attach control (web): a picked image file, read by the page. The
+    /// driver stages it as a chip, like Ctrl+V does on the terminal.
+    AttachFile {
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    /// `/clear`: hides the transcript rows that are on screen now, in this
+    /// view only (nothing is sent). A reconnect or a session change shows
+    /// them again. Handled by the host, never sent on.
+    Clear,
+    /// `/context`: a local note from the snapshot's context and token numbers.
+    Context,
+    /// Automations (`/automations`): the core's `list_automations`, then
+    /// `add_automation` (a prompt on an interval) and `remove_automation`.
+    ListAutomations,
+    AddAutomation {
+        name: String,
+        prompt: String,
+        interval_minutes: u32,
+    },
+    RemoveAutomation(String),
+    /// Tasks (`/tasks`): one task's status (the core answers with a note) and
+    /// the merge of its branch into the base (the core's `merge_task`).
+    TaskStatusOf(Uuid),
+    MergeTask(Uuid),
 }
 
 /// Set by `/exit` (see [`UiAction::Exit`]); the terminal loop checks it.
@@ -348,6 +374,8 @@ static NEW_BELOW: AtomicBool = AtomicBool::new(false);
 static LINE_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 /// Sent inputs kept for recall.
+use crate::clock::Instant;
+
 pub const HISTORY_MAX: usize = 200;
 /// Transcript lines a PageUp or PageDown moves.
 pub const SCROLL_PAGE: usize = 10;
@@ -364,6 +392,13 @@ pub(crate) fn set_draft(text: &str) {
 
 fn draft_text() -> String {
     DRAFT.lock().map(|d| d.clone()).unwrap_or_default()
+}
+
+/// The composer text the engine has applied. The host reads it to route
+/// Enter and Esc, and it moves on the engine thread, so a harness that types
+/// waits on it (the same text the view shows once the engine commits).
+pub fn composer_text() -> String {
+    draft_text()
 }
 
 /// A key the host routes, named without any target's key type. The
@@ -490,6 +525,10 @@ pub struct KeyFacts {
     pub auth_keying: bool,
     /// Image chips staged for the next submit (Backspace removes one first).
     pub attachments: usize,
+    /// An inline form is open on the automations or tasks screen.
+    pub form_open: bool,
+    /// The task Enter would attach (Tasks only).
+    pub selected_task: Option<Uuid>,
 }
 
 /// One transcript scroll step (the keys PageUp, PageDown, Home, End).
@@ -534,6 +573,8 @@ pub enum Routed {
     Scroll(ScrollStep),
     /// The key became an action.
     Action(UiAction),
+    /// Esc on an idle composer with text: the text goes (chips stay).
+    ClearDraft,
     /// The key is a screen step (Sessions, Settings, and the Ctrl+O / F2
     /// openers).
     Nav(NavStep),
@@ -604,7 +645,7 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     let recall = !suggesting && single_line && (draft.is_empty() || facts.recalling);
     match key {
         Key::Escape if chord => return composer,
-        Key::Escape => return escape_route(&facts),
+        Key::Escape => return escape_route(&facts, draft),
         Key::Enter if suggesting && !facts.slash_exact && !facts.file_mode => {
             return Routed::Nav(NavStep::CompleteSelected)
         }
@@ -710,8 +751,10 @@ pub fn submit_action(task: &str) -> UiAction {
 
 /// Esc, in precedence order: a pending approval is denied (its last option,
 /// the third decision); a pending plan stays pending; open command suggestions
-/// close; a running turn is interrupted; otherwise nothing happens.
-fn escape_route(facts: &KeyFacts) -> Routed {
+/// close; a running turn is interrupted; an idle composer with text is
+/// cleared; otherwise nothing happens (staged image chips are never cleared
+/// by Esc).
+fn escape_route(facts: &KeyFacts, draft: &str) -> Routed {
     if let Some(count) = facts.approval_options {
         return match count {
             0 => Routed::Ignored,
@@ -726,6 +769,9 @@ fn escape_route(facts: &KeyFacts) -> Routed {
     }
     if facts.running {
         return Routed::Action(UiAction::Interrupt);
+    }
+    if !draft.is_empty() {
+        return Routed::ClearDraft;
     }
     Routed::Ignored
 }
@@ -816,6 +862,7 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
                 _ => Routed::Ignored,
             };
         }
+        Screen::Automations | Screen::Tasks => return route_list_screen_key(key, facts),
         Screen::Auth => {
             return match key {
                 Key::Escape if facts.auth_keying => Routed::Nav(NavStep::AuthCancelKey),
@@ -852,6 +899,53 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
         Key::Char('j') if sessions && !facts.filter_active => Routed::Nav(NavStep::Move(1)),
         Key::Char('k') if sessions && !facts.filter_active => Routed::Nav(NavStep::Move(-1)),
         Key::Char(c) if sessions => Routed::Nav(NavStep::Filter(c)),
+        _ => Routed::Ignored,
+    }
+}
+
+/// Keys on the automations and tasks screens. An open form takes its own
+/// keys: Enter moves to the next field (and submits on the last), Tab moves
+/// on, Backspace edits, Esc closes it. Otherwise the list types a filter (Esc
+/// clears it first), arrows move, and the letters act only while the filter
+/// is empty: `a` adds and `d` removes an automation; `n` creates, `m` merges,
+/// and Enter attaches a task.
+fn route_list_screen_key(key: Key, facts: &KeyFacts) -> Routed {
+    use crate::nav::FormKind;
+    if facts.form_open {
+        return match key {
+            Key::Escape => Routed::Nav(NavStep::FormCancel),
+            Key::Enter => Routed::Nav(NavStep::FormEnter),
+            Key::Tab => Routed::Nav(NavStep::FormNext),
+            Key::Backspace => Routed::Nav(NavStep::FormBack),
+            Key::Char(c) => Routed::Nav(NavStep::FormChar(c)),
+            _ => Routed::Ignored,
+        };
+    }
+    let automations = facts.screen == Screen::Automations;
+    let tasks = facts.screen == Screen::Tasks;
+    match key {
+        Key::Escape if facts.filter_active => Routed::Nav(NavStep::ClearFilter),
+        Key::Escape => Routed::Nav(NavStep::Back),
+        Key::Up => Routed::Nav(NavStep::Move(-1)),
+        Key::Down => Routed::Nav(NavStep::Move(1)),
+        Key::Backspace => Routed::Nav(NavStep::FilterBack),
+        Key::Enter if tasks => match facts.selected_task {
+            Some(id) => Routed::Nav(NavStep::Attach(id)),
+            None => Routed::Ignored,
+        },
+        Key::Char('a') if automations && !facts.filter_active => {
+            Routed::Nav(NavStep::OpenForm(FormKind::Automation))
+        }
+        Key::Char('d') if automations && !facts.filter_active => {
+            Routed::Nav(NavStep::AskRemove(facts.selected_index))
+        }
+        Key::Char('n') if tasks && !facts.filter_active => {
+            Routed::Nav(NavStep::OpenForm(FormKind::Task))
+        }
+        Key::Char('m') if tasks && !facts.filter_active => {
+            Routed::Nav(NavStep::AskMerge(facts.selected_index))
+        }
+        Key::Char(c) => Routed::Nav(NavStep::Filter(c)),
         _ => Routed::Ignored,
     }
 }
@@ -950,12 +1044,15 @@ pub struct Model {
     pub tool_title: String,
     /// The staged image chips (`[img name · size]`), above the composer.
     pub attachments: Vec<String>,
+    /// The standing goal (`[goal: ...]`), empty when none is set.
+    pub goal: String,
 }
 
 impl Model {
     pub fn from_snapshot(s: &ViewModelSnapshot) -> Self {
         Self {
             attachments: staged_labels(),
+            goal: modron_mobile_core::view::goal_label(&s.goal),
             connection: s.connection_label.clone(),
             provider: s.provider.clone(),
             running: s.running_label.clone(),
@@ -1039,6 +1136,44 @@ pub fn transcript_lines(history: &[RenderedRow]) -> Vec<Line> {
         .collect()
 }
 
+/// How long a note stays in the status area: the old terminal's toast
+/// (`TOAST_TICKS` = 40 ticks at its 50 ms poll, crates/modron-tui/src/lib.rs).
+/// `last_error` is not a note and never expires.
+pub const NOTE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a note that appeared at `since` has expired by `now`.
+pub fn note_expired(since: Instant, now: Instant) -> bool {
+    now >= since + NOTE_TTL
+}
+
+/// The snapshot the view shows: the first `cleared` transcript rows are
+/// dropped (`/clear`), and an expired note is removed. Errors are never
+/// touched.
+pub fn shown_copy(raw: &ViewModelSnapshot, cleared: usize, note_gone: bool) -> ViewModelSnapshot {
+    let mut shown = raw.clone();
+    let floor = cleared.min(shown.history.len());
+    shown.history.drain(..floor);
+    if note_gone {
+        shown.last_note = None;
+    }
+    shown
+}
+
+/// Clipboard text for the composer (Ctrl+V with no image): the driver reads
+/// the clipboard and offers the text here; the host appends it on its next
+/// pass (see `Host::try_action`).
+static OFFERED_TEXT: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn offer_text(text: String) {
+    if let Ok(mut slot) = OFFERED_TEXT.lock() {
+        *slot = Some(text);
+    }
+}
+
+fn take_offered_text() -> Option<String> {
+    OFFERED_TEXT.lock().ok().and_then(|mut slot| slot.take())
+}
+
 /// The view's end of the link, handed to `App` through `CLIENT`.
 pub struct Client {
     pub snapshots: UnboundedReceiver<ViewModelSnapshot>,
@@ -1071,6 +1206,20 @@ pub struct Host {
     portal: VecDeque<UiAction>,
     /// Rows of the tool detail the snapshot held at the last push.
     tool_len: usize,
+    /// The latest snapshot as the driver sent it; the shown copy is derived
+    /// from it (see [`shown_copy`]).
+    raw: Option<ViewModelSnapshot>,
+    /// Transcript rows `/clear` hid (a count from the start of the history).
+    clear_floor: usize,
+    /// The session the floor belongs to (a change resets it).
+    view_session: Option<Uuid>,
+    /// The last note's text, when it appeared, and whether it has expired.
+    note_text: Option<String>,
+    note_since: Instant,
+    note_gone: bool,
+    /// A local note (`/context`) and when it was shown; it wins the note slot
+    /// for [`NOTE_TTL`] and then expires like the core's notes.
+    local_note: Option<(String, Instant)>,
     /// The tool detail panel's first visible row, while it is open.
     tool_panel: Option<usize>,
 }
@@ -1105,6 +1254,13 @@ pub fn link() -> (Host, Client) {
             portal: VecDeque::new(),
             tool_len: 0,
             tool_panel: None,
+            raw: None,
+            clear_floor: 0,
+            view_session: None,
+            note_text: None,
+            note_since: Instant::now(),
+            note_gone: false,
+            local_note: None,
         },
         Client { snapshots: snap_rx, actions: act_tx, nav: nav_rx },
     )
@@ -1127,21 +1283,115 @@ impl Host {
             NEW_BELOW.store(true, Ordering::SeqCst);
         }
         self.seen_rows = rows;
-        self.nav.observe(snapshot);
-        for action in self.nav.first_run(snapshot) {
+        self.bookkeeping(snapshot);
+        self.raw = Some(snapshot.clone());
+        let shown = self.presented(snapshot);
+        self.nav.observe(&shown);
+        for action in self.nav.first_run(&shown) {
             self.act(action);
         }
-        let _ = self.snapshots.send(snapshot.clone());
+        let _ = self.snapshots.send(shown);
         self.notify();
+    }
+
+    /// Resets the `/clear` floor when the session changes or the connection
+    /// is not up (a reconnect shows the rows again), and restarts the note's
+    /// clock when its text changes.
+    fn bookkeeping(&mut self, raw: &ViewModelSnapshot) {
+        if raw.session_id != self.view_session
+            || !matches!(raw.connection, modron_mobile_core::ConnectionState::Connected)
+        {
+            self.clear_floor = 0;
+        }
+        self.view_session = raw.session_id;
+        if raw.last_note != self.note_text {
+            self.note_text = raw.last_note.clone();
+            self.note_since = Instant::now();
+            self.note_gone = false;
+        }
+    }
+
+    fn presented(&self, raw: &ViewModelSnapshot) -> ViewModelSnapshot {
+        let mut shown = shown_copy(raw, self.clear_floor, self.note_gone);
+        if let Some((text, _)) = &self.local_note {
+            shown.last_note = Some(text.clone());
+        }
+        shown
+    }
+
+    /// Sends the latest snapshot again (the note expired, or `/clear` ran).
+    fn republish(&mut self) {
+        let Some(raw) = self.raw.clone() else {
+            return;
+        };
+        let shown = self.presented(&raw);
+        self.nav.observe(&shown);
+        let _ = self.snapshots.send(shown);
+        self.notify();
+    }
+
+    /// Expires the last note after [`NOTE_TTL`]; `last_error` never expires.
+    fn expire_note(&mut self) {
+        if self.local_note.as_ref().is_some_and(|(_, since)| note_expired(*since, Instant::now())) {
+            self.local_note = None;
+            self.republish();
+        }
+        if self.note_gone
+            || self.note_text.is_none()
+            || !note_expired(self.note_since, Instant::now())
+        {
+            return;
+        }
+        self.note_gone = true;
+        self.republish();
+    }
+
+    /// Esc on an idle composer: the text goes and history browsing resets.
+    /// The composer empties the way a queued message's does (`nav.set_text`).
+    fn clear_draft(&mut self) {
+        set_draft("");
+        set_history_pos(None);
+        self.nav.set_text("");
+        self.notify();
+    }
+
+    /// `/context`: the gauge and token numbers from the last snapshot, shown
+    /// as a local note for [`NOTE_TTL`].
+    fn context_note(&mut self) {
+        let text = match self.raw.as_ref() {
+            Some(raw) => modron_mobile_core::view::context_note(
+                &raw.context_label,
+                raw.cumulative_tokens,
+                raw.session_cache_pct,
+            ),
+            None => modron_mobile_core::view::context_note("", 0, None),
+        };
+        self.local_note = Some((text, Instant::now()));
+        self.republish();
+    }
+
+    /// `/clear`: hides the rows on screen now.
+    fn clear_view(&mut self) {
+        self.clear_floor = self.raw.as_ref().map_or(0, |raw| raw.history.len());
+        self.republish();
     }
 
     /// The next action for the driver, if any. Navigation steps (from taps)
     /// are applied here and never returned.
     pub fn try_action(&mut self) -> Option<UiAction> {
+        // Ctrl+V with clipboard text: the text joins the composer.
+        if let Some(text) = take_offered_text() {
+            let combined = format!("{}{text}", draft_text());
+            self.nav.set_text(&combined);
+            self.notify();
+        }
+        self.expire_note();
         loop {
             match self.actions.try_recv().ok()? {
                 UiAction::Nav(step) => self.nav_step(step),
                 UiAction::Tools(step) => self.tools_step(step),
+                UiAction::Clear => self.clear_view(),
+                UiAction::Context => self.context_note(),
                 UiAction::Exit => QUIT.store(true, Ordering::SeqCst),
                 action if action.is_portal() => self.portal.push_back(action),
                 action => return Some(action),
@@ -1244,6 +1494,8 @@ impl Host {
             screen: self.nav.top(),
             filter_active: !self.nav.filter().is_empty(),
             selected_session: self.nav.selected_session(),
+            form_open: self.nav.form_open(),
+            selected_task: self.nav.selected_task(),
             enter_setting: self.nav.enter_setting(),
             save_default: self.nav.save_default_action(),
             slash_len: if self.nav.suggestions_shown() { items.names.len() } else { 0 },
@@ -1287,6 +1539,10 @@ impl Host {
                     self.notify();
                 }
                 self.act(action);
+                true
+            }
+            Routed::ClearDraft => {
+                self.clear_draft();
                 true
             }
             Routed::Nav(step) => {
@@ -1557,6 +1813,10 @@ pub(crate) fn header(model: Signal<Model>) -> impl IntoElement {
             text(move || model.with(|m| m.session.clone()))
                 .text_color(move || token_ink("muted-foreground")),
         )
+        .child(
+            text(move || model.with(|m| m.goal.clone()))
+                .text_color(move || token_ink("muted-foreground")),
+        )
 }
 
 /// Up to `max` rows of `rows(model)`, one text element per slot. A slot
@@ -1609,7 +1869,11 @@ fn attachment_rows(m: &Model) -> Vec<String> {
 }
 
 fn queue_rows(m: &Model) -> Vec<String> {
-    m.queued.iter().enumerate().map(|(i, q)| format!("[{}] {q}", i + 1)).collect()
+    m.queued
+        .iter()
+        .enumerate()
+        .map(|(i, q)| modron_mobile_core::view::queue_chip(i + 1, q))
+        .collect()
 }
 
 /// The queue chips above the composer. On the web each chip is a button
@@ -1641,7 +1905,7 @@ fn queue_chips(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl
 }
 
 fn steer_rows(m: &Model) -> Vec<String> {
-    m.pending_steers.iter().map(|s| format!("> {s}")).collect()
+    m.pending_steers.iter().map(|s| modron_mobile_core::view::steer_echo(s)).collect()
 }
 
 fn plan_line_rows(m: &Model) -> Vec<String> {
@@ -1809,6 +2073,19 @@ fn approval_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> i
 
 /// The web-only composer controls: Queue beside the composer (queues the
 /// composer text, as Alt+Enter does), and Stop while a turn runs.
+/// The attach control's label (web).
+const ATTACH_LABEL: &str = "attach";
+
+/// Opens the browser's file chooser (web). The terminal has no chooser: its
+/// image path is Ctrl+V.
+#[cfg(target_arch = "wasm32")]
+fn open_file_picker(actions: UnboundedSender<UiAction>) {
+    crate::web::open_file_picker(actions);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_file_picker(_actions: UnboundedSender<UiAction>) {}
+
 fn composer_controls(
     model: Signal<Model>,
     draft: Signal<String>,
@@ -1831,6 +2108,15 @@ fn composer_controls(
             })
             .child(text(QUEUE_LABEL).text_color(move || token_ink(style_token(Style::Plain))))
     };
+    let attach_actions = actions.clone();
+    let attach = move || {
+        let attach_actions = attach_actions.clone();
+        view()
+            .role(AccessibilityRole::Button)
+            .px(px(8.0))
+            .on_press(move || open_file_picker(attach_actions.clone()))
+            .child(text(ATTACH_LABEL).text_color(move || token_ink(style_token(Style::Plain))))
+    };
     let stop = move || {
         let stop_actions = actions.clone();
         view()
@@ -1844,6 +2130,7 @@ fn composer_controls(
     view()
         .flex_row()
         .child(when(move || WEB_CONTROLS, queue))
+        .child(when(move || WEB_CONTROLS, attach))
         .child(when(move || WEB_CONTROLS && model.with(|m| m.is_running), stop))
 }
 
@@ -2106,6 +2393,8 @@ mod tests {
         tool_panel: false,
         file_mode: false,
         auth_keying: false,
+        form_open: false,
+        selected_task: None,
     };
 
     fn approval(options: usize) -> KeyFacts {
@@ -2779,5 +3068,93 @@ mod attachment_tests {
     #[test]
     fn chips_show_name_and_the_shared_size() {
         assert_eq!(chip_label("pic.png", 1229), "[img pic.png \u{b7} 1.2 KB]");
+    }
+}
+
+#[cfg(test)]
+mod view_floor_tests {
+    use super::*;
+    use crate::clock::Instant;
+    use std::time::Duration;
+
+    #[test]
+    fn a_note_lasts_two_seconds_and_an_error_never_expires() {
+        let start = Instant::now();
+        assert!(!note_expired(start, start + Duration::from_millis(1999)));
+        assert!(note_expired(start, start + Duration::from_millis(2000)));
+
+        let raw = ViewModelSnapshot {
+            last_note: Some("task created".into()),
+            last_error: Some("refused".into()),
+            ..Default::default()
+        };
+        assert_eq!(shown_copy(&raw, 0, false).last_note.as_deref(), Some("task created"));
+        let expired = shown_copy(&raw, 0, true);
+        assert_eq!(expired.last_note, None);
+        assert_eq!(expired.last_error.as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn clearing_past_the_end_of_the_history_hides_nothing_more() {
+        let raw = ViewModelSnapshot::default();
+        assert!(shown_copy(&raw, 5, false).history.is_empty());
+    }
+
+    #[test]
+    fn the_clipboard_text_is_offered_once() {
+        offer_text("pasted".to_string());
+        assert_eq!(take_offered_text().as_deref(), Some("pasted"));
+        assert_eq!(take_offered_text(), None);
+    }
+}
+
+#[cfg(test)]
+mod esc_tests {
+    use super::*;
+
+    fn idle() -> KeyFacts {
+        KeyFacts { screen: Screen::Chat, ..Default::default() }
+    }
+
+    fn esc(facts: KeyFacts, draft: &str) -> Routed {
+        route_key(Key::Escape, false, false, facts, draft)
+    }
+
+    #[test]
+    fn esc_precedence_covers_every_state() {
+        // A pending approval is denied first, even with text in the composer.
+        assert_eq!(
+            esc(KeyFacts { approval_options: Some(3), ..idle() }, "hi"),
+            Routed::Action(UiAction::Decide(2))
+        );
+        // A pending plan takes nothing.
+        assert_eq!(esc(KeyFacts { plan_pending: true, ..idle() }, "hi"), Routed::Ignored);
+        // Open suggestions close; the text stays.
+        assert_eq!(
+            esc(KeyFacts { slash_len: 2, ..idle() }, "/co"),
+            Routed::Nav(NavStep::SlashHide)
+        );
+        // A running turn is interrupted; the text stays.
+        assert_eq!(
+            esc(KeyFacts { running: true, ..idle() }, "hi"),
+            Routed::Action(UiAction::Interrupt)
+        );
+        // Idle with text: the text is cleared.
+        assert_eq!(esc(idle(), "hi"), Routed::ClearDraft);
+        // Idle, recalling a sent input: the recalled text clears too.
+        assert_eq!(
+            esc(KeyFacts { recalling: true, history_len: 3, ..idle() }, "old"),
+            Routed::ClearDraft
+        );
+        // Idle and empty: nothing.
+        assert_eq!(esc(idle(), ""), Routed::Ignored);
+    }
+
+    #[test]
+    fn esc_never_detaches_the_staged_chips() {
+        // Chips alone: nothing happens.
+        assert_eq!(esc(KeyFacts { attachments: 2, ..idle() }, ""), Routed::Ignored);
+        // Chips with text: only the text goes (Detach is Backspace's, never Esc's).
+        assert_eq!(esc(KeyFacts { attachments: 2, ..idle() }, "hi"), Routed::ClearDraft);
     }
 }

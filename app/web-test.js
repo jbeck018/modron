@@ -182,7 +182,8 @@ function startWsServer(opts = {}) {
             setTimeout(() => socket.destroy(), 1500);
           }
           send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: opts.live || {} });
-          send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
+          // quiet: no streamed text, so the session stays idle (attachments need an idle session).
+          if (!opts.quiet) send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
           (opts.after || []).forEach((extra, i) => send({ session: SESSION, seq: 2 + i, ...extra }));
         } else if (frame.type === 'submit') {
           onSubmit(frame);
@@ -402,6 +403,15 @@ async function openLive(browser, base, ws) {
   return opened;
 }
 
+// Opens the live page on an idle session (no streamed text): waits for the
+// connection label instead of the stream.
+async function openIdle(browser, base, ws) {
+  const query = `?url=${encodeURIComponent(ws.url)}&session=${SESSION}`;
+  const opened = await openPage(browser, base + '/' + query);
+  await opened.page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+  return opened;
+}
+
 // Clicks the page element whose whole text is `label`.
 async function tapLabel(page, label) {
   await page.getByText(label, { exact: true }).first().click();
@@ -436,6 +446,24 @@ async function testEscapeInterrupts(browser, base) {
     await page.waitForFunction(() => document.body.innerText.includes('stop'), null, { timeout: TIMEOUT });
     await page.keyboard.press('Escape');
     await waitFrame(ws, 'interrupt');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Esc on an idle composer with text clears the text and sends no frame.
+async function testEscClearsDraft(browser, base) {
+  const ws = await startWsServer({ live: { running: false }, quiet: true });
+  try {
+    const { page, errors } = await openIdle(browser, base, ws);
+    await page.locator('input:not([type=file]), textarea').first().click();
+    await page.keyboard.type('zz');
+    await page.waitForFunction(() => document.activeElement.value === 'zz', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => document.activeElement.value === '', null, { timeout: TIMEOUT });
+    if (ws.received.some((f) => String(f).includes('interrupt'))) throw new Error('esc sent: ' + ws.received.join(','));
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     await page.close();
   } finally {
@@ -867,6 +895,44 @@ async function testAgentSteerAndKill(browser, base) {
   }
 }
 
+// The attach control opens the file chooser for an image. The picked file is
+// one chip; the next submit carries it as one image attachment, and the chip
+// goes once the send is accepted (APP-4 item 3).
+async function testAttachSendsOneImage(browser, base) {
+  // An idle session: attachments ride only on a submit (a steer refuses them).
+  const ws = await startWsServer({ live: { running: false }, quiet: true });
+  try {
+    const { page, errors } = await openIdle(browser, base, ws);
+    await tapLabel(page, 'attach');
+    await page.waitForSelector('input[type=file]', { state: 'attached', timeout: TIMEOUT });
+    const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
+    await page.setInputFiles('input[type=file]', { name: 'shot.png', mimeType: 'image/png', buffer: png });
+    await page.waitForFunction(() => document.body.innerText.includes('shot.png'), null, { timeout: TIMEOUT });
+    // The picker left focus on the hidden file input: give the composer the focus back.
+    await page.locator('input:not([type=file]), textarea').first().click();
+    await page.keyboard.type('hi');
+    await page.waitForFunction(() => document.activeElement.value === 'hi', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    const frame = await waitFrame(ws, 'submit').catch(async (e) => {
+      const shown = await page.evaluate(() => { const a = document.activeElement; return [a && a.tagName, a && a.type, a && a.value, document.querySelectorAll('input').length].join(' | '); });
+      throw new Error(e.message + '\nfocus: ' + shown + '\nframes: ' + ws.received.join(','));
+    });
+    if (!Array.isArray(frame.attachments) || frame.attachments.length !== 1) {
+      throw new Error('submit carried ' + JSON.stringify(frame.attachments));
+    }
+    const image = frame.attachments[0];
+    if (image.kind !== 'image' || image.media_type !== 'image/png') {
+      throw new Error('attachment was ' + JSON.stringify({ kind: image.kind, media_type: image.media_type }));
+    }
+    await page.waitForFunction(() => !document.body.innerText.includes('shot.png'), null, { timeout: 8000 }).catch(async () => { throw new Error('the chip or its notice stayed; page text: ' + JSON.stringify((await page.evaluate(() => document.body.innerText)).slice(0, 600))); });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 (async () => {
   const sitePort = await freePort();
   // The portal is off here (/api/me 503), so no-url pages are the demo.
@@ -917,6 +983,8 @@ async function testAgentSteerAndKill(browser, base) {
       const s = await portalSite('on'); try { await testInviteFromSettings(browser, s); } finally { s.close(); } }],
     ['(d1) ctrl+t note, and "!ls" sends a shell frame (no submit)', () => testCtrlTAndShellPassthrough(browser, base)],
     ['(d1b) "!!ls" sends a private shell frame (no submit)', () => testBangBangPrivate(browser, base)],
+    ['(h) attach control: one image with the submit, then its chip goes', () => testAttachSendsOneImage(browser, base)],
+    ['(i) Esc on an idle composer clears the typed text, sends nothing', () => testEscClearsDraft(browser, base)],
   ];
   more.push(...portal);
   for (const [name, run] of more) {

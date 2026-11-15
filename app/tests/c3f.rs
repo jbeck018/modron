@@ -109,15 +109,42 @@ impl Harness {
         self.send(ctrl(name));
     }
 
-    fn send(&mut self, input: Input) {
+    /// Returns true when the view got the key (the host did not consume it).
+    fn send(&mut self, input: Input) -> bool {
         if let Some(input) = self.host.filter(input) {
             self.view.handle(input);
+            true
+        } else {
+            false
         }
     }
 
+    /// Waits until the engine has applied `want` as the composer text. The
+    /// host routes Enter from that text, so the next key must not race it.
+    fn wait_draft(&mut self, want: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            self.draw();
+            if modron_app::chat::composer_text() == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for composer text {want:?}\n{}",
+                self.screen()
+            );
+            let _ = self.wake.recv_timeout(Duration::from_millis(20));
+        }
+    }
+
+    /// Types one key at a time. A key the composer gets waits until the
+    /// engine has applied it, so Enter after the text reads the whole text.
     fn type_text(&mut self, text: &str) {
         for c in text.chars() {
-            self.key(&c.to_string());
+            let want = format!("{}{c}", modron_app::chat::composer_text());
+            if self.send(key(&c.to_string())) {
+                self.wait_draft(&want);
+            }
         }
     }
 
@@ -240,10 +267,7 @@ fn enter_completes_a_partial_command_then_runs_the_complete_one() {
     h.key("Enter");
     assert_eq!(h.action(), None);
     // The completion reaches the composer on the next engine turn.
-    for _ in 0..20 {
-        h.draw();
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    h.wait_draft("/compact");
     // Enter on the complete word runs it.
     h.key("Enter");
     assert_eq!(h.action(), Some(UiAction::Compact));

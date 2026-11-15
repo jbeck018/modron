@@ -21,8 +21,15 @@ use nsh_core::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::{self, style_token, token_ink, Model, SecretKey, Style, UiAction, WEB_CONTROLS};
+use modron_mobile_core::view::{
+    AUTOMATIONS_EMPTY_LABEL, AUTOMATIONS_NO_MATCH_LABEL, AUTOMATIONS_TITLE_LABEL,
+    AUTOMATION_ADD_LABEL, AUTOMATION_FORM_HINT, SAVE_DEFAULT_HINT, SAVE_DEFAULT_LABEL,
+    TASKS_EMPTY_LABEL, TASKS_NO_MATCH_LABEL, TASKS_TITLE_LABEL, TASK_FORM_HINT, TASK_MERGE_LABEL,
+    TASK_NEW_LABEL,
+};
+
 use crate::help;
-use crate::nav::{NavStep, NavView, Screen};
+use crate::nav::{FormKind, NavStep, NavView, Screen};
 
 /// Visible slots: fixed counts keep NSH's cell layout static (see the chat
 /// body's notes). Rows past the slot count are not shown.
@@ -32,6 +39,14 @@ const AUTH_SLOTS: usize = 12;
 const MODEL_SLOTS: usize = 16;
 const PORTAL_SLOTS: usize = 24;
 const INVITE_SLOTS: usize = 8;
+const AUTOMATION_SLOTS: usize = 12;
+const TASK_SLOTS: usize = 12;
+const FORM_SLOTS: usize = 3;
+
+/// Web controls for the list screens and their forms. App copy: the
+/// terminal does not draw these (its keys are the hints above each list).
+const FORM_SAVE_LABEL: &str = "save";
+const FORM_CANCEL_LABEL: &str = "cancel";
 
 /// Terminal hints for the openers. Key names are presentation (the
 /// divergence table); the web shows buttons instead.
@@ -98,7 +113,239 @@ fn chat_frame(
             let actions = actions.clone();
             move || auth_body(nav, actions.clone())
         }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Automations), {
+            let actions = actions.clone();
+            move || automations_body(nav, actions.clone())
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Tasks), {
+            let actions = actions.clone();
+            move || tasks_body(nav, actions.clone())
+        }))
         .child(when(move || nav.with(|n| n.screen == Screen::Help), help_body))
+}
+
+/// The automations screen (`/automations`): the filter, the rows (the core's
+/// text, from `view::automation_row`), the add control, the inline form, and
+/// the remove confirmation. The form's fields are text on both targets; the
+/// keys are `chat::route_key`'s.
+fn automations_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    column = column.child(text(AUTOMATIONS_TITLE_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.automations_total == 0),
+        move || text(AUTOMATIONS_EMPTY_LABEL).text_color(muted()),
+    ));
+    column = column.child(when(
+        move || nav.with(|n| n.automations_total > 0 && n.automations.is_empty()),
+        move || text(AUTOMATIONS_NO_MATCH_LABEL).text_color(muted()),
+    ));
+    for i in 0..AUTOMATION_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.automations.len() > i),
+            move || automation_row(nav, i, actions.clone()),
+        ));
+    }
+    column
+        .child(when(move || WEB_CONTROLS && nav.with(|n| n.form.is_none()), {
+            let actions = actions.clone();
+            move || {
+                tap(
+                    AUTOMATION_ADD_LABEL,
+                    actions.clone(),
+                    UiAction::Nav(NavStep::OpenForm(FormKind::Automation)),
+                )
+            }
+        }))
+        .child(form_body(nav, actions.clone()))
+        .child(confirm_line(nav, actions))
+}
+
+/// The tasks screen (`/tasks`, `/worktree`): the filter, the rows (title,
+/// branch, state), the create control, the inline form, the merge
+/// confirmation, and the last note (a task's status or the merge result).
+fn tasks_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    column = column.child(text(TASKS_TITLE_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.tasks_total == 0),
+        move || text(TASKS_EMPTY_LABEL).text_color(muted()),
+    ));
+    column = column.child(when(
+        move || nav.with(|n| n.tasks_total > 0 && n.tasks.is_empty()),
+        move || text(TASKS_NO_MATCH_LABEL).text_color(muted()),
+    ));
+    for i in 0..TASK_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.tasks.len() > i),
+            move || task_row(nav, i, actions.clone()),
+        ));
+    }
+    column = column.child(when(
+        move || nav.with(|n| n.note.is_some()),
+        move || text(move || nav.with(|n| n.note.clone().unwrap_or_default())).text_color(muted()),
+    ));
+    column
+        .child(when(move || WEB_CONTROLS && nav.with(|n| n.form.is_none()), {
+            let actions = actions.clone();
+            move || {
+                tap(
+                    TASK_NEW_LABEL,
+                    actions.clone(),
+                    UiAction::Nav(NavStep::OpenForm(FormKind::Task)),
+                )
+            }
+        }))
+        .child(form_body(nav, actions.clone()))
+        .child(confirm_line(nav, actions))
+}
+
+/// One automation row: the shared text, marked when selected. On the web its
+/// remove control asks first.
+fn automation_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let selected = move || nav.with(|n| n.selected == i);
+    let line = move || {
+        nav.with(|n| {
+            let row = n.automations.get(i).map(|r| r.text.clone()).unwrap_or_default();
+            if n.selected == i {
+                format!("> {row}")
+            } else {
+                row
+            }
+        })
+    };
+    let row = view().child(text(line).text_color(move || {
+        token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+    }));
+    if WEB_CONTROLS {
+        view().flex_row().child(row).child(tap(
+            DELETE_LABEL,
+            actions,
+            UiAction::Nav(NavStep::AskRemove(i)),
+        ))
+    } else {
+        row
+    }
+}
+
+/// One task row: the shared text, marked when selected. On the web a tap
+/// attaches the task; its merge control asks first.
+fn task_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let selected = move || nav.with(|n| n.selected == i);
+    let line = move || {
+        nav.with(|n| {
+            let row = n.tasks.get(i).map(|r| r.text.clone()).unwrap_or_default();
+            if n.selected == i {
+                format!("> {row}")
+            } else {
+                row
+            }
+        })
+    };
+    let row = view().child(text(line).text_color(move || {
+        token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+    }));
+    if WEB_CONTROLS {
+        let attach = actions.clone();
+        let attach_row = row.role(AccessibilityRole::Button).on_press(move || {
+            if let Some(id) = nav.with(|n| n.tasks.get(i).map(|r| r.id)) {
+                let _ = attach.send(UiAction::Nav(NavStep::Attach(id)));
+            }
+        });
+        view().flex_row().child(attach_row).child(tap(
+            TASK_MERGE_LABEL,
+            actions,
+            UiAction::Nav(NavStep::AskMerge(i)),
+        ))
+    } else {
+        row
+    }
+}
+
+/// The open inline form: one line per field (the active one marked), its
+/// refusal, the form's hint, and on the web the save and cancel controls.
+fn form_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    when(
+        move || nav.with(|n| n.form.is_some()),
+        move || {
+            let mut column = view().flex_col();
+            for i in 0..FORM_SLOTS {
+                column = column.child(when(
+                    move || nav.with(|n| n.form.as_ref().is_some_and(|f| f.labels.len() > i)),
+                    move || form_field(nav, i),
+                ));
+            }
+            column = column.child(when(
+                move || nav.with(|n| n.form.as_ref().and_then(|f| f.error.clone()).is_some()),
+                move || {
+                    text(move || {
+                        nav.with(|n| {
+                            n.form.as_ref().and_then(|f| f.error.clone()).unwrap_or_default()
+                        })
+                    })
+                    .text_color(move || token_ink("warning"))
+                },
+            ));
+            column = column.child(
+                text(move || {
+                    nav.with(|n| match n.form.as_ref().map(|f| f.kind) {
+                        Some(FormKind::Automation) => AUTOMATION_FORM_HINT,
+                        _ => TASK_FORM_HINT,
+                    })
+                    .to_string()
+                })
+                .text_color(muted()),
+            );
+            let save = actions.clone();
+            let cancel = actions.clone();
+            column.child(when(
+                move || WEB_CONTROLS,
+                move || {
+                    view()
+                        .flex_row()
+                        .child(tap(
+                            FORM_SAVE_LABEL,
+                            save.clone(),
+                            UiAction::Nav(NavStep::FormSubmit),
+                        ))
+                        .child(tap(
+                            FORM_CANCEL_LABEL,
+                            cancel.clone(),
+                            UiAction::Nav(NavStep::FormCancel),
+                        ))
+                },
+            ))
+        },
+    )
+}
+
+/// One form field: `> label: value` on the active field.
+fn form_field(nav: Signal<NavView>, i: usize) -> impl IntoElement {
+    text(move || {
+        nav.with(|n| {
+            n.form
+                .as_ref()
+                .and_then(|f| {
+                    let label = f.labels.get(i)?;
+                    let value = f.values.get(i)?;
+                    let mark = if f.active == i { ">" } else { " " };
+                    Some(format!("{mark} {label}: {value}"))
+                })
+                .unwrap_or_default()
+        })
+    })
+    .text_color(move || token_ink(style_token(Style::Plain)))
 }
 
 /// The credentials screen (parity D2): the core's provider rows (label and
@@ -487,11 +734,6 @@ fn models_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl
     }
     column
 }
-
-/// The save control's label (web) and the terminal's hint line. App copy:
-/// the shared formatter does not carry it yet (see the report).
-pub(crate) const SAVE_DEFAULT_LABEL: &str = "save as default";
-pub(crate) const SAVE_DEFAULT_HINT: &str = "shift+s: save the highlighted model as the default";
 
 fn model_row(
     nav: Signal<NavView>,

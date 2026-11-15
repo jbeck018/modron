@@ -5,8 +5,10 @@
 //! a bounded subprocess (2 s), so a hung clipboard service cannot hang the
 //! app. The commands run through [`Runner`], so tests inject their output.
 //!
-//! Not done: the macOS JXA pasteboard bridge the old terminal uses for
-//! images (macOS image paste reports the clipboard as empty here).
+//! macOS: the image comes from a JavaScript-for-Automation script run by
+//! `osascript`, which writes the pasteboard's PNG (TIFF converted) to stdout;
+//! text comes from `pbpaste`. The old terminal's bridge
+//! (crates/modron-tui/src/clipboard.rs) wrote the same PNG to a file.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -86,15 +88,36 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn image_tools() -> &'static [(&'static str, &'static [&'static str])] {
-    &[
-        ("wl-paste", &["--type", "image/png"]),
-        ("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"]),
-    ]
+/// The macOS image read: JXA (`osascript -l JavaScript`) takes the PNG from
+/// the pasteboard, or the TIFF converted to PNG, and writes the raw bytes to
+/// stdout. No image writes nothing, and the signature check rejects it.
+const MACOS_IMAGE_JXA: &str = "ObjC.import('AppKit'); \
+    const pb = $.NSPasteboard.generalPasteboard; \
+    let png = pb.dataForType('public.png'); \
+    if (!png) { \
+        const tiff = pb.dataForType('public.tiff'); \
+        if (tiff) { \
+            const rep = $.NSBitmapImageRep.imageRepWithData(tiff); \
+            if (rep) { png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $()); } \
+        } \
+    } \
+    if (png) { $.NSFileHandle.fileHandleWithStandardOutput.writeData(png); }";
+
+/// The image tools for a platform: macOS asks the JXA bridge, Linux asks
+/// wl-paste, then xclip.
+fn image_tools(macos: bool) -> &'static [(&'static str, &'static [&'static str])] {
+    if macos {
+        &[("osascript", &["-l", "JavaScript", "-e", MACOS_IMAGE_JXA])]
+    } else {
+        &[
+            ("wl-paste", &["--type", "image/png"]),
+            ("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"]),
+        ]
+    }
 }
 
-fn text_tools() -> &'static [(&'static str, &'static [&'static str])] {
-    if cfg!(target_os = "macos") {
+fn text_tools(macos: bool) -> &'static [(&'static str, &'static [&'static str])] {
+    if macos {
         &[("pbpaste", &[])]
     } else {
         &[("wl-paste", &["--no-newline"]), ("xclip", &["-selection", "clipboard", "-o"])]
@@ -104,17 +127,21 @@ fn text_tools() -> &'static [(&'static str, &'static [&'static str])] {
 /// Reads the clipboard through `runner`: an image first (only bytes with an
 /// image signature count), then text. Never a submit, never a write.
 pub fn harvest_with(runner: &dyn Runner) -> Harvest {
-    if !cfg!(target_os = "macos") {
-        for (program, args) in image_tools() {
-            if let Some(bytes) = runner.stdout(program, args) {
-                if let Some(mime) = sniff(&bytes) {
-                    let ext = mime.trim_start_matches("image/");
-                    return Harvest::Image { name: format!("clipboard.{ext}"), mime, bytes };
-                }
+    harvest_with_os(runner, cfg!(target_os = "macos"))
+}
+
+/// [`harvest_with`] for a named platform, so both platforms' tool choices
+/// are testable on any host.
+pub fn harvest_with_os(runner: &dyn Runner, macos: bool) -> Harvest {
+    for (program, args) in image_tools(macos) {
+        if let Some(bytes) = runner.stdout(program, args) {
+            if let Some(mime) = sniff(&bytes) {
+                let ext = mime.trim_start_matches("image/");
+                return Harvest::Image { name: format!("clipboard.{ext}"), mime, bytes };
             }
         }
     }
-    for (program, args) in text_tools() {
+    for (program, args) in text_tools(macos) {
         if let Some(bytes) = runner.stdout(program, args) {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             if !text.is_empty() {
@@ -177,6 +204,40 @@ mod tests {
     fn nothing_on_the_clipboard_is_empty() {
         assert_eq!(harvest_with(&Fake(|_, _| None)), Harvest::Empty);
         assert_eq!(harvest_with(&Fake(|_, _| Some(Vec::new()))), Harvest::Empty);
+    }
+
+    #[test]
+    fn on_macos_the_image_comes_from_osascript_and_linux_tools_are_not_asked() {
+        let fake = Fake(|program, _| match program {
+            "osascript" => Some(PNG.to_vec()),
+            _ => panic!("{program} must not run on macOS for an image"),
+        });
+        match harvest_with_os(&fake, true) {
+            Harvest::Image { name, mime, bytes } => {
+                assert_eq!(name, "clipboard.png");
+                assert_eq!(mime, "image/png");
+                assert_eq!(bytes, PNG);
+            }
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_macos_text_without_an_image_comes_from_pbpaste() {
+        let fake = Fake(|program, args| match program {
+            "osascript" => Some(Vec::new()),
+            "pbpaste" => {
+                assert!(args.is_empty());
+                Some(b"copied words".to_vec())
+            }
+            _ => None,
+        });
+        assert_eq!(harvest_with_os(&fake, true), Harvest::Text("copied words".into()));
+    }
+
+    #[test]
+    fn on_macos_a_failed_image_read_with_no_text_is_empty() {
+        assert_eq!(harvest_with_os(&Fake(|_, _| None), true), Harvest::Empty);
     }
 
     #[test]

@@ -11,12 +11,18 @@ use modron_mobile_core::view::{
     OAuthProgressView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT, MODEL_ROLE_FALLBACK,
     MODEL_ROLE_STRONG, SETTING_AUTH_LABEL,
 };
+use modron_mobile_core::view::{
+    automation_interval_error, automation_row, merge_confirm_text, task_row,
+    AUTOMATION_FIELDS_NEEDED, AUTOMATION_INTERVAL_LABEL, AUTOMATION_NAME_LABEL,
+    AUTOMATION_PROMPT_LABEL, TASK_TITLE_LABEL, TASK_TITLE_NEEDED,
+};
 use modron_mobile_core::{
     approval_mode_next, effort_next, phase_next, sandbox_next, ViewModelSnapshot,
     EFFORT_UNSET_LABEL, RULES_NONE_LABEL, SETTING_APPROVAL_LABEL, SETTING_COMPACT_LABEL,
     SETTING_CONTEXT_LABEL, SETTING_EFFORT_LABEL, SETTING_MODEL_LABEL, SETTING_PHASE_LABEL,
     SETTING_PROVIDER_LABEL, SETTING_RULES_LABEL, SETTING_SANDBOX_LABEL,
 };
+use modron_protocol::AutomationWire;
 use uuid::Uuid;
 
 use crate::chat::UiAction;
@@ -44,6 +50,12 @@ pub enum Screen {
     /// Credentials (`/auth`, the Settings auth row): the provider rows, the
     /// sign-in progress, and the masked key entry.
     Auth,
+    /// Scheduled automations (`/automations`): the list, the inline add form,
+    /// and the inline remove confirmation.
+    Automations,
+    /// Task sessions (`/tasks`, `/worktree`): the list, the inline create
+    /// form, attach, and the inline merge confirmation.
+    Tasks,
 }
 
 /// One navigation step. Keys and taps both become steps; [`Nav::apply`]
@@ -100,6 +112,73 @@ pub enum NavStep {
     AuthCancelKey,
     /// The key entry was submitted: close it (the view has sent the key).
     AuthKeyDone,
+    /// `a` on an empty filter (Automations) or `n` (Tasks), or the add
+    /// control: open the inline form for that kind.
+    OpenForm(FormKind),
+    /// A typed character into the open form's active field.
+    FormChar(char),
+    /// Backspace in the open form.
+    FormBack,
+    /// Tab: the next field (the last field stays).
+    FormNext,
+    /// Enter: the next field, or on the last field the submit.
+    FormEnter,
+    /// The form's save control (web): submit whatever field is active.
+    FormSubmit,
+    /// Esc in the open form (or its cancel control): close it.
+    FormCancel,
+    /// `d` on an automation row (or its remove control): ask first (row index).
+    AskRemove(usize),
+    /// `m` on a task row (or its merge control): ask first (row index).
+    AskMerge(usize),
+}
+
+/// Which inline form is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormKind {
+    /// Name, prompt and interval minutes.
+    Automation,
+    /// The task title.
+    Task,
+}
+
+impl FormKind {
+    fn labels(self) -> Vec<&'static str> {
+        match self {
+            FormKind::Automation => {
+                vec![AUTOMATION_NAME_LABEL, AUTOMATION_PROMPT_LABEL, AUTOMATION_INTERVAL_LABEL]
+            }
+            FormKind::Task => vec![TASK_TITLE_LABEL],
+        }
+    }
+}
+
+/// The open inline form as the view shows it: each field's label and text,
+/// the active field, and the refusal (the client's check, or none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormView {
+    pub kind: FormKind,
+    pub labels: Vec<&'static str>,
+    pub values: Vec<String>,
+    pub active: usize,
+    pub error: Option<String>,
+}
+
+/// One automation row: its name (for the remove confirmation) and the
+/// shared row text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutomationRow {
+    pub name: String,
+    pub text: String,
+}
+
+/// One task row: the session id (attach, status, merge), the branch (the
+/// merge confirmation) and the shared row text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRow {
+    pub id: Uuid,
+    pub branch: String,
+    pub text: String,
 }
 
 /// One credentials row: the core's label and status (shown verbatim), and
@@ -250,6 +329,18 @@ pub struct NavView {
     pub auth_key: Option<String>,
     /// The latest browser sign-in progress from the snapshot.
     pub auth_progress: Option<OAuthProgressView>,
+    /// The automation rows that match the filter, in the server's order.
+    pub automations: Vec<AutomationRow>,
+    /// Every automation the server listed (0 shows the empty state).
+    pub automations_total: usize,
+    /// The task rows that match the filter, and every task's count.
+    pub tasks: Vec<TaskRow>,
+    pub tasks_total: usize,
+    /// The inline form, while one is open.
+    pub form: Option<FormView>,
+    /// The snapshot's last note (a task's status or merge result) while it
+    /// is still fresh; the host expires it (see `Host::push`).
+    pub note: Option<String>,
 }
 
 impl NavView {
@@ -303,6 +394,28 @@ pub struct Nav {
     auth_key: Option<String>,
     /// The first-run check ran (see [`Nav::first_run`]).
     first_run_done: bool,
+    automations: Vec<AutomationWire>,
+    /// Sessions that carry a task branch (the Tasks screen's rows).
+    tasks: Vec<TaskRow>,
+    /// The open inline form: its kind, field texts and the active field.
+    form: Option<Form>,
+    form_error: Option<String>,
+    /// The snapshot's last note, as the host passed it (expired by the host).
+    last_note: Option<String>,
+}
+
+/// The inline form's state. `values` has one text per field of the kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Form {
+    kind: FormKind,
+    values: Vec<String>,
+    active: usize,
+}
+
+impl Form {
+    fn new(kind: FormKind) -> Self {
+        Self { kind, values: vec![String::new(); kind.labels().len()], active: 0 }
+    }
 }
 
 impl Nav {
@@ -407,6 +520,18 @@ impl Nav {
         self.auth_progress = snapshot.oauth.clone();
         self.models = model_rows(snapshot);
         self.agents = snapshot.agents.clone();
+        self.automations = snapshot.automations.clone();
+        self.last_note = snapshot.last_note.clone();
+        self.tasks = snapshot
+            .sessions
+            .iter()
+            .filter(|meta| meta.task_branch.as_deref().is_some_and(|b| !b.is_empty()))
+            .map(|meta| TaskRow {
+                id: meta.id,
+                branch: meta.task_branch.clone().unwrap_or_default(),
+                text: task_row(meta, meta.task_state.as_deref() == Some("running")),
+            })
+            .collect();
         if let Some(id) = &self.agent_id {
             if let Some(row) = self.agents.iter().find(|a| &a.id == id) {
                 self.agent_row = Some(row.clone());
@@ -434,9 +559,53 @@ impl Nav {
             .collect()
     }
 
-    /// True on the two screens with a filter line.
+    /// The automation rows that match the filter (the row text).
+    fn visible_automations(&self) -> Vec<(&AutomationWire, String)> {
+        let needle = self.filter.to_lowercase();
+        self.automations
+            .iter()
+            .map(|a| (a, automation_row(a)))
+            .filter(|(_, text)| needle.is_empty() || text.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// The task rows that match the filter (the row text).
+    fn visible_tasks(&self) -> Vec<&TaskRow> {
+        let needle = self.filter.to_lowercase();
+        self.tasks
+            .iter()
+            .filter(|row| needle.is_empty() || row.text.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Whether an inline form is open on the automations or tasks screen.
+    pub fn form_open(&self) -> bool {
+        self.form.is_some() && matches!(self.top(), Screen::Automations | Screen::Tasks)
+    }
+
+    /// The task Enter would attach (Tasks on top only).
+    pub fn selected_task(&self) -> Option<Uuid> {
+        if self.top() != Screen::Tasks {
+            return None;
+        }
+        self.visible_tasks().get(self.selected).map(|row| row.id)
+    }
+
+    /// The status request for the selected task row (Tasks on top only).
+    fn status_for_selected(&self) -> Option<UiAction> {
+        self.selected_task().map(UiAction::TaskStatusOf)
+    }
+
+    /// True on the screens with a filter line.
     fn filtering(&self) -> bool {
-        matches!(self.top(), Screen::Sessions | Screen::Models | Screen::Portal)
+        matches!(
+            self.top(),
+            Screen::Sessions
+                | Screen::Models
+                | Screen::Portal
+                | Screen::Automations
+                | Screen::Tasks
+        )
     }
 
     /// The session Enter would attach (Sessions on top only).
@@ -558,6 +727,8 @@ impl Nav {
             Screen::Sessions => self.visible().len(),
             Screen::Models => self.visible_models().len(),
             Screen::Settings => self.settings.len(),
+            Screen::Automations => self.visible_automations().len(),
+            Screen::Tasks => self.visible_tasks().len(),
         }
     }
 
@@ -570,6 +741,8 @@ impl Nav {
         self.filter.clear();
         self.selected = 0;
         self.pending = None;
+        self.form = None;
+        self.form_error = None;
     }
 
     fn leave_to_chat(&mut self) {
@@ -580,6 +753,50 @@ impl Nav {
         self.agent_id = None;
         self.agent_row = None;
         self.auth_key = None;
+        self.form = None;
+        self.form_error = None;
+    }
+
+    /// Submits the open form: the automation (checked here against the
+    /// shared interval floor; the server stays the authority) or the task.
+    /// A refused form stays open with its message.
+    fn submit_form(&mut self) -> Vec<UiAction> {
+        let Some(form) = self.form.clone() else {
+            return Vec::new();
+        };
+        match form.kind {
+            FormKind::Automation => {
+                let name = form.values[0].trim().to_string();
+                let prompt = form.values[1].trim().to_string();
+                let interval = form.values[2].trim().to_string();
+                if name.is_empty() || prompt.is_empty() || interval.is_empty() {
+                    self.form_error = Some(AUTOMATION_FIELDS_NEEDED.to_string());
+                    return Vec::new();
+                }
+                if let Some(error) = automation_interval_error(&interval) {
+                    self.form_error = Some(error);
+                    return Vec::new();
+                }
+                let Ok(interval_minutes) = interval.parse::<u32>() else {
+                    return Vec::new();
+                };
+                self.form = None;
+                self.form_error = None;
+                vec![
+                    UiAction::AddAutomation { name, prompt, interval_minutes },
+                    UiAction::ListAutomations,
+                ]
+            }
+            FormKind::Task => {
+                let title = form.values[0].trim().to_string();
+                if title.is_empty() {
+                    self.form_error = Some(TASK_TITLE_NEEDED.to_string());
+                    return Vec::new();
+                }
+                self.leave_to_chat();
+                vec![UiAction::CreateTask(title)]
+            }
+        }
     }
 
     fn complete(&mut self, name: &str) {
@@ -610,6 +827,13 @@ impl Nav {
                     }
                     Screen::Settings if self.share_active() => return vec![UiAction::ListInvites],
                     Screen::Auth => return vec![UiAction::ListAuth],
+                    Screen::Automations => return vec![UiAction::ListAutomations],
+                    // The list and, when a row is selected, its status.
+                    Screen::Tasks => {
+                        let mut actions = vec![UiAction::ListSessions];
+                        actions.extend(self.status_for_selected());
+                        return actions;
+                    }
                     _ => {}
                 }
             }
@@ -626,6 +850,8 @@ impl Nav {
                     self.agent_row = None;
                 }
                 self.auth_key = None;
+                self.form = None;
+                self.form_error = None;
                 self.stack.pop();
                 self.filter.clear();
                 self.selected = 0;
@@ -638,14 +864,76 @@ impl Nav {
             NavStep::Filter(c) if self.filtering() => {
                 self.filter.push(c);
                 self.selected = 0;
+                return self.status_for_selected().into_iter().collect();
             }
             NavStep::FilterBack if self.filtering() => {
                 self.filter.pop();
                 self.selected = 0;
+                return self.status_for_selected().into_iter().collect();
             }
             NavStep::Move(delta) => {
                 let last = self.list_len().saturating_sub(1) as isize;
                 self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+                return self.status_for_selected().into_iter().collect();
+            }
+            NavStep::OpenForm(kind) => {
+                let fits = matches!(
+                    (kind, self.top()),
+                    (FormKind::Automation, Screen::Automations) | (FormKind::Task, Screen::Tasks)
+                );
+                if fits {
+                    self.form = Some(Form::new(kind));
+                    self.form_error = None;
+                }
+            }
+            NavStep::FormChar(c) => {
+                if let Some(form) = self.form.as_mut() {
+                    form.values[form.active].push(c);
+                    self.form_error = None;
+                }
+            }
+            NavStep::FormBack => {
+                if let Some(form) = self.form.as_mut() {
+                    form.values[form.active].pop();
+                    self.form_error = None;
+                }
+            }
+            NavStep::FormNext => {
+                if let Some(form) = self.form.as_mut() {
+                    form.active = (form.active + 1).min(form.values.len() - 1);
+                }
+            }
+            NavStep::FormEnter => {
+                let last = self.form.as_ref().map(|f| f.active + 1 >= f.values.len());
+                return match last {
+                    Some(false) => self.apply(NavStep::FormNext),
+                    Some(true) => self.submit_form(),
+                    None => Vec::new(),
+                };
+            }
+            NavStep::FormSubmit => return self.submit_form(),
+            NavStep::FormCancel => {
+                self.form = None;
+                self.form_error = None;
+            }
+            NavStep::AskRemove(index) if self.top() == Screen::Automations => {
+                let found = self.visible_automations().get(index).map(|(a, _)| a.name.clone());
+                if let Some(name) = found {
+                    self.selected = index;
+                    self.pending = Some(Pending {
+                        text: delete_confirm_text(&name),
+                        actions: vec![UiAction::RemoveAutomation(name), UiAction::ListAutomations],
+                    });
+                }
+            }
+            NavStep::AskMerge(index) if self.top() == Screen::Tasks => {
+                if let Some(row) = self.visible_tasks().get(index).map(|r| (*r).clone()) {
+                    self.selected = index;
+                    self.pending = Some(Pending {
+                        text: merge_confirm_text(&row.branch),
+                        actions: vec![UiAction::MergeTask(row.id), UiAction::ListSessions],
+                    });
+                }
             }
             NavStep::OpenPortal(index) if self.top() == Screen::Portal => {
                 if let Some(url) =
@@ -754,6 +1042,22 @@ impl Nav {
             auth: self.auth.clone(),
             auth_key: self.auth_key.clone(),
             auth_progress: self.auth_progress.clone(),
+            automations: self
+                .visible_automations()
+                .into_iter()
+                .map(|(a, text)| AutomationRow { name: a.name.clone(), text })
+                .collect(),
+            automations_total: self.automations.len(),
+            tasks: self.visible_tasks().into_iter().cloned().collect(),
+            tasks_total: self.tasks.len(),
+            note: self.last_note.clone(),
+            form: self.form.as_ref().map(|f| FormView {
+                kind: f.kind,
+                labels: f.kind.labels(),
+                values: f.values.clone(),
+                active: f.active,
+                error: self.form_error.clone(),
+            }),
         }
     }
 }
@@ -1374,5 +1678,179 @@ mod model_mark_tests {
         nav.observe(&snap);
         nav.apply(NavStep::Open(Screen::Models));
         assert_eq!(nav.view().selected, 0);
+    }
+}
+
+#[cfg(test)]
+mod list_screen_tests {
+    use super::*;
+    use modron_mobile_core::view::{merge_confirm_text, TASK_TITLE_NEEDED};
+    use modron_mobile_core::{SessionMetaWire, ViewModelSnapshot};
+    use modron_protocol::AutomationWire;
+
+    fn meta(n: u128, title: &str, branch: Option<&str>, state: Option<&str>) -> SessionMetaWire {
+        SessionMetaWire {
+            id: Uuid::from_u128(n),
+            title: title.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            message_count: 0,
+            task_branch: branch.map(String::from),
+            task_state: state.map(String::from),
+            working_dir: None,
+        }
+    }
+
+    fn snapshot() -> ViewModelSnapshot {
+        ViewModelSnapshot {
+            sessions: vec![
+                meta(1, "fix parser", Some("task/fix"), Some("running")),
+                meta(2, "plain chat", None, None),
+            ],
+            session_rows: vec!["fix parser".into(), "plain chat".into()],
+            automations: vec![AutomationWire {
+                name: "nightly".into(),
+                prompt: "check the build".into(),
+                interval_minutes: 30,
+                last_run: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn nav_on(screen: Screen) -> Nav {
+        let mut nav = Nav::default();
+        nav.observe(&snapshot());
+        nav.apply(NavStep::Open(screen));
+        nav
+    }
+
+    fn type_text(nav: &mut Nav, text: &str) {
+        for c in text.chars() {
+            nav.apply(NavStep::FormChar(c));
+        }
+    }
+
+    #[test]
+    fn opening_automations_asks_for_the_list_and_shows_the_shared_rows() {
+        let mut nav = Nav::default();
+        nav.observe(&snapshot());
+        assert_eq!(nav.apply(NavStep::Open(Screen::Automations)), vec![UiAction::ListAutomations]);
+        let view = nav.view();
+        assert_eq!(view.automations_total, 1);
+        assert_eq!(view.automations[0].name, "nightly");
+        assert_eq!(view.automations[0].text, "nightly \u{b7} every 30 min \u{b7} last run never");
+    }
+
+    #[test]
+    fn the_automation_form_refuses_an_interval_below_the_floor_and_keeps_its_text() {
+        let mut nav = nav_on(Screen::Automations);
+        assert!(nav.apply(NavStep::OpenForm(FormKind::Automation)).is_empty());
+        type_text(&mut nav, "backup");
+        nav.apply(NavStep::FormEnter);
+        type_text(&mut nav, "run it");
+        nav.apply(NavStep::FormEnter);
+        type_text(&mut nav, "4");
+        assert!(nav.apply(NavStep::FormEnter).is_empty());
+        let form = nav.view().form.expect("form stays open");
+        assert_eq!(form.error.as_deref(), Some("interval must be at least 5 minutes"));
+        assert_eq!(form.values, vec!["backup", "run it", "4"]);
+        assert_eq!(form.active, 2);
+    }
+
+    #[test]
+    fn a_valid_automation_form_sends_the_add_then_a_refresh_and_closes() {
+        let mut nav = nav_on(Screen::Automations);
+        nav.apply(NavStep::OpenForm(FormKind::Automation));
+        type_text(&mut nav, "backup");
+        nav.apply(NavStep::FormNext);
+        type_text(&mut nav, "run it");
+        nav.apply(NavStep::FormNext);
+        type_text(&mut nav, "9");
+        nav.apply(NavStep::FormBack);
+        type_text(&mut nav, "15");
+        assert_eq!(
+            nav.apply(NavStep::FormSubmit),
+            vec![
+                UiAction::AddAutomation {
+                    name: "backup".into(),
+                    prompt: "run it".into(),
+                    interval_minutes: 15,
+                },
+                UiAction::ListAutomations,
+            ]
+        );
+        assert!(nav.view().form.is_none());
+    }
+
+    #[test]
+    fn escape_closes_the_form_and_a_second_escape_leaves_the_screen() {
+        let mut nav = nav_on(Screen::Automations);
+        nav.apply(NavStep::OpenForm(FormKind::Automation));
+        nav.apply(NavStep::FormCancel);
+        assert!(nav.view().form.is_none());
+        assert_eq!(nav.top(), Screen::Automations);
+        nav.apply(NavStep::Back);
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+
+    #[test]
+    fn remove_asks_first_and_the_confirmation_sends_the_remove_and_a_refresh() {
+        let mut nav = nav_on(Screen::Automations);
+        nav.apply(NavStep::AskRemove(0));
+        assert_eq!(nav.view().confirm.as_deref(), Some("delete nightly? y / n"));
+        assert_eq!(
+            nav.apply(NavStep::Confirm),
+            vec![UiAction::RemoveAutomation("nightly".into()), UiAction::ListAutomations]
+        );
+    }
+
+    #[test]
+    fn the_tasks_screen_lists_only_sessions_with_a_branch_and_asks_for_their_status() {
+        let mut nav = Nav::default();
+        nav.observe(&snapshot());
+        let opened = nav.apply(NavStep::Open(Screen::Tasks));
+        assert_eq!(
+            opened,
+            vec![UiAction::ListSessions, UiAction::TaskStatusOf(Uuid::from_u128(1))]
+        );
+        let view = nav.view();
+        assert_eq!(view.tasks_total, 1);
+        assert_eq!(view.tasks[0].text, "fix parser \u{b7} task/fix \u{b7} running");
+        assert_eq!(nav.selected_task(), Some(Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn a_task_needs_a_title_and_creating_one_goes_back_to_chat() {
+        let mut nav = nav_on(Screen::Tasks);
+        nav.apply(NavStep::OpenForm(FormKind::Task));
+        assert!(nav.apply(NavStep::FormSubmit).is_empty());
+        assert_eq!(nav.view().form.and_then(|f| f.error).as_deref(), Some(TASK_TITLE_NEEDED));
+        type_text(&mut nav, "  add tests ");
+        assert_eq!(nav.apply(NavStep::FormSubmit), vec![UiAction::CreateTask("add tests".into())]);
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+
+    #[test]
+    fn merge_asks_first_then_sends_the_merge_and_a_refresh() {
+        let mut nav = nav_on(Screen::Tasks);
+        nav.apply(NavStep::AskMerge(0));
+        assert_eq!(nav.view().confirm, Some(merge_confirm_text("task/fix")));
+        assert_eq!(
+            nav.apply(NavStep::Confirm),
+            vec![UiAction::MergeTask(Uuid::from_u128(1)), UiAction::ListSessions]
+        );
+    }
+
+    #[test]
+    fn enter_attaches_the_selected_task_and_the_filter_types() {
+        let mut nav = nav_on(Screen::Tasks);
+        nav.apply(NavStep::Filter('p'));
+        assert_eq!(nav.view().tasks.len(), 1);
+        assert_eq!(
+            nav.apply(NavStep::Attach(Uuid::from_u128(1))),
+            vec![UiAction::Attach(Uuid::from_u128(1))]
+        );
+        assert_eq!(nav.top(), Screen::Chat);
     }
 }

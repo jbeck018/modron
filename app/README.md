@@ -89,19 +89,43 @@ and its provider as the server's default for future sessions
 (`persist_default_model`). A refusal (for example over a portal tunnel) shows
 through the status line's error.
 
-Images: Ctrl+V (terminal) reads an image from the system clipboard with
-`wl-paste` or `xclip` (Linux) or `pbpaste` for text on macOS, bounded at 2 s
-per tool (`src/clipboard.rs`, the tools injectable for tests). An image becomes
-a chip above the composer (`[img name, size]`) that the next submit carries;
-Backspace on an empty composer removes the last chip before it dequeues a
-message. A refused submit keeps its chips. Not done: the macOS image read, and
-the web attach control. The old terminal did not attach typed or dropped
-paths either, so they stay text.
+Images: Ctrl+V (terminal) reads an image from the system clipboard: `wl-paste`
+or `xclip` on Linux, `osascript` (a JavaScript-for-Automation script that writes the
+pasteboard's PNG, TIFF converted, to stdout) on macOS, bounded at 2 s per tool
+(`src/clipboard.rs`, the tools injectable for tests). An image becomes a chip above
+the composer (`[img name, size]`) that the next submit carries; Backspace on an empty
+composer removes the last chip before it dequeues a message. A refused submit keeps
+its chips. With no image on the clipboard, Ctrl+V pastes the clipboard's text into
+the composer. On the web, the `attach` control beside the composer opens the browser's
+file chooser for an image: the picked file becomes the same chip (`AttachFile`, read
+with `Blob.arrayBuffer`, checked by the core's `attachment_from_bytes`). The old
+terminal did not attach typed or dropped paths either, so they stay text.
 
 Tool lists: `/allow <tool>` and `/deny <tool>` add the tool to the list for
 future runs (the core's `set_tool_lists`); bare, they show both lists.
-`/worktree <title>` creates a task session. `/automations` is recognised but
-its screen is not built yet.
+`/worktree <title>` creates a task session; bare `/worktree` and `/tasks` open the
+tasks screen. `/automations` opens the automations screen.
+
+Automations (`/automations`): the server's rows (name, every N minutes, last run),
+type-to-filter (Esc clears the filter, then closes). `a` with an empty filter (or
+the web `add` control) opens an inline form: name, prompt, interval minutes. Tab or
+Enter moves between fields, Enter on the last field saves, Esc closes it. The
+interval must be a whole number of at least 5 minutes (the server's floor, mirrored
+in `view::AUTOMATION_MIN_INTERVAL_MINUTES`); a refused form stays open with its
+message. `d` (or the web `delete` control) asks `delete <name>? y / n` first. The
+list refreshes when the screen opens and after each change.
+
+Tasks (`/tasks`, bare `/worktree`): the sessions that carry a branch, as
+`title - branch - running|idle`. Type to filter; `n` (or `new task`) opens the title
+form (Enter creates the task in its worktree and goes to chat); Enter attaches the
+selected task's session and returns to chat; `m` (or `merge`) asks `merge <branch>
+into its base? y / n`. The status line of the selected row is requested when the
+screen opens and when the selection moves, and the core's note (the status, or the
+merge result, ok or the conflict summary) shows at the foot of the screen.
+
+`/clear` hides the transcript rows on screen in this view only; nothing is sent. A
+reconnect or a session change shows them again. Notes in the status area (the core's
+`last_note`) expire after 2 s, the old terminal's toast length; `last_error` stays.
 
 `@file` completion (terminal only): an `@` that starts a token opens the
 suggestion list with workspace paths that contain the text typed after it

@@ -96,8 +96,8 @@ mod tests {
     fn a_plain_slash_word_still_lists_commands() {
         let items = for_draft("/co");
         assert!(!items.file);
-        assert_eq!(items.names, vec!["compact".to_string()]);
-        assert_eq!(items.rows.len(), 1);
+        assert_eq!(items.names, vec!["compact".to_string(), "context".to_string()]);
+        assert_eq!(items.rows.len(), 2);
         assert!(items.rows[0].contains(" - "));
     }
 

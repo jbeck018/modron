@@ -102,6 +102,36 @@ pub fn context_label(gauge: Option<ContextGaugeWire>) -> String {
     }
 }
 
+/// The longest goal the status area shows, in characters (cut with `short`).
+pub const GOAL_MAX_CHARS: usize = 60;
+
+/// The standing goal for the status area (`[goal: ship it]`, the old TUI's
+/// dim row). Empty when no goal is set, so the shell hides the row.
+pub fn goal_label(goal: &str) -> String {
+    let goal = goal.trim();
+    if goal.is_empty() {
+        String::new()
+    } else {
+        format!("[goal: {}]", modron_view::short(goal, GOAL_MAX_CHARS))
+    }
+}
+
+/// The `/context` note: the context gauge (`ctx 41% (74k/180k)`, empty when
+/// unknown), the session's cumulative tokens and cache hit rate, worded as
+/// the status line words them.
+pub fn context_note(context: &str, tokens: u64, cache_pct: Option<f64>) -> String {
+    let gauge = if context.is_empty() {
+        "ctx window unknown"
+    } else {
+        context
+    };
+    let mut note = format!("context: {gauge} \u{b7} {tokens} tok");
+    if let Some(pct) = cache_pct {
+        note.push_str(&format!(" \u{b7} cache {pct:.0}%"));
+    }
+    note
+}
+
 /// The approval mode label for the status line (`ask`/`yolo`/`deny`,
 /// default `ask`), delegating to the shared protocol label.
 pub fn approval_mode_label(mode: Option<ApprovalModeWire>) -> &'static str {
@@ -263,6 +293,100 @@ pub fn delete_confirm_text(title: &str) -> String {
 /// The inline confirmation for killing a sub-agent.
 pub fn kill_confirm_text(label: &str) -> String {
     format!("{AGENT_KILL_LABEL} {label}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
+/// The smallest interval an automation may fire at, in minutes. Mirrors
+/// `MIN_INTERVAL_MINUTES` in `crates/modron-server/src/automations.rs`: the
+/// server clamps on load and refuses a smaller interval on add. Clients check
+/// the form against this before sending; the server stays the authority, and
+/// its refusal arrives as the snapshot's last error.
+pub const AUTOMATION_MIN_INTERVAL_MINUTES: u32 = 5;
+pub const AUTOMATIONS_TITLE_LABEL: &str = "automations";
+pub const AUTOMATIONS_EMPTY_LABEL: &str = "no automations yet";
+pub const AUTOMATIONS_NO_MATCH_LABEL: &str = "no automations match";
+pub const AUTOMATION_ADD_LABEL: &str = "add";
+pub const AUTOMATION_NAME_LABEL: &str = "name";
+pub const AUTOMATION_PROMPT_LABEL: &str = "prompt";
+pub const AUTOMATION_INTERVAL_LABEL: &str = "every (minutes)";
+pub const AUTOMATION_NEVER_RUN_LABEL: &str = "never";
+pub const AUTOMATION_FORM_HINT: &str = "tab next field - enter save - esc cancel";
+pub const AUTOMATION_FIELDS_NEEDED: &str = "name, prompt and interval are needed";
+pub const AUTOMATION_INTERVAL_NOT_A_NUMBER: &str = "interval must be a whole number of minutes";
+
+/// One automation row: `name - every N min - last run TIME` (`never` before
+/// its first run). The time is [`short_time`] of the server's stamp.
+pub fn automation_row(automation: &modron_protocol::AutomationWire) -> String {
+    let last = automation
+        .last_run
+        .as_deref()
+        .map(short_time)
+        .unwrap_or_else(|| AUTOMATION_NEVER_RUN_LABEL.to_string());
+    format!(
+        "{} \u{b7} every {} min \u{b7} last run {last}",
+        automation.name, automation.interval_minutes
+    )
+}
+
+/// The form's interval check: a whole number of minutes at or above
+/// [`AUTOMATION_MIN_INTERVAL_MINUTES`]. Returns the refusal copy, None when
+/// the text is acceptable.
+pub fn automation_interval_error(text: &str) -> Option<String> {
+    match text.trim().parse::<u32>() {
+        Err(_) => Some(AUTOMATION_INTERVAL_NOT_A_NUMBER.to_string()),
+        Ok(minutes) if minutes < AUTOMATION_MIN_INTERVAL_MINUTES => Some(format!(
+            "interval must be at least {AUTOMATION_MIN_INTERVAL_MINUTES} minutes"
+        )),
+        Ok(_) => None,
+    }
+}
+
+pub const TASKS_TITLE_LABEL: &str = "tasks";
+pub const TASKS_EMPTY_LABEL: &str = "no tasks yet";
+pub const TASKS_NO_MATCH_LABEL: &str = "no tasks match";
+pub const TASK_NEW_LABEL: &str = "new task";
+pub const TASK_TITLE_LABEL: &str = "title";
+pub const TASK_MERGE_LABEL: &str = "merge";
+pub const TASK_FORM_HINT: &str = "enter create - esc cancel";
+pub const TASK_NO_BRANCH_LABEL: &str = "no branch";
+pub const TASK_TITLE_NEEDED: &str = "a task needs a title";
+
+/// One task row: `title - branch - running|idle`. A task is a session with
+/// a branch; `running` is the session's task state (the caller reads it).
+pub fn task_row(meta: &SessionMetaWire, running: bool) -> String {
+    let title = if meta.title.trim().is_empty() {
+        UNTITLED_LABEL.to_string()
+    } else {
+        meta.title.clone()
+    };
+    let branch = meta
+        .task_branch
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .unwrap_or(TASK_NO_BRANCH_LABEL);
+    let state = if running { RUNNING_LABEL } else { IDLE_LABEL };
+    format!("{title} \u{b7} {branch} \u{b7} {state}")
+}
+
+/// The inline confirmation for merging a task's branch into its base.
+pub fn merge_confirm_text(branch: &str) -> String {
+    format!("merge {branch} into its base? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
+/// The save-as-default copy (the model picker's web control and the
+/// terminal's hint line). Shared so every client words it the same way.
+pub const SAVE_DEFAULT_LABEL: &str = "save as default";
+pub const SAVE_DEFAULT_KEY: &str = "shift+s";
+pub const SAVE_DEFAULT_HINT: &str = "shift+s: save the highlighted model as the default";
+
+/// A composer queue chip: `[n] text`, n counted from 1 (the next to run).
+pub fn queue_chip(position: usize, text: &str) -> String {
+    format!("[{position}] {text}")
+}
+
+/// A steer echo: the dim `> text` row for a steer accepted but not yet
+/// persisted as a task.
+pub fn steer_echo(text: &str) -> String {
+    format!("> {text}")
 }
 
 /// The connection line: the state word, the address, and the note (when
@@ -1374,6 +1498,32 @@ pub(crate) fn fold_turn_unfinished(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn goal_label_hides_an_empty_goal_and_cuts_a_long_one() {
+        use super::{goal_label, GOAL_MAX_CHARS};
+        assert_eq!(goal_label(""), "");
+        assert_eq!(goal_label("   "), "");
+        assert_eq!(goal_label(" ship it "), "[goal: ship it]");
+        let long = "x".repeat(GOAL_MAX_CHARS + 5);
+        assert_eq!(
+            goal_label(&long),
+            format!("[goal: {}\u{2026}]", "x".repeat(GOAL_MAX_CHARS))
+        );
+    }
+
+    #[test]
+    fn context_note_words_the_gauge_tokens_and_cache() {
+        use super::context_note;
+        assert_eq!(
+            context_note("ctx 41% (74k/180k)", 1234, Some(33.0)),
+            "context: ctx 41% (74k/180k) \u{b7} 1234 tok \u{b7} cache 33%"
+        );
+        assert_eq!(
+            context_note("", 0, None),
+            "context: ctx window unknown \u{b7} 0 tok"
+        );
+    }
+
     use super::*;
     use modron_types::{Message, ToolOutcome};
 
@@ -2236,5 +2386,109 @@ mod auth_copy_tests {
         assert!(!auth_is_signed_in(AUTH_NOT_CONFIGURED));
         assert!(auth_is_signed_in("api key"));
         assert!(auth_is_signed_in("subscription (oauth)"));
+    }
+}
+
+#[cfg(test)]
+mod app4_shared_copy_tests {
+    use super::*;
+    use modron_protocol::AutomationWire;
+
+    fn automation(last_run: Option<&str>) -> AutomationWire {
+        AutomationWire {
+            name: "nightly".into(),
+            prompt: "check the build".into(),
+            interval_minutes: 30,
+            last_run: last_run.map(String::from),
+        }
+    }
+
+    fn task_meta(title: &str, branch: Option<&str>) -> SessionMetaWire {
+        SessionMetaWire {
+            id: Uuid::from_u128(7),
+            title: title.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            message_count: 0,
+            task_branch: branch.map(String::from),
+            task_state: None,
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn automation_row_shows_name_interval_and_last_run() {
+        assert_eq!(
+            automation_row(&automation(None)),
+            "nightly \u{b7} every 30 min \u{b7} last run never"
+        );
+        assert_eq!(
+            automation_row(&automation(Some("2026-11-14T09:30:00Z"))),
+            "nightly \u{b7} every 30 min \u{b7} last run 2026-11-14 09:30"
+        );
+    }
+
+    #[test]
+    fn the_interval_floor_is_the_servers_five_minutes() {
+        // Pinned to MIN_INTERVAL_MINUTES in crates/modron-server/src/automations.rs.
+        assert_eq!(AUTOMATION_MIN_INTERVAL_MINUTES, 5);
+    }
+
+    #[test]
+    fn the_interval_check_refuses_text_and_values_below_the_floor() {
+        assert_eq!(automation_interval_error(" 5 "), None);
+        assert_eq!(automation_interval_error("60"), None);
+        assert_eq!(
+            automation_interval_error("4").as_deref(),
+            Some("interval must be at least 5 minutes")
+        );
+        assert_eq!(
+            automation_interval_error("0").as_deref(),
+            Some("interval must be at least 5 minutes")
+        );
+        assert_eq!(
+            automation_interval_error("soon").as_deref(),
+            Some(AUTOMATION_INTERVAL_NOT_A_NUMBER)
+        );
+        assert_eq!(
+            automation_interval_error("-5").as_deref(),
+            Some(AUTOMATION_INTERVAL_NOT_A_NUMBER)
+        );
+        assert_eq!(
+            automation_interval_error("").as_deref(),
+            Some(AUTOMATION_INTERVAL_NOT_A_NUMBER)
+        );
+    }
+
+    #[test]
+    fn task_row_names_the_title_branch_and_state() {
+        assert_eq!(
+            task_row(&task_meta("fix parser", Some("task/fix-parser")), true),
+            "fix parser \u{b7} task/fix-parser \u{b7} running"
+        );
+        assert_eq!(
+            task_row(&task_meta("", None), false),
+            format!("{UNTITLED_LABEL} \u{b7} {TASK_NO_BRANCH_LABEL} \u{b7} idle")
+        );
+    }
+
+    #[test]
+    fn merge_confirmation_names_the_branch_and_both_answers() {
+        assert_eq!(
+            merge_confirm_text("task/fix-parser"),
+            "merge task/fix-parser into its base? y / n"
+        );
+    }
+
+    #[test]
+    fn queue_chip_and_steer_echo_keep_their_shapes() {
+        assert_eq!(queue_chip(2, "next"), "[2] next");
+        assert_eq!(steer_echo("also check tests"), "> also check tests");
+    }
+
+    #[test]
+    fn save_default_copy_leads_with_its_key() {
+        assert!(SAVE_DEFAULT_HINT.starts_with(SAVE_DEFAULT_KEY));
+        assert_eq!(SAVE_DEFAULT_LABEL, "save as default");
     }
 }

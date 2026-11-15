@@ -457,3 +457,80 @@ fn listen_keys(web: Rc<RefCell<Web>>) {
     // The page keeps the listener for its whole life.
     on_key.forget();
 }
+
+// ---- Attach control (APP-4 item 3) ----
+
+thread_local! {
+    /// The hidden file input (made on first use) and its change handler. The
+    /// handler is kept here so the browser never holds a dropped closure.
+    static PICKER: RefCell<Option<(web_sys::HtmlInputElement, Closure<dyn FnMut(web_sys::Event)>)>> =
+        RefCell::new(None);
+    /// The action sender the picked file goes to (the driver's channel).
+    static PICK_TO: RefCell<Option<UnboundedSender<crate::chat::UiAction>>> = RefCell::new(None);
+}
+
+/// Opens the file chooser for an image (the attach control). The input is
+/// hidden and made once; its change event reads the file and sends
+/// `AttachFile`, which the driver stages as a chip, as Ctrl+V does.
+pub fn open_file_picker(actions: UnboundedSender<crate::chat::UiAction>) {
+    PICK_TO.with(|slot| *slot.borrow_mut() = Some(actions));
+    let input = PICKER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = make_picker();
+        }
+        slot.as_ref().map(|(input, _)| input.clone())
+    });
+    if let Some(input) = input {
+        input.set_value("");
+        input.click();
+    }
+}
+
+fn make_picker() -> Option<(web_sys::HtmlInputElement, Closure<dyn FnMut(web_sys::Event)>)> {
+    let document = web_sys::window()?.document()?;
+    let input =
+        document.create_element("input").ok()?.dyn_into::<web_sys::HtmlInputElement>().ok()?;
+    input.set_type("file");
+    input.set_accept("image/*");
+    input.set_hidden(true);
+    document.body()?.append_child(&input).ok()?;
+    let on_change = Closure::<dyn FnMut(web_sys::Event)>::new(|event: web_sys::Event| {
+        let file = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            .and_then(|input| input.files())
+            .and_then(|files| files.get(0));
+        let Some(file) = file else {
+            return;
+        };
+        let Some(to) = PICK_TO.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        spawn_local(async move {
+            let name = file.name();
+            let mime = file.type_();
+            let action = match read_file(&file).await {
+                Ok(bytes) => crate::chat::UiAction::AttachFile { name, mime, bytes },
+                Err(reason) => crate::chat::UiAction::Notice(reason),
+            };
+            let _ = to.send(action);
+        });
+    });
+    input.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref()).ok()?;
+    Some((input, on_change))
+}
+
+/// The file's bytes through `Blob.arrayBuffer()`, called by name so no
+/// extra web-sys feature is needed.
+async fn read_file(file: &web_sys::File) -> Result<Vec<u8>, String> {
+    const REFUSED: &str = "the browser would not read that file";
+    let refused = || REFUSED.to_string();
+    let method =
+        js_sys::Reflect::get(file, &JsValue::from_str("arrayBuffer")).map_err(|_| refused())?;
+    let method: js_sys::Function = method.dyn_into().map_err(|_| refused())?;
+    let promise: js_sys::Promise =
+        method.call0(file).map_err(|_| refused())?.dyn_into().map_err(|_| refused())?;
+    let buffer = JsFuture::from(promise).await.map_err(|_| refused())?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}

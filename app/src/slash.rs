@@ -41,11 +41,9 @@ pub const LOCAL: &[Entry] = &[
     Entry { name: "goal", usage: "/goal [condition]", about: "stop condition for long runs" },
     Entry { name: "agent", usage: "/agent <name>", about: "switch persona" },
     Entry { name: "exit", usage: "/exit", about: "leave the app" },
+    Entry { name: "clear", usage: "/clear", about: "clear the transcript view (nothing is sent)" },
+    Entry { name: "context", usage: "/context", about: "context window, tokens and cache use" },
 ];
-
-/// Shown for `/automations` until its screen exists.
-const AUTOMATIONS_NOT_BUILT: &str =
-    "automations screen is not in this app yet; use modron automations";
 
 /// The shared table as entries, in its order.
 fn table_entries() -> Vec<Entry> {
@@ -174,16 +172,17 @@ pub fn run(line: &str) -> UiAction {
         "agent" | "persona" if args.is_empty() => UiAction::Notice(AGENT_USAGE.to_string()),
         "agent" | "persona" => UiAction::SetPersona(args.to_string()),
         "exit" | "quit" | "q" => UiAction::Exit,
+        "clear" => UiAction::Clear,
+        "context" => UiAction::Context,
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,
-        "tasks" => UiAction::TaskStatus,
+        "tasks" => UiAction::Nav(NavStep::Open(Screen::Tasks)),
         "allow" | "deny" if args.is_empty() => UiAction::ShowToolLists,
         "allow" => UiAction::AddToolRule { allow: true, tool: args.to_string() },
         "deny" => UiAction::AddToolRule { allow: false, tool: args.to_string() },
-        // The automations screen (PARITY-D2 item 18) is not built yet: the
-        // word is recognised so the command list and help stay honest.
-        "automations" => UiAction::Notice(AUTOMATIONS_NOT_BUILT.to_string()),
-        "worktree" | "worktrees" if args.is_empty() => usage("worktree"),
+        "automations" => UiAction::Nav(NavStep::Open(Screen::Automations)),
+        // Bare `/worktree` opens the tasks screen; with a title it creates the task.
+        "worktree" | "worktrees" if args.is_empty() => UiAction::Nav(NavStep::Open(Screen::Tasks)),
         "worktree" | "worktrees" => UiAction::CreateTask(args.to_string()),
         "share" | "publish" => UiAction::Share,
         "remote-control" | "rc" if args.is_empty() => usage("remote-control"),
@@ -271,6 +270,7 @@ mod tests {
         assert_eq!(run("/effort max"), UiAction::SetEffort(Some(Effort::Max)));
         assert_eq!(run("/build"), UiAction::SetPhase(Phase::Build));
         assert_eq!(run("/exit"), UiAction::Exit);
+        assert_eq!(run("/clear"), UiAction::Clear);
         assert_eq!(run("/q"), UiAction::Exit);
         assert_eq!(run("/login"), UiAction::Nav(NavStep::Open(Screen::Auth)));
         assert_eq!(run("/rc ws://x"), UiAction::RemoteControl("ws://x".into()));
@@ -284,6 +284,10 @@ mod tests {
         assert_eq!(run("/btw"), UiAction::Notice(BTW_USAGE.into()));
         assert_eq!(run("/learn Fix Parser"), UiAction::Send(learn_task("Fix Parser")));
         assert_eq!(run("/remote-control ws://x"), UiAction::RemoteControl("ws://x".into()));
+        assert_eq!(run("/automations"), UiAction::Nav(NavStep::Open(Screen::Automations)));
+        assert_eq!(run("/tasks"), UiAction::Nav(NavStep::Open(Screen::Tasks)));
+        assert_eq!(run("/worktree"), UiAction::Nav(NavStep::Open(Screen::Tasks)));
+        assert_eq!(run("/worktree fix parser"), UiAction::CreateTask("fix parser".into()));
     }
 
     #[test]
@@ -295,7 +299,7 @@ mod tests {
     #[test]
     fn typing_co_suggests_compact_and_completion_keeps_the_word() {
         let names: Vec<&str> = suggestions_for("/co").iter().map(|e| e.name).collect();
-        assert_eq!(names, vec!["compact"]);
+        assert_eq!(names, vec!["compact", "context"]);
         assert_eq!(complete_text("model"), "/model ");
         assert_eq!(complete_text("help"), "/help");
     }

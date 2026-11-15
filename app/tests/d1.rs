@@ -69,24 +69,69 @@ impl Harness {
     }
 
     /// Draws for a short while, so the engine applies what the host sent.
+    /// Draws until the engine commits nothing for 50 ms, bounded at 5 s: a
+    /// pushed snapshot is applied before the next key. The wake channel
+    /// reports engine commits, so this waits on the engine, not on time.
     fn settle(&mut self) {
-        let end = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < end {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
             self.draw();
+            if self.wake.recv_timeout(Duration::from_millis(50)).is_err() || Instant::now() >= end {
+                return;
+            }
+        }
+    }
+
+    /// Waits until the screen shows `what`, waking on engine commits.
+    fn settle_on(&mut self, what: &str) {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.draw();
+            if self.screen().contains(what) {
+                return;
+            }
+            assert!(Instant::now() < end, "timed out waiting for {what}\n{}", self.screen());
             let _ = self.wake.recv_timeout(Duration::from_millis(20));
         }
     }
 
     /// Routes a key the way the real terminal host does.
-    fn send(&mut self, input: Input) {
+    /// Returns true when the view got the key (the host did not consume it).
+    fn send(&mut self, input: Input) -> bool {
         if let Some(input) = self.host.filter(input) {
             self.view.handle(input);
+            true
+        } else {
+            false
         }
     }
 
+    /// Waits until the engine has applied `want` as the composer text. The
+    /// host routes Enter from that text, so the next key must not race it.
+    fn wait_draft(&mut self, want: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            self.draw();
+            if modron_app::chat::composer_text() == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for composer text {want:?}\n{}",
+                self.screen()
+            );
+            let _ = self.wake.recv_timeout(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Types one key at a time; a key the composer gets waits until the
+    /// engine has applied it (Enter after the text reads the whole text).
     fn type_text(&mut self, text: &str) {
         for c in text.chars() {
-            self.send(key(&c.to_string()));
+            let want = format!("{}{c}", modron_app::chat::composer_text());
+            if self.send(key(&c.to_string())) {
+                self.wait_draft(&want);
+            }
         }
     }
 
@@ -186,7 +231,7 @@ fn connected(h: &mut Harness) {
         connection_label: "connected".into(),
         ..Default::default()
     });
-    h.settle();
+    h.settle_on("connected");
 }
 
 #[test]

@@ -94,9 +94,13 @@ impl Harness {
 
     /// Routes a key the way the real host does: the link's filter first,
     /// then the NSH view.
-    fn send(&mut self, input: Input) {
+    /// Returns true when the view got the key (the host did not consume it).
+    fn send(&mut self, input: Input) -> bool {
         if let Some(input) = self.host.filter(input) {
             self.view.handle(input);
+            true
+        } else {
+            false
         }
     }
 
@@ -250,6 +254,59 @@ fn escape_sends_interrupt() {
     h.wait_for("transcript", |s| s.contains("fix the router crate"));
     h.send(key("Escape"));
     assert_eq!(h.action(), Some(UiAction::Interrupt));
+}
+
+#[test]
+fn esc_on_an_idle_composer_clears_the_text_and_sends_nothing() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    snapshot.running = false;
+    h.push(&snapshot);
+    h.wait_for("transcript", |s| s.contains("fix the router crate"));
+    h.type_text("zz");
+    h.wait_for("typed", |s| s.contains("zz"));
+    h.send(key("Escape"));
+    h.wait_for("cleared", |s| !s.contains("zz"));
+    assert_eq!(h.action(), None);
+}
+
+#[test]
+fn context_command_shows_the_snapshot_numbers_as_a_note() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    snapshot.running = false;
+    snapshot.context_label = "ctx 41% (74k/180k)".into();
+    snapshot.cumulative_tokens = 1234;
+    snapshot.session_cache_pct = Some(33.0);
+    h.push(&snapshot);
+    h.wait_for("transcript", |s| s.contains("fix the router crate"));
+    h.type_text("/context");
+    h.send(key("Enter"));
+    // The host makes the note when it pumps the action; the action never
+    // reaches the driver, so every pump returns nothing.
+    let want = "context: ctx 41% (74k/180k) \u{b7} 1234 tok \u{b7} cache 33%";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert_eq!(h.host.try_action(), None);
+        h.draw();
+        if h.screen().contains(want) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for the note\n{}", h.screen());
+        let _ = h.wake.recv_timeout(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_standing_goal_shows_in_the_header() {
+    let mut h = Harness::new();
+    let mut snapshot = fixture();
+    snapshot.goal = "ship the parity packet".into();
+    h.push(&snapshot);
+    h.wait_for("goal", |s| s.contains("[goal: ship the parity packet]"));
+    snapshot.goal = String::new();
+    h.push(&snapshot);
+    h.wait_for("goal cleared", |s| !s.contains("[goal:"));
 }
 
 #[test]

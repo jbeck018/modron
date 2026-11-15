@@ -723,6 +723,13 @@ impl RemoteClient {
         self.shared.state.lock().unwrap().vm.last_error = Some(text.into());
     }
 
+    /// Clears a notice set with [`Self::note_local_error`] once it no
+    /// longer applies (for example "attached ..." after the message it
+    /// refers to has been sent). Server errors arriving later set it again.
+    pub fn clear_local_error(&self) {
+        self.shared.state.lock().unwrap().vm.last_error = None;
+    }
+
     /// Marks the session id as explicitly chosen: a later frame naming
     /// another session is not ignored as a mismatch.
     fn explicit_session(&self) {

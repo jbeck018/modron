@@ -7,7 +7,7 @@ use modron_view::slash::{slash_help_lines, slash_lookup};
 use uuid::Uuid;
 
 use crate::chat::{Key, KeyFacts, Routed, ScrollStep, ToolsStep, UiAction};
-use crate::nav::{NavStep, Screen};
+use crate::nav::{FormKind, NavStep, Screen};
 use crate::slash;
 
 /// One binding: the label and wording help shows, and a routing case the
@@ -40,6 +40,77 @@ fn session_id() -> Uuid {
 /// Every binding the app has, in help order.
 pub fn bindings() -> Vec<Binding> {
     vec![
+        Binding {
+            label: "a (automations)",
+            what: "opens the add form: name, prompt, interval minutes (tab next, enter save, esc cancel)",
+            key: Key::Char('a'),
+            chord: false,
+            alt: false,
+            facts: || {
+                with(|f| {
+                    f.screen = Screen::Automations;
+                })
+            },
+            draft: "",
+            expect: || Routed::Nav(NavStep::OpenForm(FormKind::Automation)),
+        },
+        Binding {
+            label: "d (automations)",
+            what: "asks to remove the selected automation (y removes, n keeps it)",
+            key: Key::Char('d'),
+            chord: false,
+            alt: false,
+            facts: || {
+                with(|f| {
+                    f.screen = Screen::Automations;
+                })
+            },
+            draft: "",
+            expect: || Routed::Nav(NavStep::AskRemove(0)),
+        },
+        Binding {
+            label: "n (tasks)",
+            what: "opens the new task form (its title; enter creates it in a worktree)",
+            key: Key::Char('n'),
+            chord: false,
+            alt: false,
+            facts: || {
+                with(|f| {
+                    f.screen = Screen::Tasks;
+                })
+            },
+            draft: "",
+            expect: || Routed::Nav(NavStep::OpenForm(FormKind::Task)),
+        },
+        Binding {
+            label: "m (tasks)",
+            what: "asks to merge the selected task's branch into its base (y merges, n keeps it)",
+            key: Key::Char('m'),
+            chord: false,
+            alt: false,
+            facts: || {
+                with(|f| {
+                    f.screen = Screen::Tasks;
+                })
+            },
+            draft: "",
+            expect: || Routed::Nav(NavStep::AskMerge(0)),
+        },
+        Binding {
+            label: "enter (tasks)",
+            what: "attaches the selected task's session and returns to chat",
+            key: Key::Enter,
+            chord: false,
+            alt: false,
+            facts: || {
+                with(|f| {
+                    f.screen = Screen::Tasks;
+                    f.selected_task = Some(session_id());
+                })
+            },
+            draft: "",
+            expect: || Routed::Nav(NavStep::Attach(session_id())),
+        },
         Binding {
             label: "ctrl+v",
             what: "paste an image from the clipboard as a chip for the next message",
@@ -140,8 +211,18 @@ pub fn bindings() -> Vec<Binding> {
             expect: || Routed::Action(UiAction::Queue("hi".into())),
         },
         Binding {
+            label: "esc (composer)",
+            what: "clear the composer text when nothing else takes esc (chips stay)",
+            key: Key::Escape,
+            chord: false,
+            alt: false,
+            facts: chat,
+            draft: "hi",
+            expect: || Routed::ClearDraft,
+        },
+        Binding {
             label: "esc",
-            what: "deny the pending approval, else interrupt the run",
+            what: "deny the pending approval, else close suggestions, else interrupt the run",
             key: Key::Escape,
             chord: false,
             alt: false,
@@ -400,8 +481,14 @@ pub const HOST_BINDINGS: &[(&str, &str)] =
     &[("ctrl+c", "interrupt the running turn; a second press within 2 s, or when idle, quits")];
 
 pub fn help_lines() -> Vec<String> {
+    // The list screens' keys (automations, tasks) come after the commands:
+    // help has no scroll, and this keeps the commands heading where it was on
+    // a 40-row terminal.
+    let (list_keys, keys): (Vec<Binding>, Vec<Binding>) = bindings()
+        .into_iter()
+        .partition(|b| matches!((b.facts)().screen, Screen::Automations | Screen::Tasks));
     let mut lines = vec![HELP_KEYS_HEADING.to_string()];
-    lines.extend(bindings().iter().map(|b| format!("{}   {}", b.label, b.what)));
+    lines.extend(keys.iter().map(|b| format!("{}   {}", b.label, b.what)));
     lines.extend(HOST_BINDINGS.iter().map(|(label, what)| format!("{label}   {what}")));
     lines.push(HELP_COMMANDS_HEADING.to_string());
     lines.extend(slash_help_lines());
@@ -412,6 +499,7 @@ pub fn help_lines() -> Vec<String> {
             .filter(|e| slash_lookup(e.name).is_none())
             .map(|e| format!("{} - {}", e.usage, e.about)),
     );
+    lines.extend(list_keys.iter().map(|b| format!("{}   {}", b.label, b.what)));
     lines
 }
 
