@@ -1656,3 +1656,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   wasm32 check clean; 231 tests, three consecutive full runs green;
   web-test.js 29 of 29 on three consecutive runs. Client core 119
   tests, clippy clean.
+- 2026-11-15: full e2e against the current tree: 21 of 22, the one
+  failure being W4, which still expected an approval prompt for the
+  owner's shell command. Rewritten to PLAN 10.2a (no prompt, `!!`
+  private frame, runs in deny mode) and passing: 22 of 22.

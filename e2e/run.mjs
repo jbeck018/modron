@@ -597,30 +597,34 @@ await scenario('W3', 'settings round trip: effort and approval mode echo into th
     'status line does not show "effort low" and "yolo" after the echo');
 });
 
-await scenario('W4', 'shell passthrough: approval, output in transcript; /mode deny refuses', async (s) => {
+// PLAN 10.2a: the owner's own `!command` is not approval-prompted (the
+// approval mode restricts the model, not the user), `!cmd` joins the
+// transcript, and `!!cmd` is private. Deny mode therefore does not refuse it.
+await scenario('W4', 'shell passthrough: runs without an approval, output shown; !! is private; deny mode does not block the owner', async (s) => {
   const { lx, sid, vw } = await sharedSession('w4', 'e2e w4');
   lx.setAuto(false);
   const from = lx.frames.length;
   await typeAndSend(vw, '!echo e2e-shell-ok');
-  const req = await soft(s, lx.waitFor((f) => f.type === 'approval_requested' && f.session === sid, 30000, 'shell approval', from),
-    'the shell command asked for no approval');
-  await soft(s, waitBody(vw, (t) => t.includes('allow once'), 20000, 'approval strip'), 'approval strip not shown for shell');
-  await clickText(vw, 'allow once');
-  if (req) await soft(s, lx.waitFor((f) => f.type === 'approval_resolved' && f.request_id === req.request_id, 15000, 'resolved', from), 'shell approval not resolved');
   await soft(s, lx.turnDone(sid, 60000, from), 'shell turn did not finish');
+  s.check(!lx.frames.slice(from).some((f) => f.type === 'approval_requested'), 'the owner was asked to approve their own shell command');
   await soft(s, waitUntil(async () => {
     const t = await bodyText(vw);
-    return /(^|\n)\s*e2e-shell-ok\s*(\n|$)/.test(t) && !t.includes('allow once');
+    return /(^|\n)\s*e2e-shell-ok\s*(\n|$)/.test(t);
   }, 20000, 'shell output'), 'shell output not shown in the transcript');
 
+  const priv = lx.frames.length;
+  await typeAndSend(vw, '!!echo e2e-shell-private');
+  await soft(s, lx.turnDone(sid, 60000, priv), 'private shell turn did not finish');
+  s.check(wsFrames(vw, 'out', '"private":true').length > 0, 'the browser did not send a private shell frame for !!');
+  await soft(s, waitBody(vw, (t) => t.includes('e2e-shell-private'), 20000, 'private output'), 'private shell output not shown to the user');
+
   await typeAndSend(vw, '/mode deny');
-  await soft(s, lx.waitFor((f) => f.type === 'config_changed', 15000, 'mode deny echo', from), 'no config echo for /mode deny');
+  await soft(s, lx.waitFor((f) => f.type === 'config_changed', 15000, 'mode deny echo', priv), 'no config echo for /mode deny');
   const mark = lx.frames.length;
-  await typeAndSend(vw, '!echo e2e-shell-denied');
-  await soft(s, lx.turnDone(sid, 60000, mark), 'denied shell turn did not finish');
-  s.check(!lx.frames.slice(mark).some((f) => f.type === 'approval_requested'), 'deny mode still asked for approval');
-  const refusal = lx.frames.slice(mark).some((f) => /denied|refus|not allowed|deny/i.test(JSON.stringify(f)));
-  s.check(refusal, 'no refusal reached the server frames for the denied shell command');
+  await typeAndSend(vw, '!echo e2e-shell-in-deny-mode');
+  await soft(s, lx.turnDone(sid, 60000, mark), 'shell turn in deny mode did not finish');
+  s.check(!lx.frames.slice(mark).some((f) => f.type === 'approval_requested'), 'deny mode asked for approval');
+  await soft(s, waitBody(vw, (t) => t.includes('e2e-shell-in-deny-mode'), 20000, 'output in deny mode'), 'the owner command did not run in deny mode');
 });
 
 // A remote-control tunnel is pinned to one session: the serve refuses list,
