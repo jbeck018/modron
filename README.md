@@ -124,8 +124,14 @@ Checks the latest GitHub release, downloads the platform archive and replaces
 the binary. The previous binary is kept as `modron.bak`. When `modron-app-tui` is
 installed next to `modron` and the archive carries it, it is replaced the same way
 (kept as `modron-app-tui.bak`); older archives do not carry it and leave it alone.
-Limitation: the upgrade does not check the archive against `SHA256SUMS`; it only runs
-the new `modron --version` before replacing anything. The TUI and chat show
+The archive is checked against the release's `SHA256SUMS` (SHA-256) before anything
+is extracted or replaced; a missing manifest, a missing entry, a malformed manifest or
+a digest mismatch aborts the upgrade and leaves the installed binaries untouched.
+This catches a corrupted or truncated download and an archive replaced without the
+manifest changing. It does NOT protect against an attacker who can replace both the
+archive and `SHA256SUMS` in the release; that needs signed releases, which this project
+does not have yet. Downgrades are refused, and redirects are followed only to https.
+The TUI and chat show
 an upgrade notice when a newer release exists. The check runs at most once per
 24h and is cached in `~/.modron/update-check.json`.
 

@@ -18,6 +18,7 @@ pub mod daemon;
 pub mod onboarding;
 use daemon as modron_daemon;
 pub mod auth;
+mod checksums;
 pub mod config;
 pub mod evals;
 pub mod upgrade;
