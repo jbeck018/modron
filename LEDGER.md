@@ -1375,3 +1375,79 @@ Round 2 (same day): the low-severity findings and open items were worked
 through as well - see sections 7 and 8 of `docs/SECURITY_PLAN.md` for
 what was done, what is still open and why. Gate evidence: 922 tests pass,
 clippy and fmt clean on Linux.
+
+
+# Program U - unified NSH client, Cloudflare portal, harness gaps (opened 2026-11-15)
+
+Plan: PLAN.md section 10. Lead: the lead architect (single writer of this
+ledger). Workers are small-model agents given one packet each with an
+explicit file list; they do not commit. The lead reviews every diff, runs
+the gates (fmt, clippy -D warnings, test --workspace --exclude
+modron-desktop on Linux) and commits.
+
+Status values: TODO, ACTIVE, DONE, BLOCKED (with the blocker and who can
+clear it). A packet is DONE only with evidence (commit + gate result).
+
+## Rules for this program
+
+- Old clients (modron-tui views, modron-desktop, mobile/app TSX) are
+  frozen: no packet adds features to them. Shared logic goes to
+  modron-view, modron-protocol or the client core.
+- One packet = one worker = a disjoint file list. Engine packets
+  (crates/modron-core/src/engine.rs) run one at a time.
+- New protocol events are documented in docs/PROTOCOL_V2.md and in
+  modron-protocol doc comments before any client renders them.
+
+## Packets
+
+### Spikes
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| S1 | NSH web target in Rust: one transcript screen over the wasm client core; measure bundle size, load time, input | TODO | |
+| S2 | NSH terminal target: startup time, streaming at token rate, scrollback | TODO | |
+| S3 | furrow snapshot/restore over R2 from a container | BLOCKED | Needs an R2 bucket and credentials (owner) |
+
+### Protocol
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| P1 | docs/PROTOCOL_V2.md: steer/queue, plan approval, sub-agent approvals and counters, reviewer verdict, pause/wake, actor+role | TODO | |
+
+### Harness
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| H1 | Steer and queue messages during a run (engine, server hub, protocol) | TODO | |
+| H2 | Enforced plan phase, approve step, per-turn plan re-injection | TODO | |
+| H3 | Sub-agents: approvals to parent, live counters, completion events, cap | TODO | |
+| H4 | Reviewer role + verdict event + non-LLM claim checks | TODO | |
+| H5 | Scheduled wakeups, pause reasons, completion/block notifications | TODO | |
+| H6 | Hash-anchored line edits, measured with modron bench | TODO | |
+| H7 | Reasoning-effort parameter and named model roles | TODO | |
+| H8 | Command and path permission rules + explain command | TODO | |
+| H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | TODO | |
+| H9b | Real compact command and true context occupancy over the protocol | TODO | |
+| H9c | Hooks: turn-end and session-start events | TODO | |
+| H9d | MCP over HTTP | TODO | |
+| H9e | Web fetch tool | TODO | |
+
+### Client
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | TODO | |
+| C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | TODO | |
+| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | TODO | Depends on S1 |
+| C4 | Portal: Worker serves the web build; owner sign-in; linked GitHub accounts; session directory; invite links | TODO | Deploy needs the owner's Cloudflare login |
+| C5 | Tandem: multi-device attach, replay on reconnect, push for approvals | TODO | |
+| C6 | Cloud runs: container runs modron serve; sleep/restore; handoff | TODO | Depends on S3; deploy needs the owner's Cloudflare login |
+| C7 | Terminal target from the NSH app | TODO | Depends on S2 |
+| C8 | Phone packaging (iOS, Android) | BLOCKED | Needs macOS/Xcode and signing (owner) |
+| C9 | Delete modron-tui views, modron-desktop, mobile/app TSX, bridge inline viewer; rewrite the AGENTS.md parity contract | TODO | After C3, C7 |
+| C10 | CI: nsh check / nsh test; drop the gpui exclusion | TODO | |
+
+## Log
+
+- 2026-11-15: program opened; plan and decisions recorded in PLAN.md
+  section 10.

@@ -256,7 +256,8 @@ models at zero markup, BYOK + local models. Feature snapshot vs Modron:
    **Backlog A3.**
 4. **Surface breadth** (IDE/desktop/cloud/mobile): we will not chase this.
    Our answer is terminal-first + the planned ACP server (Zed) — one protocol
-   instead of six GUI codebases.
+   instead of six GUI codebases. (Superseded 2026-11-15 by section 10: one
+   NSH client codebase for every surface, still one protocol.)
 
 **Marketplace posture:** Kilo ships a curated Skills/Agents/Plugins gallery.
 Modron consumes the SKILL.md open standard already — run a compatibility pass
@@ -267,3 +268,95 @@ against popular community skills instead of building a marketplace.
 
 `LEDGER.md` — the live work ledger. Single writer: the lead architect.
 Workers report; the lead verifies against acceptance criteria and records evidence.
+
+## 10. Program U - unified client, Cloudflare portal, harness gaps (2026-11-15)
+
+Goal: a harness as easy to use as Claude Code or pi, reachable from any
+device, running locally, in the cloud, or both in tandem. Three things
+change: (a) every UI surface is rebuilt as ONE NSH app (https://nsh.dev,
+Rust UI framework with web, iOS, Android, desktop and terminal backends);
+(b) Cloudflare becomes the hub (portal, relay, cloud runs); (c) the harness
+closes the gaps found against pi, oh-my-pi, jcode and dirge. Those four
+projects are references for gaps only: nothing is adopted as a dependency
+and no code is copied (dirge is GPL-3.0).
+
+### 10.1 Target shape
+
+- One client app (NSH, screens written in Rust). It only speaks
+  modron-protocol and never embeds the agent. Targets: web (the portal)
+  first, then phone, terminal, desktop.
+- A session host that runs anywhere: `modron serve` on a local machine
+  tunnelling out through the bridge, or in a Cloudflare container against
+  a cloned repo.
+- Cloudflare as the hub: one Durable Object per session relays frames and
+  stores the event log so any number of devices attach, drop and resume.
+- The existing ratatui TUI, gpui-kit desktop and TSX mobile clients are
+  frozen (no new features) and deleted once the NSH app covers them. The
+  Oculus theme and the main functionality carry over.
+
+### 10.2 Decisions (owner interview, 2026-11-15)
+
+| Area | Decision |
+|---|---|
+| Hosting | Self-deploy into each user's own Cloudflare account; single owner first |
+| Identity | One owner sign-in; any number of linked GitHub accounts and orgs; each repo or session picks the identity it clones and pushes as |
+| Secrets | Worker secrets, injected into the container at start |
+| Guests | Per-session invite links (viewer or approver), scoped and revocable, in v1; no guest accounts |
+| UI language | Rust on NSH for every surface, including the terminal |
+| Surface order | Web portal, then phone; desktop later |
+| Tandem | Many devices drive one session; approvals answerable from any device with push; multi-person via invite links |
+| Handoff | Any direction (local to cloud, cloud to local). furrow (github.com/Agent-Field/furrow) over R2 after a spike; a pushed session branch is the fallback |
+| Writer model | One host runs the agent and owns the files; a handoff moves the host and the previous host stays attached as a full driver. Two hosts editing separate copies at once is out of scope |
+| Idle cloud | Snapshot, sleep, restore on the next message or wakeup |
+| Old clients | Delete and rebuild; keep the theme and main functionality |
+
+### 10.3 What survives, what goes
+
+Keep: modron-protocol, modron-view, modron-server, mobile/rust-core (becomes
+the single client core; already builds to wasm), the bridge Worker and its
+per-session Durable Object, the Oculus palette as the one theme.
+
+Discard at parity: crates/modron-tui view code, crates/modron-desktop,
+mobile/app/App.tsx, the bridge's inline HTML viewer.
+
+### 10.4 Harness gaps to close (in priority order)
+
+| # | Gap today | Build |
+|---|---|---|
+| H1 | No steering: a message sent mid-run is refused | Steer (inject at next safe boundary) and queue (after the run) as protocol frames |
+| H2 | No real plan mode; plan re-shown per message, not per turn | Enforced read-only plan phase, approve step, per-turn plan re-injection |
+| H3 | Sub-agents throttled: approval-gated so sequential in Ask mode, children cannot ask, no live counters, no completion push, cap 4 | Approvals routed to the parent session, live turn/token counters, completion events, steerable per-agent view |
+| H4 | No independent reviewer; finish gate only re-runs verify | Reviewer role reading the diff, verdict event before the turn reports done, cheap non-LLM claim checks |
+| H5 | Background work thin: interval automations only, no notifications | Scheduled wakeups, pause reasons, push on completion or block |
+| H6 | Edit is exact string replace only | Hash-anchored line edits; default only if `modron bench` shows a gain |
+| H7 | No reasoning-effort control; only cheap/strong tiers | Effort parameter and named roles (plan, sub-agent, critic, summary) |
+| H8 | Permissions by tool name only | Command and path rules, plus an explain-this-decision command |
+| H9 | Small defects: /compact is a no-op, /context reports cumulative tokens, hooks only pre/post tool, MCP stdio only, no web fetch | Fix each |
+
+### 10.5 Build order
+
+1. Spikes (S1-S3): NSH web target in Rust (bundle size, load time, mobile
+   Safari input); NSH terminal target (startup, streaming, scrollback);
+   furrow over R2 from a container.
+2. Protocol v2 (P1): events for steer/queue, plan approval, sub-agent
+   approvals and counters, reviewer verdicts, pause/wake, actor and role on
+   every event. Both tracks build against it. See docs/PROTOCOL_V2.md.
+3. Harness track (H1-H9), each measured with `modron bench` / `modron eval`.
+4. Client track (C1-C10): client core and theme, NSH app, portal (owner
+   sign-in, linked GitHub, session list, invite links), tandem, cloud runs
+   with sleep/restore and handoff, terminal, phone, CI.
+5. Delete the old clients.
+
+### 10.6 Risks
+
+- NSH is pre-1.0 (0.5.x is "not yet a recorded compatibility baseline")
+  and its web and terminal targets are on the critical path. Pin exact
+  versions. Fallback for web: a plain web front end over the same wasm
+  client core. The terminal is committed to NSH by owner decision; the
+  spike decides how much must be worked around or upstreamed.
+- furrow is very early (v0.3.x), has no Cloudflare support, and does not
+  merge concurrent edits; R2 via its S3-compatible mode is unverified.
+- AGENTS.md's parity contract describes three clients; it is rewritten
+  when the NSH app lands (one codebase, divergence by target only).
+
+Packet-level status and evidence: LEDGER.md, "Program U".
