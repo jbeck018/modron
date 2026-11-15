@@ -9,5 +9,11 @@ publish = false
 
 [dependencies]
 nsh-core = "=0.5.1"
-nsh-platform-tui = "=0.5.1"
+# S2b: no JavaScript engine. nsh-platform-tui's `js` feature (default) is the
+# only switch that pulls nsh-engine/js -> nsh-js -> quickjs-jit-sys.
+nsh-platform-tui = { version = "=0.5.1", default-features = false }
 ratatui = "=0.30.2"
+# S2b: `sync` for tokio::sync::mpsc (runtime-agnostic receiver used by the
+# external-event bridge). nsh-core already depends on tokio with rt + time.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
