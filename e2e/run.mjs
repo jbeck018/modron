@@ -1006,4 +1006,8 @@ const skipped = results.filter((r) => r.skipped).length;
 console.log(`${results.length - failed.length - skipped}/${results.length} passed, ${failed.length} failed, ${skipped} skipped; left-over tracked processes: ${liveCount() + taggedCount()}`);
 writeFileSync(join(SCRATCH, 'results.json'), JSON.stringify(results, null, 2));
 console.log(`results: ${join(SCRATCH, 'results.json')}`);
-process.exit(failed.length ? 1 : 0);
+// E2E_NO_SKIP=1 (CI): a skipped step (for example a stale terminal binary) is
+// a failure too, so a green run means every scenario actually ran.
+const noSkipFailure = process.env.E2E_NO_SKIP === '1' && skipped > 0;
+if (noSkipFailure) console.log(`E2E_NO_SKIP=1: ${skipped} skipped step(s) count as failures`);
+process.exit(failed.length || noSkipFailure ? 1 : 0);

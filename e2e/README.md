@@ -35,6 +35,22 @@ process the run starts is in its own process group and is killed on exit
 (SIGTERM, then SIGKILL). Re-run with no leftovers; `left-over tracked
 processes` in the summary must be 0.
 
+## CI (GitHub Actions job `e2e`, `.github/workflows/ci.yml`)
+
+The job builds its own inputs (`modron`, `modron-app-tui`, the web bundle),
+stages them under `$RUNNER_TEMP/e2e`, installs `cloud/bridge` (`npm ci`),
+Playwright 1.63.0 with Chromium, and `pyte==0.8.2` into `$RUNNER_TEMP/pyte`,
+then runs `node e2e/run.mjs` with:
+
+- `E2E_SCRATCH=$RUNNER_TEMP/e2e` (short root: the daemon socket stays under
+  108 bytes);
+- `E2E_PYTE_DIR=$RUNNER_TEMP/pyte`;
+- `E2E_NO_SKIP=1`: a skipped step (for example a stale terminal binary) fails
+  the job. Unset locally, skips are reported and do not fail the run.
+
+Any FAIL exits 1. On failure the job uploads `run-*/**/*.json`,
+`run-*/**/*.log` and `run-*/**/*.png` as the `e2e-results-<run id>` artifact.
+
 ## Scenarios
 
 | ID | What it checks |
