@@ -329,6 +329,9 @@ Decisions made under this rule:
 | Esc on an idle composer | Clears the draft (double Esc) | Clears the draft | Esc clears the draft when nothing else claims the key (approval, plan, suggestions, running) |
 | Theme switching | /theme offers several themes (dark, light, colour-blind variants, ANSI) | Themes are selectable | Offer a /theme picker with what exists: Oculus dark, Oculus light and "system" (follow the terminal or browser appearance). No custom theme files for now; NSH can swap tokens at runtime, so a further palette is a data change |
 | Removing a saved credential | /logout | /logout | Add it: a client can remove a provider credential it could have added. Local connections only, like adding one |
+| Enter while a run is active | The message is taken as guidance for the running turn | Enter steers; a second key queues | Enter steers the running turn; Alt+Enter queues a follow-up (docs/PROTOCOL_V2.md section 2) |
+| What `/settings` opens | A settings view | A settings view | The Settings screen (the old terminal UI opened its credentials wizard, which is now `/auth`) |
+| Approval keys typed just before the prompt appears | Not accepted as an answer | Not accepted as an answer | Keep the old terminal UI's guard: a decision key pressed within a short window of the prompt appearing is ignored, so type-ahead cannot approve a command by accident |
 
 ### 10.3 What survives, what goes
 
