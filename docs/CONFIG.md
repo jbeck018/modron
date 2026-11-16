@@ -378,6 +378,7 @@ while any sandbox is active.
 | `~/.modron/daemon.sock` | Daemon socket. |
 | `~/.modron/serve.sock` | Unix socket of `modron serve`. |
 | `~/.modron/bench/*.jsonl` | `modron bench` baselines. |
+| `~/.modron/evals/*.jsonl` | `modron eval` records, one row per task run (`edit_tool`, edit calls, edit errors and retries per row). |
 | `~/.modron/logs/modron.log` | Log file for interactive `modron` runs, which keeps stderr clear. |
 | `~/.modron/update-check.json` | Cache for the once-a-day update check. |
 | `.modron/worktrees/` | Git worktrees for `delegate` with `isolate`, under the working directory. |

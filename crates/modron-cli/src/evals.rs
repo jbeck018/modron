@@ -7,7 +7,8 @@
 //! the difference between "the model said done" and "the work is done".
 
 use crate::{config, short, AgentSinks, Cli};
-use modron_core::{Engine, RunSummary};
+use clap::ValueEnum;
+use modron_core::{Engine, RunSummary, SessionEvent};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +35,49 @@ pub struct EvalTask {
 /// via test feedback, extraction, transformation, and multi-input synthesis.
 pub const MINI_SWE_TOML: &str = include_str!("../../../evals/mini_swe.toml");
 
+/// The edit-focused suite (twelve tasks, each checked by a shell verifier
+/// that compares the resulting file byte for byte). Selected by
+/// `modron eval --suite edit`; the mini-SWE suite stays the default.
+pub const EDIT_SUITE_TOML: &str = include_str!("edit_suite.toml");
+
+/// `--suite` choices for `modron eval`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EvalSuite {
+    /// The committed mini-SWE tasks (default).
+    Mini,
+    /// The edit-focused benchmark (`crates/modron-cli/src/edit_suite.toml`).
+    Edit,
+}
+
+impl EvalSuite {
+    fn toml(self) -> &'static str {
+        match self {
+            Self::Mini => MINI_SWE_TOML,
+            Self::Edit => EDIT_SUITE_TOML,
+        }
+    }
+}
+
+/// `--edit-tool` choices for `modron eval`. `Edit` is the production default
+/// (the `edit` string-replace tool); `EditLines` offers `edit_lines` plus
+/// `read` line hashes instead, via `modron_tools::prefer_edit_lines`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EditArm {
+    #[value(name = "edit")]
+    Edit,
+    #[value(name = "edit_lines")]
+    EditLines,
+}
+
+impl EditArm {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Edit => "edit",
+            Self::EditLines => "edit_lines",
+        }
+    }
+}
+
 pub fn load_suite(toml_text: &str) -> anyhow::Result<Vec<EvalTask>> {
     #[derive(Deserialize)]
     struct Suite {
@@ -55,6 +99,66 @@ pub struct EvalResult {
     pub duration_ms: u128,
     /// Verify stdout/stderr tail on failure — the debugging breadcrumb.
     pub failure_note: Option<String>,
+    /// Which edit arm ran (`edit` or `edit_lines`); empty for direct callers.
+    #[serde(default)]
+    pub edit_tool: String,
+    /// Calls to the edit tool of the arm (`edit` or `edit_lines`).
+    #[serde(default)]
+    pub edit_calls: u32,
+    /// Edit-tool calls whose result was a tool error (stale hash, string not
+    /// found, read gate, ...).
+    #[serde(default)]
+    pub edit_errors: u32,
+    /// Edit calls made after an earlier edit error in the same task.
+    #[serde(default)]
+    pub edit_retries: u32,
+    /// First few edit error messages, truncated (for the write-up).
+    #[serde(default)]
+    pub edit_error_samples: Vec<String>,
+}
+
+/// Edit-tool activity read back from a session log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditActivity {
+    pub calls: u32,
+    pub errors: u32,
+    pub retries: u32,
+    pub samples: Vec<String>,
+}
+
+/// Counts `edit` / `edit_lines` calls, their error results and retries in a
+/// session log. A retry is an edit call made after an earlier edit error.
+pub fn edit_activity(events: &[SessionEvent]) -> EditActivity {
+    const SAMPLES: usize = 3;
+    let mut activity = EditActivity::default();
+    let mut edit_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut failed_before = false;
+    for event in events {
+        match event {
+            SessionEvent::Message { message, .. } => {
+                for call in &message.tool_calls {
+                    if matches!(call.name.as_str(), "edit" | "edit_lines") {
+                        edit_ids.insert(call.id.clone());
+                        activity.calls += 1;
+                        if failed_before {
+                            activity.retries += 1;
+                        }
+                    }
+                }
+            }
+            SessionEvent::ToolResult { call_id, outcome }
+                if edit_ids.contains(call_id) && outcome.is_error =>
+            {
+                activity.errors += 1;
+                failed_before = true;
+                if activity.samples.len() < SAMPLES {
+                    activity.samples.push(short(outcome.content.trim(), 160));
+                }
+            }
+            _ => {}
+        }
+    }
+    activity
 }
 
 /// Workspace directory name for one (task, model) pair. The model id is
@@ -128,6 +232,11 @@ pub async fn run_eval_task(
                     "setup failed: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 )),
+                edit_tool: String::new(),
+                edit_calls: 0,
+                edit_errors: 0,
+                edit_retries: 0,
+                edit_error_samples: Vec::new(),
             });
         }
     }
@@ -171,6 +280,11 @@ pub async fn run_eval_task(
                 tokens: 0,
                 duration_ms: started.elapsed().as_millis(),
                 failure_note: Some(format!("agent error: {e}")),
+                edit_tool: String::new(),
+                edit_calls: 0,
+                edit_errors: 0,
+                edit_retries: 0,
+                edit_error_samples: Vec::new(),
             });
         }
     };
@@ -198,11 +312,17 @@ pub async fn run_eval_task(
     }
 
     let RunSummary {
+        session_id,
         turns,
         tool_calls,
         usage,
         ..
     } = summary;
+    // Edit activity comes from the session log (the engine's own record).
+    let activity = match child_engine.store.load(session_id).await {
+        Ok(events) => edit_activity(&events),
+        Err(_) => EditActivity::default(),
+    };
     let _ = PathBuf::from(&workspace); // workspace kept for post-mortem until process exit
     Ok(EvalResult {
         id: task.id.clone(),
@@ -213,6 +333,11 @@ pub async fn run_eval_task(
         tokens: usage.total(),
         duration_ms: started.elapsed().as_millis(),
         failure_note,
+        edit_tool: String::new(),
+        edit_calls: activity.calls,
+        edit_errors: activity.errors,
+        edit_retries: activity.retries,
+        edit_error_samples: activity.samples,
     })
 }
 
@@ -224,10 +349,13 @@ pub(crate) async fn run_evals(
     cfg: &config::Config,
     models_arg: Option<&str>,
     filter: Option<&str>,
+    suite: EvalSuite,
+    edit_tool: EditArm,
+    delay_ms: Option<u64>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let tasks = load_suite(MINI_SWE_TOML)?;
+    let tasks = load_suite(suite.toml())?;
     let tasks: Vec<_> = match filter {
         Some(f) => tasks.into_iter().filter(|t| t.id.contains(f)).collect(),
         None => tasks,
@@ -260,41 +388,58 @@ pub(crate) async fn run_evals(
     let mut all: Vec<EvalResult> = Vec::new();
 
     for model in &models {
-        println!("eval: {} tasks on {model}", tasks.len());
+        println!(
+            "eval: {} tasks on {model} (suite {suite:?}, edit tool {})",
+            tasks.len(),
+            edit_tool.label()
+        );
         for task in &tasks {
             // Per-model config: force the model, approve mutations, exact
             // task limits.
             let mut model_cli = cli.clone();
             model_cli.model = Some(model.clone());
             model_cli.approve_all = true;
-            let agent = crate::build_agent_with(
+            let mut agent = crate::build_agent_with(
                 &model_cli,
                 cfg,
                 false,
                 AgentSinks::for_mode(crate::RunMode::HEADLESS),
                 &mcp,
             )?;
+            if edit_tool == EditArm::EditLines {
+                agent.engine.tools = Arc::new(modron_tools::prefer_edit_lines(&agent.engine.tools));
+            }
             let mut task = task.clone();
             if task.max_turns.is_none() {
                 task.max_turns = Some(16);
             }
             let mut result = run_eval_task(&agent.engine, &task, model, &workspaces_root).await?;
             result.model = model.clone();
+            result.edit_tool = edit_tool.label().to_string();
             println!(
-                "{:<3} {:<24} {:>4} turns {:>3} tools {:>7} tok {:>6} ms",
+                "{:<3} {:<24} {:>4} turns {:>3} tools {:>7} tok {:>6} ms  edits {} (err {}, retry {})",
                 if result.passed { "✓" } else { "✗" },
                 result.id,
                 result.turns,
                 result.tool_calls,
                 result.tokens,
-                result.duration_ms
+                result.duration_ms,
+                result.edit_calls,
+                result.edit_errors,
+                result.edit_retries
             );
             if let Some(note) = &result.failure_note {
                 if !result.passed {
                     println!("    └ {}", short(note, 110));
                 }
             }
+            for sample in &result.edit_error_samples {
+                println!("    edit error: {sample}");
+            }
             all.push(result);
+            if let Some(ms) = delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
         }
     }
 
@@ -442,6 +587,93 @@ mod tests {
         assert_eq!(a, a_again);
         assert!(!a_again.join("answer.txt").exists(), "stale file removed");
         assert!(a_again.is_dir());
+    }
+
+    #[test]
+    fn edit_suite_is_twelve_tasks_with_setup_and_verify() {
+        let tasks = load_suite(EDIT_SUITE_TOML).unwrap();
+        assert_eq!(tasks.len(), 12, "edit suite size");
+        let mut ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 12, "unique task ids");
+        for task in &tasks {
+            assert!(task.setup.is_some(), "{} has a setup", task.id);
+            assert!(!task.verify.is_empty(), "{} has a verifier", task.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_suite_verifiers_reject_the_untouched_workspace() {
+        // A verifier that passes before any edit would score nothing.
+        for task in load_suite(EDIT_SUITE_TOML).unwrap() {
+            let dir = tempfile::tempdir().unwrap();
+            let setup = task.setup.clone().unwrap();
+            let setup_ok = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&setup)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(setup_ok, "{} setup runs", task.id);
+            let verified = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&task.verify)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(!verified, "{} verifier rejects the setup state", task.id);
+        }
+    }
+
+    #[test]
+    fn edit_activity_counts_calls_errors_and_retries() {
+        use modron_core::{Message, ToolCall, ToolOutcome};
+        let call = |id: &str, name: &str| {
+            let mut m = Message::assistant("");
+            m.tool_calls = vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: serde_json::json!({}),
+            }];
+            SessionEvent::Message {
+                parent_id: None,
+                message: m,
+            }
+        };
+        let result = |id: &str, is_error: bool, content: &str| SessionEvent::ToolResult {
+            call_id: id.into(),
+            outcome: ToolOutcome {
+                content: content.into(),
+                is_error,
+                usage: None,
+                meta: None,
+            },
+        };
+        let events = vec![
+            call("r1", "read"),
+            result("r1", false, "ok"),
+            call("e1", "edit_lines"),
+            result("e1", true, "hash drift at line 3"),
+            call("e2", "edit_lines"),
+            result("e2", false, "ok"),
+            call("e3", "edit"),
+            // A non-edit tool error is not an edit error.
+            call("b1", "bash"),
+            result("b1", true, "exit 1"),
+        ];
+        assert_eq!(
+            edit_activity(&events),
+            EditActivity {
+                calls: 3,
+                errors: 1,
+                // e2 and e3 both follow the failed e1.
+                retries: 2,
+                samples: vec!["hash drift at line 3".into()],
+            }
+        );
     }
 
     #[test]
