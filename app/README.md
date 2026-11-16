@@ -96,7 +96,11 @@ Esc clears the filter, then closes. The Settings rows for approval mode,
 effort, sandbox, theme and agent open the same pickers on Enter (the old
 terminal's bare commands opened the same menus). `/mode yolo` and the other
 arguments still apply directly. Shift+Tab still flips the approval mode.
-Agent shows the shared "none" row until the snapshot names personas.
+Agent lists the server's personas: the picker opens with `personas_req`, and each
+row is the core's `name - summary` text verbatim, the current one marked. Enter
+sends `set_config` with that persona. Until the list arrives, or when the server
+refuses it (a portal tunnel), the picker shows the shared "none" row. There is
+no row that clears the persona: the server refuses an empty name.
 
 Settings removal: `d` on a permission rule or an allow or deny entry asks
 first (y or n). A rule removal sends the rest of the set through
@@ -135,7 +139,11 @@ form (Enter creates the task in its worktree and goes to chat); Enter attaches t
 selected task's session and returns to chat; `m` (or `merge`) asks `merge <branch>
 into its base? y / n`. The status line of the selected row is requested when the
 screen opens and when the selection moves, and the core's note (the status, or the
-merge result, ok or the conflict summary) shows at the foot of the screen.
+merge result, ok or the conflict summary) shows at the foot of the screen. Each row shows the core's summary under it
+(`ahead 3 - 1 file (+120 -14)`) once a status arrives. The statuses are asked
+for when the screen opens, when the selection moves past the rows the last
+refresh covered, and every 5 seconds while the screen shows (never while
+another screen is up). The core answers ten rows per call, round-robin.
 
 `/clear` hides the transcript rows on screen in this view only; nothing is sent. A
 reconnect or a session change shows them again. Notes in the status area (the core's
@@ -177,6 +185,11 @@ the key through `auth_set_key` and closes the entry, Esc closes it unsent.
 The keys are never logged (`SecretKey` prints redacted) or kept. On the first
 snapshot after connect, the screen opens once when no provider is signed in.
 Sign-in needs a session on the server: with none attached, the call is refused.
+`d` (or the web `remove` control beside a signed-in row) asks `remove <label>
+credentials? y / n` and then sends `auth_remove`; a row that is not signed in
+has no remove. The refreshed rows and the server's note (a refusal for a sign-in
+that another tool owns, for example) arrive through the snapshot, not by a local
+change.
 
 Task commands: `/review`, `/btw <text>`, `/learn [title]` and `/plan <task>`
 submit the canned task text the old terminal sent (shared in

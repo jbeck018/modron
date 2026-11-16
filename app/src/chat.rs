@@ -203,6 +203,12 @@ pub enum UiAction {
     /// Settings: remove a permission rule by its row index (after y); the
     /// remaining rules are sent as the whole set.
     RemoveRule(usize),
+    /// Tasks: refresh the statuses of the task sessions (one core batch).
+    RefreshTaskStatuses,
+    /// The agent picker opened: ask for the server's personas (`personas_req`).
+    ListPersonas,
+    /// Credentials: remove a signed-in provider's saved credentials (`auth_remove`).
+    AuthRemove(String),
     /// Settings: remove an allow (`allow`) or deny entry by its tool name.
     RemoveToolRule {
         allow: bool,
@@ -909,6 +915,7 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
                 Key::Enter => Routed::Nav(NavStep::Activate),
                 Key::Up => Routed::Nav(NavStep::Move(-1)),
                 Key::Down => Routed::Nav(NavStep::Move(1)),
+                Key::Char('d') => Routed::Nav(NavStep::AskAuthRemove(facts.selected_index)),
                 _ => Routed::Ignored,
             };
         }
@@ -1392,6 +1399,11 @@ impl Host {
     /// header changes (including the hint clearing once the user types).
     /// Returns whether it republished.
     pub fn tick(&mut self, now: Instant) -> bool {
+        // The Tasks screen re-asks for its statuses every few seconds (the
+        // request goes to the driver through the host's own loopback).
+        if self.nav.task_refresh_due(now) {
+            let _ = self.loopback.send(UiAction::RefreshTaskStatuses);
+        }
         {
             let mut next = ANIM_NEXT.lock().unwrap_or_else(|e| e.into_inner());
             match *next {
@@ -1502,6 +1514,12 @@ impl Host {
 
     /// The next owner-portal action (web host), if any. Call after
     /// [`Host::try_action`], which moves them here.
+    /// Whether the Tasks screen is on top: the terminal loop keeps waking for
+    /// its refresh timer while it is.
+    pub fn tasks_open(&self) -> bool {
+        self.nav.on_tasks()
+    }
+
     pub fn take_portal(&mut self) -> Option<UiAction> {
         self.portal.pop_front()
     }
@@ -3393,5 +3411,19 @@ mod tick_tests {
     fn a_running_turn_asks_for_the_animation_period_and_an_idle_app_asks_for_nothing() {
         assert_eq!(tick_deadline(true), Some(ANIM_PERIOD));
         assert_eq!(tick_deadline(false), None);
+    }
+}
+
+#[cfg(test)]
+mod credential_remove_key_tests {
+    use super::*;
+
+    #[test]
+    fn d_on_the_credentials_screen_asks_to_remove_the_selected_row() {
+        let facts = KeyFacts { screen: Screen::Auth, selected_index: 1, ..Default::default() };
+        assert_eq!(
+            route_key(Key::Char('d'), false, false, facts, ""),
+            Routed::Nav(NavStep::AskAuthRemove(1))
+        );
     }
 }

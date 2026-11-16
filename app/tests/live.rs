@@ -19,7 +19,10 @@ use modron_mobile_core::{
     PlanDecisionOption, RenderedRow, ViewModelSnapshot, DECISION_LABELS, PLAN_DECISION_LABELS,
     UNDECODABLE_NOTE,
 };
-use modron_protocol::{Frame, LiveState, Payload, PendingApproval, WireDelta, PROTOCOL_VERSION};
+use modron_protocol::{
+    AuthProviderWire, Frame, LiveState, Payload, PendingApproval, PersonaWire, SessionMetaWire,
+    WireDelta, PROTOCOL_VERSION,
+};
 use modron_types::{ToolCall, Usage};
 use modron_view::{GenUi, TranscriptEntry};
 use nsh_platform_tui::{AppOptions, AppView, CacheOptions, Input, Modifiers, Root};
@@ -372,7 +375,7 @@ async fn send_frame(ws: &mut Ws, frame: &Frame) {
 }
 
 /// How the scripted server behaves after the welcome.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Script {
     /// Share link: no attach is sent; the server names the session in a
     /// snapshot right after the welcome.
@@ -387,6 +390,11 @@ struct Script {
     garbage: bool,
     /// The Welcome names a protocol one version ahead of the client's.
     protocol_skew: bool,
+    /// The personas `personas_req` is answered with. None: the request is
+    /// reported and not answered.
+    personas: Option<Vec<PersonaWire>>,
+    /// The rows `auth_providers_req` is answered with.
+    providers: Vec<AuthProviderWire>,
 }
 
 /// Starts the scripted server on its own thread. Returns its ws URL and a
@@ -469,11 +477,32 @@ fn start_server(session: Uuid, script: Script) -> (String, mpsc::Receiver<Payloa
             )
             .await;
 
-            // The connect also sends auth_providers and list_sessions; skip them.
+            // The connect also sends auth_providers and list_sessions: the
+            // scripted rows answer auth_providers, and the scripted personas
+            // answer personas_req (both reported, where a request is). Any
+            // other request ends the loop and is the one the test checks.
             let request = loop {
                 let frame = read_frame(&mut ws).await;
-                if !matches!(frame.payload, Payload::AuthProvidersReq { .. } | Payload::ListSessions {}) {
-                    break frame;
+                match &frame.payload {
+                    Payload::AuthProvidersReq { .. } => {
+                        let rows = script.providers.clone();
+                        send_frame(
+                            &mut ws,
+                            &Frame::event(Some(session), 3, Payload::AuthProviders { rows }),
+                        )
+                        .await;
+                    }
+                    Payload::ListSessions {} => {}
+                    Payload::PersonasReq {} if script.personas.is_some() => {
+                        let personas = script.personas.clone().unwrap_or_default();
+                        send_frame(
+                            &mut ws,
+                            &Frame::event(Some(session), 4, Payload::Personas { personas }),
+                        )
+                        .await;
+                        report_tx.send(Payload::PersonasReq {}).expect("report request");
+                    }
+                    _ => break frame,
                 }
             };
             report_tx.send(request.payload).expect("report request");
@@ -798,4 +827,130 @@ fn a_server_one_protocol_ahead_is_refused_and_never_streams() {
     // header reads disconnected and the server's stream is not folded.
     h.wait_for("refused handshake", Some(&mut live), |s| s.contains("disconnected"));
     assert!(!h.screen().contains("Migrating the router now"), "{}", h.screen());
+}
+
+#[test]
+fn agent_picker_asks_for_personas_and_enter_sends_the_chosen_one() {
+    let session = Uuid::new_v4();
+    let script = Script {
+        personas: Some(vec![
+            PersonaWire { name: "planner".into(), model: None, summary: "plans the work".into() },
+            PersonaWire { name: "reviewer".into(), model: None, summary: String::new() },
+        ]),
+        ..Script::default()
+    };
+    let (url, reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
+    let mut h = Harness::new();
+    h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
+    h.type_text("/agent");
+    h.wait_draft("/agent");
+    h.send(key("Enter"));
+    assert!(matches!(next_request(&mut h, &mut live, &reports), Payload::PersonasReq {}));
+    h.wait_for("the persona rows", Some(&mut live), |s| s.contains("planner - plans the work"));
+    h.send(key("ArrowDown"));
+    h.wait_for("the reviewer row selected", Some(&mut live), |s| s.contains("> reviewer"));
+    h.send(key("Enter"));
+    match next_request(&mut h, &mut live, &reports) {
+        Payload::SetConfig { patch } => assert_eq!(patch.persona.as_deref(), Some("reviewer")),
+        other => panic!("expected set_config, got {other:?}"),
+    }
+}
+
+#[test]
+fn d_on_a_signed_in_provider_asks_then_y_sends_auth_remove() {
+    let session = Uuid::new_v4();
+    let script = Script {
+        providers: vec![AuthProviderWire {
+            id: "anthropic".into(),
+            label: "Anthropic".into(),
+            status: "configured".into(),
+            oauth_capable: true,
+        }],
+        ..Script::default()
+    };
+    let (url, reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
+    let mut h = Harness::new();
+    h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
+    h.type_text("/auth");
+    h.wait_draft("/auth");
+    h.send(key("Enter"));
+    h.wait_for("the signed-in row", Some(&mut live), |s| s.contains("Anthropic: configured"));
+    h.send(key("d"));
+    h.wait_for("the removal question", Some(&mut live), |s| {
+        s.contains("remove Anthropic credentials? y / n")
+    });
+    h.send(key("y"));
+    match next_request(&mut h, &mut live, &reports) {
+        Payload::AuthRemove { provider, .. } => assert_eq!(provider, "anthropic"),
+        other => panic!("expected auth_remove, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_tasks_screen_renders_the_core_summary_under_the_row() {
+    let mut snapshot = ViewModelSnapshot {
+        connection: ConnectionState::Connected,
+        connection_label: "connected".into(),
+        ..Default::default()
+    };
+    snapshot.sessions = vec![SessionMetaWire {
+        id: Uuid::from_u128(1),
+        title: "t".into(),
+        created_at: String::new(),
+        updated_at: String::new(),
+        message_count: 0,
+        working_dir: None,
+        task_branch: Some("task/fix".into()),
+        task_state: Some("idle".into()),
+    }];
+    snapshot.task_rows = vec![modron_mobile_core::view::TaskRowView {
+        session_id: Uuid::from_u128(1),
+        text: "fix parser - task/fix - idle".into(),
+        summary: "ahead 3 - 1 file (+120 -14)".into(),
+    }];
+    let mut h = Harness::new();
+    h.push(&snapshot);
+    h.wait_for("composer", None, |s| s.contains("type a task"));
+    h.type_text("/tasks");
+    h.wait_draft("/tasks");
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::ListSessions));
+    h.wait_for("the summary", None, |s| s.contains("ahead 3 - 1 file (+120 -14)"));
+    assert!(h.screen().contains("fix parser - task/fix - idle"));
+}
+
+#[test]
+fn the_agent_picker_renders_the_personas_the_snapshot_names() {
+    let mut snapshot = ViewModelSnapshot {
+        connection: ConnectionState::Connected,
+        connection_label: "connected".into(),
+        ..Default::default()
+    };
+    snapshot.personas = vec![modron_mobile_core::view::PersonaRowView {
+        name: "reviewer".into(),
+        text: "reviewer - reviews diffs".into(),
+        current: true,
+    }];
+    let mut h = Harness::new();
+    h.push(&snapshot);
+    h.wait_for("composer", None, |s| s.contains("type a task"));
+    h.type_text("/agent");
+    h.wait_draft("/agent");
+    h.send(key("Enter"));
+    assert_eq!(h.action(), Some(UiAction::ListPersonas));
+    h.wait_for("the persona row", None, |s| s.contains("reviewer - reviews diffs"));
 }

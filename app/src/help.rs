@@ -484,6 +484,16 @@ pub fn bindings() -> Vec<Binding> {
             expect: || Routed::Nav(NavStep::AskSettingRemove(0)),
         },
         Binding {
+            label: "d (credentials)",
+            what: "removes a signed-in provider's saved credentials (y confirms, n cancels); a row not signed in has no remove",
+            key: Key::Char('d'),
+            chord: false,
+            alt: false,
+            facts: || with(|f| f.screen = Screen::Auth),
+            draft: "",
+            expect: || Routed::Nav(NavStep::AskAuthRemove(0)),
+        },
+        Binding {
             label: "enter (pickers)",
             what: "applies the highlighted row of /mode, /sandbox, /effort, /agent or /theme and closes the list",
             key: Key::Enter,

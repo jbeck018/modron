@@ -201,6 +201,9 @@ function startWsServer(opts = {}) {
         } else if (frame.type === 'auth_providers_req') {
           // The credentials screen's rows (the first-run check reads them too).
           send({ session: SESSION, seq: 5, type: 'auth_providers', rows: opts.providers || [] });
+        } else if (frame.type === 'personas_req') {
+          // The agent picker's rows.
+          send({ session: SESSION, seq: 6, type: 'personas', personas: opts.personas || [] });
         } else if (frame.type === 'list_sessions') {
           // The sessions screen's refresh: answer with the scripted rows.
           send({ session: SESSION, seq: 3, type: 'sessions', sessions: opts.sessions || [] });
@@ -902,6 +905,61 @@ async function testCredentialsScreen(browser, base) {
   }
 }
 
+// /agent opens the persona picker: the server's personas are its rows, and a
+// tap on a row sends set_config with that persona.
+async function testPersonaPicker(browser, base) {
+  const personas = [
+    { name: 'planner', summary: 'plans the work' },
+    { name: 'reviewer', summary: 'reviews diffs' },
+  ];
+  const ws = await startWsServer({ personas });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/agent');
+    await page.waitForFunction(() => document.activeElement.value === '/agent', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    await waitFrame(ws, 'personas_req');
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'reviewer - reviews diffs', { timeout: TIMEOUT });
+    await tapLabel(page, 'reviewer - reviews diffs');
+    const cfg = await waitFrame(ws, 'set_config', (f) => f.patch && f.patch.persona === 'reviewer');
+    if (cfg.patch.persona !== 'reviewer') throw new Error('set_config carried the wrong persona');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Credentials removal: the signed-in row has one remove control (the
+// not-configured row has none); remove asks y / n, and y sends auth_remove.
+async function testCredentialRemove(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'configured', oauth_capable: true },
+    { id: 'openai', label: 'OpenAI', status: 'not configured', oauth_capable: false },
+  ];
+  const ws = await startWsServer({ providers });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'OpenAI: not configured', { timeout: TIMEOUT });
+    const removes = await page.getByText('remove', { exact: true }).count();
+    if (removes !== 1) throw new Error(`expected one remove control, saw ${removes}`);
+    await tapLabel(page, 'remove');
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'remove Anthropic credentials? y / n', { timeout: TIMEOUT });
+    await tapLabel(page, 'y');
+    const removed = await waitFrame(ws, 'auth_remove');
+    if (removed.provider !== 'anthropic') throw new Error('auth_remove was ' + JSON.stringify(removed));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // Delete asks inline; the yes control sends delete_session for that row.
 async function testDeleteAfterConfirmation(browser, base) {
   const other = '9c2d7e10-1a2b-4c3d-8e4f-5a6b7c8d9e0f';
@@ -1020,6 +1078,8 @@ async function testAttachSendsOneImage(browser, base) {
     ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
     ['(t) no page or console error for a few seconds and across a forced reconnect', () => testNoErrorsAcrossReconnect(browser, base)],
     ['(s) credentials: /auth opens it, OAuth sends auth_start, a typed key is sent once and leaves the page', () => testCredentialsScreen(browser, base)],
+    ['(s2) agent picker: /agent lists the server personas, a tap sends set_config with the persona', () => testPersonaPicker(browser, base)],
+    ['(s3) credentials: remove on a signed-in row only, asks y / n, then sends auth_remove', () => testCredentialRemove(browser, base)],
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
     ['(q) shift+enter adds a line and does not submit', () => testShiftEnterNewline(browser, base)],
     ['(r) esc on a pending approval sends deny', () => testEscDeniesApproval(browser, base)],

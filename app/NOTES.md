@@ -169,11 +169,6 @@ mapping, the tick deadline (none when idle), the picker, removal, help tab
 and theme paths, and web-test (l) for the theme.
 
 Not done:
-- Credential removal: `RemoteClient::auth_remove` does not exist in
-  `mobile/rust-core/src/client.rs`, so the credentials screen has no remove
-  row. Needs the core method first.
-- The agent picker shows only "none": the snapshot carries no persona names,
-  so `PickerNow.personas` is always empty.
 - The spinner period is the app's 120 ms (`ANIM_PERIOD`); the old terminal's
   poll is 50 ms (`crates/modron-tui/src/run.rs`), and its frame rate was not
   read. Not checked in a pty.
@@ -182,3 +177,32 @@ Not done:
 - Flake: web-test (s) (credentials: `auth_set_key sent the wrong key`) failed
   in the first full run after the picker change and passed in the next three;
   not diagnosed (the key entry's typing is the suspect).
+
+# Packet APP-8: persona picker, task summaries, credential removal
+
+Closed (the two gaps above are gone):
+- Agent picker: `/agent` and the Settings agent row send `personas_req` when
+  the picker opens (`UiAction::ListPersonas`); the rows are the core's
+  `PersonaRowView.text` verbatim, the current one marked, Enter sends
+  `SetPersona` (a `set_config` frame). "none" stays for an empty list. No
+  clear row: the server refuses an empty persona name (hub.rs `persona`).
+- Tasks: rows come from `snapshot.task_rows` (text and summary). The timer
+  (`Nav::task_refresh_due`, driven by `Host::tick` through the host's loopback)
+  asks `refresh_task_statuses` every 5 s while the Tasks screen is on top and
+  never elsewhere; `Host::tasks_open` keeps the terminal loop waking for it.
+  The core round-robins ten rows per call, so `Nav.task_covered` is an
+  approximation: it starts at the first batch on open and advances per call,
+  and a move past it asks for the next batch.
+- Credentials: `d` (terminal) or the web `remove` control on a signed-in row
+  asks `credential_remove_confirm_text` y / n, then `auth_remove` through the
+  session's attached session. No optimistic change: the rows come back in the
+  snapshot.
+
+Tests: headless (nav unit tests for picker rows, the timer, batch coverage and
+removal; live.rs render tests for the summary and the persona rows), scripted
+server (`agent_picker_asks_for_personas_and_enter_sends_the_chosen_one`,
+`d_on_a_signed_in_provider_asks_then_y_sends_auth_remove`), web cases (s2, s3).
+
+Note for headless tests: a navigation step (Enter on a slash command) reaches
+the screen only when the host's actions are pumped (`Harness::action`), since
+`Host::try_action` applies nav steps; the scripted driver does this in `pump`.

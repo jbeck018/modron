@@ -420,6 +420,12 @@ pub fn delete_confirm_text(title: &str) -> String {
     format!("delete {title}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
 }
 
+/// The inline confirmation before a provider's saved credentials are removed
+/// (`auth_remove`). `label` is the provider's shared label.
+pub fn credential_remove_confirm_text(label: &str) -> String {
+    format!("remove {label} credentials? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
 /// The inline confirmation for killing a sub-agent.
 pub fn kill_confirm_text(label: &str) -> String {
     format!("{AGENT_KILL_LABEL} {label}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
@@ -2869,6 +2875,16 @@ mod removal_tests {
             remove_confirm_text("allow bash"),
             "remove allow bash? y / n"
         );
+    }
+
+    #[test]
+    fn the_credential_removal_confirmation_names_the_provider_and_the_keys() {
+        assert_eq!(
+            credential_remove_confirm_text("Anthropic"),
+            "remove Anthropic credentials? y / n"
+        );
+        assert!(auth_is_signed_in("configured"));
+        assert!(!auth_is_signed_in(AUTH_NOT_CONFIGURED));
     }
 
     #[test]

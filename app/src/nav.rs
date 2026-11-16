@@ -6,6 +6,7 @@
 //! changes. Presentation only: every word comes from the core or the shared
 //! table.
 
+use modron_mobile_core::client::TASK_STATUS_REFRESH_BATCH;
 use modron_mobile_core::view::{
     auth_is_signed_in, auth_row_line, delete_confirm_text, kill_confirm_text, remove_confirm_text,
     sandbox_label, AgentRowView, OAuthProgressView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT,
@@ -13,10 +14,11 @@ use modron_mobile_core::view::{
     SETTING_ALLOW_LABEL, SETTING_AUTH_LABEL, SETTING_DENY_LABEL, SETTING_THEME_LABEL,
 };
 use modron_mobile_core::view::{
-    automation_interval_error, automation_row, merge_confirm_text, task_row,
-    AUTOMATION_FIELDS_NEEDED, AUTOMATION_INTERVAL_LABEL, AUTOMATION_NAME_LABEL,
-    AUTOMATION_PROMPT_LABEL, TASK_TITLE_LABEL, TASK_TITLE_NEEDED,
+    automation_interval_error, automation_row, merge_confirm_text, AUTOMATION_FIELDS_NEEDED,
+    AUTOMATION_INTERVAL_LABEL, AUTOMATION_NAME_LABEL, AUTOMATION_PROMPT_LABEL, TASK_TITLE_LABEL,
+    TASK_TITLE_NEEDED,
 };
+use modron_mobile_core::view::{credential_remove_confirm_text, PersonaRowView};
 use modron_mobile_core::{
     phase_next, ApprovalModeWire, Effort, SandboxPolicy, ViewModelSnapshot, EFFORT_UNSET_LABEL,
     RULES_NONE_LABEL, SETTING_APPROVAL_LABEL, SETTING_COMPACT_LABEL, SETTING_CONTEXT_LABEL,
@@ -24,6 +26,12 @@ use modron_mobile_core::{
     SETTING_RULES_LABEL, SETTING_SANDBOX_LABEL,
 };
 use modron_protocol::AutomationWire;
+use std::time::Duration;
+
+use crate::clock::Instant;
+
+/// The Tasks screen asks for its statuses at most this often (the timer).
+const TASK_REFRESH_EVERY: Duration = Duration::from_secs(5);
 use uuid::Uuid;
 
 use crate::chat::UiAction;
@@ -148,6 +156,9 @@ pub enum NavStep {
     /// `d` on a removable Settings row (a rule, an allow or deny entry, or
     /// its remove control): ask first (row index).
     AskSettingRemove(usize),
+    /// `d` (or the web remove control) on a signed-in credentials row: asks
+    /// y / n first, then sends `auth_remove`.
+    AskAuthRemove(usize),
     /// Left and Right, Tab and Shift+Tab, or a tap on a help tab: step the
     /// tab ring (negative steps back).
     HelpCycle(isize),
@@ -193,7 +204,7 @@ pub struct PickerNow {
     pub sandbox: String,
     pub effort: String,
     pub theme: Choice,
-    pub personas: Vec<String>,
+    pub personas: Vec<PersonaRowView>,
 }
 
 /// The theme change the view applies once: `seq` rises by one per change, and
@@ -217,8 +228,10 @@ pub fn picker_title(kind: PickerKind) -> &'static str {
 }
 
 /// The rows of one picker, with the current value marked. Agent lists the
-/// personas the snapshot names; the snapshot carries none yet, so the row is
-/// the shared "none" and it is not selectable.
+/// personas the core sends (`personas_req` when the picker opens), the row
+/// text verbatim. Until they arrive, or when the server refuses the list, the
+/// row is the shared "none" and it is not selectable. There is no row that
+/// clears the persona: the server refuses an empty persona name.
 pub fn picker_rows(kind: PickerKind, now: &PickerNow) -> Vec<PickerRow> {
     let row = |label: String, current: bool, action: UiAction| PickerRow {
         label,
@@ -276,7 +289,12 @@ pub fn picker_rows(kind: PickerKind, now: &PickerNow) -> Vec<PickerRow> {
         PickerKind::Agent => now
             .personas
             .iter()
-            .map(|name| row(name.clone(), false, UiAction::SetPersona(name.clone())))
+            .map(|persona| PickerRow {
+                label: persona.text.clone(),
+                current: persona.current,
+                enabled: true,
+                action: Some(UiAction::SetPersona(persona.name.clone())),
+            })
             .collect(),
         PickerKind::Theme => CHOICES
             .into_iter()
@@ -337,6 +355,9 @@ pub struct TaskRow {
     pub id: Uuid,
     pub branch: String,
     pub text: String,
+    /// The latest status summary (`ahead 3 - 1 file (+120 -14)`), empty until
+    /// one arrives.
+    pub summary: String,
 }
 
 /// One credentials row: the core's label and status (shown verbatim), and
@@ -353,6 +374,11 @@ impl AuthRow {
     /// The row as the screen shows it: `label: status`.
     pub fn line(&self) -> String {
         auth_row_line(&self.label, &self.status)
+    }
+
+    /// Whether the core counts this row as signed in (not "not configured").
+    pub fn signed_in(&self) -> bool {
+        auth_is_signed_in(&self.status)
     }
 }
 
@@ -568,6 +594,12 @@ pub struct Nav {
     automations: Vec<AutomationWire>,
     /// Sessions that carry a task branch (the Tasks screen's rows).
     tasks: Vec<TaskRow>,
+    /// The personas the core lists (the agent picker's rows).
+    personas: Vec<PersonaRowView>,
+    /// When the last task status refresh was asked for (Tasks only).
+    task_refresh_at: Option<Instant>,
+    /// How many task rows the refreshes so far have been asked to cover.
+    task_covered: usize,
     /// The open inline form: its kind, field texts and the active field.
     form: Option<Form>,
     form_error: Option<String>,
@@ -710,14 +742,21 @@ impl Nav {
         self.agents = snapshot.agents.clone();
         self.automations = snapshot.automations.clone();
         self.last_note = snapshot.last_note.clone();
+        self.personas = snapshot.personas.clone();
+        // The core's rows (text and summary); the branch comes from the session.
         self.tasks = snapshot
-            .sessions
+            .task_rows
             .iter()
-            .filter(|meta| meta.task_branch.as_deref().is_some_and(|b| !b.is_empty()))
-            .map(|meta| TaskRow {
-                id: meta.id,
-                branch: meta.task_branch.clone().unwrap_or_default(),
-                text: task_row(meta, meta.task_state.as_deref() == Some("running")),
+            .map(|row| TaskRow {
+                id: row.session_id,
+                branch: snapshot
+                    .sessions
+                    .iter()
+                    .find(|meta| meta.id == row.session_id)
+                    .and_then(|meta| meta.task_branch.clone())
+                    .unwrap_or_default(),
+                text: row.text.clone(),
+                summary: row.summary.clone(),
             })
             .collect();
         if let Some(id) = &self.agent_id {
@@ -769,6 +808,29 @@ impl Nav {
     /// Whether an inline form is open on the automations or tasks screen.
     pub fn form_open(&self) -> bool {
         self.form.is_some() && matches!(self.top(), Screen::Automations | Screen::Tasks)
+    }
+
+    /// Whether the Tasks screen is on top.
+    pub fn on_tasks(&self) -> bool {
+        self.top() == Screen::Tasks
+    }
+
+    /// The task refresh timer. True at most once every [`TASK_REFRESH_EVERY`]
+    /// while the Tasks screen is on top, and never on another screen. A true
+    /// answer is the request: the host sends `refresh_task_statuses`, and this
+    /// records the time and the batch it covers.
+    pub fn task_refresh_due(&mut self, now: Instant) -> bool {
+        if !self.on_tasks() {
+            return false;
+        }
+        if let Some(last) = self.task_refresh_at {
+            if now < last + TASK_REFRESH_EVERY {
+                return false;
+            }
+        }
+        self.task_refresh_at = Some(now);
+        self.task_covered = (self.task_covered + TASK_STATUS_REFRESH_BATCH).min(self.tasks.len());
+        true
     }
 
     /// The task Enter would attach (Tasks on top only).
@@ -1022,8 +1084,11 @@ impl Nav {
                     Screen::Automations => return vec![UiAction::ListAutomations],
                     // The list and, when a row is selected, its status.
                     Screen::Tasks => {
-                        let mut actions = vec![UiAction::ListSessions];
+                        let mut actions =
+                            vec![UiAction::ListSessions, UiAction::RefreshTaskStatuses];
                         actions.extend(self.status_for_selected());
+                        self.task_refresh_at = Some(Instant::now());
+                        self.task_covered = TASK_STATUS_REFRESH_BATCH.min(self.tasks.len());
                         return actions;
                     }
                     _ => {}
@@ -1069,7 +1134,14 @@ impl Nav {
             NavStep::Move(delta) => {
                 let last = self.list_len().saturating_sub(1) as isize;
                 self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
-                return self.status_for_selected().into_iter().collect();
+                let mut actions: Vec<UiAction> = self.status_for_selected().into_iter().collect();
+                // Past the rows the refreshes covered so far: ask for the next batch.
+                if self.top() == Screen::Tasks && self.selected >= self.task_covered {
+                    actions.push(UiAction::RefreshTaskStatuses);
+                    self.task_covered =
+                        (self.task_covered + TASK_STATUS_REFRESH_BATCH).min(self.tasks.len());
+                }
+                return actions;
             }
             NavStep::OpenForm(kind) => {
                 let fits = matches!(
@@ -1166,6 +1238,15 @@ impl Nav {
                     });
                 }
             }
+            NavStep::AskAuthRemove(index) if self.top() == Screen::Auth => {
+                if let Some(row) = self.auth.get(index).filter(|r| r.signed_in()).cloned() {
+                    self.selected = index;
+                    self.pending = Some(Pending {
+                        text: credential_remove_confirm_text(&row.label),
+                        actions: vec![UiAction::AuthRemove(row.id)],
+                    });
+                }
+            }
             NavStep::Activate if self.top() == Screen::Auth && self.auth_key.is_none() => {
                 if let Some(row) = self.auth.get(self.selected).cloned() {
                     if row.oauth_capable {
@@ -1184,6 +1265,9 @@ impl Nav {
                 self.picker = Some(kind);
                 let now = self.picker_now();
                 self.selected = picker_rows(kind, &now).iter().position(|r| r.current).unwrap_or(0);
+                if kind == PickerKind::Agent {
+                    return vec![UiAction::ListPersonas];
+                }
             }
             NavStep::PickRow(index) if self.top() == Screen::Picker => {
                 let rows = self.visible_picker();
@@ -1270,7 +1354,7 @@ impl Nav {
             sandbox: self.sandbox_label.clone(),
             effort: self.effort_label.clone(),
             theme: self.theme,
-            personas: Vec::new(),
+            personas: self.personas.clone(),
         }
     }
 
@@ -2054,6 +2138,11 @@ mod list_screen_tests {
                 meta(2, "plain chat", None, None),
             ],
             session_rows: vec!["fix parser".into(), "plain chat".into()],
+            task_rows: vec![modron_mobile_core::view::TaskRowView {
+                session_id: Uuid::from_u128(1),
+                text: "fix parser \u{b7} task/fix \u{b7} running".into(),
+                summary: String::new(),
+            }],
             automations: vec![AutomationWire {
                 name: "nightly".into(),
                 prompt: "check the build".into(),
@@ -2158,7 +2247,11 @@ mod list_screen_tests {
         let opened = nav.apply(NavStep::Open(Screen::Tasks));
         assert_eq!(
             opened,
-            vec![UiAction::ListSessions, UiAction::TaskStatusOf(Uuid::from_u128(1))]
+            vec![
+                UiAction::ListSessions,
+                UiAction::RefreshTaskStatuses,
+                UiAction::TaskStatusOf(Uuid::from_u128(1)),
+            ]
         );
         let view = nav.view();
         assert_eq!(view.tasks_total, 1);
@@ -2373,5 +2466,144 @@ mod picker_tests {
         assert_eq!(nav.view().help_tab, HelpTab::Commands);
         nav.apply(NavStep::Back);
         assert_eq!(nav.top(), Screen::Chat);
+    }
+}
+
+#[cfg(test)]
+mod persona_task_auth_tests {
+    use super::*;
+    use modron_mobile_core::view::{TaskRowView, AUTH_NOT_CONFIGURED};
+    use modron_protocol::{AuthProviderWire, SessionMetaWire};
+
+    fn persona(name: &str, text: &str, current: bool) -> PersonaRowView {
+        PersonaRowView { name: name.into(), text: text.into(), current }
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn task_snapshot(count: u128) -> ViewModelSnapshot {
+        let mut s = ViewModelSnapshot::default();
+        s.sessions = (1..=count)
+            .map(|n| SessionMetaWire {
+                id: Uuid::from_u128(n),
+                title: "t".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                message_count: 0,
+                working_dir: None,
+                task_branch: Some(format!("task/{n}")),
+                task_state: Some("idle".into()),
+            })
+            .collect();
+        s.task_rows = (1..=count)
+            .map(|n| TaskRowView {
+                session_id: Uuid::from_u128(n),
+                text: format!("task {n} - task/{n} - idle"),
+                summary: String::new(),
+            })
+            .collect();
+        s
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn providers(status: &str) -> ViewModelSnapshot {
+        let mut s = ViewModelSnapshot::default();
+        s.providers = vec![AuthProviderWire {
+            id: "anthropic".into(),
+            label: "Anthropic".into(),
+            status: status.into(),
+            oauth_capable: true,
+        }];
+        s
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_agent_picker_asks_for_personas_and_lists_their_text_with_the_current_marked() {
+        let mut nav = Nav::default();
+        let mut s = ViewModelSnapshot::default();
+        s.personas = vec![
+            persona("planner", "planner - plans the work", false),
+            persona("reviewer", "reviewer", true),
+        ];
+        nav.observe(&s);
+        assert_eq!(nav.apply(NavStep::OpenPicker(PickerKind::Agent)), vec![UiAction::ListPersonas]);
+        let view = nav.view();
+        let labels: Vec<&str> = view.picker.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["planner - plans the work", "reviewer"]);
+        assert!(!view.picker[0].current && view.picker[1].current);
+        assert_eq!(nav.apply(NavStep::PickRow(0)), vec![UiAction::SetPersona("planner".into())]);
+    }
+
+    #[test]
+    fn the_agent_picker_shows_none_until_the_personas_arrive() {
+        let mut nav = Nav::default();
+        nav.observe(&ViewModelSnapshot::default());
+        nav.apply(NavStep::OpenPicker(PickerKind::Agent));
+        let labels: Vec<String> = nav.view().picker.iter().map(|r| r.label.clone()).collect();
+        assert_eq!(labels, vec![PICKER_NONE_LABEL.to_string()]);
+        assert!(nav.apply(NavStep::PickRow(0)).is_empty());
+    }
+
+    #[test]
+    fn the_tasks_screen_shows_the_core_rows_and_their_summaries() {
+        let mut s = task_snapshot(1);
+        s.task_rows[0].summary = "ahead 3 - 1 file (+120 -14)".into();
+        let mut nav = Nav::default();
+        nav.observe(&s);
+        nav.apply(NavStep::Open(Screen::Tasks));
+        let view = nav.view();
+        assert_eq!(view.tasks[0].text, "task 1 - task/1 - idle");
+        assert_eq!(view.tasks[0].summary, "ahead 3 - 1 file (+120 -14)");
+    }
+
+    #[test]
+    fn the_refresh_timer_waits_five_seconds_and_runs_only_on_the_tasks_screen() {
+        let mut nav = Nav::default();
+        nav.observe(&task_snapshot(2));
+        assert!(nav.apply(NavStep::Open(Screen::Tasks)).contains(&UiAction::RefreshTaskStatuses));
+        let base = Instant::now();
+        assert!(!nav.task_refresh_due(base + Duration::from_secs(4)), "the open just asked");
+        assert!(nav.task_refresh_due(base + Duration::from_secs(6)));
+        assert!(!nav.task_refresh_due(base + Duration::from_secs(7)));
+        assert!(nav.task_refresh_due(base + Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn no_refresh_is_issued_while_another_screen_is_showing() {
+        let mut nav = Nav::default();
+        nav.observe(&task_snapshot(2));
+        let base = Instant::now();
+        assert!(!nav.task_refresh_due(base + Duration::from_secs(60)));
+        nav.apply(NavStep::Open(Screen::Sessions));
+        assert!(!nav.task_refresh_due(base + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn a_move_past_the_refreshed_batch_asks_for_the_next_batch() {
+        let mut nav = Nav::default();
+        nav.observe(&task_snapshot(12));
+        nav.apply(NavStep::Open(Screen::Tasks));
+        assert!(!nav.apply(NavStep::Move(5)).contains(&UiAction::RefreshTaskStatuses));
+        assert!(nav.apply(NavStep::Move(5)).contains(&UiAction::RefreshTaskStatuses));
+    }
+
+    #[test]
+    fn d_on_a_signed_in_credential_asks_then_removes_it() {
+        let mut nav = Nav::default();
+        nav.observe(&providers("configured"));
+        nav.apply(NavStep::Open(Screen::Auth));
+        nav.apply(NavStep::AskAuthRemove(0));
+        assert_eq!(nav.view().confirm.as_deref(), Some("remove Anthropic credentials? y / n"));
+        assert_eq!(nav.apply(NavStep::Confirm), vec![UiAction::AuthRemove("anthropic".into())]);
+        assert!(!nav.confirming());
+    }
+
+    #[test]
+    fn a_row_that_is_not_signed_in_offers_no_removal() {
+        let mut nav = Nav::default();
+        nav.observe(&providers(AUTH_NOT_CONFIGURED));
+        nav.apply(NavStep::Open(Screen::Auth));
+        nav.apply(NavStep::AskAuthRemove(0));
+        assert_eq!(nav.view().confirm, None);
     }
 }

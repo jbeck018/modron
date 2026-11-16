@@ -268,9 +268,23 @@ fn task_row(
             }
         })
     };
-    let row = view().child(text(line).text_color(move || {
-        token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
-    }));
+    // The row text, then the core's summary under it when one has arrived.
+    let row = view()
+        .flex_col()
+        .child(text(line).text_color(move || {
+            token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+        }))
+        .child(when(
+            move || nav.with(|n| n.tasks.get(i).is_some_and(|r| !r.summary.is_empty())),
+            move || {
+                text(move || {
+                    nav.with(|n| {
+                        n.tasks.get(i).map(|r| format!("  {}", r.summary)).unwrap_or_default()
+                    })
+                })
+                .text_color(muted())
+            },
+        ));
     if WEB_CONTROLS {
         let attach = actions.clone();
         let attach_row = row.role(AccessibilityRole::Button).on_press(move || {
@@ -382,10 +396,13 @@ fn auth_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl I
     }
     column = column
         .child(when(move || nav.with(|n| n.auth_progress.is_some()), move || auth_progress(nav)));
-    column.child(when(
-        move || nav.with(|n| n.auth_key.is_some()),
-        move || auth_key_entry(nav, actions.clone()),
-    ))
+    let confirm_actions = actions.clone();
+    column
+        .child(when(
+            move || nav.with(|n| n.auth_key.is_some()),
+            move || auth_key_entry(nav, actions.clone()),
+        ))
+        .child(confirm_line(nav, confirm_actions))
 }
 
 /// One credentials row: `label: status`, marked when selected. Its hint
@@ -410,9 +427,17 @@ fn auth_row(
         token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
     }));
     if WEB_CONTROLS {
-        row.role(AccessibilityRole::Button).on_press(move || {
+        // A signed-in row also carries the remove control (it asks y / n first).
+        let remove_actions = actions.clone();
+        let press = row.role(AccessibilityRole::Button).on_press(move || {
             let _ = actions.send(UiAction::Nav(NavStep::ActivateRow(i)));
-        })
+        });
+        view().flex_row().child(press).child(when(
+            move || nav.with(|n| n.auth.get(i).is_some_and(|r| r.signed_in())),
+            move || {
+                tap(REMOVE_LABEL, remove_actions.clone(), UiAction::Nav(NavStep::AskAuthRemove(i)))
+            },
+        ))
     } else {
         row
     }

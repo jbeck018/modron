@@ -348,10 +348,11 @@ mod terminal {
                 }
                 // A running turn wakes at the animation period, so the spinner moves
                 // during silent waits; an idle app waits for input (no deadline).
-                let wait = match modron_app::chat::tick_deadline(host.running()) {
-                    Some(tick) => wait.min(tick),
-                    None => wait,
-                };
+                let wait =
+                    match modron_app::chat::tick_deadline(host.running() || host.tasks_open()) {
+                        Some(tick) => wait.min(tick),
+                        None => wait,
+                    };
                 if !redraw && event::poll(wait)? {
                     return Ok(match event::read()? {
                         Event::Key(k)

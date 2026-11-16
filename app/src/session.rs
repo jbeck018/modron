@@ -694,6 +694,11 @@ fn apply(client: &RemoteClient, action: UiAction) {
         UiAction::SteerAgent { agent, text } => client.steer_agent(agent, text),
         UiAction::KillAgent(agent) => client.kill_agent(agent),
         UiAction::ListAuth => client.auth_providers(),
+        UiAction::ListPersonas => client.request_personas(),
+        UiAction::RefreshTaskStatuses => client.refresh_task_statuses().map(|_| ()),
+        UiAction::AuthRemove(provider) => {
+            with_session(client, |s| client.auth_remove(s, &provider))
+        }
         UiAction::Plan(task) => match client.set_phase(Phase::Plan) {
             Ok(()) => client.send_message(task),
             Err(error) => Err(error),
