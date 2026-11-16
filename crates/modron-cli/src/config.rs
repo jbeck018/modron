@@ -156,11 +156,14 @@ impl PermissionsConfig {
     }
 }
 
-/// `[handoff]` section (C6c). `carrier` is `"git"` (default) or `"furrow"`
-/// (accepted; its carrier is not built yet, so using it fails with a message).
+/// `[handoff]` section (C6c). `carrier` is `"git"` (default) or `"furrow"`.
+/// `furrow_store` is the furrow store URL (`s3://bucket/prefix` or a local
+/// directory) for the furrow carrier. Credentials are never read from here:
+/// furrow takes them from the environment (docs/CONFIG.md).
 #[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct HandoffConfig {
     pub carrier: Option<String>,
+    pub furrow_store: Option<String>,
 }
 
 /// `[sessions]` section (Phase 6a). `ttl_days` enables auto-vacuum at

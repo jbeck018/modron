@@ -1058,7 +1058,7 @@ pub async fn start_serve_remote_control(
     state: &Arc<ServerState>,
     bridge_base: &str,
     share_file: Option<&Path>,
-) -> Result<String> {
+) -> Result<(String, SessionId)> {
     let sessions = state
         .store
         .list()
@@ -1082,7 +1082,7 @@ pub async fn start_serve_remote_control(
     if let Some(path) = share_file {
         write_private_file(path, &url)?;
     }
-    Ok(url)
+    Ok((url, session))
 }
 
 /// Register a remote-control tunnel for `session`: validates the session,

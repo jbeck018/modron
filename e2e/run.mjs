@@ -988,6 +988,92 @@ if (!want('T2') && !want('T3') && !want('T4')) {
   });
 }
 
+// H1 -------------------------------------------------------------------------
+// Handoff between two hosts, git carrier (docs/HANDOFF.md). Host A runs a
+// task whose mock script writes demo-output.txt, exports the session to a
+// shared bare remote, and keeps serving. Host B clones the remote, imports
+// the handoff, serves, and resumes the same session: transcript and file
+// change present. Host A then refuses a new run on the handed-off session.
+function cli(home, work, args) {
+  const r = spawnSync(MODRON, [...args, '--working-dir', work], {
+    env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 120000,
+  });
+  return { status: r.status, out: `${r.stdout || ''}${r.stderr || ''}` };
+}
+function git(cwd, args) {
+  const r = spawnSync('git', ['-C', cwd, ...args], {
+    env: {
+      ...process.env, GIT_AUTHOR_NAME: 'e2e', GIT_AUTHOR_EMAIL: 'e2e@example.invalid',
+      GIT_COMMITTER_NAME: 'e2e', GIT_COMMITTER_EMAIL: 'e2e@example.invalid',
+    },
+    encoding: 'utf8',
+  });
+  return { status: r.status, out: `${r.stdout || ''}${r.stderr || ''}` };
+}
+
+await scenario('H1', 'handoff: host A exports a session with a file change; host B imports, resumes it; A refuses runs', async (s) => {
+  // Host A's working tree is a git checkout with a shared bare remote. startServe
+  // uses SCRATCH/h-<name>/w as its working dir, so the checkout is made there first.
+  const remote = join(SCRATCH, 'handoff-remote.git');
+  const homeA = join(SCRATCH, 'h-h1a');
+  const workA = join(homeA, 'w');
+  const homeB = join(SCRATCH, 'h-h1b');
+  const workB = join(homeB, 'w');
+  mkdirSync(workA, { recursive: true });
+  for (const r of [
+    git(SCRATCH, ['init', '-q', '--bare', '-b', 'main', remote]),
+    git(workA, ['init', '-q', '-b', 'main']),
+  ]) if (r.status !== 0) throw new Error('git setup failed: ' + r.out);
+  writeFileSync(join(workA, 'README.md'), 'handoff e2e\n');
+  for (const args of [
+    ['add', '-A'], ['commit', '-q', '-m', 'base'], ['remote', 'add', 'origin', remote], ['push', '-q', 'origin', 'main'],
+  ]) {
+    const r = git(workA, args);
+    if (r.status !== 0) throw new Error(`git ${args[0]} failed: ${r.out}`);
+  }
+
+  const svA = track(serves, await startServe('h1a'));
+  const la = track(locals, await new Local(svA).connect());
+  la.setAuto(true); // the mock's write and bash approvals
+  const sid = await la.run('e2e handoff task');
+  await la.turnDone(sid, 120000);
+  await soft(s, waitUntil(() => existsSync(join(workA, 'demo-output.txt')), 30000, 'demo-output.txt'),
+    'the mock write did not land in host A');
+
+  const exp = cli(homeA, workA, ['handoff', 'export', '--session', sid, '--remote', 'origin']);
+  s.check(exp.status === 0, 'export on host A failed: ' + exp.out);
+  const ref = /modron handoff import (\S+)/.exec(exp.out)?.[1];
+  s.check(Boolean(ref), 'export printed no import command: ' + exp.out);
+  if (!ref) return;
+
+  // Host A keeps serving; its engine must read the HandedOff line before the next run.
+  const from = la.frames.length;
+  await la.run('e2e after handoff', sid);
+  const refused = await soft(s, la.waitFor((f) => JSON.stringify(f).includes('was handed off to another host'), 30000,
+    'handoff refusal', from), 'host A did not refuse a run on the handed-off session');
+  if (refused) s.check(JSON.stringify(refused).includes(ref), 'the refusal does not name the carrier ref');
+
+  // Host B: clone the remote (clean tree), import, serve, resume the same session.
+  mkdirSync(homeB, { recursive: true });
+  const clone = spawnSync('git', ['clone', '-q', remote, workB], { encoding: 'utf8' });
+  if (clone.status !== 0) throw new Error('git clone for host B failed: ' + clone.stderr);
+  const imp = cli(homeB, workB, ['handoff', 'import', ref, '--remote', 'origin']);
+  s.check(imp.status === 0, 'import on host B failed: ' + imp.out);
+  if (imp.status !== 0) return;
+  s.check(existsSync(join(workB, 'demo-output.txt')), 'the file change did not reach host B');
+
+  const svB = track(serves, await startServe('h1b'));
+  const lb = track(locals, await new Local(svB).connect());
+  lb.setAuto(true);
+  const snap = await lb.attach(sid);
+  s.check(JSON.stringify(snap).includes('e2e handoff task'), 'the transcript did not come across the handoff');
+  const fromB = lb.frames.length;
+  await lb.run('e2e resumed on host b', sid);
+  await soft(s, lb.turnDone(sid, 120000), 'host B did not finish a turn on the imported session');
+  s.check(lb.frames.slice(fromB).some((f) => JSON.stringify(f).includes('e2e resumed on host b')),
+    'host B did not take the resumed task on the same session');
+});
+
 // ---- wrap up ----------------------------------------------------------------------
 // Always reached: a normal end, or a step's error that escaped its wrapper.
 try {

@@ -1,13 +1,14 @@
 //! `modron handoff export|import` (PLAN.md 10.8, C6c): move the working tree,
 //! the session log and the ownership of one session to another host.
 //!
-//! Carrier: git only. The export commits the working tree (tracked changes
+//! Carriers: git (the default) and furrow (`handoff_furrow.rs`). The git export commits the working tree (tracked changes
 //! and untracked, non-ignored files) to `refs/heads/modron/handoff/<id>` from
 //! a temporary index, so the user's index, HEAD and branch never move. The
 //! session bundle (a tar of allow-listed store files) is a second commit on
 //! `refs/heads/modron/handoff/<id>-session`. Both refs are pushed when a
-//! remote is named. The furrow carrier is not built yet.
+//! remote is named. The furrow carrier snapshots the tree to a furrow store.
 
+use crate::handoff_furrow::{settings_from_config, FurrowSettings};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use modron_core::handoff::handed_off_ref;
@@ -17,23 +18,20 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Where a handoff goes. Only git exists today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a handoff goes: git (the default), or a furrow snapshot.
+#[derive(Debug, Clone)]
 pub enum Carrier {
     Git,
+    Furrow(FurrowSettings),
 }
 
 impl Carrier {
-    /// `[handoff] carrier`: unset means git. `furrow` is accepted by the
-    /// config but its carrier is not built in this version.
-    pub fn from_config(name: Option<&str>) -> Result<Self> {
+    /// `[handoff] carrier`: unset means git. `furrow` needs `furrow_store`.
+    pub fn from_config(name: Option<&str>, furrow_store: Option<&str>) -> Result<Self> {
         match name.unwrap_or("git") {
             "git" => Ok(Carrier::Git),
-            "furrow" => bail!(
-                "the furrow handoff carrier is not built yet; set `carrier = \"git\"` \
-                 in the [handoff] section of config.toml"
-            ),
-            other => bail!("unknown handoff carrier `{other}`: use \"git\""),
+            "furrow" => Ok(Carrier::Furrow(settings_from_config(furrow_store)?)),
+            other => bail!("unknown handoff carrier `{other}`: use \"git\" or \"furrow\""),
         }
     }
 }
@@ -65,6 +63,14 @@ pub fn bundle_members(id: SessionId) -> [String; 3] {
 /// Accepts a session id or a handoff ref (`refs/heads/modron/handoff/<id>`,
 /// with or without the `-session` suffix) and returns the session id.
 pub fn parse_reference(arg: &str) -> Result<SessionId> {
+    if let Some(rest) = arg.trim().strip_prefix("furrow:") {
+        // furrow:<workspace url>[@snapshot]; the workspace is modron-<id>.
+        let url = rest.split('@').next().unwrap_or(rest);
+        let last = url.rsplit('/').next().unwrap_or(url);
+        let id = last.strip_prefix("modron-").unwrap_or(last);
+        return SessionId::parse_str(id)
+            .with_context(|| format!("`{arg}` names no modron session"));
+    }
     let s = arg.trim();
     let s = s.strip_prefix("refs/heads/").unwrap_or(s);
     let s = s.strip_prefix("modron/handoff/").unwrap_or(s);
@@ -74,7 +80,7 @@ pub fn parse_reference(arg: &str) -> Result<SessionId> {
 }
 
 /// Removes a path when dropped (temporary index files and scratch dirs).
-struct Cleanup(PathBuf);
+pub(crate) struct Cleanup(pub(crate) PathBuf);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -106,7 +112,7 @@ fn git_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<Vec<u8>> 
     Ok(output.stdout)
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_env(dir, args, &[]).map(|out| String::from_utf8_lossy(&out).trim().to_string())
 }
 
@@ -119,7 +125,7 @@ fn has_remote(dir: &Path, remote: &str) -> bool {
     git_try(dir, &["remote", "get-url", remote]).is_some()
 }
 
-fn scratch_dir(label: &str) -> PathBuf {
+pub(crate) fn scratch_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -128,6 +134,24 @@ fn scratch_dir(label: &str) -> PathBuf {
         "modron-handoff-{label}-{}-{nanos}",
         std::process::id()
     ))
+}
+
+/// Writes the session bundle (the allow-listed store files, as a tar) into
+/// `dir` and returns its path. Shared by both carriers.
+pub(crate) fn bundle_tar(store_root: &Path, id: SessionId, dir: &Path) -> Result<PathBuf> {
+    let tar_path = dir.join(bundle_name(id));
+    let mut tar = Command::new("tar");
+    tar.arg("-cf").arg(&tar_path).arg("-C").arg(store_root);
+    for name in bundle_members(id) {
+        if store_root.join(&name).is_file() {
+            tar.arg(name);
+        }
+    }
+    let status = tar.status().context("could not run tar")?;
+    if !status.success() {
+        bail!("tar failed while bundling session {id}");
+    }
+    Ok(tar_path)
 }
 
 /// What `export` did, for the command's report.
@@ -150,7 +174,6 @@ pub async fn export(
     session: Option<SessionId>,
     remote: Option<&str>,
 ) -> Result<ExportReport> {
-    let Carrier::Git = carrier;
     let store = JsonlSessionStore::new(store_root);
     let id = match session {
         Some(id) => id,
@@ -172,6 +195,27 @@ pub async fn export(
         bail!("session {id} is already handed off (ref {carrier_ref}); import it back first");
     }
 
+    if let Carrier::Furrow(settings) = &carrier {
+        let (carrier_ref, files) = crate::handoff_furrow::export(settings, store_root, repo, id)?;
+        store
+            .append(
+                id,
+                &SessionEvent::HandedOff {
+                    to: None,
+                    at: Utc::now(),
+                    carrier_ref: carrier_ref.clone(),
+                },
+            )
+            .await?;
+        return Ok(ExportReport {
+            session: id,
+            tree_ref: carrier_ref,
+            bundle_ref: String::new(),
+            files,
+            ignored_left_behind: 0,
+            pushed_to: None,
+        });
+    }
     let top = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?);
     let gitdir = PathBuf::from(git(repo, &["rev-parse", "--absolute-git-dir"])?);
     let head = git_try(&top, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]);
@@ -210,18 +254,7 @@ pub async fn export(
     // Bundle: allow-listed store files as a tar, stored as one blob.
     let scratch = Cleanup(scratch_dir(&id.to_string()));
     std::fs::create_dir_all(&scratch.0)?;
-    let tar_path = scratch.0.join(bundle_name(id));
-    let mut tar = Command::new("tar");
-    tar.arg("-cf").arg(&tar_path).arg("-C").arg(store_root);
-    for name in bundle_members(id) {
-        if store_root.join(&name).is_file() {
-            tar.arg(name);
-        }
-    }
-    let status = tar.status().context("could not run tar")?;
-    if !status.success() {
-        bail!("tar failed while bundling session {id}");
-    }
+    let tar_path = bundle_tar(store_root, id, &scratch.0)?;
     let blob = git(&top, &["hash-object", "-w", &tar_path.to_string_lossy()])?;
     let bundle_index = Cleanup(gitdir.join(format!("modron-handoff-{id}-bundle.index")));
     let bundle_index_str = bundle_index.0.to_string_lossy().to_string();
@@ -397,6 +430,7 @@ pub struct ImportReport {
 /// anything when the log decision refuses, or when the working tree is dirty
 /// and `force` is not set.
 pub async fn import(
+    carrier: Carrier,
     store_root: &Path,
     repo: &Path,
     reference: &str,
@@ -404,6 +438,10 @@ pub async fn import(
     force: bool,
 ) -> Result<ImportReport> {
     let id = parse_reference(reference)?;
+    if let Carrier::Furrow(settings) = &carrier {
+        return crate::handoff_furrow::import(settings, store_root, repo, id, reference, force)
+            .await;
+    }
     let tree_ref = tree_ref(id);
     let bundle_ref = bundle_ref(id);
     let top = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?);
@@ -449,37 +487,10 @@ pub async fn import(
         &[],
     )?;
     std::fs::write(&tar_path, tar_bytes)?;
-    let listed = Command::new("tar")
-        .arg("-tf")
-        .arg(&tar_path)
-        .output()
-        .context("could not run tar")?;
-    if !listed.status.success() {
-        bail!("the session bundle in {bundle_ref} is not a readable tar");
-    }
-    let names: BTreeSet<String> = String::from_utf8_lossy(&listed.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect();
-    let allowed: BTreeSet<String> = bundle_members(id).into_iter().collect();
-    if !names.is_subset(&allowed) || !names.contains(&format!("{id}.jsonl")) {
-        bail!("the session bundle holds unexpected entries: {names:?}");
-    }
     let extract = scratch.0.join("bundle");
-    std::fs::create_dir_all(&extract)?;
-    let status = Command::new("tar")
-        .arg("-xf")
-        .arg(&tar_path)
-        .arg("-C")
-        .arg(&extract)
-        .status()
-        .context("could not run tar")?;
-    if !status.success() {
-        bail!("tar failed while unpacking the session bundle");
-    }
-    let incoming = std::fs::read_to_string(extract.join(format!("{id}.jsonl")))
-        .context("bundle has no session log")?;
-    let incoming_rewind = std::fs::read_to_string(extract.join(format!("{id}.rewind"))).ok();
+    let bundle = unpack_bundle(&tar_path, id, &extract)?;
+    let incoming = bundle.log.clone();
+    let incoming_rewind = bundle.rewind.clone();
 
     // Decide the log before touching any file.
     let store = JsonlSessionStore::new(store_root);
@@ -532,7 +543,7 @@ pub async fn import(
 
     if log == LogDecision::Write {
         store
-            .replace_transcript(id, &incoming, incoming_title(&extract, id).as_deref())
+            .replace_transcript(id, &incoming, bundle.title.as_deref())
             .map_err(anyhow::Error::from)?;
         if let Some(rewind) = incoming_rewind {
             std::fs::write(store_root.join(format!("{id}.rewind")), rewind)?;
@@ -545,6 +556,52 @@ pub async fn import(
         files_removed,
         events: events.len(),
         still_handed_off: handed_off_ref(&events).is_some(),
+    })
+}
+
+/// What a session bundle holds once unpacked.
+pub(crate) struct Bundle {
+    pub log: String,
+    pub rewind: Option<String>,
+    pub title: Option<String>,
+}
+
+/// Unpacks the bundle at `tar_path` into `extract`. Only the allow-listed
+/// names are accepted (`bundle_members`), and the session log must be there.
+pub(crate) fn unpack_bundle(tar_path: &Path, id: SessionId, extract: &Path) -> Result<Bundle> {
+    let listed = Command::new("tar")
+        .arg("-tf")
+        .arg(tar_path)
+        .output()
+        .context("could not run tar")?;
+    if !listed.status.success() {
+        bail!("the session bundle is not a readable tar");
+    }
+    let names: BTreeSet<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let allowed: BTreeSet<String> = bundle_members(id).into_iter().collect();
+    if !names.is_subset(&allowed) || !names.contains(&format!("{id}.jsonl")) {
+        bail!("the session bundle holds unexpected entries: {names:?}");
+    }
+    std::fs::create_dir_all(extract)?;
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(tar_path)
+        .arg("-C")
+        .arg(extract)
+        .status()
+        .context("could not run tar")?;
+    if !status.success() {
+        bail!("tar failed while unpacking the session bundle");
+    }
+    let log = std::fs::read_to_string(extract.join(format!("{id}.jsonl")))
+        .context("bundle has no session log")?;
+    Ok(Bundle {
+        log,
+        rewind: std::fs::read_to_string(extract.join(format!("{id}.rewind"))).ok(),
+        title: incoming_title(extract, id),
     })
 }
 
@@ -754,9 +811,16 @@ mod tests {
 
         // Host B imports the handoff; its branch stays at the base commit.
         let b = &fx.repo_b;
-        let import_report = import(&fx.store_b, b, &tree_ref(id), Some("origin"), false)
-            .await
-            .unwrap();
+        let import_report = import(
+            Carrier::Git,
+            &fx.store_b,
+            b,
+            &tree_ref(id),
+            Some("origin"),
+            false,
+        )
+        .await
+        .unwrap();
         assert!(!import_report.still_handed_off);
         assert_eq!(git_ok(b, &["symbolic-ref", "HEAD"]), "refs/heads/main");
 
@@ -811,6 +875,7 @@ mod tests {
         .unwrap();
         // B takes it over, continues the session, and hands it back.
         import(
+            Carrier::Git,
             &fx.store_b,
             &fx.repo_b,
             &id.to_string(),
@@ -843,6 +908,7 @@ mod tests {
         // A imports the longer log: its HandedOff line is replaced, so the
         // session runs here again.
         let report = import(
+            Carrier::Git,
             &fx.store_a,
             &fx.repo_a,
             &id.to_string(),
@@ -905,6 +971,7 @@ mod tests {
 
         std::fs::write(fx.repo_b.join("README.md"), "local B edit\n").unwrap();
         let err = import(
+            Carrier::Git,
             &fx.store_b,
             &fx.repo_b,
             &id.to_string(),
@@ -924,6 +991,7 @@ mod tests {
         );
 
         import(
+            Carrier::Git,
             &fx.store_b,
             &fx.repo_b,
             &id.to_string(),
@@ -975,12 +1043,22 @@ mod tests {
     }
 
     #[test]
-    fn furrow_carrier_says_not_built_yet() {
-        let err = Carrier::from_config(Some("furrow")).unwrap_err();
-        assert!(err.to_string().contains("not built yet"), "{err}");
-        assert_eq!(Carrier::from_config(None).unwrap(), Carrier::Git);
-        assert_eq!(Carrier::from_config(Some("git")).unwrap(), Carrier::Git);
-        assert!(Carrier::from_config(Some("ftp")).is_err());
+    fn furrow_carrier_needs_a_store() {
+        let err = Carrier::from_config(Some("furrow"), None).unwrap_err();
+        assert!(err.to_string().contains("furrow_store"), "{err}");
+        assert!(matches!(
+            Carrier::from_config(Some("furrow"), Some("s3://bucket/modron")).unwrap(),
+            Carrier::Furrow(_)
+        ));
+        assert!(matches!(
+            Carrier::from_config(None, None).unwrap(),
+            Carrier::Git
+        ));
+        assert!(matches!(
+            Carrier::from_config(Some("git"), None).unwrap(),
+            Carrier::Git
+        ));
+        assert!(Carrier::from_config(Some("ftp"), None).is_err());
     }
 
     #[test]

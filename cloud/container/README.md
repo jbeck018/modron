@@ -7,6 +7,19 @@ after 10 minutes without requests. The relay in front is `cloud/bridge`.
 Status: scaffold. The image builds in CI; the wake path is written but not
 deployed or tested live. Read "Known gaps" before relying on it.
 
+## Handoff on exit
+
+`entrypoint.sh` sets `MODRON_HANDOFF_ON_EXIT=1`, so `modron serve` exports the
+remote-control session (docs/HANDOFF.md, "Exit hand-off") when it receives
+SIGTERM or ctrl+c. This relies on the platform delivering SIGTERM, and waiting
+for the process to exit, before it sleeps the container. That is unverified:
+no test here stops a real container. The hand-off has a 30 second limit.
+
+Known gap: the entrypoint drops `GITHUB_TOKEN` before `exec modron serve`, so
+the git export's push to `origin` has no credentials and fails unless the
+container has another way to push. `HANDOFF_REF` import is unaffected. Until
+that is solved, a stop leaves the session on this host with an error printed.
+
 ## Repository secrets (Settings > Secrets and variables > Actions)
 
 Deploy-time (used by the workflow itself):

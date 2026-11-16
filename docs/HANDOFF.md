@@ -16,14 +16,58 @@ Travels (git carrier, the default):
 
 Does not travel:
 
-- ignored files (`git status --porcelain --ignored` lists how many were
-  left behind; export prints the count);
+- ignored files (git carrier only: `git status --porcelain --ignored` lists
+  how many were left behind, and export prints the count; the furrow carrier
+  carries them);
 - provider credentials, env files and anything else in the store
   directory: the bundle is an allow-list, never a glob;
 - the HandedOff line: it is written only to the exporting host's log.
 
 Export never moves the user's index, HEAD or branch: the tree is built from
 a temporary index (`GIT_INDEX_FILE`) and only the two refs are written.
+
+## The furrow carrier
+
+`[handoff] carrier = "furrow"` with `furrow_store = "s3://bucket/prefix"` (see
+docs/CONFIG.md for every setting and variable). Export runs, in the working
+tree:
+
+1. writes the session bundle (the same allow-listed tar) to
+   `.modron/handoff/<id>.handoff.tar`;
+2. `furrow remote add <store> --name modron-<id> --key <recovery key>`;
+3. `furrow snap -m ...`, then `furrow --json sync --push --takeover` (the
+   takeover is safe here because ownership is the log prefix rule below, not
+   furrow's writer lease);
+4. removes the bundle file (and `.modron/handoff` when empty) whatever the
+   outcome, then appends `HandedOff` as on the git carrier.
+
+The bundle therefore travels inside the furrow snapshot and never stays in the
+user's tree. The snapshot holds the whole working tree, ignored files, `.git`
+and the bundle. The printed carrier ref is
+`furrow:<store>/modron-<id>@<snapshot>`.
+
+Import runs `furrow clone <url> <scratch> --no-watch` with the key in
+`FURROW_RECOVERY_KEY`, reads the bundle from the clone, and then applies the
+same rules as git: the log decision and the dirty-tree check run before any
+file changes; a file the handoff has that is ignored or untracked here needs
+`--force`. The clone's `.git`, furrow state and bundle are not copied; the
+other files are copied over the checkout, and tracked files the handoff no
+longer has are removed. The checkout's own HEAD and branch are not changed.
+Import needs a git checkout in the working directory.
+
+Furrow is found on PATH, or via `MODRON_FURROW_BIN`. A missing binary, an
+unset `furrow_store` or `FURROW_RECOVERY_KEY`, or a non-zero furrow exit is an
+error that names the step; furrow's stderr is passed through with the secret
+values removed.
+
+## Exit hand-off (serve)
+
+`modron serve --remote-control <bridge> --handoff-on-exit` (or
+`MODRON_HANDOFF_ON_EXIT=1`) exports the session that remote control serves when
+serve stops on ctrl+c or SIGTERM. Serve first interrupts that session's run,
+then runs the configured export on its own thread and waits at most 30 seconds.
+A failure or a timeout is printed and serve exits anyway. The git export pushes
+to `origin`, so the exiting host needs push access to it.
 
 ## Commands
 
@@ -68,6 +112,8 @@ It prints `modron --resume=<id>` when the session is runnable here.
   guard, because a running host reads the HandedOff line before its next run.
 - Diverged trees are not merged. Two hosts editing the same session in
   parallel are out of scope.
-- The furrow carrier is not built. `[handoff] carrier = "furrow"` fails with
-  a "not built yet" message (see docs/CONFIG.md).
+- Furrow 0.3.7 (`clone`) imports only `s3://` and `ssh://` stores.
+- Two writers are not guarded beyond the log prefix rule. The furrow export
+  takes over furrow's writer lease, so exporting while another host still
+  runs the session is not prevented by furrow.
 - Provider credentials do not move; each host signs in on its own.

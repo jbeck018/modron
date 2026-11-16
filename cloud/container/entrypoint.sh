@@ -48,6 +48,11 @@ fi
 # The agent process must not inherit the token.
 unset GITHUB_TOKEN
 
+# On a stop signal, serve exports the session it serves for the next host
+# (docs/HANDOFF.md, "Exit hand-off"). The git export pushes to origin, which
+# needs credentials this script no longer holds (see cloud/container/README.md).
+export MODRON_HANDOFF_ON_EXIT=1
+
 # Loopback only: nothing listens on a public interface. --bridge sets the
 # relay base for share/publish. --remote-control opens the tunnel at start,
 # with no client attached, for the repo's session (see cloud/container/README.md).
