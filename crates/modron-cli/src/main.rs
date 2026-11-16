@@ -48,6 +48,10 @@ enum ProviderChoice {
     /// ChatGPT subscription sign-in (Responses API on the ChatGPT
     /// backend; tokens from `/auth` → OpenAI → sign in with browser).
     Chatgpt,
+    /// OpenAI Responses API with an API key (`OPENAI_API_KEY`, base from
+    /// `OPENAI_BASE_URL`): the same request code as `chatgpt`, reasoning replay
+    /// included, with its own block scope.
+    OpenaiResponses,
     /// Keyless scripted demo provider (no network, runs the built-in script).
     Mock,
     /// Z.ai (Zhipu) GLM models — OpenAI-compatible, key via `ZAI_API_KEY`.
@@ -60,6 +64,7 @@ impl ProviderChoice {
             Self::Anthropic => "anthropic",
             Self::OpenaiCompat => "openai-compat",
             Self::Chatgpt => "chatgpt",
+            Self::OpenaiResponses => "openai-responses",
             Self::Mock => "mock",
             Self::Zai => "zai",
         }
@@ -1388,6 +1393,7 @@ fn build_agent_with(
     for extra_id in [
         "anthropic",
         "openai-compat",
+        "openai-responses",
         "chatgpt",
         "zai",
         "google",

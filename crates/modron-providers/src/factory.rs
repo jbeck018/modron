@@ -5,6 +5,7 @@
 //! lookup is a closure so unit tests never mutate process-global state; the
 //! convenience constructor reads `std::env` directly.
 
+use crate::openai_responses::API_KEY_DEFAULT_BASE_URL;
 use crate::{AnthropicProvider, OpenAiCompatProvider, OpenAiResponsesProvider};
 use modron_core::{Error, ModelProvider, Result};
 use std::sync::Arc;
@@ -135,6 +136,21 @@ pub fn provider_from_config(
         // The provider reads the stored tokens itself so the error names
         // the sign-in path, not an env var.
         "chatgpt" => Ok(Arc::new(OpenAiResponsesProvider::from_stored_tokens()?)),
+        // Same Responses request/stream code on the public API (H7b-3):
+        // OPENAI_API_KEY bearer, base from OPENAI_BASE_URL (default /v1).
+        "openai-responses" => {
+            let api_key = env("OPENAI_API_KEY").ok_or_else(|| {
+                missing_key(
+                    "OPENAI_API_KEY",
+                    "get a key at https://platform.openai.com/api-keys",
+                )
+            })?;
+            let base_url =
+                env("OPENAI_BASE_URL").unwrap_or_else(|| API_KEY_DEFAULT_BASE_URL.to_string());
+            Ok(Arc::new(OpenAiResponsesProvider::with_api_key(
+                api_key, base_url,
+            )?))
+        }
         // Free-tier providers (Phase 5g): all OpenAI-compatible; each is a
         // base URL + env key. See README "Free models" for rate limits.
         "groq" => openai_compat_with_key(
@@ -194,7 +210,7 @@ pub fn provider_from_config(
         )),
         other => Err(Error::Config(
             format!("unknown provider `{other}`"),
-            "supported providers: anthropic, openai-compat, zai, chatgpt (ChatGPT sign-in)".into(),
+            "supported providers: anthropic, openai-compat, openai-responses (API key), zai, chatgpt (ChatGPT sign-in)".into(),
         )),
     }
 }
@@ -405,6 +421,21 @@ mod tests {
             }
             other => panic!("expected Error::Config, got: {other}"),
         }
+    }
+
+    #[test]
+    fn openai_responses_needs_the_api_key_and_takes_the_base_override() {
+        let err = config_err(provider_from_config("openai-responses", |_| None));
+        match err {
+            Error::Config(what, _) => assert!(what.contains("OPENAI_API_KEY"), "{what}"),
+            other => panic!("expected Error::Config, got: {other}"),
+        }
+        let provider = provider_from_config("openai-responses", |key| {
+            (key == "OPENAI_API_KEY").then(|| "sk-test".to_string())
+        })
+        .unwrap();
+        assert_eq!(provider.id(), "openai-responses");
+        assert_eq!(provider.id(), crate::openai_responses::API_KEY_PROVIDER_ID);
     }
 
     #[test]
