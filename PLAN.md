@@ -500,3 +500,35 @@ and ownership. Two carriers, chosen by `[handoff] carrier = "git" |
 5. Out of scope for v1: live handoff during a run, merging diverged
    trees, moving provider credentials.
 
+### 10.9 Decision and design: provider credentials belong to the owner (C6d)
+
+Owner, 2026-11-16: model auth must come from the harness sign-in, not
+from how a container was deployed. Compared with Claude Code (model
+access follows the signed-in user; environment secrets are for the
+user's code): same rule here. This replaces the "Secrets" row of 10.2
+for provider credentials; infrastructure tokens stay Worker secrets.
+
+1. Vault in the bridge. Owner-only routes (owner cookie; invites and
+   viewers refused): `GET /api/credentials` lists provider ids and
+   whether each is set (never a value), `PUT /api/credentials/<id>`
+   stores an API key, `DELETE` removes it. Values are stored in the
+   Directory DO encrypted with AES-GCM under a key derived (HKDF) from
+   a dedicated Worker secret `VAULT_KEY`; unset = 503 and nothing else
+   changes. Values are never logged and never returned to a browser.
+2. Host fetch. `GET /api/host/credentials` with the HOST_TOKEN bearer
+   returns the decrypted set to a host. `modron serve
+   --portal-credentials` (env MODRON_PORTAL_CREDENTIALS=1; the cloud
+   container sets it) fetches them at start and after each tunnel
+   reconnect, keeps them in process memory only (never written to the
+   env file or the session log), and applies them to future turns. A
+   locally configured key wins over a vault key.
+3. App. On the web target, when the app is served by a bridge and the
+   viewer is the owner, the credentials screen writes API keys to the
+   vault (HTTPS to the bridge, not through the session socket). The
+   existing rule stays: key entry and removal over a relayed session
+   socket are refused.
+4. The cloud deploy workflow and the container worker drop
+   ANTHROPIC_API_KEY and OPENAI_API_KEY.
+5. Not in this pass: subscription sign-ins (browser OAuth and token
+   files), per-invite credentials, key rotation of VAULT_KEY.
+
