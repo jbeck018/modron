@@ -132,6 +132,121 @@ pub fn share_key() -> String {
 /// before and registers nothing with the portal.
 pub const HOST_TOKEN_ENV: &str = "MODRON_HOST_TOKEN";
 
+/// Environment variable that turns the portal credentials overlay on:
+/// `modron serve --portal-credentials` sets it, and so does the cloud
+/// container. The tunnel refetches the keys after each reconnect only when
+/// it is set (see `dial_once`).
+pub const PORTAL_CREDENTIALS_ENV: &str = "MODRON_PORTAL_CREDENTIALS";
+
+/// Whether the portal credentials overlay is on, per `lookup` (`1` or `true`).
+pub fn portal_credentials_on(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    matches!(
+        lookup(PORTAL_CREDENTIALS_ENV).as_deref(),
+        Some("1" | "true")
+    )
+}
+
+/// The start-up rule for `--portal-credentials` (PLAN 10.9): the keys come
+/// from the bridge the tunnel dials, so it needs the remote-control bridge,
+/// and the bridge's HOST_TOKEN for the bearer. `Ok` when the flag is off.
+pub fn check_portal_credentials(
+    portal: bool,
+    remote: Option<&str>,
+    host_token: Option<&str>,
+) -> Result<()> {
+    if !portal {
+        return Ok(());
+    }
+    if remote.is_none() {
+        return Err(anyhow!(
+            "--portal-credentials needs --remote-control (or MODRON_REMOTE_CONTROL): \
+             the keys come from the bridge the tunnel dials"
+        ));
+    }
+    if host_token.filter(|t| !t.is_empty()).is_none() {
+        return Err(anyhow!(
+            "--portal-credentials needs {HOST_TOKEN_ENV} (the bridge's HOST_TOKEN)"
+        ));
+    }
+    Ok(())
+}
+
+/// Environment variable names the portal may send: upper-case letters,
+/// digits and underscores, not starting with a digit.
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Fetches the owner's provider keys from the bridge (`GET
+/// /api/host/credentials`, bearer `host_token`) and replaces `overlay` with
+/// them. Returns the environment variable names now held. The bridge base is
+/// checked as the tunnel's is (`wss://`, or `ws://` on loopback only). On any
+/// failure the overlay is left as it was. No value is ever in an error.
+pub async fn refresh_portal_credentials(
+    bridge_base: &str,
+    host_token: &str,
+    overlay: &modron_core::credential_overlay::CredentialOverlay,
+) -> Result<Vec<String>> {
+    check_tunnel_bridge(bridge_base)?;
+    let url = format!("{}/api/host/credentials", bridge_http_base(bridge_base)?);
+    let client = reqwest::Client::builder()
+        .timeout(REGISTRATION_TIMEOUT)
+        .build()
+        .context("building the credentials client")?;
+    let response = client
+        .get(&url)
+        .header("authorization", format!("Bearer {host_token}"))
+        .send()
+        .await
+        .context("fetching the portal credentials")?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "the bridge answered {status} to the credentials fetch"
+        ));
+    }
+    let body = response
+        .text()
+        .await
+        .context("reading the portal credentials")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| anyhow!("the credentials answer is not JSON"))?;
+    let map = parsed
+        .get("credentials")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("the credentials answer has no credentials object"))?;
+    let mut values = std::collections::BTreeMap::new();
+    for (name, value) in map {
+        if !valid_env_name(name) {
+            continue;
+        }
+        if let Some(text) = value.as_str().filter(|t| !t.is_empty()) {
+            values.insert(name.clone(), text.to_string());
+        }
+    }
+    Ok(overlay.replace(values))
+}
+
+/// [`refresh_portal_credentials`] into the process overlay, for the serve
+/// path (start and each reconnect). Logs the environment variable names
+/// fetched, never a value; on failure logs a warning and keeps the previous set.
+pub async fn refresh_portal_credentials_logged(bridge_base: &str, host_token: &str) {
+    let overlay = modron_core::credential_overlay::shared();
+    match refresh_portal_credentials(bridge_base, host_token, &overlay).await {
+        Ok(names) => {
+            tracing::info!(env_vars = ?names, "portal credentials applied to future turns")
+        }
+        Err(e) => tracing::warn!(
+            error = format!("{e:#}"),
+            "portal credentials not refreshed; keeping the previous set"
+        ),
+    }
+}
+
 /// Environment variable naming this host's kind in the portal directory:
 /// `cloud`; `local` when unset.
 pub const HOST_KIND_ENV: &str = "MODRON_HOST_KIND";
@@ -541,6 +656,8 @@ struct TunnelTarget {
     key: String,
     agent_url: String,
     host_token: Option<String>,
+    /// Refetch the portal credentials after each connect (`--portal-credentials`).
+    portal: bool,
 }
 
 /// How one dial of the tunnel ended.
@@ -634,12 +751,14 @@ pub async fn run_tunnel_timed(
     // A bad header is a configuration error: checked once, never redialled.
     tunnel_request(&agent_url, host_token.as_deref())
         .with_context(|| format!("preparing the remote-control bridge request at {bridge_base}"))?;
+    let portal = portal_credentials_on(&*lookup) && host_token.is_some();
     let target = TunnelTarget {
         session,
         bridge_base,
         key,
         agent_url,
         host_token,
+        portal,
     };
     let mut failures = 0u32;
     let mut last_logged: Option<Instant> = None;
@@ -706,6 +825,12 @@ async fn dial_once(
     };
     let up_since = Instant::now();
     tracing::info!(%session, "remote-control tunnel connected");
+    // Portal credentials refreshed on every connect, before any frame flows.
+    if target.portal {
+        if let Some(token) = target.host_token.as_deref() {
+            refresh_portal_credentials_logged(&target.bridge_base, token).await;
+        }
+    }
     let (mut sink, mut stream) = socket.split();
 
     // Server->relay writer: drains the connection's outbound frames (the

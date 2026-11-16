@@ -19,8 +19,6 @@ export interface Env {
   GITHUB_REPO?: string;
   GITHUB_TOKEN?: string;
   MODRON_HOST_TOKEN?: string;
-  ANTHROPIC_API_KEY?: string;
-  OPENAI_API_KEY?: string;
 }
 
 // Environment names passed through to the container (all from Worker secrets).
@@ -29,8 +27,6 @@ const CONTAINER_ENV_KEYS = [
   "GITHUB_REPO",
   "GITHUB_TOKEN",
   "MODRON_HOST_TOKEN",
-  "ANTHROPIC_API_KEY",
-  "OPENAI_API_KEY",
 ] as const;
 
 const SLEEP_AFTER_MS = 10 * 60 * 1000;

@@ -39,8 +39,13 @@ with a notice when unset):
 | `CLOUD_GITHUB_TOKEN` | `GITHUB_TOKEN` | Token that can read the repo (fine-grained PAT, contents read). Used once for the clone, then unset in the agent process. |
 | `MODRON_HOST_TOKEN` | `MODRON_HOST_TOKEN` | Must equal the bridge's `HOST_TOKEN` secret, for portal registration. |
 | `WAKE_TOKEN` | `WAKE_TOKEN` | Bearer token for `POST /wake`. Choose a long random string. If unset, wake is disabled. |
-| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` | Provider key for the agent (optional). |
-| `OPENAI_API_KEY` | `OPENAI_API_KEY` | Provider key for the agent (optional). |
+
+Provider keys are not container secrets. The owner stores them in the bridge
+vault (`cloud/bridge/README.md`, "Provider keys (vault)"); the container's
+entrypoint sets `MODRON_PORTAL_CREDENTIALS=1`, so `modron serve` fetches them
+from the bridge at start and after each reconnect, and keeps them in memory
+only. A workflow or Worker secret named `ANTHROPIC_API_KEY` or
+`OPENAI_API_KEY` is no longer read.
 
 GitHub does not allow repository secret names starting with `GITHUB_`, which
 is why the two GitHub values use the `CLOUD_` prefix.

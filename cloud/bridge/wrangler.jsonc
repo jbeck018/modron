@@ -12,6 +12,7 @@
   //   npx wrangler secret put VAPID_PUBLIC_KEY  (web push; unset = 503)
   //   npx wrangler secret put VAPID_PRIVATE_KEY (web push; README "Web push")
   //   npx wrangler secret put VAPID_SUBJECT    (mailto: or https: contact)
+  //   npx wrangler secret put VAULT_KEY        (provider keys; unset = 503; README "Provider keys")
   // Static assets: the unified web app bundle lives in public/app/ and is
   // NOT committed; `sh scripts/sync-app.sh` copies it there after
   // `nsh package --target web -o dist` in app/. run_worker_first keeps the

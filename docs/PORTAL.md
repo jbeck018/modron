@@ -71,6 +71,19 @@ renders the list and opens `/app/?url=wss://host/ws/<viewer key>`.
 - A cloud run picks one identity; the Worker injects that token into the
   container at start (C6). Local hosts keep using their own git setup.
 
+## Provider keys (vault, C6d)
+
+Owner-only routes in the bridge store provider API keys encrypted under a
+`VAULT_KEY` Worker secret (AES-256-GCM, HKDF-derived key, fresh nonce per
+write, provider id as AAD). `GET /api/host/credentials` with the `HOST_TOKEN`
+bearer returns the decrypted set to a host. `modron serve --remote-control
+--portal-credentials` (env `MODRON_PORTAL_CREDENTIALS=1`, set by the cloud
+container) fetches it at start and after each tunnel reconnect, keeps it in
+process memory only, and applies it to future turns. A key set locally in the
+environment or the env file wins over a vault key. Nothing is written to the
+env file or the session log; the log names only the env vars fetched. Full
+scheme and routes: `cloud/bridge/README.md` ("Provider keys (vault)").
+
 ## Notifications (C5)
 
 Status (PUSH-1): the bridge side is built (cloud/bridge/README.md "Web

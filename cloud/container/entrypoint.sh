@@ -53,6 +53,10 @@ unset GITHUB_TOKEN
 # needs credentials this script no longer holds (see cloud/container/README.md).
 export MODRON_HANDOFF_ON_EXIT=1
 
+# Provider keys come from the owner's bridge vault, not from this container's
+# environment (PLAN 10.9): serve fetches them at start and after each reconnect.
+export MODRON_PORTAL_CREDENTIALS=1
+
 # Loopback only: nothing listens on a public interface. --bridge sets the
 # relay base for share/publish. --remote-control opens the tunnel at start,
 # with no client attached, for the repo's session (see cloud/container/README.md).

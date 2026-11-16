@@ -137,6 +137,7 @@ Both are Wrangler secrets, never in `wrangler.jsonc` or the repository:
 ```sh
 npx wrangler secret put OWNER_TOKEN   # owner sign-in; also keys invite signatures
 npx wrangler secret put HOST_TOKEN    # host registration and the agent tunnel
+npx wrangler secret put VAULT_KEY     # provider-key vault (see "Provider keys")
 ```
 
 - `OWNER_TOKEN` unset: every `/auth`, `/api/*` and `/i/*` route answers
@@ -153,6 +154,37 @@ npx wrangler secret put HOST_TOKEN    # host registration and the agent tunnel
 
 Tokens are compared in constant time and never logged. Owner cookies are
 stored in the Directory as SHA-256 hashes.
+
+### Provider keys (vault)
+
+Provider API keys belong to the owner, not to a container deploy (PLAN 10.9).
+The owner stores a key here; a host running `modron serve --remote-control
+--portal-credentials` fetches the set and uses it for future turns.
+
+- `VAULT_KEY` (Wrangler secret) unset: `GET/PUT/DELETE /api/credentials*` and
+  `GET /api/host/credentials` answer `503`; nothing else changes.
+- `GET /api/credentials` (owner cookie): one row per allowed provider with
+  `set` and `unreadable`. Never a value.
+- `PUT /api/credentials/<id>` with `{ "key": "..." }` (owner cookie and an
+  `Origin` header equal to the bridge's origin): stores the key, `204`.
+  `DELETE` removes it, `204` or `404`.
+- Allowed ids are the auth catalog's (`anthropic`, `openai-compat`, `zai`,
+  `google`, `groq`, `openrouter`, `mistral`, `cerebras`, `nvidia`,
+  `github-models`); each maps to one env var (`src/vault.ts`). Other ids are
+  `400`. A key is 1-512 UTF-8 bytes with no control characters.
+- `GET /api/host/credentials` (bearer `HOST_TOKEN`): `{ "credentials":
+  { "ANTHROPIC_API_KEY": "...", ... } }`. The only route that returns a value,
+  and only to the host.
+- Encryption: AES-256-GCM. The key is HKDF-SHA256 of `VAULT_KEY` (salt
+  `modron-vault-v1`, info `modron-vault-aes-gcm-v1`). Each write draws a fresh
+  96-bit nonce; the provider id is the additional authenticated data. The
+  Directory table `credentials` stores nonce and ciphertext only. A row that
+  fails to open is reported `unreadable`, and the host fetch leaves it out.
+- Invites never manage keys: a request presenting `?invite=` gets `403`; a
+  request with no owner cookie gets `401`.
+- Values are never logged and never returned to a browser. Responses are
+  `cache-control: no-store`. Rotating `VAULT_KEY` makes existing rows
+  unreadable; re-enter the keys (key rotation is not built).
 
 ### Routes
 

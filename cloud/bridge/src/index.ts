@@ -81,6 +81,10 @@ interface Env {
   // Host registration and the agent tunnel. Unset leaves /agent open to
   // anyone holding the agent key, as before.
   HOST_TOKEN?: string;
+  // Provider-key vault (src/vault.ts, README "Provider keys"). Wrangler
+  // secret, separate from every other secret. Unset: /api/credentials and
+  // /api/host/credentials answer 503 and nothing else changes.
+  VAULT_KEY?: string;
   DIRECTORY: DurableObjectNamespace<Directory>;
   // Test-only (set by test/portal.mjs, never in a deployment): accepts a
   // ttl_seconds field on POST /api/invites so expiry can be tested quickly.
@@ -132,7 +136,15 @@ interface RegistryEntry {
 }
 
 import { DurableObject } from "cloudflare:workers";
-import { Directory } from "./directory";
+import { Directory, type CredentialRow } from "./directory";
+import {
+  checkCredentialValue,
+  openCredential,
+  providerEnvVar,
+  sealCredential,
+  VAULT_PROVIDERS,
+  type Sealed,
+} from "./vault";
 import {
   PUSH_WORKER,
   importVapid,
@@ -1005,6 +1017,103 @@ async function handlePushSubscribe(request: Request, env: Env): Promise<Response
   return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 }
 
+// --- provider-key vault: /api/credentials (owner), /api/host/credentials (host) ---
+// Owner routes need the owner cookie (401 without it). A request that presents
+// an invite (any role, `?invite=`) is refused 403: invites never manage keys.
+// PUT and DELETE also need an Origin header equal to this bridge's origin, on
+// top of the SameSite=Strict cookie. Every response is no-store and no route
+// returns a value to a browser; only the host route returns values, and only
+// with the HOST_TOKEN bearer.
+
+function sameOriginWrite(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  return origin !== null && origin === new URL(request.url).origin;
+}
+
+function sealedOf(row: CredentialRow): Sealed {
+  return { nonce: new Uint8Array(row.nonce), ciphertext: new Uint8Array(row.ciphertext) };
+}
+
+// Copies a fresh byte array into its own ArrayBuffer for DO storage.
+const bufferOf = (bytes: Uint8Array): ArrayBuffer => bytes.slice().buffer;
+
+// GET /api/credentials: { credentials: [{ provider, env_var, set, unreadable,
+// updated_at }] } for every allowed provider. Never a value.
+// PUT /api/credentials/<id> { key }: store (204). DELETE: remove (204 or 404).
+async function handleCredentials(request: Request, env: Env, path: string): Promise<Response> {
+  if (!env.VAULT_KEY) return plainResponse(503, "provider keys are disabled: this bridge has no VAULT_KEY secret");
+  if (!(await ownerCookieLive(request, env))) {
+    if (new URL(request.url).searchParams.has("invite")) return plainResponse(403, "invites cannot manage provider keys");
+    return plainResponse(401, "unauthorized");
+  }
+  const dir = directory(env);
+  if (path === "/api/credentials") {
+    if (request.method !== "GET") return plainResponse(405, "method not allowed");
+    const rows = new Map((await dir.listCredentials()).map((row) => [row.provider_id, row] as const));
+    const list = [];
+    for (const [id, envVar] of Object.entries(VAULT_PROVIDERS)) {
+      const row = rows.get(id);
+      let unreadable = false;
+      if (row) {
+        try { await openCredential(env.VAULT_KEY, id, sealedOf(row)); } catch { unreadable = true; }
+      }
+      list.push({
+        provider: id,
+        env_var: envVar,
+        set: row !== undefined,
+        unreadable,
+        updated_at: row ? iso(row.updated_at) : null,
+      });
+    }
+    return jsonResponse(200, { credentials: list });
+  }
+  const m = path.match(/^\/api\/credentials\/([^/]+)$/);
+  if (!m) return plainResponse(404, "not found");
+  const id = m[1];
+  if (request.method !== "PUT" && request.method !== "DELETE") return plainResponse(405, "method not allowed");
+  if (!sameOriginWrite(request)) return plainResponse(403, "cross-origin change refused");
+  if (providerEnvVar(id) === null) return plainResponse(400, "unknown provider id");
+  if (request.method === "DELETE") {
+    const existed = await dir.deleteCredential(id);
+    return existed
+      ? new Response(null, { status: 204, headers: { "cache-control": "no-store" } })
+      : plainResponse(404, "not set");
+  }
+  const parsed = await readJsonObject(request, ["key"]);
+  if (!parsed.ok) return parsed.response;
+  const value = checkCredentialValue(parsed.body.key);
+  if (!value.ok) return plainResponse(400, value.message);
+  const sealed = await sealCredential(env.VAULT_KEY, id, value.value);
+  await dir.putCredential({
+    provider_id: id,
+    nonce: bufferOf(sealed.nonce),
+    ciphertext: bufferOf(sealed.ciphertext),
+    updated_at: requestNow(request, env),
+  });
+  return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+}
+
+// GET /api/host/credentials, bearer HOST_TOKEN: { credentials: { <ENV>: value } }
+// for every readable stored key. An unreadable row is left out, never sent.
+async function handleHostCredentials(request: Request, env: Env): Promise<Response> {
+  if (!env.HOST_TOKEN || !env.VAULT_KEY) {
+    return plainResponse(503, "host credentials are disabled: this bridge has no HOST_TOKEN or VAULT_KEY secret");
+  }
+  if (request.method !== "GET") return plainResponse(405, "method not allowed");
+  if (!bearerMatches(request, env.HOST_TOKEN)) return plainResponse(401, "unauthorized");
+  const out: Record<string, string> = {};
+  for (const row of await directory(env).listCredentials()) {
+    const envVar = providerEnvVar(row.provider_id);
+    if (envVar === null) continue;
+    try {
+      out[envVar] = await openCredential(env.VAULT_KEY, row.provider_id, sealedOf(row));
+    } catch {
+      // Unreadable: omitted. The value is never part of an error.
+    }
+  }
+  return jsonResponse(200, { credentials: out });
+}
+
 const router: ExportedHandler<Env> = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -1067,6 +1176,10 @@ const router: ExportedHandler<Env> = {
     }
     if ((m = path.match(/^\/api\/host\/sessions\/([^/]+)$/))) {
       return handleHostSession(request, env, m[1]);
+    }
+    if (path === "/api/host/credentials") return handleHostCredentials(request, env);
+    if (path === "/api/credentials" || path.startsWith("/api/credentials/")) {
+      return handleCredentials(request, env, path);
     }
     if (path === "/api/invites" || path.startsWith("/api/invites/")) {
       const denied = await requireOwner(request, env);

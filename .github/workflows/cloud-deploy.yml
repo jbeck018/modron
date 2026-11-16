@@ -86,8 +86,6 @@ jobs:
       SECRET_GITHUB_TOKEN: ${{ secrets.CLOUD_GITHUB_TOKEN }}
       SECRET_MODRON_HOST_TOKEN: ${{ secrets.MODRON_HOST_TOKEN }}
       SECRET_WAKE_TOKEN: ${{ secrets.WAKE_TOKEN }}
-      SECRET_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      SECRET_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -111,7 +109,7 @@ jobs:
         working-directory: cloud/container
         run: |
           set -eu
-          for name in BRIDGE_URL GITHUB_REPO GITHUB_TOKEN MODRON_HOST_TOKEN WAKE_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY; do
+          for name in BRIDGE_URL GITHUB_REPO GITHUB_TOKEN MODRON_HOST_TOKEN WAKE_TOKEN; do
             var="SECRET_$name"
             value="${!var:-}"
             if [ -z "$value" ]; then

@@ -62,6 +62,14 @@ export type PushRow = {
 
 export type IssuedTicket = { ticket: string; viewer_key: string; role: Role };
 
+// A stored provider key (vault.ts): ciphertext only, never the plaintext.
+export type CredentialRow = {
+  provider_id: string;
+  nonce: ArrayBuffer;
+  ciphertext: ArrayBuffer;
+  updated_at: number;
+};
+
 export class Directory extends DurableObject<object> {
   private readonly sql: SqlStorage;
 
@@ -112,6 +120,13 @@ export class Directory extends DurableObject<object> {
         role TEXT NOT NULL,
         session_id TEXT,
         created_at INTEGER NOT NULL)`);
+      // Provider keys (vault.ts). Sealed with AES-GCM under VAULT_KEY; the
+      // Directory never sees the key material, only nonce and ciphertext.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS credentials (
+        provider_id TEXT PRIMARY KEY,
+        nonce BLOB NOT NULL,
+        ciphertext BLOB NOT NULL,
+        updated_at INTEGER NOT NULL)`);
     });
   }
 
@@ -279,4 +294,25 @@ export class Directory extends DurableObject<object> {
       .toArray();
     return { session, subs };
   }
+  // --- provider-key vault (vault.ts) ---
+
+  async putCredential(row: CredentialRow): Promise<void> {
+    this.sql.exec(
+      `INSERT OR REPLACE INTO credentials (provider_id, nonce, ciphertext, updated_at)
+       VALUES (?, ?, ?, ?)`,
+      row.provider_id, row.nonce, row.ciphertext, row.updated_at,
+    );
+  }
+
+  // Returns false when no value was stored for the provider.
+  async deleteCredential(providerId: string): Promise<boolean> {
+    const existed = this.sql.exec("SELECT 1 AS one FROM credentials WHERE provider_id = ?", providerId).toArray().length > 0;
+    this.sql.exec("DELETE FROM credentials WHERE provider_id = ?", providerId);
+    return existed;
+  }
+
+  async listCredentials(): Promise<CredentialRow[]> {
+    return this.sql.exec<CredentialRow>("SELECT provider_id, nonce, ciphertext, updated_at FROM credentials").toArray();
+  }
 }
+

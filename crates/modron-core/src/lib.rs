@@ -17,6 +17,7 @@ pub mod budget;
 pub mod builtin_skills;
 pub mod compact;
 pub mod context;
+pub mod credential_overlay;
 pub mod engine;
 pub mod goal;
 pub mod handoff;

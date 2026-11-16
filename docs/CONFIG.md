@@ -336,6 +336,7 @@ Z.ai Coding Plan keys work only on the coding endpoint. Set
 | `MODRON_HOST_TOKEN` | `modron serve` | Bearer token sent on the bridge tunnel. Needed when the bridge has `HOST_TOKEN` set. Never shown in error text. |
 | `MODRON_HOST_KIND` | `modron serve` | `cloud` marks the session's host as cloud. Any other value, or unset, means local. |
 | `MODRON_REMOTE_CONTROL` | `modron serve` | Bridge URL (`ws://` or `wss://`) to open remote control against at start, as `--remote-control`. The flag wins when both are set. Empty counts as unset. |
+| `MODRON_PORTAL_CREDENTIALS` | `modron serve` | `1` or `true` turns on `--portal-credentials`: the owner's provider keys are fetched from the bridge vault (needs `--remote-control` and `MODRON_HOST_TOKEN`), held in memory only, and used for future turns. A key set in the environment or the env file wins. Set by the cloud container. |
 | `MODRON_PUBLISH_TOKEN` | `modron serve` (`/share`) | Bearer token for publishing a page to the bridge. Without it, publishing fails before any request is sent. |
 | `MODRON_DEVICE_TOKEN` | `modron --connect ws://...` | Device token for a `modron serve` that requires one. A `token` URL parameter wins over it. |
 

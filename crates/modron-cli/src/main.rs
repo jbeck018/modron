@@ -197,6 +197,13 @@ enum Command {
         /// upgrade that carries an Origin header is refused.
         #[arg(long = "allow-origin")]
         allow_origin: Vec<String>,
+        /// Fetch the owner's provider keys from the bridge vault at start and
+        /// after each tunnel reconnect (needs --remote-control and
+        /// MODRON_HOST_TOKEN). The keys stay in memory only; a key set in the
+        /// environment or env file wins. Also set by env
+        /// MODRON_PORTAL_CREDENTIALS=1 (the cloud container sets it).
+        #[arg(long = "portal-credentials")]
+        portal_credentials: bool,
     },
     /// Manage paired remote devices (Phase 3): mint, list, revoke the
     /// bearer tokens remote clients send in their hello frame.
@@ -757,6 +764,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         remote_control,
         share_url_file,
         handoff_on_exit,
+        portal_credentials,
     }) = &cli.command
     {
         // The flag wins over MODRON_REMOTE_CONTROL (see rc::resolve_remote_control).
@@ -803,6 +811,29 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         } else {
             None
         };
+        // Portal credentials (PLAN 10.9): the owner's vault keys are fetched
+        // before any provider is built, so a provider with no local key still
+        // starts. The tunnel refetches them on each reconnect (rc::dial_once).
+        let portal = *portal_credentials
+            || modron_server::rc::portal_credentials_on(&|name| std::env::var(name).ok());
+        let host_token = std::env::var(modron_server::rc::HOST_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty());
+        modron_server::rc::check_portal_credentials(
+            portal,
+            remote.as_deref(),
+            host_token.as_deref(),
+        )?;
+        if let (true, Some(bridge), Some(token)) =
+            (portal, remote.as_deref(), host_token.as_deref())
+        {
+            modron_server::rc::check_tunnel_bridge(bridge)?;
+            // Set for the tunnel's reconnects; the flag alone is not enough
+            // for them, which read the environment.
+            std::env::set_var(modron_server::rc::PORTAL_CREDENTIALS_ENV, "1");
+            modron_core::credential_overlay::enable();
+            modron_server::rc::refresh_portal_credentials_logged(bridge, token).await;
+        }
         let mcp = spawn_mcp_servers(&cfg).await?;
         let agent = build_agent_with(
             &cli,
@@ -1618,6 +1649,18 @@ fn stdout_delta_sink() -> Arc<modron_core::DeltaSink> {
 /// Construct one provider by id (mock/demo or env-backed), shared by the
 /// agent builder and the multi-provider bench.
 pub(crate) fn build_provider_shim(pid: &str) -> anyhow::Result<Arc<dyn ModelProvider>> {
+    // With --portal-credentials the key is resolved per turn: the process
+    // environment, then the vault overlay (see modron_providers::overlay).
+    if pid != "mock" && modron_core::credential_overlay::enabled() {
+        let env: modron_providers::overlay::EnvFn = Arc::new(|name: &str| std::env::var(name).ok());
+        if let Some(provider) = modron_providers::overlay::OverlayProvider::new(
+            pid,
+            modron_core::credential_overlay::shared(),
+            env,
+        ) {
+            return Ok(Arc::new(RetryingProvider::new(Arc::new(provider))));
+        }
+    }
     Ok(match pid {
         "mock" => Arc::new(modron_core::testing::rich_demo_provider()),
         other => Arc::new(RetryingProvider::new(provider_from_env(other).map_err(
