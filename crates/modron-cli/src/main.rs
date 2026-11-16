@@ -48,6 +48,10 @@ enum ProviderChoice {
     /// ChatGPT subscription sign-in (Responses API on the ChatGPT
     /// backend; tokens from `/auth` → OpenAI → sign in with browser).
     Chatgpt,
+    /// OpenAI Responses API with an API key (`OPENAI_API_KEY`, base from
+    /// `OPENAI_BASE_URL`): the same request code as `chatgpt`, reasoning replay
+    /// included, with its own block scope.
+    OpenaiResponses,
     /// Keyless scripted demo provider (no network, runs the built-in script).
     Mock,
     /// Z.ai (Zhipu) GLM models — OpenAI-compatible, key via `ZAI_API_KEY`.
@@ -60,6 +64,7 @@ impl ProviderChoice {
             Self::Anthropic => "anthropic",
             Self::OpenaiCompat => "openai-compat",
             Self::Chatgpt => "chatgpt",
+            Self::OpenaiResponses => "openai-responses",
             Self::Mock => "mock",
             Self::Zai => "zai",
         }
@@ -122,6 +127,16 @@ enum Command {
         /// Only run eval tasks whose id contains this substring.
         #[arg(long)]
         filter: Option<String>,
+        /// Task suite: mini (default) or edit (twelve edit-focused tasks).
+        #[arg(long, value_enum, default_value_t = evals::EvalSuite::Mini)]
+        suite: evals::EvalSuite,
+        /// Edit tool the model is offered: edit (default, production) or
+        /// edit_lines (edit_lines + read line hashes instead of edit).
+        #[arg(long, value_enum, default_value_t = evals::EditArm::Edit)]
+        edit_tool: evals::EditArm,
+        /// Pause this many milliseconds after each task (rate limits).
+        #[arg(long)]
+        delay_ms: Option<u64>,
     },
     /// Upgrade the binary from the latest GitHub release.
     Upgrade,
@@ -681,8 +696,24 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     }
 
     // `modron eval` — mini-SWE scoring (Phase 6c).
-    if let Some(Command::Eval { models, filter }) = cli.command.clone() {
-        return crate::evals::run_evals(&cli, &cfg, models.as_deref(), filter.as_deref()).await;
+    if let Some(Command::Eval {
+        models,
+        filter,
+        suite,
+        edit_tool,
+        delay_ms,
+    }) = cli.command.clone()
+    {
+        return crate::evals::run_evals(
+            &cli,
+            &cfg,
+            models.as_deref(),
+            filter.as_deref(),
+            suite,
+            edit_tool,
+            delay_ms,
+        )
+        .await;
     }
 
     // `modron upgrade` — self-update from the latest release (Phase 6e).
@@ -1362,6 +1393,7 @@ fn build_agent_with(
     for extra_id in [
         "anthropic",
         "openai-compat",
+        "openai-responses",
         "chatgpt",
         "zai",
         "google",

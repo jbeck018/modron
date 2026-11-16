@@ -1,0 +1,17 @@
+edit: files=['19-19-14', '19-22-22', '19-25-02'] passed=[12, 12, 12] (36/36) edit_calls=[14, 15, 13] errors=[1, 1, 1] retries=[1, 1, 1] tok/task=[16377, 19897, 15023] mean_tok/task=17099 sd=2054 ms/task=[14150, 11783, 9655] mean_ms=11863 sd=1836 tool_calls/task=[3.5, 3.58, 3.33]
+  failed tasks: []
+  error samples (n=3):
+    edit: read-before-edit gate: read `tail.txt` first — edits to files the session has not read are blocked
+    edit: read-before-edit gate: read `crlf.txt` first — edits to files the session has not read are blocked
+    edit: read-before-edit gate: read `crlf.txt` first — edits to files the session has not read are blocked
+edit_lines: files=['19-19-14', '19-22-12', '19-25-21'] passed=[11, 11, 11] (33/36) edit_calls=[13, 17, 17] errors=[2, 4, 5] retries=[2, 6, 7] tok/task=[18096, 19645, 19477] mean_tok/task=19073 sd=694 ms/task=[13314, 14247, 12923] mean_ms=13495 sd=555 tool_calls/task=[3.92, 4.17, 4.33]
+  failed tasks: ['edit-10-blank-lines', 'edit-10-blank-lines', 'edit-10-blank-lines']
+  error samples (n=11):
+    edit_lines: `expected_hashes` has 3 entries for 2 line(s) in 7..=8; pass exactly one hash per line
+    edit_lines: hash mismatch in /tmp/claude-0/bench-work/tmp/modron-evals-2026-11-16T19-19-14.999413819-00-00/eval-edit-04-several-values-glm-4.6/config.ini: the f…
+    edit_lines: hash mismatch in /tmp/claude-0/bench-work/tmp/modron-evals-2026-11-16T19-22-12.841682164-00-00/eval-edit-04-several-values-glm-4.6/config.ini: the f…
+    edit_lines: `expected_hashes` has 3 entries for 1 line(s) in 3..=3; pass exactly one hash per line
+    edit_lines: hash mismatch in /tmp/claude-0/bench-work/tmp/modron-evals-2026-11-16T19-22-12.841682164-00-00/eval-edit-05-edit-after-shift-glm-4.6/shift.txt: the …
+    edit_lines: invalid arguments: missing required argument `start_line`
+    edit_lines: hash mismatch in /tmp/claude-0/bench-work/tmp/modron-evals-2026-11-16T19-25-21.886271802-00-00/eval-edit-03-duplicate-lines-glm-4.6/dup.py: the file…
+    edit_lines: invalid arguments: missing required argument `start_line`

@@ -1,0 +1,154 @@
+# Edit-focused eval suite (modron eval --suite edit). Each task is verified by
+# a shell check that compares the whole resulting file byte for byte, so no
+# model judgement is involved. Prompts do not name an edit tool: the arm
+# decides which one the model is offered.
+
+[[task]]
+id = "edit-01-multiline-block"
+prompt = "In block.txt, replace lines 2 and 3 (beta and gamma) with three lines: one, two, three. Leave every other line unchanged."
+setup = 'printf "alpha\nbeta\ngamma\ndelta\nepsilon\n" > block.txt'
+verify = 'printf "alpha\none\ntwo\nthree\ndelta\nepsilon\n" | cmp -s - block.txt'
+
+[[task]]
+id = "edit-02-middle-insert-long"
+prompt = "In long.txt, insert two new lines directly after line 200 (which reads 'row 200'): first 'inserted A', then 'inserted B'. Do not change any other line."
+setup = "seq -f 'row %g' 1 400 > long.txt"
+verify = "{ seq -f 'row %g' 1 200; echo 'inserted A'; echo 'inserted B'; seq -f 'row %g' 201 400; } | cmp -s - long.txt"
+
+[[task]]
+id = "edit-03-duplicate-lines"
+prompt = "In dup.py, change only the return value inside beta (its line 'return None' must become 'return 0'). The same 'return None' lines in alpha and gamma must stay as they are."
+setup = '''cat > dup.py <<'EOF'
+def alpha(x):
+    if x is None:
+        return None
+    return x
+
+def beta(x):
+    if x is None:
+        return None
+    return x + 1
+
+def gamma(x):
+    if x is None:
+        return None
+    return x * 2
+EOF'''
+verify = '''cmp -s - dup.py <<'EOF'
+def alpha(x):
+    if x is None:
+        return None
+    return x
+
+def beta(x):
+    if x is None:
+        return 0
+    return x + 1
+
+def gamma(x):
+    if x is None:
+        return None
+    return x * 2
+EOF'''
+
+[[task]]
+id = "edit-04-several-values"
+prompt = "In config.ini change three values: port to 9090, debug to true, and timeout to 60. Keep every other line exactly as it is."
+setup = '''cat > config.ini <<'EOF'
+name = demo
+port = 8080
+host = localhost
+debug = false
+workers = 2
+timeout = 30
+EOF'''
+verify = '''cmp -s - config.ini <<'EOF'
+name = demo
+port = 9090
+host = localhost
+debug = true
+workers = 2
+timeout = 60
+EOF'''
+
+[[task]]
+id = "edit-05-edit-after-shift"
+prompt = "Read shift.txt first. Then run `sed -i '1i new header' shift.txt` with bash. Then change the line 'second' to 'SECOND' in shift.txt. Leave everything else unchanged."
+setup = 'printf "target line\nsecond\nthird\n" > shift.txt'
+verify = 'printf "new header\ntarget line\nSECOND\nthird\n" | cmp -s - shift.txt'
+
+[[task]]
+id = "edit-06-indentation"
+prompt = "In indent.py, the line 'return self.w * self.h' is indented 12 spaces inside method area. Replace that one line with two lines at the same 12-space indentation: 'area = self.w * self.h' and then 'return area'. Change nothing else."
+setup = '''cat > indent.py <<'EOF'
+class Box:
+    def area(self):
+        if self.w:
+            return self.w * self.h
+        return 0
+
+    def label(self):
+        return "box"
+EOF'''
+verify = '''cmp -s - indent.py <<'EOF'
+class Box:
+    def area(self):
+        if self.w:
+            area = self.w * self.h
+            return area
+        return 0
+
+    def label(self):
+        return "box"
+EOF'''
+
+[[task]]
+id = "edit-07-crlf"
+prompt = "crlf.txt uses Windows CRLF line endings. Change the line 'second' to 'middle' and keep CRLF line endings on every line."
+setup = 'printf "first\r\nsecond\r\nthird\r\n" > crlf.txt'
+verify = 'printf "first\r\nmiddle\r\nthird\r\n" | cmp -s - crlf.txt'
+
+[[task]]
+id = "edit-08-large-tail"
+prompt = "In tail.txt replace the last three lines (entry 1498, entry 1499, entry 1500) with a single line 'entry tail'. Change nothing else."
+setup = "seq -f 'entry %g' 1 1500 > tail.txt"
+verify = "{ seq -f 'entry %g' 1 1497; echo 'entry tail'; } | cmp -s - tail.txt"
+
+[[task]]
+id = "edit-09-delete-block"
+prompt = "In del.txt delete lines 4 through 6 (item 4, item 5 and item 6). Leave the rest unchanged."
+setup = "seq -f 'item %g' 1 10 > del.txt"
+verify = "{ seq -f 'item %g' 1 3; seq -f 'item %g' 7 10; } | cmp -s - del.txt"
+
+[[task]]
+id = "edit-10-blank-lines"
+prompt = "In blank.txt change 'body b' to 'body B'. Also put a line containing only 'divider' between the two empty lines that come after 'body a'."
+setup = 'printf "title\n\n\nsection one\nbody a\n\n\nsection two\nbody b\n" > blank.txt'
+verify = 'printf "title\n\n\nsection one\nbody a\n\ndivider\n\nsection two\nbody B\n" | cmp -s - blank.txt'
+
+[[task]]
+id = "edit-11-function-body"
+prompt = "In calc.py replace the four-line body of total (from 'result = 0' through 'return result') with one line: 'return sum(items)'. Keep the header of total and all of mean unchanged."
+setup = '''cat > calc.py <<'EOF'
+def total(items):
+    result = 0
+    for item in items:
+        result += item
+    return result
+
+def mean(items):
+    return total(items) / len(items)
+EOF'''
+verify = '''cmp -s - calc.py <<'EOF'
+def total(items):
+    return sum(items)
+
+def mean(items):
+    return total(items) / len(items)
+EOF'''
+
+[[task]]
+id = "edit-12-unicode-line"
+prompt = "In menu.txt change the first line 'café menu' to 'crème brûlée menu'. Leave the other lines unchanged."
+setup = 'printf "café menu\nprice: 3 EUR\nthanks\n" > menu.txt'
+verify = 'printf "crème brûlée menu\nprice: 3 EUR\nthanks\n" | cmp -s - menu.txt'

@@ -138,10 +138,66 @@ pub fn tier_default_tools(registry: &mut ToolRegistry) {
     }
 }
 
+/// Benchmark arm (`modron eval --edit-tool edit_lines`): a copy of `registry`
+/// where `edit_lines` replaces `edit`. `edit` is removed, and `edit_lines` is
+/// offered in the prompt schema (not on-demand) so the model sees it without
+/// a `tool_search` round trip. Every other tool, its tier and the shared read
+/// ledger carry over unchanged. Production registries never call this.
+pub fn prefer_edit_lines(registry: &ToolRegistry) -> ToolRegistry {
+    let mut out = ToolRegistry::new();
+    out.read_gate = registry.read_gate.clone();
+    for spec in registry.specs() {
+        if spec.name == "edit" {
+            continue;
+        }
+        if let Some(tool) = registry.get(&spec.name) {
+            out.register(Arc::clone(tool));
+        }
+        if registry.is_on_demand(&spec.name) && spec.name != "edit_lines" {
+            out.mark_on_demand(&spec.name);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prefer_edit_lines_swaps_edit_for_edit_lines() {
+        let mut registry = default_registry_with_memory(Path::new("/tmp/modron-test-memory"));
+        tier_default_tools(&mut registry);
+        let swapped = prefer_edit_lines(&registry);
+        let names: Vec<String> = swapped.specs().into_iter().map(|s| s.name).collect();
+        assert!(
+            !names.iter().any(|n| n == "edit"),
+            "edit removed: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "edit_lines"), "edit_lines kept");
+        assert!(names.iter().any(|n| n == "read"), "read kept");
+        assert!(
+            !swapped.is_on_demand("edit_lines"),
+            "edit_lines in the prompt"
+        );
+        assert!(swapped.is_on_demand("remember"), "other tiers unchanged");
+        assert!(
+            registry.specs().iter().any(|s| s.name == "edit"),
+            "the source registry is not mutated"
+        );
+        let prompt: Vec<String> = swapped
+            .specs_prompt()
+            .into_iter()
+            .filter(|s| !s.description.contains("on-demand tool"))
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            prompt.contains(&"edit_lines".to_string()),
+            "prompt: {prompt:?}"
+        );
+        assert!(!prompt.contains(&"edit".to_string()), "prompt: {prompt:?}");
+    }
 
     #[test]
     fn default_registry_has_seven_tools() {

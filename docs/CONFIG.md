@@ -37,7 +37,7 @@ Sources of truth in the code:
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `default_provider` | string | `anthropic` | Provider used when `--provider` is not given. Accepted ids: `anthropic`, `openai-compat`, `chatgpt`, `zai`, `mock`, and the free-tier ids in the environment section. Env: `MODRON_DEFAULT_PROVIDER`. |
+| `default_provider` | string | `anthropic` | Provider used when `--provider` is not given. Accepted ids: `anthropic`, `openai-compat`, `openai-responses`, `chatgpt`, `zai`, `mock`, and the free-tier ids in the environment section. Env: `MODRON_DEFAULT_PROVIDER`. |
 | `default_model` | string | see note | Model used when `--model` is not given. Env: `MODRON_DEFAULT_MODEL`. |
 | `max_input_tokens` | integer | `180000` | Per-turn cap on the assembled context (pre-flight estimate). Env: `MODRON_MAX_INPUT_TOKENS`. `--max-input-tokens` overrides both. |
 | `max_total_tokens` | integer | `2000000` | Cumulative token cap for one run, from provider-reported usage. Env: `MODRON_MAX_TOTAL_TOKENS`. `--max-total-tokens` overrides both. |
@@ -310,8 +310,9 @@ written by `modron auth set` (and by `/auth` in the app) are kept in
 | Provider id | Key | Base URL override | Default endpoint |
 |---|---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | Anthropic Messages API |
-| `openai-compat` | `OPENAI_API_KEY` (optional when `OPENAI_BASE_URL` is set) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`; a custom base URL makes the key optional, for keyless local servers such as Ollama |
+| `openai-compat` | `OPENAI_API_KEY` (optional when `OPENAI_BASE_URL` is set) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`; a custom base URL makes the key optional, for keyless local servers such as Ollama. The output limit is sent as `max_completion_tokens` on `api.openai.com` and Azure OpenAI hosts, and as `max_tokens` elsewhere; a server that refuses `max_tokens` with a `max_completion_tokens` hint is retried once and the choice is kept for the session |
 | `zai` | `ZAI_API_KEY` | `ZAI_BASE_URL` | `https://api.z.ai/api/paas/v4` |
+| `openai-responses` | `OPENAI_API_KEY` (required) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`, path `/responses`. The OpenAI Responses API with a plain API key: same request and stream code as `chatgpt`, reasoning items replayed; no ChatGPT account header, no token refresh. Its reasoning blocks are scoped to this provider id, separate from `chatgpt` |
 | `chatgpt` | none; uses a stored ChatGPT sign-in | none | ChatGPT backend |
 | `groq` | `GROQ_API_KEY` | `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` |
 | `google` | `GEMINI_API_KEY` | `GOOGLE_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` |
@@ -321,8 +322,8 @@ written by `modron auth set` (and by `/auth` in the app) are kept in
 | `openrouter` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
 | `github-models` | `GITHUB_MODELS_TOKEN` | `GITHUB_MODELS_BASE_URL` | `https://models.github.ai/inference` |
 
-`--provider` accepts only `anthropic`, `openai-compat`, `chatgpt`, `zai` and
-`mock`. The other ids work through `default_provider`, through `/model` in the
+`--provider` accepts only `anthropic`, `openai-compat`, `openai-responses`,
+`chatgpt`, `zai` and `mock`. The other ids work through `default_provider`, through `/model` in the
 app and chat, and through the router, once their key is set.
 
 Z.ai Coding Plan keys work only on the coding endpoint. Set
@@ -378,6 +379,7 @@ while any sandbox is active.
 | `~/.modron/daemon.sock` | Daemon socket. |
 | `~/.modron/serve.sock` | Unix socket of `modron serve`. |
 | `~/.modron/bench/*.jsonl` | `modron bench` baselines. |
+| `~/.modron/evals/*.jsonl` | `modron eval` records, one row per task run (`edit_tool`, edit calls, edit errors and retries per row). |
 | `~/.modron/logs/modron.log` | Log file for interactive `modron` runs, which keeps stderr clear. |
 | `~/.modron/update-check.json` | Cache for the once-a-day update check. |
 | `.modron/worktrees/` | Git worktrees for `delegate` with `isolate`, under the working directory. |

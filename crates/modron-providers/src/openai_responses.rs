@@ -1,16 +1,26 @@
-//! OpenAI Responses provider over the ChatGPT backend (subscription auth).
+//! OpenAI Responses provider, in two modes that share the request and
+//! stream code.
 //!
-//! ChatGPT-plan traffic does NOT go to api.openai.com: the Codex-style
-//! backend at `chatgpt.com/backend-api/codex/responses` speaks the
-//! Responses API (`instructions` + typed `input` items) and requires the
-//! `chatgpt-account-id` header alongside the OAuth bearer token. Login is
-//! the device flow in `modron_core::auth::oauth::chatgpt` (`/auth add` in
-//! the TUI); tokens live 0600 in `~/.modron/auth/openai.json`.
+//! - ChatGPT subscription ([`PROVIDER_ID`] = "chatgpt"): the Codex-style
+//!   backend at `chatgpt.com/backend-api/codex/responses` speaks the
+//!   Responses API (`instructions` + typed `input` items) and requires the
+//!   `chatgpt-account-id` header alongside the OAuth bearer token. Login is
+//!   the device flow in `modron_core::auth::oauth::chatgpt` (`/auth add` in
+//!   the TUI); tokens live 0600 in `~/.modron/auth/openai.json`.
+//! - API key ([`API_KEY_PROVIDER_ID`] = "openai-responses"): the public
+//!   `POST {OPENAI_BASE_URL}/responses` (default `https://api.openai.com/v1`)
+//!   with `Authorization: Bearer $OPENAI_API_KEY`. No account header, no
+//!   refresh. Same body and stream shape.
+//!
+//! The two modes keep separate provider ids for reasoning-block matching
+//! (H7b-3): the same wire format, but encrypted reasoning items are scoped to
+//! the account or key that produced them, so a chatgpt block never replays to
+//! an API-key turn or the reverse.
 //!
 //! Request building ([`build_body`]) and event decoding
 //! ([`ResponsesAccumulator`]) are pure; tests assert wire shape and parse
 //! scripted SSE fixtures — no network. Live verification needs a real
-//! ChatGPT sign-in (the user's browser round-trip).
+//! ChatGPT sign-in (the user's browser round-trip) or an OpenAI API key.
 
 use async_trait::async_trait;
 use modron_core::auth::oauth::chatgpt;
@@ -20,13 +30,23 @@ use modron_core::{
 };
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// ChatGPT (subscription) provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "chatgpt";
+/// API-key provider id ([`ModelProvider::id`]) for `OPENAI_API_KEY` traffic
+/// to the public Responses endpoint.
+pub const API_KEY_PROVIDER_ID: &str = "openai-responses";
+/// Default API-key base URL (`/responses` is appended).
+pub const API_KEY_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// Wire api for provider-block replay (H7b-2): reasoning items are only
 /// replayed to this api.
 const REPLAY_API: &str = "responses";
+/// Debug-only: when set to a directory, every outgoing request body is written
+/// there as `NNNN-<provider>.json` (body only, never headers). Off by default.
+const DEBUG_REQUEST_DIR_ENV: &str = "MODRON_DEBUG_REQUEST_DIR";
+static DEBUG_REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::http::{
     build_client, check_status, drain_sse, with_401_retry, within_idle, REQUEST_TIMEOUT,
@@ -43,14 +63,30 @@ struct StoredAuth {
     account_id: String,
 }
 
-/// A ChatGPT-subscription provider: Responses API on the Codex backend.
+/// Which credentials and endpoint a provider instance uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// ChatGPT subscription: OAuth bearer + `chatgpt-account-id`, full
+    /// backend endpoint, token refresh on 401.
+    Chatgpt,
+    /// Public API: bearer API key, `{base}/responses`, no refresh.
+    ApiKey,
+}
+
+/// A Responses API provider: the ChatGPT subscription backend, or the public
+/// API with an API key (see the module doc).
 pub struct OpenAiResponsesProvider {
     auth: std::sync::RwLock<StoredAuth>,
+    /// ChatGPT: the full endpoint. API key: the `/v1` base (no trailing slash).
     base_url: String,
     http: Client,
     /// Single-flight guard for refreshes — concurrent 401s must not both
     /// POST the same single-use refresh token.
     refresh_lock: tokio::sync::Mutex<()>,
+    mode: Mode,
+    /// Block-matching and error provider id ([`PROVIDER_ID`] or
+    /// [`API_KEY_PROVIDER_ID`]).
+    provider_id: &'static str,
 }
 
 impl OpenAiResponsesProvider {
@@ -65,7 +101,34 @@ impl OpenAiResponsesProvider {
             base_url: chatgpt::BACKEND_URL.to_string(),
             http: build_client()?,
             refresh_lock: tokio::sync::Mutex::new(()),
+            mode: Mode::Chatgpt,
+            provider_id: PROVIDER_ID,
         })
+    }
+
+    /// Build the API-key provider (`openai-responses`): `api_key` as the
+    /// bearer, `base_url` as the `/v1` root (`/responses` is appended per turn).
+    pub fn with_api_key(api_key: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            auth: std::sync::RwLock::new(StoredAuth {
+                access_token: api_key.into(),
+                refresh_token: None,
+                account_id: String::new(),
+            }),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http: build_client()?,
+            refresh_lock: tokio::sync::Mutex::new(()),
+            mode: Mode::ApiKey,
+            provider_id: API_KEY_PROVIDER_ID,
+        })
+    }
+
+    /// Full POST endpoint for this mode.
+    fn endpoint(&self) -> String {
+        match self.mode {
+            Mode::Chatgpt => self.base_url.trim_end_matches('/').to_string(),
+            Mode::ApiKey => format!("{}/responses", self.base_url),
+        }
     }
 
     /// Build from the stored `/auth add` sign-in. Actionable error when no
@@ -82,6 +145,8 @@ impl OpenAiResponsesProvider {
                 base_url: chatgpt::BACKEND_URL.to_string(),
                 http: build_client()?,
                 refresh_lock: tokio::sync::Mutex::new(()),
+                mode: Mode::Chatgpt,
+                provider_id: PROVIDER_ID,
             }),
             Ok(None) => Err(Error::Config(
                 "no ChatGPT sign-in".into(),
@@ -107,19 +172,25 @@ impl OpenAiResponsesProvider {
         req: &TurnRequest,
         tx: UnboundedSender<modron_core::StreamDelta>,
     ) -> Result<TurnResponse> {
-        // BACKEND_URL is the complete endpoint — no path to append
+        // ChatGPT: BACKEND_URL is the complete endpoint — no path to append
         // (double-appending /responses 404s with {"detail":"Not Found"}).
-        let url = self.base_url.trim_end_matches('/').to_string();
-        let body = build_body(req);
-        let response =
-            within_idle(PROVIDER_ID, STREAM_IDLE_TIMEOUT, self.post(&url, &body)).await?;
+        // API key: the base is the /v1 root, so `/responses` is appended.
+        let url = self.endpoint();
+        let body = build_body_for(req, self.provider_id);
+        debug_dump_request(self.provider_id, &body);
+        let response = within_idle(
+            self.provider_id,
+            STREAM_IDLE_TIMEOUT,
+            self.post(&url, &body),
+        )
+        .await?;
         // Streaming failures arrive as a plain (non-SSE) error body; the
         // shared status check maps them to the canonical error text.
-        let response = check_status(PROVIDER_ID, response).await?;
+        let response = check_status(self.provider_id, response).await?;
 
-        let mut acc = ResponsesAccumulator::default();
+        let mut acc = ResponsesAccumulator::new(self.provider_id);
         drain_sse(
-            PROVIDER_ID,
+            self.provider_id,
             response.bytes_stream(),
             STREAM_IDLE_TIMEOUT,
             |payload| {
@@ -150,16 +221,23 @@ impl OpenAiResponsesProvider {
             let auth = self.auth.read().expect("auth lock");
             (auth.access_token.clone(), auth.account_id.clone())
         };
-        self.http
+        let request = self
+            .http
             .post(url)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("chatgpt-account-id", account_id)
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "modron")
+            .header("Authorization", format!("Bearer {access_token}"));
+        // ChatGPT-backend-only headers; the public API takes the bearer alone.
+        let request = match self.mode {
+            Mode::Chatgpt => request
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "modron"),
+            Mode::ApiKey => request,
+        };
+        request
             .json(body)
             .send()
             .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))
+            .map_err(|err| crate::transport_error(self.provider_id, err))
     }
 
     /// Refresh an expired access token via the OpenAI refresh-token grant.
@@ -276,7 +354,7 @@ impl OpenAiResponsesProvider {
 #[async_trait]
 impl ModelProvider for OpenAiResponsesProvider {
     fn id(&self) -> &str {
-        PROVIDER_ID
+        self.provider_id
     }
 
     async fn turn(&self, req: std::sync::Arc<TurnRequest>) -> Result<TurnResponse> {
@@ -293,10 +371,31 @@ impl ModelProvider for OpenAiResponsesProvider {
     }
 }
 
-/// Map a [`TurnRequest`] to the Responses API body shape: `instructions`
-/// carries the system prompt and the transcript becomes typed `input`
-/// items (message / function_call / function_call_output).
+/// Map a [`TurnRequest`] to the ChatGPT-provider body shape (see
+/// [`build_body_for`]).
 pub fn build_body(req: &TurnRequest) -> Value {
+    build_body_for(req, PROVIDER_ID)
+}
+
+/// Write the request body to `$MODRON_DEBUG_REQUEST_DIR` when that is set
+/// (debug only; errors are ignored). Only the JSON body is written.
+fn debug_dump_request(provider_id: &str, body: &Value) {
+    let Some(dir) = std::env::var_os(DEBUG_REQUEST_DIR_ENV).filter(|d| !d.is_empty()) else {
+        return;
+    };
+    let seq = DEBUG_REQUEST_SEQ.fetch_add(1, Ordering::SeqCst);
+    let path = std::path::Path::new(&dir).join(format!("{seq:04}-{provider_id}.json"));
+    if let Ok(text) = serde_json::to_string_pretty(body) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Map a [`TurnRequest`] to the Responses API body shape for `provider_id`:
+/// `instructions` carries the system prompt and the transcript becomes typed
+/// `input` items (message / function_call / function_call_output). Reasoning
+/// blocks replay only when their provider id matches `provider_id`.
+pub fn build_body_for(req: &TurnRequest, provider_id: &str) -> Value {
     let mut input: Vec<Value> = Vec::new();
     for message in &req.messages {
         match message.role {
@@ -335,7 +434,7 @@ pub fn build_body(req: &TurnRequest) -> Value {
             Role::Assistant => {
                 // Reasoning items first, in their original order, exactly as
                 // received (H7b-2); only this provider's Responses items.
-                for block in replayable_blocks(message, PROVIDER_ID, REPLAY_API) {
+                for block in replayable_blocks(message, provider_id, REPLAY_API) {
                     input.push(block.payload.clone());
                 }
                 if !message.content.is_empty() {
@@ -413,8 +512,9 @@ pub fn build_body(req: &TurnRequest) -> Value {
 }
 
 /// Incremental state for one streaming Responses turn.
-#[derive(Default)]
 struct ResponsesAccumulator {
+    /// Provider id stamped on reasoning blocks and error messages.
+    provider: &'static str,
     text: String,
     tools: Vec<ToolCall>,
     usage: Option<Usage>,
@@ -424,14 +524,31 @@ struct ResponsesAccumulator {
     done: bool,
 }
 
+impl Default for ResponsesAccumulator {
+    fn default() -> Self {
+        Self::new(PROVIDER_ID)
+    }
+}
+
 impl ResponsesAccumulator {
+    fn new(provider: &'static str) -> Self {
+        Self {
+            provider,
+            text: String::new(),
+            tools: Vec::new(),
+            usage: None,
+            reasoning: Vec::new(),
+            done: false,
+        }
+    }
+
     fn ingest(
         &mut self,
         payload: &str,
         tx: &UnboundedSender<modron_core::StreamDelta>,
     ) -> Result<()> {
         let event: Value = serde_json::from_str(payload).map_err(|err| Error::Provider {
-            provider: PROVIDER_ID.into(),
+            provider: self.provider.into(),
             message: format!("malformed stream event: {err}"),
         })?;
         match event.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -458,7 +575,7 @@ impl ResponsesAccumulator {
                             .and_then(Value::as_u64)
                             .unwrap_or(self.reasoning.len() as u64);
                         self.reasoning.push(ProviderBlock {
-                            provider: PROVIDER_ID.into(),
+                            provider: self.provider.into(),
                             api: REPLAY_API.into(),
                             kind: "reasoning".into(),
                             index: u32::try_from(index).unwrap_or(u32::MAX),
@@ -482,7 +599,7 @@ impl ResponsesAccumulator {
                             json!({})
                         } else {
                             serde_json::from_str(raw_args).map_err(|err| Error::Provider {
-                                provider: PROVIDER_ID.into(),
+                                provider: self.provider.into(),
                                 message: format!("malformed tool arguments for `{name}`: {err}"),
                             })?
                         };
@@ -527,7 +644,7 @@ impl ResponsesAccumulator {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown backend error");
                 return Err(Error::Provider {
-                    provider: PROVIDER_ID.into(),
+                    provider: self.provider.into(),
                     message: message.to_string(),
                 });
             }
@@ -539,7 +656,7 @@ impl ResponsesAccumulator {
     fn finish(&self) -> Result<TurnResponse> {
         if !self.done && self.usage.is_none() {
             return Err(Error::Provider {
-                provider: PROVIDER_ID.into(),
+                provider: self.provider.into(),
                 message: "connection error: stream ended before completion".into(),
             });
         }
@@ -550,6 +667,8 @@ impl ResponsesAccumulator {
         };
         let mut provider_blocks = self.reasoning.clone();
         provider_blocks.sort_by_key(|block| block.index);
+        // Stamped by `ingest` with `self.provider`; a block from one mode never
+        // matches the other mode's `replayable_blocks` filter.
         Ok(TurnResponse {
             text: self.text.clone(),
             tool_calls: self.tools.clone(),
@@ -812,5 +931,161 @@ mod tests {
         let provider = OpenAiResponsesProvider::new("tok", "acc").unwrap();
         assert_eq!(provider.id(), "chatgpt");
         assert_eq!(provider.base_url(), chatgpt::BACKEND_URL);
+    }
+
+    fn reasoning_item() -> Value {
+        json!({
+            "type": "reasoning",
+            "id": "rs_0abc",
+            "summary": [],
+            "encrypted_content": "gAAAAABencrypted+/=="
+        })
+    }
+
+    fn assistant_with_block(provider: &str, payload: Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls"}),
+            }],
+            tool_call_id: None,
+            attachments: Vec::new(),
+            provider_blocks: vec![ProviderBlock {
+                provider: provider.into(),
+                api: REPLAY_API.into(),
+                kind: "reasoning".into(),
+                index: 0,
+                payload,
+            }],
+        }
+    }
+
+    #[test]
+    fn api_key_provider_takes_the_v1_base_and_appends_responses() {
+        let provider =
+            OpenAiResponsesProvider::with_api_key("sk-test", "http://127.0.0.1:18090/v1/").unwrap();
+        assert_eq!(provider.id(), API_KEY_PROVIDER_ID);
+        assert_eq!(provider.base_url(), "http://127.0.0.1:18090/v1");
+        assert_eq!(provider.endpoint(), "http://127.0.0.1:18090/v1/responses");
+        let default =
+            OpenAiResponsesProvider::with_api_key("sk-test", API_KEY_DEFAULT_BASE_URL).unwrap();
+        assert_eq!(default.endpoint(), "https://api.openai.com/v1/responses");
+        // The ChatGPT endpoint is untouched: BACKEND_URL is already complete.
+        let chatgpt = OpenAiResponsesProvider::new("tok", "acc").unwrap();
+        assert_eq!(chatgpt.endpoint(), chatgpt::BACKEND_URL);
+    }
+
+    #[test]
+    fn api_key_body_matches_the_chatgpt_body_shape() {
+        let mut req = request();
+        // Without reasoning: byte-identical bodies.
+        assert_eq!(build_body_for(&req, API_KEY_PROVIDER_ID), build_body(&req));
+        // With reasoning: same include + reasoning.effort in both modes.
+        req.effort = Some(modron_core::Effort::Low);
+        let body = build_body_for(&req, API_KEY_PROVIDER_ID);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["reasoning"], json!({"effort": "low"}));
+        assert_eq!(body, build_body(&req));
+        // Off again: no include, no reasoning key.
+        req.effort = None;
+        let body = build_body_for(&req, API_KEY_PROVIDER_ID);
+        assert!(body.get("include").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn blocks_replay_only_to_the_provider_that_produced_them() {
+        let item = reasoning_item();
+        // An API-key block replays to the API-key provider...
+        let mut req = request();
+        req.messages = vec![assistant_with_block(API_KEY_PROVIDER_ID, item.clone())];
+        let api = build_body_for(&req, API_KEY_PROVIDER_ID);
+        assert_eq!(api["input"][0], item, "own block replays first");
+        assert_eq!(api["input"][1]["type"], "function_call");
+        // ...but not to the ChatGPT provider, and a ChatGPT block never
+        // replays to the API-key provider (separate account scope).
+        let chatgpt_body = build_body_for(&req, PROVIDER_ID);
+        assert_eq!(chatgpt_body["input"][0]["type"], "function_call");
+        req.messages = vec![assistant_with_block(PROVIDER_ID, item.clone())];
+        let api = build_body_for(&req, API_KEY_PROVIDER_ID);
+        assert_eq!(api["input"][0]["type"], "function_call");
+        let chatgpt_body = build_body_for(&req, PROVIDER_ID);
+        assert_eq!(chatgpt_body["input"][0], item);
+    }
+
+    #[test]
+    fn accumulator_stamps_blocks_with_its_own_provider_id() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = ResponsesAccumulator::new(API_KEY_PROVIDER_ID);
+        acc.ingest(
+            &json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item()})
+                .to_string(),
+            &tx,
+        )
+        .unwrap();
+        acc.done = true;
+        let parsed = acc.finish().unwrap();
+        assert_eq!(parsed.provider_blocks[0].provider, API_KEY_PROVIDER_ID);
+        assert_eq!(parsed.provider_blocks[0].api, REPLAY_API);
+        // Default stays the ChatGPT id.
+        let default = ResponsesAccumulator::default();
+        assert_eq!(default.provider, PROVIDER_ID);
+    }
+
+    /// One-shot local server: captures the request text, answers with a
+    /// canned Responses SSE stream (reasoning item, text, usage).
+    async fn scripted_responses_server() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            let n = socket.read(&mut buf).await.unwrap();
+            let sse = [
+                json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item()}),
+                json!({"type": "response.output_text.delta", "delta": "hi"}),
+                json!({"type": "response.completed", "response": {"usage": {"input_tokens": 9, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 0}}}}),
+            ]
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect::<String>()
+                + "data: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse.len(),
+                sse
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    #[tokio::test]
+    async fn api_key_request_sends_bearer_only_and_parses_the_stream() {
+        let (base, server) = scripted_responses_server().await;
+        let provider = OpenAiResponsesProvider::with_api_key("sk-test-key", base).unwrap();
+        let mut req = request();
+        req.effort = Some(modron_core::Effort::Low);
+        let turn = provider.turn(std::sync::Arc::new(req)).await.unwrap();
+        assert_eq!(turn.text, "hi");
+        assert_eq!(turn.provider_blocks.len(), 1);
+        assert_eq!(turn.provider_blocks[0].provider, API_KEY_PROVIDER_ID);
+
+        let raw = server.await.unwrap().to_ascii_lowercase();
+        assert!(raw.starts_with("post /v1/responses "), "{raw}");
+        assert!(raw.contains("authorization: bearer sk-test-key"), "{raw}");
+        for backend_only in ["chatgpt-account-id", "originator:", "openai-beta"] {
+            assert!(
+                !raw.contains(backend_only),
+                "{backend_only} must not be sent"
+            );
+        }
+        assert!(raw.contains("\"include\":[\"reasoning.encrypted_content\"]"));
+        assert!(raw.contains("\"store\":false"));
     }
 }

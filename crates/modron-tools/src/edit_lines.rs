@@ -509,6 +509,108 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("l.txt")).unwrap(), b"a\nB");
     }
 
+    const BLANK_FIXTURE: &str = "title\n\n\nsection one\nbody a\n\n\nsection two\nbody b\n";
+    const BLANK_VERIFIER: &str =
+        "title\n\n\nsection one\nbody a\n\ndivider\n\nsection two\nbody B\n";
+
+    /// Hashes copied from the benchmark logs (`read(line_hashes=true)` output)
+    /// must be the real hashes of those lines.
+    #[test]
+    fn logged_hashes_match_their_lines() {
+        assert_eq!(line_hash(""), "c8d");
+        assert_eq!(line_hash("section two"), "ce9");
+        assert_eq!(line_hash("body b"), "613");
+        assert_eq!(line_hash("body a"), "7ad");
+    }
+
+    /// Calls copied verbatim from the edit-10-blank-lines runs. The tool applies
+    /// exactly what each call's `new_text` says; the failing calls omitted a
+    /// blank line, so their bytes are the failing bytes, not a tool defect.
+    #[tokio::test]
+    async fn logged_blank_line_calls_apply_exactly_their_new_text() {
+        let cases: [(usize, usize, Value, &str, &str); 4] = [
+            // gpt-5.4-mini, failing: leading blank line dropped.
+            (
+                6,
+                9,
+                json!(["c8d", "c8d", "ce9", "613"]),
+                "divider\n\nsection two\nbody B",
+                "title\n\n\nsection one\nbody a\ndivider\n\nsection two\nbody B\n",
+            ),
+            // gpt-5.4-mini and glm, passing: leading newline keeps the blank.
+            (
+                6,
+                9,
+                json!(["c8d", "c8d", "ce9", "613"]),
+                "\ndivider\n\nsection two\nbody B",
+                BLANK_VERIFIER,
+            ),
+            // glm-4.6, failing: range starts at body a and doubles the blanks.
+            (
+                5,
+                9,
+                json!(["7ad", "c8d", "c8d", "ce9", "613"]),
+                "body a\n\n\ndivider\n\n\nsection two\nbody B",
+                "title\n\n\nsection one\nbody a\n\n\ndivider\n\n\nsection two\nbody B\n",
+            ),
+            // gpt-5.4-mini, failing: range starts at body a, one blank lost.
+            (
+                5,
+                9,
+                json!(["7ad", "c8d", "c8d", "ce9", "613"]),
+                "body a\ndivider\n\nsection two\nbody B",
+                "title\n\n\nsection one\nbody a\ndivider\n\nsection two\nbody B\n",
+            ),
+        ];
+        for (start, end, hashes, new_text, expected) in cases {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("blank.txt"), BLANK_FIXTURE).unwrap();
+            let out = run(
+                json!({"path": "blank.txt", "start_line": start, "end_line": end,
+                       "expected_hashes": hashes, "new_text": new_text}),
+                dir.path(),
+            )
+            .await;
+            assert!(!out.is_error, "{out:?}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("blank.txt")).unwrap(),
+                expected,
+                "new_text {new_text:?} at {start}..={end}"
+            );
+        }
+    }
+
+    /// The newline convention documented in the spec: one trailing newline is
+    /// a terminator, each further newline is a blank line, a leading newline
+    /// is a blank first line, and empty text deletes the range.
+    #[tokio::test]
+    async fn new_text_newline_convention() {
+        let cases = [
+            ("", "a\n"),
+            ("x", "a\nx\n"),
+            ("x\n", "a\nx\n"),
+            ("x\n\n", "a\nx\n\n"),
+            ("\n", "a\n\n"),
+            ("\nx", "a\n\nx\n"),
+        ];
+        for (new_text, expected) in cases {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join("n.txt"), "a\nb\n").unwrap();
+            let out = run(
+                json!({"path": "n.txt", "start_line": 2, "end_line": 2,
+                       "expected_hashes": hashes(&["b"]), "new_text": new_text}),
+                dir.path(),
+            )
+            .await;
+            assert!(!out.is_error, "{out:?}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("n.txt")).unwrap(),
+                expected,
+                "new_text {new_text:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn protected_path_is_refused() {
         let dir = tempdir().unwrap();
