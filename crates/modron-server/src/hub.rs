@@ -1183,12 +1183,10 @@ impl SessionHandle {
         if let SessionEvent::Plan { items } = event {
             *lock(&self.plan) = items.clone();
         }
-        self.publish_locked(
-            &mut seq,
-            Payload::Event {
-                event: event.clone(),
-            },
-        );
+        // Provider blocks never leave the server (H7b-2): strip at the send.
+        let mut wire = event.clone();
+        wire.strip_provider_blocks();
+        self.publish_locked(&mut seq, Payload::Event { event: wire });
     }
 
     /// The `explain` lines for a hypothetical call under the session's
@@ -2491,6 +2489,41 @@ mod tests {
             done_criteria: "parser tests pass".into(),
             status: "pending".into(),
         }]
+    }
+
+    #[tokio::test]
+    async fn live_frames_strip_provider_blocks_but_the_stored_line_keeps_them() {
+        let hub = test_hub();
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        let mut rx = handle.tx.subscribe();
+        let mut message = modron_core::Message::assistant("answer");
+        message.provider_blocks = vec![modron_core::ProviderBlock {
+            provider: "anthropic".into(),
+            api: "messages".into(),
+            kind: "thinking".into(),
+            index: 0,
+            payload: serde_json::json!({
+                "type": "thinking",
+                "thinking": "private",
+                "signature": "SIG-LIVE-ONLY"
+            }),
+        }];
+        let event = SessionEvent::Message {
+            parent_id: None,
+            message,
+        };
+        handle.on_persisted(&event);
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("frame in time")
+            .expect("live frame");
+        assert!(frame.json.contains("\"answer\""), "{}", frame.json);
+        assert!(!frame.json.contains("provider_blocks"), "{}", frame.json);
+        assert!(!frame.json.contains("SIG-LIVE-ONLY"), "{}", frame.json);
+        let stored = serde_json::to_string(&event).unwrap();
+        assert!(stored.contains("provider_blocks"), "{stored}");
+        assert!(stored.contains("SIG-LIVE-ONLY"), "{stored}");
     }
 
     /// Read live frames until one of `kind` arrives (2s budget).

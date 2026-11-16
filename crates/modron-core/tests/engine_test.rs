@@ -92,6 +92,7 @@ fn tool_call_response(id: &str, name: &str, usage: Usage) -> TurnResponse {
         }],
         usage,
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -117,6 +118,7 @@ async fn full_tool_loop_end_to_end() {
                     cached_input_tokens: 0,
                 },
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             }),
     );
     let engine = engine(provider.clone(), base_config(), registry(false));

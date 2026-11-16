@@ -32,6 +32,66 @@ pub struct Message {
     /// ride with the message; providers encode them per their wire format.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// Provider-native blocks kept for replay (H7b-2): Anthropic thinking
+    /// and redacted-thinking blocks, OpenAI Responses reasoning items. Only
+    /// the provider and api that produced a block replays it; clients never
+    /// see this field (the server strips it at the send boundary).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_blocks: Vec<ProviderBlock>,
+}
+
+/// One provider-native content block, stored verbatim (H7b-2). `payload` is
+/// the provider's JSON exactly as received, replayed unchanged and never
+/// interpreted by the harness. `index` is the block's position in the
+/// provider's content list for the turn, so replay keeps the original order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderBlock {
+    /// Provider id that produced the block (e.g. "anthropic", "openai").
+    pub provider: String,
+    /// Wire api of that provider (e.g. "messages", "responses").
+    pub api: String,
+    /// Provider block type (e.g. "thinking", "redacted_thinking", "reasoning").
+    pub kind: String,
+    pub index: u32,
+    pub payload: serde_json::Value,
+}
+
+impl ProviderBlock {
+    /// The one replay rule (H7b-2, PLAN 10.7 rule 3): a block goes back to a
+    /// request only when the provider and api that produced it are the
+    /// request's target. Every provider request builder filters through
+    /// [`replayable_blocks`], which uses this predicate.
+    pub fn replays_to(&self, provider: &str, api: &str) -> bool {
+        self.provider == provider && self.api == api
+    }
+}
+
+/// The blocks of `message` that may be replayed to `provider` / `api`, in
+/// original order (ascending `index`, stable for equal indices).
+pub fn replayable_blocks<'a>(
+    message: &'a Message,
+    provider: &str,
+    api: &str,
+) -> Vec<&'a ProviderBlock> {
+    let mut blocks: Vec<&ProviderBlock> = message
+        .provider_blocks
+        .iter()
+        .filter(|block| block.replays_to(provider, api))
+        .collect();
+    blocks.sort_by_key(|block| block.index);
+    blocks
+}
+
+impl SessionEvent {
+    /// Drop the provider-native blocks of a message before the event leaves
+    /// the server (H7b-2, PLAN 10.7 rule 6). Clients never see
+    /// `provider_blocks`: snapshots, live frames and ACP call this at the
+    /// send boundary; the stored line keeps them.
+    pub fn strip_provider_blocks(&mut self) {
+        if let SessionEvent::Message { message, .. } = self {
+            message.provider_blocks.clear();
+        }
+    }
 }
 
 /// A multimodal attachment on a user message (Phase 7).
@@ -60,6 +120,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             attachments: Vec::new(),
+            provider_blocks: Vec::new(),
         }
     }
     /// A user message with multimodal attachments (Phase 7).
@@ -77,6 +138,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             attachments: Vec::new(),
+            provider_blocks: Vec::new(),
         }
     }
     pub fn tool_result(call_id: impl Into<String>, outcome: &ToolOutcome) -> Self {
@@ -86,6 +148,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             attachments: Vec::new(),
+            provider_blocks: Vec::new(),
         }
     }
 }
@@ -589,6 +652,103 @@ pub struct RunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn thinking_block(provider: &str, api: &str, index: u32) -> ProviderBlock {
+        ProviderBlock {
+            provider: provider.into(),
+            api: api.into(),
+            kind: "thinking".into(),
+            index,
+            payload: json!({"type": "thinking", "thinking": "t", "signature": "S/+=="}),
+        }
+    }
+
+    #[test]
+    fn replay_keeps_only_the_producing_provider_and_api_in_order() {
+        let mut message = Message::assistant("done");
+        message.provider_blocks = vec![
+            thinking_block("anthropic", "messages", 2),
+            thinking_block("chatgpt", "responses", 0),
+            thinking_block("anthropic", "messages", 0),
+            thinking_block("anthropic", "legacy", 1),
+        ];
+        let kept = replayable_blocks(&message, "anthropic", "messages");
+        assert_eq!(kept.iter().map(|b| b.index).collect::<Vec<_>>(), vec![0, 2]);
+        assert!(replayable_blocks(&message, "openai-compat", "chat").is_empty());
+        assert_eq!(replayable_blocks(&message, "chatgpt", "responses").len(), 1);
+    }
+
+    #[test]
+    fn provider_blocks_are_stored_but_absent_when_empty() {
+        let plain = serde_json::to_string(&Message::assistant("hi")).unwrap();
+        assert!(!plain.contains("provider_blocks"), "{plain}");
+        let mut with = Message::assistant("hi");
+        with.provider_blocks = vec![thinking_block("anthropic", "messages", 0)];
+        let line = serde_json::to_string(&SessionEvent::Message {
+            parent_id: None,
+            message: with,
+        })
+        .unwrap();
+        assert!(line.contains("\"provider_blocks\""), "{line}");
+        assert!(line.contains("S/+=="), "signature bytes stored: {line}");
+    }
+
+    /// The Message shape as it was before H7b-2 (no provider_blocks field).
+    #[derive(Deserialize)]
+    struct OldMessage {
+        role: Role,
+        content: String,
+        #[serde(default)]
+        tool_calls: Vec<ToolCall>,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        attachments: Vec<Attachment>,
+    }
+
+    #[test]
+    fn a_line_written_with_blocks_parses_in_a_build_without_the_field() {
+        // Forward compatibility: an old binary reads a new line, ignoring the
+        // unknown field, and loses only the blocks.
+        let mut with = Message::assistant("answer");
+        with.provider_blocks = vec![thinking_block("anthropic", "messages", 0)];
+        let line = serde_json::to_string(&with).unwrap();
+        let old: OldMessage = serde_json::from_str(&line).expect("old shape reads new line");
+        assert_eq!(old.content, "answer");
+        assert_eq!(old.role, Role::Assistant);
+        assert!(old.tool_calls.is_empty() && old.tool_call_id.is_none());
+        assert!(old.attachments.is_empty());
+    }
+
+    #[test]
+    fn strip_removes_blocks_from_the_wire_form_only() {
+        let mut with = Message::assistant("answer");
+        with.provider_blocks = vec![thinking_block("anthropic", "messages", 0)];
+        let stored = SessionEvent::Message {
+            parent_id: None,
+            message: with,
+        };
+        let mut wire = stored.clone();
+        wire.strip_provider_blocks();
+        let wire_line = serde_json::to_string(&wire).unwrap();
+        assert!(!wire_line.contains("provider_blocks"), "{wire_line}");
+        let stored_line = serde_json::to_string(&stored).unwrap();
+        assert!(stored_line.contains("provider_blocks"), "{stored_line}");
+    }
+
+    #[test]
+    fn an_old_format_line_loads_with_no_blocks() {
+        let line = r#"{"role":"assistant","content":"hi","tool_calls":[]}"#;
+        let message: Message = serde_json::from_str(line).unwrap();
+        assert!(message.provider_blocks.is_empty());
+        let old_line =
+            r#"{"type":"message","parent_id":null,"message":{"role":"assistant","content":"hi"}}"#;
+        match serde_json::from_str::<SessionEvent>(old_line).unwrap() {
+            SessionEvent::Message { message, .. } => assert!(message.provider_blocks.is_empty()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 
     /// The session log format is the wire/replay contract: an event must
     /// round-trip without change (serde defaults keep old logs loadable).

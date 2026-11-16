@@ -314,6 +314,7 @@ impl OaiStreamAccumulator {
             tool_calls,
             usage,
             stop_reason: map_stop_reason(self.finish_reason.as_deref()),
+            provider_blocks: Vec::new(),
         })
     }
 }
@@ -500,6 +501,7 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
         tool_calls,
         usage,
         stop_reason: map_stop_reason(choice.finish_reason.as_deref()),
+        provider_blocks: Vec::new(),
     })
 }
 

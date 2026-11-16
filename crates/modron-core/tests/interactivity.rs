@@ -24,6 +24,7 @@ fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> Tur
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -37,6 +38,7 @@ fn text_response(text: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -351,6 +353,7 @@ async fn delegate_runs_child_with_persona_model() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     };
     let child_answer = TurnResponse {
         text: String::new(),
@@ -362,6 +365,7 @@ async fn delegate_runs_child_with_persona_model() {
         },
         // Child "edits" then ends: EndTurn directly (no tools in this script).
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let parent_final = TurnResponse {
         text: "delegated and merged".into(),
@@ -372,6 +376,7 @@ async fn delegate_runs_child_with_persona_model() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let provider = MockProvider::new()
         .then_response(delegate_call)
@@ -530,6 +535,7 @@ async fn parallel_delegates_run_concurrently() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     };
     let child_answer = |n: &str| TurnResponse {
         text: format!("result {n}"),
@@ -540,6 +546,7 @@ async fn parallel_delegates_run_concurrently() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let parent_final = TurnResponse {
         text: "both done".into(),
@@ -550,6 +557,7 @@ async fn parallel_delegates_run_concurrently() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let provider = MockProvider::new()
         .then_response(twin_delegates)

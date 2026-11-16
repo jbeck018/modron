@@ -79,6 +79,7 @@ impl MockProvider {
             tool_calls: Vec::new(),
             usage: Usage::default(),
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         })
     }
 
@@ -98,6 +99,7 @@ impl MockProvider {
             }],
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         })
     }
 
@@ -141,6 +143,7 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
             ],
             usage: Usage { input_tokens: 800, output_tokens: 120, cached_input_tokens: 400 },
             stop_reason: ToolUse,
+            provider_blocks: Vec::new(),
         },
         // Turn 2: a write (exercises the checkpoint path).
         TurnResponse {
@@ -155,6 +158,7 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
             }],
             usage: Usage { input_tokens: 900, output_tokens: 80, cached_input_tokens: 600 },
             stop_reason: ToolUse,
+            provider_blocks: Vec::new(),
         },
         // Turn 3: a failing bash (exercises the error styling).
         TurnResponse {
@@ -166,6 +170,7 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
             }],
             usage: Usage { input_tokens: 1000, output_tokens: 70, cached_input_tokens: 800 },
             stop_reason: ToolUse,
+            provider_blocks: Vec::new(),
         },
         // Turn 4: the final streamed answer.
         TurnResponse {
@@ -173,6 +178,7 @@ pub fn rich_demo_script() -> Vec<TurnResponse> {
             tool_calls: Vec::new(),
             usage: Usage { input_tokens: 1100, output_tokens: 200, cached_input_tokens: 900 },
             stop_reason: EndTurn,
+            provider_blocks: Vec::new(),
         },
     ]
 }

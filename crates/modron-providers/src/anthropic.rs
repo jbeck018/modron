@@ -12,7 +12,8 @@
 use crate::stream::StreamDelta;
 use async_trait::async_trait;
 use modron_core::{
-    Error, ModelProvider, Result, Role, StopReason, ToolCall, TurnRequest, TurnResponse, Usage,
+    replayable_blocks, Error, ModelProvider, ProviderBlock, Result, Role, StopReason, ToolCall,
+    TurnRequest, TurnResponse, Usage,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -21,6 +22,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// Anthropic provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "anthropic";
+/// Wire api of this provider for provider-block replay (H7b-2).
+const REPLAY_API: &str = "messages";
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -368,6 +371,10 @@ struct StreamAccumulator {
     /// `(block index, id, name, accumulated partial_json)` for `tool_use`
     /// blocks, in first-appearance order.
     tool_blocks: Vec<(u64, String, String, String)>,
+    /// `(block index, block JSON)` for `thinking` and `redacted_thinking`
+    /// blocks, built up from their deltas (thinking text, signature). The
+    /// JSON is replayed unchanged (H7b-2).
+    replay_blocks: Vec<(u64, Value)>,
     /// Anthropic's uncached `input_tokens` (message_start only).
     input_tokens: u64,
     /// `cache_read_input_tokens` (message_start only).
@@ -426,8 +433,11 @@ impl StreamAccumulator {
                             .into();
                         self.tool_blocks.push((index, id, name, String::new()));
                     }
-                    // thinking / redacted_thinking / unknown blocks carry
-                    // nothing that belongs in the TurnResponse.
+                    Some("thinking") | Some("redacted_thinking") => {
+                        self.replay_blocks.push((index, block.clone()));
+                    }
+                    // Unknown blocks carry nothing that belongs in the
+                    // TurnResponse.
                     _ => {}
                 }
             }
@@ -462,11 +472,25 @@ impl StreamAccumulator {
                             .get("thinking")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
+                        if let Some(slot) = self.replay_blocks.iter_mut().find(|(i, _)| *i == index)
+                        {
+                            append_string_field(&mut slot.1, "thinking", thinking);
+                        }
                         if !thinking.is_empty() {
                             let _ = tx.send(StreamDelta::Reasoning(thinking.to_string()));
                         }
                     }
-                    // signature_delta and friends are bookkeeping only.
+                    Some("signature_delta") => {
+                        let signature = delta
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(slot) = self.replay_blocks.iter_mut().find(|(i, _)| *i == index)
+                        {
+                            append_string_field(&mut slot.1, "signature", signature);
+                        }
+                    }
+                    // Other delta types are bookkeeping only.
                     _ => {}
                 }
             }
@@ -579,6 +603,13 @@ impl StreamAccumulator {
             });
         }
 
+        self.replay_blocks.sort_by_key(|(index, _)| *index);
+        let provider_blocks = self
+            .replay_blocks
+            .into_iter()
+            .map(|(index, payload)| replay_block(index, payload))
+            .collect();
+
         Ok(TurnResponse {
             text,
             tool_calls,
@@ -592,8 +623,58 @@ impl StreamAccumulator {
                 cached_input_tokens: self.cache_read_input_tokens,
             },
             stop_reason: map_stop_reason(self.stop_reason.as_deref()),
+            provider_blocks,
         })
     }
+}
+
+/// Append a streamed fragment to a string field of a replayed block (the
+/// thinking text or the signature). Byte-exact: fragments concatenate as
+/// received.
+fn append_string_field(payload: &mut Value, key: &str, fragment: &str) {
+    if let Some(obj) = payload.as_object_mut() {
+        if let Value::String(current) = obj
+            .entry(key)
+            .or_insert_with(|| Value::String(String::new()))
+        {
+            current.push_str(fragment);
+        }
+    }
+}
+
+/// Wrap one thinking / redacted_thinking block JSON as a [`ProviderBlock`]
+/// for this provider. The payload is kept exactly as the API sent it.
+fn replay_block(index: u64, payload: Value) -> ProviderBlock {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    ProviderBlock {
+        provider: PROVIDER_ID.into(),
+        api: REPLAY_API.into(),
+        kind,
+        index: u32::try_from(index).unwrap_or(u32::MAX),
+        payload,
+    }
+}
+
+/// The thinking and redacted_thinking blocks of a complete (non-streaming)
+/// response body, with their content positions (H7b-2).
+fn replay_blocks_from_body(body: &Value) -> Vec<ProviderBlock> {
+    body.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, block)| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        })
+        .map(|(index, block)| replay_block(index as u64, block.clone()))
+        .collect()
 }
 
 /// Build the `/v1/messages` request body from a [`TurnRequest`] (no
@@ -653,6 +734,10 @@ pub fn build_body_with_prefix(req: &TurnRequest, system_prefix: &str) -> Value {
 fn build_body_inner(req: &TurnRequest) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     let mut last_role: Option<&'static str> = None;
+    // Stored thinking blocks go back only on a request that itself turns
+    // thinking on: a request without the `thinking` field must not carry
+    // thinking content (conservative; the blocks stay in the log).
+    let thinking_on = req.reasoning_summary && summarized_thinking_supported(&req.model);
 
     for message in &req.messages {
         let (role, blocks): (&'static str, Vec<Value>) = match message.role {
@@ -688,7 +773,17 @@ fn build_body_inner(req: &TurnRequest) -> Value {
                 ("user", blocks)
             }
             Role::Assistant => {
-                let mut blocks = Vec::new();
+                // Thinking blocks first, in their original order, exactly as
+                // the API sent them (H7b-2). Only blocks from this provider
+                // and api are replayed.
+                let mut blocks: Vec<Value> = if thinking_on {
+                    replayable_blocks(message, PROVIDER_ID, REPLAY_API)
+                        .into_iter()
+                        .map(|block| block.payload.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 if !message.content.is_empty() {
                     blocks.push(json!({ "type": "text", "text": message.content }));
                 }
@@ -763,7 +858,7 @@ fn build_body_inner(req: &TurnRequest) -> Value {
     // accepts adaptive thinking with `display: "summarized"`. Every other
     // request keeps no `thinking` field at all (older models use a
     // `budget_tokens` form this code never sends).
-    if req.reasoning_summary && summarized_thinking_supported(&req.model) {
+    if thinking_on {
         body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
     }
     // Reasoning effort (H7a): the GA `output_config.effort` field, merged
@@ -816,6 +911,7 @@ pub fn summarized_thinking_supported(model: &str) -> bool {
 /// required — provider-reported usage is ground truth for accounting, so a
 /// response without it is a protocol error, not a zero.
 pub fn parse_response(body: Value) -> Result<TurnResponse> {
+    let provider_blocks = replay_blocks_from_body(&body);
     let resp: AnthropicResponse = serde_json::from_value(body).map_err(|err| Error::Provider {
         provider: PROVIDER_ID.into(),
         message: format!("malformed response body: {err}"),
@@ -854,6 +950,7 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
         tool_calls,
         usage,
         stop_reason: map_stop_reason(resp.stop_reason.as_deref()),
+        provider_blocks,
     })
 }
 

@@ -352,6 +352,7 @@ mod tests {
                     cached_input_tokens: 0,
                 },
                 stop_reason: StopReason::ToolUse,
+                provider_blocks: Vec::new(),
             })
             .then_response(TurnResponse {
                 text: "done".into(),
@@ -362,6 +363,7 @@ mod tests {
                     cached_input_tokens: 0,
                 },
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             });
         let mut registry = modron_core::ToolRegistry::new();
         registry.register(Arc::new(modron_tools::WriteTool));

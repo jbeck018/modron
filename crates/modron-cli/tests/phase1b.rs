@@ -28,6 +28,7 @@ fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> Tur
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -41,6 +42,7 @@ fn text_response(text: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     }
 }
 

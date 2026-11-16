@@ -846,6 +846,30 @@ impl Engine {
                 )
                 .await?;
 
+            // Record the assistant message (text and/or tool calls) before
+            // any early exit: the turn is billed, so it must be in the log
+            // even when the spend cap below stops the run. A dangling tool
+            // call left by that stop is pruned on resume.
+            let assistant = Message {
+                role: Role::Assistant,
+                content: turn.response.text.clone(),
+                tool_calls: turn.response.tool_calls.clone(),
+                tool_call_id: None,
+                attachments: Vec::new(),
+                provider_blocks: turn.response.provider_blocks.clone(),
+            };
+            self.store
+                .append(
+                    session_id,
+                    &SessionEvent::Message {
+                        parent_id: None,
+                        message: assistant.clone(),
+                    },
+                )
+                .await?;
+            state.transcript.push(assistant);
+            state.answer = turn.response.text.clone();
+
             // USD spend cap (A3): computed from provider-reported usage and
             // the injected price lookup — an honest estimate, checked after
             // the turn so the turn's real usage is what trips it.
@@ -858,7 +882,6 @@ impl Engine {
                     );
                     // The capped turn's own text is the run's final answer;
                     // keep it (not the previous turn's) ahead of the note.
-                    state.answer = turn.response.text.clone();
                     state.answer = format!(
                         "{}\n\n[stopped: USD spend cap exceeded — spent ~${:.4} of ${cap:.4} cap]",
                         state.answer, state.spend_usd
@@ -877,26 +900,6 @@ impl Engine {
                     break;
                 }
             }
-
-            // Record the assistant message (text and/or tool calls).
-            let assistant = Message {
-                role: Role::Assistant,
-                content: turn.response.text.clone(),
-                tool_calls: turn.response.tool_calls.clone(),
-                tool_call_id: None,
-                attachments: Vec::new(),
-            };
-            self.store
-                .append(
-                    session_id,
-                    &SessionEvent::Message {
-                        parent_id: None,
-                        message: assistant.clone(),
-                    },
-                )
-                .await?;
-            state.transcript.push(assistant);
-            state.answer = turn.response.text;
 
             if turn.response.stop_reason != StopReason::ToolUse
                 || turn.response.tool_calls.is_empty()
@@ -2945,6 +2948,7 @@ impl Engine {
             tool_calls: Vec::new(),
             tool_call_id: None,
             attachments: Vec::new(),
+            provider_blocks: response.provider_blocks.clone(),
         };
         self.store
             .append(
@@ -3837,6 +3841,7 @@ mod tests {
             }],
             usage: Default::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -3846,6 +3851,7 @@ mod tests {
             tool_calls: Vec::new(),
             usage: Default::default(),
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -4149,6 +4155,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: Default::default(),
                     stop_reason: StopReason::EndTurn,
+                    provider_blocks: Vec::new(),
                 });
             }
             let read_call = ToolCall {
@@ -4165,6 +4172,7 @@ mod tests {
                 tool_calls: vec![read_call],
                 usage: Default::default(),
                 stop_reason: StopReason::ToolUse,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -4277,6 +4285,7 @@ mod tests {
                 tool_calls: self.final_calls.clone(),
                 usage: Default::default(),
                 stop_reason: StopReason::ToolUse,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -4399,6 +4408,7 @@ mod tests {
                         cached_input_tokens: 0,
                     },
                     stop_reason: StopReason::EndTurn,
+                    provider_blocks: Vec::new(),
                 },
             ])),
         );
@@ -4424,6 +4434,65 @@ mod tests {
             summary.answer.contains("spend cap"),
             "the cap note is still appended: {:?}",
             summary.answer
+        );
+    }
+
+    #[tokio::test]
+    async fn spend_cap_stop_logs_the_billed_tool_call_turn() {
+        // The capped turn is billed, so its assistant message (with the tool
+        // call it requested) must reach the log even though the run stops
+        // before any tool runs. Resume must then prune the dangling call.
+        use crate::SessionStore;
+        use std::collections::HashMap;
+        let store = Arc::new(crate::testing::InMemoryStore::default());
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(crate::testing::MockProvider::with_script(vec![
+                TurnResponse {
+                    text: "reading first".into(),
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                    },
+                    ..call("read")
+                },
+            ])),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(ToolRegistry::new()),
+            store: store.clone(),
+            config: EngineConfig {
+                max_cost_usd: Some(0.5),
+                price_lookup: Some(Arc::new(|_: &str| Some((1.0, 1.0)))),
+                ..EngineConfig::default()
+            },
+        };
+        let summary = engine.run_task("big task").await.unwrap();
+        let events = store.load(summary.session_id).await.unwrap();
+        let logged: Vec<&Message> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Message { message, .. } => Some(message),
+                _ => None,
+            })
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(logged.len(), 1, "the billed turn is in the log");
+        assert_eq!(logged[0].content, "reading first");
+        assert_eq!(logged[0].tool_calls.len(), 1);
+        // Resume: the dangling call is pruned before the next request.
+        let pruned = prune_unanswered_tool_calls(&events);
+        assert!(
+            !pruned.iter().any(|e| matches!(
+                e,
+                SessionEvent::Message { message, .. }
+                    if message.role == Role::Assistant && !message.tool_calls.is_empty()
+            )),
+            "a dangling tool call is not replayed on resume"
         );
     }
 
@@ -4864,6 +4933,7 @@ mod tests {
             }],
             usage: Default::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -5538,6 +5608,7 @@ mod claim_pass_tests {
             }],
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -5547,6 +5618,7 @@ mod claim_pass_tests {
             tool_calls: Vec::new(),
             usage: Usage::default(),
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -5840,6 +5912,7 @@ mod review_pass_tests {
             }],
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -5849,6 +5922,7 @@ mod review_pass_tests {
             tool_calls: Vec::new(),
             usage: Usage::default(),
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -6121,6 +6195,7 @@ OPEN ITEMS: write the fix.";
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -6134,6 +6209,7 @@ OPEN ITEMS: write the fix.";
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -6405,6 +6481,7 @@ mod delegate_approval_tests {
             tool_calls: vec![call("d1"), call("d2")],
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         };
         let asked = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&asked);
@@ -6476,6 +6553,7 @@ mod model_role_tests {
             tool_calls: Vec::new(),
             usage: Usage::default(),
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -6489,6 +6567,7 @@ mod model_role_tests {
             }],
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 

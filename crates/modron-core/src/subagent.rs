@@ -906,6 +906,7 @@ mod tests {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         };
         let parent = parent_engine(MockProvider::new().then_response(answer));
         let report = explore(&parent, "where is the token counter?", 10_000)
@@ -933,6 +934,7 @@ mod tests {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         };
         let parent = parent_engine(
             MockProvider::new()
@@ -1086,6 +1088,7 @@ mod tests {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         };
         let answer_turn = TurnResponse {
             text: "found it".into(),
@@ -1096,6 +1099,7 @@ mod tests {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         };
         let mut parent = parent_engine(
             MockProvider::new()
@@ -1219,6 +1223,7 @@ mod approval_tests {
             }],
             usage: crate::Usage::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         };
         MockProvider::new()
             .then_response(write)
@@ -1617,6 +1622,7 @@ mod h3d_tests {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 

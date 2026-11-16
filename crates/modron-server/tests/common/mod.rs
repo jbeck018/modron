@@ -89,6 +89,7 @@ pub fn bash_call(id: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -107,6 +108,7 @@ pub fn read_call(id: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -121,6 +123,7 @@ pub fn text_turn(text: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     }
 }
 

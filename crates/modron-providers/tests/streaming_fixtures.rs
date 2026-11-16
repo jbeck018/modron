@@ -266,8 +266,8 @@ fn anthropic_equivalent_body() -> Value {
 fn thinking_equivalent_body() -> Value {
     json!({
         "content": [
-            // The non-streaming parser skips thinking blocks entirely; the
-            // streaming path must too (reasoning goes to the delta channel).
+            // Thinking blocks are reasoning text (delta channel) and are also
+            // kept verbatim as provider blocks for replay (H7b-2).
             {"type": "thinking", "thinking": "Need to list files first", "signature": "sig=="},
             {"type": "text", "text": "Done."}
         ],
@@ -360,8 +360,178 @@ async fn anthropic_streaming_thinking_surfaces_reasoning_only() {
     let expected = modron_providers::anthropic::parse_response(thinking_equivalent_body())
         .expect("non-streaming parse");
     assert_same_turn(&response, &expected);
+    assert_eq!(response.provider_blocks, expected.provider_blocks);
+    assert_eq!(response.provider_blocks.len(), 1);
+    assert_eq!(response.provider_blocks[0].kind, "thinking");
+    assert_eq!(
+        response.provider_blocks[0].payload,
+        json!({"type": "thinking", "thinking": "Need to list files first", "signature": "sig=="})
+    );
     assert_eq!(response.text, "Done.");
     assert!(response.tool_calls.is_empty());
+}
+
+/// Thinking with a signature split across two deltas, a redacted_thinking
+/// block (data arrives whole in its start event), text, and a tool call.
+/// The signature is a realistic base64 string with `+`, `/` and `=`.
+const ANTHROPIC_REPLAY_STREAM: &[&str] = &[
+    "event: message_start",
+    r#"data: {"type":"message_start","message":{"id":"msg_01REPLAY","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":400,"output_tokens":1}}}"#,
+    "",
+    "event: content_block_start",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Read the file "}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"before editing."}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCgIYAhIM+/Q3"}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"zk1Pl8I=="}}"#,
+    "",
+    "event: content_block_stop",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "",
+    "event: content_block_start",
+    r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"ENCRYPTED+opaque/data=="}}"#,
+    "",
+    "event: content_block_stop",
+    r#"data: {"type":"content_block_stop","index":1}"#,
+    "",
+    "event: content_block_start",
+    r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Checking."}}"#,
+    "",
+    "event: content_block_stop",
+    r#"data: {"type":"content_block_stop","index":2}"#,
+    "",
+    "event: content_block_start",
+    r#"data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_01R","name":"read","input":{}}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+    "",
+    "event: content_block_delta",
+    r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"\"a.rs\"}"}}"#,
+    "",
+    "event: content_block_stop",
+    r#"data: {"type":"content_block_stop","index":3}"#,
+    "",
+    "event: message_delta",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":90}}"#,
+    "",
+    "event: message_stop",
+    r#"data: {"type":"message_stop"}"#,
+];
+
+#[tokio::test]
+async fn anthropic_thinking_blocks_round_trip_byte_exact_to_the_next_request() {
+    let body = sse_body(ANTHROPIC_REPLAY_STREAM);
+    let (addr, server) = spawn_sse_server(vec![(sse_response(&body), 0)]).await;
+    let provider = AnthropicProvider::new("sk-test-key")
+        .expect("provider")
+        .with_base_url(format!("http://{addr}"));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let response = provider
+        .turn_streaming(Arc::new(simple_request("claude-sonnet-4-5")), tx)
+        .await
+        .expect("streaming turn succeeds");
+    let _ = server.await.expect("server task");
+
+    let kept: Vec<Value> = response
+        .provider_blocks
+        .iter()
+        .map(|b| b.payload.clone())
+        .collect();
+    let thinking = json!({
+        "type": "thinking",
+        "thinking": "Read the file before editing.",
+        "signature": "EqQBCgIYAhIM+/Q3zk1Pl8I=="
+    });
+    let redacted = json!({"type": "redacted_thinking", "data": "ENCRYPTED+opaque/data=="});
+    assert_eq!(kept, vec![thinking.clone(), redacted.clone()]);
+    assert_eq!(response.provider_blocks[0].index, 0);
+    assert_eq!(response.provider_blocks[1].index, 1);
+    assert_eq!(response.provider_blocks[1].kind, "redacted_thinking");
+
+    // The next request: the assistant turn carries the blocks back in
+    // their original order, before the text and the tool call. Blocks are
+    // replayed only on a request that turns thinking on.
+    let mut req = simple_request("claude-sonnet-4-6");
+    req.reasoning_summary = true;
+    req.messages.push(Message {
+        role: modron_core::Role::Assistant,
+        content: response.text.clone(),
+        tool_calls: response.tool_calls.clone(),
+        tool_call_id: None,
+        attachments: Vec::new(),
+        provider_blocks: response.provider_blocks.clone(),
+    });
+    let wire = modron_providers::anthropic::build_body(&req);
+    let content = wire["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(content[0], thinking);
+    assert_eq!(content[1], redacted);
+    assert_eq!(content[2]["type"], "text");
+    assert_eq!(content[2]["text"], "Checking.");
+    assert_eq!(content[3]["type"], "tool_use");
+    assert_eq!(content[3]["id"], "toolu_01R");
+    // Signature bytes survive exactly, not just structurally.
+    assert_eq!(
+        content[0]["signature"].as_str().unwrap(),
+        "EqQBCgIYAhIM+/Q3zk1Pl8I=="
+    );
+
+    // Without thinking on, the same history carries no thinking content.
+    req.reasoning_summary = false;
+    let wire = modron_providers::anthropic::build_body(&req);
+    let content = wire["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert!(content
+        .iter()
+        .all(|b| b["type"] != "thinking" && b["type"] != "redacted_thinking"));
+}
+
+#[tokio::test]
+async fn anthropic_provider_blocks_from_another_provider_are_not_replayed() {
+    // Same blocks, but the turn was produced by OpenAI: the Anthropic request
+    // must not carry them (PLAN 10.7 rule 3, provider switch).
+    let foreign = modron_core::ProviderBlock {
+        provider: "openai".into(),
+        api: "responses".into(),
+        kind: "reasoning".into(),
+        index: 0,
+        payload: json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "x"}),
+    };
+    let same_provider_other_api = modron_core::ProviderBlock {
+        provider: "anthropic".into(),
+        api: "legacy".into(),
+        kind: "thinking".into(),
+        index: 1,
+        payload: json!({"type": "thinking", "thinking": "t", "signature": "s"}),
+    };
+    let mut req = simple_request("claude-sonnet-4-5");
+    req.messages.push(Message {
+        role: modron_core::Role::Assistant,
+        content: "Done.".into(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        attachments: Vec::new(),
+        provider_blocks: vec![foreign, same_provider_other_api],
+    });
+    let wire = modron_providers::anthropic::build_body(&req);
+    assert_eq!(
+        wire["messages"][1]["content"],
+        json!([{"type": "text", "text": "Done."}])
+    );
 }
 
 #[tokio::test]

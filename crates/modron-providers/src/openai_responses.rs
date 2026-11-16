@@ -15,7 +15,8 @@
 use async_trait::async_trait;
 use modron_core::auth::oauth::chatgpt;
 use modron_core::{
-    Error, ModelProvider, Result, Role, StopReason, ToolCall, TurnRequest, TurnResponse, Usage,
+    replayable_blocks, Error, ModelProvider, ProviderBlock, Result, Role, StopReason, ToolCall,
+    TurnRequest, TurnResponse, Usage,
 };
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -23,6 +24,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// ChatGPT (subscription) provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "chatgpt";
+/// Wire api for provider-block replay (H7b-2): reasoning items are only
+/// replayed to this api.
+const REPLAY_API: &str = "responses";
 
 use crate::http::{
     build_client, check_status, drain_sse, with_401_retry, within_idle, REQUEST_TIMEOUT,
@@ -329,6 +333,11 @@ pub fn build_body(req: &TurnRequest) -> Value {
                 }));
             }
             Role::Assistant => {
+                // Reasoning items first, in their original order, exactly as
+                // received (H7b-2); only this provider's Responses items.
+                for block in replayable_blocks(message, PROVIDER_ID, REPLAY_API) {
+                    input.push(block.payload.clone());
+                }
                 if !message.content.is_empty() {
                     input.push(json!({
                         "type": "message",
@@ -372,6 +381,12 @@ pub fn build_body(req: &TurnRequest) -> Value {
         "store": false,
         "stream": true,
     });
+    // Reasoning on: ask for the encrypted reasoning items so they can be
+    // sent back on the next turn (store is false, so this is the only copy).
+    // Absent when reasoning is off: the request bytes are unchanged then.
+    if req.effort.is_some() || req.reasoning_summary {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
         body["tool_choice"] = json!("auto");
@@ -403,6 +418,9 @@ struct ResponsesAccumulator {
     text: String,
     tools: Vec<ToolCall>,
     usage: Option<Usage>,
+    /// Reasoning output items, kept verbatim for replay (H7b-2), keyed by
+    /// their output position.
+    reasoning: Vec<ProviderBlock>,
     done: bool,
 }
 
@@ -434,6 +452,19 @@ impl ResponsesAccumulator {
             }
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
+                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                        let index = event
+                            .get("output_index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(self.reasoning.len() as u64);
+                        self.reasoning.push(ProviderBlock {
+                            provider: PROVIDER_ID.into(),
+                            api: REPLAY_API.into(),
+                            kind: "reasoning".into(),
+                            index: u32::try_from(index).unwrap_or(u32::MAX),
+                            payload: item.clone(),
+                        });
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let name = item
                             .get("name")
@@ -517,10 +548,13 @@ impl ResponsesAccumulator {
         } else {
             StopReason::ToolUse
         };
+        let mut provider_blocks = self.reasoning.clone();
+        provider_blocks.sort_by_key(|block| block.index);
         Ok(TurnResponse {
             text: self.text.clone(),
             tool_calls: self.tools.clone(),
             usage: self.usage.unwrap_or_default(),
+            provider_blocks,
             stop_reason,
         })
     }
@@ -547,6 +581,7 @@ mod tests {
                     }],
                     tool_call_id: None,
                     attachments: Vec::new(),
+                    provider_blocks: Vec::new(),
                 },
                 Message {
                     role: Role::Tool,
@@ -554,6 +589,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     tool_call_id: Some("call-1".into()),
                     attachments: Vec::new(),
+                    provider_blocks: Vec::new(),
                 },
             ],
             tools: vec![ToolSpec {
@@ -589,6 +625,84 @@ mod tests {
             assert_eq!(body["reasoning"], json!({ "effort": word }), "{effort:?}");
             assert_eq!(body["store"], false, "rest of the body unchanged");
         }
+    }
+
+    #[test]
+    fn reasoning_items_round_trip_before_the_call_they_preceded() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = ResponsesAccumulator::default();
+        let reasoning_item = json!({
+            "type": "reasoning",
+            "id": "rs_0abc",
+            "summary": [{"type": "summary_text", "text": "list first"}],
+            "encrypted_content": "gAAAAABencrypted+/=="
+        });
+        // Output positions out of arrival order: the reasoning item is 0.
+        acc.ingest(
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"}
+            })
+            .to_string(),
+            &tx,
+        )
+        .unwrap();
+        acc.ingest(
+            &json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item})
+                .to_string(),
+            &tx,
+        )
+        .unwrap();
+        acc.done = true;
+        let parsed = acc.finish().unwrap();
+        assert_eq!(parsed.provider_blocks.len(), 1);
+        assert_eq!(parsed.provider_blocks[0].payload, reasoning_item);
+
+        let mut req = request();
+        req.effort = Some(modron_core::Effort::High);
+        req.messages = vec![
+            Message::user("hi"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: parsed.tool_calls.clone(),
+                tool_call_id: None,
+                attachments: Vec::new(),
+                provider_blocks: parsed.provider_blocks.clone(),
+            },
+        ];
+        let body = build_body(&req);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1], reasoning_item, "byte-for-byte item");
+        assert_eq!(input[2]["type"], "function_call");
+
+        // Off: no include key at all.
+        req.effort = None;
+        assert!(build_body(&req).get("include").is_none());
+    }
+
+    #[test]
+    fn reasoning_items_from_another_provider_are_not_replayed() {
+        let mut req = request();
+        req.messages = vec![Message {
+            role: Role::Assistant,
+            content: "ok".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            attachments: Vec::new(),
+            provider_blocks: vec![ProviderBlock {
+                provider: "anthropic".into(),
+                api: "messages".into(),
+                kind: "thinking".into(),
+                index: 0,
+                payload: json!({"type": "thinking", "thinking": "t", "signature": "s"}),
+            }],
+        }];
+        let body = build_body(&req);
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["type"], "message");
     }
 
     #[test]
@@ -679,6 +793,7 @@ mod tests {
                     text: "hello doc".into(),
                 },
             ],
+            provider_blocks: Vec::new(),
         }];
         let body = build_body(&req);
         let content = &body["input"][0]["content"];

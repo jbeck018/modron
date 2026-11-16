@@ -2165,6 +2165,11 @@ async fn attach(
     // watermark; the append lock still held makes the persisted log match it.
     let (watermark, live) = handle.snapshot_point();
     drop(append_guard);
+    // Provider blocks never leave the server (H7b-2): strip at the send.
+    let mut events = events;
+    events
+        .iter_mut()
+        .for_each(modron_core::SessionEvent::strip_provider_blocks);
     let snapshot = Frame {
         id: request_id,
         session: Some(session_id),

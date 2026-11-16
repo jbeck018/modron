@@ -91,6 +91,7 @@ fn call_response(id: &str, name: &str) -> TurnResponse {
         }],
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -337,6 +338,7 @@ fn call_response_with_args(id: &str, name: &str, arguments: serde_json::Value) -
         }],
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 

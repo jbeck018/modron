@@ -67,6 +67,7 @@ fn tool_call_response(id: &str, name: &str, usage: Usage) -> TurnResponse {
         }],
         usage,
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -98,6 +99,7 @@ async fn system_and_tools_are_byte_identical_across_all_turns() {
                     cached_input_tokens: 0,
                 },
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             }),
     );
     let dir = tempfile::tempdir().expect("tempdir");
@@ -153,6 +155,7 @@ async fn stability_holds_over_three_turns_with_repeated_tool_calls() {
                 tool_calls: vec![],
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             }),
     );
     let dir = tempfile::tempdir().expect("tempdir");

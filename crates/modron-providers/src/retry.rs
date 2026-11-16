@@ -379,6 +379,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -500,6 +501,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -651,6 +653,7 @@ mod tests {
                         tool_calls: Vec::new(),
                         usage: Usage::default(),
                         stop_reason: StopReason::EndTurn,
+                        provider_blocks: Vec::new(),
                     })
                 }
             }
@@ -850,6 +853,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: Usage::default(),
                     stop_reason: StopReason::EndTurn,
+                    provider_blocks: Vec::new(),
                 })
             }
         }

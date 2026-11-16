@@ -1077,6 +1077,7 @@ mod tests {
                     cached_input_tokens: 0,
                 },
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -1284,6 +1285,7 @@ mod tests {
                     cached_input_tokens: 0,
                 },
                 stop_reason: StopReason::ToolUse,
+                provider_blocks: Vec::new(),
             })
             .then_text("done");
         let mut tools = modron_core::ToolRegistry::new();

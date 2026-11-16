@@ -688,6 +688,7 @@ mod phase5i_tests {
                 cached_input_tokens: 0,
             },
             stop_reason: modron_core::StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         };
         let mut providers: HashMap<String, Arc<dyn modron_core::ModelProvider>> = HashMap::new();
         providers.insert(

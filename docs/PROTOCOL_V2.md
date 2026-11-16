@@ -18,6 +18,13 @@ with a doc comment stating its one UI effect before any client renders it
 - Persisted `SessionEvent`s stay replayable by old binaries: new facts are
   new variants, never changed fields.
 
+- Provider blocks (H7b-2): `Message` carries an optional `provider_blocks`
+  list (the provider's thinking, redacted-thinking or reasoning items) in
+  the session log only. It is a serde-default field, so older binaries read
+  new lines and ignore it. It never goes on the wire: the server strips it
+  from snapshots and live `Event` frames at the send boundary, so no client
+  receives it and no frame version changes.
+
 ## 1. Actor and role (tandem, guests)
 
 Every connection has an identity and a role, fixed at `hello`:

@@ -62,9 +62,9 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 pub use modron_types::{
-    AgentState, Attachment, Effort, Message, ModelRoles, PlanItem, Role, RunSummary, SandboxPolicy,
-    SessionEvent, SessionId, SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall,
-    ToolOutcome, ToolSpec, Usage,
+    replayable_blocks, AgentState, Attachment, Effort, Message, ModelRoles, PlanItem,
+    ProviderBlock, Role, RunSummary, SandboxPolicy, SessionEvent, SessionId, SessionMeta,
+    StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec, Usage,
 };
 
 /// Context handed to a tool execution.
@@ -278,6 +278,9 @@ pub struct TurnResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
     pub stop_reason: StopReason,
+    /// Provider-native blocks to keep with the assistant message (H7b-2).
+    /// Empty for providers that keep nothing.
+    pub provider_blocks: Vec<ProviderBlock>,
 }
 
 #[async_trait]
