@@ -211,6 +211,30 @@ mod tests {
         EditTool.execute(args, &ctx).await.expect("execute")
     }
 
+    /// The edit-10-blank-lines task with the default tool: one exact-string
+    /// replacement covering the blank lines, byte-equal to the verifier output.
+    #[tokio::test]
+    async fn blank_lines_task_gives_verifier_bytes() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("blank.txt"),
+            "title\n\n\nsection one\nbody a\n\n\nsection two\nbody b\n",
+        )
+        .unwrap();
+        let out = run(
+            json!({"path": "blank.txt",
+                   "old_string": "body a\n\n\nsection two\nbody b",
+                   "new_string": "body a\n\ndivider\n\nsection two\nbody B"}),
+            dir.path(),
+        )
+        .await;
+        assert!(!out.is_error, "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("blank.txt")).unwrap(),
+            "title\n\n\nsection one\nbody a\n\ndivider\n\nsection two\nbody B\n"
+        );
+    }
+
     #[tokio::test]
     async fn replaces_single_occurrence() {
         let dir = tempdir().unwrap();

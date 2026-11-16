@@ -120,3 +120,33 @@ it is not diagnosed (tool behaviour around blank lines, or the task).
 The recommendation stands: edit stays the default, edit_lines opt-in,
 and edit-10 is the thing to look at before revisiting.
 
+
+## Diagnosis of edit-10-blank-lines
+
+Cause: model error in new_text, not a tool defect. The tool applies exactly the
+lines it is given; pass or fail depends on whether new_text starts with a newline.
+
+Evidence (blank.txt: title, blank, blank, section one, body a, blank, blank,
+section two, body b). Failing gpt-5.4-mini call (session 14588d62, others alike):
+  start_line=6 end_line=9 expected_hashes=[c8d,c8d,ce9,613]
+  new_text="divider\n\nsection two\nbody B"
+Tool result: 4 lines replaced by 4; file is body a / divider / blank / section two,
+so the blank before divider is lost. Passing call: same range, new_text starting
+with a newline. Other failures: start 5 with "body a\ndivider..." (one blank lost),
+and glm-4.6 start 5 that doubled the blanks. Eval rows show edit_errors=0 each time.
+In every logged run, a leading-newline call passed and every other call failed.
+The default edit tool has no line arithmetic and passes the same task byte-for-byte.
+
+Changes: tests only (edit_lines.rs and edit.rs). Logged calls replayed verbatim
+assert their exact bytes; newline convention test added; default-edit blank test
+added. Tool behavior, schema and descriptions unchanged. A description rewrite
+and a "(blank)" rail marker were tried and reverted: no gain measured.
+
+Rerun numbers (edit-10, edit_lines):
+  baseline gpt-5.4-mini 10/15 (+ control 3/6 later); baseline glm-4.6 2/3
+  variants (discarded): gpt-5.4-mini 5/15 and 2/12
+  final binary: gpt-5.4-mini full suite 11/12 (edit-10 fails); glm-4.6 12/12
+
+Recommendation: no change. Keep edit as default, edit_lines opt-in. Weaker models
+miscount blank lines because edit_lines makes them re-send unchanged lines;
+an insert-after operation would avoid that, but it is not implemented.
