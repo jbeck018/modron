@@ -1679,3 +1679,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   had focus and failed about one run in six; it now waits for the
   field and its value (seven clean runs). Client core 129 tests. The
   app is 12,197 source lines.
+- 2026-11-16: full e2e against the current tree: 21 of 22; W3 still
+  drove Settings by cycling rows, which now open pickers. Rewritten to
+  pick the values; passes. T1 rerun against a freshly built terminal
+  binary.

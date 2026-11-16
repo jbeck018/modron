@@ -581,17 +581,23 @@ await scenario('W2', 'plan phase: /plan refuses gated tools in the engine, /buil
     'no config echo for /build');
 });
 
-await scenario('W3', 'settings round trip: effort and approval mode echo into the status line', async (s) => {
+// Settings rows open a picker (app/src/nav.rs Screen::Picker): press the row,
+// then press the value in the list.
+await scenario('W3', 'settings round trip: effort and approval mode picked in Settings echo into the status line', async (s) => {
   const { lx, vw } = await sharedSession('w3', 'e2e w3');
   await clickText(vw, 'settings');
   await soft(s, waitBody(vw, (t) => t.includes('effort'), 20000, 'settings rows'), 'settings screen did not open');
   const mark = lx.frames.length;
   await clickContains(vw, 'effort');
+  await soft(s, waitBody(vw, (t) => /(^|\n)\s*\S?\s*low\s*(\n|$)/.test(t), 20000, 'effort picker'), 'the effort picker did not open');
+  await clickText(vw, 'low');
   await soft(s, lx.waitFor((f) => f.type === 'config_changed' && JSON.stringify(f).includes('low'), 15000, 'effort echo', mark),
     'server did not echo effort low');
+  const second = lx.frames.length;
   await clickContains(vw, 'approval mode');
-  await soft(s, lx.waitFor((f) => f.type === 'config_changed', 15000, 'mode echo', mark + 1), 'server did not echo the mode change');
-  await sleep(500);
+  await soft(s, waitBody(vw, (t) => /(^|\n)\s*\S?\s*yolo\s*(\n|$)/.test(t), 20000, 'mode picker'), 'the mode picker did not open');
+  await clickText(vw, 'yolo');
+  await soft(s, lx.waitFor((f) => f.type === 'config_changed', 15000, 'mode echo', second), 'server did not echo the mode change');
   await vw.page.keyboard.press('Escape');
   await soft(s, waitBody(vw, (t) => t.includes('effort low') && t.includes('yolo'), 20000, 'status line'),
     'status line does not show "effort low" and "yolo" after the echo');
