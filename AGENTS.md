@@ -71,6 +71,7 @@ rule, not by memory.
 | Platform chrome | None (fullscreen terminal) | Browser chrome |
 | Remote-control registration | `/remote-control <bridge-url>` slash command, prints the share URL | The same command, from the slash popup or the share control |
 | Presentation of per-turn meta | Lines after each turn | Set by the web view in app/src/chat.rs; the words are the shared ones |
+| Push notifications | None (a terminal has no push service) | "notify this device" row in settings, web push through the bridge |
 
 Divergence covers PRESENTATION and KEYS only. The words, the states, the
 ordering and the semantics do not diverge. A row not listed here must match.

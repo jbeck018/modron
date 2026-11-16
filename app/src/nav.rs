@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::chat::UiAction;
 use crate::help::{self, HelpTab, HELP_VISIBLE};
 use crate::portal::{self, PortalLine, PortalRow};
+use crate::push::PushView;
 use crate::slash;
 use crate::theme::{Choice, CHOICES};
 
@@ -485,6 +486,8 @@ pub struct ShareView {
 /// What the view renders.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct NavView {
+    /// The Settings web push row (web host only; `None` hides it).
+    pub push: Option<PushView>,
     /// Bumped by every transcript scroll step; the view scrolls once per step.
     pub scroll_seq: u64,
     /// Lines the transcript is scrolled up from the newest row (0 = following).
@@ -608,6 +611,7 @@ pub struct Nav {
     invites: Vec<InviteLine>,
     created: Option<String>,
     share_note: Option<String>,
+    push: Option<PushView>,
     auth: Vec<AuthRow>,
     auth_progress: Option<OAuthProgressView>,
     /// The provider whose masked key entry is open.
@@ -707,6 +711,11 @@ impl Nav {
 
     pub fn set_share_note(&mut self, note: Option<String>) {
         self.share_note = note;
+    }
+
+    /// The Settings web push row; `None` hides it.
+    pub fn set_push(&mut self, row: Option<PushView>) {
+        self.push = row;
     }
 
     /// Whether the credentials screen has a key entry open.
@@ -1485,6 +1494,7 @@ impl Nav {
                 created: self.created.clone(),
                 note: self.share_note.clone(),
             }),
+            push: self.push.clone(),
             auth: self.auth.clone(),
             auth_key: self.auth_key.clone(),
             auth_progress: self.auth_progress.clone(),

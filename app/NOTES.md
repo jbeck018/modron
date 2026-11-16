@@ -255,3 +255,49 @@ the screen only when the host's actions are pumped (`Harness::action`), since
 - Parallel chat tests were flaky because the harness released its serial
   lock before the view dropped (field order). Fixed; the single-thread pin
   is gone. A few chat.rs unit tests still touch the globals without a lock.
+
+# Packet PUSH-2: web push (Settings row, web only)
+
+## Result
+- Settings shows "notify this device: off|on|unavailable" on the web host.
+  Tap subscribes or unsubscribes. The state rules and bodies are pure and
+  unit-tested (`src/push.rs`); the browser calls are in `src/web.rs`, with
+  `Reflect` and `JsFuture` only, so no closure is created and none can outlive
+  its owner. Labels are shared in `modron-mobile-core` view.rs (`PUSH_*`,
+  `push_line`).
+- The row is hidden unless the key route answers 200 for a non-viewer and the
+  browser has `serviceWorker` and `PushManager`. An iOS tab without them shows
+  "unavailable" with the Home Screen hint. A blocked permission leaves the row
+  off and shows the shared reason under it.
+- Request bodies match `cloud/bridge/src/index.ts` exactly: subscribe sends
+  `endpoint` and `keys` (`p256dh`, `auth`), plus `invite` only for an approver;
+  unsubscribe sends `endpoint`, plus `invite` for an approver. The bridge
+  refuses unknown fields, so nothing else is sent.
+
+## Gap: an approver invite cannot reach the push routes from the page
+- `GET /i/<id>.<sig>` redirects to `/app/?url=<ws url with ticket>` and does
+  not carry the invite token. The page never sees `<id>.<sig>`, so an invited
+  approver's page probes with no invite, gets 401, and the row stays hidden.
+  The `?invite=` path works (tested), but the portal never produces that
+  address. Fix in cloud/bridge (`handleInviteLink`): add `&invite=<id>.<sig>`
+  to the redirect. Not changed here (cloud/ is outside this packet).
+
+## Decisions
+- Permission is not part of the row state. A blocked permission keeps the
+  row "off" and the reason stays under it (not the 2 s note, which expires).
+- The toggle is `UiAction::TogglePush`, routed like the portal actions (web
+  host only, `is_portal`). The terminal never sends it and never shows the row.
+- The probe runs only where the browser could show the row (`supported` or an
+  iOS tab), so other browsers make no request to the key route.
+- The iOS check is the user agent (iPhone, iPad, iPod) with
+  `navigator.standalone` not true. It is an approximation of "iOS Safari".
+- Viewer-invite test: the key route answers 403, which Chromium logs as a
+  console error. That one message is expected in that test only; the global
+  allowed set (401, 429, 503) is unchanged.
+
+## Not done or not verified
+- No real push service was reached. The browser tests stub
+  `serviceWorker`, `PushManager` and `Notification`, and the bridge is a
+  scripted site. Delivery to a device and the service worker's `push` handler
+  are not exercised.
+- The bridge-side redirect gap above.

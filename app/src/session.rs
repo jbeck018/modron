@@ -772,6 +772,7 @@ fn apply(client: &RemoteClient, action: UiAction) {
         | UiAction::CreateInvite(_)
         | UiAction::RevokeInvite(_)
         | UiAction::CopyInvite(_)
+        | UiAction::TogglePush
         | UiAction::Clear
         | UiAction::Context => Ok(()),
     };

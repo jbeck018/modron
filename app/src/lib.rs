@@ -14,6 +14,7 @@ pub mod files;
 pub mod help;
 pub mod nav;
 pub mod portal;
+pub mod push;
 pub mod screens;
 pub mod session;
 pub mod slash;

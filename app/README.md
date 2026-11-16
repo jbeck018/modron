@@ -238,6 +238,16 @@ Serve `dist/Modron/` with any static server. The page address picks the mode:
 The portal's sign-in token is sent once to `POST /auth` and never stored: no
 query string, no storage. The list refreshes every 15 s while it shows.
 
+Web push (Settings, "notify this device"): on a page the bridge serves, the
+page asks `GET /api/push/key` (with `?invite=` when the address carries one).
+A 200 shows the row where the browser has `serviceWorker` and `PushManager`;
+off or on follows this device's subscription. A tap subscribes (service
+worker `/app/sw.js`, permission, `pushManager.subscribe`, then POST
+`/api/push/subscribe`) or unsubscribes (`subscription.unsubscribe()`, then
+DELETE). An iOS tab outside the Home Screen shows the row unavailable with a
+hint. The state rules and request bodies are in `src/push.rs`; the browser
+calls are in `src/web.rs`. Nothing subscribes without a tap.
+
 The real server refuses browser Origins unless started with `--allow-origin`.
 
 ## Tests
@@ -260,6 +270,7 @@ and page text after Enter.
 ## Layout
 
 - `src/chat.rs`: screen, model and key routing (target-neutral).
+- `src/push.rs`: web push row state, request bodies, base64url (target-neutral).
 - `src/session.rs`: the driver (`Driver::step`), target-neutral.
 - `nsh.json`: app id `dev.modron.app`, theme `theme/oculus.json`.
 

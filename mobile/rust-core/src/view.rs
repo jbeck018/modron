@@ -367,6 +367,16 @@ pub const COPIED_LABEL: &str = "copied";
 pub const REVOKE_LABEL: &str = "revoke";
 pub const NO_INVITES_LABEL: &str = "no invites";
 
+// Web push (the Settings row of the web host; the terminal never shows it).
+pub const PUSH_LABEL: &str = "notify this device";
+pub const PUSH_ON_LABEL: &str = "on";
+pub const PUSH_OFF_LABEL: &str = "off";
+pub const PUSH_UNAVAILABLE_LABEL: &str = "unavailable";
+pub const PUSH_HOME_SCREEN_HINT: &str = "on iPhone, add this page to the Home Screen first";
+pub const PUSH_BLOCKED_LABEL: &str = "notifications are blocked for this site";
+pub const PUSH_NOT_ALLOWED_LABEL: &str = "notifications were not allowed";
+pub const PUSH_FAILED_LABEL: &str = "could not change notifications";
+
 /// Parity D2: the credentials screen (`/auth`, and the Settings auth row).
 /// The row label and the first-run hint are the old TUI's words
 /// (crates/modron-tui/src/lib.rs, the auth manager and the idle hints).
@@ -648,6 +658,11 @@ pub fn portal_session_row(title: &str, host_label: &str, online: bool, updated_a
 /// One invite row: its role and when it expires.
 pub fn invite_row(role: &str, expires_at: &str) -> String {
     format!("{role} \u{b7} expires {}", short_time(expires_at))
+}
+
+/// The web push row's line: the label and its value (`notify this device: on`).
+pub fn push_line(value: &str) -> String {
+    format!("{PUSH_LABEL}: {value}")
 }
 
 /// One sessions-list row: the title (the short id when untitled), the
@@ -2623,6 +2638,15 @@ mod portal_copy_tests {
         assert_eq!(
             invite_row("viewer", "2026-11-16T10:20:30Z"),
             "viewer \u{b7} expires 2026-11-16 10:20"
+        );
+    }
+
+    #[test]
+    fn push_line_is_the_label_and_the_value() {
+        assert_eq!(push_line(PUSH_ON_LABEL), "notify this device: on");
+        assert_eq!(
+            push_line(PUSH_UNAVAILABLE_LABEL),
+            "notify this device: unavailable"
         );
     }
 }

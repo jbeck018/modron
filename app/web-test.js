@@ -4,6 +4,11 @@
 //       welcome, a snapshot and a streamed delta; typing + Enter sends a submit.
 //   (p1..p5) owner portal: sign-in, the session list, open and offline rows,
 //       sign-out, and an invite created, shown and revoked from Settings.
+//   (w1..w6) Settings "notify this device": hidden on 503, on/off from the
+//       browser's subscription, a tap subscribes (exact body), a denied
+//       permission, a second tap unsubscribes, a viewer invite hides it,
+//       an approver invite subscribes with its invite, iOS tab hint. The push
+//       service is stubbed in the page (no real push service is reached).
 // The page is served by a Node site (startSite) on one origin: the built
 // bundle under / and /app/, and the portal's routes (/api/*, /auth) answered
 // from a scripted state. Uses only Node built-ins and the preinstalled
@@ -14,6 +19,7 @@ const fs = require('fs');
 const http = require('http');
 const net = require('net');
 const path = require('path');
+const assert = require('assert');
 
 const DIST = path.join(__dirname, 'dist', 'Modron');
 const SESSION = '5b1e8f4a-2c3d-4e5f-8a9b-0c1d2e3f4a5b';
@@ -70,6 +76,21 @@ function startSite(port, state) {
         if (p === '/auth/logout' && req.method === 'POST') {
           state.loggedOut += 1;
           return send(res, 204, '', { 'Set-Cookie': 'modron_owner=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' });
+        }
+        // Web push: the owner, or an invite the page carries (approver ok,
+        // viewer 403), as cloud/bridge/src/index.ts pushGrant does.
+        if (p === '/api/push/key' || p === '/api/push/subscribe') {
+          if (state.push === 'off') return json(res, 503, { error: 'web push is not configured' });
+          const parsed = JSON.parse(body || '{}');
+          const invite = p === '/api/push/key' ? url.searchParams.get('invite') : (parsed.invite ?? null);
+          if (p === '/api/push/key') state.pushKeyRequests.push(invite);
+          const grant = owner ? 'owner' : invite === 'approver-token' ? 'approver' : invite === 'viewer-token' ? 'viewer' : null;
+          if (grant === null) return json(res, 401, { error: 'unauthorized' });
+          if (grant === 'viewer') return json(res, 403, { error: 'only owners and approver invites may subscribe' });
+          if (p === '/api/push/key') return json(res, 200, { key: PUSH_KEY });
+          if (req.method === 'POST') { state.pushPosts.push(parsed); return send(res, 204, ''); }
+          if (req.method === 'DELETE') { state.pushDeletes.push(parsed); return send(res, 204, ''); }
+          return json(res, 405, { error: 'method not allowed' });
         }
         if (!owner) return json(res, 401, { error: 'unauthorized' });
         if (p === '/api/sessions' && req.method === 'GET') return json(res, 200, state.sessions);
@@ -349,7 +370,243 @@ async function testInviteFromSettings(browser, site) {
 }
 
 function newSiteState(portal) {
-  return { portal, rateLimited: false, sessions: PORTAL_ROWS, invites: [], invitePosts: [], deletes: [], loggedOut: 0 };
+  return { portal, rateLimited: false, sessions: PORTAL_ROWS, invites: [], invitePosts: [], deletes: [], loggedOut: 0,
+    push: 'on', pushKeyRequests: [], pushPosts: [], pushDeletes: [] };
+}
+
+// Web push fixtures: the bridge's VAPID public key (65 bytes from 0x04) and the
+// browser's subscription keys, as the stub hands them out.
+const PUSH_KEY_BYTES = Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 7)]);
+const PUSH_KEY = PUSH_KEY_BYTES.toString('base64url');
+const P256DH_BYTES = Buffer.concat([Buffer.from([4]), Buffer.from(Array.from({ length: 64 }, (_, i) => (i * 3) & 255))]);
+const AUTH_BYTES = Buffer.from(Array.from({ length: 16 }, (_, i) => 160 + i));
+const PUSH_ENDPOINT = 'https://fcm.googleapis.com/fcm/send/test-endpoint';
+const PUSH_BLOCKED = 'notifications are blocked for this site';
+
+// The browser's push APIs, stubbed before the page's scripts run. `options`:
+// permission (the answer to requestPermission), subscribed (a subscription
+// already exists), noPush (no PushManager), ios (an iPhone tab, not standalone).
+// The stub records what the page asked for in window.__push.
+function pushStub(options) {
+  return `(() => {
+    const opts = ${JSON.stringify(options)};
+    const state = { permission: opts.permission || 'default', answer: opts.answer || 'granted',
+      subscription: null, subscribeOptions: null, unsubscribed: 0, registered: null };
+    window.__push = state;
+    const keyBytes = (bytes) => new Uint8Array(bytes).buffer;
+    const makeSub = () => ({
+      endpoint: ${JSON.stringify(PUSH_ENDPOINT)},
+      getKey: (name) => keyBytes(name === 'p256dh' ? ${JSON.stringify([...P256DH_BYTES])} : ${JSON.stringify([...AUTH_BYTES])}),
+      unsubscribe: async () => { state.subscription = null; state.unsubscribed += 1; return true; },
+    });
+    if (opts.subscribed) { state.subscription = makeSub(); state.registered = ['/app/sw.js', '/app/']; }
+    const pushManager = {
+      getSubscription: async () => state.subscription,
+      subscribe: async (o) => {
+        state.subscribeOptions = { userVisibleOnly: o.userVisibleOnly, key: Array.from(new Uint8Array(o.applicationServerKey)) };
+        state.subscription = makeSub();
+        return state.subscription;
+      },
+    };
+    const registration = { scope: '/app/', pushManager };
+    const serviceWorker = {
+      register: async (url, o) => { state.registered = [url, o.scope]; return registration; },
+      getRegistration: async (scope) => (state.registered && scope === '/app/' ? registration : undefined),
+    };
+    Object.defineProperty(navigator, 'serviceWorker', { get: () => serviceWorker, configurable: true });
+    if (!opts.noPush) window.PushManager = function PushManager() {};
+    else window.PushManager = undefined;
+    window.Notification = {
+      get permission() { return state.permission; },
+      requestPermission: async () => { state.permission = state.answer; return state.permission; },
+    };
+    if (opts.ios) {
+      Object.defineProperty(navigator, 'userAgent', { get: () => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15' , configurable: true });
+    }
+  })();`;
+}
+
+// A live page (session attached) with the push stub; `cookie` signs the owner
+// in, `query` adds an invite. Returns the page's context, page and errors.
+async function openPushPage(browser, site, { cookie = true, query = '', push = {} } = {}) {
+  const context = await browser.newContext({ viewport: { width: 1000, height: 800 } });
+  if (cookie) await context.addCookies([{ name: 'modron_owner', value: COOKIE, url: site.base }]);
+  await context.addInitScript(pushStub(push));
+  const page = await context.newPage();
+  const errors = [];
+  watchErrors(page, errors);
+  await page.goto(site.base + '/app/?url=' + encodeURIComponent(site.ws.url) + '&session=' + SESSION + query, { waitUntil: 'domcontentloaded' });
+  return { context, page, errors };
+}
+
+// Opens Settings on a live page once its stream has shown.
+async function openSettings(page) {
+  await page.waitForFunction((s) => document.body.innerText.includes(s), STREAM, { timeout: TIMEOUT });
+  await tapLabel(page, 'settings');
+  await page.waitForFunction(() => document.body.innerText.includes('settings'), null, { timeout: TIMEOUT });
+}
+
+// Waits until the page's probe of the key route has answered (the row's state
+// is set after that), then a short settle for the row to paint.
+async function waitForProbe(site, count = 1) {
+  const end = Date.now() + TIMEOUT;
+  while (site.state.pushKeyRequests.length < count && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  await new Promise((r) => setTimeout(r, 400));
+}
+
+const expectedBody = (extra = {}) => ({ endpoint: PUSH_ENDPOINT, keys: { p256dh: P256DH_BYTES.toString('base64url'), auth: AUTH_BYTES.toString('base64url') }, ...extra });
+// Structural equality (the key order of the JSON is not part of the contract).
+function sameBody(actual, expected) {
+  try { assert.deepStrictEqual(actual, expected); return true; } catch { return false; }
+}
+
+// The row is hidden where the key route answers 503.
+async function testPushHiddenOn503(browser, site) {
+  site.state.push = 'off';
+  const ws = await startWsServer();
+  site.ws = ws;
+  const { context, page, errors } = await openPushPage(browser, site);
+  try {
+    await openSettings(page);
+    await waitForProbe(site);
+    const text = await page.evaluate(() => document.body.innerText);
+    if (text.includes('notify this device')) throw new Error('row shown on 503');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// Off on a fresh device; a tap subscribes and POSTs the exact body; the row
+// turns on. The registration is /app/sw.js at scope /app/.
+async function testPushTapSubscribes(browser, site) {
+  site.state.push = 'on';
+  const ws = await startWsServer();
+  site.ws = ws;
+  const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'default', answer: 'granted' } });
+  try {
+    await openSettings(page);
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'notify this device: off');
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
+    if (site.state.pushPosts.length !== 1) throw new Error('subscribe posts: ' + site.state.pushPosts.length);
+    const post = site.state.pushPosts[0];
+    if (!sameBody(post, expectedBody())) throw new Error('subscribe body was ' + JSON.stringify(post));
+    const stub = await page.evaluate(() => window.__push);
+    if (stub.subscribeOptions.userVisibleOnly !== true) throw new Error('userVisibleOnly not true');
+    if (JSON.stringify(stub.subscribeOptions.key) !== JSON.stringify([...PUSH_KEY_BYTES])) throw new Error('applicationServerKey is not the bridge key');
+    if (JSON.stringify(stub.registered) !== JSON.stringify(['/app/sw.js', '/app/'])) throw new Error('registered ' + JSON.stringify(stub.registered));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// A blocked permission: the tap sends nothing, the row stays off, the reason shows.
+async function testPushDeniedStaysOff(browser, site) {
+  site.state.push = 'on';
+  const ws = await startWsServer();
+  site.ws = ws;
+  const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'default', answer: 'denied' } });
+  try {
+    await openSettings(page);
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'notify this device: off');
+    await page.waitForFunction((s) => document.body.innerText.includes(s), PUSH_BLOCKED, { timeout: TIMEOUT });
+    await waitForProbe(site, 0);
+    if (site.state.pushPosts.length !== 0) throw new Error('a denied permission posted a subscription');
+    const text = await page.evaluate(() => document.body.innerText);
+    if (!text.includes('notify this device: off')) throw new Error('row left off was not shown');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// A subscription that already exists shows on at load (from getSubscription);
+// a second tap unsubscribes the browser and DELETEs the endpoint.
+async function testPushSecondTapUnsubscribes(browser, site) {
+  site.state.push = 'on';
+  const ws = await startWsServer();
+  site.ws = ws;
+  const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'granted', subscribed: true } });
+  try {
+    await openSettings(page);
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'notify this device: on');
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
+    const stub = await page.evaluate(() => window.__push);
+    if (stub.unsubscribed !== 1) throw new Error('unsubscribe calls: ' + stub.unsubscribed);
+    if (site.state.pushDeletes.length !== 1 || site.state.pushDeletes[0].endpoint !== PUSH_ENDPOINT || Object.keys(site.state.pushDeletes[0]).length !== 1) {
+      throw new Error('DELETE body was ' + JSON.stringify(site.state.pushDeletes));
+    }
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// A viewer invite: the key route refuses it (403), so the row is hidden. The
+// 403 is the page's own probe, so that one console line is expected here.
+async function testPushViewerInviteHidden(browser, site) {
+  site.state.push = 'on';
+  const ws = await startWsServer();
+  site.ws = ws;
+  const { context, page, errors } = await openPushPage(browser, site, { cookie: false, query: '&invite=viewer-token' });
+  try {
+    await openSettings(page);
+    await waitForProbe(site);
+    const text = await page.evaluate(() => document.body.innerText);
+    if (text.includes('notify this device')) throw new Error('row shown to a viewer');
+    if (site.state.pushKeyRequests[0] !== 'viewer-token') throw new Error('probe did not carry the invite');
+    const unexpected = errors.filter((e) => !e.includes('status of 403'));
+    if (unexpected.length) throw new Error('page errors: ' + unexpected.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// An approver invite: the row shows, and a tap posts the invite with the keys.
+async function testPushApproverInvite(browser, site) {
+  site.state.push = 'on';
+  const ws = await startWsServer();
+  site.ws = ws;
+  const { context, page, errors } = await openPushPage(browser, site, { cookie: false, query: '&invite=approver-token', push: { permission: 'granted' } });
+  try {
+    await openSettings(page);
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'notify this device: off');
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
+    const post = site.state.pushPosts[0];
+    if (!sameBody(post, expectedBody({ invite: 'approver-token' }))) throw new Error('approver body was ' + JSON.stringify(post));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// An iPhone tab without push: the row shows unavailable with the Home Screen hint.
+async function testPushIosTabHint(browser, site) {
+  site.state.push = 'on';
+  const ws = await startWsServer();
+  site.ws = ws;
+  const { context, page, errors } = await openPushPage(browser, site, { push: { noPush: true, ios: true } });
+  try {
+    await openSettings(page);
+    await page.waitForFunction(() => document.body.innerText.includes('notify this device: unavailable'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('add this page to the Home Screen first'), null, { timeout: TIMEOUT });
+    if (site.state.pushPosts.length !== 0) throw new Error('an unavailable row posted');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
 }
 
 async function testDemo(browser, base) {
@@ -1193,6 +1450,20 @@ async function testAttachSendsOneImage(browser, base) {
     ['(d1b) "!!ls" sends a private shell frame (no submit)', () => testBangBangPrivate(browser, base)],
     ['(h) attach control: one image with the submit, then its chip goes', () => testAttachSendsOneImage(browser, base)],
     ['(i) Esc on an idle composer clears the typed text, sends nothing', () => testEscClearsDraft(browser, base)],
+    ['(w1) push row hidden where the key route answers 503', async () => {
+      const s = await portalSite('on'); try { await testPushHiddenOn503(browser, s); } finally { s.close(); } }],
+    ['(w2) push row off on a new device; a tap subscribes and posts the exact body', async () => {
+      const s = await portalSite('on'); try { await testPushTapSubscribes(browser, s); } finally { s.close(); } }],
+    ['(w3) push: a denied permission leaves the row off and names the reason', async () => {
+      const s = await portalSite('on'); try { await testPushDeniedStaysOff(browser, s); } finally { s.close(); } }],
+    ['(w4) push: an existing subscription shows on; a second tap unsubscribes and DELETEs', async () => {
+      const s = await portalSite('on'); try { await testPushSecondTapUnsubscribes(browser, s); } finally { s.close(); } }],
+    ['(w5) push: a viewer invite hides the row', async () => {
+      const s = await portalSite('on'); try { await testPushViewerInviteHidden(browser, s); } finally { s.close(); } }],
+    ['(w6) push: an approver invite subscribes with its invite', async () => {
+      const s = await portalSite('on'); try { await testPushApproverInvite(browser, s); } finally { s.close(); } }],
+    ['(w7) push: an iPhone tab without push shows unavailable with the Home Screen hint', async () => {
+      const s = await portalSite('on'); try { await testPushIosTabHint(browser, s); } finally { s.close(); } }],
   ];
   more.push(...portal);
   for (const [name, run] of more) {

@@ -143,6 +143,9 @@ pub enum UiAction {
     CreateInvite(String),
     RevokeInvite(String),
     CopyInvite(String),
+    /// Settings web push (web): subscribe this device when it is off, or
+    /// unsubscribe it when it is on. The page decides which from its state.
+    TogglePush,
     /// `!command` (shared: the output may reach the model) and `!!command`
     /// (private: shown, never sent to the model). The core's `shell` and
     /// `shell_private`; a bare `!` gives the core's usage refusal.
@@ -271,6 +274,7 @@ impl UiAction {
                 | UiAction::CreateInvite(_)
                 | UiAction::RevokeInvite(_)
                 | UiAction::CopyInvite(_)
+                | UiAction::TogglePush
         )
     }
 }
@@ -1653,6 +1657,12 @@ impl Host {
 
     pub fn set_share_note(&mut self, note: Option<String>) {
         self.nav.set_share_note(note);
+        self.notify();
+    }
+
+    /// The Settings web push row (web host): `None` hides it.
+    pub fn set_push(&mut self, row: Option<crate::push::PushView>) {
+        self.nav.set_push(row);
         self.notify();
     }
 

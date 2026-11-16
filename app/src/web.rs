@@ -11,7 +11,9 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use modron_mobile_core::view::{invite_row, COPIED_LABEL};
+use modron_mobile_core::view::{
+    invite_row, COPIED_LABEL, PUSH_BLOCKED_LABEL, PUSH_FAILED_LABEL, PUSH_NOT_ALLOWED_LABEL,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -21,6 +23,7 @@ use crate::{
     demo::Player,
     nav::{InviteLine, Screen},
     portal::{self, Mode},
+    push::{self, Permission},
     session::{Driver, Live, LiveOptions, TICK},
 };
 
@@ -41,6 +44,11 @@ enum Reply {
     Created(u16, String),
     Changed,
     Copied,
+    /// The page's push facts at load (see `probe_push`).
+    PushProbe(Probe),
+    /// A Settings push tap finished: the endpoint now subscribed (None when
+    /// off), or the shared reason it did not change.
+    PushDone(Result<Option<String>, &'static str>),
 }
 
 /// The two feeds the page's timer advances, and the portal's states.
@@ -68,6 +76,7 @@ struct Web {
     feed: Feed,
     replies: UnboundedReceiver<Reply>,
     reply_tx: UnboundedSender<Reply>,
+    push: PushState,
 }
 
 fn now() -> f64 {
@@ -164,6 +173,24 @@ impl Web {
             }
             Reply::Changed => self.list_invites(),
             Reply::Copied => self.host.set_share_note(Some(COPIED_LABEL.to_string())),
+            Reply::PushProbe(probe) => {
+                self.push.key_status = probe.key_status;
+                self.push.key = probe.key;
+                self.push.endpoint = probe.endpoint;
+                self.push.browser = Some(probe.browser);
+                self.refresh_push();
+            }
+            Reply::PushDone(result) => {
+                self.push.busy = false;
+                match result {
+                    Ok(endpoint) => {
+                        self.push.endpoint = endpoint;
+                        self.push.error = None;
+                    }
+                    Err(reason) => self.push.error = Some(reason.to_string()),
+                }
+                self.refresh_push();
+            }
         }
     }
 
@@ -243,9 +270,268 @@ impl Web {
                 request("DELETE", url, None, tx, |_, _| Reply::Changed);
             }
             UiAction::CopyInvite(url) => copy_text(url, tx),
+            UiAction::TogglePush => self.toggle_push(),
             _ => {}
         }
     }
+}
+
+impl Web {
+    /// The Settings push row's facts, once the probe has answered.
+    fn push_facts(&self) -> Option<push::Facts> {
+        let browser = self.push.browser?;
+        Some(push::Facts {
+            key_status: self.push.key_status,
+            role: push::role_of(self.push.key_status, self.push.invite.is_some()),
+            supported: browser.supported,
+            ios_tab: browser.ios_tab,
+            permission: browser.permission,
+            subscribed: self.push.endpoint.is_some(),
+        })
+    }
+
+    /// Sends the row to the host (`None` hides it).
+    fn refresh_push(&mut self) {
+        let row =
+            self.push_facts().and_then(|facts| push::view(&facts, self.push.error.as_deref()));
+        self.host.set_push(row);
+    }
+
+    /// A tap on the row: subscribe when it is off, unsubscribe when it is on.
+    /// One at a time; any other tap (hidden, unavailable, busy) does nothing.
+    fn toggle_push(&mut self) {
+        if self.push.busy {
+            return;
+        }
+        let Some(facts) = self.push_facts() else { return };
+        let tx = self.reply_tx.clone();
+        let invite = self.push.invite.clone();
+        match (push::row_state(&facts), self.push.endpoint.clone(), self.push.key.clone()) {
+            (push::RowState::On, Some(endpoint), _) => spawn_local(async move {
+                let _ = tx.send(Reply::PushDone(push_off(endpoint, invite).await));
+            }),
+            (push::RowState::Off, _, Some(key)) => spawn_local(async move {
+                let _ = tx.send(Reply::PushDone(push_on(key, invite).await));
+            }),
+            _ => return,
+        }
+        self.push.busy = true;
+        self.push.error = None;
+        self.refresh_push();
+    }
+}
+
+/// The page's push state (the Settings row). The browser's own subscription
+/// is the source of truth for `endpoint`; this copy is what the row shows.
+#[derive(Default)]
+struct PushState {
+    /// `GET /api/push/key`: 200 when the page may subscribe, else the status.
+    key_status: Option<u16>,
+    /// The VAPID public key (base64url) from that answer.
+    key: Option<String>,
+    browser: Option<Browser>,
+    /// The endpoint of this device's subscription, when there is one.
+    endpoint: Option<String>,
+    /// The last tap's shared reason, shown until the next tap.
+    error: Option<String>,
+    /// A tap is in flight; further taps wait for its answer.
+    busy: bool,
+    /// The invite the page was opened with (`?invite=`), if any.
+    invite: Option<String>,
+}
+
+/// What the browser offers for push, read at load.
+#[derive(Clone, Copy)]
+struct Browser {
+    /// `navigator.serviceWorker` and `PushManager` both exist.
+    supported: bool,
+    /// iOS outside a Home Screen web app.
+    ios_tab: bool,
+    permission: Permission,
+}
+
+/// The load-time answers: the key route's status, the key, the browser, and
+/// this device's existing subscription endpoint.
+struct Probe {
+    key_status: Option<u16>,
+    key: Option<String>,
+    browser: Browser,
+    endpoint: Option<String>,
+}
+
+/// The browser's push support, permission and iOS tab state (no requests).
+fn browser_push() -> Browser {
+    let navigator = navigator_value().unwrap_or(JsValue::UNDEFINED);
+    let window = window_value().unwrap_or(JsValue::UNDEFINED);
+    let present = |target: &JsValue, name: &str| {
+        field(target, name).map(|v| !v.is_undefined() && !v.is_null()).unwrap_or(false)
+    };
+    let supported = present(&navigator, "serviceWorker") && present(&window, "PushManager");
+    let user_agent =
+        field(&navigator, "userAgent").ok().and_then(|v| v.as_string()).unwrap_or_default();
+    let standalone = field(&navigator, "standalone").ok().and_then(|v| v.as_bool()) == Some(true);
+    let permission = field(&window, "Notification")
+        .and_then(|notification| field(&notification, "permission"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .map(|text| Permission::parse(&text))
+        .unwrap_or(Permission::Default);
+    Browser { supported, ios_tab: push::is_ios(&user_agent) && !standalone, permission }
+}
+
+/// The load-time probe: `GET /api/push/key` (with the page's invite, if any),
+/// then, when the key is there, this device's existing subscription. Sends
+/// nothing and changes nothing.
+async fn probe_push(browser: Browser, invite: Option<String>) -> Probe {
+    let query = invite.map(|i| format!("?invite={i}")).unwrap_or_default();
+    let (status, body) =
+        fetch("GET", &format!("/api/push/key{query}"), None).await.unwrap_or((0, String::new()));
+    let key = (status == 200)
+        .then(|| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .flatten()
+        .and_then(|v| v["key"].as_str().map(str::to_string));
+    let key_status = (status != 0 && (status != 200 || key.is_some())).then_some(status);
+    let endpoint = if key_status == Some(200) && browser.supported {
+        current_subscription()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|sub| field(&sub, "endpoint").ok())
+            .and_then(|v| v.as_string())
+    } else {
+        None
+    };
+    Probe { key_status, key, browser, endpoint }
+}
+
+/// Subscribes this device: register `/app/sw.js` (scope `/app/`), ask for
+/// permission, subscribe with the bridge's key, then POST the subscription.
+/// A refused POST unsubscribes the browser again, so the two stay in step.
+async fn push_on(key: String, invite: Option<String>) -> Result<Option<String>, &'static str> {
+    let failed = |_: JsValue| PUSH_FAILED_LABEL;
+    let registration = register_worker().await.map_err(failed)?;
+    match ask_permission().await.map_err(failed)? {
+        Permission::Granted => {}
+        Permission::Denied => return Err(PUSH_BLOCKED_LABEL),
+        Permission::Default => return Err(PUSH_NOT_ALLOWED_LABEL),
+    }
+    let manager = field(&registration, "pushManager").map_err(failed)?;
+    let options = js_sys::Object::new();
+    set(&options, "userVisibleOnly", &JsValue::TRUE).map_err(failed)?;
+    let key_bytes = push::b64url_decode(&key).ok_or(PUSH_FAILED_LABEL)?;
+    set(&options, "applicationServerKey", &js_sys::Uint8Array::from(key_bytes.as_slice()).into())
+        .map_err(failed)?;
+    let sub = settle(call(&manager, "subscribe", &[options.into()]).map_err(failed)?)
+        .await
+        .map_err(failed)?;
+    let endpoint = field(&sub, "endpoint").map_err(failed)?.as_string().ok_or(PUSH_FAILED_LABEL)?;
+    let p256dh = key_text(&sub, "p256dh").map_err(failed)?;
+    let auth = key_text(&sub, "auth").map_err(failed)?;
+    let body = push::subscribe_body(&endpoint, &p256dh, &auth, invite.as_deref());
+    let (status, _) = fetch("POST", "/api/push/subscribe", Some(body)).await.map_err(failed)?;
+    if status != 204 {
+        if let Ok(done) = call(&sub, "unsubscribe", &[]) {
+            let _ = settle(done).await;
+        }
+        return Err(PUSH_FAILED_LABEL);
+    }
+    Ok(Some(endpoint))
+}
+
+/// Unsubscribes this device (`subscription.unsubscribe()`), then DELETEs the
+/// endpoint from the bridge. A failed DELETE leaves the row on, so a second
+/// tap retries the DELETE.
+async fn push_off(
+    endpoint: String,
+    invite: Option<String>,
+) -> Result<Option<String>, &'static str> {
+    let failed = |_: JsValue| PUSH_FAILED_LABEL;
+    if let Some(sub) = current_subscription().await.map_err(failed)? {
+        settle(call(&sub, "unsubscribe", &[]).map_err(failed)?).await.map_err(failed)?;
+    }
+    let body = push::unsubscribe_body(&endpoint, invite.as_deref());
+    let (status, _) = fetch("DELETE", "/api/push/subscribe", Some(body)).await.map_err(failed)?;
+    if status == 204 {
+        Ok(None)
+    } else {
+        Err(PUSH_FAILED_LABEL)
+    }
+}
+
+/// The page's registration of `/app/sw.js` at scope `/app/`.
+async fn register_worker() -> Result<JsValue, JsValue> {
+    let options = js_sys::Object::new();
+    set(&options, "scope", &JsValue::from_str("/app/"))?;
+    settle(call(
+        &service_worker()?,
+        "register",
+        &[JsValue::from_str("/app/sw.js"), options.into()],
+    )?)
+    .await
+}
+
+/// This device's subscription for the `/app/` scope, if there is one.
+async fn current_subscription() -> Result<Option<JsValue>, JsValue> {
+    let registration =
+        settle(call(&service_worker()?, "getRegistration", &[JsValue::from_str("/app/")])?).await?;
+    if registration.is_null() || registration.is_undefined() {
+        return Ok(None);
+    }
+    let manager = field(&registration, "pushManager")?;
+    let sub = settle(call(&manager, "getSubscription", &[])?).await?;
+    Ok((!sub.is_null() && !sub.is_undefined()).then_some(sub))
+}
+
+/// `Notification.requestPermission()`: the browser's answer.
+async fn ask_permission() -> Result<Permission, JsValue> {
+    let notification = field(&window_value()?, "Notification")?;
+    let answer = settle(call(&notification, "requestPermission", &[])?).await?;
+    Ok(Permission::parse(&answer.as_string().unwrap_or_default()))
+}
+
+/// One subscription key (`p256dh` or `auth`) as unpadded base64url.
+fn key_text(sub: &JsValue, name: &str) -> Result<String, JsValue> {
+    let buffer = call(sub, "getKey", &[JsValue::from_str(name)])?;
+    if buffer.is_null() || buffer.is_undefined() {
+        return Err(JsValue::NULL);
+    }
+    Ok(push::b64url_encode(&js_sys::Uint8Array::new(&buffer).to_vec()))
+}
+
+fn window_value() -> Result<JsValue, JsValue> {
+    Ok(web_sys::window().ok_or(JsValue::NULL)?.into())
+}
+
+fn navigator_value() -> Result<JsValue, JsValue> {
+    Ok(web_sys::window().ok_or(JsValue::NULL)?.navigator().into())
+}
+
+fn service_worker() -> Result<JsValue, JsValue> {
+    field(&navigator_value()?, "serviceWorker")
+}
+
+/// A property of a JS value (`Reflect.get`), by name.
+fn field(target: &JsValue, name: &str) -> Result<JsValue, JsValue> {
+    js_sys::Reflect::get(target, &JsValue::from_str(name))
+}
+
+fn set(target: &JsValue, name: &str, value: &JsValue) -> Result<bool, JsValue> {
+    js_sys::Reflect::set(target, &JsValue::from_str(name), value)
+}
+
+/// A method call on a JS value, with `target` as `this`.
+fn call(target: &JsValue, name: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    let function: js_sys::Function = field(target, name)?.dyn_into()?;
+    let list = js_sys::Array::new();
+    for arg in args {
+        list.push(arg);
+    }
+    function.apply(target, &list)
+}
+
+/// Waits for a promise (or passes a plain value through as a resolved one).
+async fn settle(value: JsValue) -> Result<JsValue, JsValue> {
+    JsFuture::from(js_sys::Promise::resolve(&value)).await
 }
 
 /// One same-origin request with the page's cookies. The answer (or a
@@ -334,6 +620,16 @@ pub fn start() -> Client {
     host.restore_theme(crate::theme::saved_installed());
     let (reply_tx, replies) = unbounded_channel();
     let query = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
+    // The Settings push row: probed only where the browser could show it.
+    let invite = push::invite_from_query(&query);
+    let browser = browser_push();
+    if browser.supported || browser.ios_tab {
+        let tx = reply_tx.clone();
+        let probe_invite = invite.clone();
+        spawn_local(async move {
+            let _ = tx.send(Reply::PushProbe(probe_push(browser, probe_invite).await));
+        });
+    }
     let feed = match LiveOptions::from_query(&query) {
         Ok(Some(options)) => {
             let (live, actions, out) = Live::channels();
@@ -351,7 +647,8 @@ pub fn start() -> Client {
             Feed::Demo { player: Player::default(), started: now() }
         }
     };
-    let web = Rc::new(RefCell::new(Web { host, feed, replies, reply_tx }));
+    let push = PushState { invite, ..PushState::default() };
+    let web = Rc::new(RefCell::new(Web { host, feed, replies, reply_tx, push }));
     listen_keys(web.clone());
     listen_scroll(web.clone());
     if let Some(window) = web_sys::window() {

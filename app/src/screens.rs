@@ -696,10 +696,46 @@ fn settings_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> im
             move || setting_row(nav, i, actions.clone()),
         ));
     }
-    column.child(when(
-        move || nav.with(|n| n.share.is_some()),
-        move || share_section(nav, actions.clone()),
-    ))
+    let push_actions = actions.clone();
+    column
+        .child(when(
+            move || WEB_CONTROLS && nav.with(|n| n.push.is_some()),
+            move || push_row(nav, push_actions.clone()),
+        ))
+        .child(when(
+            move || nav.with(|n| n.share.is_some()),
+            move || share_section(nav, actions.clone()),
+        ))
+}
+
+/// The web push row (web only): `notify this device: on|off|unavailable`. A
+/// tap on an off or on row sends the toggle; the iOS hint and the last
+/// refusal sit under it, muted.
+fn push_row(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let line = move || nav.with(|n| n.push.as_ref().map(|p| p.line.clone()).unwrap_or_default());
+    let label = view()
+        .role(AccessibilityRole::Button)
+        .on_press(move || {
+            if nav.with(|n| n.push.as_ref().is_some_and(|p| p.tappable)) {
+                let _ = actions.send(UiAction::TogglePush);
+            }
+        })
+        .child(text(line).text_color(move || token_ink(style_token(Style::Plain))));
+    let hint =
+        move || nav.with(|n| n.push.as_ref().and_then(|p| p.hint.clone()).unwrap_or_default());
+    let note =
+        move || nav.with(|n| n.push.as_ref().and_then(|p| p.note.clone()).unwrap_or_default());
+    view()
+        .flex_col()
+        .child(label)
+        .child(when(
+            move || nav.with(|n| n.push.as_ref().is_some_and(|p| p.hint.is_some())),
+            move || text(hint).text_color(muted()),
+        ))
+        .child(when(
+            move || nav.with(|n| n.push.as_ref().is_some_and(|p| p.note.is_some())),
+            move || text(note).text_color(muted()),
+        ))
 }
 
 /// One settings row: `label: value`. On the web a tap on the label sends the
