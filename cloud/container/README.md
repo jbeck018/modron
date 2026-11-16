@@ -83,8 +83,9 @@ Actions > "Cloud container deploy" > Run workflow. Inputs:
 - `environment`: default `preview`. Deploys the Worker `modron-container-<environment>`.
 - `confirm`: must be exactly `deploy`.
 
-The run builds the image from the repo root as a gate, runs `wrangler deploy`
-in `cloud/container`, and sets `WAKE_TOKEN`. Nothing runs on push.
+The run builds the server binary, copies it to `cloud/container/.build/`,
+runs `wrangler deploy` in `cloud/container` (which builds the image there),
+and sets `WAKE_TOKEN`. Nothing runs on push.
 
 ## What gets created in the Cloudflare account
 
@@ -117,10 +118,8 @@ with the Worker.
 - **A running container keeps its first environment.** A wake for a running
   run does not restart it with a new git token; re-issuing a token takes a
   stop then a wake.
-- **No tunnel reconnect.** The tunnel opened at start is not redialled after a
-  network drop, so restart the run (stop, then wake) to reopen it.
-- **Build context unverified.** The Dockerfile copies from the repo root, but
-  `image: ./Dockerfile` in `wrangler.jsonc` may use `cloud/container/` as the
-  context. The CI gate builds from the root, so Dockerfile errors show up there.
+- **Image build context.** The image is built from `cloud/container/` and
+  copies a prebuilt binary; build it on Ubuntu 24.04 (same glibc as the base
+  image). The image build was verified locally; the Cloudflare deploy was not.
 - **Workspace coupling.** The image builds `modron-cli` and runs `modron serve`.
   It does not build the terminal app (`modron-app-tui`), which it does not need.
