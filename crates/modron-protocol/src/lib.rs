@@ -651,6 +651,13 @@ pub struct ConfigPatch {
     /// `effort` when both are sent. Absent or false leaves it alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clear_effort: bool,
+    /// Ask supporting providers for a readable reasoning summary on future
+    /// turns (H7b). Absent leaves it alone; `false` turns it off. Display
+    /// only: it does not change billing. Echoed in `ConfigChanged`.
+    /// UI effect: none on the status surface; clients still gate the
+    /// reasoning DISPLAY on their own opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<bool>,
     /// The named model roles for future turns (H7c: `plan`, `subagent`,
     /// `critic`, `summary`). Present REPLACES the whole set; an all-unset
     /// value clears it. Absent leaves the roles alone. Echoed in
@@ -872,6 +879,11 @@ pub struct LiveState {
     /// and no label. Older peers omit it and still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// Whether future turns ask for a reasoning summary (H7b). Omitted when
+    /// off; older peers omit it and still parse. UI effect: none on the
+    /// status surface.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_summary: bool,
     /// The named model roles in force (H7c). UI effect: the settings list
     /// shows each role and its model id, unset roles as `router`. Omitted
     /// when every role is unset; older peers omit it and still parse.
@@ -2628,6 +2640,37 @@ mod tests {
         let old: ConfigPatch = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
         assert_eq!(old.effort, None);
         assert!(!old.clear_effort);
+    }
+
+    /// H7b: the reasoning-summary opt-in stays off the wire when unset and
+    /// round-trips when set; an older peer's JSON still parses.
+    #[test]
+    fn reasoning_summary_fields_round_trip_and_stay_optional_on_the_wire() {
+        let on = ConfigPatch {
+            reasoning_summary: Some(true),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["reasoning_summary"], true);
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back, on);
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(unset.get("reasoning_summary").is_none());
+        let old: ConfigPatch = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+        assert_eq!(old.reasoning_summary, None);
+
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("reasoning_summary").is_none(), "false is omitted");
+        let live = LiveState {
+            reasoning_summary: true,
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["reasoning_summary"], true);
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert!(back.reasoning_summary);
+        let old: LiveState = serde_json::from_value(serde_json::json!({"running": false})).unwrap();
+        assert!(!old.reasoning_summary);
     }
 
     #[test]

@@ -1264,6 +1264,9 @@ fn build_agent_with(
         // here, so a bad value stops startup on every run path.
         effort: config::resolve_effort(cli.effort.as_deref(), cfg.effort.as_deref())
             .map_err(anyhow::Error::msg)?,
+        // H7b: config `reasoning_summary` (default off); a session's
+        // ConfigPatch can change it later for future turns.
+        reasoning_summary: cfg.reasoning_summary,
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),

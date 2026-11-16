@@ -759,10 +759,16 @@ fn build_body_inner(req: &TurnRequest) -> Value {
         }
         body["tools"] = Value::Array(tools);
     }
+    // Reasoning summary (H7b): only when the caller opted in AND the model
+    // accepts adaptive thinking with `display: "summarized"`. Every other
+    // request keeps no `thinking` field at all (older models use a
+    // `budget_tokens` form this code never sends).
+    if req.reasoning_summary && summarized_thinking_supported(&req.model) {
+        body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+    }
     // Reasoning effort (H7a): the GA `output_config.effort` field, merged
     // into `output_config` when another feature already set one. No beta
-    // header and no `thinking` change; absent when the provider default
-    // applies.
+    // header; absent when the provider default applies.
     if let Some(effort) = req.effort {
         if !body["output_config"].is_object() {
             body["output_config"] = json!({});
@@ -770,6 +776,38 @@ fn build_body_inner(req: &TurnRequest) -> Value {
         body["output_config"]["effort"] = json!(effort.label());
     }
     body
+}
+
+/// Model-id prefixes that accept `thinking: {type: "adaptive", display:
+/// "summarized"}` (H7b). Matched on the id after an optional provider
+/// namespace (`anthropic.` or `anthropic/`); a prefix matches the id itself
+/// or the id followed by `-`, so `claude-opus-4-6` does not match
+/// `claude-opus-4-60`. Anything absent here (Haiku 4.5, Sonnet 4.5, Opus 4.5
+/// and earlier, unknown or non-Claude ids) gets no `thinking` field.
+const SUMMARIZED_THINKING_PREFIXES: &[&str] = &[
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-5",
+];
+
+/// True when `model` is one of the documented ids in
+/// [`SUMMARIZED_THINKING_PREFIXES`] (H7b), with or without a provider
+/// namespace prefix.
+pub fn summarized_thinking_supported(model: &str) -> bool {
+    let bare = model
+        .strip_prefix("anthropic.")
+        .or_else(|| model.strip_prefix("anthropic/"))
+        .unwrap_or(model);
+    SUMMARIZED_THINKING_PREFIXES.iter().any(|prefix| {
+        bare.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+    })
 }
 
 /// Parse a `/v1/messages` response body into a [`TurnResponse`].
@@ -1010,6 +1048,7 @@ mod tests {
             }],
             max_tokens: 8192,
             effort: None,
+            reasoning_summary: false,
         }
     }
 
@@ -1028,6 +1067,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: 128,
             effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -1054,6 +1094,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: 128,
             effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -1093,6 +1134,112 @@ mod tests {
             assert_eq!(body["output_config"], json!({ "effort": label }));
             assert!(body.get("thinking").is_none(), "no thinking field added");
             assert_eq!(body["max_tokens"], 8192, "rest of the body unchanged");
+        }
+    }
+
+    /// H7b: flag false = byte-identical body (no `thinking` key at all),
+    /// for a model that would otherwise be supported.
+    #[test]
+    fn reasoning_summary_false_leaves_the_body_unchanged() {
+        let mut req = sample_request();
+        req.model = "claude-opus-5-5".into();
+        req.reasoning_summary = false;
+        let off = build_body(&req);
+        assert!(off.get("thinking").is_none());
+        let baseline = {
+            let mut plain = sample_request();
+            plain.model = "claude-opus-5-5".into();
+            build_body(&plain)
+        };
+        assert_eq!(off, baseline);
+    }
+
+    /// H7b: flag true on a supported id = exact adaptive+summarized field.
+    #[test]
+    fn reasoning_summary_true_adds_adaptive_summarized_thinking() {
+        let mut req = sample_request();
+        req.model = "claude-opus-5-5".into();
+        req.reasoning_summary = true;
+        let body = build_body(&req);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert!(body.get("output_config").is_none(), "effort unset here");
+    }
+
+    /// H7b: the thinking field coexists with `output_config.effort`.
+    #[test]
+    fn reasoning_summary_coexists_with_output_config_effort() {
+        let mut req = sample_request();
+        req.model = "claude-sonnet-5-5".into();
+        req.reasoning_summary = true;
+        req.effort = Some(modron_core::Effort::High);
+        let body = build_body(&req);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+    }
+
+    /// H7b: the supported table, including namespaced ids, and the
+    /// negative cases that must send nothing.
+    #[test]
+    fn summarized_thinking_table_matches_the_documented_ids() {
+        for id in [
+            "claude-fable-5",
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-5-5",
+            "anthropic.claude-opus-5-5",
+            "anthropic/claude-sonnet-4-6",
+        ] {
+            assert!(
+                summarized_thinking_supported(id),
+                "{id} should be supported"
+            );
+        }
+        for id in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-60",
+            "claude-opus-4-6x",
+            "some-unknown-model",
+            "gpt-5",
+            "",
+        ] {
+            assert!(
+                !summarized_thinking_supported(id),
+                "{id} should not be supported"
+            );
+        }
+    }
+
+    /// H7b: unsupported ids get no `thinking` field even when opted in.
+    #[test]
+    fn reasoning_summary_adds_nothing_for_unsupported_models() {
+        for model in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "some-unknown-model",
+            "gpt-5",
+        ] {
+            let mut req = sample_request();
+            req.model = model.into();
+            req.reasoning_summary = true;
+            let body = build_body(&req);
+            assert!(body.get("thinking").is_none(), "{model} sends no thinking");
         }
     }
 
@@ -1206,6 +1353,7 @@ mod tests {
             tools: vec![],
             max_tokens: 16,
             effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         assert!(body.get("tools").is_none());
@@ -1237,6 +1385,7 @@ mod tests {
             tools: vec![],
             max_tokens: 16,
             effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         assert!(body.get("system").is_none());

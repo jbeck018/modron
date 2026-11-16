@@ -400,6 +400,7 @@ mod tests {
                     tools: vec![],
                     max_tokens: 16,
                     effort: None,
+                    reasoning_summary: false,
                 }),
                 tx,
             )
@@ -447,6 +448,7 @@ mod tests {
                     tools: vec![],
                     max_tokens: 16,
                     effort: None,
+                    reasoning_summary: false,
                 }),
                 tx,
             )
@@ -510,6 +512,7 @@ mod tests {
             tools: vec![],
             max_tokens: 16,
             effort: None,
+            reasoning_summary: false,
         })
     }
 
@@ -869,6 +872,7 @@ mod tests {
                 tools: vec![],
                 max_tokens: 16,
                 effort: None,
+                reasoning_summary: false,
             }))
             .await
             .unwrap();

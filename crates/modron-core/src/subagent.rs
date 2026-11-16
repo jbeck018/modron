@@ -858,6 +858,8 @@ pub(crate) fn child_config(
         // Sub-agents inherit the parent's reasoning effort (H7a); no
         // delegate or persona argument overrides it yet.
         effort: parent.effort,
+        // Sub-agents inherit the reasoning-summary opt-in too.
+        reasoning_summary: parent.reasoning_summary,
         ..EngineConfig::default()
     }
 }
@@ -970,6 +972,16 @@ mod tests {
         assert_eq!(child.effort, Some(crate::Effort::Low));
         parent.effort = None;
         assert_eq!(child_config(&parent, None, None, 1_000, None).effort, None);
+    }
+
+    /// H7b: a sub-agent inherits the parent's reasoning-summary opt-in.
+    #[test]
+    fn child_inherits_the_parent_reasoning_summary() {
+        let mut parent = strict_parent_config();
+        parent.reasoning_summary = true;
+        assert!(child_config(&parent, None, None, 1_000, None).reasoning_summary);
+        parent.reasoning_summary = false;
+        assert!(!child_config(&parent, None, None, 1_000, None).reasoning_summary);
     }
 
     fn strict_parent_config() -> EngineConfig {

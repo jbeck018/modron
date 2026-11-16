@@ -1232,6 +1232,7 @@ impl Engine {
                 tools: tool_specs.to_vec(),
                 max_tokens: MAX_OUTPUT_TOKENS,
                 effort: self.config.effort,
+                reasoning_summary: self.config.reasoning_summary,
             });
             tracing::info!(
                 turn = state.turns + 1,
@@ -2670,6 +2671,7 @@ impl Engine {
             // Reviewer stays on the provider default (H7a): an independent
             // check must not inherit the main run's thinking budget.
             effort: None,
+            reasoning_summary: false,
         });
         tracing::info!(provider = provider.id(), model = %model, "review turn: independent reviewer");
         let turn_started = std::time::Instant::now();
@@ -2871,6 +2873,7 @@ impl Engine {
             tools: Vec::new(),
             max_tokens: MAX_OUTPUT_TOKENS,
             effort: self.config.effort,
+            reasoning_summary: self.config.reasoning_summary,
         });
         tracing::info!(
             provider = provider.id(),
@@ -3088,6 +3091,7 @@ impl Engine {
             max_tokens: COMPACTION_MAX_OUTPUT_TOKENS,
             // Summarizer stays on the provider default (H7a).
             effort: None,
+            reasoning_summary: false,
         });
         tracing::info!(
             provider = provider.id(),

@@ -73,6 +73,7 @@ fn simple_request(model: &str) -> TurnRequest {
         }],
         max_tokens: 8192,
         effort: None,
+        reasoning_summary: false,
     }
 }
 

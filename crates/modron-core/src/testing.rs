@@ -331,6 +331,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             effort: None,
+            reasoning_summary: false,
         };
 
         assert_eq!(
@@ -371,6 +372,7 @@ mod tests {
                 tools: vec![],
                 max_tokens: 1,
                 effort: None,
+                reasoning_summary: false,
             }))
             .await
             .unwrap();

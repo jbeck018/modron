@@ -461,7 +461,7 @@ impl SessionHandle {
         // sandbox, phase and allow/deny lists (apply_config writes it, the
         // session's engine clone carries it). Copy them out and drop the
         // engine lock before taking the tracker lock.
-        let (approval_mode, sandbox, allow, deny, rules, phase, effort) = {
+        let (approval_mode, sandbox, allow, deny, rules, phase, effort, reasoning_summary) = {
             let engine = self.engine_cell();
             let config = &engine.config;
             let mode = match config.approvals.mode {
@@ -483,6 +483,7 @@ impl SessionHandle {
                     .collect::<Vec<_>>(),
                 Some(config.phase),
                 config.effort,
+                config.reasoning_summary,
             )
         };
         let tracker = lock(&self.tracker);
@@ -494,6 +495,7 @@ impl SessionHandle {
             rules,
             phase,
             effort,
+            reasoning_summary,
             roles: self.engine_cell().config.roles.clone(),
             plan_pending: self.plan_pending.load(Ordering::Relaxed),
             running: self.busy.load(Ordering::Relaxed),
@@ -1251,6 +1253,10 @@ impl SessionHandle {
             config.effort = None;
         } else if let Some(effort) = patch.effort {
             config.effort = Some(effort);
+        }
+        // H7b: the reasoning-summary opt-in for future turns (absent = alone).
+        if let Some(on) = patch.reasoning_summary {
+            config.reasoning_summary = on;
         }
         // H7c: a roles patch replaces the whole set (all-unset clears it).
         if let Some(roles) = &patch.roles {
@@ -2572,6 +2578,39 @@ mod tests {
     /// H7a: an effort patch reaches the engine config (future turns) and the
     /// live state; `clear_effort` returns it to the provider default; a patch
     /// without effort fields leaves it alone.
+    /// H7b: a reasoning-summary patch reaches the engine config (future
+    /// turns) and the live state; a patch without the field leaves it alone.
+    #[test]
+    fn reasoning_summary_patch_reaches_the_engine_config_and_live_state() {
+        use modron_core::Effort;
+        let hub = test_hub();
+        let handle = hub.ensure_session(SessionId::new_v4(), None);
+        assert!(!handle.engine_cell().config.reasoning_summary);
+        assert!(!handle.live_state().reasoning_summary);
+        handle
+            .apply_config(&ConfigPatch {
+                reasoning_summary: Some(true),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert!(handle.engine_cell().config.reasoning_summary);
+        assert!(handle.live_state().reasoning_summary);
+        handle
+            .apply_config(&ConfigPatch {
+                effort: Some(Effort::Low),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert!(handle.engine_cell().config.reasoning_summary, "untouched");
+        handle
+            .apply_config(&ConfigPatch {
+                reasoning_summary: Some(false),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert!(!handle.engine_cell().config.reasoning_summary);
+    }
+
     #[test]
     fn effort_patch_reaches_the_engine_config_and_live_state() {
         use modron_core::Effort;

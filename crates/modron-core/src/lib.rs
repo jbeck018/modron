@@ -263,6 +263,12 @@ pub struct TurnRequest {
     /// provider omits its effort field entirely in that case, so the request
     /// bytes match a build without the setting.
     pub effort: Option<Effort>,
+    /// Ask the provider for a readable reasoning summary (default `false`).
+    /// Only a provider that supports it acts on this (Anthropic, for the
+    /// models in its supported table); every other provider ignores it, and
+    /// `false` keeps the request bytes identical to a build without it.
+    /// Display visibility only: it does not change billing or behaviour.
+    pub reasoning_summary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -870,6 +876,12 @@ pub struct EngineConfig {
     /// Named model roles (H7c, additive; default empty = the router decides
     /// everything). See [`ModelRoles`] for each role's semantics.
     pub roles: ModelRoles,
+    /// Ask supporting providers for a readable reasoning summary on the
+    /// main, self-check and escalation turns (default `false`). Set from
+    /// config `reasoning_summary` and the session's `ConfigPatch`. Sub-agents
+    /// inherit it. Not sent on compaction, reviewer or router/judge requests.
+    /// Changes the displayed thinking only, never billing.
+    pub reasoning_summary: bool,
 }
 
 /// Per-tier ordered fallback candidates for [`EngineConfig::tier_fallbacks`].
@@ -943,6 +955,7 @@ impl Default for EngineConfig {
             phase: Phase::Build,
             effort: None,
             roles: ModelRoles::default(),
+            reasoning_summary: false,
         }
     }
 }
@@ -979,6 +992,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("personas", &self.personas.keys().collect::<Vec<_>>())
             .field("effort", &self.effort)
             .field("roles", &self.roles)
+            .field("reasoning_summary", &self.reasoning_summary)
             .field("tier_fallbacks", &self.tier_fallbacks.is_some())
             .field(
                 "background_subagents",

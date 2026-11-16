@@ -563,6 +563,7 @@ mod tests {
             }],
             max_tokens: 1024,
             effort: None,
+            reasoning_summary: false,
         }
     }
 

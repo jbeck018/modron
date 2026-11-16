@@ -645,6 +645,7 @@ mod tests {
             }],
             max_tokens: 8192,
             effort: None,
+            reasoning_summary: false,
         }
     }
 
@@ -663,6 +664,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: 128,
             effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -685,6 +687,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: 128,
             effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         assert_eq!(body["messages"][0]["content"], "plain");
@@ -758,6 +761,7 @@ mod tests {
             tools: vec![],
             max_tokens: 16,
             effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let messages = body["messages"].as_array().unwrap();

@@ -923,6 +923,16 @@ impl RemoteClient {
         })
     }
 
+    /// Ask the provider for a reasoning summary on future turns (H7b). This
+    /// is the request side only; the reasoning DISPLAY stays gated by
+    /// `set_show_reasoning`.
+    pub fn set_reasoning_summary(&self, enable: bool) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            reasoning_summary: Some(enable),
+            ..ConfigPatch::default()
+        })
+    }
+
     /// Switch the run phase for future runs (`plan` read-only, `build`).
     pub fn set_phase(&self, phase: Phase) -> Result<(), ClientError> {
         self.set_config(ConfigPatch {

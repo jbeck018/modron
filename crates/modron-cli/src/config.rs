@@ -45,6 +45,12 @@ pub struct Config {
     /// provider default. `--effort` overrides it.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Ask supporting providers for a readable reasoning summary (H7b).
+    /// Default `false`. Only Anthropic models in its supported table honour
+    /// it (adaptive thinking, `display: "summarized"`); it changes what the
+    /// reasoning display can show, not billing. See docs/CONFIG.md.
+    #[serde(default)]
+    pub reasoning_summary: bool,
     /// Fix rounds the reviewer may request per run (default 1).
     #[serde(default)]
     pub review_max_rounds: Option<u32>,
@@ -794,6 +800,15 @@ mod tests {
             "--effort wins over config"
         );
         assert_eq!(resolve_effort(None, None), Ok(None));
+    }
+
+    /// H7b: `reasoning_summary` loads as a bool and defaults to off.
+    #[test]
+    fn reasoning_summary_loads_from_the_file_and_defaults_off() {
+        let default: Config = toml::from_str("").unwrap();
+        assert!(!default.reasoning_summary);
+        let on: Config = toml::from_str("reasoning_summary = true").unwrap();
+        assert!(on.reasoning_summary);
     }
 
     #[test]
