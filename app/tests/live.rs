@@ -40,11 +40,13 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 static SERIAL: Mutex<()> = Mutex::new(());
 
 struct Harness {
-    _serial: MutexGuard<'static, ()>,
     view: AppView,
     term: Terminal<TestBackend>,
     host: Host,
     wake: mpsc::Receiver<()>,
+    // Last on purpose: fields drop in order, and the view (its engine
+    // thread) must be gone before the next test may take the lock.
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Harness {
@@ -883,10 +885,44 @@ fn agent_picker_asks_for_personas_and_enter_sends_the_chosen_one() {
     assert!(matches!(next_request(&mut h, &mut live, &reports), Payload::PersonasReq {}));
     h.wait_for("the persona rows", Some(&mut live), |s| s.contains("planner - plans the work"));
     h.send(key("ArrowDown"));
+    h.send(key("ArrowDown"));
     h.wait_for("the reviewer row selected", Some(&mut live), |s| s.contains("> reviewer"));
     h.send(key("Enter"));
     match next_request(&mut h, &mut live, &reports) {
         Payload::SetConfig { patch } => assert_eq!(patch.persona.as_deref(), Some("reviewer")),
+        other => panic!("expected set_config, got {other:?}"),
+    }
+}
+
+#[test]
+fn agent_picker_first_row_clears_the_persona_with_an_empty_name() {
+    let session = Uuid::new_v4();
+    let script = Script {
+        personas: Some(vec![PersonaWire {
+            name: "planner".into(),
+            model: None,
+            summary: "plans the work".into(),
+        }]),
+        ..Script::default()
+    };
+    let (url, reports) = start_server(session, script);
+    let mut live = session::spawn(LiveOptions {
+        url,
+        token: None,
+        session: Some(session),
+        ..Default::default()
+    })
+    .expect("spawn driver");
+    let mut h = Harness::new();
+    h.wait_for("streamed text", Some(&mut live), |s| s.contains("Migrating the router now"));
+    h.type_text("/agent");
+    h.wait_draft("/agent");
+    h.send(key("Enter"));
+    assert!(matches!(next_request(&mut h, &mut live, &reports), Payload::PersonasReq {}));
+    h.wait_for("the clear row", Some(&mut live), |s| s.contains("no persona"));
+    h.send(key("Enter"));
+    match next_request(&mut h, &mut live, &reports) {
+        Payload::SetConfig { patch } => assert_eq!(patch.persona.as_deref(), Some("")),
         other => panic!("expected set_config, got {other:?}"),
     }
 }

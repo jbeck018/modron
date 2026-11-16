@@ -351,6 +351,9 @@ pub struct SessionHandle {
     /// The persona last switched to (`/agent <name>`, a ConfigPatch
     /// `persona`); `None` until one is set on this server.
     persona: Mutex<Option<String>>,
+    /// The config the first persona switch replaced; `None` while no
+    /// persona is set. Restored by `persona: ""`.
+    persona_base: Mutex<Option<PersonaBase>>,
     /// This session's engine clone (sinks + adoption store wired in
     /// [`SessionHub::ensure_session`]). Mutex-guarded so a concurrent
     /// SetConfig can never interleave with a Submit cloning it.
@@ -375,6 +378,18 @@ pub struct SessionHandle {
     /// The armed scheduled wake (H5a), if any. Written under the seq lock
     /// together with its `WakeChanged` frame (see `arm_wake`).
     wake: Mutex<Option<ArmedWake>>,
+}
+
+/// What a session's config held before its first persona switch, so
+/// `persona: ""` can put it back exactly (the persona's system prompt, model,
+/// provider and the allow/deny entries it added).
+#[derive(Clone, Debug)]
+struct PersonaBase {
+    system: String,
+    model: String,
+    provider: String,
+    allow: Vec<String>,
+    deny: Vec<String>,
 }
 
 impl SessionHandle {
@@ -1272,7 +1287,23 @@ impl SessionHandle {
             // Parsed before commit: one bad entry rejects the whole patch.
             config.approvals.rules = parse_rule_set(rules).map_err(anyhow::Error::msg)?;
         }
-        if let Some(persona) = &patch.persona {
+        // Some(None) clears the saved base, Some(Some(base)) saves one; the
+        // commit below applies it with the rest of the patch.
+        let mut persona_base_commit: Option<Option<PersonaBase>> = None;
+        if patch.persona.as_deref() == Some("") {
+            // `persona: ""` clears the persona: the config the first switch
+            // replaced comes back. With no persona set this is a no-op.
+            if let Some(base) = lock(&self.persona_base).clone() {
+                config.system = base.system;
+                config.default_model = base.model.clone();
+                model_label = Some(base.model);
+                config.default_provider = base.provider.clone();
+                provider_label = Some(base.provider);
+                config.approvals.allow = base.allow;
+                config.approvals.deny = base.deny;
+            }
+            persona_base_commit = Some(None);
+        } else if let Some(persona) = &patch.persona {
             // The /agent pattern: system prompt + model/provider/allow/deny
             // follow the configured persona when set.
             let spec = config.personas.get(persona).cloned().ok_or_else(|| {
@@ -1290,6 +1321,17 @@ impl SessionHandle {
                     }
                 )
             })?;
+            // The first switch saves what it is about to replace; later
+            // switches keep that original base.
+            if lock(&self.persona_base).is_none() {
+                persona_base_commit = Some(Some(PersonaBase {
+                    system: config.system.clone(),
+                    model: config.default_model.clone(),
+                    provider: config.default_provider.clone(),
+                    allow: config.approvals.allow.clone(),
+                    deny: config.approvals.deny.clone(),
+                }));
+            }
             if let Some(system) = spec.system {
                 config.system = system;
             }
@@ -1320,8 +1362,16 @@ impl SessionHandle {
         if let Some(goal) = goal_label {
             *lock(&self.goal) = goal;
         }
+        if let Some(base) = persona_base_commit {
+            *lock(&self.persona_base) = base;
+        }
         if let Some(persona) = persona_label {
-            *lock(&self.persona) = Some(persona);
+            // The empty name clears the persona (see above).
+            *lock(&self.persona) = if persona.is_empty() {
+                None
+            } else {
+                Some(persona)
+            };
         }
         Ok(())
     }
@@ -1575,6 +1625,7 @@ impl SessionHub {
             provider: Mutex::new(engine.config.default_provider.clone()),
             goal: Mutex::new(String::new()),
             persona: Mutex::new(None),
+            persona_base: Mutex::new(None),
             engine: Mutex::new(engine),
             steer,
             queue: Mutex::new(VecDeque::new()),
@@ -2534,6 +2585,93 @@ mod tests {
             })
             .unwrap();
         assert_eq!(handle.live_state().persona.as_deref(), Some("reviewer"));
+    }
+
+    /// `persona: ""` clears the persona: with none set it is a no-op, and
+    /// after a switch the system prompt and allow/deny lists are the ones the
+    /// session had before (the persona's additions are gone). An unknown
+    /// non-empty name is still refused.
+    #[test]
+    fn clearing_the_persona_restores_the_session_config() {
+        use modron_core::PersonaSpec;
+        let hub = SessionHub::empty();
+        let mut personas = std::collections::BTreeMap::new();
+        personas.insert(
+            "reviewer".to_string(),
+            PersonaSpec {
+                system: Some("Review.".into()),
+                model: None,
+                provider: None,
+                allow: vec!["read".into()],
+                deny: vec!["bash".into()],
+            },
+        );
+        hub.set_engine(Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: Default::default(),
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::new(InMemoryStore::new()),
+            config: EngineConfig {
+                default_model: "mock-model".into(),
+                default_provider: "mock".into(),
+                system: "Default prompt.".into(),
+                personas,
+                ..EngineConfig::default()
+            },
+        });
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+
+        // No persona set: clearing succeeds and changes nothing.
+        handle
+            .apply_config(&ConfigPatch {
+                persona: Some(String::new()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.live_state().persona, None);
+        assert_eq!(handle.engine_cell().config.system, "Default prompt.");
+
+        handle
+            .apply_config(&ConfigPatch {
+                persona: Some("reviewer".into()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.engine_cell().config.system, "Review.");
+        assert!(handle
+            .engine_cell()
+            .config
+            .approvals
+            .allow
+            .contains(&"read".to_string()));
+
+        handle
+            .apply_config(&ConfigPatch {
+                persona: Some(String::new()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.live_state().persona, None);
+        let config = handle.engine_cell().config.clone();
+        assert_eq!(config.system, "Default prompt.");
+        assert!(config.approvals.allow.is_empty());
+        assert!(config.approvals.deny.is_empty());
+
+        // Clearing again is a no-op, and an unknown name is still refused.
+        handle
+            .apply_config(&ConfigPatch {
+                persona: Some(String::new()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert!(handle
+            .apply_config(&ConfigPatch {
+                persona: Some("ghost".into()),
+                ..ConfigPatch::default()
+            })
+            .is_err());
+        assert_eq!(handle.live_state().persona, None);
     }
 
     /// H7c: a roles patch replaces the engine's roles and reaches the live

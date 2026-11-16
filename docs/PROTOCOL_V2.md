@@ -219,6 +219,7 @@ marks the row whose name equals `LiveState.persona` as current. A persona is
 switched with `ConfigPatch.persona` (the `/agent` command); the server
 answers with `ConfigChanged` echoing it, and the snapshot's `persona` is
 the server's current value (absent until one is set on this server).
+An empty name (`persona: ""`) clears the persona: the session returns to the default prompt and lists, and with none set it is a no-op.
 
 Who may send it: local connections and the owner of a trusted
 remote-control tunnel, like `ModelsReq`. Approvers and viewers are refused

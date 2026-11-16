@@ -969,7 +969,7 @@ impl RemoteClient {
     }
 
     /// Persona switch (`--agent`, `/agent`). The server refuses a name that
-    /// is not configured.
+    /// is not configured; an empty name clears the persona (sent unchanged).
     pub fn set_persona(&self, persona: impl Into<String>) -> Result<(), ClientError> {
         self.set_config(ConfigPatch {
             persona: Some(persona.into()),

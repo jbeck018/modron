@@ -46,6 +46,25 @@ impl Conn {
     }
 }
 
+/// Dropping the closures does NOT unregister them: the browser would still
+/// call the freed handlers (a late `onclose` after `close()`, or
+/// `onerror`/`onclose` after a failed or timed-out connect) and
+/// wasm-bindgen throws "closure invoked recursively or after being
+/// dropped". Detach every handler first, then close a socket that is
+/// still connecting or open.
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.ws.set_onopen(None);
+        self.ws.set_onmessage(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        let state = self.ws.ready_state();
+        if state == web_sys::WebSocket::CONNECTING || state == web_sys::WebSocket::OPEN {
+            let _ = self.ws.close();
+        }
+    }
+}
+
 fn js_string(v: &JsValue) -> String {
     v.as_string().unwrap_or_else(|| "unknown error".into())
 }

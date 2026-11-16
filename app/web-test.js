@@ -1049,6 +1049,28 @@ async function testDeleteAfterConfirmation(browser, base) {
   }
 }
 
+// /agent's first row clears the persona: a tap sends set_config with an empty name.
+async function testPersonaClear(browser, base) {
+  const ws = await startWsServer({ personas: [{ name: 'reviewer', summary: 'reviews diffs' }] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/agent');
+    await page.waitForFunction(() => document.activeElement.value === '/agent', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    await waitFrame(ws, 'personas_req');
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'no persona', { timeout: TIMEOUT });
+    // The first row is selected, so its text carries the "> " marker: match it inexactly.
+    await page.getByText('no persona').first().click();
+    const cfg = await waitFrame(ws, 'set_config', (f) => f.patch && f.patch.persona === '');
+    if (cfg.patch.persona !== '') throw new Error('set_config did not carry an empty persona');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // The agent screen: a tap on the sub-agent row opens it; Enter steers; kill asks, then y.
 async function testAgentSteerAndKill(browser, base) {
   const agent = { id: 'agent-review', label: 'reviewer', turns: 2, tokens: 900, last_tool: 'read', done: null, state: 'running' };
@@ -1149,6 +1171,7 @@ async function testAttachSendsOneImage(browser, base) {
     ['(t) no page or console error for a few seconds and across a forced reconnect', () => testNoErrorsAcrossReconnect(browser, base)],
     ['(s) credentials: /auth opens it, OAuth sends auth_start, a typed key is sent once and leaves the page', () => testCredentialsScreen(browser, base)],
     ['(s2) agent picker: /agent lists the server personas, a tap sends set_config with the persona', () => testPersonaPicker(browser, base)],
+    ['(s2b) agent picker: the first row clears the persona with an empty set_config', () => testPersonaClear(browser, base)],
     ['(s3) credentials: remove on a signed-in row only, asks y / n, then sends auth_remove', () => testCredentialRemove(browser, base)],
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
     ['(q) shift+enter adds a line and does not submit', () => testShiftEnterNewline(browser, base)],

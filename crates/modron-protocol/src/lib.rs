@@ -540,7 +540,9 @@ pub enum Payload {
     /// picker replaces its list with `personas`, in the order given (the
     /// server sorts by name). The row whose name equals
     /// `LiveState.persona` is marked current. A persona is switched with
-    /// `set_config` (`ConfigPatch.persona`); `ConfigChanged` echoes it.
+    /// `set_config` (`ConfigPatch.persona`); `ConfigChanged` echoes it. An
+    /// empty name clears the persona (back to the default prompt and lists;
+    /// a no-op when none is set).
     /// Each row carries a one-line summary, never the full system prompt.
     Personas { personas: Vec<PersonaWire> },
     /// An informational toast/scrollback note (slash-command results).

@@ -270,9 +270,10 @@ pub const SETTING_DENY_LABEL: &str = "deny";
 /// The picker row shown when the server lists no personas (the shared word
 /// for an empty list, as the rules row uses).
 pub const PICKER_NONE_LABEL: &str = "none";
-/// The agent picker's note: there is no row that clears the persona, because
-/// the server refuses an empty persona name (app/src/nav.rs `picker_rows`).
-pub const PERSONA_CLEAR_NOTE: &str = "no clear row - the server refuses an empty persona name";
+/// The agent picker's first row: it clears the persona (`set_config` with an
+/// empty name), back to the default prompt. Marked current when no persona is
+/// set.
+pub const PERSONA_CLEAR_LABEL: &str = "no persona";
 /// The web control that removes the row it sits on.
 pub const REMOVE_LABEL: &str = "remove";
 
@@ -1192,6 +1193,10 @@ pub struct ViewModelSnapshot {
     /// session's persona ([`persona_row`]). Empty when none are configured.
     #[serde(default)]
     pub personas: Vec<PersonaRowView>,
+    /// The session's persona (`None` when none is set): the agent picker's
+    /// clear row is marked current then ([`PERSONA_CLEAR_LABEL`]).
+    #[serde(default)]
+    pub persona: Option<String>,
     /// The tasks screen rows: every task session in list order, each with
     /// its summary ([`TaskRowView`]).
     #[serde(default)]
@@ -1305,6 +1310,7 @@ impl ViewModelSnapshot {
                 .iter()
                 .map(|persona| persona_row(persona, vm.persona.as_deref()))
                 .collect(),
+            persona: vm.persona.clone(),
             task_rows: vm
                 .sessions
                 .iter()
@@ -2649,12 +2655,9 @@ mod task_copy_tests {
     }
 
     #[test]
-    fn the_persona_picker_says_it_cannot_clear_the_persona() {
-        assert_eq!(
-            PERSONA_CLEAR_NOTE,
-            "no clear row - the server refuses an empty persona name"
-        );
-        assert!(PERSONA_CLEAR_NOTE.is_ascii());
+    fn the_persona_picker_clears_with_the_shared_label() {
+        assert_eq!(PERSONA_CLEAR_LABEL, "no persona");
+        assert!(PERSONA_CLEAR_LABEL.is_ascii());
     }
 
     #[test]

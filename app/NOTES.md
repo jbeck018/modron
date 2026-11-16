@@ -252,5 +252,6 @@ the screen only when the host's actions are pumped (`Harness::action`), since
   appeared intermittently in the e2e viewers (T4 check once; S5 once, in
   viewerB, at approval resolution). Not reproduced by `web-test.js` (33/33 in
   three runs, no console errors). Not diagnosed.
-- Parallel chat tests were flaky until the single-thread config; the cause is
-  believed to be per-thread NSH state, not confirmed.
+- Parallel chat tests were flaky because the harness released its serial
+  lock before the view dropped (field order). Fixed; the single-thread pin
+  is gone. A few chat.rs unit tests still touch the globals without a lock.

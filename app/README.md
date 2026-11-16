@@ -247,9 +247,10 @@ The real server refuses browser Origins unless started with `--allow-origin`.
     cargo check --lib --target wasm32-unknown-unknown
     nsh package --target web -o dist && node web-test.js
 
-`app/.cargo/config.toml` sets `RUST_TEST_THREADS=1`: NSH views keep per-thread
-state, and parallel test threads made the chat harness flaky (a blank screen
-after a snapshot push). Each test still runs in its own view.
+Tests run in parallel. Each integration harness holds a serial lock as its
+LAST field, so the view (and its engine thread) is torn down before the next
+test may take the lock; releasing it earlier let a late mount take the next
+test's client and left that screen blank.
 
 `web-test.js` uses Playwright and headless Chromium (preinstalled). It serves
 `dist/Modron/` with `python3 -m http.server` and runs a scripted WebSocket

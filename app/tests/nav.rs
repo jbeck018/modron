@@ -27,11 +27,13 @@ const CHAT_MARK: &str = "Message";
 static SERIAL: Mutex<()> = Mutex::new(());
 
 struct Harness {
-    _serial: MutexGuard<'static, ()>,
     view: AppView,
     term: Terminal<TestBackend>,
     host: Host,
     wake: mpsc::Receiver<()>,
+    // Last on purpose: fields drop in order, and the view (its engine
+    // thread) must be gone before the next test may take the lock.
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Harness {

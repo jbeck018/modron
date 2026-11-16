@@ -10,7 +10,7 @@ use modron_mobile_core::client::TASK_STATUS_REFRESH_BATCH;
 use modron_mobile_core::view::{
     auth_is_signed_in, auth_row_line, delete_confirm_text, kill_confirm_text, remove_confirm_text,
     sandbox_label, AgentRowView, OAuthProgressView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT,
-    MODEL_ROLE_FALLBACK, MODEL_ROLE_STRONG, PERSONA_CLEAR_NOTE, PICKER_NONE_LABEL,
+    MODEL_ROLE_FALLBACK, MODEL_ROLE_STRONG, PERSONA_CLEAR_LABEL, PICKER_NONE_LABEL,
     SETTING_AGENT_LABEL, SETTING_ALLOW_LABEL, SETTING_AUTH_LABEL, SETTING_DENY_LABEL,
     SETTING_THEME_LABEL,
 };
@@ -212,6 +212,8 @@ pub struct PickerNow {
     pub effort: String,
     pub theme: Choice,
     pub personas: Vec<PersonaRowView>,
+    /// The session's persona (`None` when none is set): the clear row's mark.
+    pub persona: Option<String>,
 }
 
 /// The theme change the view applies once: `seq` rises by one per change, and
@@ -237,8 +239,9 @@ pub fn picker_title(kind: PickerKind) -> &'static str {
 /// The rows of one picker, with the current value marked. Agent lists the
 /// personas the core sends (`personas_req` when the picker opens), the row
 /// text verbatim. Until they arrive, or when the server refuses the list, the
-/// row is the shared "none" and it is not selectable. There is no row that
-/// clears the persona: the server refuses an empty persona name.
+/// row is the shared "none" and it is not selectable. The first Agent row
+/// always clears the persona (an empty name, which the server accepts); it is
+/// marked current when no persona is set.
 pub fn picker_rows(kind: PickerKind, now: &PickerNow) -> Vec<PickerRow> {
     let row = |label: String, current: bool, action: UiAction| PickerRow {
         label,
@@ -287,22 +290,33 @@ pub fn picker_rows(kind: PickerKind, now: &PickerNow) -> Vec<PickerRow> {
             );
             rows
         }
-        PickerKind::Agent if now.personas.is_empty() => vec![PickerRow {
-            label: PICKER_NONE_LABEL.to_string(),
-            current: false,
-            enabled: false,
-            action: None,
-        }],
-        PickerKind::Agent => now
-            .personas
-            .iter()
-            .map(|persona| PickerRow {
-                label: persona.text.clone(),
-                current: persona.current,
+        PickerKind::Agent => {
+            let clear = PickerRow {
+                label: PERSONA_CLEAR_LABEL.to_string(),
+                current: now.persona.is_none(),
                 enabled: true,
-                action: Some(UiAction::SetPersona(persona.name.clone())),
-            })
-            .collect(),
+                action: Some(UiAction::SetPersona(String::new())),
+            };
+            let rest: Vec<PickerRow> = if now.personas.is_empty() {
+                vec![PickerRow {
+                    label: PICKER_NONE_LABEL.to_string(),
+                    current: false,
+                    enabled: false,
+                    action: None,
+                }]
+            } else {
+                now.personas
+                    .iter()
+                    .map(|persona| PickerRow {
+                        label: persona.text.clone(),
+                        current: persona.current,
+                        enabled: true,
+                        action: Some(UiAction::SetPersona(persona.name.clone())),
+                    })
+                    .collect()
+            };
+            std::iter::once(clear).chain(rest).collect()
+        }
         PickerKind::Theme => CHOICES
             .into_iter()
             .map(|choice| {
@@ -607,6 +621,8 @@ pub struct Nav {
     tasks: Vec<TaskRow>,
     /// The personas the core lists (the agent picker's rows).
     personas: Vec<PersonaRowView>,
+    /// The session's persona (`None` when none is set).
+    persona: Option<String>,
     /// When the last task status refresh was asked for (Tasks only).
     task_refresh_at: Option<Instant>,
     /// How many task rows the refreshes so far have been asked to cover.
@@ -754,6 +770,7 @@ impl Nav {
         self.automations = snapshot.automations.clone();
         self.last_note = snapshot.last_note.clone();
         self.personas = snapshot.personas.clone();
+        self.persona = snapshot.persona.clone();
         // The core's rows (text and summary); the branch comes from the session.
         self.tasks = snapshot
             .task_rows
@@ -1400,6 +1417,7 @@ impl Nav {
             effort: self.effort_label.clone(),
             theme: self.theme,
             personas: self.personas.clone(),
+            persona: self.persona.clone(),
         }
     }
 
@@ -1483,11 +1501,7 @@ impl Nav {
                 .picker
                 .map(|kind| picker_title(kind).to_string())
                 .unwrap_or_default(),
-            picker_note: if self.top() == Screen::Picker && self.picker == Some(PickerKind::Agent) {
-                PERSONA_CLEAR_NOTE.to_string()
-            } else {
-                String::new()
-            },
+            picker_note: String::new(),
             picker: if self.top() == Screen::Picker { self.visible_picker() } else { Vec::new() },
             theme: self.theme,
             theme_change: self.theme_change,
@@ -2460,15 +2474,16 @@ mod picker_tests {
     }
 
     #[test]
-    fn the_agent_picker_lists_none_and_enter_on_it_does_nothing() {
+    fn the_agent_picker_lists_none_after_the_clear_row_and_enter_on_none_does_nothing() {
         let mut nav = Nav::default();
         nav.observe(&base());
         nav.apply(NavStep::OpenPicker(PickerKind::Agent));
         let view = nav.view();
-        assert_eq!(view.picker.len(), 1);
-        assert_eq!(view.picker[0].label, PICKER_NONE_LABEL);
-        assert!(!view.picker[0].enabled);
-        assert!(nav.apply(NavStep::PickRow(0)).is_empty());
+        assert_eq!(view.picker.len(), 2);
+        assert_eq!(view.picker[0].label, PERSONA_CLEAR_LABEL);
+        assert_eq!(view.picker[1].label, PICKER_NONE_LABEL);
+        assert!(!view.picker[1].enabled);
+        assert!(nav.apply(NavStep::PickRow(1)).is_empty());
         assert_eq!(nav.top(), Screen::Picker);
     }
 
@@ -2626,9 +2641,28 @@ mod persona_task_auth_tests {
         assert_eq!(nav.apply(NavStep::OpenPicker(PickerKind::Agent)), vec![UiAction::ListPersonas]);
         let view = nav.view();
         let labels: Vec<&str> = view.picker.iter().map(|r| r.label.as_str()).collect();
-        assert_eq!(labels, ["planner - plans the work", "reviewer"]);
-        assert!(!view.picker[0].current && view.picker[1].current);
-        assert_eq!(nav.apply(NavStep::PickRow(0)), vec![UiAction::SetPersona("planner".into())]);
+        assert_eq!(labels, [PERSONA_CLEAR_LABEL, "planner - plans the work", "reviewer"]);
+        assert!(!view.picker[1].current && view.picker[2].current);
+        assert_eq!(nav.apply(NavStep::PickRow(1)), vec![UiAction::SetPersona("planner".into())]);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_agent_clear_row_is_marked_only_when_no_persona_is_set_and_sends_an_empty_name() {
+        let mut nav = Nav::default();
+        let mut s = ViewModelSnapshot::default();
+        s.personas = vec![persona("reviewer", "reviewer", false)];
+        s.persona = Some("reviewer".into());
+        nav.observe(&s);
+        nav.apply(NavStep::OpenPicker(PickerKind::Agent));
+        assert!(!nav.view().picker[0].current);
+        assert_eq!(nav.apply(NavStep::PickRow(0)), vec![UiAction::SetPersona(String::new())]);
+
+        s.persona = None;
+        nav.observe(&s);
+        nav.apply(NavStep::OpenPicker(PickerKind::Agent));
+        assert!(nav.view().picker[0].current);
+        assert_eq!(nav.view().picker_note, "");
     }
 
     #[test]
@@ -2637,19 +2671,21 @@ mod persona_task_auth_tests {
         nav.observe(&ViewModelSnapshot::default());
         nav.apply(NavStep::OpenPicker(PickerKind::Agent));
         let labels: Vec<String> = nav.view().picker.iter().map(|r| r.label.clone()).collect();
-        assert_eq!(labels, vec![PICKER_NONE_LABEL.to_string()]);
-        assert!(nav.apply(NavStep::PickRow(0)).is_empty());
+        assert_eq!(labels, vec![PERSONA_CLEAR_LABEL.to_string(), PICKER_NONE_LABEL.to_string()]);
+        assert!(!nav.view().picker[1].enabled);
+        assert!(nav.apply(NavStep::PickRow(1)).is_empty());
     }
 
     #[test]
-    fn the_agent_picker_says_it_cannot_clear_the_persona_and_other_pickers_say_nothing() {
+    fn no_picker_shows_a_note_and_the_mode_picker_has_no_clear_row() {
         let mut nav = Nav::default();
         nav.observe(&ViewModelSnapshot::default());
         nav.apply(NavStep::OpenPicker(PickerKind::Agent));
-        assert_eq!(nav.view().picker_note, PERSONA_CLEAR_NOTE);
+        assert_eq!(nav.view().picker_note, "");
         nav.apply(NavStep::Back);
         nav.apply(NavStep::OpenPicker(PickerKind::Mode));
         assert_eq!(nav.view().picker_note, "");
+        assert!(nav.view().picker.iter().all(|r| r.label != PERSONA_CLEAR_LABEL));
     }
 
     #[test]
