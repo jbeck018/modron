@@ -1,0 +1,66 @@
+[package]
+name = "modron-app"
+version = "0.1.3"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Own workspace root: independent of the modron root workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+# cdylib: the web build (`nsh package --target web`) links the library as
+# a wasm module; rlib keeps the terminal binary and the tests.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "modron-app-tui"
+path = "src/bin/modron-app-tui.rs"
+
+[dependencies]
+nsh-core = "=0.5.1"
+# No JavaScript engine (spikes/nsh-tui/RESULTS.md, Follow-up S2b).
+modron-mobile-core = { path = "../mobile/rust-core", version = "0.1.3" }
+modron-view = { path = "../crates/modron-view", version = "0.1.3" }
+modron-protocol = { path = "../crates/modron-protocol", version = "0.1.3" }
+modron-types = { path = "../crates/modron-types", version = "0.1.3" }
+# sync only: the channels between the driver and the view. No runtime here:
+# the core owns its own on native and uses spawn_local on wasm.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+uuid = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Terminal host only (the web build must not link any of these).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nsh-platform-tui = { version = "=0.5.1", features = ["run-app"] }
+# @file completion walks the workspace: .gitignore respect for free (the
+# same crate and version as the modron root workspace).
+ignore = "0.4"
+ratatui = "=0.30.2"
+crossterm = "=0.29.0"
+
+# Browser host only: the page's timer, its address and the clock.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Location", "console", "Document", "EventTarget", "KeyboardEvent", "Element", "Node", "HtmlCollection", "Range", "Selection", "Navigator", "Clipboard", "Headers", "RequestInit", "RequestCredentials", "Response", "WheelEvent", "TouchEvent", "TouchList", "Touch", "Event", "File", "FileList", "HtmlElement", "HtmlInputElement", "Storage"] }
+
+[profile.release]
+# Size-optimised, as measured in spikes/nsh-tui/RESULTS.md (Follow-up S2c).
+# Only the profile is adopted there; its vendored feature patch is not.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+# No panic = "abort": the app stops a server it started and restores the
+# terminal by unwinding. Aborting would skip that and orphan the server.
+strip = true
+
+[dev-dependencies]
+# The scripted server for tests/live.rs: the same crates the core's own
+# tests use (tokio-tungstenite 0.28), plus the protocol types.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio-tungstenite = "0.28"

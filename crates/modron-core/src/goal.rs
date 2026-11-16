@@ -110,6 +110,7 @@ mod tests {
             tool_calls: vec![],
             usage: crate::Usage::default(),
             stop_reason: crate::StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         }
     }
 

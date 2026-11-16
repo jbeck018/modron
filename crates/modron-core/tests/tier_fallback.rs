@@ -87,6 +87,7 @@ fn scripted_mock(answer: &str) -> Arc<MockProvider> {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     Arc::new(MockProvider::with_script(vec![response]))
 }
@@ -160,6 +161,7 @@ async fn fallback_persists_for_the_rest_of_the_run() {
         }],
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     };
     let response_final = TurnResponse {
         text: "done after the tool".into(),
@@ -170,6 +172,7 @@ async fn fallback_persists_for_the_rest_of_the_run() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let engine = engine(
         Arc::new(AuthFail {

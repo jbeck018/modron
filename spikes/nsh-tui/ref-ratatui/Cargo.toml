@@ -1,0 +1,19 @@
+[package]
+name = "ref-ratatui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace root: independent of the modron root workspace and the spike.
+[workspace]
+
+[dependencies]
+ratatui = "=0.30.2"
+
+# Same profile as the spike's base configuration (C0): z, fat LTO, cgu 1, abort.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false

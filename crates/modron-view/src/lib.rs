@@ -44,7 +44,7 @@ pub use gen_ui::{
     GenUi,
 };
 
-use modron_types::{SessionEvent, ToolActivity, Usage};
+use modron_types::{AgentState, SessionEvent, ToolActivity, Usage};
 use serde::{Deserialize, Serialize};
 
 /// One grouped tool event for the collapsed tool view (lifted from the
@@ -75,6 +75,24 @@ impl ToolEvent {
 }
 
 /// `2.1 KB`-style byte sizes for tool panels and summaries.
+/// The shared marker word on a private (`!!`) shell row. The row is shown
+/// in every client but never sent to the model.
+pub const PRIVATE_SHELL_MARK: &str = "private";
+
+/// The shared row text of a shell entry: the `$ <command>` header, then one
+/// row per output line. A private entry's header carries
+/// [`PRIVATE_SHELL_MARK`]. Every client renders shell rows through this.
+pub fn shell_rows(command: &str, lines: &[String], private: bool) -> Vec<String> {
+    let header = if private {
+        format!("$ {command} [{PRIVATE_SHELL_MARK}]")
+    } else {
+        format!("$ {command}")
+    };
+    std::iter::once(header)
+        .chain(lines.iter().cloned())
+        .collect()
+}
+
 pub fn human_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -82,6 +100,38 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Compact token count for the context meter: exact below a thousand,
+/// otherwise nearest thousand with a `k` suffix (`74k`, `180k`). Used by
+/// every client's context label (`ctx 41% (74k/180k)`).
+pub fn compact_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else {
+        format!("{}k", n.saturating_add(500) / 1_000)
+    }
+}
+
+/// The composer's placeholder, shown while its draft is empty.
+pub const COMPOSER_PLACEHOLDER: &str = "Message";
+
+/// The composer's Stop control label, shown while a turn runs on the web
+/// host (AGENTS.md: a stop button stands in for the terminal's Esc).
+pub const STOP_LABEL: &str = "stop";
+
+/// The composer's Queue control label on the web host: queues the composer
+/// text, as Alt+Enter does in the terminal.
+pub const QUEUE_LABEL: &str = "queue";
+
+/// The sandbox label shown in every client's settings views: `off`,
+/// `seatbelt` (macOS Seatbelt) or `bwrap` (Linux bubblewrap).
+pub fn sandbox_label(policy: modron_types::SandboxPolicy) -> &'static str {
+    match policy {
+        modron_types::SandboxPolicy::Off => "off",
+        modron_types::SandboxPolicy::Seatbelt => "seatbelt",
+        modron_types::SandboxPolicy::Bubblewrap => "bwrap",
     }
 }
 
@@ -131,7 +181,7 @@ pub fn sanitize_display(s: &str) -> String {
 pub fn approval_summary(name: &str, args: &serde_json::Value, max: usize) -> String {
     let essential = match name {
         "bash" => args.get("command").and_then(serde_json::Value::as_str),
-        "write" | "edit" => args.get("path").and_then(serde_json::Value::as_str),
+        "write" | "edit" | "edit_lines" => args.get("path").and_then(serde_json::Value::as_str),
         _ => None,
     };
     let raw = match essential {
@@ -176,6 +226,29 @@ pub struct SwarmRow {
     /// rows rebuilt from the wire snapshot (the clock restarts there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_ms: Option<u64>,
+    /// Lifecycle state (PROTOCOL_V2 section 4). Rows from older peers have
+    /// none and read as running; see [`SwarmRow::effective_state`].
+    #[serde(default)]
+    pub state: AgentState,
+}
+
+/// The state word a swarm row shows (shared by every client). `running`
+/// and `done` keep their historic text.
+pub fn agent_state_word(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Running => "running",
+        AgentState::WaitingApproval => "waiting approval",
+        AgentState::Done => "done",
+        AgentState::Failed => "failed",
+        AgentState::Killed => "killed",
+    }
+}
+
+/// The Notify / toast / last-note text for a finished background sub-agent
+/// (PROTOCOL_V2 section 4): `sub-agent <label> finished` or `... failed`.
+pub fn agent_finished_text(label: &str, ok: bool) -> String {
+    let verdict = if ok { "finished" } else { "failed" };
+    format!("sub-agent {label} {verdict}")
 }
 
 /// Wall-clock epoch milliseconds (elapsed-time rendering without
@@ -188,18 +261,23 @@ pub fn now_epoch_ms() -> Option<u64> {
 }
 
 impl SwarmRow {
+    /// The state the row shows. A row from an older peer carries no state,
+    /// so its `done` flag decides between done and failed.
+    pub fn effective_state(&self) -> AgentState {
+        match (self.state, self.done) {
+            (AgentState::Running, Some(true)) => AgentState::Done,
+            (AgentState::Running, Some(false)) => AgentState::Failed,
+            (state, _) => state,
+        }
+    }
+
     /// The display row, e.g. `⏵ [reviewer] done · 3 turns · 1.2k tok ·
     /// last: read`.
     pub fn summary(&self) -> String {
-        let mark = match self.done {
-            Some(true) => "done",
-            Some(false) => "failed",
-            None => "running",
-        };
         format!(
             "⏵ [{}] {} · {} turns · {} tok · last: {}",
             self.label,
-            mark,
+            agent_state_word(self.effective_state()),
             self.turns,
             self.tokens,
             self.last_tool.as_deref().unwrap_or("-")
@@ -267,6 +345,7 @@ impl ActivityTracker {
                     last_tool: None,
                     done: None,
                     started_ms: now_epoch_ms(),
+                    state: AgentState::Running,
                 });
             }
             ToolActivity::SubagentProgress {
@@ -293,8 +372,30 @@ impl ActivityTracker {
                     row.turns = row.turns.max(*turns);
                     row.tokens = row.tokens.max(*tokens);
                     row.done = Some(!*is_error);
+                    // A kill is sticky: its finish keeps the killed state.
+                    if row.state != AgentState::Killed {
+                        row.state = if *is_error {
+                            AgentState::Failed
+                        } else {
+                            AgentState::Done
+                        };
+                    }
                 }
             }
+            ToolActivity::SubagentState { id, state, .. } => {
+                if let Some(row) = self.subagents.iter_mut().find(|r| r.id == *id) {
+                    // Only a live row changes state; a settled one keeps its
+                    // finish.
+                    if row.done.is_none() {
+                        row.state = *state;
+                        if *state == AgentState::Killed {
+                            row.done = Some(false);
+                        }
+                    }
+                }
+            }
+            // Background settlement is a push (AgentFinished), not a row change.
+            ToolActivity::BackgroundFinished { .. } => {}
         }
     }
 
@@ -383,6 +484,15 @@ pub enum TranscriptEntry {
     },
     /// A committed subagent-swarm block.
     Swarm { lines: Vec<String> },
+    /// A `!` / `!!` shell command the user ran (not a model tool call).
+    /// `lines` are the output lines; `private` marks a `!!` command that
+    /// never reaches the model ([`shell_rows`] is the shared row text).
+    Shell {
+        command: String,
+        lines: Vec<String>,
+        is_error: bool,
+        private: bool,
+    },
     /// Model-selection note.
     Model { model: String, reason: String },
     /// Usage accounting for one turn.
@@ -400,6 +510,46 @@ pub enum TranscriptEntry {
     /// an assistant answer (table, chart, form). The GUI renders native
     /// widgets; the TUI renders the ASCII projection.
     GenerativeUi { ui: crate::gen_ui::GenUi },
+    /// An independent reviewer verdict (H4a). `summary` is the one-line
+    /// verdict ([`review_summary`]); `findings` are the expandable rows
+    /// ([`finding_line`]).
+    Review {
+        verdict: modron_types::ReviewVerdict,
+        summary: String,
+        findings: Vec<String>,
+    },
+}
+
+/// The one-line reviewer verdict shared by every client: `review: pass`,
+/// `review: skipped`, or `review: needs fix - N findings` (`1 finding`
+/// singular).
+pub fn review_summary(verdict: modron_types::ReviewVerdict, finding_count: usize) -> String {
+    use modron_types::ReviewVerdict;
+    match verdict {
+        ReviewVerdict::Pass => "review: pass".to_string(),
+        ReviewVerdict::Skipped => "review: skipped".to_string(),
+        ReviewVerdict::NeedsFix => {
+            let noun = if finding_count == 1 {
+                "finding"
+            } else {
+                "findings"
+            };
+            format!("review: needs fix - {finding_count} {noun}")
+        }
+    }
+}
+
+/// One reviewer finding row: `p1 path:line - text`. The `path:line` part is
+/// omitted when absent (`p1 - text`); the line alone is never shown without
+/// its path.
+pub fn finding_line(finding: &modron_types::Finding) -> String {
+    let code = finding.severity.code().to_ascii_lowercase();
+    let location = match (&finding.path, finding.line) {
+        (Some(path), Some(line)) => format!("{path}:{line} - "),
+        (Some(path), None) => format!("{path} - "),
+        (None, _) => "- ".to_string(),
+    };
+    format!("{code} {location}{}", finding.text)
 }
 
 /// Rebuild the display transcript from a session's persisted event log —
@@ -454,6 +604,20 @@ impl ReplayFolder {
                 self.flush_tools();
                 self.entries
                     .push(TranscriptEntry::Task { text: text.clone() });
+            }
+            SessionEvent::UserShell {
+                command,
+                output,
+                is_error,
+                private,
+            } => {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Shell {
+                    command: command.clone(),
+                    lines: output.lines().map(str::to_string).collect(),
+                    is_error: *is_error,
+                    private: *private,
+                });
             }
             SessionEvent::Plan { items } => {
                 self.flush_tools();
@@ -531,6 +695,16 @@ impl ReplayFolder {
                     summarized_events: *summarized_events,
                 });
             }
+            SessionEvent::Review {
+                verdict, findings, ..
+            } => {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Review {
+                    verdict: *verdict,
+                    summary: review_summary(*verdict, findings.len()),
+                    findings: findings.iter().map(finding_line).collect(),
+                });
+            }
             SessionEvent::TurnTrace { .. } | SessionEvent::Checkpoint { .. } => {}
         }
     }
@@ -595,6 +769,23 @@ mod tests {
     use super::*;
     use modron_types::{Message, ToolCall, ToolOutcome};
     use serde_json::json;
+
+    #[test]
+    fn compact_tokens_is_exact_below_a_thousand_and_rounds_to_k() {
+        assert_eq!(compact_tokens(0), "0");
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(1_000), "1k");
+        assert_eq!(compact_tokens(1_499), "1k");
+        assert_eq!(compact_tokens(1_500), "2k");
+        assert_eq!(compact_tokens(74_000), "74k");
+        assert_eq!(compact_tokens(180_000), "180k");
+    }
+
+    #[test]
+    fn shared_control_labels_are_the_web_copy() {
+        assert_eq!(STOP_LABEL, "stop");
+        assert_eq!(QUEUE_LABEL, "queue");
+    }
 
     #[test]
     fn cache_hit_pct_is_cached_over_input() {
@@ -742,6 +933,105 @@ mod tests {
         assert!(t.take_swarm_summary().is_empty(), "cleared after commit");
     }
 
+    #[test]
+    fn swarm_rows_show_waiting_approval_and_killed_states() {
+        let mut t = ActivityTracker::new();
+        t.on_tool(&ToolActivity::SubagentStarted {
+            id: "k1".into(),
+            label: "delegate".into(),
+        });
+        t.on_tool(&ToolActivity::SubagentState {
+            id: "k1".into(),
+            label: "delegate".into(),
+            state: AgentState::WaitingApproval,
+        });
+        assert!(t.subagents[0].summary().contains("] waiting approval "));
+        t.on_tool(&ToolActivity::SubagentState {
+            id: "k1".into(),
+            label: "delegate".into(),
+            state: AgentState::Running,
+        });
+        assert_eq!(t.subagents[0].state, AgentState::Running, "the ask settled");
+        assert!(t.subagents[0].summary().contains("] running "));
+
+        t.on_tool(&ToolActivity::SubagentState {
+            id: "k1".into(),
+            label: "delegate".into(),
+            state: AgentState::Killed,
+        });
+        t.on_tool(&ToolActivity::SubagentFinished {
+            id: "k1".into(),
+            label: "delegate".into(),
+            tokens: 1_050,
+            turns: 1,
+            is_error: true,
+        });
+        assert_eq!(t.subagents[0].state, AgentState::Killed, "a kill is sticky");
+        assert!(t.subagents[0].summary().contains("] killed "));
+
+        t.on_tool(&ToolActivity::SubagentStarted {
+            id: "f1".into(),
+            label: "persona".into(),
+        });
+        t.on_tool(&ToolActivity::SubagentFinished {
+            id: "f1".into(),
+            label: "persona".into(),
+            tokens: 0,
+            turns: 0,
+            is_error: true,
+        });
+        assert!(t.subagents[1].summary().contains("] failed "));
+    }
+
+    #[test]
+    fn background_settlement_is_not_a_row_change() {
+        let mut t = ActivityTracker::new();
+        t.on_tool(&ToolActivity::SubagentStarted {
+            id: "b1".into(),
+            label: "delegate".into(),
+        });
+        t.on_tool(&ToolActivity::BackgroundFinished {
+            id: "b1".into(),
+            label: "delegate".into(),
+            ok: true,
+            brief: "done".into(),
+        });
+        assert_eq!(t.subagents[0].done, None, "the push is not the finish");
+        assert_eq!(t.subagents[0].state, AgentState::Running);
+    }
+
+    #[test]
+    fn rows_from_older_peers_read_their_done_flag_and_shared_words_hold() {
+        let row = SwarmRow {
+            id: "o".into(),
+            label: "explore".into(),
+            turns: 2,
+            tokens: 9,
+            last_tool: None,
+            done: Some(true),
+            started_ms: None,
+            state: AgentState::Running,
+        };
+        assert!(row.summary().contains("] done "));
+        let failed = SwarmRow {
+            done: Some(false),
+            ..row.clone()
+        };
+        assert!(failed.summary().contains("] failed "));
+        assert_eq!(
+            agent_state_word(AgentState::WaitingApproval),
+            "waiting approval"
+        );
+        assert_eq!(
+            agent_finished_text("delegate", true),
+            "sub-agent delegate finished"
+        );
+        assert_eq!(
+            agent_finished_text("persona", false),
+            "sub-agent persona failed"
+        );
+    }
+
     fn fixture_events() -> Vec<SessionEvent> {
         let tool_call = ToolCall {
             id: "call-1".into(),
@@ -806,11 +1096,13 @@ mod tests {
                 TranscriptEntry::Assistant { .. } => "assistant",
                 TranscriptEntry::ToolSummary { .. } => "tools",
                 TranscriptEntry::Swarm { .. } => "swarm",
+                TranscriptEntry::Shell { .. } => "shell",
                 TranscriptEntry::Model { .. } => "model",
                 TranscriptEntry::Usage { .. } => "usage",
                 TranscriptEntry::Compaction { .. } => "compaction",
                 TranscriptEntry::GenerativeUi { .. } => "gen_ui",
                 TranscriptEntry::Plan { .. } => "plan",
+                TranscriptEntry::Review { .. } => "review",
             })
             .collect();
         assert_eq!(
@@ -917,5 +1209,190 @@ mod tests {
     #[test]
     fn approval_max_is_the_one_shared_cap() {
         assert_eq!(APPROVAL_SUMMARY_MAX, 80);
+    }
+
+    #[test]
+    fn sandbox_label_words_are_shared() {
+        use modron_types::SandboxPolicy;
+        assert_eq!(sandbox_label(SandboxPolicy::Off), "off");
+        assert_eq!(sandbox_label(SandboxPolicy::Seatbelt), "seatbelt");
+        assert_eq!(sandbox_label(SandboxPolicy::Bubblewrap), "bwrap");
+    }
+
+    fn finding(
+        severity: modron_types::Severity,
+        path: Option<&str>,
+        line: Option<u32>,
+        text: &str,
+    ) -> modron_types::Finding {
+        modron_types::Finding {
+            severity,
+            path: path.map(String::from),
+            line,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn review_summary_has_three_shapes() {
+        use modron_types::ReviewVerdict;
+        assert_eq!(review_summary(ReviewVerdict::Pass, 0), "review: pass");
+        assert_eq!(review_summary(ReviewVerdict::Skipped, 0), "review: skipped");
+        assert_eq!(
+            review_summary(ReviewVerdict::NeedsFix, 1),
+            "review: needs fix - 1 finding"
+        );
+        assert_eq!(
+            review_summary(ReviewVerdict::NeedsFix, 3),
+            "review: needs fix - 3 findings"
+        );
+    }
+
+    #[test]
+    fn finding_line_omits_absent_location() {
+        use modron_types::Severity;
+        assert_eq!(
+            finding_line(&finding(
+                Severity::P1,
+                Some("src/a.rs"),
+                Some(7),
+                "off by one"
+            )),
+            "p1 src/a.rs:7 - off by one"
+        );
+        assert_eq!(
+            finding_line(&finding(Severity::P2, Some("src/a.rs"), None, "no line")),
+            "p2 src/a.rs - no line"
+        );
+        assert_eq!(
+            finding_line(&finding(Severity::P0, None, None, "general concern")),
+            "p0 - general concern"
+        );
+    }
+
+    #[test]
+    fn replay_folds_review_events_in_log_order() {
+        use modron_types::{ReviewVerdict, Severity};
+        let events = vec![
+            SessionEvent::Message {
+                parent_id: None,
+                message: Message::assistant("done"),
+            },
+            SessionEvent::Review {
+                verdict: ReviewVerdict::NeedsFix,
+                findings: vec![finding(Severity::P1, Some("a.rs"), Some(2), "bad")],
+                model: "rev".into(),
+            },
+            SessionEvent::Review {
+                verdict: ReviewVerdict::Pass,
+                findings: Vec::new(),
+                model: "rev".into(),
+            },
+            SessionEvent::Review {
+                verdict: ReviewVerdict::Skipped,
+                findings: Vec::new(),
+                model: "rev".into(),
+            },
+        ];
+        let entries = replay(&events);
+        let reviews: Vec<(&str, &str, Vec<String>)> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Review {
+                    verdict,
+                    summary,
+                    findings,
+                } => Some((
+                    match verdict {
+                        ReviewVerdict::Pass => "pass",
+                        ReviewVerdict::NeedsFix => "needs_fix",
+                        ReviewVerdict::Skipped => "skipped",
+                    },
+                    summary.as_str(),
+                    findings.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reviews,
+            vec![
+                (
+                    "needs_fix",
+                    "review: needs fix - 1 finding",
+                    vec!["p1 a.rs:2 - bad".to_string()]
+                ),
+                ("pass", "review: pass", Vec::new()),
+                ("skipped", "review: skipped", Vec::new()),
+            ]
+        );
+        assert!(matches!(entries[0], TranscriptEntry::Assistant { .. }));
+        assert_eq!(
+            entries.len(),
+            4,
+            "one row per Review event after the message"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn shell_rows_show_header_then_output_with_the_private_marker() {
+        let lines = vec!["hello".to_string(), "exit code: 0".to_string()];
+        assert_eq!(
+            shell_rows("echo hello", &lines, false),
+            vec!["$ echo hello", "hello", "exit code: 0"]
+        );
+        assert_eq!(
+            shell_rows("echo hello", &lines, true),
+            vec!["$ echo hello [private]", "hello", "exit code: 0"]
+        );
+        assert_eq!(shell_rows("true", &[], false), vec!["$ true"]);
+    }
+
+    #[test]
+    fn replay_turns_a_user_shell_event_into_a_shell_entry() {
+        let events = vec![
+            SessionEvent::UserShell {
+                command: "ls".into(),
+                output: "a.rs\nb.rs\n".into(),
+                is_error: false,
+                private: false,
+            },
+            SessionEvent::UserShell {
+                command: "cat .env".into(),
+                output: "SECRET=1".into(),
+                is_error: true,
+                private: true,
+            },
+        ];
+        let entries = replay(&events);
+        assert_eq!(
+            entries,
+            vec![
+                TranscriptEntry::Shell {
+                    command: "ls".into(),
+                    lines: vec!["a.rs".into(), "b.rs".into()],
+                    is_error: false,
+                    private: false,
+                },
+                TranscriptEntry::Shell {
+                    command: "cat .env".into(),
+                    lines: vec!["SECRET=1".into()],
+                    is_error: true,
+                    private: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn old_task_encoded_shell_text_still_replays_as_a_task() {
+        let text = "Shell command run by the user with `!` (not a model tool call):\n$ ls\nx";
+        let entries = replay(&[SessionEvent::Task { text: text.into() }]);
+        assert!(matches!(&entries[..], [TranscriptEntry::Task { .. }]));
     }
 }

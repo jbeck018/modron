@@ -1,0 +1,26 @@
+16:28:23 C0_base: ['C0_base', '0', '17081600', '343', 'pass', '']
+16:32:13 C1_ratatui_nodef: ['C1_ratatui_nodef', '219', '17081536', '322', 'pass', '']
+16:36:04 C2_plus_no_highlight: ['C2_plus_no_highlight', '220', '15498712', '311', 'pass', '']
+16:38:18 C3_plus_no_net BUILD FAILED after 134s: /src/index.crates.io-1949cf8c6b5b557f/nsh-engine-0.5.1/src/lib.rs:22:9
+    |
+ 21 | #[cfg(feature = "net")]
+    |       --------------- the item is gated behind the `net` feature
+ 22 | pub mod net;
+    |         ^^^
+help: a struct with a similar name exists
+    |
+313 -         config.network = Some(nsh_engine::net::network());
+313 +         config.network = Some(nsh_engine::Net::network());
+    |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `nsh-platform-tui` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+16:38:18 C3_plus_no_net: ['C3_plus_no_net', '134', 'BUILD_FAIL', '', '', '']
+16:40:56 C3_plus_no_net: ['C3_plus_no_net', '129', '15279016', '305', 'pass', '']
+16:43:08 C4_plus_no_nbase_extras: ['C4_plus_no_nbase_extras', '121', '11359432', '298', 'pass', '']
+16:43:08 best feature config: C4_plus_no_nbase_extras
+16:46:30 P1_C4_plus_no_nbase_extras_opt_s_abort: ['P1_C4_plus_no_nbase_extras_opt_s_abort', '194', '12706696', '298', 'pass', '']
+16:49:49 P2_C4_plus_no_nbase_extras_opt_z_unwind: ['P2_C4_plus_no_nbase_extras_opt_z_unwind', '188', '13017800', '298', 'pass', '']
+16:53:55 P3_C4_plus_no_nbase_extras_app_s_deps_z: ['P3_C4_plus_no_nbase_extras_app_s_deps_z', '236', '11383160', '298', 'pass', '']
+16:53:55 driver phase 2 done

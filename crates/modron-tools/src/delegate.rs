@@ -243,6 +243,12 @@ impl Tool for DelegateTool {
         // via delegate's working_dir parameter) — results are reported,
         // never auto-merged.
 
+        // H3c: the child belongs to the run that spawns it. Capture that run's
+        // token now, during the call, so a background child started here can
+        // ask only while this run lasts (never during a later run). H3d: the
+        // owner also names the session the child is steerable/killable under.
+        let owner = modron_core::subagent::ChildOwner::for_session(ctx.session_id);
+
         if background {
             let bg = engine.config.background_subagents.clone();
             let id = modron_core::subagent::new_worktree_id();
@@ -272,7 +278,8 @@ impl Tool for DelegateTool {
             let registry = bg.clone();
             let task_id = id.clone();
             let handle = tokio::spawn(async move {
-                let report = modron_core::subagent::delegate(
+                let report = modron_core::subagent::delegate_owned(
+                    owner.detached(),
                     &engine,
                     &task,
                     persona_for_task.as_ref(),
@@ -284,6 +291,11 @@ impl Tool for DelegateTool {
                 let mut guard = registry.lock().unwrap();
                 if let Some(entry) = guard.get_mut(&task_id) {
                     entry.status = match report {
+                        Ok(report) if report.killed => modron_core::BackgroundStatus::Killed {
+                            brief: report.brief,
+                            tokens: report.usage.total(),
+                            turns: report.turns,
+                        },
                         Ok(report) => modron_core::BackgroundStatus::Done {
                             brief: report.brief,
                             tokens: report.usage.total(),
@@ -310,7 +322,8 @@ impl Tool for DelegateTool {
             )));
         }
 
-        match modron_core::subagent::delegate(
+        match modron_core::subagent::delegate_owned(
+            owner,
             engine,
             task,
             persona,
@@ -321,6 +334,8 @@ impl Tool for DelegateTool {
         .await
         {
             Ok(report) => {
+                // H3d: a user stop is a failed call; its spend still counts.
+                let killed = report.killed;
                 let mut brief = report.brief;
                 if isolate {
                     brief = format!(
@@ -339,7 +354,7 @@ impl Tool for DelegateTool {
                 );
                 Ok(ToolOutcome {
                     content: body,
-                    is_error: brief.is_empty(),
+                    is_error: killed || brief.is_empty(),
                     usage: Some(report.usage),
                     meta: None,
                 })
@@ -364,7 +379,7 @@ impl Tool for DelegateStatusTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "delegate_status".to_string(),
-            description: "Check background subagents: list all, or fetch one by id (returns                           the result brief when done)."
+            description: "Check background subagents: list all, or fetch one by id (returns the result brief when done)."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -420,6 +435,11 @@ fn format_status(id: &str, entry: &modron_core::BackgroundDelegate) -> String {
             let mark = if *is_error { "FAILED" } else { "done" };
             format!("{id}: {mark} ({tokens} tok, {turns} turns)\n{brief}")
         }
+        modron_core::BackgroundStatus::Killed {
+            brief,
+            tokens,
+            turns,
+        } => format!("{id}: killed ({tokens} tok, {turns} turns)\n{brief}"),
     }
 }
 
@@ -626,6 +646,180 @@ mod phase5i_tests {
             .unwrap();
         assert!(!started.is_error, "{started:?}");
         abort_background_delegates();
+    }
+
+    /// A `read` the child calls; it blocks until the child is killed.
+    struct BlockingRead;
+
+    #[async_trait::async_trait]
+    impl Tool for BlockingRead {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "read".into(),
+                description: "blocks until killed".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> modron_core::Result<ToolOutcome> {
+            std::future::pending().await
+        }
+    }
+
+    /// Parent whose child spends 1000 in + 50 out on a `read` that blocks.
+    /// Every tool-activity event the parent sees is captured.
+    fn blocking_engine() -> (
+        Arc<modron_core::Engine>,
+        Arc<Mutex<Vec<modron_core::ToolActivity>>>,
+    ) {
+        let spent = modron_core::TurnResponse {
+            text: String::new(),
+            tool_calls: vec![modron_core::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: modron_core::Usage {
+                input_tokens: 1_000,
+                output_tokens: 50,
+                cached_input_tokens: 0,
+            },
+            stop_reason: modron_core::StopReason::ToolUse,
+            provider_blocks: Vec::new(),
+        };
+        let mut providers: HashMap<String, Arc<dyn modron_core::ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(MockProvider::new().then_response(spent)),
+        );
+        let mut registry = modron_core::ToolRegistry::new();
+        registry.register(Arc::new(BlockingRead));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&events);
+        let sink: Arc<modron_core::ToolActivitySink> =
+            Arc::new(move |activity: modron_core::ToolActivity| {
+                sink_events.lock().unwrap().push(activity);
+            });
+        let engine = modron_core::Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config: modron_core::EngineConfig {
+                on_tool_event: Some(sink),
+                ..modron_core::EngineConfig::default()
+            },
+        };
+        (Arc::new(engine), events)
+    }
+
+    /// The id of the first sub-agent the events announce (2s budget).
+    async fn wait_for_started(events: &Mutex<Vec<modron_core::ToolActivity>>) -> String {
+        for _ in 0..400 {
+            let found = events.lock().unwrap().iter().find_map(|e| match e {
+                modron_core::ToolActivity::SubagentStarted { id, .. } => Some(id.clone()),
+                _ => None,
+            });
+            if let Some(id) = found {
+                return id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the sub-agent never started");
+    }
+
+    #[tokio::test]
+    async fn killing_a_foreground_child_fails_the_call_and_keeps_its_spend() {
+        let _guard = BG_TEST_LOCK.lock().await;
+        let (engine, events) = blocking_engine();
+        let session = modron_core::SessionId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let call = {
+            let ctx = ToolCtx {
+                working_dir: dir.path().to_path_buf(),
+                sandbox: Default::default(),
+                engine: Some(Arc::clone(&engine)),
+                session_id: Some(session),
+            };
+            tokio::spawn(async move {
+                DelegateTool
+                    .execute(serde_json::json!({"task": "find it"}), &ctx)
+                    .await
+            })
+        };
+        let id = wait_for_started(&events).await;
+        modron_core::subagent::kill_agent(session, &id).unwrap();
+        let outcome = call.await.unwrap().unwrap();
+        assert!(outcome.is_error, "{outcome:?}");
+        assert!(
+            outcome.content.contains("was stopped by the user"),
+            "{}",
+            outcome.content
+        );
+        assert_eq!(
+            outcome.usage.map(|u| u.total()),
+            Some(1_050),
+            "the spend before the stop is charged to the parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn killing_a_background_child_marks_it_killed_in_delegate_status() {
+        let _guard = BG_TEST_LOCK.lock().await;
+        let (engine, events) = blocking_engine();
+        let session = modron_core::SessionId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            working_dir: dir.path().to_path_buf(),
+            sandbox: Default::default(),
+            engine: Some(Arc::clone(&engine)),
+            session_id: Some(session),
+        };
+        let started = DelegateTool
+            .execute(
+                serde_json::json!({"task": "work", "background": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!started.is_error, "{started:?}");
+        let id = wait_for_started(&events).await;
+        modron_core::subagent::kill_agent(session, &id).unwrap();
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = DelegateStatusTool
+                .execute(serde_json::json!({}), &ctx)
+                .await
+                .unwrap()
+                .content;
+            if status.contains("killed") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(status.contains("killed"), "{status}");
+        assert!(status.contains("was stopped by the user"), "{status}");
+        assert!(status.contains("1050 tok"), "{status}");
+
+        // The settlement is pushed once, and it is a failure.
+        let finished: Vec<bool> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                modron_core::ToolActivity::BackgroundFinished { ok, .. } => Some(*ok),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished, vec![false]);
+        assert!(
+            modron_core::subagent::kill_agent(session, &id).is_err(),
+            "a settled child is no longer live"
+        );
     }
 
     #[tokio::test]

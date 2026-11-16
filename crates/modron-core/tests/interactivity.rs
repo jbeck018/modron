@@ -24,6 +24,7 @@ fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> Tur
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -37,6 +38,7 @@ fn text_response(text: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -191,6 +193,7 @@ async fn approver_allows_mutating_tool_in_ask_mode() {
                 non_interactive: false,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             approver: Some(always_allow()),
             ..EngineConfig::default()
@@ -202,11 +205,11 @@ async fn approver_allows_mutating_tool_in_ask_mode() {
 }
 
 fn always_allow() -> Arc<modron_core::Approver> {
-    Arc::new(|_call: &ToolCall| true)
+    Arc::new(|_ask: &modron_core::ApprovalAsk<'_>| true)
 }
 
 fn always_deny() -> Arc<modron_core::Approver> {
-    Arc::new(|_call: &ToolCall| false)
+    Arc::new(|_ask: &modron_core::ApprovalAsk<'_>| false)
 }
 
 /// I2: a denying approver blocks with the actionable message.
@@ -228,6 +231,7 @@ async fn approver_denial_blocks_with_message() {
                 non_interactive: false,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             approver: Some(always_deny()),
             ..EngineConfig::default()
@@ -349,6 +353,7 @@ async fn delegate_runs_child_with_persona_model() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     };
     let child_answer = TurnResponse {
         text: String::new(),
@@ -360,6 +365,7 @@ async fn delegate_runs_child_with_persona_model() {
         },
         // Child "edits" then ends: EndTurn directly (no tools in this script).
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let parent_final = TurnResponse {
         text: "delegated and merged".into(),
@@ -370,6 +376,7 @@ async fn delegate_runs_child_with_persona_model() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let provider = MockProvider::new()
         .then_response(delegate_call)
@@ -528,6 +535,7 @@ async fn parallel_delegates_run_concurrently() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     };
     let child_answer = |n: &str| TurnResponse {
         text: format!("result {n}"),
@@ -538,6 +546,7 @@ async fn parallel_delegates_run_concurrently() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let parent_final = TurnResponse {
         text: "both done".into(),
@@ -548,6 +557,7 @@ async fn parallel_delegates_run_concurrently() {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     };
     let provider = MockProvider::new()
         .then_response(twin_delegates)
@@ -752,6 +762,7 @@ async fn run_single_named_call(
         config: EngineConfig {
             working_dir: dir.path().to_path_buf(),
             approvals: ApprovalPolicy {
+                rules: Default::default(),
                 mode,
                 non_interactive: false,
                 allow,

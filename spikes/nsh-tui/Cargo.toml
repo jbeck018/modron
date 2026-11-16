@@ -1,0 +1,24 @@
+[package]
+name = "nsh-tui-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace root: independent of the modron root workspace.
+[workspace]
+
+[dependencies]
+nsh-core = "=0.5.1"
+nsh-platform-tui = { version = "=0.5.1", default-features = false }
+ratatui = { version = "=0.30.2", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[patch.crates-io]
+nsh-platform-tui = { path = "vendor/nsh-platform-tui" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false

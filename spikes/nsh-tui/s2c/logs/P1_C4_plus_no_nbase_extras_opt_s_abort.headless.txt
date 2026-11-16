@@ -1,0 +1,22 @@
+== startup rc=0 ok
+first_frame_ms=1.92
+
+== stream 0 rc=0 ok
+stream rows=0 tokens=2000 mean_ms=3.537 median_ms=3.617 p95_ms=6.377
+
+== scroll rc=0 ok
+scroll_down pages=140 reached_last_row=true mean_ms=1.439 median_ms=0.638 p95_ms=4.431
+scroll_up pages=135 back_at_top=true mean_ms=1.367 median_ms=0.714 p95_ms=4.265
+
+== input rc=0 ok
+typed_readback=ok
+enter_submit_readback=ok
+paste_counted=ok paste_shows_text=true
+
+== external 0 0 rc=0 ok
+external pace_us=0 rows=0 tokens_shown=2000/2000 total_ms=8.0 draws=3 wakes=2 wait_timeouts=0 idle_draws=2
+external frame_ms mean=0.463 p95=1.103 | token_latency_ms mean=7.610 p95=7.838
+
+== focus rc=0 ok
+enter_submit_readback=ok
+type_after_enter_no_tab=ok mode=submit

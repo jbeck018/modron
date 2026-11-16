@@ -1,14 +1,20 @@
 //! Hub unit tests: seq monotonicity, the LiveState projection, and the
 //! approval gate round-trip (park -> resolve -> sticky allow-rest).
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::{assert_approval_notify, next_live_frame};
+use modron_core::permissions::{Rule, RuleEffect, RuleSet};
 use modron_core::{
     ApprovalMode, ApprovalPolicy, Engine, EngineConfig, SandboxPolicy, SessionEvent, SessionId,
     SessionStore, StreamDelta, ToolActivity, ToolCall, Usage,
 };
-use modron_protocol::{ApprovalModeWire, ConfigPatch, Decision, Frame, Payload, WireDelta};
+use modron_protocol::{
+    ApprovalModeWire, ConfigPatch, Decision, Frame, Payload, RuleWire, WireDelta,
+};
 use modron_server::{BroadcastingStore, SessionHub};
 use tokio::sync::broadcast;
 
@@ -208,7 +214,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     // Park the gate in a background task.
     let parked = Arc::clone(&handle);
     let call_clone = call.clone();
-    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone, None) });
 
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -216,12 +222,16 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
         .map(parse_live)
         .unwrap();
     let request_id = match frame.payload {
-        Payload::ApprovalRequested { request_id, call } => {
+        Payload::ApprovalRequested {
+            request_id, call, ..
+        } => {
             assert_eq!(call.name, "bash");
             request_id
         }
         other => panic!("expected approval_requested, got {other:?}"),
     };
+    // The approval Notify follows the request, before the resolution.
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
     // It is visible in the live projection while pending.
     let live = handle.live_state();
     assert!(live.pending_approval.is_some());
@@ -246,7 +256,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     // AllowAll: approves, arms allow-rest; the next call passes instantly.
     let parked = Arc::clone(&handle);
     let call_clone = call.clone();
-    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone, None) });
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("second request frame")
@@ -256,6 +266,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
         Payload::ApprovalRequested { request_id, .. } => request_id,
         other => panic!("expected approval_requested, got {other:?}"),
     };
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
     handle.resolve(&request_id, Decision::AllowAll).unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(2), gate)
         .await
@@ -274,7 +285,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
             ..
         }
     ));
-    assert!(handle.approve_gate(&call));
+    assert!(handle.approve_gate(&call, None));
     assert!(matches!(
         rx.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
@@ -302,7 +313,7 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
     .unwrap();
     let parked = Arc::clone(&handle);
     let call_clone = call.clone();
-    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call_clone, None) });
     let request_id = loop {
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -319,6 +330,46 @@ async fn approval_gate_round_trip_and_sticky_allow_rest() {
         .unwrap()
         .unwrap());
     handle.interrupt();
+}
+
+/// Each approval request publishes exactly one approval Notify, right after
+/// the request, naming only the tool: the arguments never reach the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_request_publishes_one_notify_without_arguments() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    let mut rx = handle.subscribe();
+    let call = ToolCall {
+        id: "c1".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": "rm -rf /secret/path"}),
+    };
+    let gate = {
+        let parked = Arc::clone(&handle);
+        let call = call.clone();
+        tokio::spawn(async move { parked.approve_gate(&call, None) })
+    };
+    let request_id = match next_live_frame(&mut rx).await.payload {
+        Payload::ApprovalRequested { request_id, .. } => request_id,
+        other => panic!("expected approval_requested, got {other:?}"),
+    };
+    let notify = next_live_frame(&mut rx).await;
+    assert_approval_notify(&notify, "bash");
+    let raw = serde_json::to_string(&notify).unwrap();
+    assert!(!raw.contains("secret"), "arguments leaked: {raw}");
+
+    handle.resolve(&request_id, Decision::Deny).unwrap();
+    // Exactly one Notify per request: the rest of the flow is the echo.
+    let resolved = next_live_frame(&mut rx).await;
+    assert!(matches!(resolved.payload, Payload::ApprovalResolved { .. }));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(!tokio::time::timeout(Duration::from_secs(2), gate)
+        .await
+        .unwrap()
+        .unwrap());
 }
 
 /// Interrupt: a run occupying the slot is aborted, a parked approver
@@ -356,7 +407,7 @@ async fn interrupt_unblocks_a_parked_approver_and_aborts_the_run() {
 
     // The engine parks in the gate mid-run.
     let parked = Arc::clone(&handle);
-    let gate = tokio::spawn(async move { parked.approve_gate(&call) });
+    let gate = tokio::spawn(async move { parked.approve_gate(&call, None) });
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .unwrap()
@@ -366,6 +417,7 @@ async fn interrupt_unblocks_a_parked_approver_and_aborts_the_run() {
         Payload::ApprovalRequested { request_id, .. } => request_id,
         other => panic!("expected approval_requested, got {other:?}"),
     };
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
 
     assert!(handle.interrupt());
     // The parked approver returned (denied by the interrupt drain).
@@ -488,7 +540,7 @@ async fn approval_timeout_publishes_a_deny_resolution() {
     let gate = {
         let parked = Arc::clone(&handle);
         let call = call.clone();
-        tokio::spawn(async move { parked.approve_gate(&call) })
+        tokio::spawn(async move { parked.approve_gate(&call, None) })
     };
     let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -496,6 +548,7 @@ async fn approval_timeout_publishes_a_deny_resolution() {
         .map(parse_live)
         .unwrap();
     assert!(matches!(frame.payload, Payload::ApprovalRequested { .. }));
+    assert_approval_notify(&next_live_frame(&mut rx).await, "bash");
 
     let denied = tokio::time::timeout(Duration::from_secs(2), gate)
         .await
@@ -548,6 +601,129 @@ fn parked_run(id: SessionId) -> modron_server::RunFuture {
             models_used: vec![],
         })
     })
+}
+
+/// A run the test completes on demand (`done` sends the success path).
+fn completing_run(
+    id: SessionId,
+    done: tokio::sync::oneshot::Receiver<()>,
+) -> modron_server::RunFuture {
+    Box::pin(async move {
+        let _ = done.await;
+        Ok(modron_core::RunSummary {
+            session_id: id,
+            answer: "done".into(),
+            turns: 0,
+            tool_calls: 0,
+            usage: Default::default(),
+            models_used: vec![],
+        })
+    })
+}
+
+fn child_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": "echo"}),
+    }
+}
+
+/// H3b: a child's ask is published with its label, one grant covers the
+/// run's other children (allow-all is the parent's sticky flag), and the
+/// sticky pass publishes nothing new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_asks_carry_the_agent_label_and_share_allow_all() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    let (_done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    hub.start_run(id, completing_run(id, done_rx)).unwrap();
+    let mut rx = handle.subscribe();
+
+    let parked = Arc::clone(&handle);
+    let first = child_call("c1");
+    let gate = tokio::spawn(async move { parked.approve_gate(&first, Some("delegate")) });
+    let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("request frame")
+        .map(parse_live)
+        .unwrap();
+    let request_id = match frame.payload {
+        Payload::ApprovalRequested {
+            request_id,
+            call,
+            agent,
+        } => {
+            assert_eq!(call.name, "bash");
+            assert_eq!(
+                agent.as_deref(),
+                Some("delegate"),
+                "the child label rides the ask"
+            );
+            request_id
+        }
+        other => panic!("expected approval_requested, got {other:?}"),
+    };
+    handle
+        .resolve(&request_id, Decision::AllowAll)
+        .expect("resolve the child's ask");
+    assert!(gate.await.unwrap());
+
+    // Another child of the same run: allowed without a new prompt.
+    assert!(handle.approve_gate(&child_call("c2"), Some("persona")));
+    loop {
+        let live = parse_live(rx.recv().await.unwrap());
+        if matches!(live.payload, Payload::ApprovalResolved { .. }) {
+            break;
+        }
+    }
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+/// H3b: no approver outlives its run. A child asking after the run ended is
+/// refused without a prompt; a child parked when the run ends is denied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_asks_after_the_run_ends_are_refused() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+
+    // Late ask: the run completed first.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    hub.start_run(id, completing_run(id, done_rx)).unwrap();
+    done_tx.send(()).unwrap();
+    for _ in 0..200 {
+        if !handle.is_busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!handle.is_busy(), "the run ended");
+    let mut rx = handle.subscribe();
+    assert!(!handle.approve_gate(&child_call("late"), Some("delegate")));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+
+    // Parked ask: the run completes while the child waits for a decision.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    hub.start_run(id, completing_run(id, done_rx)).unwrap();
+    let mut rx = handle.subscribe();
+    let parked = Arc::clone(&handle);
+    let gate =
+        tokio::spawn(async move { parked.approve_gate(&child_call("parked"), Some("delegate")) });
+    let _request = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("request frame");
+    done_tx.send(()).unwrap();
+    assert!(
+        !gate.await.unwrap(),
+        "a parked child ask is denied at run end"
+    );
+    assert!(handle.live_state().pending_approval.is_none());
 }
 
 /// LG-a: a rejected patch applies nothing - the status labels and the
@@ -610,7 +786,7 @@ async fn a_run_started_after_an_interrupt_still_prompts_for_approval() {
         arguments: serde_json::json!({}),
     };
     let gate_handle = Arc::clone(&handle);
-    let gate = tokio::spawn(async move { gate_handle.approve_gate(&call) });
+    let gate = tokio::spawn(async move { gate_handle.approve_gate(&call, None) });
 
     let request_id = loop {
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -687,4 +863,166 @@ async fn accepted_config_patch_moves_config_and_labels_together() {
     assert_eq!(live.model, "other-model");
     assert_eq!(live.goal, "ship it");
     assert_eq!(handle.engine_cell().config.default_model, "other-model");
+}
+
+fn rule_wire(effect: &str, spec: &str) -> RuleWire {
+    RuleWire {
+        effect: effect.into(),
+        spec: spec.into(),
+    }
+}
+
+/// The CLI's `[permissions]` reach a new session through the hub template:
+/// the session's engine config carries the rules and live state reports
+/// them as wire rules.
+#[tokio::test]
+async fn template_rules_reach_a_new_session() {
+    let hub = SessionHub::empty();
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::new());
+    let rules = RuleSet::new(vec![Rule::parse(RuleEffect::Deny, "bash(rm -rf*)").unwrap()]);
+    hub.set_engine(Engine {
+        selector: Arc::new(modron_core::testing::StaticSelector::new(
+            "mock-model",
+            "mock",
+        )),
+        providers: Default::default(),
+        tools: Arc::new(modron_core::ToolRegistry::new()),
+        store,
+        config: EngineConfig {
+            approvals: ApprovalPolicy {
+                rules,
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        },
+    });
+    let id = uuid::Uuid::new_v4();
+    let handle = hub.ensure_session(id, None);
+    assert_eq!(
+        handle.live_state().rules,
+        vec![rule_wire("deny", "bash(rm -rf*)")]
+    );
+    assert!(handle
+        .engine_cell()
+        .config
+        .approvals
+        .rules
+        .evaluate("bash", &serde_json::json!({"command": "rm -rf x"}))
+        .is_some());
+}
+
+/// A valid rules patch replaces the whole set for future runs and shows in
+/// live state; an empty list clears it.
+#[tokio::test]
+async fn rules_patch_replaces_the_set_and_shows_in_live_state() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    assert!(handle.live_state().rules.is_empty());
+
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![
+                rule_wire("deny", "bash(rm -rf*)"),
+                rule_wire("ask", "bash(git push*)"),
+                rule_wire("allow", "read(src/**)"),
+            ]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    assert_eq!(
+        handle.live_state().rules,
+        vec![
+            rule_wire("deny", "bash(rm -rf*)"),
+            rule_wire("ask", "bash(git push*)"),
+            rule_wire("allow", "read(src/**)"),
+        ]
+    );
+
+    // A second patch replaces the whole set, it does not merge.
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![rule_wire("allow", "read")]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    assert_eq!(handle.live_state().rules, vec![rule_wire("allow", "read")]);
+
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(Vec::new()),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    assert!(handle.live_state().rules.is_empty());
+}
+
+/// One invalid rule rejects the whole patch: the error names that rule, and
+/// the rules, the model and everything else in the patch stay as they were.
+#[tokio::test]
+async fn invalid_rule_rejects_the_whole_patch_and_changes_nothing() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![rule_wire("deny", "bash(rm -rf*)")]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let before = handle.live_state();
+
+    let err = handle
+        .apply_config(&ConfigPatch {
+            model: Some("other-model".into()),
+            rules: Some(vec![rule_wire("allow", "read"), rule_wire("deny", "bash(")]),
+            ..ConfigPatch::default()
+        })
+        .expect_err("a bad rule rejects the patch");
+    assert!(
+        err.to_string().contains("bash("),
+        "error names the rule: {err}"
+    );
+
+    let after = handle.live_state();
+    assert_eq!(after.rules, before.rules);
+    assert_eq!(after.model, before.model);
+    assert_ne!(handle.engine_cell().config.default_model, "other-model");
+
+    let bad_effect = handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![rule_wire("maybe", "read")]),
+            ..ConfigPatch::default()
+        })
+        .expect_err("an unknown effect is rejected");
+    assert!(bad_effect.to_string().contains("maybe"));
+}
+
+/// ExplainRule's text: one line per rule, then `result:` with the verdict
+/// the engine would reach. Deny beats the allow-all rule.
+#[tokio::test]
+async fn explain_rule_lists_each_rule_and_ends_with_the_result() {
+    let (hub, id) = test_hub();
+    let handle = hub.handle(&id).unwrap();
+    handle
+        .apply_config(&ConfigPatch {
+            rules: Some(vec![
+                rule_wire("allow", "bash"),
+                rule_wire("deny", "bash(rm -rf*)"),
+            ]),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+
+    let text = handle.explain_rule("bash", &serde_json::json!({"command": "rm -rf /"}));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "allow bash: matched",
+            "deny bash(rm -rf*): matched",
+            "result: deny",
+        ]
+    );
+
+    let none = handle.explain_rule("read", &serde_json::json!({"path": "a"}));
+    assert!(none.lines().last() == Some("result: no rule"), "{none}");
 }

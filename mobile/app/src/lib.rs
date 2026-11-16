@@ -722,6 +722,9 @@ fn demo_snapshot() -> String {
                 },
             }),
         ],
+        // The client core adds snapshot fields over time; this fixture
+        // names only the ones the demo shows.
+        ..Default::default()
     };
     serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into())
 }

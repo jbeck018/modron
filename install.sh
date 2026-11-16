@@ -28,10 +28,12 @@ platform() {
 TARGET="$(platform)"
 VERSION="${MODRON_VERSION:-latest}"
 if [ "$VERSION" = "latest" ]; then
-  URL="https://github.com/$REPO/releases/latest/download/modron-$TARGET.tar.gz"
+  BASE="https://github.com/$REPO/releases/latest/download"
 else
-  URL="https://github.com/$REPO/releases/download/$VERSION/modron-$TARGET.tar.gz"
+  BASE="https://github.com/$REPO/releases/download/$VERSION"
 fi
+URL="$BASE/modron-$TARGET.tar.gz"
+SUMS_URL="$BASE/SHA256SUMS"
 
 info "installing modron ($TARGET) into $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
@@ -41,15 +43,30 @@ trap 'rm -rf "$WORKDIR_DL"' EXIT
 ARCHIVE="modron-$TARGET.tar.gz"
 TARBALL="$WORKDIR_DL/$ARCHIVE"
 
-sha256_check() {
-  # Verifies "<hash>  <file>" lines in $1 against files in the cwd.
+sha256_tool() {
+  # Prints the name of an available SHA-256 tool, or fails.
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -c "$1"
+    echo sha256sum
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 -c "$1"
+    echo "shasum -a 256"
   else
     fail "neither sha256sum nor shasum found - cannot verify the download"
   fi
+}
+
+# Extracts the SHA256SUMS line for $ARCHIVE into $2. Fails unless every
+# non-blank line is "<64 lowercase hex>  <name>" or "<64 lowercase hex> *<name>"
+# and $ARCHIVE is listed exactly once. Other entries are fine.
+pick_sum_line() {
+  awk -v f="$ARCHIVE" '
+    /^[ \t]*$/ { next }
+    {
+      h = substr($0, 1, 64); s = substr($0, 65, 2); n = substr($0, 67)
+      if (length($0) < 67 || length(h) != 64 || h !~ /^[0-9a-f]+$/ || (s != "  " && s != " *") || n == "" || substr(n, 1, 1) == " ") { bad = 1; exit }
+      if (n == f) { hit++; line = $0 }
+    }
+    END { if (bad || hit != 1) exit 1; print line }
+  ' "$1" > "$2"
 }
 
 # Try the release binary. Only "no release for this platform" (HTTP 404)
@@ -58,16 +75,21 @@ sha256_check() {
 # binary and never paper over a tampered one by building something else.
 INSTALLED=0
 if command -v curl >/dev/null 2>&1; then
-  HTTP_CODE="$(curl -sSL -o "$TARBALL" -w '%{http_code}' "$URL")" || fail "download failed: $URL"
+  HTTP_CODE="$(curl -sSL --proto '=https' --proto-redir '=https' -o "$TARBALL" -w '%{http_code}' "$URL")" || fail "download failed: $URL"
   case "$HTTP_CODE" in
     200)
-      curl -fsSL -o "$TARBALL.sha256" "$URL.sha256" \
-        || fail "release has no checksum file ($URL.sha256) - refusing to install an unverified binary"
-      (cd "$WORKDIR_DL" && sha256_check "$ARCHIVE.sha256" >/dev/null) \
+      SHA_TOOL="$(sha256_tool)"
+      curl -fsSL --proto '=https' --proto-redir '=https' -o "$WORKDIR_DL/SHA256SUMS" "$SUMS_URL" \
+        || fail "release has no SHA256SUMS ($SUMS_URL) - refusing to install an unverified binary"
+      pick_sum_line "$WORKDIR_DL/SHA256SUMS" "$WORKDIR_DL/$ARCHIVE.sha256" \
+        || fail "SHA256SUMS is malformed or does not list $ARCHIVE exactly once - refusing to install"
+      (cd "$WORKDIR_DL" && $SHA_TOOL -c "$ARCHIVE.sha256" >/dev/null) \
         || fail "checksum mismatch for $ARCHIVE - refusing to install"
       tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron \
         || fail "release archive could not be unpacked"
-      info "installed release binary (sha256 verified)"
+      # The terminal app is in newer archives only; its absence is not an error.
+      tar -xzf "$TARBALL" -C "$INSTALL_DIR" modron-app-tui 2>/dev/null || true
+      info "installed release binary (sha256 verified against SHA256SUMS)"
       INSTALLED=1
       ;;
     404) info "no release binary for $TARGET ($VERSION)" ;;
@@ -87,9 +109,14 @@ if [ "$INSTALLED" -ne 1 ]; then
   else
     git clone --depth 1 --branch "$VERSION" "https://github.com/$REPO.git" "$SRC"
   fi
-  # -p modron-cli: the CLI only (the desktop crate needs GUI system libs).
+  # -p modron-cli: the CLI only. The terminal app (`modron app`) is its own
+  # workspace under app/; tags that predate it have no app/ and skip it.
   (cd "$SRC" && cargo build --release --locked -p modron-cli)
   cp "$SRC/target/release/modron" "$INSTALL_DIR/modron"
+  if [ -f "$SRC/app/Cargo.toml" ]; then
+    (cd "$SRC/app" && cargo build --release --locked --bin modron-app-tui)
+    cp "$SRC/app/target/release/modron-app-tui" "$INSTALL_DIR/modron-app-tui"
+  fi
   info "built and installed from source"
 fi
 

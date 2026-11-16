@@ -95,6 +95,7 @@ fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> Tur
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -108,6 +109,7 @@ fn text_response(text: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -139,6 +141,7 @@ async fn verify_tool_runs_through_the_engine() {
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },
@@ -179,6 +182,7 @@ async fn verify_failure_is_visible_to_the_model() {
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },

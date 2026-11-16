@@ -1,0 +1,16 @@
+[package]
+name = "nsh-web-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Own workspace root: independent of the modron root workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned to the NSH CLI version used for packaging (nsh 0.5.1).
+nsh-core = "=0.5.1"
+nsh-base = "=0.5.1"

@@ -11,13 +11,16 @@ use crate::budget::BudgetGovernor;
 use crate::compact;
 use crate::context;
 use crate::hooks;
+use crate::permissions::{RuleEffect, RuleSet, Verdict};
+use crate::review;
 use crate::speculative;
 use crate::{
-    estimate_tokens, judge, ActionKind, ApprovalMode, Engine, Error, JudgeMode, Message,
-    ModelChoice, ModelProvider, Result, Role, RunSummary, SelectRequest, SessionEvent, SessionId,
-    StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome, ToolSpec, TurnRequest,
-    TurnResponse, Usage,
+    estimate_tokens, judge, ActionKind, ApprovalMode, CompactOutcome, ContextGauge, Engine, Error,
+    JudgeMode, Message, ModelChoice, ModelProvider, Phase, Result, Role, RunSummary, SelectRequest,
+    SessionEvent, SessionId, StopReason, StreamDelta, ToolActivity, ToolCall, ToolCtx, ToolOutcome,
+    ToolSpec, TurnRequest, TurnResponse, Usage, UserShellOutcome,
 };
+use modron_types::ReviewVerdict;
 use std::sync::Arc;
 
 /// Output-token ask sent with every provider turn (`EngineConfig` has no
@@ -31,10 +34,12 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 ///
 /// Every new tool needs an explicit gated/ungated decision here: a tool that
 /// is not added to this list runs without approval.
-const MUTATING_TOOLS: [&str; 7] = [
+const MUTATING_TOOLS: [&str; 9] = [
+    "webfetch",
     "bash",
     "write",
     "edit",
+    "edit_lines",
     "verify",
     "diagnostics",
     "interact",
@@ -44,7 +49,7 @@ const MUTATING_TOOLS: [&str; 7] = [
 /// The file-mutating subset of the approval-gated class. Finish-gate arming
 /// and pre-mutation checkpoints key off this list, not [`MUTATING_TOOLS`]:
 /// widening the approval gate must not change their behavior.
-const FILE_MUTATING_TOOLS: [&str; 4] = ["bash", "write", "edit", "verify"];
+const FILE_MUTATING_TOOLS: [&str; 5] = ["bash", "write", "edit", "edit_lines", "verify"];
 
 /// Accumulate provider-reported usage into a run total. Counts come from
 /// the provider (possibly hostile or buggy), so every field saturates
@@ -72,6 +77,72 @@ fn has_http_status_prefix(message: &str, code: &str) -> bool {
 /// [`MUTATING_TOOLS`] or any `mcp__`-prefixed tool.
 fn is_gated(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name) || name.starts_with("mcp__")
+}
+
+/// The refusal a gated tool gets in [`Phase::Plan`] (H2a).
+const PLAN_PHASE_REFUSAL: &str =
+    "plan phase: read-only. Explore with read/grep/glob, then record the plan with the plan tool and stop.";
+
+/// The transient per-turn plan message (H2a), built into the TurnRequest
+/// only: `Current plan:` plus one `[status] text` line per item (with the
+/// done criteria when present), then the phase line in Plan phase. `None`
+/// when there is nothing to say (Build phase with no plan).
+fn plan_tail_message(phase: Phase, plan: Option<&[modron_types::PlanItem]>) -> Option<Message> {
+    let mut lines: Vec<String> = Vec::new();
+    let has_plan = plan.is_some_and(|items| !items.is_empty());
+    if let Some(items) = plan.filter(|items| !items.is_empty()) {
+        lines.push("Current plan:".to_string());
+        for item in items {
+            let mut line = format!("[{}] {}", item.status, item.text);
+            if !item.done_criteria.trim().is_empty() {
+                line.push_str(&format!(" (done: {})", item.done_criteria.trim()));
+            }
+            lines.push(line);
+        }
+    }
+    if phase == Phase::Plan {
+        if has_plan {
+            lines.push("Phase: plan (read-only).".to_string());
+        } else {
+            lines.push(
+                "This session is in plan phase (read-only) and must end by recording a plan \
+                 with the plan tool."
+                    .to_string(),
+            );
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(Message::user(lines.join("\n")))
+    }
+}
+
+/// Byte cap for a user-issued command's output kept in the transcript. The
+/// bash tool already caps its own output at the same size (modron-tools
+/// MAX_BYTES); this bounds whatever reaches the log.
+const USER_SHELL_MAX_BYTES: usize = 10 * 1024;
+
+/// Keep the TAIL of a `!` output over the cap (errors land at the end),
+/// head-marked, never splitting a UTF-8 character.
+fn cap_user_shell_output(text: &str) -> String {
+    if text.len() <= USER_SHELL_MAX_BYTES {
+        return text.to_string();
+    }
+    let mut start = text.len() - USER_SHELL_MAX_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("... (output truncated)\n{}", &text[start..])
+}
+
+/// The transcript text a user-issued command leaves behind. It is a user
+/// message on the next turn, labelled so the model can tell it was typed by
+/// the user rather than issued as a tool call.
+pub fn user_shell_transcript(command: &str, output: &str) -> String {
+    format!(
+        "Shell command run by the user with `!` (not a model tool call):\n$ {command}\n{output}"
+    )
 }
 
 /// The approval policy's verdict on one tool name, before any prompt (A5).
@@ -218,6 +289,201 @@ fn rewind_view<'a>(
     }
 }
 
+/// A model id from a config string (`roles`, `review_model`,
+/// `escalate_on_check_failure`): a bare model id, or `provider::model` naming
+/// the provider explicitly. The double colon is the separator because single
+/// colons and slashes occur inside real model ids (`llama3:8b`,
+/// `anthropic/claude-x`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelRef<'a> {
+    Bare(&'a str),
+    Explicit { provider: &'a str, model: &'a str },
+}
+
+/// Parse a config model string. Empty parts are rejected, never guessed.
+pub(crate) fn parse_model_ref(spec: &str) -> std::result::Result<ModelRef<'_>, String> {
+    match spec.split_once("::") {
+        None if spec.is_empty() => Err("the model id is empty".into()),
+        None => Ok(ModelRef::Bare(spec)),
+        Some((provider, model)) if provider.is_empty() || model.is_empty() => Err(format!(
+            "`{spec}` needs both a provider and a model around `::`"
+        )),
+        Some((provider, model)) => Ok(ModelRef::Explicit { provider, model }),
+    }
+}
+
+/// The model part of a config string: what is sent on the wire and recorded.
+fn model_part(spec: &str) -> &str {
+    match parse_model_ref(spec) {
+        Ok(ModelRef::Explicit { model, .. }) => model,
+        _ => spec,
+    }
+}
+
+/// Log a configuration warning once per process: a role that cannot resolve
+/// would otherwise warn on every turn.
+fn warn_once(key: String, message: String) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert(key) {
+        tracing::warn!("{message}");
+    }
+}
+
+/// One reviewer outcome ready to record (H4b): the verdict and findings the
+/// reviewer gave, or `Skipped` when the review could not run.
+struct ReviewedDiff {
+    verdict: ReviewVerdict,
+    findings: Vec<modron_types::Finding>,
+    model: String,
+}
+
+impl ReviewedDiff {
+    fn skipped(model: String) -> Self {
+        Self {
+            verdict: ReviewVerdict::Skipped,
+            findings: Vec::new(),
+            model,
+        }
+    }
+}
+
+/// Reviewer diff cap (H4a): stdout beyond this many bytes is cut and a
+/// truncation marker is appended before the diff reaches the reviewer.
+const REVIEW_DIFF_MAX_BYTES: usize = 60 * 1024;
+
+/// Wall-clock bound on the `git diff` call that feeds the reviewer (H4a).
+const REVIEW_DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Cap a diff at [`REVIEW_DIFF_MAX_BYTES`] on a char boundary, with a marker.
+fn truncate_review_diff(mut text: String) -> String {
+    if text.len() <= REVIEW_DIFF_MAX_BYTES {
+        return text;
+    }
+    let mut end = REVIEW_DIFF_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("\n[diff truncated at 60 KB]");
+    text
+}
+
+/// Upper bound on the untracked-path listing read (a pathological repo must
+/// not buffer an unbounded list). Over it, the new files are left out.
+const REVIEW_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Run `git args` in `dir` and read its stdout. `None` when git cannot run
+/// or exits non-zero. Output past `cap` bytes stops the producer and returns
+/// `cap + 1` bytes, so the caller can tell the output was cut.
+/// Stdout is read incrementally so a huge output is never buffered whole.
+async fn git_stdout(dir: &std::path::Path, args: &[&str], cap: usize) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let mut buf = Vec::new();
+    stdout
+        .take(cap as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .ok()?;
+    if buf.len() > cap {
+        let _ = child.kill().await;
+    } else {
+        let status = child.wait().await.ok()?;
+        if !status.success() {
+            return None;
+        }
+    }
+    Some(buf)
+}
+
+/// Read one untracked path for the reviewer (H4b). Never follows a symlink:
+/// the metadata is taken with `symlink_metadata`, content is read only for a
+/// regular file whose canonical path is inside the working dir and that is
+/// within the size limit. Anything else is returned unread.
+fn read_untracked(dir: &std::path::Path, path: String) -> review::UntrackedFile {
+    let full = dir.join(&path);
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
+        return review::UntrackedFile {
+            path,
+            bytes: 0,
+            content: None,
+        };
+    };
+    let bytes = meta.len();
+    let inside = match (std::fs::canonicalize(&full), std::fs::canonicalize(dir)) {
+        (Ok(file), Ok(base)) => file.starts_with(base),
+        _ => false,
+    };
+    let content = (meta.file_type().is_file() && inside && bytes <= review::NEW_FILE_MAX_BYTES)
+        .then(|| std::fs::read(&full).ok())
+        .flatten();
+    review::UntrackedFile {
+        path,
+        bytes,
+        content,
+    }
+}
+
+/// The working-tree diff the reviewer sees (H4a, H4b): `git diff --no-color
+/// HEAD` (plain `git diff` when HEAD does not exist) followed by unified
+/// new-file diffs for untracked files. `None` when git cannot run or the
+/// directory is not a repository, or when the 15 s budget runs out. The
+/// combined text is capped at [`REVIEW_DIFF_MAX_BYTES`]; tracked changes come
+/// first, so a cut always falls in the new-file section.
+async fn git_diff_text(dir: &std::path::Path) -> Option<String> {
+    let read = async {
+        let tracked =
+            match git_stdout(dir, &["diff", "--no-color", "HEAD"], REVIEW_DIFF_MAX_BYTES).await {
+                Some(text) => text,
+                // No HEAD yet (a repository without commits): plain diff.
+                None => git_stdout(dir, &["diff", "--no-color"], REVIEW_DIFF_MAX_BYTES).await?,
+            };
+        let mut text = String::from_utf8_lossy(&tracked).into_owned();
+        let listing = git_stdout(
+            dir,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            REVIEW_LIST_MAX_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+        if listing.len() <= REVIEW_LIST_MAX_BYTES {
+            let paths: Vec<String> = listing
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect();
+            let (paths, left_out) = review::select_untracked(paths);
+            let files: Vec<review::UntrackedFile> = paths
+                .into_iter()
+                .map(|path| read_untracked(dir, path))
+                .collect();
+            let section = review::render_new_files(&files, left_out);
+            if !section.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&section);
+            }
+        }
+        Some(text)
+    };
+    let text = tokio::time::timeout(REVIEW_DIFF_TIMEOUT, read)
+        .await
+        .ok()??;
+    Some(truncate_review_diff(text))
+}
+
 /// Finish-gate bound: verification feedback rounds before the run may end
 /// without passing verification (StaminaBench: gains plateau after 3-5
 /// retries; 2 keeps the worst case tight).
@@ -315,9 +581,22 @@ struct RunLoopState {
     /// Whether the most recent dispatch turn ENDED with a passing
     /// `verify` call — the model's own evidence satisfies the gate.
     last_dispatch_ended_with_passing_verify: bool,
+    /// Whether a file-mutating tool actually ran this run. Unlike
+    /// `mutated_this_run` (the finish gate's pending-verification flag) it
+    /// is never cleared: the reviewer pass keys off it.
+    ran_file_mutation: bool,
+    /// Facts for the cheap claim checks on the final answer (H4b): bash
+    /// commands that ran and the outcome of the last verify run.
+    run_facts: review::RunFacts,
+    /// Reviewer feedback rounds spent this run (NeedsFix findings fed back).
+    review_feedback_rounds: u32,
     /// Why the loop ended (`end_turn` / `max_turns` / `spend_cap` /
     /// `budget_exhausted`) — the terminal TurnTrace's failure label.
     stop_label: &'static str,
+    /// The run's current plan (H2a): the latest `Plan` event, loaded at run
+    /// start and refreshed after any turn whose tools included `plan`. It
+    /// feeds the transient per-turn tail message only, never the transcript.
+    current_plan: Option<Vec<modron_types::PlanItem>>,
 }
 
 impl RunLoopState {
@@ -339,7 +618,11 @@ impl RunLoopState {
             self_check_turn_pending: false,
             run_tier_override: None,
             last_dispatch_ended_with_passing_verify: false,
+            ran_file_mutation: false,
+            run_facts: review::RunFacts::default(),
+            review_feedback_rounds: 0,
             stop_label: "end_turn",
+            current_plan: None,
         }
     }
 }
@@ -387,7 +670,7 @@ impl Engine {
             )
             .await?;
         let transcript = vec![Message::user_with_attachments(task, attachments)];
-        self.run_loop(meta.id, task, transcript).await
+        self.run_loop(meta.id, task, transcript, None).await
     }
 
     /// Continue an existing session in the SAME session id (LEDGER L1
@@ -450,6 +733,9 @@ impl Engine {
         // rewrite also trims a rewind tail.
         let pruned = prune_unanswered_tool_calls(sliced);
         let mut transcript = reconstruct_transcript(&pruned, self.config.compaction.tail_messages);
+        // The run's starting plan comes from the same (rewound) events the
+        // transcript was rebuilt from.
+        let initial_plan = latest_plan(&pruned).filter(|items| !items.is_empty());
         self.store
             .append(
                 session_id,
@@ -459,7 +745,8 @@ impl Engine {
             )
             .await?;
         transcript.push(Message::user_with_attachments(task, attachments));
-        self.run_loop(session_id, task, transcript).await
+        self.run_loop(session_id, task, transcript, initial_plan)
+            .await
     }
 
     /// Shared turn loop for fresh and resumed runs. `task` is the current
@@ -477,7 +764,10 @@ impl Engine {
         session_id: SessionId,
         task: &str,
         transcript: Vec<Message>,
+        initial_plan: Option<Vec<modron_types::PlanItem>>,
     ) -> Result<RunSummary> {
+        // H3c: the run is live until this guard drops, on every exit path.
+        let _run = crate::run_scope().begin(session_id);
         let tool_specs = self.tools.specs_prompt();
         let system = self.assemble_system(&tool_specs);
         // Cache-discipline audit key: one hash over the exact wire prefix
@@ -485,6 +775,8 @@ impl Engine {
         // instability (cache busts), visible in TurnTrace records.
         let prompt_hash = prompt_wire_hash(&system, &tool_specs);
         let mut state = RunLoopState::new(transcript, self.config.max_total_tokens);
+        state.current_plan = initial_plan;
+        self.run_session_start_hook(session_id).await;
 
         loop {
             if state.turns >= self.config.max_turns {
@@ -496,6 +788,10 @@ impl Engine {
                 state.stop_label = "max_turns";
                 break;
             }
+
+            // Steer inbox: messages typed while the run was active become
+            // user messages between model turns, before the next route.
+            self.drain_steer_inbox(session_id, &mut state).await?;
 
             // Route FIRST (Phase 5i): the selected model's context window
             // (from ModelChoice) is the compaction trigger — a 128k-window
@@ -550,6 +846,30 @@ impl Engine {
                 )
                 .await?;
 
+            // Record the assistant message (text and/or tool calls) before
+            // any early exit: the turn is billed, so it must be in the log
+            // even when the spend cap below stops the run. A dangling tool
+            // call left by that stop is pruned on resume.
+            let assistant = Message {
+                role: Role::Assistant,
+                content: turn.response.text.clone(),
+                tool_calls: turn.response.tool_calls.clone(),
+                tool_call_id: None,
+                attachments: Vec::new(),
+                provider_blocks: turn.response.provider_blocks.clone(),
+            };
+            self.store
+                .append(
+                    session_id,
+                    &SessionEvent::Message {
+                        parent_id: None,
+                        message: assistant.clone(),
+                    },
+                )
+                .await?;
+            state.transcript.push(assistant);
+            state.answer = turn.response.text.clone();
+
             // USD spend cap (A3): computed from provider-reported usage and
             // the injected price lookup — an honest estimate, checked after
             // the turn so the turn's real usage is what trips it.
@@ -562,7 +882,6 @@ impl Engine {
                     );
                     // The capped turn's own text is the run's final answer;
                     // keep it (not the previous turn's) ahead of the note.
-                    state.answer = turn.response.text.clone();
                     state.answer = format!(
                         "{}\n\n[stopped: USD spend cap exceeded — spent ~${:.4} of ${cap:.4} cap]",
                         state.answer, state.spend_usd
@@ -570,33 +889,29 @@ impl Engine {
                     .trim()
                     .to_string();
                     state.stop_label = "spend_cap";
+                    self.run_turn_end_hook(
+                        session_id,
+                        state.turns,
+                        &turn.model,
+                        turn.response.usage,
+                        turn.response.tool_calls.len(),
+                    )
+                    .await;
                     break;
                 }
             }
 
-            // Record the assistant message (text and/or tool calls).
-            let assistant = Message {
-                role: Role::Assistant,
-                content: turn.response.text.clone(),
-                tool_calls: turn.response.tool_calls.clone(),
-                tool_call_id: None,
-                attachments: Vec::new(),
-            };
-            self.store
-                .append(
-                    session_id,
-                    &SessionEvent::Message {
-                        parent_id: None,
-                        message: assistant.clone(),
-                    },
-                )
-                .await?;
-            state.transcript.push(assistant);
-            state.answer = turn.response.text;
-
             if turn.response.stop_reason != StopReason::ToolUse
                 || turn.response.tool_calls.is_empty()
             {
+                self.run_turn_end_hook(
+                    session_id,
+                    state.turns,
+                    &turn.model,
+                    turn.response.usage,
+                    turn.response.tool_calls.len(),
+                )
+                .await;
                 // Finish gate (harness-enforced verification): a run that
                 // dispatched mutating tools must show verify evidence
                 // before it may end — outcome-only scoring hides unverified
@@ -606,6 +921,20 @@ impl Engine {
                 // continue — StaminaBench's retry-with-test-feedback loop,
                 // bounded to MAX_VERIFY_ROUNDS per run.
                 if !self.run_finish_gate(session_id, &mut state).await? {
+                    // Steer guard: a message typed during this run that is
+                    // still waiting keeps the run going (the next iteration
+                    // drains it and the model answers). Checked before the
+                    // escalation so the escalation's one-shot bound holds.
+                    if self.steer_pending() {
+                        continue;
+                    }
+                    // Independent reviewer (H4a, opt-in): one tool-less
+                    // review of the diff at normal completion. NeedsFix
+                    // findings feed back and the loop continues; the
+                    // escalation below always exits, so it stays one-shot.
+                    if self.review_round(session_id, task, &mut state).await? {
+                        continue;
+                    }
                     // Escalation (ONE per run): the gate just exhausted its
                     // feedback rounds with verification still failing (the
                     // same two conditions its give-up note keys on) and the
@@ -651,6 +980,19 @@ impl Engine {
                 &mut state,
             )
             .await?;
+            self.run_turn_end_hook(
+                session_id,
+                state.turns,
+                &turn.model,
+                turn.response.usage,
+                turn.response.tool_calls.len(),
+            )
+            .await;
+            // A `plan` write this turn replaces the current plan: re-read it
+            // from the log so the next turn's tail shows the new value.
+            if turn.response.tool_calls.iter().any(|c| c.name == "plan") {
+                state.current_plan = self.load_current_plan(session_id).await?;
+            }
 
             // A main turn completed: it counts toward the compaction
             // min-interval (the compaction call itself is not a turn).
@@ -668,6 +1010,55 @@ impl Engine {
         }
 
         self.finalize_run(session_id, &mut state).await
+    }
+
+    /// The session's current plan: the latest `Plan` event, `None` when no
+    /// non-empty plan has been recorded.
+    async fn load_current_plan(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<Vec<modron_types::PlanItem>>> {
+        let events = self.store.load(session_id).await?;
+        Ok(latest_plan(&events).filter(|items| !items.is_empty()))
+    }
+
+    /// The messages for one model turn (H2a): the transcript plus, when
+    /// there is a plan or the run is in Plan phase, the transient tail
+    /// message. The tail lives only in the request; the transcript and the
+    /// persisted log never see it.
+    fn turn_messages(&self, state: &RunLoopState) -> Vec<Message> {
+        let mut messages = state.transcript.clone();
+        if let Some(tail) = plan_tail_message(self.config.phase, state.current_plan.as_deref()) {
+            messages.push(tail);
+        }
+        messages
+    }
+
+    /// True when a steer message is queued for the active run.
+    fn steer_pending(&self) -> bool {
+        self.config
+            .steer
+            .as_ref()
+            .is_some_and(|inbox| !inbox.is_empty())
+    }
+
+    /// Append every queued steer message, oldest first, as a `Task` event
+    /// and a user message on the run's transcript (see [`SteerInbox`]).
+    async fn drain_steer_inbox(
+        &self,
+        session_id: SessionId,
+        state: &mut RunLoopState,
+    ) -> Result<()> {
+        let Some(inbox) = self.config.steer.as_ref() else {
+            return Ok(());
+        };
+        for text in inbox.drain() {
+            self.store
+                .append(session_id, &SessionEvent::Task { text: text.clone() })
+                .await?;
+            state.transcript.push(Message::user(text));
+        }
+        Ok(())
     }
 
     /// Route/decide phase of one loop iteration (Phase 5i): estimate the
@@ -699,6 +1090,7 @@ impl Engine {
                 .max_cost_usd
                 .map(|cap| (cap - state.spend_usd).max(0.0)),
         });
+        choice = self.with_role(choice, self.plan_role(), "plan");
         let effective_cap = choice
             .context_window
             .unwrap_or(self.config.max_input_tokens)
@@ -737,6 +1129,7 @@ impl Engine {
                         .max_cost_usd
                         .map(|cap| (cap - state.spend_usd).max(0.0)),
                 });
+                choice = self.with_role(choice, self.plan_role(), "plan");
             }
         }
 
@@ -767,7 +1160,7 @@ impl Engine {
                     };
                     let mut re = self.selector.select(&synthetic);
                     re.reason = format!("async-router: {verdict:?} → {}", re.reason);
-                    choice = re;
+                    choice = self.with_role(re, self.plan_role(), "plan");
                 }
             }
         }
@@ -838,9 +1231,11 @@ impl Engine {
             let request = std::sync::Arc::new(TurnRequest {
                 model: model.clone(),
                 system: system.to_string(),
-                messages: state.transcript.clone(),
+                messages: self.turn_messages(state),
                 tools: tool_specs.to_vec(),
                 max_tokens: MAX_OUTPUT_TOKENS,
+                effort: self.config.effort,
+                reasoning_summary: self.config.reasoning_summary,
             });
             tracing::info!(
                 turn = state.turns + 1,
@@ -866,7 +1261,13 @@ impl Engine {
                     // hooks, the on_tool_event sink, and the --deny list
                     // all must keep seeing every execution
                     // ([`speculative::allowed_for`]).
-                    if speculative::allowed_for(&self.config) {
+                    // The driver runs read-only tools before the gate sees
+                    // them, so it is disarmed whenever any permission rule
+                    // exists: a rule's `ask`/`deny` must never be bypassed by
+                    // a speculative read.
+                    if speculative::allowed_for(&self.config)
+                        && self.config.approvals.rules == RuleSet::default()
+                    {
                         let driver = speculative::SpeculativeDriver::spawn(
                             Arc::new(self.clone()),
                             session_id,
@@ -995,14 +1396,36 @@ impl Engine {
         // actually prompt; under ApproveAll or an allow-list entry it keeps
         // the concurrency it had before the gate widened (parallel
         // delegates).
-        let prompts = |name: &str| {
-            is_gated(name)
+        // A rule verdict decides first: `ask` prompts even for an ungated
+        // tool, `allow` never prompts. With no verdict, the gate rules apply.
+        let prompts = |call: &ToolCall| {
+            match self
+                .config
+                .approvals
+                .rules
+                .evaluate(&call.name, &call.arguments)
+                .map(|v| v.effect)
+            {
+                Some(RuleEffect::Ask) => return true,
+                Some(RuleEffect::Allow) => return false,
+                Some(RuleEffect::Deny) | None => {}
+            }
+            // A delegate prompts only when admission says it must ask; the
+            // Ask-mode un-throttle (H3b) lets several start concurrently.
+            // Refused delegates keep the sequential path, as before.
+            if call.name == "delegate" {
+                return !matches!(
+                    self.admission_for_call(&call.name, &call.arguments),
+                    Admission::Run
+                );
+            }
+            is_gated(&call.name)
                 && self.config.approvals.mode != ApprovalMode::ApproveAll
-                && !self.config.approvals.allow.iter().any(|a| a == name)
+                && !self.config.approvals.allow.iter().any(|a| a == &call.name)
         };
         let all_read_only = tool_calls
             .iter()
-            .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(&c.name));
+            .all(|c| !FILE_MUTATING_TOOLS.contains(&c.name.as_str()) && !prompts(c));
         // A speculative result was computed mid-stream, before this turn's
         // calls ran. It is only valid for a call when no file-mutating call
         // precedes it in this turn; otherwise `[edit X, read X]` would reuse
@@ -1043,6 +1466,26 @@ impl Engine {
             .any(|(c, (_, ran))| *ran && FILE_MUTATING_TOOLS.contains(&c.name.as_str()))
         {
             state.mutated_this_run = true;
+            state.ran_file_mutation = true;
+        }
+        // Claim-check facts (H4b): bash commands that actually ran, and the
+        // outcome of each verify call that actually ran.
+        for (call, (outcome, ran)) in tool_calls.iter().zip(&dispatched) {
+            if !*ran {
+                continue;
+            }
+            match call.name.as_str() {
+                "bash" => {
+                    if let Some(command) = call.arguments.get("command").and_then(|c| c.as_str()) {
+                        state.run_facts.commands.push(command.to_string());
+                    }
+                }
+                "verify" => {
+                    state.run_facts.verify_ran = true;
+                    state.run_facts.verify_passed = Some(!outcome.is_error);
+                }
+                _ => {}
+            }
         }
         let outcomes: Vec<ToolOutcome> =
             dispatched.into_iter().map(|(outcome, _)| outcome).collect();
@@ -1289,6 +1732,147 @@ impl Engine {
             })
     }
 
+    /// Resolve a configured model role (H7c) onto `base` (a selector choice
+    /// whose provider is kept): the role's model id swapped in, resolved
+    /// through [`Self::resolve_provider`] exactly like the escalation and
+    /// reviewer turns. `None` (with one warning) when the id does not resolve
+    /// to itself, so the caller keeps today's routing.
+    pub(crate) fn role_choice(
+        &self,
+        base: crate::ModelChoice,
+        model: &str,
+        role: &str,
+    ) -> Option<crate::ModelChoice> {
+        // The provider that serves the role's model (explicit `provider::`,
+        // then the catalog lookup, then the router's provider).
+        let (provider, wire_model) = self.resolve_model_ref(model, &base.provider)?;
+        let mut choice = base;
+        choice.provider = provider;
+        choice.model = wire_model.clone();
+        choice.reason = format!("role {role}: {model}");
+        choice.confident = true;
+        // The role's model has its own window, which the router's choice
+        // does not know: leave it unset so the global cap applies.
+        choice.context_window = None;
+        match self.resolve_provider(&choice) {
+            Ok((_, resolved)) if resolved == wire_model => Some(choice),
+            _ => {
+                tracing::warn!(
+                    role,
+                    model,
+                    "model role did not resolve; falling back to default routing"
+                );
+                None
+            }
+        }
+    }
+
+    /// The provider serving a model id named by a config setting: the
+    /// `provider_lookup` answer only when that provider is registered in
+    /// `self.providers`, otherwise `fallback_provider` (the selector's
+    /// provider for the turn, as before the lookup existed).
+    fn resolve_model_provider(&self, model: &str, fallback_provider: &str) -> String {
+        let looked_up = self
+            .config
+            .provider_lookup
+            .as_ref()
+            .and_then(|lookup| lookup(model));
+        match looked_up {
+            Some(provider) if self.providers.contains_key(&provider) => provider,
+            Some(provider) => {
+                tracing::debug!(
+                    model,
+                    provider = %provider,
+                    "catalog provider is not registered; keeping the turn's provider"
+                );
+                fallback_provider.to_string()
+            }
+            None => fallback_provider.to_string(),
+        }
+    }
+
+    /// Resolve a config model string to `(provider, wire model)`. An explicit
+    /// `provider::model` wins when that provider is registered; an
+    /// unregistered one is warned about once and the model part resolves as
+    /// a bare id. `None` for an unparsable string (warned once): the caller
+    /// treats the setting as unresolved.
+    pub(crate) fn resolve_model_ref(
+        &self,
+        spec: &str,
+        fallback_provider: &str,
+    ) -> Option<(String, String)> {
+        let model = match parse_model_ref(spec) {
+            Ok(ModelRef::Explicit { provider, model }) if self.providers.contains_key(provider) => {
+                return Some((provider.to_string(), model.to_string()));
+            }
+            Ok(ModelRef::Explicit { provider, model }) => {
+                warn_once(
+                    format!("unregistered:{spec}"),
+                    format!(
+                        "model `{spec}` names provider `{provider}`, which is not registered; using the routed provider"
+                    ),
+                );
+                model
+            }
+            Ok(ModelRef::Bare(model)) => model,
+            Err(why) => {
+                warn_once(
+                    format!("invalid:{spec}"),
+                    format!("invalid model setting: {why}"),
+                );
+                return None;
+            }
+        };
+        Some((
+            self.resolve_model_provider(model, fallback_provider),
+            model.to_string(),
+        ))
+    }
+
+    /// Apply a role to a routed `choice` unless the selector is a pin (H7c
+    /// precedence: pin > role > router). Returns `choice` unchanged when the
+    /// role is unset or does not resolve.
+    fn with_role(
+        &self,
+        choice: crate::ModelChoice,
+        role_model: Option<&str>,
+        role: &str,
+    ) -> crate::ModelChoice {
+        match role_model {
+            Some(model) if !self.selector.pinned() => self
+                .role_choice(choice.clone(), model, role)
+                .unwrap_or(choice),
+            _ => choice,
+        }
+    }
+
+    /// The `plan` role, live only while the run phase is `plan`.
+    fn plan_role(&self) -> Option<&str> {
+        if self.config.phase == Phase::Plan {
+            self.config.roles.plan.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// The `critic` role as a reviewer (H7c): one review round on the role's
+    /// model when no explicit `reviewer` is configured. Unresolvable = `None`
+    /// (today's behaviour: no reviewer).
+    fn critic_reviewer(&self, task: &str) -> Option<crate::ReviewerConfig> {
+        let model = self.config.roles.critic.clone()?;
+        let base = self.selector.select(&SelectRequest {
+            task: task.to_string(),
+            action: ActionKind::Chat,
+            context_tokens: estimate_tokens(task),
+            budget_remaining_usd: None,
+        });
+        self.role_choice(base, &model, "critic")?;
+        Some(crate::ReviewerConfig {
+            model,
+            max_rounds: 1,
+        })
+    }
+
     fn resolve_provider(&self, choice: &ModelChoice) -> Result<(Arc<dyn ModelProvider>, String)> {
         if let Some(provider) = self.providers.get(&choice.provider) {
             return Ok((provider.clone(), choice.model.clone()));
@@ -1327,7 +1911,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
     ) -> Result<Option<SessionEvent>> {
-        if !matches!(call.name.as_str(), "write" | "edit") {
+        if !matches!(call.name.as_str(), "write" | "edit" | "edit_lines") {
             return Ok(None);
         }
         let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
@@ -1366,6 +1950,49 @@ impl Engine {
         Ok(())
     }
 
+    /// Observe-only `session_start` hook, run once per run before the first
+    /// route. A no-op unless configured; never fails the run.
+    async fn run_session_start_hook(&self, session_id: SessionId) {
+        if let Some(cmd) = self.config.hooks.session_start.as_deref() {
+            hooks::run_session_start_hook(
+                cmd,
+                &session_id.to_string(),
+                &self.config.working_dir.display().to_string(),
+            )
+            .await;
+        }
+    }
+
+    /// Observe-only `turn_end` hook, run once per model turn after its tools
+    /// are dispatched (or after the provider turn when it requested none). A
+    /// no-op unless configured; never fails the run and holds no lock.
+    async fn run_turn_end_hook(
+        &self,
+        session_id: SessionId,
+        turn: u32,
+        model: &str,
+        usage: Usage,
+        tool_calls: usize,
+    ) {
+        if let Some(cmd) = self.config.hooks.turn_end.as_deref() {
+            let session = session_id.to_string();
+            let working = self.config.working_dir.display().to_string();
+            hooks::run_turn_end_hook(
+                cmd,
+                hooks::TurnEndFacts {
+                    session_id: &session,
+                    working_dir: &working,
+                    turn,
+                    model,
+                    tool_calls: u32::try_from(tool_calls).unwrap_or(u32::MAX),
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            )
+            .await;
+        }
+    }
+
     /// Dispatch one tool call through the hook pipeline (H1): a `pre_tool`
     /// hook may veto the call (its stderr tail becomes the model-visible
     /// error, fail-closed on hook infrastructure errors), then the tool
@@ -1378,6 +2005,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
         ctx: &ToolCtx,
+        user_typed: bool,
     ) -> Result<(ToolOutcome, bool)> {
         let hook_envs = |exit: Option<u8>| {
             let mut envs: Vec<(String, String)> = vec![
@@ -1413,7 +2041,7 @@ impl Engine {
                 call_id: call_id.clone(),
             });
         }
-        let (executed, ran) = self.execute_tool(session_id, call, ctx).await;
+        let (executed, ran) = self.execute_tool(session_id, call, ctx, user_typed).await;
         if let Some(sink) = self.config.on_tool_event.as_ref() {
             sink(ToolActivity::Done {
                 name: call.name.clone(),
@@ -1439,10 +2067,84 @@ impl Engine {
     /// path, then Ask-with-approver (a prompt), otherwise refused. Pure rules:
     /// model-issued calls and the finish gate both route through here.
     fn admission(&self, name: &str) -> Admission {
-        if self.config.approvals.deny.iter().any(|d| d == name) {
+        self.admission_under(name, None)
+    }
+
+    /// [`Engine::admission`] for one concrete call: the permission rules are
+    /// evaluated against its arguments (see `ApprovalPolicy::rules`).
+    fn admission_for_call(&self, name: &str, args: &serde_json::Value) -> Admission {
+        let verdict = self.config.approvals.rules.evaluate(name, args);
+        self.admission_under(name, verdict)
+    }
+
+    /// The only gates a user-typed `!` / `!!` command passes (decision 2).
+    /// The owner's own hard limits: the deny list and a DENY permission
+    /// rule (checked against each `;` / `&&` / `|` segment too, via
+    /// `RuleSet::evaluate`). Approval mode, ASK and ALLOW rules, the plan
+    /// phase and the approver restrict the model, not the user, so they are
+    /// not consulted here. Returns the refusal message, or `None` to run.
+    fn user_shell_refusal(&self, name: &str, args: &serde_json::Value) -> Option<String> {
+        if self.config.approvals.deny.iter().any(|entry| entry == name) {
+            return Some(format!("tool `{name}` denied by configuration (--deny)"));
+        }
+        match self.config.approvals.rules.evaluate(name, args) {
+            Some(verdict) if verdict.effect == RuleEffect::Deny => {
+                Some(format!("tool `{name}` denied by rule `{}`", verdict.rule))
+            }
+            _ => None,
+        }
+    }
+
+    fn admission_under(&self, name: &str, verdict: Option<Verdict>) -> Admission {
+        // `edit_lines` is the same capability as `edit`: an allow or deny
+        // entry for `edit` covers both, so an existing `--deny edit` is
+        // not bypassed by the anchored variant.
+        let listed = |list: &[String]| {
+            list.iter()
+                .any(|entry| entry == name || (name == "edit_lines" && entry == "edit"))
+        };
+        if listed(&self.config.approvals.deny) {
             return Admission::Refused(format!("tool `{name}` denied by configuration (--deny)"));
         }
-        let explicitly_allowed = self.config.approvals.allow.iter().any(|a| a == name);
+        // Plan phase (H2a): read-only by construction. Checked before the
+        // permission rules and the ApproveAll fast path, so no allow rule
+        // or mode can lift it. Ungated tools fall through and still run.
+        if self.config.phase == Phase::Plan && is_gated(name) {
+            return Admission::Refused(PLAN_PHASE_REFUSAL.to_string());
+        }
+        // Permission rules come after the deny list and before the mode
+        // fast path. No verdict, or an `allow` in Deny mode, falls through.
+        if let Some(verdict) = verdict {
+            match verdict.effect {
+                RuleEffect::Deny => {
+                    return Admission::Refused(format!(
+                        "tool `{name}` denied by rule `{}`",
+                        verdict.rule
+                    ));
+                }
+                // Deny mode stays the ceiling: an ask rule never lets a
+                // gated tool reach the approver there (falls through to
+                // the mode's refusal).
+                RuleEffect::Ask
+                    if self.config.approvals.mode == ApprovalMode::Deny && is_gated(name) => {}
+                RuleEffect::Ask => {
+                    // Forced to the approver even when ungated, allow-listed
+                    // or ApproveAll. Without an approver it cannot be asked.
+                    if self.config.approver.is_some() {
+                        return Admission::Ask;
+                    }
+                    return Admission::Refused(format!(
+                        "tool `{name}` requires approval by rule `{}`",
+                        verdict.rule
+                    ));
+                }
+                RuleEffect::Allow if self.config.approvals.mode != ApprovalMode::Deny => {
+                    return Admission::Run;
+                }
+                RuleEffect::Allow => {}
+            }
+        }
+        let explicitly_allowed = listed(&self.config.approvals.allow);
         if !is_gated(name)
             || explicitly_allowed
             || self.config.approvals.mode == ApprovalMode::ApproveAll
@@ -1450,6 +2152,13 @@ impl Engine {
             return Admission::Run;
         }
         if self.config.approvals.mode == ApprovalMode::Ask && self.config.approver.is_some() {
+            // `delegate` starts no prompt of its own (H3b): the child's
+            // gated calls are what the approver sees, each tagged with the
+            // child's label. Deny entries, deny rules and ask rules have
+            // already decided above, so this only lifts the start prompt.
+            if name == "delegate" {
+                return Admission::Run;
+            }
             return Admission::Ask;
         }
         let mode = self.config.approvals.mode;
@@ -1473,10 +2182,12 @@ impl Engine {
                     name: "verify".into(),
                     arguments: serde_json::json!({}),
                 };
-                self.config
-                    .approver
-                    .as_ref()
-                    .is_some_and(|approver| approver(&call))
+                self.config.approver.as_ref().is_some_and(|approver| {
+                    approver(&crate::ApprovalAsk {
+                        call: &call,
+                        agent: None,
+                    })
+                })
             }
             Admission::Refused(_) => false,
         }
@@ -1490,6 +2201,7 @@ impl Engine {
         session_id: SessionId,
         call: &ToolCall,
         ctx: &ToolCtx,
+        user_typed: bool,
     ) -> (ToolOutcome, bool) {
         let Some(tool) = self.tools.get(&call.name).cloned() else {
             let available = self
@@ -1508,16 +2220,25 @@ impl Engine {
             );
         };
 
-        match self.admission(&call.name) {
+        // A user-typed command is never prompted: it passes only the
+        // owner's hard limits (see `user_shell_refusal`).
+        let admission = if user_typed {
+            match self.user_shell_refusal(&call.name, &call.arguments) {
+                Some(message) => Admission::Refused(message),
+                None => Admission::Run,
+            }
+        } else {
+            self.admission_for_call(&call.name, &call.arguments)
+        };
+        match admission {
             Admission::Run => {}
             Admission::Ask => {
                 // Ask mode with an interactive approver (Phase-1c I2): a
                 // denial falls through to the block.
-                let approved = self
-                    .config
-                    .approver
-                    .as_ref()
-                    .is_some_and(|approver| approver(call));
+                let approved =
+                    self.config.approver.as_ref().is_some_and(|approver| {
+                        approver(&crate::ApprovalAsk { call, agent: None })
+                    });
                 if !approved {
                     return (
                         ToolOutcome::err(approval_block_hint(self.config.approvals.mode)),
@@ -1548,6 +2269,84 @@ impl Engine {
             Err(err) => ToolOutcome::err(format!("tool `{}` failed to run: {err}", call.name)),
         };
         (outcome, true)
+    }
+
+    /// Run one user-issued `!command` (or private `!!command`) in the
+    /// session's workspace (PARITY-C, decision 1 and 2 of PLAN.md 10.2a).
+    ///
+    /// The command is a `bash` call built from the user's text. It runs
+    /// through the sandbox policy, the bash timeout, the output cap, the
+    /// pre_tool and post_tool hooks and the pre-mutation checkpoint, like a
+    /// model call. It does NOT go through the approval gate: no approval
+    /// mode, approver, ASK rule or plan phase applies. It is refused only by
+    /// the owner's hard limits (see [`Engine::user_shell_refusal`]), a
+    /// vetoing pre_tool hook, a missing bash tool or an empty command. A
+    /// refused command persists nothing. A command that ran is persisted as
+    /// a `UserShell` event; `private` ones are never sent to the model.
+    /// The finish gate is not armed: no model run is in progress.
+    pub async fn run_user_shell(
+        &self,
+        session_id: SessionId,
+        command: &str,
+        private: bool,
+    ) -> Result<UserShellOutcome> {
+        let command = command.trim();
+        if command.is_empty() {
+            return Ok(UserShellOutcome::refused("usage: !<shell command>"));
+        }
+        if self.tools.get("bash").is_none() {
+            return Ok(UserShellOutcome::refused(
+                "no `bash` tool is registered; shell passthrough needs it",
+            ));
+        }
+        let args = serde_json::json!({ "command": command });
+        // Checked before any hook runs, so a refused command never reaches
+        // the hook either. `execute_tool` repeats the same check.
+        if let Some(reason) = self.user_shell_refusal("bash", &args) {
+            return Ok(UserShellOutcome::refused(reason));
+        }
+        let call = ToolCall {
+            id: format!("user-shell-{}", uuid::Uuid::new_v4()),
+            name: "bash".into(),
+            arguments: args,
+        };
+        let ctx = ToolCtx {
+            sandbox: self.config.sandbox,
+            working_dir: self.config.working_dir.clone(),
+            engine: Some(Arc::new(self.clone())),
+            session_id: Some(session_id),
+        };
+        // `ran` is false for every refusal (a pre_tool veto, the gate, a
+        // failed checkpoint), so only a command that really executed is
+        // persisted.
+        let (outcome, ran) = match self
+            .execute_tool_with_hooks(session_id, &call, &ctx, true)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(err) => (ToolOutcome::err(err.to_string()), false),
+        };
+        if !ran {
+            return Ok(UserShellOutcome::refused(outcome.content));
+        }
+        let output = cap_user_shell_output(&outcome.content);
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::UserShell {
+                    command: command.to_string(),
+                    output: output.clone(),
+                    is_error: outcome.is_error,
+                    private,
+                },
+            )
+            .await?;
+        Ok(UserShellOutcome {
+            allowed: true,
+            output,
+            is_error: outcome.is_error,
+            refused_reason: None,
+        })
     }
 
     /// Whether the autocompaction trigger fires before this turn (X1): never
@@ -1587,6 +2386,11 @@ impl Engine {
         session_id: SessionId,
         state: &mut RunLoopState,
     ) -> Result<bool> {
+        // Plan phase (H2a) is read-only and ends with a recorded plan, not a
+        // verified change: no verify, self-check or escalation runs.
+        if self.config.phase == Phase::Plan {
+            return Ok(false);
+        }
         if !state.mutated_this_run {
             return Ok(false);
         }
@@ -1672,6 +2476,8 @@ impl Engine {
             "finish gate verification"
         );
         let passed = !outcome.is_error;
+        state.run_facts.verify_ran = true;
+        state.run_facts.verify_passed = Some(passed);
         // Persisted as a user message (not an orphan ToolResult): resume and
         // compaction rebuild transcripts from the event log and an unpaired
         // Role::Tool breaks provider request building.
@@ -1698,6 +2504,259 @@ impl Engine {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Independent reviewer pass (H4a) and claim checks (H4b) at normal run
+    /// completion. Returns `true` when NeedsFix findings were queued as a
+    /// user message and the loop must continue; `false` ends the run
+    /// normally. A reviewer error never fails the run: every such path
+    /// records `Skipped`. Claim findings never extend the run: a claim-driven
+    /// NeedsFix is recorded, but only the reviewer's own verdict queues a
+    /// feedback round.
+    async fn review_round(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        state: &mut RunLoopState,
+    ) -> Result<bool> {
+        let claims = self.run_claim_findings(state);
+        // An explicit reviewer wins over the `critic` role (H7c).
+        let reviewer = self
+            .config
+            .reviewer
+            .clone()
+            .or_else(|| self.critic_reviewer(task));
+        let Some(reviewer) = reviewer else {
+            self.record_claims_only(session_id, claims).await?;
+            return Ok(false);
+        };
+        let Some(reviewed) = self
+            .run_reviewer(session_id, task, state, &reviewer)
+            .await?
+        else {
+            self.record_claims_only(session_id, claims).await?;
+            return Ok(false);
+        };
+        let reviewer_verdict = reviewed.verdict;
+        let (verdict, findings) = review::merge_claims(reviewer_verdict, reviewed.findings, claims);
+        self.record_review(session_id, verdict, findings.clone(), &reviewed.model)
+            .await?;
+
+        // Feedback only while the round bound, the turn headroom and the
+        // budgets all leave the loop able to service the fix.
+        let can_feed_back = reviewer_verdict == ReviewVerdict::NeedsFix
+            && state.review_feedback_rounds < reviewer.max_rounds
+            && state.turns < self.config.max_turns
+            && !state.governor.exceeded()
+            && !self
+                .config
+                .max_cost_usd
+                .is_some_and(|cap| state.spend_usd > cap);
+        if !can_feed_back {
+            return Ok(false);
+        }
+        state.review_feedback_rounds += 1;
+        // Persisted as a user message, like the finish gate's feedback.
+        let feedback = Message::user(review::feedback_message(&findings));
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Message {
+                    parent_id: None,
+                    message: feedback.clone(),
+                },
+            )
+            .await?;
+        state.transcript.push(feedback);
+        Ok(true)
+    }
+
+    /// Record the claim checks alone, under model `rules`, when no reviewer
+    /// result is recorded. No claim findings records nothing.
+    async fn record_claims_only(
+        &self,
+        session_id: SessionId,
+        claims: Vec<modron_types::Finding>,
+    ) -> Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+        let (verdict, findings) = review::merge_claims(ReviewVerdict::Pass, Vec::new(), claims);
+        self.record_review(session_id, verdict, findings, "rules")
+            .await
+    }
+
+    /// Claim checks (H4b) on the final answer. Only runs once a file-mutating
+    /// tool ran; a read-only answer makes no claim this check cares about.
+    fn run_claim_findings(&self, state: &RunLoopState) -> Vec<modron_types::Finding> {
+        if !state.ran_file_mutation {
+            return Vec::new();
+        }
+        review::claim_findings(&state.answer, &state.run_facts)
+    }
+
+    /// The reviewer call (H4a). `None` when no review applies (wrong phase,
+    /// nothing mutated, verification given up, budget exhausted). Otherwise
+    /// the outcome to record; `Skipped` whenever the review could not run.
+    async fn run_reviewer(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        state: &mut RunLoopState,
+        reviewer: &crate::ReviewerConfig,
+    ) -> Result<Option<ReviewedDiff>> {
+        // Build phase only, and only after a file-mutating tool actually ran.
+        if self.config.phase != Phase::Build || !state.ran_file_mutation {
+            return Ok(None);
+        }
+        // The finish gate gave up with verification still failing: the
+        // escalation owns that outcome, the reviewer does not run.
+        if state.mutated_this_run && state.verify_rounds >= MAX_VERIFY_ROUNDS {
+            return Ok(None);
+        }
+        // Abnormal stops never get a review: budget, spend cap, and no
+        // turn headroom left to service a feedback round.
+        if state.governor.exceeded()
+            || state.turns >= self.config.max_turns
+            || self
+                .config
+                .max_cost_usd
+                .is_some_and(|cap| state.spend_usd > cap)
+        {
+            return Ok(None);
+        }
+
+        // Only the model part of `provider::model` reaches the wire and the
+        // records; the provider is resolved below.
+        let model = model_part(&reviewer.model).to_string();
+        let Some(diff) = self.collect_review_diff().await else {
+            return Ok(Some(ReviewedDiff::skipped(model)));
+        };
+
+        // Provider resolution mirrors the escalation turn: the reviewer model's
+        // provider (explicit, catalog, else the selector's), the model swapped
+        // in; a model that does not resolve to itself is not silently run
+        // elsewhere (Skipped).
+        let prompt = review::build_review_prompt(task, &diff);
+        let context_tokens = estimate_tokens(review::REVIEWER_SYSTEM) + estimate_tokens(&prompt);
+        let mut choice = self.selector.select(&SelectRequest {
+            task: task.to_string(),
+            action: ActionKind::Chat,
+            context_tokens,
+            budget_remaining_usd: self
+                .config
+                .max_cost_usd
+                .map(|cap| (cap - state.spend_usd).max(0.0)),
+        });
+        let Some((provider_id, _)) = self.resolve_model_ref(&reviewer.model, &choice.provider)
+        else {
+            return Ok(Some(ReviewedDiff::skipped(model.clone())));
+        };
+        choice.provider = provider_id;
+        choice.model = model.clone();
+        choice.reason = format!("review: independent reviewer → {model}");
+        choice.confident = true;
+        let (provider, _) = match self.resolve_provider(&choice) {
+            Ok(resolved) if resolved.1 == model => resolved,
+            _ => {
+                tracing::warn!(model = %model, "reviewer model did not resolve; review skipped");
+                return Ok(Some(ReviewedDiff::skipped(model.clone())));
+            }
+        };
+
+        // ONE tool-less call. Its usage is counted like any other turn.
+        let request = Arc::new(TurnRequest {
+            model: model.clone(),
+            system: review::REVIEWER_SYSTEM.to_string(),
+            messages: vec![Message::user(prompt)],
+            tools: Vec::new(),
+            max_tokens: MAX_OUTPUT_TOKENS,
+            // Reviewer stays on the provider default (H7a): an independent
+            // check must not inherit the main run's thinking budget.
+            effort: None,
+            reasoning_summary: false,
+        });
+        tracing::info!(provider = provider.id(), model = %model, "review turn: independent reviewer");
+        let turn_started = std::time::Instant::now();
+        let response = match provider.turn(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(error = %err, "review turn failed; review skipped");
+                return Ok(Some(ReviewedDiff::skipped(model.clone())));
+            }
+        };
+
+        state.turns += 1;
+        state.governor.feed_turn(response.usage);
+        add_usage(&mut state.total, &response.usage);
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Usage {
+                    model: model.clone(),
+                    usage: response.usage,
+                },
+            )
+            .await?;
+        if !state.models_used.contains(&model) {
+            state.models_used.push(model.clone());
+        }
+        let turn_cost = self.turn_cost_usd(&model, &response.usage);
+        state.spend_usd += turn_cost;
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::TurnTrace {
+                    turn: state.turns,
+                    harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                    provider: provider.id().to_string(),
+                    model: model.clone(),
+                    prompt_hash: None,
+                    latency_ms: Some(turn_started.elapsed().as_millis() as u64),
+                    cost_usd: Some(turn_cost),
+                    usage: Some(response.usage),
+                    verifier: None,
+                    failure_label: None,
+                },
+            )
+            .await?;
+
+        let (verdict, findings) = review::parse_review(&response.text);
+        Ok(Some(ReviewedDiff {
+            verdict,
+            findings,
+            model,
+        }))
+    }
+
+    /// Append one `Review` event (H4a).
+    async fn record_review(
+        &self,
+        session_id: SessionId,
+        verdict: ReviewVerdict,
+        findings: Vec<modron_types::Finding>,
+        model: &str,
+    ) -> Result<()> {
+        self.store
+            .append(
+                session_id,
+                &SessionEvent::Review {
+                    verdict,
+                    findings,
+                    model: model.to_string(),
+                },
+            )
+            .await
+    }
+
+    /// The diff the reviewer sees: the injected source when configured,
+    /// else `git diff --no-color` in the working dir. Empty means no review.
+    async fn collect_review_diff(&self) -> Option<String> {
+        let diff = match &self.config.review_diff_source {
+            Some(source) => (source.as_ref())().map(truncate_review_diff),
+            None => git_diff_text(&self.config.working_dir).await,
+        }?;
+        (!diff.trim().is_empty()).then_some(diff)
     }
 
     /// ONE best-effort escalation turn after the finish gate exhausted its
@@ -1736,12 +2795,10 @@ impl Engine {
                 )
             })?;
 
-        // Provider resolution mirrors the persona path (subagent.rs
-        // ForcedSelector → resolve_provider): keep the selector's provider
-        // for a Chat action and swap only the model, so the registered-
-        // provider → default-provider fallback ladder applies unchanged. A
-        // model id from another provider rides the run's provider — a
-        // mismatch surfaces as a provider error and degrades below.
+        // The escalation model's provider (explicit `provider::`, catalog,
+        // else the selector's for a Chat action), then the usual
+        // resolve_provider ladder. Unresolvable = keep the pre-escalation
+        // answer, as every other escalation failure does.
         let context_tokens = estimate_context_tokens(system, &[], &state.transcript);
         let mut choice = self.selector.select(&SelectRequest {
             task: task.to_string(),
@@ -1752,7 +2809,13 @@ impl Engine {
                 .max_cost_usd
                 .map(|cap| (cap - state.spend_usd).max(0.0)),
         });
-        choice.model = escalation_model.clone();
+        let Some((provider_id, escalation_wire)) =
+            self.resolve_model_ref(&escalation_model, &choice.provider)
+        else {
+            return Ok(());
+        };
+        choice.provider = provider_id;
+        choice.model = escalation_wire.clone();
         choice.reason = format!(
             "escalation: verification failed after {MAX_VERIFY_ROUNDS} rounds → {escalation_model}"
         );
@@ -1762,7 +2825,7 @@ impl Engine {
         // provider is unregistered — an escalation that silently runs on
         // default_model would lie about "the escalation model re-checked
         // this". Abort the escalation instead; the old answer survives.
-        if model != escalation_model {
+        if model != escalation_wire {
             tracing::warn!(
                 requested = %escalation_model,
                 resolved = %model,
@@ -1807,11 +2870,13 @@ impl Engine {
         let request = std::sync::Arc::new(TurnRequest {
             model: model.clone(),
             system: format!("{system}{ESCALATION_SYSTEM_ADDENDUM}"),
-            messages: state.transcript.clone(),
+            messages: self.turn_messages(state),
             // No tools: see the doc comment — a tool call the harness
             // cannot service must not be provoked.
             tools: Vec::new(),
             max_tokens: MAX_OUTPUT_TOKENS,
+            effort: self.config.effort,
+            reasoning_summary: self.config.reasoning_summary,
         });
         tracing::info!(
             provider = provider.id(),
@@ -1883,6 +2948,7 @@ impl Engine {
             tool_calls: Vec::new(),
             tool_call_id: None,
             attachments: Vec::new(),
+            provider_blocks: response.provider_blocks.clone(),
         };
         self.store
             .append(
@@ -1937,7 +3003,7 @@ impl Engine {
                 tracing::warn!(tool = %call.name, "speculative placeholder left by a panicked task - re-executing");
             }
         }
-        self.execute_tool_with_hooks(session_id, call, ctx)
+        self.execute_tool_with_hooks(session_id, call, ctx, false)
             .await
             .unwrap_or_else(|err| (ToolOutcome::err(err.to_string()), false))
     }
@@ -1966,18 +3032,37 @@ impl Engine {
         task: &str,
         next_model: &str,
     ) -> Result<Option<CompactionOutcome>> {
+        let events = self.rewound_events(session_id).await?;
+        self.compact_events(session_id, task, &events, next_model)
+            .await
+    }
+
+    /// The session's event log as a resume sees it: the rewind view applied,
+    /// so a rewound range is never summarized back into context.
+    async fn rewound_events(&self, session_id: SessionId) -> Result<Vec<SessionEvent>> {
         let events = self.store.load(session_id).await?;
-        // Same view as a resume: a rewound range must not be summarized
-        // back into context by a later compaction.
-        let events = rewind_view(
+        Ok(rewind_view(
             &events,
             self.config.resume_from_event,
             self.config.resume_skip_end,
             &self.config.resume_skip_ranges,
         )
-        .into_owned();
-        let (older, tail) =
-            compact::split_older_tail(&events, self.config.compaction.tail_messages);
+        .into_owned())
+    }
+
+    /// The shared compaction routine (autocompaction and `compact_session`):
+    /// summarize everything in `events` older than the kept tail, persist the
+    /// `Compaction` and `Usage` events, and return the rebuilt transcript.
+    /// `events` is the rewound log. `Ok(None)` writes nothing and calls no
+    /// provider when there is nothing older than the tail.
+    async fn compact_events(
+        &self,
+        session_id: SessionId,
+        task: &str,
+        events: &[SessionEvent],
+        next_model: &str,
+    ) -> Result<Option<CompactionOutcome>> {
+        let (older, tail) = compact::split_older_tail(events, self.config.compaction.tail_messages);
         let summarized_count = older
             .iter()
             .filter(|event| is_transcript_item(event))
@@ -1990,7 +3075,7 @@ impl Engine {
         // Only what the previous compaction did not already cover (A7),
         // capped so the summarizer request cannot outgrow its window.
         let older_text =
-            compact::incremental_transcript_text(&events, self.config.compaction.tail_messages);
+            compact::incremental_transcript_text(events, self.config.compaction.tail_messages);
 
         // Route the summarization (cheap model for Summarize per PLAN §4.3).
         let choice = self.selector.select(&SelectRequest {
@@ -1999,6 +3084,7 @@ impl Engine {
             context_tokens: estimate_tokens(&older_text),
             budget_remaining_usd: None,
         });
+        let choice = self.with_role(choice, self.config.roles.summary.as_deref(), "summary");
         let (provider, model) = self.resolve_provider(&choice)?;
 
         let request = std::sync::Arc::new(TurnRequest {
@@ -2007,6 +3093,9 @@ impl Engine {
             messages: vec![Message::user(older_text.as_str())],
             tools: Vec::new(),
             max_tokens: COMPACTION_MAX_OUTPUT_TOKENS,
+            // Summarizer stays on the provider default (H7a).
+            effort: None,
+            reasoning_summary: false,
         });
         tracing::info!(
             provider = provider.id(),
@@ -2079,6 +3168,88 @@ impl Engine {
         }
         bitmap_compact::render_text_bitmap(older_text, bitmap_compact::COMPACT_BITMAP_WIDTH_PX)
     }
+
+    /// Manual compaction (H9b, the `Compact` command) for an IDLE session:
+    /// the same routine autocompaction runs ([`Self::compact_events`]), with
+    /// the threshold and min-interval rule ignored. The starting context is
+    /// rebuilt exactly as a resume would rebuild it (rewind view, orphan
+    /// prune, compaction-aware reconstruction), so `tokens_before` is the
+    /// occupancy the next request would carry. Too little history (nothing
+    /// older than the kept tail) is a no-op: nothing is written.
+    ///
+    /// The caller must ensure no run is active on the session; this method
+    /// does not take a run lock.
+    pub async fn compact_session(&self, session_id: SessionId) -> Result<CompactOutcome> {
+        let events = self.rewound_events(session_id).await?;
+        let tool_specs = self.tools.specs_prompt();
+        let system = self.assemble_system(&tool_specs);
+        let tokens_before = estimate_context_tokens(
+            &system,
+            &tool_specs,
+            &resumed_transcript(&events, self.config.compaction.tail_messages),
+        );
+        // The next turn's model decides the bitmap gate; the default model
+        // is the session's model when no run has selected another.
+        let next_model = self.config.default_model.clone();
+        match self
+            .compact_events(session_id, "", &events, &next_model)
+            .await?
+        {
+            None => Ok(CompactOutcome {
+                compacted: false,
+                tokens_before,
+                tokens_after: tokens_before,
+                usage: Usage::default(),
+                note: "nothing to compact: history fits in the kept tail".into(),
+            }),
+            Some(done) => {
+                let tokens_after = estimate_context_tokens(&system, &tool_specs, &done.transcript);
+                Ok(CompactOutcome {
+                    compacted: true,
+                    tokens_before,
+                    tokens_after,
+                    usage: done.usage,
+                    note: format!("compacted: {tokens_before} -> {tokens_after} tokens"),
+                })
+            }
+        }
+    }
+
+    /// The session's context occupancy (H9b). `used` is the pre-flight
+    /// estimate of the next request: system prompt, tool specs and the
+    /// transcript a resume rebuilds. `window` is the cap the compaction
+    /// trigger uses for the default model: the selector's `context_window`
+    /// (falling back to `max_input_tokens`), never above `max_input_tokens`.
+    /// Read-only: nothing is persisted.
+    pub async fn context_gauge(&self, session_id: SessionId) -> Result<ContextGauge> {
+        let events = self.rewound_events(session_id).await?;
+        let tool_specs = self.tools.specs_prompt();
+        let system = self.assemble_system(&tool_specs);
+        let used = estimate_context_tokens(
+            &system,
+            &tool_specs,
+            &resumed_transcript(&events, self.config.compaction.tail_messages),
+        );
+        let choice = self.selector.select(&SelectRequest {
+            task: String::new(),
+            action: ActionKind::Chat,
+            context_tokens: used,
+            budget_remaining_usd: None,
+        });
+        let window = choice
+            .context_window
+            .unwrap_or(self.config.max_input_tokens)
+            .min(self.config.max_input_tokens);
+        Ok(ContextGauge { used, window })
+    }
+}
+
+/// The transcript a resume rebuilds from a (rewound) event log: orphaned
+/// tool calls pruned, then the compaction-aware reconstruction. Shared by
+/// [`Engine::compact_session`] and [`Engine::context_gauge`].
+fn resumed_transcript(events: &[SessionEvent], tail_messages: usize) -> Vec<Message> {
+    let pruned = prune_unanswered_tool_calls(events);
+    reconstruct_transcript(&pruned, tail_messages)
 }
 
 /// Result of one compaction pass: the rebuilt in-memory transcript plus the
@@ -2101,7 +3272,10 @@ fn compact_state_message(summary: &str) -> Message {
 fn is_transcript_item(event: &SessionEvent) -> bool {
     matches!(
         event,
-        SessionEvent::Task { .. } | SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
+        SessionEvent::Task { .. }
+            | SessionEvent::Message { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::UserShell { private: false, .. }
     )
 }
 
@@ -2198,6 +3372,18 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
         match event {
             SessionEvent::TurnTrace { .. } => {}
             SessionEvent::Task { text } => messages.push(Message::user(text.clone())),
+            SessionEvent::UserShell {
+                command,
+                output,
+                private,
+                ..
+            } => {
+                // A private `!!` command is shown to the user only: it is
+                // skipped here, so it never reaches a TurnRequest.
+                if !private {
+                    messages.push(Message::user(user_shell_transcript(command, output)));
+                }
+            }
             SessionEvent::Message { message, .. } => messages.push(message.clone()),
             SessionEvent::ToolResult { call_id, outcome } => {
                 messages.push(Message::tool_result(call_id.clone(), outcome));
@@ -2207,10 +3393,13 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
             }
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
+            // A review verdict is not conversation content: its feedback
+            // is persisted as its own `Message` event.
+            | SessionEvent::Review { .. }
             | SessionEvent::Usage { .. } => {}
-            // The plan is not a conversation message: the context builder
-            // re-injects the latest plan every turn (the stays-on-track
-            // mechanism), so raw plan writes stay out of the transcript.
+            // The plan is not a conversation message: `run_loop` re-injects
+            // the current plan as a transient tail on every turn (H2a), so
+            // raw plan writes stay out of the transcript.
             SessionEvent::Plan { .. } => {}
         }
     }
@@ -2235,7 +3424,9 @@ fn reconstruct_transcript(events: &[SessionEvent], tail_messages: usize) -> Vec<
             SessionEvent::Compaction { summary, .. } => Some((idx, summary)),
             _ => None,
         });
-    let mut messages = match last_compaction {
+    // The standing plan is not replayed here: `run_loop` re-injects the
+    // current plan as a transient tail on every model turn (H2a).
+    match last_compaction {
         None => events_to_messages(events),
         Some((idx, summary)) => {
             let mut messages = vec![compact_state_message(summary)];
@@ -2244,27 +3435,7 @@ fn reconstruct_transcript(events: &[SessionEvent], tail_messages: usize) -> Vec<
             messages.extend(events_to_messages(&events[idx + 1..]));
             messages
         }
-    };
-    // The standing plan rides at the end of every turn (the
-    // stays-on-track mechanism): the model re-reads its own commitments
-    // before responding. One message; no plan writes to the transcript.
-    if let Some(items) = latest_plan(events) {
-        if !items.is_empty() {
-            let mut body =
-                String::from("[standing plan - keep statuses current via the plan tool]\n");
-            for (ix, item) in items.iter().enumerate() {
-                body.push_str(&format!(
-                    "{}. [{}] {} - {}\n",
-                    ix + 1,
-                    item.status,
-                    item.text,
-                    item.done_criteria
-                ));
-            }
-            messages.push(Message::user(body));
-        }
     }
-    messages
 }
 
 /// The most recent plan in the log, if any.
@@ -2670,6 +3841,7 @@ mod tests {
             }],
             usage: Default::default(),
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -2679,6 +3851,7 @@ mod tests {
             tool_calls: Vec::new(),
             usage: Default::default(),
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -2695,6 +3868,134 @@ mod tests {
             "verify ran twice (fail then pass)"
         );
         assert!(summary.turns >= 3, "the gate forced an extra model turn");
+    }
+
+    /// Engine over an arbitrary provider/registry with the steer inbox wired.
+    fn steer_engine(
+        provider: Arc<dyn ModelProvider>,
+        registry: ToolRegistry,
+        inbox: Arc<crate::SteerInbox>,
+    ) -> Engine {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("mock".to_string(), provider);
+        Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                steer: Some(inbox),
+                ..approve_all_config()
+            },
+        }
+    }
+
+    /// Tool that types a steer message while it runs.
+    struct SteerProbeTool(Arc<crate::SteerInbox>);
+    #[async_trait]
+    impl Tool for SteerProbeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "steer_probe".into(),
+                description: "pushes a steer message".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.0.push("also check the logs".into());
+            Ok(ToolOutcome::ok("probed"))
+        }
+    }
+
+    /// Provider wrapper that pushes a steer message during provider call
+    /// number `at_call` (1-based), then answers as the inner mock does.
+    struct SteerOnCallProvider {
+        inner: Arc<crate::testing::MockProvider>,
+        inbox: Arc<crate::SteerInbox>,
+        at_call: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelProvider for SteerOnCallProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn turn(&self, req: Arc<TurnRequest>) -> Result<TurnResponse> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.at_call {
+                self.inbox.push("wait, also check the tests".into());
+            }
+            self.inner.turn(req).await
+        }
+    }
+
+    #[tokio::test]
+    async fn steer_queued_before_the_run_reaches_the_first_turn() {
+        let inbox = Arc::new(crate::SteerInbox::new());
+        inbox.push("use tabs".into());
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![text("ok")]));
+        let engine = steer_engine(mock.clone(), ToolRegistry::new(), Arc::clone(&inbox));
+        let summary = engine.run_task("write it").await.unwrap();
+        let reqs = mock.requests();
+        let first = &reqs[0].messages;
+        assert_eq!(first[0].content, "write it");
+        assert!(matches!(first[1].role, Role::User));
+        assert_eq!(first[1].content, "use tabs");
+        assert!(inbox.is_empty(), "drained by the first iteration");
+        let events = engine.store.load(summary.session_id).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Task { text } if text == "use tabs")));
+    }
+
+    #[tokio::test]
+    async fn steer_sent_during_a_tool_call_reaches_the_next_turn() {
+        let inbox = Arc::new(crate::SteerInbox::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(SteerProbeTool(Arc::clone(&inbox))));
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![
+            call("steer_probe"),
+            text("done"),
+        ]));
+        let engine = steer_engine(mock.clone(), registry, Arc::clone(&inbox));
+        let summary = engine.run_task("investigate").await.unwrap();
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2);
+        let second = &reqs[1].messages;
+        let pos = second
+            .iter()
+            .position(|m| m.content == "also check the logs")
+            .expect("steer message in the second turn");
+        assert!(matches!(second[pos].role, Role::User));
+        assert!(matches!(second[pos - 1].role, Role::Tool));
+        let events = engine.store.load(summary.session_id).await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Task { text } if text == "also check the logs")));
+    }
+
+    #[tokio::test]
+    async fn steer_arriving_as_the_model_finishes_adds_one_more_turn() {
+        let inbox = Arc::new(crate::SteerInbox::new());
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![
+            text("first answer"),
+            text("answer to steer"),
+        ]));
+        let wrapped = Arc::new(SteerOnCallProvider {
+            inner: Arc::clone(&mock),
+            inbox: Arc::clone(&inbox),
+            at_call: 1,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let engine = steer_engine(wrapped, ToolRegistry::new(), Arc::clone(&inbox));
+        let summary = engine.run_task("hello").await.unwrap();
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "the waiting steer forced one more turn");
+        assert!(reqs[1]
+            .messages
+            .iter()
+            .any(|m| m.content == "wait, also check the tests"));
+        assert_eq!(summary.answer, "answer to steer");
     }
 
     #[tokio::test]
@@ -2724,6 +4025,90 @@ mod tests {
                 .any(|(_, _, label)| label.as_deref() == Some("end_turn")),
             "terminal record carries the stop label: {traces:?}"
         );
+    }
+
+    /// Observe-only lifecycle hooks (H9c): `session_start` fires once per run,
+    /// `turn_end` once per model turn with the right turn numbers, and the
+    /// turn_end stdin carries the turn's usage but no assistant text.
+    #[tokio::test]
+    async fn lifecycle_hooks_fire_once_per_run_and_once_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let starts = dir.path().join("starts.txt");
+        let ends = dir.path().join("ends.txt");
+        let json = dir.path().join("turn_end.json");
+        let config = EngineConfig {
+            hooks: crate::hooks::HookConfig {
+                session_start: Some(format!(
+                    "printf '%s\\n' \"$MODRON_EVENT\" >> {}",
+                    starts.display()
+                )),
+                turn_end: Some(format!(
+                    "printf '%s|%s|%s\\n' \"$MODRON_EVENT\" \"$MODRON_TURN\" \"$MODRON_TOOL_CALLS\" >> {ends}; \
+                     cat >> {json}; echo >> {json}",
+                    ends = ends.display(),
+                    json = json.display()
+                )),
+                ..Default::default()
+            },
+            ..approve_all_config()
+        };
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut first = call_with("probe", json!({}));
+        first.usage = Usage {
+            input_tokens: 11,
+            output_tokens: 3,
+            cached_input_tokens: 0,
+        };
+        let mut last = text("done");
+        last.usage = Usage {
+            input_tokens: 20,
+            output_tokens: 5,
+            cached_input_tokens: 0,
+        };
+        let tool: Arc<dyn Tool> = Arc::new(CountingTool {
+            name: "probe",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(vec![first, last], config, vec![tool]);
+        let summary = engine.run_task("go").await.unwrap();
+        assert_eq!(summary.turns, 2);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        assert_eq!(std::fs::read_to_string(&starts).unwrap(), "session_start\n");
+        assert_eq!(
+            std::fs::read_to_string(&ends).unwrap(),
+            "turn_end|1|1\nturn_end|2|0\n"
+        );
+        let raw = std::fs::read_to_string(&json).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{raw}");
+        assert_eq!(lines[0]["turn"], 1);
+        assert_eq!(lines[0]["input_tokens"], 11);
+        assert_eq!(lines[0]["output_tokens"], 3);
+        assert_eq!(lines[1]["turn"], 2);
+        assert_eq!(lines[1]["input_tokens"], 20);
+        assert_eq!(lines[1]["output_tokens"], 5);
+        assert!(!raw.contains("done"), "assistant text leaked: {raw}");
+    }
+
+    /// Lifecycle hooks are observe-only: a failing hook never fails the run.
+    #[tokio::test]
+    async fn failing_lifecycle_hooks_never_fail_the_run() {
+        let config = EngineConfig {
+            hooks: crate::hooks::HookConfig {
+                session_start: Some("echo boom >&2; exit 1".into()),
+                turn_end: Some("exit 2".into()),
+                ..Default::default()
+            },
+            ..approve_all_config()
+        };
+        let engine = engine_over(vec![text("fine")], config, Vec::new());
+        let summary = engine.run_task("go").await.unwrap();
+        assert_eq!(summary.answer, "fine");
+        assert_eq!(summary.turns, 1);
     }
 
     /// Glob stub counting executions (speculative-execution tests).
@@ -2770,6 +4155,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: Default::default(),
                     stop_reason: StopReason::EndTurn,
+                    provider_blocks: Vec::new(),
                 });
             }
             let read_call = ToolCall {
@@ -2786,6 +4172,7 @@ mod tests {
                 tool_calls: vec![read_call],
                 usage: Default::default(),
                 stop_reason: StopReason::ToolUse,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -2898,6 +4285,7 @@ mod tests {
                 tool_calls: self.final_calls.clone(),
                 usage: Default::default(),
                 stop_reason: StopReason::ToolUse,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -3020,6 +4408,7 @@ mod tests {
                         cached_input_tokens: 0,
                     },
                     stop_reason: StopReason::EndTurn,
+                    provider_blocks: Vec::new(),
                 },
             ])),
         );
@@ -3045,6 +4434,65 @@ mod tests {
             summary.answer.contains("spend cap"),
             "the cap note is still appended: {:?}",
             summary.answer
+        );
+    }
+
+    #[tokio::test]
+    async fn spend_cap_stop_logs_the_billed_tool_call_turn() {
+        // The capped turn is billed, so its assistant message (with the tool
+        // call it requested) must reach the log even though the run stops
+        // before any tool runs. Resume must then prune the dangling call.
+        use crate::SessionStore;
+        use std::collections::HashMap;
+        let store = Arc::new(crate::testing::InMemoryStore::default());
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(crate::testing::MockProvider::with_script(vec![
+                TurnResponse {
+                    text: "reading first".into(),
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                    },
+                    ..call("read")
+                },
+            ])),
+        );
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(ToolRegistry::new()),
+            store: store.clone(),
+            config: EngineConfig {
+                max_cost_usd: Some(0.5),
+                price_lookup: Some(Arc::new(|_: &str| Some((1.0, 1.0)))),
+                ..EngineConfig::default()
+            },
+        };
+        let summary = engine.run_task("big task").await.unwrap();
+        let events = store.load(summary.session_id).await.unwrap();
+        let logged: Vec<&Message> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Message { message, .. } => Some(message),
+                _ => None,
+            })
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(logged.len(), 1, "the billed turn is in the log");
+        assert_eq!(logged[0].content, "reading first");
+        assert_eq!(logged[0].tool_calls.len(), 1);
+        // Resume: the dangling call is pruned before the next request.
+        let pruned = prune_unanswered_tool_calls(&events);
+        assert!(
+            !pruned.iter().any(|e| matches!(
+                e,
+                SessionEvent::Message { message, .. }
+                    if message.role == Role::Assistant && !message.tool_calls.is_empty()
+            )),
+            "a dangling tool call is not replayed on resume"
         );
     }
 
@@ -3242,6 +4690,71 @@ mod tests {
         assert_eq!(summary.turns, 5);
     }
 
+    /// The escalation harness with a second provider `other`: the main loop
+    /// runs on `mock`, and the escalation model (`other-*`) is served by
+    /// `other` through the provider lookup.
+    fn escalation_on_other_provider(
+        mock_script: Vec<TurnResponse>,
+        other_script: Vec<TurnResponse>,
+        escalate: &str,
+    ) -> (
+        Engine,
+        std::sync::Arc<crate::testing::MockProvider>,
+        std::sync::Arc<crate::testing::MockProvider>,
+    ) {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(GateWriteTool));
+        registry.register(std::sync::Arc::new(AlwaysFailVerifyTool));
+        let mock = std::sync::Arc::new(crate::testing::MockProvider::with_script(mock_script));
+        let other = std::sync::Arc::new(crate::testing::MockProvider::with_script(other_script));
+        let mut providers: HashMap<String, std::sync::Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            std::sync::Arc::clone(&mock) as std::sync::Arc<dyn ModelProvider>,
+        );
+        providers.insert(
+            "other".into(),
+            std::sync::Arc::clone(&other) as std::sync::Arc<dyn ModelProvider>,
+        );
+        let lookup: std::sync::Arc<crate::ProviderLookup> = std::sync::Arc::new(|model: &str| {
+            model.starts_with("other-").then(|| "other".to_string())
+        });
+        let engine = Engine {
+            selector: std::sync::Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: std::sync::Arc::new(registry),
+            store: std::sync::Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                escalate_on_check_failure: Some(escalate.to_string()),
+                approvals: approve_all(),
+                provider_lookup: Some(lookup),
+                ..EngineConfig::default()
+            },
+        };
+        (engine, mock, other)
+    }
+
+    #[tokio::test]
+    async fn escalation_follows_the_lookup_to_its_provider() {
+        let (engine, mock, other) = escalation_on_other_provider(
+            vec![
+                call("write"),
+                text("attempt 1"),
+                text("attempt 2"),
+                text("attempt 3"),
+            ],
+            vec![text("ESCALATED ANSWER")],
+            "other-escalated",
+        );
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.answer, "ESCALATED ANSWER");
+        assert_eq!(mock.requests().len(), 4, "main turns stay on the router");
+        let escalated = other.requests();
+        assert_eq!(escalated.len(), 1, "one escalation turn");
+        assert_eq!(escalated[0].model, "other-escalated");
+    }
+
     #[tokio::test]
     async fn escalation_does_not_fire_when_unset() {
         // Same exhausted-gate script without `escalate_on_check_failure`:
@@ -3390,6 +4903,287 @@ mod tests {
         assert_eq!(summary.turns, 2, "the skip ends the run, no feedback turn");
     }
 
+    /// Tool that counts its executions under a fixed name (rule tests).
+    struct CountingTool {
+        name: &'static str,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "counting tool".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutcome::ok("ran"))
+        }
+    }
+
+    fn call_with(name: &str, arguments: serde_json::Value) -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("c-{name}"),
+                name: name.into(),
+                arguments,
+            }],
+            usage: Default::default(),
+            stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    /// Engine over the given tools with an explicit config.
+    fn engine_over(
+        script: Vec<TurnResponse>,
+        config: EngineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Engine {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(tool);
+        }
+        let mock = Arc::new(crate::testing::MockProvider::with_script(script));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), mock as Arc<dyn ModelProvider>);
+        Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config,
+        }
+    }
+
+    /// An approver that counts its calls and answers `answer`.
+    fn counting_approver(
+        answer: bool,
+    ) -> (Arc<crate::Approver>, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let approver: Arc<crate::Approver> = Arc::new(move |_ask: &crate::ApprovalAsk<'_>| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer
+        });
+        (approver, asked)
+    }
+
+    /// Comparable form of an admission verdict.
+    fn admission_tag(admission: &Admission) -> String {
+        match admission {
+            Admission::Run => "run".to_string(),
+            Admission::Ask => "ask".to_string(),
+            Admission::Refused(message) => format!("refused: {message}"),
+        }
+    }
+
+    fn rules_of(specs: &[(crate::permissions::RuleEffect, &str)]) -> crate::permissions::RuleSet {
+        crate::permissions::RuleSet::new(
+            specs
+                .iter()
+                .map(|(effect, spec)| crate::permissions::Rule::parse(*effect, spec).unwrap())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn rule_deny_refuses_even_under_approve_all() {
+        use crate::permissions::RuleEffect::Deny;
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                rules: rules_of(&[(Deny, "bash(rm -rf*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = engine_over(Vec::new(), config, Vec::new());
+        let admission = engine.admission_for_call("bash", &json!({"command": "rm -rf /tmp/x"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: tool `bash` denied by rule `deny bash(rm -rf*)`"
+        );
+        // A non-matching call still gets the mode's verdict.
+        let ok = engine.admission_for_call("bash", &json!({"command": "ls"}));
+        assert_eq!(admission_tag(&ok), "run");
+    }
+
+    #[tokio::test]
+    async fn rule_ask_forces_an_ungated_tool_to_the_approver() {
+        use crate::permissions::RuleEffect::Ask;
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (approver, asked) = counting_approver(true);
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                rules: rules_of(&[(Ask, "read(.env*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            approver: Some(approver),
+            ..EngineConfig::default()
+        };
+        let read = Arc::new(CountingTool {
+            name: "read",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call_with("read", json!({"path": ".env"})), text("done")],
+            config,
+            vec![read as Arc<dyn Tool>],
+        );
+        let admission = engine.admission_for_call("read", &json!({"path": ".env"}));
+        assert_eq!(admission_tag(&admission), "ask");
+        // Other paths stay on the ungated fast path.
+        let plain = engine.admission_for_call("read", &json!({"path": "src/lib.rs"}));
+        assert_eq!(admission_tag(&plain), "run");
+
+        engine.run_task("read the secrets").await.unwrap();
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "approved once"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_ask_without_an_approver_refuses_the_call() {
+        use crate::permissions::RuleEffect::Ask;
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                rules: rules_of(&[(Ask, "read(.env*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let read = Arc::new(CountingTool {
+            name: "read",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call_with("read", json!({"path": ".env"})), text("done")],
+            config,
+            vec![read as Arc<dyn Tool>],
+        );
+        let admission = engine.admission_for_call("read", &json!({"path": ".env"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: tool `read` requires approval by rule `ask read(.env*)`"
+        );
+        engine.run_task("read the secrets").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rule_allow_runs_a_gated_tool_without_prompting() {
+        use crate::permissions::RuleEffect::Allow;
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The approver would refuse, so any prompt would block the write.
+        let (approver, asked) = counting_approver(false);
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::Ask,
+                rules: rules_of(&[(Allow, "write(src/**)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            approver: Some(approver),
+            ..EngineConfig::default()
+        };
+        let write = Arc::new(CountingTool {
+            name: "write",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![
+                call_with("write", json!({"path": "src/a.rs"})),
+                text("done"),
+            ],
+            config,
+            vec![write as Arc<dyn Tool>],
+        );
+        let admission = engine.admission_for_call("write", &json!({"path": "src/a.rs"}));
+        assert_eq!(admission_tag(&admission), "run");
+        engine.run_task("edit").await.unwrap();
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rule_allow_keeps_deny_mode_blocking() {
+        use crate::permissions::RuleEffect::Allow;
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::Deny,
+                rules: rules_of(&[(Allow, "write")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = engine_over(Vec::new(), config, Vec::new());
+        let admission = engine.admission_for_call("write", &json!({"path": "a"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: blocked by approval mode: deny"
+        );
+    }
+
+    #[test]
+    fn deny_list_beats_an_allow_rule() {
+        use crate::permissions::RuleEffect::Allow;
+        let config = EngineConfig {
+            approvals: crate::ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                deny: vec!["bash".into()],
+                rules: rules_of(&[(Allow, "bash(cargo*)")]),
+                ..crate::ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = engine_over(Vec::new(), config, Vec::new());
+        let admission = engine.admission_for_call("bash", &json!({"command": "cargo test"}));
+        assert_eq!(
+            admission_tag(&admission),
+            "refused: tool `bash` denied by configuration (--deny)"
+        );
+    }
+
+    #[test]
+    fn no_rules_leaves_admission_unchanged() {
+        let cases = [
+            (ApprovalMode::Ask, vec![], vec![]),
+            (ApprovalMode::Deny, vec![], vec![]),
+            (ApprovalMode::ApproveAll, vec![], vec![]),
+            (ApprovalMode::Ask, vec!["write".to_string()], vec![]),
+            (ApprovalMode::Ask, vec![], vec!["read".to_string()]),
+        ];
+        for (mode, allow, deny) in cases {
+            let config = EngineConfig {
+                approvals: crate::ApprovalPolicy {
+                    mode,
+                    allow: allow.clone(),
+                    deny: deny.clone(),
+                    ..crate::ApprovalPolicy::default()
+                },
+                ..EngineConfig::default()
+            };
+            let engine = engine_over(Vec::new(), config, Vec::new());
+            for name in ["read", "write", "bash", "edit_lines", "mcp__fs__x"] {
+                let args = json!({"path": "src/a.rs", "command": "ls"});
+                assert_eq!(
+                    admission_tag(&engine.admission_for_call(name, &args)),
+                    admission_tag(&engine.admission(name)),
+                    "{name} under {mode:?} allow={allow:?} deny={deny:?}"
+                );
+            }
+        }
+    }
+
     /// A tool-call turn that also carries non-empty assistant text.
     fn call_with_text(text: &str, name: &str) -> TurnResponse {
         TurnResponse {
@@ -3460,5 +5254,2164 @@ mod tests {
             result.is_err(),
             "a provider error on a later turn must propagate, got {result:?}"
         );
+    }
+
+    /// Plan-phase fixtures (H2a). `PlanWriteTool` appends a plan to the
+    /// run's log the way the real `plan` tool does (the engine supplies the
+    /// session through the tool context).
+    struct PlanWriteTool;
+    #[async_trait]
+    impl Tool for PlanWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "plan".into(),
+                description: "test plan".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+            let (Some(engine), Some(session)) = (ctx.engine.as_ref(), ctx.session_id) else {
+                return Ok(ToolOutcome::err("no session in context"));
+            };
+            engine
+                .store
+                .append(
+                    session,
+                    &SessionEvent::Plan {
+                        items: plan_items(),
+                    },
+                )
+                .await?;
+            Ok(ToolOutcome::ok("plan set"))
+        }
+    }
+
+    fn plan_items() -> Vec<modron_types::PlanItem> {
+        vec![
+            modron_types::PlanItem {
+                text: "map the crate".into(),
+                done_criteria: "crate listed".into(),
+                status: "done".into(),
+            },
+            modron_types::PlanItem {
+                text: "draft the fix".into(),
+                done_criteria: String::new(),
+                status: "pending".into(),
+            },
+        ]
+    }
+
+    const PLAN_TAIL: &str = "Current plan:\n[done] map the crate (done: crate listed)\n[pending] draft the fix\nPhase: plan (read-only).";
+
+    fn plan_config(approvals: crate::ApprovalPolicy) -> EngineConfig {
+        EngineConfig {
+            phase: Phase::Plan,
+            approvals,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn plan_phase_refuses_gated_tools_even_under_approve_all_and_allow_rules() {
+        let approve_all_plan = admission_engine(plan_config(approve_all()));
+        assert_eq!(
+            admission_tag(&approve_all_plan.admission_for_call("write", &json!({}))),
+            format!("refused: {PLAN_PHASE_REFUSAL}")
+        );
+        assert_eq!(
+            admission_tag(&approve_all_plan.admission("bash")),
+            format!("refused: {PLAN_PHASE_REFUSAL}"),
+            "every gated tool is refused, not just write"
+        );
+        let allow_rule_plan = admission_engine(plan_config(crate::ApprovalPolicy {
+            mode: ApprovalMode::Ask,
+            rules: rules_of(&[(crate::permissions::RuleEffect::Allow, "write")]),
+            ..crate::ApprovalPolicy::default()
+        }));
+        assert_eq!(
+            admission_tag(&allow_rule_plan.admission_for_call("write", &json!({"path": "a"}))),
+            format!("refused: {PLAN_PHASE_REFUSAL}"),
+            "an allow rule cannot lift the plan-phase refusal"
+        );
+    }
+
+    /// Engine with no tools or script, for admission-level checks.
+    fn admission_engine(config: EngineConfig) -> Engine {
+        engine_over(Vec::new(), config, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn plan_phase_never_runs_a_gated_tool() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write = Arc::new(CountingTool {
+            name: "write",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call("write"), text("done")],
+            plan_config(approve_all()),
+            vec![write],
+        );
+        let summary = engine.run_task("plan it").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(summary.answer, "done");
+    }
+
+    #[tokio::test]
+    async fn plan_phase_still_runs_ungated_tools() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read = Arc::new(CountingTool {
+            name: "read",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call("read"), text("done")],
+            plan_config(crate::ApprovalPolicy::default()),
+            vec![read],
+        );
+        engine.run_task("explore").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn build_phase_runs_gated_tools_under_approve_all() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write = Arc::new(CountingTool {
+            name: "write",
+            runs: Arc::clone(&runs),
+        });
+        let engine = engine_over(
+            vec![call("write"), text("done")],
+            approve_all_config(),
+            vec![write],
+        );
+        engine.run_task("build it").await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn plan_tail_message_shapes() {
+        let items = plan_items();
+        let plan_with = plan_tail_message(Phase::Plan, Some(&items)).unwrap();
+        assert_eq!(plan_with.content, PLAN_TAIL);
+        let build_with = plan_tail_message(Phase::Build, Some(&items)).unwrap();
+        assert_eq!(
+            build_with.content,
+            PLAN_TAIL.replace("\nPhase: plan (read-only).", "")
+        );
+        let plan_none = plan_tail_message(Phase::Plan, None).unwrap();
+        assert_eq!(
+            plan_none.content,
+            "This session is in plan phase (read-only) and must end by recording a plan with the plan tool."
+        );
+        assert!(plan_tail_message(Phase::Build, None).is_none());
+        assert!(plan_tail_message(Phase::Build, Some(&[])).is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_tail_is_transient_and_refreshed_after_a_plan_write() {
+        use std::collections::HashMap;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(PlanWriteTool));
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![
+            call("plan"),
+            text("done"),
+        ]));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: plan_config(crate::ApprovalPolicy::default()),
+        };
+        let summary = engine.run_task("ship it").await.unwrap();
+        assert_eq!(summary.turns, 2);
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        // Turn 1: no plan yet, so the tail only states the phase; the
+        // request is the task plus that tail.
+        let first = &requests[0].messages;
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            first.last().unwrap().content,
+            "This session is in plan phase (read-only) and must end by recording a plan with the plan tool."
+        );
+        // Turn 2: the plan written during turn 1 is in the tail, last.
+        let second = &requests[1].messages;
+        assert_eq!(second.len(), 4, "task, plan call, plan result, tail");
+        assert_eq!(second.last().unwrap().content, PLAN_TAIL);
+
+        // The tail is never persisted: no event carries it.
+        let session = engine.store.list().await.unwrap()[0].id;
+        let events = engine.store.load(session).await.unwrap();
+        let dump = format!("{events:?}");
+        assert!(!dump.contains("Current plan:"), "tail leaked into the log");
+        assert!(
+            !dump.contains("plan phase (read-only)"),
+            "tail leaked into the log"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Plan { .. })),
+            "the plan itself is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_run_gets_the_plan_tail_not_a_transcript_copy() {
+        let mock = Arc::new(crate::testing::MockProvider::with_script(vec![text(
+            "continued",
+        )]));
+        let mut providers: std::collections::HashMap<String, Arc<dyn ModelProvider>> =
+            std::collections::HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let engine = Engine {
+            selector: Arc::new(crate::testing::StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::new(crate::testing::InMemoryStore::default()),
+            config: EngineConfig {
+                phase: Phase::Build,
+                ..EngineConfig::default()
+            },
+        };
+        let session = engine.store.create_session("resume").await.unwrap().id;
+        engine
+            .store
+            .append(
+                session,
+                &SessionEvent::Task {
+                    text: "first".into(),
+                },
+            )
+            .await
+            .unwrap();
+        engine
+            .store
+            .append(
+                session,
+                &SessionEvent::Plan {
+                    items: plan_items(),
+                },
+            )
+            .await
+            .unwrap();
+        engine.run_task_resuming(session, "again").await.unwrap();
+
+        let requests = mock.requests();
+        let messages = &requests[0].messages;
+        // Task, the new task, and exactly one plan tail: the plan is not
+        // also replayed as a transcript message.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages.last().unwrap().content,
+            PLAN_TAIL.replace("\nPhase: plan (read-only).", "")
+        );
+        assert!(messages
+            .iter()
+            .all(|m| !m.content.contains("standing plan")));
+    }
+}
+
+#[cfg(test)]
+mod claim_pass_tests {
+    //! Claim checks and the working-tree diff (H4b) against the scripted
+    //! mock provider. Only the new-file test touches git (a temp repo).
+    use super::*;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalMode, ApprovalPolicy, EngineConfig, ReviewDiffSource, ReviewerConfig, SessionStore,
+        Tool, ToolRegistry,
+    };
+    use async_trait::async_trait;
+    use modron_types::{Finding, ReviewVerdict, Severity};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A named tool: `write`/`bash` always succeed; `verify` succeeds only
+    /// when `passes` is set.
+    struct NamedTool {
+        name: &'static str,
+        passes: bool,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "test tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(if self.passes {
+                ToolOutcome::ok("ok")
+            } else {
+                ToolOutcome::err("tests failed")
+            })
+        }
+    }
+
+    struct Harness {
+        engine: Engine,
+        mock: Arc<MockProvider>,
+        store: Arc<InMemoryStore>,
+    }
+
+    fn build(script: Vec<TurnResponse>, config: EngineConfig, tools: Vec<NamedTool>) -> Harness {
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(Arc::new(tool));
+        }
+        let mock = Arc::new(MockProvider::with_script(script));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let store = Arc::new(InMemoryStore::default());
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::clone(&store) as Arc<dyn SessionStore>,
+            config,
+        };
+        Harness {
+            engine,
+            mock,
+            store,
+        }
+    }
+
+    fn auto_approve() -> ApprovalPolicy {
+        ApprovalPolicy {
+            mode: ApprovalMode::ApproveAll,
+            ..ApprovalPolicy::default()
+        }
+    }
+
+    fn fixed_diff(diff: Option<&str>) -> Option<Arc<ReviewDiffSource>> {
+        let diff = diff.map(String::from);
+        Some(Arc::new(move || diff.clone()) as Arc<ReviewDiffSource>)
+    }
+
+    fn tool_turn(name: &str, arguments: serde_json::Value) -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("{name}-call"),
+                name: name.into(),
+                arguments,
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    fn reply(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    async fn reviews(
+        h: &Harness,
+        session: SessionId,
+    ) -> Vec<(ReviewVerdict, Vec<Finding>, String)> {
+        h.store
+            .load(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Review {
+                    verdict,
+                    findings,
+                    model,
+                } => Some((verdict, findings, model)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rules_config() -> EngineConfig {
+        EngineConfig {
+            approvals: auto_approve(),
+            ..EngineConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_without_a_reviewer_is_recorded_under_rules() {
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                reply("All tests pass."),
+            ],
+            rules_config(),
+            vec![NamedTool {
+                name: "write",
+                passes: true,
+            }],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, ReviewVerdict::Pass);
+        assert_eq!(found[0].2, "rules");
+        assert_eq!(found[0].1.len(), 1);
+        assert_eq!(found[0].1[0].severity, Severity::P2);
+        assert_eq!(h.mock.requests().len(), 2, "no reviewer call, no fix round");
+    }
+
+    #[tokio::test]
+    async fn no_claim_records_nothing_without_a_reviewer() {
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                reply("Edited the file."),
+            ],
+            rules_config(),
+            vec![NamedTool {
+                name: "write",
+                passes: true,
+            }],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_test_command_that_ran_silences_the_tests_claim() {
+        let h = build(
+            vec![
+                tool_turn("bash", serde_json::json!({"command": "cargo test -q"})),
+                tool_turn("write", serde_json::json!({})),
+                reply("All tests pass."),
+            ],
+            rules_config(),
+            vec![
+                NamedTool {
+                    name: "write",
+                    passes: true,
+                },
+                NamedTool {
+                    name: "bash",
+                    passes: true,
+                },
+            ],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_verify_claim_flips_pass_to_needs_fix_without_a_round() {
+        // Ask mode: the approver grants the model's own verify call and
+        // refuses the finish gate's, so verify ends failed and the gate
+        // stands down (the run is not extended by the gate or a feedback round).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let approver_calls = Arc::clone(&calls);
+        let approver = Arc::new(move |_ask: &crate::ApprovalAsk<'_>| {
+            approver_calls.fetch_add(1, Ordering::SeqCst) == 0
+        }) as Arc<crate::Approver>;
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::Ask,
+                allow: vec!["write".into()],
+                ..ApprovalPolicy::default()
+            },
+            approver: Some(approver),
+            reviewer: Some(ReviewerConfig {
+                model: "rev-model".into(),
+                max_rounds: 1,
+            }),
+            review_diff_source: fixed_diff(Some("diff --git a/a b/a\n+x\n")),
+            ..EngineConfig::default()
+        };
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                tool_turn("verify", serde_json::json!({})),
+                reply("All tests pass."),
+                reply("VERDICT: PASS"),
+            ],
+            config,
+            vec![
+                NamedTool {
+                    name: "write",
+                    passes: true,
+                },
+                NamedTool {
+                    name: "verify",
+                    passes: false,
+                },
+            ],
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, ReviewVerdict::NeedsFix);
+        assert_eq!(found[0].2, "rev-model");
+        assert!(
+            found[0].1.iter().any(|f| f.severity == Severity::P1
+                && f.text == "claims success, but the verify command failed"),
+            "{:?}",
+            found[0].1
+        );
+        assert_eq!(
+            h.mock.requests().len(),
+            4,
+            "write, verify, answer, reviewer: no feedback round"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_files_only_change_is_reviewed_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+
+        let config = EngineConfig {
+            approvals: auto_approve(),
+            working_dir: dir.path().to_path_buf(),
+            reviewer: Some(ReviewerConfig {
+                model: "rev-model".into(),
+                max_rounds: 1,
+            }),
+            review_diff_source: None,
+            ..EngineConfig::default()
+        };
+        let h = build(
+            vec![
+                tool_turn("write", serde_json::json!({})),
+                reply("Added new.rs."),
+                reply("VERDICT: PASS"),
+            ],
+            config,
+            vec![NamedTool {
+                name: "write",
+                passes: true,
+            }],
+        );
+        let summary = h.engine.run_task("add new.rs").await.unwrap();
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, ReviewVerdict::Pass, "reviewed, not Skipped");
+        let requests = h.mock.requests();
+        let reviewer_prompt = &requests[2].messages[0].content;
+        assert!(reviewer_prompt.contains("diff --git a/new.rs b/new.rs"));
+        assert!(reviewer_prompt.contains("+fn main() {}"));
+    }
+}
+
+#[cfg(test)]
+mod review_pass_tests {
+    //! Reviewer pass (H4a) against the scripted mock provider. The diff is
+    //! injected through `EngineConfig::review_diff_source`, so no git repo
+    //! is needed. The mock serves main turns and reviewer calls alike.
+    use super::*;
+    use crate::review::REVIEWER_SYSTEM;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalMode, ApprovalPolicy, EngineConfig, ReviewDiffSource, ReviewerConfig, SessionStore,
+        Tool, ToolRegistry,
+    };
+    use async_trait::async_trait;
+    use modron_types::{Finding, ReviewVerdict, Severity};
+    use std::collections::HashMap;
+
+    /// A file-mutating tool that always succeeds (no verify tool registered,
+    /// so the finish gate stays out of the way).
+    struct ReviewWriteTool;
+
+    #[async_trait]
+    impl Tool for ReviewWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "test write".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::ok("wrote"))
+        }
+    }
+
+    struct Harness {
+        engine: Engine,
+        mock: Arc<MockProvider>,
+        store: Arc<InMemoryStore>,
+    }
+
+    fn reviewer(max_rounds: u32) -> Option<ReviewerConfig> {
+        Some(ReviewerConfig {
+            model: "rev-model".into(),
+            max_rounds,
+        })
+    }
+
+    fn harness(
+        script: Vec<TurnResponse>,
+        reviewer: Option<ReviewerConfig>,
+        diff: Option<&str>,
+    ) -> Harness {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReviewWriteTool));
+        let mock = Arc::new(MockProvider::with_script(script));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let store = Arc::new(InMemoryStore::default());
+        let diff = diff.map(String::from);
+        let source = Arc::new(move || diff.clone()) as Arc<ReviewDiffSource>;
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                ..ApprovalPolicy::default()
+            },
+            reviewer,
+            review_diff_source: Some(source),
+            ..EngineConfig::default()
+        };
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::clone(&store) as Arc<dyn SessionStore>,
+            config,
+        };
+        Harness {
+            engine,
+            mock,
+            store,
+        }
+    }
+
+    fn write_call() -> TurnResponse {
+        TurnResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "w1".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    fn reply(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    fn reply_with_usage(text: &str, usage: Usage) -> TurnResponse {
+        TurnResponse {
+            usage,
+            ..reply(text)
+        }
+    }
+
+    async fn reviews(
+        h: &Harness,
+        session: SessionId,
+    ) -> Vec<(ReviewVerdict, Vec<Finding>, String)> {
+        h.store
+            .load(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Review {
+                    verdict,
+                    findings,
+                    model,
+                } => Some((verdict, findings, model)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\n+let x = 1;\n";
+
+    #[tokio::test]
+    async fn pass_verdict_is_recorded_and_the_run_ends() {
+        let h = harness(
+            vec![
+                write_call(),
+                reply("done"),
+                reply("VERDICT: PASS\nP3 src/a.rs:1 - naming nit"),
+            ],
+            reviewer(1),
+            Some(DIFF),
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "done", "a pass leaves the answer alone");
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, ReviewVerdict::Pass);
+        assert_eq!(found[0].2, "rev-model");
+        assert_eq!(found[0].1.len(), 1, "findings on a pass are kept as notes");
+        assert_eq!(found[0].1[0].severity, Severity::P3);
+        assert_eq!(h.mock.requests().len(), 3, "main, main, one reviewer call");
+    }
+
+    #[tokio::test]
+    async fn reviewer_call_is_tool_less_with_the_review_prompt() {
+        let h = harness(
+            vec![write_call(), reply("done"), reply("VERDICT: PASS")],
+            reviewer(1),
+            Some(DIFF),
+        );
+        h.engine.run_task("add x").await.unwrap();
+        let requests = h.mock.requests();
+        let review_request = requests.last().unwrap();
+        assert_eq!(review_request.model, "rev-model");
+        assert_eq!(review_request.system, REVIEWER_SYSTEM);
+        assert!(
+            review_request.tools.is_empty(),
+            "the reviewer gets no tools"
+        );
+        assert_eq!(review_request.messages.len(), 1);
+        let prompt = &review_request.messages[0].content;
+        assert!(prompt.contains("add x") && prompt.contains("+let x = 1;"));
+    }
+
+    #[tokio::test]
+    async fn needs_fix_feeds_back_then_is_bounded_by_max_rounds() {
+        // write -> answer -> review NEEDS_FIX -> feedback -> fixed answer ->
+        // review NEEDS_FIX again: max_rounds = 1 spent, so the run ends with
+        // the second verdict recorded and no third review.
+        let h = harness(
+            vec![
+                write_call(),
+                reply("first answer"),
+                reply("VERDICT: NEEDS_FIX\nP1 src/a.rs:4 - off by one in the bound"),
+                reply("fixed answer"),
+                reply("VERDICT: NEEDS_FIX\nP2 src/a.rs:9 - still wrong"),
+            ],
+            reviewer(1),
+            Some(DIFF),
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "fixed answer");
+
+        let requests = h.mock.requests();
+        assert_eq!(
+            requests.len(),
+            5,
+            "main, main, review, main after feedback, review"
+        );
+        let next_turn = &requests[3];
+        assert!(
+            next_turn
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.contains("P1 src/a.rs:4 - off by one")),
+            "the findings reach the next main TurnRequest"
+        );
+
+        let found = reviews(&h, summary.session_id).await;
+        let verdicts: Vec<ReviewVerdict> = found.iter().map(|r| r.0).collect();
+        assert_eq!(
+            verdicts,
+            vec![ReviewVerdict::NeedsFix, ReviewVerdict::NeedsFix]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_file_mutation_means_no_review() {
+        let h = harness(vec![reply("just an answer")], reviewer(1), Some(DIFF));
+        let summary = h.engine.run_task("explain").await.unwrap();
+        assert_eq!(summary.answer, "just an answer");
+        assert_eq!(h.mock.requests().len(), 1, "no reviewer call");
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviewer_not_configured_means_no_review() {
+        let h = harness(vec![write_call(), reply("done")], None, Some(DIFF));
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(h.mock.requests().len(), 2);
+        assert!(reviews(&h, summary.session_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_diff_records_skipped_without_a_provider_call() {
+        let h = harness(vec![write_call(), reply("done")], reviewer(1), None);
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "done");
+        assert_eq!(
+            h.mock.requests().len(),
+            2,
+            "no reviewer call without a diff"
+        );
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, ReviewVerdict::Skipped);
+        assert!(found[0].1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviewer_provider_error_is_skipped_and_the_run_succeeds() {
+        // The script ends after the main answer: the reviewer call errors.
+        let h = harness(vec![write_call(), reply("done")], reviewer(1), Some(DIFF));
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(summary.answer, "done", "the run still succeeds");
+        let found = reviews(&h, summary.session_id).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, ReviewVerdict::Skipped);
+    }
+
+    #[tokio::test]
+    async fn reviewer_usage_is_counted_in_the_run_total() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+        };
+        let h = harness(
+            vec![
+                write_call(),
+                reply("done"),
+                reply_with_usage("VERDICT: PASS", usage),
+            ],
+            reviewer(1),
+            Some(DIFF),
+        );
+        let summary = h.engine.run_task("add x").await.unwrap();
+        assert_eq!(
+            summary.usage.input_tokens, 100,
+            "review input is in the total"
+        );
+        assert_eq!(summary.usage.output_tokens, 10);
+        let events = h.store.load(summary.session_id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Usage { model, usage: u } if model == "rev-model" && u.input_tokens == 100
+        )));
+        assert!(summary.models_used.contains(&"rev-model".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        CompactionPolicy, Engine, EngineConfig, ModelProvider, Result, Role, SessionEvent,
+        SessionStore, StopReason, Tool, ToolCall, ToolCtx, ToolOutcome, ToolRegistry, ToolSpec,
+        TurnResponse, Usage,
+    };
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    const TASK: &str = "Review the login module end to end and list the auth edge cases.";
+    const SUMMARY: &str = "TASK: review login module. DECISIONS: none. EDITS: none. \
+OPEN ITEMS: write the fix.";
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "echo_tool".into(),
+                description: "Echoes a short confirmation.".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::ok("echo ok"))
+        }
+    }
+
+    fn config() -> EngineConfig {
+        EngineConfig {
+            working_dir: PathBuf::from("/nonexistent/modron-context-test"),
+            system: "You are a test agent.".into(),
+            compaction: CompactionPolicy {
+                // Autocompaction stays out of the way: only the manual
+                // command compacts in these tests.
+                enabled: false,
+                threshold_frac: 0.8,
+                min_interval_turns: 2,
+                tail_messages: 2,
+                summary_max_bytes: 2048,
+                bitmap_compaction: false,
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    fn engine(provider: Arc<MockProvider>, store: Arc<InMemoryStore>) -> Engine {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), provider);
+        Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store,
+            config: config(),
+        }
+    }
+
+    fn tool_call(id: &str, text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "echo_tool".into(),
+                arguments: json!({}),
+            }],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    fn text_reply(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: vec![],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+            },
+            stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    /// Three tool-call turns with a long chatty middle turn, then a final
+    /// answer: the history a manual compaction has real work to do on.
+    fn long_run_script() -> Vec<TurnResponse> {
+        let long = "chatty analysis of the login module. ".repeat(200);
+        vec![
+            tool_call("call_1", ""),
+            tool_call("call_2", &long),
+            tool_call("call_3", "short note"),
+            text_reply("finished the sweep"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn compact_session_on_long_history_writes_one_compaction_and_resume_starts_from_summary()
+    {
+        let mut script = long_run_script();
+        // The summarizer call comes next, then the resumed run's answer.
+        script.push(text_reply(SUMMARY));
+        script.push(text_reply("resumed answer"));
+        let provider = Arc::new(MockProvider::with_script(script));
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine(Arc::clone(&provider), Arc::clone(&store));
+
+        let summary = engine.run_task(TASK).await.unwrap();
+        let id = summary.session_id;
+
+        let outcome = engine.compact_session(id).await.unwrap();
+        assert!(outcome.compacted, "long history compacts: {outcome:?}");
+        assert!(
+            outcome.tokens_after < outcome.tokens_before,
+            "compaction shrinks the context: {outcome:?}"
+        );
+        assert!(outcome.note.starts_with("compacted:"), "{}", outcome.note);
+        assert_eq!(outcome.usage.input_tokens, 10, "summarizer usage returned");
+
+        let events = store.load(id).await.unwrap();
+        let compactions: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Compaction { summary, .. } => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compactions.len(), 1, "exactly one Compaction event");
+        assert_eq!(compactions[0], SUMMARY);
+
+        let resumed = engine.run_task_resuming(id, "keep going").await.unwrap();
+        assert_eq!(resumed.answer, "resumed answer");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 6, "4 run turns + summarizer + resumed turn");
+        let messages = &requests[5].messages;
+        assert_eq!(
+            messages[0].content,
+            format!("Conversation compacted; summary of earlier work:\n{SUMMARY}"),
+            "resume starts from the compact state"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("chatty analysis")),
+            "the summarized middle turn is not replayed"
+        );
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content, "keep going");
+    }
+
+    #[tokio::test]
+    async fn compact_session_on_short_history_is_a_noop() {
+        let provider = Arc::new(MockProvider::with_script(vec![text_reply("hi")]));
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine(Arc::clone(&provider), Arc::clone(&store));
+
+        let summary = engine.run_task(TASK).await.unwrap();
+        let id = summary.session_id;
+        let before = store.load(id).await.unwrap().len();
+
+        let outcome = engine.compact_session(id).await.unwrap();
+        assert!(!outcome.compacted, "two items fit in the kept tail");
+        assert_eq!(outcome.tokens_after, outcome.tokens_before);
+        assert!(!outcome.note.is_empty());
+        assert_eq!(
+            store.load(id).await.unwrap().len(),
+            before,
+            "nothing written"
+        );
+        assert_eq!(provider.requests().len(), 1, "no summarizer call");
+    }
+
+    #[tokio::test]
+    async fn context_gauge_grows_with_history_and_drops_after_compaction() {
+        let mut script = long_run_script();
+        script.push(text_reply(SUMMARY));
+        let provider = Arc::new(MockProvider::with_script(script));
+        let store = Arc::new(InMemoryStore::new());
+        let engine = engine(Arc::clone(&provider), Arc::clone(&store));
+
+        let empty_id = store.create_session("empty").await.unwrap().id;
+        let empty = engine.context_gauge(empty_id).await.unwrap();
+        assert!(empty.used > 0, "system and tool specs always count");
+        assert_eq!(
+            empty.window, engine.config.max_input_tokens,
+            "no model window: the global cap"
+        );
+
+        let id = engine.run_task(TASK).await.unwrap().session_id;
+        let grown = engine.context_gauge(id).await.unwrap();
+        assert!(
+            grown.used > empty.used,
+            "history grows the gauge: {grown:?} vs {empty:?}"
+        );
+        assert!(grown.window <= engine.config.max_input_tokens);
+
+        engine.compact_session(id).await.unwrap();
+        let compacted = engine.context_gauge(id).await.unwrap();
+        assert!(
+            compacted.used < grown.used,
+            "compaction drops the gauge: {compacted:?} vs {grown:?}"
+        );
+    }
+}
+
+/// H3b: `delegate` starts without its own prompt in Ask mode with an
+/// approver (the child's gated calls are the prompts), and several delegate
+/// calls in one turn run concurrently.
+#[cfg(test)]
+mod delegate_approval_tests {
+    use crate::permissions::RuleEffect;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalAsk, ApprovalMode, ApprovalPolicy, Engine, EngineConfig, ModelProvider, Result,
+        StopReason, Tool, ToolCall, ToolCtx, ToolOutcome, ToolRegistry, ToolSpec, TurnResponse,
+        Usage,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Stand-in `delegate` that passes a two-party barrier. Both calls of one
+    /// turn reach it only when they run concurrently; sequential dispatch
+    /// makes the first wait time out and report `sequential`.
+    struct BarrierDelegate {
+        barrier: Arc<tokio::sync::Barrier>,
+        met: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for BarrierDelegate {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "delegate".into(),
+                description: "barrier stand-in".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            let timed =
+                tokio::time::timeout(std::time::Duration::from_secs(2), self.barrier.wait()).await;
+            if timed.is_ok() {
+                self.met.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolOutcome::ok("met"))
+            } else {
+                Ok(ToolOutcome::err("sequential"))
+            }
+        }
+    }
+
+    fn engine_with(
+        config: EngineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+        script: MockProvider,
+    ) -> Engine {
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(tool);
+        }
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("anthropic".into(), Arc::new(script));
+        Engine {
+            selector: Arc::new(StaticSelector::new("claude-haiku-4-5", "anthropic")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config: EngineConfig {
+                default_provider: "anthropic".into(),
+                default_model: "claude-haiku-4-5".into(),
+                ..config
+            },
+        }
+    }
+
+    fn asking_config(mode: ApprovalMode, approver: bool) -> EngineConfig {
+        let counting: Arc<crate::Approver> = Arc::new(|_ask: &ApprovalAsk<'_>| true);
+        EngineConfig {
+            approvals: ApprovalPolicy {
+                mode,
+                ..ApprovalPolicy::default()
+            },
+            approver: approver.then_some(counting),
+            ..EngineConfig::default()
+        }
+    }
+
+    fn tag(admission: super::Admission) -> String {
+        match admission {
+            super::Admission::Run => "run".into(),
+            super::Admission::Ask => "ask".into(),
+            super::Admission::Refused(message) => format!("refused: {message}"),
+        }
+    }
+
+    fn admission_tag(engine: &Engine, name: &str) -> String {
+        tag(engine.admission(name))
+    }
+
+    #[test]
+    fn delegate_starts_without_a_prompt_only_in_ask_mode_with_an_approver() {
+        let script = || MockProvider::new();
+        let ask_with = engine_with(asking_config(ApprovalMode::Ask, true), vec![], script());
+        assert_eq!(admission_tag(&ask_with, "delegate"), "run");
+
+        // Non-interactive Ask (no approver) keeps the old gate.
+        let ask_without = engine_with(asking_config(ApprovalMode::Ask, false), vec![], script());
+        assert!(admission_tag(&ask_without, "delegate").starts_with("refused"));
+
+        // Deny mode stays the ceiling.
+        let deny = engine_with(asking_config(ApprovalMode::Deny, true), vec![], script());
+        assert!(admission_tag(&deny, "delegate").starts_with("refused"));
+
+        // An ask rule still prompts for delegate; a deny entry still refuses.
+        let mut ruled = asking_config(ApprovalMode::Ask, true);
+        ruled.approvals.rules =
+            crate::permissions::RuleSet::new(vec![crate::permissions::Rule::parse(
+                RuleEffect::Ask,
+                "delegate",
+            )
+            .unwrap()]);
+        let ruled = engine_with(ruled, vec![], script());
+        // Rules are evaluated per call (admission_for_call), not by admission().
+        let verdict = ruled.admission_for_call("delegate", &serde_json::json!({}));
+        assert_eq!(tag(verdict), "ask");
+
+        let mut denied = asking_config(ApprovalMode::Ask, true);
+        denied.approvals.deny = vec!["delegate".into()];
+        let denied = engine_with(denied, vec![], script());
+        assert!(admission_tag(&denied, "delegate").starts_with("refused"));
+    }
+
+    #[tokio::test]
+    async fn two_delegates_in_one_turn_run_concurrently_under_ask_with_an_approver() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let met = Arc::new(AtomicUsize::new(0));
+        let tool = Arc::new(BarrierDelegate {
+            barrier,
+            met: Arc::clone(&met),
+        });
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "delegate".into(),
+            arguments: serde_json::json!({"task": id}),
+        };
+        let fan_out = TurnResponse {
+            text: String::new(),
+            tool_calls: vec![call("d1"), call("d2")],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
+        };
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let approver: Arc<crate::Approver> = Arc::new(move |_ask: &ApprovalAsk<'_>| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let mut config = asking_config(ApprovalMode::Ask, true);
+        config.approver = Some(approver);
+        let engine = engine_with(
+            config,
+            vec![tool as Arc<dyn Tool>],
+            MockProvider::new()
+                .then_response(fan_out)
+                .then_text("both started"),
+        );
+        let summary = engine.run_task("fan out").await.unwrap();
+        assert_eq!(summary.answer, "both started");
+        assert_eq!(
+            met.load(Ordering::SeqCst),
+            2,
+            "both delegate calls reached the barrier (concurrent dispatch)"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "starting a delegate asks nobody; its children do"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_role_tests {
+    //! H7c model roles against the scripted mock. Every provider call goes to
+    //! one recording mock, so each request's `model` shows which role or
+    //! route answered the turn.
+    use super::*;
+    use crate::subagent::ForcedSelector;
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalMode, ApprovalPolicy, CompactionPolicy, EngineConfig, ModelRoles, ReviewDiffSource,
+        ReviewerConfig, Tool, ToolRegistry,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+
+    /// A file-mutating tool (so the reviewer pass has something to review).
+    struct RoleWriteTool;
+
+    #[async_trait]
+    impl Tool for RoleWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write".into(),
+                description: "test write".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::ok("wrote"))
+        }
+    }
+
+    const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\n+let x = 1;\n";
+
+    fn text(text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    fn write_turn(id: &str, text: &str) -> TurnResponse {
+        TurnResponse {
+            text: text.into(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "write".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
+        }
+    }
+
+    /// Engine on the mock provider ("mock", routed as `mock-model`), with
+    /// the default model `mock-default` for provider fallbacks.
+    fn role_engine(
+        script: Vec<TurnResponse>,
+        configure: impl FnOnce(&mut EngineConfig),
+    ) -> (Engine, Arc<MockProvider>) {
+        let mock = Arc::new(MockProvider::with_script(script));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RoleWriteTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        let mut config = EngineConfig {
+            working_dir: std::env::temp_dir(),
+            default_provider: "mock".into(),
+            default_model: "mock-default".into(),
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                ..ApprovalPolicy::default()
+            },
+            compaction: CompactionPolicy {
+                enabled: false,
+                tail_messages: 2,
+                ..CompactionPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        configure(&mut config);
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config,
+        };
+        (engine, mock)
+    }
+
+    fn roles(plan: Option<&str>, critic: Option<&str>) -> ModelRoles {
+        ModelRoles {
+            plan: plan.map(String::from),
+            critic: critic.map(String::from),
+            ..ModelRoles::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_roles_send_the_router_model_as_before() {
+        let (engine, mock) = role_engine(vec![text("answer")], |_| {});
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "no extra calls");
+        assert_eq!(requests[0].model, "mock-model");
+    }
+
+    #[tokio::test]
+    async fn plan_role_applies_only_in_the_plan_phase() {
+        let (build, build_mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+        });
+        build.run_task("task").await.unwrap();
+        assert_eq!(build_mock.requests()[0].model, "mock-model");
+
+        let (plan, plan_mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+            c.phase = Phase::Plan;
+        });
+        plan.run_task("task").await.unwrap();
+        assert_eq!(plan_mock.requests()[0].model, "plan-model");
+    }
+
+    #[tokio::test]
+    async fn a_pin_beats_the_plan_role() {
+        let (mut engine, mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+            c.phase = Phase::Plan;
+        });
+        engine.selector = Arc::new(ForcedSelector::pin(
+            Arc::new(StaticSelector::new("mock-model", "mock")),
+            "pinned-model",
+            "mock",
+        ));
+        engine.run_task("task").await.unwrap();
+        assert_eq!(mock.requests()[0].model, "pinned-model");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_plan_role_falls_back_and_the_run_succeeds() {
+        let (mut engine, mock) = role_engine(vec![text("answer")], |c| {
+            c.roles = roles(Some("plan-model"), None);
+            c.phase = Phase::Plan;
+        });
+        // The selector's provider is not registered: the router's own turn
+        // rides the default provider, and the role cannot resolve to itself.
+        engine.selector = Arc::new(StaticSelector::new("mock-model", "missing"));
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        assert_eq!(mock.requests()[0].model, "mock-default");
+    }
+
+    #[tokio::test]
+    async fn critic_role_alone_enables_one_review_call_on_its_model() {
+        let (engine, mock) = role_engine(
+            vec![write_turn("w1", ""), text("done"), text("looks fine")],
+            |c| {
+                c.roles = roles(None, Some("critic-model"));
+                c.review_diff_source =
+                    Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+            },
+        );
+        engine.run_task("task").await.unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3, "main, main, one reviewer call");
+        assert_eq!(requests[2].model, "critic-model");
+        assert!(requests[2].tools.is_empty(), "the reviewer is tool-less");
+    }
+
+    #[tokio::test]
+    async fn explicit_reviewer_model_wins_over_the_critic_role() {
+        let (engine, mock) = role_engine(
+            vec![write_turn("w1", ""), text("done"), text("looks fine")],
+            |c| {
+                c.reviewer = Some(ReviewerConfig {
+                    model: "rev-model".into(),
+                    max_rounds: 1,
+                });
+                c.roles = roles(None, Some("critic-model"));
+                c.review_diff_source =
+                    Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+            },
+        );
+        engine.run_task("task").await.unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].model, "rev-model");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_critic_role_means_no_review() {
+        let (mut engine, mock) = role_engine(vec![write_turn("w1", ""), text("done")], |c| {
+            c.roles = roles(None, Some("critic-model"));
+            c.review_diff_source =
+                Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+        });
+        engine.selector = Arc::new(StaticSelector::new("mock-model", "missing"));
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "done");
+        assert_eq!(mock.requests().len(), 2, "no reviewer call");
+    }
+
+    #[tokio::test]
+    async fn subagent_role_reaches_delegate_but_not_explore() {
+        let (engine, mock) = role_engine(vec![text("child answer"), text("explore answer")], |c| {
+            c.roles = ModelRoles {
+                subagent: Some("sub-model".into()),
+                ..ModelRoles::default()
+            };
+        });
+        crate::subagent::delegate(&engine, "do a thing", None, None, 50_000, None)
+            .await
+            .unwrap();
+        crate::subagent::explore(&engine, "look around", 50_000)
+            .await
+            .unwrap();
+        let requests = mock.requests();
+        assert_eq!(requests[0].model, "sub-model", "delegate child");
+        assert_eq!(
+            requests[1].model, "mock-model",
+            "explore stays on the router"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_role_drives_the_compaction_summary() {
+        let long = "chatty analysis of the login module. ".repeat(200);
+        let (engine, mock) = role_engine(
+            vec![
+                write_turn("w1", &long),
+                write_turn("w2", &long),
+                write_turn("w3", &long),
+                text("final answer"),
+                text("summary of earlier work"),
+            ],
+            |c| {
+                c.roles = ModelRoles {
+                    summary: Some("summary-model".into()),
+                    ..ModelRoles::default()
+                };
+            },
+        );
+        let run = engine.run_task("task").await.unwrap();
+        let outcome = engine.compact_session(run.session_id).await.unwrap();
+        assert!(outcome.compacted, "long history compacts: {outcome:?}");
+        let requests = mock.requests();
+        assert_eq!(requests[0].model, "mock-model", "run turns use the router");
+        assert_eq!(
+            requests.last().unwrap().model,
+            "summary-model",
+            "the summarizer uses the summary role"
+        );
+    }
+
+    /// Two distinct mock providers: `mock` (the router's, serving
+    /// `mock-model`) and `other`. Each records only the requests it served.
+    /// The lookup maps every `other-*` model id to `other`.
+    fn two_provider_engine(
+        mock_script: Vec<TurnResponse>,
+        other_script: Vec<TurnResponse>,
+        configure: impl FnOnce(&mut EngineConfig),
+    ) -> (Engine, Arc<MockProvider>, Arc<MockProvider>) {
+        let mock = Arc::new(MockProvider::with_script(mock_script));
+        let other = Arc::new(MockProvider::with_script(other_script));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RoleWriteTool));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::clone(&mock) as Arc<dyn ModelProvider>);
+        providers.insert("other".into(), Arc::clone(&other) as Arc<dyn ModelProvider>);
+        let mut config = EngineConfig {
+            working_dir: std::env::temp_dir(),
+            default_provider: "mock".into(),
+            default_model: "mock-default".into(),
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                ..ApprovalPolicy::default()
+            },
+            compaction: CompactionPolicy {
+                enabled: false,
+                tail_messages: 2,
+                ..CompactionPolicy::default()
+            },
+            provider_lookup: Some(Arc::new(|model: &str| {
+                model.starts_with("other-").then(|| "other".to_string())
+            }) as Arc<crate::ProviderLookup>),
+            ..EngineConfig::default()
+        };
+        configure(&mut config);
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::new(InMemoryStore::default()),
+            config,
+        };
+        (engine, mock, other)
+    }
+
+    #[test]
+    fn model_refs_parse_bare_and_explicit_forms() {
+        use super::parse_model_ref;
+        use super::ModelRef::{Bare, Explicit};
+        assert_eq!(
+            parse_model_ref("claude-opus-5-5"),
+            Ok(Bare("claude-opus-5-5"))
+        );
+        assert_eq!(
+            parse_model_ref("anthropic::claude-opus-5-5"),
+            Ok(Explicit {
+                provider: "anthropic",
+                model: "claude-opus-5-5"
+            })
+        );
+        // Single colons and slashes belong to the model id, not a separator.
+        assert_eq!(parse_model_ref("llama3:8b"), Ok(Bare("llama3:8b")));
+        assert_eq!(
+            parse_model_ref("anthropic/claude-x"),
+            Ok(Bare("anthropic/claude-x"))
+        );
+        assert_eq!(
+            parse_model_ref("openai-compat::llama3:8b"),
+            Ok(Explicit {
+                provider: "openai-compat",
+                model: "llama3:8b"
+            })
+        );
+        assert_eq!(
+            parse_model_ref("openai-compat::anthropic/claude-x"),
+            Ok(Explicit {
+                provider: "openai-compat",
+                model: "anthropic/claude-x"
+            })
+        );
+        // Empty parts are rejected, never guessed.
+        assert!(parse_model_ref("").is_err());
+        assert!(parse_model_ref("::model").is_err());
+        assert!(parse_model_ref("provider::").is_err());
+        assert!(parse_model_ref("::").is_err());
+    }
+
+    #[tokio::test]
+    async fn lookup_sends_the_plan_role_to_its_provider() {
+        let (engine, mock, other) = two_provider_engine(vec![], vec![text("answer")], |c| {
+            c.roles = roles(Some("other-plan"), None);
+            c.phase = Phase::Plan;
+        });
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        assert!(
+            mock.requests().is_empty(),
+            "the router's provider is not used"
+        );
+        let requests = other.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "other-plan");
+    }
+
+    #[tokio::test]
+    async fn explicit_prefix_beats_the_lookup() {
+        let (engine, mock, other) = two_provider_engine(vec![text("answer")], vec![], |c| {
+            c.roles = roles(Some("mock::other-plan"), None);
+            c.phase = Phase::Plan;
+        });
+        engine.run_task("task").await.unwrap();
+        assert!(other.requests().is_empty(), "the lookup would pick `other`");
+        assert_eq!(
+            mock.requests()[0].model,
+            "other-plan",
+            "the prefix is stripped on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_prefix_falls_back_and_the_run_succeeds() {
+        let (engine, mock, other) = two_provider_engine(vec![text("answer")], vec![], |c| {
+            c.roles = roles(Some("nope::mock-plan"), None);
+            c.phase = Phase::Plan;
+        });
+        let summary = engine.run_task("task").await.unwrap();
+        assert_eq!(summary.answer, "answer");
+        assert!(other.requests().is_empty());
+        assert_eq!(mock.requests()[0].model, "mock-plan");
+    }
+
+    #[tokio::test]
+    async fn without_a_lookup_a_role_stays_on_the_turn_provider() {
+        let (engine, mock, other) = two_provider_engine(vec![text("answer")], vec![], |c| {
+            c.roles = roles(Some("other-plan"), None);
+            c.phase = Phase::Plan;
+            c.provider_lookup = None;
+        });
+        engine.run_task("task").await.unwrap();
+        assert!(other.requests().is_empty());
+        assert_eq!(mock.requests()[0].model, "other-plan");
+    }
+
+    #[tokio::test]
+    async fn reviewer_call_follows_the_lookup() {
+        let (engine, mock, other) = two_provider_engine(
+            vec![write_turn("w1", ""), text("done")],
+            vec![text("looks fine")],
+            |c| {
+                c.reviewer = Some(ReviewerConfig {
+                    model: "other-review".into(),
+                    max_rounds: 1,
+                });
+                c.review_diff_source =
+                    Some(Arc::new(|| Some(DIFF.to_string())) as Arc<ReviewDiffSource>);
+            },
+        );
+        engine.run_task("task").await.unwrap();
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "the main turns stay on the router"
+        );
+        let reviewed = other.requests();
+        assert_eq!(reviewed.len(), 1, "one reviewer call");
+        assert_eq!(reviewed[0].model, "other-review");
+        assert!(reviewed[0].tools.is_empty(), "the reviewer is tool-less");
+    }
+
+    #[tokio::test]
+    async fn subagent_role_child_runs_on_the_resolved_provider() {
+        let (engine, mock, other) = two_provider_engine(vec![], vec![text("child answer")], |c| {
+            c.roles = ModelRoles {
+                subagent: Some("other-sub".into()),
+                ..ModelRoles::default()
+            };
+        });
+        crate::subagent::delegate(&engine, "do a thing", None, None, 50_000, None)
+            .await
+            .unwrap();
+        assert!(
+            mock.requests().is_empty(),
+            "the child is not routed to the router's provider"
+        );
+        let requests = other.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "other-sub");
+    }
+}
+
+#[cfg(test)]
+mod user_shell_tests {
+    use super::*;
+    use crate::permissions::{Rule, RuleEffect, RuleSet};
+    use crate::testing::{InMemoryStore, MockProvider, StaticSelector};
+    use crate::{
+        ApprovalPolicy, EngineConfig, ModelProvider, SandboxPolicy, SessionStore, Tool,
+        ToolRegistry,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A stand-in `bash` tool: counts its runs, records the sandbox policy
+    /// it was handed, and answers with a fixed output.
+    struct FakeBash {
+        runs: Arc<AtomicUsize>,
+        sandbox_seen: Arc<std::sync::Mutex<Option<SandboxPolicy>>>,
+        output: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for FakeBash {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "bash".into(),
+                description: "fake bash".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            *self.sandbox_seen.lock().unwrap() = Some(ctx.sandbox);
+            Ok(ToolOutcome {
+                content: self.output.clone(),
+                is_error: false,
+                usage: None,
+                meta: None,
+            })
+        }
+    }
+
+    struct Fixture {
+        engine: Engine,
+        store: Arc<InMemoryStore>,
+        session: SessionId,
+        runs: Arc<AtomicUsize>,
+        sandbox_seen: Arc<std::sync::Mutex<Option<SandboxPolicy>>>,
+        asked: Arc<AtomicUsize>,
+    }
+
+    /// An engine with a fake `bash` tool (unless `with_bash` is false) and
+    /// an approver that answers `approve`. The approver counts its calls, so
+    /// a test can prove a user-typed command never asks.
+    async fn fixture(
+        config: EngineConfig,
+        output: &str,
+        with_bash: bool,
+        approve: bool,
+    ) -> Fixture {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let sandbox_seen = Arc::new(std::sync::Mutex::new(None));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        if with_bash {
+            registry.register(Arc::new(FakeBash {
+                runs: Arc::clone(&runs),
+                sandbox_seen: Arc::clone(&sandbox_seen),
+                output: output.to_string(),
+            }));
+        }
+        let counter = Arc::clone(&asked);
+        let mut config = config;
+        config.approver = Some(Arc::new(move |_ask: &crate::ApprovalAsk<'_>| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            approve
+        }));
+        let mock = Arc::new(MockProvider::with_script(Vec::new()));
+        let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        providers.insert("mock".into(), mock as Arc<dyn ModelProvider>);
+        let store = Arc::new(InMemoryStore::default());
+        let session = store.create_session("shell").await.unwrap().id;
+        let engine = Engine {
+            selector: Arc::new(StaticSelector::new("m", "mock")),
+            providers,
+            tools: Arc::new(registry),
+            store: Arc::clone(&store) as Arc<dyn SessionStore>,
+            config,
+        };
+        Fixture {
+            engine,
+            store,
+            session,
+            runs,
+            sandbox_seen,
+            asked,
+        }
+    }
+
+    fn approve_all() -> EngineConfig {
+        EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    fn with_rules(mode: ApprovalMode, effect: RuleEffect, spec: &str) -> EngineConfig {
+        EngineConfig {
+            approvals: ApprovalPolicy {
+                mode,
+                rules: RuleSet::new(vec![Rule::parse(effect, spec).unwrap()]),
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    async fn persisted_shell(f: &Fixture) -> Vec<(String, String, bool, bool)> {
+        f.store
+            .load(f.session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::UserShell {
+                    command,
+                    output,
+                    is_error,
+                    private,
+                } => Some((command, output, is_error, private)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn persisted_tasks(f: &Fixture) -> Vec<String> {
+        f.store
+            .load(f.session)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Task { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn allowed_command_runs_returns_output_and_persists_it() {
+        let mut config = approve_all();
+        config.sandbox = SandboxPolicy::Bubblewrap;
+        let f = fixture(config, "hello\nexit code: 0", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "  echo hello  ", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.refused_reason, None);
+        assert_eq!(outcome.output, "hello\nexit code: 0");
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+        // The same sandbox policy the model's bash calls get.
+        assert_eq!(
+            *f.sandbox_seen.lock().unwrap(),
+            Some(SandboxPolicy::Bubblewrap)
+        );
+        // Persisted as a shared UserShell event (decision 1).
+        assert_eq!(
+            persisted_shell(&f).await,
+            vec![(
+                "echo hello".to_string(),
+                "hello\nexit code: 0".to_string(),
+                false,
+                false
+            )]
+        );
+        assert!(persisted_tasks(&f).await.is_empty());
+        assert_eq!(f.asked.load(Ordering::SeqCst), 0, "ApproveAll never asks");
+    }
+
+    #[tokio::test]
+    async fn private_command_runs_and_persists_as_private() {
+        let f = fixture(approve_all(), "secret=1", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "env", true)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            persisted_shell(&f).await,
+            vec![("env".to_string(), "secret=1".to_string(), false, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_rule_refuses_and_persists_nothing() {
+        let f = fixture(
+            with_rules(ApprovalMode::ApproveAll, RuleEffect::Deny, "bash(rm -rf*)"),
+            "out",
+            true,
+            true,
+        )
+        .await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "rm -rf /tmp/x", false)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.refused_reason.as_deref(),
+            Some("tool `bash` denied by rule `deny bash(rm -rf*)`")
+        );
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        assert!(persisted_shell(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compound_command_hitting_a_deny_rule_in_a_later_segment_is_refused() {
+        let f = fixture(
+            with_rules(ApprovalMode::ApproveAll, RuleEffect::Deny, "bash(rm -rf*)"),
+            "out",
+            true,
+            true,
+        )
+        .await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls && rm -rf /tmp/x", false)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed, "{outcome:?}");
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        assert!(persisted_shell(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deny_list_refuses_the_bash_tool() {
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::ApproveAll,
+                deny: vec!["bash".into()],
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let f = fixture(config, "out", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.refused_reason.as_deref(),
+            Some("tool `bash` denied by configuration (--deny)")
+        );
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        assert!(persisted_shell(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_rule_runs_without_asking_the_approver() {
+        let f = fixture(
+            with_rules(ApprovalMode::Ask, RuleEffect::Ask, "bash(*)"),
+            "listing",
+            true,
+            false,
+        )
+        .await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(
+            f.asked.load(Ordering::SeqCst),
+            0,
+            "the owner is never prompted"
+        );
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn plan_phase_does_not_block_the_owners_command() {
+        let mut config = approve_all();
+        config.phase = Phase::Plan;
+        let f = fixture(config, "out", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed, "{outcome:?}");
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deny_mode_does_not_block_the_owners_command() {
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::Deny,
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let f = fixture(config, "out", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+        assert_eq!(f.asked.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ask_mode_runs_the_command_without_a_prompt() {
+        let config = EngineConfig {
+            approvals: ApprovalPolicy {
+                mode: ApprovalMode::Ask,
+                ..ApprovalPolicy::default()
+            },
+            ..EngineConfig::default()
+        };
+        let f = fixture(config, "out", true, false).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert_eq!(f.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(f.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_veto_refuses() {
+        let mut config = approve_all();
+        config.hooks.pre_tool = Some("exit 1".into());
+        let f = fixture(config, "out", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed);
+        assert!(
+            outcome
+                .refused_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("blocked by pre_tool hook"),
+            "{outcome:?}"
+        );
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
+        assert!(persisted_shell(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn private_and_shared_output_stay_out_of_model_context_and_compaction() {
+        let f = fixture(approve_all(), "TOPSECRET", true, true).await;
+        f.engine
+            .run_user_shell(f.session, "cat .env", true)
+            .await
+            .unwrap();
+        // A shared entry with its own output (the fake bash answers the same
+        // text to every call, so the shared one is seeded directly).
+        f.store
+            .append(
+                f.session,
+                &SessionEvent::UserShell {
+                    command: "git status".into(),
+                    output: "On branch main".into(),
+                    is_error: false,
+                    private: false,
+                },
+            )
+            .await
+            .unwrap();
+        let events = f.store.load(f.session).await.unwrap();
+
+        // The model's transcript (what every TurnRequest is built from).
+        let transcript = reconstruct_transcript(&events, 0);
+        let rendered: String = transcript.iter().map(|m| m.content.as_str()).collect();
+        assert!(!rendered.contains("cat .env"), "{rendered}");
+        assert!(!rendered.contains("TOPSECRET"), "{rendered}");
+        assert!(
+            rendered.contains("$ git status\nOn branch main"),
+            "{rendered}"
+        );
+
+        // The compaction summarizer's input.
+        let older = crate::compact::older_transcript_text(&events, 0);
+        assert!(!older.contains("cat .env"), "{older}");
+        assert!(!older.contains("TOPSECRET"), "{older}");
+        assert!(older.contains("On branch main"), "{older}");
+    }
+
+    #[tokio::test]
+    async fn output_is_capped_keeping_the_tail() {
+        let big = format!("{}TAILMARK", "x".repeat(50_000));
+        let f = fixture(approve_all(), &big, true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "cat big", false)
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert!(
+            outcome.output.len() <= USER_SHELL_MAX_BYTES + 32,
+            "{}",
+            outcome.output.len()
+        );
+        assert!(outcome.output.starts_with("... (output truncated)\n"));
+        assert!(outcome.output.ends_with("TAILMARK"));
+    }
+
+    #[tokio::test]
+    async fn missing_bash_tool_and_empty_command_are_refused() {
+        let f = fixture(approve_all(), "out", false, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "ls", false)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed);
+        assert!(outcome.refused_reason.unwrap().contains("no `bash` tool"));
+
+        let f = fixture(approve_all(), "out", true, true).await;
+        let outcome = f
+            .engine
+            .run_user_shell(f.session, "   ", true)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.refused_reason.as_deref(),
+            Some("usage: !<shell command>")
+        );
+        assert_eq!(f.runs.load(Ordering::SeqCst), 0);
     }
 }

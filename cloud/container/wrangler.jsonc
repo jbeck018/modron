@@ -1,15 +1,27 @@
 {
-  // modron cloud container: runs modron serve inside a Cloudflare
-  // Container against a cloned repo. Requires CF Containers (beta).
+  // modron cloud container: a Worker that wakes one `modron serve`
+  // Container per cloud run and lets it sleep when idle. Requires Cloudflare
+  // Containers. Deployed by .github/workflows/cloud-deploy.yml (manual).
+  //
+  // UNVERIFIED against a live deploy: the Container class shape follows the
+  // Containers docs (a Durable Object with ctx.container), but the image
+  // build context (Dockerfile's directory vs. repo root) is not confirmed.
   "name": "modron-container",
   "main": "src/worker.ts",
   "compatibility_date": "2026-11-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "MODRON_AGENT", "class_name": "ModronAgent" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ModronAgent"] }
+  ],
   "containers": [
     {
-      "name": "modron-agent",
+      "class_name": "ModronAgent",
       "image": "./Dockerfile",
-      "max_instances": 5,
-      "instance_type": "standard"
+      "max_instances": 5
     }
   ]
 }

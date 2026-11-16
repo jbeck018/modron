@@ -13,10 +13,12 @@
 //! writes; the answer and usage table go to stdout.
 
 pub mod acp;
+pub mod app;
 pub mod daemon;
 pub mod onboarding;
 use daemon as modron_daemon;
 pub mod auth;
+mod checksums;
 pub mod config;
 pub mod evals;
 pub mod upgrade;
@@ -25,7 +27,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use modron_core::memory::MemoryStore;
 use modron_core::{
     estimate_tokens, CompactionPolicy, Engine, EngineConfig, ModelProvider, SessionEvent,
-    SessionId, SessionStore, StreamDelta, ToolCall, Usage,
+    SessionId, SessionStore, StreamDelta, Usage,
 };
 use modron_providers::{provider_from_env, RetryingProvider};
 use modron_store::JsonlSessionStore;
@@ -74,6 +76,15 @@ enum SandboxChoice {
 }
 
 impl SandboxChoice {
+    /// The word `modron-app-tui --sandbox` takes for this choice.
+    fn app_word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Seatbelt => "seatbelt",
+            Self::Bubblewrap => "bwrap",
+        }
+    }
+
     fn policy(self) -> modron_core::SandboxPolicy {
         match self {
             Self::Off => modron_core::SandboxPolicy::Off,
@@ -88,8 +99,8 @@ enum Command {
     /// Interactive multi-turn session: type tasks, stream answers, one
     /// shared session (`/exit` to quit, Ctrl-D also works).
     Chat,
-    /// Full terminal UI: inline viewport, live tool lines, esc-to-interrupt,
-    /// inline approval prompts (y/n/a).
+    /// Start the terminal app (`modron-app-tui`), the same as bare `modron`
+    /// on a terminal. Old flags are mapped to the app's (see `modron app`).
     Tui,
     /// Router tooling (offline): score the selector against the held-out
     /// eval set and report accuracy + estimated cost delta vs. always-strong.
@@ -112,6 +123,17 @@ enum Command {
     },
     /// Upgrade the binary from the latest GitHub release.
     Upgrade,
+    /// Start the NSH terminal app (`modron-app-tui`), a client of
+    /// `modron serve`. Every argument after `app` goes to the app unchanged.
+    App {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 0..,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
     /// Diagnose your setup: keys, config, git, PDF support, terminal.
     Doctor,
     /// Manage the background engine daemon (sessions survive terminal close).
@@ -134,6 +156,18 @@ enum Command {
         /// on loopback. Use this behind tailscale-serve or cloudflared.
         #[arg(long)]
         require_token: bool,
+        /// Open remote control at start, with no client: a tunnel to this
+        /// bridge (wss://host) for the most recent session in the working
+        /// directory (a new one when there is none). Also set by env
+        /// MODRON_REMOTE_CONTROL; this flag wins. Needs a git repository in
+        /// the working directory (its .modron marker is created) or an
+        /// existing .modron directory.
+        #[arg(long = "remote-control", value_name = "BRIDGE_URL")]
+        remote_control: Option<String>,
+        /// With --remote-control: write the share URL to this file (0600) at
+        /// start, so a launcher can read it.
+        #[arg(long = "share-url-file", value_name = "PATH")]
+        share_url_file: Option<std::path::PathBuf>,
         /// Browser origin allowed to open the WebSocket (repeatable, exact
         /// match, e.g. https://app.example.com). Default: none - every
         /// upgrade that carries an Origin header is refused.
@@ -346,6 +380,10 @@ struct Cli {
     /// Working directory the tools run in.
     #[arg(long, default_value = ".", global = true)]
     working_dir: PathBuf,
+    /// Reasoning effort for model turns: low, medium, high, xhigh or max.
+    /// Overrides config `effort`; unset = the provider default.
+    #[arg(long, global = true)]
+    effort: Option<String>,
     /// Session store directory (default: ~/.modron/sessions). The workspace
     /// memory root is derived as <this dir's parent>/memory.
     #[arg(long, global = true)]
@@ -414,12 +452,39 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    // `modron app ...` is intercepted before clap: every later argument,
+    // including `--` and flags modron also defines, reaches the app as typed.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(rest) = app::passthrough_args(&argv) {
+        std::process::exit(app::launch(rest));
+    }
     let cli = Cli::parse();
+    if let Some(Command::App { .. }) = &cli.command {
+        eprintln!(
+            "modron app: `app` must be the first argument (`modron app --model x`); \
+             flags before it are modron's, not the app's"
+        );
+        std::process::exit(2);
+    }
     init_tracing(cli.verbose, tui_session(&cli));
     if let Err(err) = run(cli).await {
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }
+}
+
+/// Does this invocation start the terminal app? `modron tui`, or bare `modron`
+/// (no task and no other subcommand).
+fn app_entry(cli: &Cli) -> bool {
+    cli.task.is_none() && matches!(cli.command, None | Some(Command::Tui))
+}
+
+/// Replace this process with the terminal app for `cli`. Returns only by
+/// exiting (the app's exit code, or 2 when the app binary is missing).
+fn exec_app(cli: &Cli) -> ! {
+    let rust_log = std::env::var_os("RUST_LOG");
+    let request = app::request_from_cli(cli, rust_log.as_deref());
+    std::process::exit(app::launch_request(&request))
 }
 
 /// Will this invocation run the interactive TUI (bare `modron`, `modron
@@ -488,6 +553,26 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     }
     // Source saved API keys from onboarding (Phase 12).
     crate::onboarding::source_env_file();
+    // The interactive entry points start the terminal app (`modron-app-tui`,
+    // see `modron app`): `modron tui`, and bare `modron` with no task.
+    if app_entry(&cli) {
+        use std::io::IsTerminal as _;
+        if matches!(cli.command, Some(Command::Tui)) || std::io::stdout().is_terminal() {
+            let mut app_cli = cli.clone();
+            // First run with no provider key: onboarding picks one (bare only).
+            let needs_onboarding = cli.command.is_none()
+                && cli.provider.is_none()
+                && cli.connect.is_none()
+                && !onboarding::has_any_key();
+            if needs_onboarding && onboarding::run_onboarding()? == "mock" {
+                app_cli.provider = Some(ProviderChoice::Mock);
+            }
+            exec_app(&app_cli);
+        }
+        // Bare `modron` with piped stdout: help, as before.
+        Cli::command().print_help()?;
+        return Ok(());
+    }
     let cfg = config::load();
 
     let sessions_dir = cli
@@ -591,8 +676,16 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         bridge,
         require_token,
         allow_origin,
+        remote_control,
+        share_url_file,
     }) = &cli.command
     {
+        // The flag wins over MODRON_REMOTE_CONTROL (see rc::resolve_remote_control).
+        let env_bridge = std::env::var(modron_server::rc::REMOTE_CONTROL_ENV).ok();
+        let remote = modron_server::rc::resolve_remote_control(
+            remote_control.as_deref(),
+            env_bridge.as_deref(),
+        );
         let mcp = spawn_mcp_servers(&cfg).await?;
         let agent = build_agent_with(
             &cli,
@@ -608,6 +701,8 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
                 bridge_base: bridge.clone(),
                 require_token: *require_token,
                 allowed_origins: allow_origin.clone(),
+                remote_control: remote,
+                share_url_file: share_url_file.clone(),
                 ..modron_server::ServeOptions::default()
             },
         )
@@ -666,164 +761,9 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     if let Some(Command::Chat) = cli.command {
         return run_chat(&cli, &cfg).await;
     }
-    // `modron tui` — inline-viewport UI (Phase-1d). The sinks are created
-    // inside the TUI, so the agent is built through the closure.
-    if let Some(Command::Tui) = cli.command {
-        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-        let mcp = spawn_mcp_servers(&cfg).await?;
-        let notice = modron_upgrade_notice();
-        return modron_tui::run_with(
-            |sinks| {
-                let build = |cli: &Cli| {
-                    build_agent_with(
-                        cli,
-                        &cfg,
-                        interactive,
-                        AgentSinks {
-                            approver: Some(sinks.approver.clone()),
-                            on_delta: Some(sinks.on_delta.clone()),
-                            on_tool_event: Some(sinks.on_tool_event.clone()),
-                        },
-                        &mcp,
-                    )
-                };
-                let agent = match build(&cli) {
-                    Ok(agent) => agent,
-                    Err(err) => {
-                        // No-key startup guarantee: the TUI always opens.
-                        eprintln!(
-                            "warning: {err:#}\n  opening in mock (demo) mode — \
-                             add a key via onboarding or `modron doctor`"
-                        );
-                        let mut demo = cli.clone();
-                        demo.provider = Some(ProviderChoice::Mock);
-                        demo.model = None;
-                        // The retry can still fail for non-provider reasons
-                        // (unknown --agent, bad [router] mode) — surface the
-                        // error instead of panicking mid-startup.
-                        build(&demo)?
-                    }
-                };
-                Ok((agent.engine, agent.resume))
-            },
-            String::new(),
-            notice,
-            cli.connect.as_ref().map(|target| modron_tui::RemoteSpec {
-                target: target.clone(),
-                resume: cli.resume,
-            }),
-        )
-        .await
-        .map_err(|err| anyhow::anyhow!("{err:#}"));
-    }
-
     let Some(task) = cli.task.clone() else {
-        // Claude Code / Codex convention: bare `modron` opens the TUI when
-        // a terminal is attached; piped invocations get help.
-        use std::io::IsTerminal as _;
-        if std::io::stdout().is_terminal() {
-            let interactive = std::io::stdin().is_terminal();
-            // First-run onboarding (Phase 12): if no provider key exists,
-            // show the friendly setup screen instead of erroring later.
-            // An explicit --provider choice (especially mock) IS a
-            // configuration — never intercept it with onboarding.
-            if cli.provider.is_none() && cli.connect.is_none() && !onboarding::has_any_key() {
-                let provider = onboarding::run_onboarding()?;
-                let mut onboarded = cli.clone();
-                onboarded.provider = None; // let config drive it
-                if provider == "mock" {
-                    onboarded.provider = Some(ProviderChoice::Mock);
-                }
-                let mcp = spawn_mcp_servers(&cfg).await?;
-                let notice = modron_upgrade_notice();
-                return modron_tui::run_with(
-                    |sinks| {
-                        let build = |cli: &Cli| {
-                            build_agent_with(
-                                cli,
-                                &cfg,
-                                true,
-                                AgentSinks {
-                                    approver: Some(sinks.approver.clone()),
-                                    on_delta: Some(sinks.on_delta.clone()),
-                                    on_tool_event: Some(sinks.on_tool_event.clone()),
-                                },
-                                &mcp,
-                            )
-                        };
-                        let agent = match build(&onboarded) {
-                            Ok(agent) => agent,
-                            Err(err) => {
-                                // No-key startup guarantee: the TUI always opens.
-                                eprintln!(
-                                    "warning: {err:#}\n  opening in mock (demo) mode — \
-                                     add a key via onboarding or `modron doctor`"
-                                );
-                                let mut demo = onboarded.clone();
-                                demo.provider = Some(ProviderChoice::Mock);
-                                demo.model = None;
-                                build(&demo)?
-                            }
-                        };
-                        Ok((agent.engine, agent.resume))
-                    },
-                    tui_model_label(&onboarded, &cfg),
-                    notice,
-                    None,
-                )
-                .await
-                .map_err(|err| anyhow::anyhow!("{err:#}"));
-            }
-            let mcp = spawn_mcp_servers(&cfg).await?;
-            let notice = modron_upgrade_notice();
-            let effective_cli = if cli.yolo {
-                let mut c = cli.clone();
-                c.approve_all = true;
-                c
-            } else {
-                cli.clone()
-            };
-            return modron_tui::run_with(
-                |sinks| {
-                    let build = |cli: &Cli| {
-                        build_agent_with(
-                            cli,
-                            &cfg,
-                            interactive,
-                            AgentSinks {
-                                approver: Some(sinks.approver.clone()),
-                                on_delta: Some(sinks.on_delta.clone()),
-                                on_tool_event: Some(sinks.on_tool_event.clone()),
-                            },
-                            &mcp,
-                        )
-                    };
-                    let agent = match build(&effective_cli) {
-                        Ok(agent) => agent,
-                        Err(err) => {
-                            // No-key startup guarantee: the TUI always opens.
-                            eprintln!(
-                                "warning: {err:#}\n  opening in mock (demo) mode — \
-                                 add a key via onboarding or `modron doctor`"
-                            );
-                            let mut demo = effective_cli.clone();
-                            demo.provider = Some(ProviderChoice::Mock);
-                            demo.model = None;
-                            build(&demo)?
-                        }
-                    };
-                    Ok((agent.engine, agent.resume))
-                },
-                tui_model_label(&cli, &cfg),
-                notice,
-                cli.connect.as_ref().map(|target| modron_tui::RemoteSpec {
-                    target: target.clone(),
-                    resume: cli.resume,
-                }),
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("{err:#}"));
-        }
+        // Unreachable for `None`/`tui` (handled above); other subcommands
+        // without a task print help.
         Cli::command().print_help()?;
         return Ok(());
     };
@@ -1037,19 +977,6 @@ fn default_model_for_provider(pid: &str) -> Option<String> {
 
 /// The TUI status-line model label: explicit flag > config > "mock" for
 /// demo runs, else empty (the engine's internal default).
-fn tui_model_label(cli: &Cli, cfg: &config::Config) -> String {
-    cli.model
-        .clone()
-        .or_else(|| cfg.default_model.clone())
-        .unwrap_or_else(|| {
-            if matches!(cli.provider, Some(ProviderChoice::Mock)) {
-                "mock".to_string()
-            } else {
-                String::new()
-            }
-        })
-}
-
 /// Assemble provider + tools + store + config from flags/config (Phase-1c
 /// I3 refactor): one construction path for the one-shot run and chat mode.
 /// - `interactive`: attach the /dev/tty approver when a terminal is present,
@@ -1212,7 +1139,15 @@ fn build_agent_with(
                 non_interactive: !interactive,
                 allow: cli.allow.clone(),
                 deny: cli.deny.clone(),
+                rules: Default::default(),
             };
+            // `[permissions]` from config.toml: an invalid rule stops startup.
+            approvals.rules = cfg
+                .permissions
+                .clone()
+                .unwrap_or_default()
+                .rule_set()
+                .map_err(anyhow::Error::msg)?;
             if let Some(p) = persona.as_ref() {
                 approvals.allow.extend(p.allow.clone().unwrap_or_default());
                 approvals.deny.extend(p.deny.clone().unwrap_or_default());
@@ -1220,9 +1155,20 @@ fn build_agent_with(
             approvals
         },
         max_cost_usd: cli.max_cost,
+        steer: None,
+        phase: modron_core::Phase::Build,
+        // Flag > config.toml `effort` > provider default (H7a). Validated
+        // here, so a bad value stops startup on every run path.
+        effort: config::resolve_effort(cli.effort.as_deref(), cfg.effort.as_deref())
+            .map_err(anyhow::Error::msg)?,
+        // H7b: config `reasoning_summary` (default off); a session's
+        // ConfigPatch can change it later for future turns.
+        reasoning_summary: cfg.reasoning_summary,
         price_lookup: Some(Arc::new(|model: &str| {
             modron_router::lookup(model).map(|info| (info.input_per_m, info.output_per_m))
         })),
+        // Set below, once the providers that built are known (see `authed`).
+        provider_lookup: None,
         // Honors a prior `modron rewind` of this session (C2): the
         // abandoned range `[cut, end)` stays in the log but never re-enters
         // context; events appended after the rewind (index >= end) do.
@@ -1239,6 +1185,8 @@ fn build_agent_with(
             .map(|h| modron_core::hooks::HookConfig {
                 pre_tool: h.pre_tool,
                 post_tool: h.post_tool,
+                session_start: h.session_start,
+                turn_end: h.turn_end,
             })
             .unwrap_or_default(),
         sandbox: {
@@ -1264,10 +1212,21 @@ fn build_agent_with(
         // config.toml top-level `escalate_on_check_failure = "<model id>"`:
         // one verify-failure escalation turn on that model (None = off).
         escalate_on_check_failure: cfg.escalate_on_check_failure.clone(),
+        // config.toml top-level `review_model = "<model id>"` (+ optional
+        // `review_max_rounds`): the end-of-run reviewer pass.
+        reviewer: cfg
+            .review_model
+            .clone()
+            .map(|model| modron_core::ReviewerConfig {
+                model,
+                max_rounds: cfg.review_max_rounds.unwrap_or(1),
+            }),
+        review_diff_source: None,
         on_delta: sinks.on_delta,
         on_tool_event: sinks.on_tool_event,
         personas: Default::default(),
         background_subagents: Default::default(),
+        roles: config::model_roles(cfg),
     };
 
     if !engine_config.working_dir.is_dir() {
@@ -1398,8 +1357,29 @@ fn build_agent_with(
     // mode, bad overrides) must surface regardless of the provider choice.
     // Tiers derive from the providers that actually built (keys/sign-ins).
     let authed: Vec<String> = providers.keys().cloned().collect();
+    // Model roles (`roles`, reviewer, escalation) follow the catalog's
+    // provider, as `/model` does. Precedence in the engine: an explicit
+    // `provider::model` in the config > this lookup > the turn's provider.
+    engine_config.provider_lookup = Some(catalog_provider_lookup(&authed));
     let (router, mut tier_fallbacks) =
         build_selector(cfg, persona.as_ref().and_then(|p| p.model.clone()), &authed)?;
+    // A persona's forced model is a pin (H7c precedence: pin > role >
+    // router): wrap the router so `ModelSelector::pinned` holds and the
+    // `[roles]` table cannot override it.
+    let router: Arc<dyn modron_core::ModelSelector> =
+        match persona.as_ref().and_then(|p| p.model.clone()) {
+            Some(model) => {
+                let provider = persona
+                    .as_ref()
+                    .and_then(|p| p.provider.clone())
+                    .or_else(|| modron_router::lookup(&model).map(|i| i.provider.clone()))
+                    .unwrap_or_else(|| "anthropic".to_string());
+                Arc::new(modron_core::subagent::ForcedSelector::new(
+                    router, model, provider,
+                ))
+            }
+            None => router,
+        };
     let selector = match &cli.provider {
         // An explicitly chosen provider PINS every turn there — the
         // router would otherwise override it with its own cheap/strong
@@ -1412,8 +1392,10 @@ fn build_agent_with(
             // An explicit --provider pin is an explicit choice: the tier
             // fallback must never silently swap it.
             tier_fallbacks = None;
-            Arc::new(modron_core::testing::StaticSelector::new(
-                &engine_config.default_model,
+            // A pin (H7c): roles yield to it, exactly like a persona model.
+            Arc::new(modron_core::subagent::ForcedSelector::pin(
+                router,
+                engine_config.default_model.clone(),
                 choice.id(),
             )) as Arc<dyn modron_core::ModelSelector>
         }
@@ -1445,10 +1427,17 @@ fn tty_approver() -> Option<Arc<modron_core::Approver>> {
     }
     let rest_approved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     use std::sync::atomic::Ordering;
-    Some(Arc::new(move |call: &ToolCall| {
+    Some(Arc::new(move |ask: &modron_core::ApprovalAsk<'_>| {
         if rest_approved.load(Ordering::Relaxed) {
             return true;
         }
+        let call = ask.call;
+        // A delegated child names itself so its ask is not mistaken for the
+        // run's own call (H3b).
+        let who = ask
+            .agent
+            .map(|agent| format!("[{agent}] "))
+            .unwrap_or_default();
         // The whole tty round-trip is blocking I/O inside an async context:
         // block_in_place frees the runtime to keep other workers (streaming
         // deltas, background subagents) alive while the human decides — the
@@ -1463,7 +1452,11 @@ fn tty_approver() -> Option<Arc<modron_core::Approver>> {
             };
             use std::io::Write as _;
             let args = short(&call.arguments.to_string(), 90);
-            let _ = write!(tty, "\r\nmodron: allow {} {}? [y/N/a] ", call.name, args);
+            let _ = write!(
+                tty,
+                "\r\nmodron: allow {who}{} {}? [y/N/a] ",
+                call.name, args
+            );
             let _ = tty.flush();
             let mut line = String::new();
             let ok = std::io::BufRead::read_line(
@@ -1857,11 +1850,7 @@ async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegist
     };
     let mut out = Vec::new();
     for (name, server) in &mcp.servers {
-        let env: Vec<(String, String)> =
-            server.env.clone().unwrap_or_default().into_iter().collect();
-        let args = server.args.clone().unwrap_or_default();
-        let (handle, tools) =
-            modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await?;
+        let (handle, tools) = connect_mcp_server(name, server).await?;
         let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
         let cap = server.max_schema_tokens.unwrap_or(20_000);
         if total > cap {
@@ -1895,6 +1884,18 @@ type SelectorWithFallbacks = (
 /// Default mode is `learned` (corpus centroids + heuristic fallback — the
 /// fallback preserves budget/overflow rules, so learned is a strict
 /// refinement of the rules).
+/// The `provider_lookup` the engine uses for model roles: a model's catalog
+/// provider, but only one the user is authenticated with (`authed` = the
+/// providers that built), the same set auto tiers draw from.
+pub(crate) fn catalog_provider_lookup(authed: &[String]) -> Arc<modron_core::ProviderLookup> {
+    let authed: Vec<String> = authed.to_vec();
+    Arc::new(move |model: &str| {
+        modron_router::lookup(model)
+            .map(|info| info.provider.clone())
+            .filter(|provider| authed.contains(provider))
+    })
+}
+
 fn build_selector(
     cfg: &config::Config,
     persona_model: Option<String>,
@@ -2107,10 +2108,7 @@ async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> 
             }
         );
     };
-    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
-    let args = server.args.clone().unwrap_or_default();
-    let (handle, tools) =
-        modron_mcp::McpServerHandle::spawn(&name, &server.command, &args, &env).await?;
+    let (handle, tools) = connect_mcp_server(&name, server).await?;
     let mut handle = handle.lock().await;
 
     let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
@@ -2178,10 +2176,7 @@ async fn mcp_handle(
             }
         );
     };
-    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
-    let args = server.args.clone().unwrap_or_default();
-    let (handle, _tools) =
-        modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await?;
+    let (handle, _tools) = connect_mcp_server(name, server).await?;
     Ok(handle)
 }
 
@@ -2289,6 +2284,30 @@ fn short_hash(h: &str) -> String {
 
 /// Validate a compaction threshold fraction. Shared by the `--compact-threshold`
 /// flag and `[compaction].threshold_frac` so both reject the same values.
+/// Connect one configured MCP server over its transport: `url` selects
+/// Streamable HTTP, otherwise the stdio `command` is spawned.
+async fn connect_mcp_server(
+    name: &str,
+    server: &config::McpServerConfig,
+) -> anyhow::Result<(
+    std::sync::Arc<tokio::sync::Mutex<modron_mcp::McpServerHandle>>,
+    Vec<modron_mcp::McpToolInfo>,
+)> {
+    server.validate(name).map_err(anyhow::Error::msg)?;
+    if let Some(url) = &server.url {
+        let headers: Vec<(String, String)> = server
+            .headers
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        return modron_mcp::McpServerHandle::connect_http(name, url, &headers).await;
+    }
+    let env: Vec<(String, String)> = server.env.clone().unwrap_or_default().into_iter().collect();
+    let args = server.args.clone().unwrap_or_default();
+    modron_mcp::McpServerHandle::spawn(name, &server.command, &args, &env).await
+}
+
 fn validate_compact_threshold(threshold: f64, source: &str) -> anyhow::Result<f64> {
     if !(threshold > 0.0 && threshold < 1.0) {
         anyhow::bail!("{source} must be strictly between 0 and 1, got {threshold}");
@@ -2819,10 +2838,6 @@ fn parse_judge_mode(mode: Option<&str>) -> anyhow::Result<modron_core::JudgeMode
 
 /// Startup update check (Phase 6e): cached 24h, 2s live timeout, never
 /// fails the caller.
-fn modron_upgrade_notice() -> Option<String> {
-    crate::upgrade::startup_update_notice()
-}
-
 /// Char-safe truncation for one-line UI summaries.
 fn short(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -3378,8 +3393,22 @@ fn print_usage_row(model: &str, usage: &Usage, cost: f64) {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn only_bare_modron_and_modron_tui_start_the_app() {
+        let entry = |line: &[&str]| app_entry(&Cli::try_parse_from(line).unwrap());
+        assert!(entry(&["modron"]));
+        assert!(entry(&["modron", "--connect", "unix"]));
+        assert!(entry(&["modron", "tui"]));
+        assert!(!entry(&["modron", "hello there"]), "print mode");
+        assert!(!entry(&["modron", "chat"]));
+        assert!(!entry(&["modron", "acp"]));
+        assert!(!entry(&["modron", "serve"]));
+        assert!(!entry(&["modron", "doctor"]));
+        assert!(!entry(&["modron", "upgrade"]));
+    }
+
     #[tokio::test]
-    async fn restart_writes_a_zero_marker_so_resume_starts_fresh() {
+    async fn restart_writes_a_zero_marker_so_resume_starts_fresh_so_resume_starts_fresh() {
         use modron_store::JsonlSessionStore;
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlSessionStore::new(dir.path());
@@ -3646,5 +3675,59 @@ mod tests {
                 .expect_err("out-of-range threshold must be rejected");
             assert!(err.to_string().starts_with("[compaction].threshold_frac"));
         }
+    }
+
+    /// `[permissions]` reach the engine every front end builds through
+    /// `build_agent_with` (run, tui, chat, serve, daemon, acp): `serve` and
+    /// the daemon use the returned engine as their template, so rules set
+    /// in config.toml are enforced there too.
+    #[test]
+    fn configured_permission_rules_reach_the_built_engine() {
+        use modron_core::permissions::RuleEffect;
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let cli = Cli::try_parse_from([
+            "modron",
+            "--provider",
+            "mock",
+            "--working-dir",
+            work.to_str().unwrap(),
+            "--sessions-dir",
+            dir.path().join("sessions").to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg = config::Config {
+            permissions: Some(config::PermissionsConfig {
+                deny: vec!["bash(rm -rf*)".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let agent = build_agent_with(
+            &cli,
+            &cfg,
+            false,
+            AgentSinks::for_mode(RunMode::HEADLESS),
+            &[],
+        )
+        .unwrap();
+        let verdict = agent
+            .engine
+            .config
+            .approvals
+            .rules
+            .evaluate("bash", &serde_json::json!({"command": "rm -rf x"}));
+        assert_eq!(verdict.map(|v| v.effect), Some(RuleEffect::Deny));
+    }
+
+    #[test]
+    fn catalog_lookup_maps_a_known_model_to_its_provider() {
+        let lookup = catalog_provider_lookup(&["anthropic".to_string()]);
+        assert_eq!(lookup("claude-opus-5-5").as_deref(), Some("anthropic"));
+        // Unknown ids and providers the user is not signed in to: no answer.
+        assert_eq!(lookup("no-such-model"), None);
+        let unauthed = catalog_provider_lookup(&["openai-compat".to_string()]);
+        assert_eq!(unauthed("claude-opus-5-5"), None);
     }
 }

@@ -24,12 +24,13 @@ use crate::error::ClientError;
 use crate::transport;
 use crate::view::{
     fold_snapshot, fold_turn_done, fold_turn_unfinished, FoldState, OAuthProgressView,
-    PendingApprovalView, SessionViewModel, ViewModelSnapshot,
+    PendingApprovalView, PendingPlanView, SessionViewModel, TaskStatusRecord, ViewModelSnapshot,
 };
 use modron_protocol::{
-    ConfigPatch, Decision, Frame, Payload, WireDelta, DEFAULT_PORT, PROTOCOL_VERSION,
+    ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, Payload, PlanDecision,
+    WireDelta, WireToolActivity, DEFAULT_PORT, PROTOCOL_VERSION,
 };
-use modron_types::ToolActivity;
+use modron_types::{Attachment, Effort, Phase, SandboxPolicy, SessionEvent, ToolActivity};
 use modron_view::TranscriptEntry;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -157,6 +158,114 @@ fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The token query parameter a ws(s) target may carry
+/// (`ws://host:7699/?token=...`), and the environment fallback
+/// [`device_token_from_env`] reads (the names the terminal client uses,
+/// crates/modron-tui/src/remote.rs).
+const TOKEN_PARAM: &str = "token";
+/// The environment variable [`device_token_from_env`] reads.
+pub const DEVICE_TOKEN_ENV: &str = "MODRON_DEVICE_TOKEN";
+
+/// Split a `token` query parameter off a ws(s) target. Returns the target
+/// without that parameter (safe to show or log) and the token, if one was
+/// given and is not empty. Other targets (unix sockets) pass through
+/// untouched. The token is never part of the URL the client dials.
+pub fn split_url_token(url: &str) -> (String, Option<String>) {
+    let is_ws = url.starts_with("ws://") || url.starts_with("wss://");
+    let Some((base, query)) = url.split_once('?').filter(|_| is_ws) else {
+        return (url.to_string(), None);
+    };
+    let mut token = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| match pair.split_once('=') {
+            Some((TOKEN_PARAM, value)) => {
+                if !value.is_empty() {
+                    token = Some(value.to_string());
+                }
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    let stripped = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (stripped, token)
+}
+
+/// The device token from `MODRON_DEVICE_TOKEN`, when set and non-empty.
+/// Not read implicitly: a shell passes the result to `connect` as the
+/// explicit token. Precedence in `connect`: the explicit argument, then the
+/// URL's `?token=`.
+pub fn device_token_from_env() -> Option<String> {
+    std::env::var(DEVICE_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+/// True for the unix-socket targets: `unix` (the default socket),
+/// `unix:<path>` and `unix:///abs/path`.
+fn is_unix_target(url: &str) -> bool {
+    url == "unix" || url.starts_with("unix:")
+}
+
+/// The default local socket: `~/.modron/serve.sock` (the terminal client's
+/// default; `.` stands in when no home is known, as there).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_socket_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".modron").join("serve.sock")
+}
+
+/// The socket a unix target names. `Ok(None)` for a ws(s) target. An empty
+/// path is refused.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn unix_socket_path(url: &str) -> Result<Option<std::path::PathBuf>, ClientError> {
+    if !is_unix_target(url) {
+        return Ok(None);
+    }
+    let path = if url == "unix" {
+        default_socket_path()
+    } else {
+        let explicit = url
+            .strip_prefix("unix://")
+            .or_else(|| url.strip_prefix("unix:"))
+            .unwrap_or("");
+        std::path::PathBuf::from(explicit)
+    };
+    if path.as_os_str().is_empty() {
+        return Err(ClientError::Connect("unix socket path is empty".into()));
+    }
+    Ok(Some(path))
+}
+
+/// Accept a target before any dial: a ws(s) URL under the loopback/LAN rule
+/// ([`validate_ws_url`]), or a unix socket (native only).
+fn validate_target(url: &str, allow_insecure: bool) -> Result<(), ClientError> {
+    if is_unix_target(url) {
+        return validate_unix_target(url);
+    }
+    validate_ws_url(url, allow_insecure)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_unix_target(url: &str) -> Result<(), ClientError> {
+    unix_socket_path(url).map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn validate_unix_target(_url: &str) -> Result<(), ClientError> {
+    Err(ClientError::Connect(
+        "unix sockets are not available in the browser; use ws:// or wss://".into(),
+    ))
+}
+
 /// Runtime-agnostic deadline wrapper. Native: futures-timer polls a
 /// deadline against `Instant`. Wasm: `Instant` is unimplemented on
 /// wasm32-unknown-unknown (panics), so the delay is a browser `setTimeout`
@@ -264,6 +373,62 @@ struct Shared {
 struct CoreState {
     vm: SessionViewModel,
     fold: FoldState,
+    /// True when `vm.session_id` came from a frame rather than from an
+    /// explicit command (see [`accept_session`]).
+    adopted: bool,
+    /// Where the next [`RemoteClient::refresh_task_statuses`] call starts in
+    /// the task list (round robin, so every task is asked in turn).
+    task_status_cursor: usize,
+}
+
+/// Most `task_status` requests one [`RemoteClient::refresh_task_statuses`]
+/// call sends. A longer task list is covered over several calls.
+pub const TASK_STATUS_REFRESH_BATCH: usize = 10;
+
+/// The next round-robin batch of task ids: at most
+/// [`TASK_STATUS_REFRESH_BATCH`] ids starting at `cursor` (wrapping), and
+/// the cursor the following call starts from. Empty list, empty batch.
+fn next_task_status_batch(ids: &[Uuid], cursor: usize) -> (Vec<Uuid>, usize) {
+    if ids.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let start = cursor % ids.len();
+    let count = ids.len().min(TASK_STATUS_REFRESH_BATCH);
+    let batch = (0..count).map(|i| ids[(start + i) % ids.len()]).collect();
+    (batch, (start + count) % ids.len())
+}
+
+/// The session a frame belongs to: its envelope's `session`, or for a
+/// `Snapshot` its own `session_id`.
+fn frame_session(frame: &Frame) -> Option<Uuid> {
+    frame.session.or(match &frame.payload {
+        Payload::Snapshot { session_id, .. } => Some(*session_id),
+        _ => None,
+    })
+}
+
+/// Decides whether a frame that names a session may fold.
+///
+/// With no session attached (a share link: the page has no `session` to
+/// attach to), the first session a frame names is adopted as the attached
+/// session, so later session-scoped commands target it. After an adoption,
+/// frames for a different session are ignored (debug log): the first
+/// session wins. An explicit command (attach, new session, fork, task)
+/// clears the adoption, so its answer is taken as the new session.
+fn accept_session(vm: &mut SessionViewModel, adopted: &mut bool, id: Uuid) -> bool {
+    match vm.session_id {
+        None => {
+            vm.session_id = Some(id);
+            *adopted = true;
+            true
+        }
+        Some(current) if current == id => true,
+        Some(current) if *adopted => {
+            tracing::debug!(attached = %current, frame = %id, "ignoring frame for another session");
+            false
+        }
+        Some(_) => true,
+    }
 }
 
 /// One installed connection: the outgoing frame channel the UI-facing
@@ -335,16 +500,25 @@ impl RemoteClient {
 
     /// [`Self::connect`] with explicit options: the LAN `ws://` opt-in
     /// (`allow_insecure`), the connect deadline, and the keepalive timing.
+    ///
+    /// `url` may be `ws://`, `wss://`, or a unix socket (`unix`,
+    /// `unix:<path>`, `unix:///path`, native only; `allow_insecure` does not
+    /// apply to it). A `?token=` on a ws(s) URL is taken out before the dial
+    /// and used when `token` is `None`; the token never reaches the wire
+    /// URL or an error message. [`device_token_from_env`] supplies the
+    /// environment fallback explicitly.
     pub fn connect_with_options(
         url: &str,
         token: Option<&str>,
         options: ConnectOptions,
     ) -> Result<Self, ClientError> {
-        validate_ws_url(url, options.allow_insecure)?;
+        let (url, url_token) = split_url_token(url);
+        validate_target(&url, options.allow_insecure)?;
         let client = Self {
             shared: Arc::new(Shared::new(options)),
         };
-        client.spin_up(url, token, None);
+        let token = token.map(str::to_string).or(url_token);
+        client.spin_up(&url, token.as_deref(), None);
         Ok(client)
     }
 
@@ -370,12 +544,14 @@ impl RemoteClient {
         token: Option<&str>,
         allow_insecure: bool,
     ) -> Result<(), ClientError> {
-        validate_ws_url(url, allow_insecure)?;
+        let (url, url_token) = split_url_token(url);
+        validate_target(&url, allow_insecure)?;
         let last_seq = {
             let st = self.shared.state.lock().unwrap();
             st.vm.last_seq
         };
-        self.spin_up(url, token, Some((session_id, last_seq)));
+        let token = token.map(str::to_string).or(url_token);
+        self.spin_up(&url, token.as_deref(), Some((session_id, last_seq)));
         Ok(())
     }
 
@@ -472,6 +648,7 @@ impl RemoteClient {
     /// view in the background (poll `state()` / `take_new_entries()`).
     /// `last_seq = 0` asks for the full replay.
     pub fn attach(&self, session_id: Uuid, last_seq: u64) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Attach {
@@ -493,12 +670,24 @@ impl RemoteClient {
         session_id: Option<Uuid>,
         task: impl Into<String>,
     ) -> Result<(), ClientError> {
+        self.submit_with(session_id, task, Vec::new())
+    }
+
+    /// [`Self::submit`] carrying attachments (images from
+    /// [`crate::attach::attachment_from_bytes`]). The server runs the task
+    /// with them as multimodal input.
+    pub fn submit_with(
+        &self,
+        session_id: Option<Uuid>,
+        task: impl Into<String>,
+        attachments: Vec<Attachment>,
+    ) -> Result<(), ClientError> {
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Submit {
                 session_id,
                 task: task.into(),
-                attachments: Vec::new(),
+                attachments,
             },
         ))
     }
@@ -532,6 +721,274 @@ impl RemoteClient {
         let mut st = self.shared.state.lock().unwrap();
         crate::view::resolve_approval(&mut st.vm, &request_id);
         Ok(())
+    }
+
+    /// The attached session, the target of every session-scoped command
+    /// (steer, queue, plan, compact). Set by an explicit attach, by the
+    /// first session a frame names when none was attached (a share link),
+    /// or by a task or snapshot answer. `None` before any of those.
+    pub fn attached_session(&self) -> Option<Uuid> {
+        self.shared.state.lock().unwrap().vm.session_id
+    }
+
+    /// [`Self::attached_session`] as a request error when there is none.
+    fn require_session(&self) -> Result<Uuid, ClientError> {
+        self.attached_session()
+            .ok_or_else(|| ClientError::Request("no session attached".into()))
+    }
+
+    /// Shows a call the client could not make (it was never sent) in
+    /// `state().last_error`, where the server's own refusals land too.
+    pub fn note_local_error(&self, text: impl Into<String>) {
+        self.shared.state.lock().unwrap().vm.last_error = Some(text.into());
+    }
+
+    /// Clears a notice set with [`Self::note_local_error`] once it no
+    /// longer applies (for example "attached ..." after the message it
+    /// refers to has been sent). Server errors arriving later set it again.
+    pub fn clear_local_error(&self) {
+        self.shared.state.lock().unwrap().vm.last_error = None;
+    }
+
+    /// Marks the session id as explicitly chosen: a later frame naming
+    /// another session is not ignored as a mismatch.
+    fn explicit_session(&self) {
+        self.shared.state.lock().unwrap().adopted = false;
+    }
+
+    /// Composer submit (PROTOCOL_V2 section 2): while the attached session
+    /// runs, the text is a steer (injected at the next safe boundary);
+    /// otherwise it is a submit (a new run, or a new session when none is
+    /// attached).
+    pub fn send_message(&self, text: impl Into<String>) -> Result<(), ClientError> {
+        self.send_message_with(text, Vec::new())
+    }
+
+    /// [`Self::send_message`] with attachments. Attachments ride only on a
+    /// submit: while the attached session runs, a message with attachments
+    /// is refused (the steer frame has no attachment field), so nothing is
+    /// dropped silently. Wait for the turn to finish, then send again.
+    pub fn send_message_with(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<Attachment>,
+    ) -> Result<(), ClientError> {
+        let text = text.into();
+        let (session_id, running) = {
+            let st = self.shared.state.lock().unwrap();
+            (st.vm.session_id, st.vm.running)
+        };
+        match (running, session_id) {
+            (true, Some(_)) if !attachments.is_empty() => Err(ClientError::Request(
+                "attachments can only be sent when the session is idle".into(),
+            )),
+            (true, Some(session_id)) => self.send_frame(Frame::request(
+                self.next_request_id(),
+                Payload::Steer { session_id, text },
+            )),
+            _ => self.submit_with(session_id, text, attachments),
+        }
+    }
+
+    /// Steer a running session: the text joins the active run at the next
+    /// safe boundary. Errors when no session is attached.
+    pub fn steer(&self, text: impl Into<String>) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Steer {
+                session_id,
+                text: text.into(),
+            },
+        ))
+    }
+
+    /// Steer one live sub-agent of the attached session (PROTOCOL_V2 section
+    /// 4, H3d). `agent` is the swarm row's id.
+    pub fn steer_agent(
+        &self,
+        agent: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::SteerAgent {
+                session_id,
+                agent: agent.into(),
+                text: text.into(),
+            },
+        ))
+    }
+
+    /// Stop one live sub-agent of the attached session (H3d). Only that
+    /// child ends; its row turns killed in place.
+    pub fn kill_agent(&self, agent: impl Into<String>) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::KillAgent {
+                session_id,
+                agent: agent.into(),
+            },
+        ))
+    }
+
+    /// Run `command` in the attached session's shell: the terminal's
+    /// `!command` passthrough, executed on the server host under the same
+    /// approval and permission rules as a model `bash` call. The answer
+    /// (labelled output, or a refusal) arrives as a note or an error. An
+    /// empty command and a missing session fail here, nothing is sent.
+    pub fn shell(&self, command: impl Into<String>) -> Result<(), ClientError> {
+        self.send_shell(command.into(), false)
+    }
+
+    /// Run a `!!` command: shown in the transcript, never sent to the model
+    /// (see [`parse_shell_input`] for the composer rule that picks this).
+    pub fn shell_private(&self, command: impl Into<String>) -> Result<(), ClientError> {
+        self.send_shell(command.into(), true)
+    }
+
+    fn send_shell(&self, command: String, private: bool) -> Result<(), ClientError> {
+        if command.trim().is_empty() {
+            return Err(ClientError::Request("usage: !<shell command>".into()));
+        }
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Shell {
+                session_id,
+                command,
+                private,
+            },
+        ))
+    }
+
+    /// Hold a message for the session's next run (the alternate submit).
+    pub fn enqueue(&self, text: impl Into<String>) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Enqueue {
+                session_id,
+                text: text.into(),
+            },
+        ))
+    }
+
+    /// Remove one queued message by position (0 = next to run).
+    pub fn dequeue(&self, index: u32) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Dequeue { session_id, index },
+        ))
+    }
+
+    /// Answer the proposed plan: `Approve` flips to build and runs the
+    /// plan; `Revise` plans again with the note as the task.
+    pub fn decide_plan(
+        &self,
+        decision: PlanDecision,
+        note: Option<String>,
+    ) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::DecidePlan {
+                session_id,
+                decision,
+                note,
+            },
+        ))
+    }
+
+    /// Compact the attached session now (idle sessions only; the server
+    /// refuses while a run is active).
+    pub fn compact(&self) -> Result<(), ClientError> {
+        let session_id = self.require_session()?;
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::Compact { session_id },
+        ))
+    }
+
+    /// Set the reasoning effort for future turns. `None` clears it back to
+    /// the provider default.
+    pub fn set_effort(&self, effort: Option<Effort>) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            effort,
+            clear_effort: effort.is_none(),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Ask the provider for a reasoning summary on future turns (H7b). This
+    /// is the request side only; the reasoning DISPLAY stays gated by
+    /// `set_show_reasoning`.
+    pub fn set_reasoning_summary(&self, enable: bool) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            reasoning_summary: Some(enable),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Switch the run phase for future runs (`plan` read-only, `build`).
+    pub fn set_phase(&self, phase: Phase) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            phase: Some(phase),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Approval mode for future runs (`ask`, `yolo` = `ApproveAll`, `deny`).
+    /// The terminal's `--yolo` startup flag sends `ApproveAll`.
+    pub fn set_approval_mode(&self, mode: ApprovalModeWire) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            approval_mode: Some(mode),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Sandbox policy for future tool runs (`--sandbox`). The server refuses
+    /// a policy its platform cannot enforce.
+    pub fn set_sandbox(&self, policy: SandboxPolicy) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            sandbox: Some(policy),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Standing goal prepended to submitted tasks (`--goal`, `/goal`). An
+    /// empty string clears it (the server treats it as no goal).
+    pub fn set_goal(&self, goal: impl Into<String>) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            goal: Some(goal.into()),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Persona switch (`--agent`, `/agent`). The server refuses a name that
+    /// is not configured; an empty name clears the persona (sent unchanged).
+    pub fn set_persona(&self, persona: impl Into<String>) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            persona: Some(persona.into()),
+            ..ConfigPatch::default()
+        })
+    }
+
+    /// Tool allow and deny lists for future runs (`--allow`, `--deny`). `None`
+    /// leaves that list alone; `Some(vec![])` clears it.
+    pub fn set_tool_lists(
+        &self,
+        allow: Option<Vec<String>>,
+        deny: Option<Vec<String>>,
+    ) -> Result<(), ClientError> {
+        self.set_config(ConfigPatch {
+            allow,
+            deny,
+            ..ConfigPatch::default()
+        })
     }
 
     /// Mutate config for future turns only (server semantics).
@@ -677,8 +1134,22 @@ impl RemoteClient {
         ))
     }
 
+    /// Remove a provider's saved credential (the env-file key and Modron's
+    /// own sign-in tokens). The outcome arrives as a note and the refreshed
+    /// rows land in `state().providers`.
+    pub fn auth_remove(&self, session_id: Uuid, provider: &str) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::AuthRemove {
+                session_id,
+                provider: provider.into(),
+            },
+        ))
+    }
+
     /// Create an empty session without submitting a task.
     pub fn new_session(&self, title: Option<&str>) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::NewSession {
@@ -690,6 +1161,7 @@ impl RemoteClient {
     /// Fork a session: the server copies its log under a fresh id and
     /// both sessions get a note.
     pub fn fork_session(&self, session_id: Uuid) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::Fork { session_id },
@@ -699,6 +1171,7 @@ impl RemoteClient {
     /// Create a task: a new session in a dedicated worktree/branch off
     /// `base` (the reply adopts the new session).
     pub fn create_task(&self, title: &str, base: Option<&str>) -> Result<(), ClientError> {
+        self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
             Payload::CreateTask {
@@ -738,6 +1211,49 @@ impl RemoteClient {
         ))
     }
 
+    /// Request the model catalog for a picker; the rows land in
+    /// `state().models`.
+    pub fn request_models(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::ModelsReq {},
+        ))
+    }
+
+    /// Request the configured personas for the persona picker; the rows
+    /// land in `state().personas`, the current one marked.
+    pub fn request_personas(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::PersonasReq {},
+        ))
+    }
+
+    /// Ask for the status of the task sessions, at most
+    /// [`TASK_STATUS_REFRESH_BATCH`] per call: the next batch starts where
+    /// the previous call stopped, so a long list is covered over several
+    /// calls. Answers land in each task row's `summary` (`state().task_rows`).
+    /// Returns how many requests were sent.
+    pub fn refresh_task_statuses(&self) -> Result<usize, ClientError> {
+        let picked: Vec<Uuid> = {
+            let mut st = self.shared.state.lock().unwrap();
+            let ids: Vec<Uuid> = st
+                .vm
+                .sessions
+                .iter()
+                .filter(|meta| meta.task_branch.as_deref().is_some_and(|b| !b.is_empty()))
+                .map(|meta| meta.id)
+                .collect();
+            let (picked, next) = next_task_status_batch(&ids, st.task_status_cursor);
+            st.task_status_cursor = next;
+            picked
+        };
+        for id in &picked {
+            self.task_status(*id)?;
+        }
+        Ok(picked.len())
+    }
+
     /// Persist router defaults into the server's config; the outcome
     /// lands as a note.
     pub fn persist_router(
@@ -754,6 +1270,19 @@ impl RemoteClient {
                 strong: strong.into(),
                 cheap_fallback: cheap_fallback.map(Into::into),
                 strong_fallback: strong_fallback.map(Into::into),
+            },
+        ))
+    }
+
+    /// Save a default model and provider for FUTURE sessions on the server
+    /// (written to its config.toml). The current session keeps its model.
+    /// Answered by a correlated note, or an error for a refused pair.
+    pub fn persist_default_model(&self, model: &str, provider: &str) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::PersistDefaultModel {
+                model: model.into(),
+                provider: provider.into(),
             },
         ))
     }
@@ -785,10 +1314,16 @@ impl RemoteClient {
 
     fn send_frame(&self, frame: Frame) -> Result<(), ClientError> {
         let guard = self.shared.live.lock().unwrap();
-        match &*guard {
+        let result = match &*guard {
             Some(live) => live.tx.send(frame).map_err(|_| ClientError::Closed),
             None => Err(ClientError::Closed),
+        };
+        if let Err(e) = &result {
+            // A refused send says why in the snapshot, not only in the
+            // return value. Lock order: live, then state.
+            self.shared.state.lock().unwrap().vm.last_error = Some(format!("not sent: {e}"));
         }
+        result
     }
 }
 
@@ -991,13 +1526,68 @@ fn shutdown(shared: &Shared, gen: u64, reason: Option<String>) {
 // Frame folding (one defined effect per payload, per modron-protocol docs)
 // ---------------------------------------------------------------------------
 
+/// Whether a live frame can only come from a run in progress. The server
+/// announces a run's start with no frame of its own (its `busy` flag is set
+/// at spawn, and a snapshot carries it only to a client that attaches
+/// later), so a client attached before the run learns of it from the first
+/// frame that the run sends. Until a terminal frame clears `running` (see
+/// the view fold), that frame keeps the session running, and an approval
+/// wait counts as running too: the run is still live and accepts a steer.
+///
+/// Tool completions, reasoning-done markers and persisted events other
+/// than a task echo are left out, because they can trail a run's end.
+fn implies_run(payload: &Payload) -> bool {
+    match payload {
+        Payload::Event { event } => matches!(event, SessionEvent::Task { .. }),
+        Payload::Delta { delta } => {
+            matches!(delta, WireDelta::Text { .. } | WireDelta::Reasoning { .. })
+        }
+        Payload::Tool { activity } => matches!(
+            activity,
+            WireToolActivity::Start { .. } | WireToolActivity::SubagentStarted { .. }
+        ),
+        Payload::ApprovalRequested { .. } => true,
+        _ => false,
+    }
+}
+
 fn fold_frame(shared: &Shared, frame: Frame) {
     let mut st = shared.state.lock().unwrap();
-    let CoreState { vm, fold } = &mut *st;
+    let CoreState {
+        vm, fold, adopted, ..
+    } = &mut *st;
+
+    // A task's status is keyed by its own session id, so it is recorded
+    // before the attached-session gate: a share link that adopted another
+    // session still keeps every task's summary.
+    if let Payload::TaskStatus {
+        session_id,
+        ahead,
+        files,
+        ..
+    } = &frame.payload
+    {
+        vm.task_statuses.insert(
+            *session_id,
+            TaskStatusRecord {
+                ahead: *ahead,
+                files: files.clone(),
+            },
+        );
+    }
+
+    if let Some(id) = frame_session(&frame) {
+        if !accept_session(vm, adopted, id) {
+            return;
+        }
+    }
 
     // Any session-scoped sequenced frame advances the resume cursor.
     if frame.session.is_some() && frame.seq > vm.last_seq {
         vm.last_seq = frame.seq;
+    }
+    if implies_run(&frame.payload) {
+        vm.running = true;
     }
 
     match frame.payload {
@@ -1036,12 +1626,27 @@ fn fold_frame(shared: &Shared, frame: Frame) {
             let core: ToolActivity = activity.into();
             fold.fold_tool(vm, &core);
         }
-        Payload::ApprovalRequested { request_id, call } => {
-            crate::view::enqueue_approval(vm, request_id, &call);
+        Payload::ApprovalRequested {
+            request_id,
+            call,
+            agent,
+        } => {
+            crate::view::enqueue_approval(vm, request_id, &call, agent.as_deref());
         }
         Payload::ApprovalResolved { request_id, .. } => {
             crate::view::resolve_approval(vm, &request_id);
         }
+        // Steer echo: pending until its persisted Task event arrives.
+        Payload::Steered { text } => vm.pending_steers.push(text),
+        // Queue chips: the server's full list replaces ours.
+        Payload::QueueChanged { queued } => vm.queued = queued,
+        Payload::ContextChanged { used, window } => {
+            vm.context = Some(ContextGaugeWire { used, window });
+        }
+        Payload::PlanProposed { items } => {
+            vm.plan_pending = Some(PendingPlanView::new(&items));
+        }
+        Payload::PlanDecided { .. } => vm.plan_pending = None,
         Payload::ConfigChanged { patch } => apply_config(vm, &patch),
         Payload::Sessions { sessions } => vm.sessions = sessions,
         Payload::Automations { rows } => vm.automations = rows,
@@ -1061,6 +1666,10 @@ fn fold_frame(shared: &Shared, frame: Frame) {
                 strong_fallback,
             });
         }
+        Payload::Models { models } => vm.models = models,
+        // The persona picker's rows; the current marker comes from the
+        // session's persona, not from this list.
+        Payload::Personas { personas } => vm.personas = personas,
         // A task creation adopts the fresh session (the desktop does the
         // same); status and merge answers land as scrollback notes.
         Payload::TaskCreated {
@@ -1069,6 +1678,7 @@ fn fold_frame(shared: &Shared, frame: Frame) {
             branch,
         } => {
             vm.session_id = Some(session_id);
+            *adopted = false;
             vm.last_note = Some(format!("task created: {branch} in {worktree}"));
         }
         Payload::TaskStatus {
@@ -1108,6 +1718,17 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         Payload::TurnFailed { error } => fold_turn_unfinished(vm, fold, Some(error)),
         Payload::TurnAborted {} => fold_turn_unfinished(vm, fold, None),
         Payload::Note { text } => vm.last_note = Some(text),
+        // H3d: a background sub-agent settled. The shared view wording goes
+        // to the last-note line; the label comes from its swarm row.
+        Payload::AgentFinished { agent, ok, .. } => {
+            let label = vm
+                .subagents
+                .iter()
+                .find(|row| row.id == agent)
+                .map(|row| row.label.clone())
+                .unwrap_or_else(|| agent.chars().take(8).collect());
+            vm.last_note = Some(modron_view::agent_finished_text(&label, ok));
+        }
         Payload::OAuthProgress {
             provider,
             stage,
@@ -1156,6 +1777,49 @@ fn apply_config(vm: &mut SessionViewModel, patch: &ConfigPatch) {
     if let Some(goal) = &patch.goal {
         vm.goal = goal.clone();
     }
+    if let Some(persona) = &patch.persona {
+        // An empty name is the clear: no persona, same as a fresh snapshot.
+        vm.persona = Some(persona.clone()).filter(|p| !p.is_empty());
+    }
+    if let Some(phase) = patch.phase {
+        vm.phase = phase;
+    }
+    // `clear_effort` wins over `effort`, as on the server (H7a).
+    if patch.clear_effort {
+        vm.effort = None;
+    } else if let Some(effort) = patch.effort {
+        vm.effort = Some(effort);
+    }
+    if let Some(rules) = &patch.rules {
+        vm.rules = rules.clone();
+    }
+}
+
+/// A composer line read as a shell command (decision 1, PLAN.md 10.2a).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellInput {
+    /// The command, trimmed. Empty when the user typed only `!` or `!!`.
+    pub command: String,
+    /// `true` for `!!`: the output is shown but never reaches the model.
+    pub private: bool,
+}
+
+/// The one composer rule for shell input, shared by every client. Text
+/// starting with `!!` is a private command, `!` is a shared one; the rest is
+/// trimmed. Anything else is not shell input (`None`). An empty command is
+/// `Some` with an empty `command`, so the caller can show the usage line.
+pub fn parse_shell_input(text: &str) -> Option<ShellInput> {
+    if let Some(rest) = text.strip_prefix("!!") {
+        return Some(ShellInput {
+            command: rest.trim().to_string(),
+            private: true,
+        });
+    }
+    let rest = text.strip_prefix('!')?;
+    Some(ShellInput {
+        command: rest.trim().to_string(),
+        private: false,
+    })
 }
 
 #[cfg(test)]
@@ -1181,12 +1845,273 @@ mod tests {
         assert!(validate_ws_url("ws:///path", false).is_err());
     }
 
+    /// The persona reply folds into the picker rows, and the current marker
+    /// follows the snapshot's persona and then a `ConfigChanged` switch.
+    #[test]
+    fn personas_reply_marks_the_current_persona() {
+        use modron_protocol::{LiveState, PersonaWire};
+        let session = Uuid::new_v4();
+        let snapshot = Frame {
+            id: None,
+            session: Some(session),
+            seq: 1,
+            role: None,
+            payload: Payload::Snapshot {
+                session_id: session,
+                last_seq: 1,
+                events: Vec::new(),
+                live: LiveState {
+                    persona: Some("reviewer".into()),
+                    ..LiveState::default()
+                },
+            },
+        };
+        let catalog = Frame {
+            id: Some(9),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Personas {
+                personas: vec![
+                    PersonaWire {
+                        name: "reviewer".into(),
+                        model: None,
+                        summary: "Review diffs.".into(),
+                    },
+                    PersonaWire {
+                        name: "writer".into(),
+                        model: Some("claude-haiku-4-5".into()),
+                        summary: String::new(),
+                    },
+                ],
+            },
+        };
+        let snap = folded_all(vec![snapshot.clone(), catalog.clone()]);
+        assert_eq!(snap.personas.len(), 2);
+        assert_eq!(snap.personas[0].text, "reviewer - Review diffs.");
+        assert!(snap.personas[0].current);
+        assert_eq!(snap.personas[1].text, "writer");
+        assert!(!snap.personas[1].current);
+
+        let switched = Frame {
+            id: None,
+            session: Some(session),
+            seq: 2,
+            role: None,
+            payload: Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    persona: Some("writer".into()),
+                    ..ConfigPatch::default()
+                },
+            },
+        };
+        let snap = folded_all(vec![snapshot.clone(), catalog.clone(), switched.clone()]);
+        assert!(!snap.personas[0].current);
+        assert!(snap.personas[1].current);
+
+        // An empty name clears: no row is current and the persona is absent.
+        let cleared = Frame {
+            id: None,
+            session: Some(session),
+            seq: 3,
+            role: None,
+            payload: Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    persona: Some(String::new()),
+                    ..ConfigPatch::default()
+                },
+            },
+        };
+        let snap = folded_all(vec![snapshot, catalog, switched, cleared]);
+        assert!(snap.personas.iter().all(|p| !p.current));
+        assert_eq!(snap.persona, None);
+    }
+
+    /// The batch helper asks for at most ten tasks per call, round robin:
+    /// a 25-task list is covered over three calls, the last one wrapping.
+    #[test]
+    fn task_status_batches_are_capped_and_round_robin() {
+        let ids: Vec<Uuid> = (0..25).map(Uuid::from_u128).collect();
+        let (first, cursor) = next_task_status_batch(&ids, 0);
+        assert_eq!(first, ids[0..10].to_vec());
+        assert_eq!(cursor, 10);
+        let (second, cursor) = next_task_status_batch(&ids, cursor);
+        assert_eq!(second, ids[10..20].to_vec());
+        assert_eq!(cursor, 20);
+        let (third, cursor) = next_task_status_batch(&ids, cursor);
+        let wrapped: Vec<Uuid> = ids[20..25]
+            .iter()
+            .chain(ids[0..5].iter())
+            .copied()
+            .collect();
+        assert_eq!(third, wrapped);
+        assert_eq!(cursor, 5);
+        assert_eq!(next_task_status_batch(&[], 3), (Vec::new(), 0));
+    }
+
+    /// Task rows carry the summary of the latest status for their own
+    /// session, a status for another task folds without touching the rest,
+    /// and a task with no status yet has an empty summary. Non-task sessions
+    /// get no row.
+    #[test]
+    fn task_status_folds_into_the_task_rows() {
+        use modron_protocol::{SessionMetaWire, TaskFileStat};
+        let meta = |n: u128, branch: Option<&str>| SessionMetaWire {
+            id: Uuid::from_u128(n),
+            title: format!("task {n}"),
+            created_at: String::new(),
+            updated_at: String::new(),
+            message_count: 0,
+            task_branch: branch.map(String::from),
+            task_state: None,
+            working_dir: None,
+        };
+        let listed = Frame {
+            id: Some(3),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Sessions {
+                sessions: vec![
+                    meta(1, Some("task/one")),
+                    meta(2, None),
+                    meta(3, Some("task/three")),
+                ],
+            },
+        };
+        let status = Frame {
+            id: Some(4),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::TaskStatus {
+                session_id: Uuid::from_u128(1),
+                worktree: "/wt/one".into(),
+                branch: "task/one".into(),
+                running: false,
+                ahead: 3,
+                files: vec![
+                    TaskFileStat {
+                        path: "a.rs".into(),
+                        added: 100,
+                        deleted: 10,
+                    },
+                    TaskFileStat {
+                        path: "b.rs".into(),
+                        added: 20,
+                        deleted: 4,
+                    },
+                ],
+            },
+        };
+        let snap = folded_all(vec![listed, status]);
+        assert_eq!(snap.task_rows.len(), 2, "the plain session has no row");
+        assert_eq!(snap.task_rows[0].session_id, Uuid::from_u128(1));
+        assert_eq!(snap.task_rows[0].summary, "ahead 3 - 2 files (+120 -14)");
+        assert_eq!(snap.task_rows[0].text, "task 1 \u{b7} task/one \u{b7} idle");
+        assert_eq!(snap.task_rows[1].session_id, Uuid::from_u128(3));
+        assert_eq!(snap.task_rows[1].summary, "");
+    }
+
+    /// The catalog reply folds into the picker rows: the session's model
+    /// is marked current, and an unavailable row keeps its flag.
+    #[test]
+    fn models_reply_folds_into_picker_rows() {
+        use modron_protocol::ModelWire;
+        let row = |id: &str, provider: &str, window: u64, available: bool| ModelWire {
+            id: id.into(),
+            provider: provider.into(),
+            label: id.into(),
+            context_window: Some(window),
+            available,
+            tier: Some("cheap".into()),
+        };
+        let current = Frame {
+            id: None,
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    model: Some("claude-haiku-4-5".into()),
+                    provider: Some("anthropic".into()),
+                    ..ConfigPatch::default()
+                },
+            },
+        };
+        let catalog = Frame {
+            id: Some(7),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Models {
+                models: vec![
+                    row("claude-haiku-4-5", "anthropic", 200_000, true),
+                    row("llama-3.3-70b", "ollama", 128_000, false),
+                ],
+            },
+        };
+        let snap = folded_all(vec![current, catalog]);
+        assert_eq!(snap.models.len(), 2);
+        assert_eq!(
+            snap.models[0].text,
+            "claude-haiku-4-5 - anthropic - 200k ctx"
+        );
+        assert!(snap.models[0].current && snap.models[0].available);
+        assert!(!snap.models[1].available && !snap.models[1].current);
+        assert_eq!(snap.models[1].text, "llama-3.3-70b - ollama - 128k ctx");
+    }
+
     /// Fold one frame into a fresh shared state and return the snapshot.
     fn folded(frame: Frame) -> ViewModelSnapshot {
         let shared = Shared::new(ConnectOptions::default());
         fold_frame(&shared, frame);
         let st = shared.state.lock().unwrap();
         ViewModelSnapshot::from_vm(&st.vm)
+    }
+
+    /// H3d: a background settlement folds into last_note with the shared
+    /// wording, labelled from the swarm row when the row is live.
+    #[test]
+    fn agent_finished_folds_into_the_last_note_with_the_row_label() {
+        let session = Uuid::new_v4();
+        let snap = folded_all(vec![
+            Frame::event(
+                Some(session),
+                1,
+                Payload::Tool {
+                    activity: modron_protocol::WireToolActivity::SubagentStarted {
+                        id: "agent-1".into(),
+                        label: "delegate".into(),
+                    },
+                },
+            ),
+            Frame::event(
+                Some(session),
+                2,
+                Payload::AgentFinished {
+                    agent: "agent-1".into(),
+                    ok: true,
+                    brief: "all good".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            snap.last_note.as_deref(),
+            Some("sub-agent delegate finished")
+        );
+
+        // No live row for the id: the note falls back to a short id.
+        let snap = folded(Frame::event(
+            Some(session),
+            3,
+            Payload::AgentFinished {
+                agent: "zz".into(),
+                ok: false,
+                brief: "stopped by the user".into(),
+            },
+        ));
+        assert_eq!(snap.last_note.as_deref(), Some("sub-agent zz failed"));
     }
 
     #[test]
@@ -1204,6 +2129,264 @@ mod tests {
             snap.last_note.as_deref(),
             Some("remote-control live: https://bridge.example.com/s/abc - open on any device")
         );
+    }
+
+    /// A client with no connection, for folding frames by hand.
+    fn bare_client() -> RemoteClient {
+        RemoteClient {
+            shared: Arc::new(Shared::new(ConnectOptions::default())),
+        }
+    }
+
+    fn snapshot_for(session: Uuid) -> Frame {
+        Frame::event(
+            Some(session),
+            0,
+            Payload::Snapshot {
+                session_id: session,
+                last_seq: 0,
+                events: vec![],
+                live: modron_protocol::LiveState::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn the_first_session_a_frame_names_is_adopted() {
+        // Share link: no attach was sent, the first snapshot names the session.
+        let session = Uuid::new_v4();
+        let client = bare_client();
+        assert_eq!(client.attached_session(), None);
+        fold_frame(&client.shared, snapshot_for(session));
+        assert_eq!(client.attached_session(), Some(session));
+    }
+
+    #[test]
+    fn a_second_session_is_ignored_once_one_is_adopted() {
+        let first = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let client = bare_client();
+        fold_frame(
+            &client.shared,
+            Frame::event(
+                Some(first),
+                1,
+                Payload::Delta {
+                    delta: WireDelta::Text { text: "a".into() },
+                },
+            ),
+        );
+        fold_frame(
+            &client.shared,
+            Frame::event(
+                Some(other),
+                7,
+                Payload::Delta {
+                    delta: WireDelta::Text { text: "b".into() },
+                },
+            ),
+        );
+        assert_eq!(client.attached_session(), Some(first));
+        assert_eq!(client.state().streaming_text, "a");
+        assert_eq!(client.last_seq(), 1);
+    }
+
+    #[test]
+    fn an_explicit_new_session_takes_over_from_the_adopted_one() {
+        let first = Uuid::new_v4();
+        let next = Uuid::new_v4();
+        let client = bare_client();
+        fold_frame(&client.shared, snapshot_for(first));
+        // No connection, so the send fails; the explicit mark is still set.
+        assert!(client.new_session(None).is_err());
+        fold_frame(&client.shared, snapshot_for(next));
+        assert_eq!(client.attached_session(), Some(next));
+    }
+
+    #[test]
+    fn a_local_error_lands_in_last_error() {
+        let client = bare_client();
+        client.note_local_error("send refused");
+        assert_eq!(client.state().last_error.as_deref(), Some("send refused"));
+    }
+
+    /// Fold several frames, in order, into one fresh shared state.
+    fn folded_all(frames: Vec<Frame>) -> ViewModelSnapshot {
+        let shared = Shared::new(ConnectOptions::default());
+        for frame in frames {
+            fold_frame(&shared, frame);
+        }
+        let st = shared.state.lock().unwrap();
+        ViewModelSnapshot::from_vm(&st.vm)
+    }
+
+    #[test]
+    fn steer_queue_and_context_frames_fold_into_the_view() {
+        let session = Uuid::new_v4();
+        let snap = folded_all(vec![
+            Frame::event(
+                Some(session),
+                1,
+                Payload::Steered {
+                    text: "also check B".into(),
+                },
+            ),
+            Frame::event(
+                Some(session),
+                2,
+                Payload::QueueChanged {
+                    queued: vec!["first".into(), "second".into()],
+                },
+            ),
+            Frame::event(
+                Some(session),
+                3,
+                Payload::QueueChanged {
+                    queued: vec!["second".into()],
+                },
+            ),
+            Frame::event(
+                Some(session),
+                4,
+                Payload::ContextChanged {
+                    used: 74_000,
+                    window: 180_000,
+                },
+            ),
+        ]);
+        assert_eq!(snap.pending_steers, vec!["also check B".to_string()]);
+        // QueueChanged replaces the list rather than appending to it.
+        assert_eq!(snap.queued, vec!["second".to_string()]);
+        assert_eq!(snap.context_label, "ctx 41% (74k/180k)");
+    }
+
+    #[test]
+    fn plan_proposed_opens_the_block_and_plan_decided_clears_it() {
+        let session = Uuid::new_v4();
+        let items = vec![modron_types::PlanItem {
+            text: "Add the endpoint".into(),
+            done_criteria: "curl returns 200".into(),
+            status: "pending".into(),
+        }];
+        let open = folded_all(vec![Frame::event(
+            Some(session),
+            1,
+            Payload::PlanProposed {
+                items: items.clone(),
+            },
+        )]);
+        let plan = open.plan_pending.expect("plan block opens");
+        assert_eq!(plan.lines, vec!["○ Add the endpoint - curl returns 200"]);
+        assert_eq!(plan.options[0].label, "approve");
+        assert_eq!(plan.options[1].label, "revise");
+
+        let cleared = folded_all(vec![
+            Frame::event(Some(session), 1, Payload::PlanProposed { items }),
+            Frame::event(
+                Some(session),
+                2,
+                Payload::PlanDecided {
+                    decision: PlanDecision::Approve,
+                },
+            ),
+        ]);
+        assert!(cleared.plan_pending.is_none());
+    }
+
+    #[test]
+    fn config_changed_effort_folds_into_the_status_line() {
+        let set = folded_all(vec![Frame::event(
+            None,
+            0,
+            Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    effort: Some(Effort::High),
+                    ..ConfigPatch::default()
+                },
+            },
+        )]);
+        assert_eq!(set.effort_label, "high");
+        assert!(
+            set.status_line.contains(" · effort high"),
+            "{}",
+            set.status_line
+        );
+
+        let cleared = folded_all(vec![
+            Frame::event(
+                None,
+                0,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        effort: Some(Effort::High),
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+            Frame::event(
+                None,
+                1,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        clear_effort: true,
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(cleared.effort_label, "");
+        assert!(!cleared.status_line.contains("effort"));
+    }
+
+    #[test]
+    fn config_changed_phase_and_rules_fold_into_labels() {
+        let snap = folded_all(vec![Frame::event(
+            None,
+            0,
+            Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    phase: Some(Phase::Plan),
+                    rules: Some(vec![modron_protocol::RuleWire {
+                        effect: "ask".into(),
+                        spec: "bash(git push*)".into(),
+                    }]),
+                    ..ConfigPatch::default()
+                },
+            },
+        )]);
+        assert_eq!(snap.phase_label, "plan");
+        assert!(
+            snap.status_line.ends_with(" · plan"),
+            "{}",
+            snap.status_line
+        );
+        assert_eq!(snap.rules, vec!["ask bash(git push*)".to_string()]);
+
+        // A patch without phase or rules leaves both alone.
+        let snap = folded_all(vec![
+            Frame::event(
+                None,
+                0,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        phase: Some(Phase::Plan),
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+            Frame::event(
+                None,
+                1,
+                Payload::ConfigChanged {
+                    patch: ConfigPatch {
+                        model: Some("m2".into()),
+                        ..ConfigPatch::default()
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(snap.phase_label, "plan");
+        assert!(snap.rules.is_empty());
     }
 
     #[test]
@@ -1284,5 +2467,43 @@ mod tests {
         // The flag only relaxes ws://; a malformed URL is still refused.
         assert!(validate_ws_url("ws://", true).is_err());
         assert!(validate_ws_url("http://example.com", true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shell_input_tests {
+    use super::*;
+
+    fn shell(command: &str, private: bool) -> Option<ShellInput> {
+        Some(ShellInput {
+            command: command.into(),
+            private,
+        })
+    }
+
+    #[test]
+    fn single_bang_is_a_shared_command_and_double_bang_is_private() {
+        assert_eq!(parse_shell_input("!ls -la"), shell("ls -la", false));
+        assert_eq!(parse_shell_input("!!env"), shell("env", true));
+        assert_eq!(
+            parse_shell_input("!  cargo test  "),
+            shell("cargo test", false)
+        );
+        assert_eq!(parse_shell_input("!! pwd "), shell("pwd", true));
+    }
+
+    #[test]
+    fn bare_bangs_parse_to_an_empty_command_for_the_usage_line() {
+        assert_eq!(parse_shell_input("!"), shell("", false));
+        assert_eq!(parse_shell_input("!!"), shell("", true));
+        assert_eq!(parse_shell_input("!   "), shell("", false));
+    }
+
+    #[test]
+    fn anything_else_is_not_shell_input() {
+        assert_eq!(parse_shell_input("ls"), None);
+        assert_eq!(parse_shell_input(""), None);
+        assert_eq!(parse_shell_input(" !ls"), None);
+        assert_eq!(parse_shell_input("fix the ! bug"), None);
     }
 }

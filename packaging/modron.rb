@@ -14,6 +14,11 @@ class Modron < Formula
     # --root #{prefix}: without it cargo installs into $CARGO_HOME/bin and
     # the formula's bin/modron (and the test block) never exists.
     system "cargo", "install", "--locked", "--root", prefix, "--path", "crates/modron-cli"
+    # The terminal app (`modron app`) lives in app/ and needs a tag that has
+    # it; older tags have no app/ directory and install modron alone.
+    if (buildpath/"app/Cargo.toml").exist?
+      system "cargo", "install", "--locked", "--root", prefix, "--path", "app"
+    end
   end
 
   test do

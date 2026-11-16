@@ -67,6 +67,11 @@ pub struct HookConfig {
     pub pre_tool: Option<String>,
     /// Run after every tool call completes; failures never block.
     pub post_tool: Option<String>,
+    /// Run once at the start of each run (observe-only; never blocks).
+    pub session_start: Option<String>,
+    /// Run once per model turn after its tools are dispatched (observe-only;
+    /// never blocks).
+    pub turn_end: Option<String>,
 }
 
 /// What a hook decided. `blocked` is only meaningful for `pre_tool`.
@@ -201,6 +206,18 @@ pub async fn run_hook(
         }
     }
 
+    spawn_hook(cmd, &child_envs, stdin_payload, timeout).await
+}
+
+/// Spawns `cmd` with the already-resolved env and stdin payload, waits up to
+/// `timeout`, and maps the exit status to a [`HookOutcome`]. Shared by
+/// [`run_hook`] and the lifecycle runners.
+async fn spawn_hook(
+    cmd: &str,
+    child_envs: &[(String, String)],
+    stdin_payload: Vec<u8>,
+    timeout: Duration,
+) -> Result<HookOutcome> {
     let mut command = tokio::process::Command::new("sh");
     scrub_tokio_command(&mut command);
     command
@@ -280,6 +297,84 @@ pub async fn run_hook(
             ),
         })
     }
+}
+
+/// Facts about one completed model turn, handed to the `turn_end` hook.
+/// Assistant text and tool arguments are deliberately absent.
+#[derive(Clone, Copy, Debug)]
+pub struct TurnEndFacts<'a> {
+    pub session_id: &'a str,
+    pub working_dir: &'a str,
+    /// 1-based turn number within this run.
+    pub turn: u32,
+    pub model: &'a str,
+    /// Tool calls the model requested in this turn.
+    pub tool_calls: u32,
+    /// Provider-reported prompt tokens for the turn.
+    pub input_tokens: u64,
+    /// Provider-reported completion tokens for the turn.
+    pub output_tokens: u64,
+}
+
+/// Logs a lifecycle hook's failure or timeout; never propagates it.
+fn log_lifecycle(hook: &'static str, result: Result<HookOutcome>) {
+    match result {
+        Ok(outcome) if outcome.blocked => tracing::warn!(
+            hook,
+            message = %outcome.message,
+            "lifecycle hook failed (non-blocking)"
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(hook, error = %err, "lifecycle hook failed (non-blocking)"),
+    }
+}
+
+/// Runs the `session_start` hook. Env: `MODRON_EVENT=session_start`,
+/// `MODRON_SESSION_ID`, `MODRON_WORKING_DIR`. Observe-only: a failure or a
+/// timeout is logged and never fails the run.
+pub async fn run_session_start_hook(cmd: &str, session_id: &str, working_dir: &str) {
+    let envs = vec![
+        ("MODRON_EVENT".to_string(), "session_start".to_string()),
+        ("MODRON_SESSION_ID".to_string(), session_id.to_string()),
+        ("MODRON_WORKING_DIR".to_string(), working_dir.to_string()),
+    ];
+    log_lifecycle("session_start", run_hook(cmd, &envs, HOOK_TIMEOUT).await);
+}
+
+/// Runs the `turn_end` hook. Env: `MODRON_EVENT=turn_end`, `MODRON_SESSION_ID`,
+/// `MODRON_WORKING_DIR`, `MODRON_TURN`, `MODRON_MODEL`, `MODRON_TOOL_CALLS`.
+/// Stdin is a small JSON object with the same facts plus `input_tokens` and
+/// `output_tokens`. Observe-only: failures are logged, never propagated.
+pub async fn run_turn_end_hook(cmd: &str, facts: TurnEndFacts<'_>) {
+    let turn = facts.turn.to_string();
+    let tool_calls = facts.tool_calls.to_string();
+    let envs: Vec<(String, String)> = [
+        ("MODRON_EVENT", "turn_end"),
+        ("MODRON_SESSION_ID", facts.session_id),
+        ("MODRON_WORKING_DIR", facts.working_dir),
+        ("MODRON_TURN", turn.as_str()),
+        ("MODRON_MODEL", facts.model),
+        ("MODRON_TOOL_CALLS", tool_calls.as_str()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let stdin = serde_json::json!({
+        "event": "turn_end",
+        "session_id": facts.session_id,
+        "working_dir": facts.working_dir,
+        "turn": facts.turn,
+        "model": facts.model,
+        "tool_calls": facts.tool_calls,
+        "input_tokens": facts.input_tokens,
+        "output_tokens": facts.output_tokens,
+    })
+    .to_string()
+    .into_bytes();
+    log_lifecycle(
+        "turn_end",
+        spawn_hook(cmd, &envs, stdin, HOOK_TIMEOUT).await,
+    );
 }
 
 /// Last `max` characters of `s` (char-boundary safe) — for surfacing hook
@@ -532,6 +627,87 @@ mod tests {
             .unwrap();
         std::env::remove_var("MODRON_TEST_HOOK_API_KEY");
         assert!(!out.blocked, "{}", out.message);
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "unset");
+    }
+
+    #[tokio::test]
+    async fn session_start_runner_sets_its_env_and_never_panics_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("start.txt");
+        let cmd = format!(
+            "printf '%s|%s|%s' \"$MODRON_EVENT\" \"$MODRON_SESSION_ID\" \"$MODRON_WORKING_DIR\" > {}",
+            seen.display()
+        );
+        run_session_start_hook(&cmd, "sess-9", "/work/dir").await;
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            "session_start|sess-9|/work/dir"
+        );
+        // A failing hook is logged and swallowed (returns unit, no panic).
+        run_session_start_hook("exit 7", "sess-9", "/work/dir").await;
+    }
+
+    #[tokio::test]
+    async fn turn_end_runner_sets_env_and_streams_json_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_out = dir.path().join("env.txt");
+        let stdin_out = dir.path().join("stdin.json");
+        let cmd = format!(
+            "printf '%s|%s|%s|%s|%s|%s' \"$MODRON_EVENT\" \"$MODRON_SESSION_ID\" \"$MODRON_TURN\" \"$MODRON_MODEL\" \"$MODRON_TOOL_CALLS\" \"$MODRON_WORKING_DIR\" > {env}; cat > {stdin}",
+            env = env_out.display(),
+            stdin = stdin_out.display()
+        );
+        run_turn_end_hook(
+            &cmd,
+            TurnEndFacts {
+                session_id: "sess-7",
+                working_dir: "/w",
+                turn: 3,
+                model: "m-1",
+                tool_calls: 2,
+                input_tokens: 100,
+                output_tokens: 40,
+            },
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&env_out).unwrap(),
+            "turn_end|sess-7|3|m-1|2|/w"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&stdin_out).unwrap()).unwrap();
+        assert_eq!(json["event"], "turn_end");
+        assert_eq!(json["turn"], 3);
+        assert_eq!(json["tool_calls"], 2);
+        assert_eq!(json["input_tokens"], 100);
+        assert_eq!(json["output_tokens"], 40);
+        assert!(json.get("text").is_none() && json.get("args").is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_end_hook_env_does_not_leak_provider_secret() {
+        // Unique name: no other test reads or sets it.
+        std::env::set_var("MODRON_TEST_TURN_API_KEY", "sekrit-turn");
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen.txt");
+        let cmd = format!(
+            "printf '%s' \"${{MODRON_TEST_TURN_API_KEY-unset}}\" > {}",
+            seen.display()
+        );
+        run_turn_end_hook(
+            &cmd,
+            TurnEndFacts {
+                session_id: "s",
+                working_dir: "/w",
+                turn: 1,
+                model: "m",
+                tool_calls: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        )
+        .await;
+        std::env::remove_var("MODRON_TEST_TURN_API_KEY");
         assert_eq!(std::fs::read_to_string(&seen).unwrap(), "unset");
     }
 

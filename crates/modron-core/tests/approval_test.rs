@@ -91,6 +91,7 @@ fn call_response(id: &str, name: &str) -> TurnResponse {
         }],
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -112,6 +113,7 @@ async fn mutating_tool_gated_per_mode() {
         let engine = engine(
             provider.clone(),
             ApprovalPolicy {
+                rules: Default::default(),
                 mode,
                 non_interactive: true,
                 allow: Vec::new(),
@@ -167,6 +169,7 @@ async fn read_only_tool_unaffected_by_every_mode() {
         let engine = engine(
             provider.clone(),
             ApprovalPolicy {
+                rules: Default::default(),
                 mode,
                 non_interactive: true,
                 allow: Vec::new(),
@@ -202,6 +205,7 @@ async fn model_adapts_after_block() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         },
         tools,
     );
@@ -242,6 +246,7 @@ async fn resume_unaffected_by_blocks() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         },
         Arc::clone(&tools),
     );
@@ -269,6 +274,7 @@ async fn resume_unaffected_by_blocks() {
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },
@@ -332,6 +338,7 @@ fn call_response_with_args(id: &str, name: &str, arguments: serde_json::Value) -
         }],
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -345,6 +352,7 @@ fn checkpoints(events: &[SessionEvent]) -> Vec<SessionEvent> {
 
 fn policy(mode: ApprovalMode) -> ApprovalPolicy {
     ApprovalPolicy {
+        rules: Default::default(),
         mode,
         non_interactive: false,
         allow: Vec::new(),
@@ -359,7 +367,7 @@ fn policy(mode: ApprovalMode) -> ApprovalPolicy {
 async fn checkpoint_taken_in_every_allowing_mode() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), b"before").unwrap();
-    let allow: Arc<modron_core::Approver> = Arc::new(|_c: &ToolCall| true);
+    let allow: Arc<modron_core::Approver> = Arc::new(|_c: &modron_core::ApprovalAsk<'_>| true);
     for (mode, approver) in [
         (ApprovalMode::ApproveAll, None),
         (ApprovalMode::Ask, Some(allow)),
@@ -401,7 +409,7 @@ async fn checkpoint_taken_in_every_allowing_mode() {
 async fn refused_write_records_no_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), b"before").unwrap();
-    let deny: Arc<modron_core::Approver> = Arc::new(|_c: &ToolCall| false);
+    let deny: Arc<modron_core::Approver> = Arc::new(|_c: &modron_core::ApprovalAsk<'_>| false);
     for (mode, approver) in [(ApprovalMode::Deny, None), (ApprovalMode::Ask, Some(deny))] {
         let store = Arc::new(InMemoryStore::new());
         let engine = engine_in(

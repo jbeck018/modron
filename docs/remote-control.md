@@ -1,4 +1,4 @@
-# Remote control — `modron serve`
+# Remote control - `modron serve`
 
 The remote-control server (Phases 2+3) runs the Modron engine as a
 long-lived process so clients anywhere (desktop, phone, another machine)
@@ -9,7 +9,7 @@ running task, and a run keeps going with zero clients attached.
 ```
 +----------------+        WebSocket (JSON frames)      +----------------------+
 | remote client  | <-----------------------------------> |    modron serve      |
-| (TUI/GUI/web)  |                                       |  SessionHub          |
+| (app/web)      |                                       |  SessionHub          |
 +----------------+                                       |  - broadcast/seq     |
                                                          |  - approvals         |
 +----------------+        Unix socket (NDJSON frames)    |  - interrupt         |
@@ -175,16 +175,63 @@ loopback (`localhost`, `127.0.0.0/8`, `[::1]`); any other host is refused,
 because the share key, publish token and transcript would cross the
 network in clear.
 
+### Open at start (`serve --remote-control`)
+
+`modron serve --remote-control <bridge-url>` opens the tunnel itself, when
+the server starts, with no client attached. `MODRON_REMOTE_CONTROL` sets the
+same thing from the environment; the flag wins when both are set. The bridge
+URL must be `ws://` or `wss://` (the same rule as `/remote-control`), and
+plaintext `ws://` only for a loopback host. A bad URL exits non-zero before
+anything is bound.
+
+At start, after the listeners are up, the server picks the session for the
+tunnel: the most recently updated session in its store that is not a worktree
+task's, or a new one when there is none. The store records no working
+directory, so "the session for this directory" means "the session in this
+server's store": run one serve per repository. The tunnel then starts through
+the same code the `remote_control` frame uses, with the same checks, the same
+`MODRON_HOST_TOKEN` and the same portal registration.
+
+The project marker rule is the one `/remote-control` uses: the agent is handed
+its working directory, so that directory must be a project, not an empty one.
+A `.modron` directory marks it. With the flag, serve creates `.modron` when the
+working directory is a git repository (a `.git` directory or worktree file) and
+logs that it did; a directory that is neither, with no marker, is refused.
+
+The share URL is logged at info level. `--share-url-file <path>` also writes it
+to that file, mode 0600, so a launcher can read it. The file needs the flag.
+
+A tunnel reconnects on its own, however it was opened (at start or by a
+`remote_control` frame). When the socket drops, or the bridge cannot be reached,
+the tunnel redials with exponential backoff and jitter: 1 s, doubling, capped at
+60 s, each delay jittered between half and all of its nominal value. A
+connection that stayed up 30 s resets the schedule. Every redial reuses the same
+share key and session, so existing share links, portal entries and invites keep
+working; each new connection re-registers the portal entry (the entry is removed
+when the socket drops and put back on reconnect) and sends viewers a fresh
+snapshot. The redials log at info, at most one line per attempt, and once a
+minute while they sit at the cap. Redialling stops when the tunnel is stopped,
+when its session is deleted, or when the server shuts down. A bridge that
+refuses the host token (401 or 403) ends the tunnel for good, logged once at
+error with the fix (set `MODRON_HOST_TOKEN` to the bridge's `HOST_TOKEN`); it is
+never retried. The server keeps running either way.
+
+```sh
+MODRON_HOST_TOKEN=... modron serve --listen 127.0.0.1:7699 \
+  --remote-control wss://modron-bridge.example.workers.dev \
+  --share-url-file ~/.modron/share-url
+```
+
 ## Notes and limits
 
 - Sessions and transcripts are the shared JSONL store
   (`~/.modron/sessions`): `modron sessions list`, `--resume`, and the
-  TUI see everything the server creates.
+  app see everything the server creates.
 - Attach snapshots carry the full persisted log plus the live view
   (streaming buffers, grouped tool activity, pending approval, cumulative
   usage, model/provider/goal labels).
 - Approve-rest: answering one request with `allow_all` auto-approves
-  every later mutating call in that session (the TUI's `a`).
+  every later mutating call in that session (the app's `a`).
 - A run whose task panics would leave the run slot occupied until restart;
   engine failures are reported as `turn_failed` frames, never slots.
 - v1 wire format is JSON over WS/NDJSON; a binary codec can replace the

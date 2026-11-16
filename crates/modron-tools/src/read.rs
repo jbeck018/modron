@@ -1,8 +1,9 @@
 //! `read` tool (LEDGER T1) — file reading with line numbers and hard caps.
 
 use crate::common::{
-    arg_str, open_regular_file, opt_usize, resolve_path, tool_err, MAX_INPUT_BYTES,
+    arg_str, open_regular_file, opt_bool, opt_usize, resolve_path, tool_err, MAX_INPUT_BYTES,
 };
+use crate::edit_lines::line_hash;
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
 use async_trait::async_trait;
@@ -48,7 +49,8 @@ impl Tool for ReadTool {
                 "properties": {
                     "path": {"type": "string", "description": "File path (relative to working dir or absolute)."},
                     "offset": {"type": "integer", "description": "1-based first line to read."},
-                    "limit": {"type": "integer", "description": "Max lines to read (default 2000, max 2000)."}
+                    "limit": {"type": "integer", "description": "Max lines to read (default 2000, max 2000)."},
+                    "line_hashes": {"type": "boolean", "description": "Prefix each line as <n>:<hash>| for edit_lines (default false)."}
                 },
                 "required": ["path"]
             }),
@@ -73,6 +75,7 @@ impl Tool for ReadTool {
         let limit = opt_usize(&args, "limit")
             .unwrap_or(MAX_LINES)
             .clamp(1, MAX_LINES);
+        let line_hashes = opt_bool(&args, "line_hashes").unwrap_or(false);
 
         // Only regular files are opened (devices and FIFOs would hang or grow
         // without bound). Reads are capped at MAX_INPUT_BYTES in total; one
@@ -143,7 +146,12 @@ impl Tool for ReadTool {
             if shown >= limit {
                 break;
             }
-            out.push_str(&format!("{:>6}\t{}\n", idx, cap_line(line)));
+            if line_hashes {
+                // Hash the full line; the display cap does not change the anchor.
+                out.push_str(&format!("{}:{}|{}\n", idx, line_hash(line), cap_line(line)));
+            } else {
+                out.push_str(&format!("{:>6}\t{}\n", idx, cap_line(line)));
+            }
             shown += 1;
         }
         let input_note = if truncated {
@@ -208,6 +216,23 @@ mod tests {
         .await;
         assert!(!out.is_error);
         assert_eq!(out.content, "     2\tl2\n     3\tl3");
+    }
+
+    #[tokio::test]
+    async fn line_hashes_prefix_replaces_line_numbers() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta  \n").unwrap();
+        let out = run(json!({"path": "f.txt", "line_hashes": true}), dir.path()).await;
+        assert!(!out.is_error, "{out:?}");
+        let expected = format!(
+            "1:{}|alpha\n2:{}|beta  ",
+            line_hash("alpha"),
+            line_hash("beta")
+        );
+        assert_eq!(out.content, expected);
+        // Default output keeps the cat -n prefix.
+        let plain = run(json!({"path": "f.txt"}), dir.path()).await;
+        assert!(plain.content.starts_with("     1\talpha"), "{plain:?}");
     }
 
     #[tokio::test]

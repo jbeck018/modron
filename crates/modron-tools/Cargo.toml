@@ -16,6 +16,8 @@ tokio.workspace = true
 regex.workspace = true
 ignore.workspace = true
 walkdir.workspace = true
+# webfetch: the same HTTP client crate, version and TLS setup as modron-providers.
+reqwest.workspace = true
 # Process-group signaling for bash-tool timeout kills (unix).
 libc = "0.2"
 

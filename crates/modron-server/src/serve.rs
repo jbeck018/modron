@@ -39,6 +39,13 @@ pub struct ServeOptions {
     /// Exact `Origin` header values a browser upgrade may present. Empty by
     /// default: any upgrade that carries an `Origin` header is refused (D3).
     pub allowed_origins: Vec<String>,
+    /// Bridge URL (`ws://` or `wss://`) to open remote control against at
+    /// start, with no client: see [`crate::rc::start_serve_remote_control`].
+    /// `None` = no tunnel (today's behaviour).
+    pub remote_control: Option<String>,
+    /// File the share URL is written to at start (0600). Requires
+    /// `remote_control`.
+    pub share_url_file: Option<PathBuf>,
 }
 
 /// The addresses a server actually bound (returned by [`bind_server`]).
@@ -53,10 +60,20 @@ pub struct BoundServer {
 }
 
 impl BoundServer {
-    /// Abort every accept loop (integration tests use this to tear down).
+    /// Abort every accept loop and every remote-control tunnel (tunnels
+    /// redial on their own, so they must be stopped here too). Integration
+    /// tests use this to tear down.
     pub fn shutdown(&self) {
         for task in &self.tasks {
             task.abort();
+        }
+        let tunnels = self
+            .state
+            .rc_tunnels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for tunnel in tunnels.values() {
+            tunnel.abort();
         }
     }
 }
@@ -71,6 +88,15 @@ impl Drop for BoundServer {
 /// accept loops run on detached tasks; drop the returned value (or call
 /// [`BoundServer::shutdown`]) to stop them.
 pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Result<BoundServer> {
+    // Checks that need no listener run first, so a bad flag fails before
+    // anything is bound.
+    if options.share_url_file.is_some() && options.remote_control.is_none() {
+        anyhow::bail!("--share-url-file needs --remote-control (or MODRON_REMOTE_CONTROL)");
+    }
+    if let Some(bridge) = &options.remote_control {
+        crate::rc::check_tunnel_bridge(bridge)?;
+        crate::rc::prepare_project_marker(&engine.config.working_dir)?;
+    }
     let clients_dir = match &options.clients_dir {
         Some(dir) => dir.clone(),
         None => pairing::default_clients_dir()?,
@@ -154,6 +180,21 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
             listener,
             Arc::clone(&state),
         )));
+    }
+
+    // Remote control at start, once the listeners are up (same tunnel path
+    // as the `remote_control` frame). A failure here stops the accept loops
+    // before the error goes back to the caller.
+    if let Some(bridge) = &options.remote_control {
+        if let Err(e) =
+            crate::rc::start_serve_remote_control(&state, bridge, options.share_url_file.as_deref())
+                .await
+        {
+            for task in &tasks {
+                task.abort();
+            }
+            return Err(e);
+        }
     }
 
     Ok(BoundServer {

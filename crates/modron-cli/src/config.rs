@@ -34,6 +34,30 @@ pub struct Config {
     /// answer replaces the run answer on success. Unset = never escalate.
     #[serde(default)]
     pub escalate_on_check_failure: Option<String>,
+    /// Reviewer model id (engine `reviewer`): when set, a run that changed
+    /// files ends with an independent review of the diff on this model.
+    /// `None` (default) = no review pass.
+    #[serde(default)]
+    pub review_model: Option<String>,
+    /// Reasoning effort for model turns: `low`, `medium`, `high`, `xhigh` or
+    /// `max`. Kept raw here so a bad value is a startup error (see
+    /// [`resolve_effort`]), not a silent fallback to defaults. Unset = the
+    /// provider default. `--effort` overrides it.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Ask supporting providers for a readable reasoning summary (H7b).
+    /// Default `false`. Only Anthropic models in its supported table honour
+    /// it (adaptive thinking, `display: "summarized"`); it changes what the
+    /// reasoning display can show, not billing. See docs/CONFIG.md.
+    #[serde(default)]
+    pub reasoning_summary: bool,
+    /// Fix rounds the reviewer may request per run (default 1).
+    #[serde(default)]
+    pub review_max_rounds: Option<u32>,
+    /// Named model roles (H7c): `[roles] plan / subagent / critic / summary`,
+    /// each an optional model id. See [`model_roles`].
+    #[serde(default)]
+    pub roles: Option<RolesConfig>,
     /// Lifecycle hooks around tool calls (Phase-1c I4): `pre_tool` may veto
     /// (non-zero exit blocks the tool), `post_tool` observes. Shell commands
     /// receiving the `MODRON_TOOL_*` env contract.
@@ -68,6 +92,64 @@ pub struct Config {
     /// Session lifecycle (Phase 6a): auto-vacuum TTL.
     #[serde(default)]
     pub sessions: Option<SessionsConfig>,
+    /// `[permissions]`: `allow` / `ask` / `deny` rules such as
+    /// `bash(cargo test*)` or `read(.env*)`. Validated at startup by
+    /// [`PermissionsConfig::rule_set`], not while loading, so a bad rule is a
+    /// startup error rather than a silently ignored file.
+    #[serde(default)]
+    pub permissions: Option<PermissionsConfig>,
+}
+
+/// Resolve the reasoning effort: the `--effort` flag wins over the config
+/// file's top-level `effort`; neither set = `None` (provider default). An
+/// invalid or empty value is an error that names the five accepted levels.
+pub fn resolve_effort(
+    flag: Option<&str>,
+    file: Option<&str>,
+) -> Result<Option<modron_core::Effort>, String> {
+    use std::str::FromStr;
+    let (raw, source) = match (flag, file) {
+        (Some(raw), _) => (raw, "--effort"),
+        (None, Some(raw)) => (raw, "effort in config.toml"),
+        (None, None) => return Ok(None),
+    };
+    modron_core::Effort::from_str(raw)
+        .map(Some)
+        .map_err(|err| format!("invalid {source}: {err}"))
+}
+
+/// `[permissions]` section: rule text lists, one list per effect. Stored as
+/// raw strings so a malformed rule cannot make the whole file fall back to
+/// defaults; [`PermissionsConfig::rule_set`] parses them.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct PermissionsConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl PermissionsConfig {
+    /// Parse every rule. The error names the first rule that is invalid.
+    pub fn rule_set(&self) -> Result<modron_core::permissions::RuleSet, String> {
+        use modron_core::permissions::{Rule, RuleEffect, RuleSet};
+        let groups = [
+            (RuleEffect::Allow, &self.allow),
+            (RuleEffect::Ask, &self.ask),
+            (RuleEffect::Deny, &self.deny),
+        ];
+        let mut rules = Vec::new();
+        for (effect, specs) in groups {
+            for spec in specs {
+                let rule = Rule::parse(effect, spec)
+                    .map_err(|err| format!("invalid permission rule `{spec}`: {err}"))?;
+                rules.push(rule);
+            }
+        }
+        Ok(RuleSet::new(rules))
+    }
 }
 
 /// `[sessions]` section (Phase 6a). `ttl_days` enables auto-vacuum at
@@ -101,17 +183,46 @@ pub struct McpConfig {
     pub servers: std::collections::BTreeMap<String, McpServerConfig>,
 }
 
-/// One MCP stdio server.
+/// One MCP server: a stdio child (`command`) or a Streamable HTTP endpoint
+/// (`url`). Exactly one of the two must be set; see [`McpServerConfig::validate`].
 #[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
+    /// Launch command for a stdio server (empty when `url` is set).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// Streamable HTTP endpoint, e.g. `https://host/mcp` (exclusive with `command`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Request headers for an HTTP server. Values may reference `${ENV_VAR}`,
+    /// expanded at connect time; secrets belong in the environment, not here.
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Refuse the server if its tools' combined schema cost exceeds this
     /// (prompt budget is a product principle; default 20_000 tokens).
     pub max_schema_tokens: Option<u64>,
+}
+
+impl McpServerConfig {
+    /// Startup check: the transport fields must name exactly one transport.
+    /// The error names the server, never a header value.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        match (&self.url, self.command.is_empty()) {
+            (Some(_), false) => Err(format!(
+                "MCP server `{name}` sets both `url` and `command` — pick one transport"
+            )),
+            (None, true) => Err(format!(
+                "MCP server `{name}` needs `command` (stdio) or `url` (Streamable HTTP)"
+            )),
+            (None, false) if self.headers.is_some() => {
+                Err(format!("MCP server `{name}`: `headers` requires `url`"))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// `[judge]` section (Phase-3b M3).
@@ -147,6 +258,33 @@ impl std::fmt::Debug for KevConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("mode", &self.mode)
             .finish()
+    }
+}
+
+/// `[roles]` section (H7c): one optional model id per kind of work. Blank
+/// values count as unset (see [`model_roles`]).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+pub struct RolesConfig {
+    /// Main-loop turns while the run phase is `plan`.
+    pub plan: Option<String>,
+    /// Default model for `delegate` children without a persona model.
+    pub subagent: Option<String>,
+    /// Reviewer model; setting it enables one review round.
+    pub critic: Option<String>,
+    /// Compaction summary model.
+    pub summary: Option<String>,
+}
+
+/// The engine's [`modron_core::ModelRoles`] from `[roles]`. Blank or
+/// whitespace-only values are unset, so an empty table changes nothing.
+pub fn model_roles(cfg: &Config) -> modron_core::ModelRoles {
+    let roles = cfg.roles.clone().unwrap_or_default();
+    let clean = |raw: Option<String>| raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    modron_core::ModelRoles {
+        plan: clean(roles.plan),
+        subagent: clean(roles.subagent),
+        critic: clean(roles.critic),
+        summary: clean(roles.summary),
     }
 }
 
@@ -193,6 +331,10 @@ pub struct HooksConfig {
     pub pre_tool: Option<String>,
     /// Run after every tool call; failures never block.
     pub post_tool: Option<String>,
+    /// Run once at the start of each run; observe-only, never blocks.
+    pub session_start: Option<String>,
+    /// Run once per model turn after its tools; observe-only, never blocks.
+    pub turn_end: Option<String>,
 }
 
 /// `~/.config/modron/config.toml`, or `None` when no home directory is
@@ -431,6 +573,101 @@ mod tests {
     }
 
     #[test]
+    fn permissions_section_parses_into_rules() {
+        use modron_core::permissions::RuleEffect;
+        use serde_json::json;
+        let src = "[permissions]\nallow = [\"bash(cargo test*)\"]\nask = [\"bash(git push*)\"]\ndeny = [\"read(.env*)\"]\n";
+        let config = parse_config(src).expect("valid config");
+        let rules = config
+            .permissions
+            .expect("section present")
+            .rule_set()
+            .expect("valid rules");
+        let eval = |tool: &str, args: serde_json::Value| {
+            rules.evaluate(tool, &args).map(|v| (v.effect, v.rule))
+        };
+        assert_eq!(
+            eval("bash", json!({"command": "cargo test --workspace"})),
+            Some((RuleEffect::Allow, "allow bash(cargo test*)".to_string()))
+        );
+        assert_eq!(
+            eval("bash", json!({"command": "git push origin"})),
+            Some((RuleEffect::Ask, "ask bash(git push*)".to_string()))
+        );
+        assert_eq!(
+            eval("read", json!({"path": ".env.local"})),
+            Some((RuleEffect::Deny, "deny read(.env*)".to_string()))
+        );
+        // A file without the section yields no rules at all.
+        assert!(parse_config("default_model = \"m\"\n")
+            .expect("valid config")
+            .permissions
+            .is_none());
+    }
+
+    #[test]
+    fn mcp_http_server_parses_url_and_headers() {
+        let config = parse_config(
+            "[mcp.servers.web]\nurl = \"https://example.test/mcp\"\n\
+             headers = { Authorization = \"Bearer ${MODRON_MCP_TOKEN}\" }\n",
+        )
+        .expect("valid TOML");
+        let server = &config.mcp.expect("mcp section").servers["web"];
+        assert_eq!(server.url.as_deref(), Some("https://example.test/mcp"));
+        assert!(server.command.is_empty());
+        assert_eq!(
+            server.headers.as_ref().unwrap()["Authorization"],
+            "Bearer ${MODRON_MCP_TOKEN}"
+        );
+        assert!(server.validate("web").is_ok());
+    }
+
+    #[test]
+    fn mcp_server_with_url_and_command_is_a_conflict() {
+        let config = parse_config(
+            "[mcp.servers.both]\ncommand = \"srv\"\nurl = \"https://example.test/mcp\"\n",
+        )
+        .expect("valid TOML");
+        let server = &config.mcp.unwrap().servers["both"];
+        let err = server
+            .validate("both")
+            .expect_err("url + command must conflict");
+        assert!(
+            err.contains("both") && err.contains("url") && err.contains("command"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_needs_command_or_url_and_headers_need_url() {
+        let config = parse_config("[mcp.servers.none]\nargs = []\n").expect("valid TOML");
+        let err = config.mcp.unwrap().servers["none"]
+            .validate("none")
+            .unwrap_err();
+        assert!(err.contains("`command`") && err.contains("`url`"), "{err}");
+
+        let config =
+            parse_config("[mcp.servers.stdio]\ncommand = \"srv\"\nheaders = { A = \"b\" }\n")
+                .expect("valid TOML");
+        let err = config.mcp.unwrap().servers["stdio"]
+            .validate("stdio")
+            .unwrap_err();
+        assert!(err.contains("requires `url`"), "{err}");
+    }
+
+    #[test]
+    fn invalid_permission_rule_is_a_startup_error_naming_the_rule() {
+        let config = parse_config("[permissions]\ndeny = [\"bash(cargo\"]\n")
+            .expect("the file itself is valid TOML");
+        let err = config
+            .permissions
+            .unwrap_or_default()
+            .rule_set()
+            .expect_err("unbalanced rule must be rejected");
+        assert!(err.contains("bash(cargo"), "error names the rule: {err}");
+    }
+
+    #[test]
     fn config_path_points_at_modron_config() {
         if let Some(path) = config_path() {
             assert!(
@@ -439,6 +676,23 @@ mod tests {
             );
         }
         // None (no home dir) is equally acceptable; nothing to assert.
+    }
+
+    #[test]
+    fn lifecycle_hooks_parse_alongside_tool_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[hooks]\nsession_start = \"echo start\"\nturn_end = \"echo end\"\n",
+        )
+        .unwrap();
+        let hooks = load_from(&path, no_env)
+            .hooks
+            .expect("hooks section parsed");
+        assert_eq!(hooks.session_start.as_deref(), Some("echo start"));
+        assert_eq!(hooks.turn_end.as_deref(), Some("echo end"));
+        assert!(hooks.pre_tool.is_none() && hooks.post_tool.is_none());
     }
 
     #[test]
@@ -517,5 +771,77 @@ mod tests {
         assert!(load_from(&empty, no_env)
             .escalate_on_check_failure
             .is_none());
+    }
+
+    /// H7a: top-level `effort` loads as the raw word; the flag beats it, an
+    /// invalid value is an error naming the five levels, and nothing set is
+    /// the provider default.
+    #[test]
+    fn effort_loads_from_the_file_and_the_flag_overrides_it() {
+        use modron_core::Effort;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "effort = 'high'
+",
+        )
+        .unwrap();
+        let config = load_from(&path, no_env);
+        assert_eq!(config.effort.as_deref(), Some("high"));
+
+        assert_eq!(
+            resolve_effort(None, config.effort.as_deref()),
+            Ok(Some(Effort::High))
+        );
+        assert_eq!(
+            resolve_effort(Some("max"), config.effort.as_deref()),
+            Ok(Some(Effort::Max)),
+            "--effort wins over config"
+        );
+        assert_eq!(resolve_effort(None, None), Ok(None));
+    }
+
+    /// H7b: `reasoning_summary` loads as a bool and defaults to off.
+    #[test]
+    fn reasoning_summary_loads_from_the_file_and_defaults_off() {
+        let default: Config = toml::from_str("").unwrap();
+        assert!(!default.reasoning_summary);
+        let on: Config = toml::from_str("reasoning_summary = true").unwrap();
+        assert!(on.reasoning_summary);
+    }
+
+    #[test]
+    fn invalid_effort_is_an_error_that_names_the_five_levels() {
+        let err = resolve_effort(None, Some("extreme")).unwrap_err();
+        assert!(err.contains("effort in config.toml"), "{err}");
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(err.contains(level), "{err} should list {level}");
+        }
+        let flag_err = resolve_effort(Some(""), None).unwrap_err();
+        assert!(flag_err.contains("--effort"), "{flag_err}");
+    }
+}
+
+#[cfg(test)]
+mod roles_config_tests {
+    //! H7c: the `[roles]` table loads per role, and blank values are unset.
+    use super::*;
+
+    #[test]
+    fn roles_table_loads_per_role_and_blank_values_are_unset() {
+        let config = parse_config("[roles]\nplan = 'plan-m'\ncritic = '   '\nsummary = 'sum-m'\n")
+            .expect("the file parses");
+        let roles = model_roles(&config);
+        assert_eq!(roles.plan.as_deref(), Some("plan-m"));
+        assert_eq!(roles.subagent, None);
+        assert_eq!(roles.critic, None, "whitespace counts as unset");
+        assert_eq!(roles.summary.as_deref(), Some("sum-m"));
+    }
+
+    #[test]
+    fn no_roles_table_means_no_roles() {
+        let config = parse_config("default_model = 'm'\n").expect("the file parses");
+        assert!(model_roles(&config).is_empty());
     }
 }

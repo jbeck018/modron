@@ -12,7 +12,8 @@
 use crate::stream::StreamDelta;
 use async_trait::async_trait;
 use modron_core::{
-    Error, ModelProvider, Result, Role, StopReason, ToolCall, TurnRequest, TurnResponse, Usage,
+    replayable_blocks, Error, ModelProvider, ProviderBlock, Result, Role, StopReason, ToolCall,
+    TurnRequest, TurnResponse, Usage,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -21,6 +22,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// Anthropic provider id ([`ModelProvider::id`]).
 pub const PROVIDER_ID: &str = "anthropic";
+/// Wire api of this provider for provider-block replay (H7b-2).
+const REPLAY_API: &str = "messages";
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -368,6 +371,10 @@ struct StreamAccumulator {
     /// `(block index, id, name, accumulated partial_json)` for `tool_use`
     /// blocks, in first-appearance order.
     tool_blocks: Vec<(u64, String, String, String)>,
+    /// `(block index, block JSON)` for `thinking` and `redacted_thinking`
+    /// blocks, built up from their deltas (thinking text, signature). The
+    /// JSON is replayed unchanged (H7b-2).
+    replay_blocks: Vec<(u64, Value)>,
     /// Anthropic's uncached `input_tokens` (message_start only).
     input_tokens: u64,
     /// `cache_read_input_tokens` (message_start only).
@@ -426,8 +433,11 @@ impl StreamAccumulator {
                             .into();
                         self.tool_blocks.push((index, id, name, String::new()));
                     }
-                    // thinking / redacted_thinking / unknown blocks carry
-                    // nothing that belongs in the TurnResponse.
+                    Some("thinking") | Some("redacted_thinking") => {
+                        self.replay_blocks.push((index, block.clone()));
+                    }
+                    // Unknown blocks carry nothing that belongs in the
+                    // TurnResponse.
                     _ => {}
                 }
             }
@@ -462,11 +472,25 @@ impl StreamAccumulator {
                             .get("thinking")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
+                        if let Some(slot) = self.replay_blocks.iter_mut().find(|(i, _)| *i == index)
+                        {
+                            append_string_field(&mut slot.1, "thinking", thinking);
+                        }
                         if !thinking.is_empty() {
                             let _ = tx.send(StreamDelta::Reasoning(thinking.to_string()));
                         }
                     }
-                    // signature_delta and friends are bookkeeping only.
+                    Some("signature_delta") => {
+                        let signature = delta
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(slot) = self.replay_blocks.iter_mut().find(|(i, _)| *i == index)
+                        {
+                            append_string_field(&mut slot.1, "signature", signature);
+                        }
+                    }
+                    // Other delta types are bookkeeping only.
                     _ => {}
                 }
             }
@@ -579,6 +603,13 @@ impl StreamAccumulator {
             });
         }
 
+        self.replay_blocks.sort_by_key(|(index, _)| *index);
+        let provider_blocks = self
+            .replay_blocks
+            .into_iter()
+            .map(|(index, payload)| replay_block(index, payload))
+            .collect();
+
         Ok(TurnResponse {
             text,
             tool_calls,
@@ -592,8 +623,58 @@ impl StreamAccumulator {
                 cached_input_tokens: self.cache_read_input_tokens,
             },
             stop_reason: map_stop_reason(self.stop_reason.as_deref()),
+            provider_blocks,
         })
     }
+}
+
+/// Append a streamed fragment to a string field of a replayed block (the
+/// thinking text or the signature). Byte-exact: fragments concatenate as
+/// received.
+fn append_string_field(payload: &mut Value, key: &str, fragment: &str) {
+    if let Some(obj) = payload.as_object_mut() {
+        if let Value::String(current) = obj
+            .entry(key)
+            .or_insert_with(|| Value::String(String::new()))
+        {
+            current.push_str(fragment);
+        }
+    }
+}
+
+/// Wrap one thinking / redacted_thinking block JSON as a [`ProviderBlock`]
+/// for this provider. The payload is kept exactly as the API sent it.
+fn replay_block(index: u64, payload: Value) -> ProviderBlock {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    ProviderBlock {
+        provider: PROVIDER_ID.into(),
+        api: REPLAY_API.into(),
+        kind,
+        index: u32::try_from(index).unwrap_or(u32::MAX),
+        payload,
+    }
+}
+
+/// The thinking and redacted_thinking blocks of a complete (non-streaming)
+/// response body, with their content positions (H7b-2).
+fn replay_blocks_from_body(body: &Value) -> Vec<ProviderBlock> {
+    body.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, block)| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        })
+        .map(|(index, block)| replay_block(index as u64, block.clone()))
+        .collect()
 }
 
 /// Build the `/v1/messages` request body from a [`TurnRequest`] (no
@@ -653,6 +734,10 @@ pub fn build_body_with_prefix(req: &TurnRequest, system_prefix: &str) -> Value {
 fn build_body_inner(req: &TurnRequest) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     let mut last_role: Option<&'static str> = None;
+    // Stored thinking blocks go back only on a request that itself turns
+    // thinking on: a request without the `thinking` field must not carry
+    // thinking content (conservative; the blocks stay in the log).
+    let thinking_on = req.reasoning_summary && summarized_thinking_supported(&req.model);
 
     for message in &req.messages {
         let (role, blocks): (&'static str, Vec<Value>) = match message.role {
@@ -688,7 +773,17 @@ fn build_body_inner(req: &TurnRequest) -> Value {
                 ("user", blocks)
             }
             Role::Assistant => {
-                let mut blocks = Vec::new();
+                // Thinking blocks first, in their original order, exactly as
+                // the API sent them (H7b-2). Only blocks from this provider
+                // and api are replayed.
+                let mut blocks: Vec<Value> = if thinking_on {
+                    replayable_blocks(message, PROVIDER_ID, REPLAY_API)
+                        .into_iter()
+                        .map(|block| block.payload.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 if !message.content.is_empty() {
                     blocks.push(json!({ "type": "text", "text": message.content }));
                 }
@@ -759,7 +854,55 @@ fn build_body_inner(req: &TurnRequest) -> Value {
         }
         body["tools"] = Value::Array(tools);
     }
+    // Reasoning summary (H7b): only when the caller opted in AND the model
+    // accepts adaptive thinking with `display: "summarized"`. Every other
+    // request keeps no `thinking` field at all (older models use a
+    // `budget_tokens` form this code never sends).
+    if thinking_on {
+        body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+    }
+    // Reasoning effort (H7a): the GA `output_config.effort` field, merged
+    // into `output_config` when another feature already set one. No beta
+    // header; absent when the provider default applies.
+    if let Some(effort) = req.effort {
+        if !body["output_config"].is_object() {
+            body["output_config"] = json!({});
+        }
+        body["output_config"]["effort"] = json!(effort.label());
+    }
     body
+}
+
+/// Model-id prefixes that accept `thinking: {type: "adaptive", display:
+/// "summarized"}` (H7b). Matched on the id after an optional provider
+/// namespace (`anthropic.` or `anthropic/`); a prefix matches the id itself
+/// or the id followed by `-`, so `claude-opus-4-6` does not match
+/// `claude-opus-4-60`. Anything absent here (Haiku 4.5, Sonnet 4.5, Opus 4.5
+/// and earlier, unknown or non-Claude ids) gets no `thinking` field.
+const SUMMARIZED_THINKING_PREFIXES: &[&str] = &[
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-5",
+];
+
+/// True when `model` is one of the documented ids in
+/// [`SUMMARIZED_THINKING_PREFIXES`] (H7b), with or without a provider
+/// namespace prefix.
+pub fn summarized_thinking_supported(model: &str) -> bool {
+    let bare = model
+        .strip_prefix("anthropic.")
+        .or_else(|| model.strip_prefix("anthropic/"))
+        .unwrap_or(model);
+    SUMMARIZED_THINKING_PREFIXES.iter().any(|prefix| {
+        bare.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+    })
 }
 
 /// Parse a `/v1/messages` response body into a [`TurnResponse`].
@@ -768,6 +911,7 @@ fn build_body_inner(req: &TurnRequest) -> Value {
 /// required — provider-reported usage is ground truth for accounting, so a
 /// response without it is a protocol error, not a zero.
 pub fn parse_response(body: Value) -> Result<TurnResponse> {
+    let provider_blocks = replay_blocks_from_body(&body);
     let resp: AnthropicResponse = serde_json::from_value(body).map_err(|err| Error::Provider {
         provider: PROVIDER_ID.into(),
         message: format!("malformed response body: {err}"),
@@ -806,6 +950,7 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
         tool_calls,
         usage,
         stop_reason: map_stop_reason(resp.stop_reason.as_deref()),
+        provider_blocks,
     })
 }
 
@@ -999,6 +1144,8 @@ mod tests {
                 }),
             }],
             max_tokens: 8192,
+            effort: None,
+            reasoning_summary: false,
         }
     }
 
@@ -1016,6 +1163,8 @@ mod tests {
             )],
             tools: Vec::new(),
             max_tokens: 128,
+            effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -1041,6 +1190,8 @@ mod tests {
             )],
             tools: Vec::new(),
             max_tokens: 128,
+            effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -1049,6 +1200,144 @@ mod tests {
             .unwrap()
             .contains("[Attached document: notes.md]"));
         assert!(content[0]["text"].as_str().unwrap().contains("hello notes"));
+    }
+
+    #[test]
+    fn effort_is_absent_from_the_body_when_unset() {
+        let body = build_body(&sample_request());
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["max_tokens", "messages", "model", "system", "tools"]);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn effort_maps_to_output_config_for_every_level() {
+        use modron_core::Effort;
+        for (effort, label) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            let mut req = sample_request();
+            req.effort = Some(effort);
+            let body = build_body(&req);
+            assert_eq!(body["output_config"], json!({ "effort": label }));
+            assert!(body.get("thinking").is_none(), "no thinking field added");
+            assert_eq!(body["max_tokens"], 8192, "rest of the body unchanged");
+        }
+    }
+
+    /// H7b: flag false = byte-identical body (no `thinking` key at all),
+    /// for a model that would otherwise be supported.
+    #[test]
+    fn reasoning_summary_false_leaves_the_body_unchanged() {
+        let mut req = sample_request();
+        req.model = "claude-opus-5-5".into();
+        req.reasoning_summary = false;
+        let off = build_body(&req);
+        assert!(off.get("thinking").is_none());
+        let baseline = {
+            let mut plain = sample_request();
+            plain.model = "claude-opus-5-5".into();
+            build_body(&plain)
+        };
+        assert_eq!(off, baseline);
+    }
+
+    /// H7b: flag true on a supported id = exact adaptive+summarized field.
+    #[test]
+    fn reasoning_summary_true_adds_adaptive_summarized_thinking() {
+        let mut req = sample_request();
+        req.model = "claude-opus-5-5".into();
+        req.reasoning_summary = true;
+        let body = build_body(&req);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert!(body.get("output_config").is_none(), "effort unset here");
+    }
+
+    /// H7b: the thinking field coexists with `output_config.effort`.
+    #[test]
+    fn reasoning_summary_coexists_with_output_config_effort() {
+        let mut req = sample_request();
+        req.model = "claude-sonnet-5-5".into();
+        req.reasoning_summary = true;
+        req.effort = Some(modron_core::Effort::High);
+        let body = build_body(&req);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+    }
+
+    /// H7b: the supported table, including namespaced ids, and the
+    /// negative cases that must send nothing.
+    #[test]
+    fn summarized_thinking_table_matches_the_documented_ids() {
+        for id in [
+            "claude-fable-5",
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-5-5",
+            "anthropic.claude-opus-5-5",
+            "anthropic/claude-sonnet-4-6",
+        ] {
+            assert!(
+                summarized_thinking_supported(id),
+                "{id} should be supported"
+            );
+        }
+        for id in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-60",
+            "claude-opus-4-6x",
+            "some-unknown-model",
+            "gpt-5",
+            "",
+        ] {
+            assert!(
+                !summarized_thinking_supported(id),
+                "{id} should not be supported"
+            );
+        }
+    }
+
+    /// H7b: unsupported ids get no `thinking` field even when opted in.
+    #[test]
+    fn reasoning_summary_adds_nothing_for_unsupported_models() {
+        for model in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "some-unknown-model",
+            "gpt-5",
+        ] {
+            let mut req = sample_request();
+            req.model = model.into();
+            req.reasoning_summary = true;
+            let body = build_body(&req);
+            assert!(body.get("thinking").is_none(), "{model} sends no thinking");
+        }
     }
 
     #[test]
@@ -1160,6 +1449,8 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 16,
+            effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         assert!(body.get("tools").is_none());
@@ -1190,6 +1481,8 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 16,
+            effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         assert!(body.get("system").is_none());

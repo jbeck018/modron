@@ -18,7 +18,8 @@
 pub mod client;
 
 use modron_types::{
-    Attachment, RunSummary, SandboxPolicy, SessionEvent, StreamDelta, ToolActivity, ToolCall, Usage,
+    AgentState, Attachment, Effort, ModelRoles, Phase, PlanItem, RunSummary, SandboxPolicy,
+    SessionEvent, StreamDelta, ToolActivity, ToolCall, Usage,
 };
 use modron_view::ToolEvent;
 use serde::{Deserialize, Serialize};
@@ -49,8 +50,28 @@ pub struct Frame {
     pub session: Option<Uuid>,
     #[serde(default)]
     pub seq: u64,
+    /// The role of the person behind a relayed client frame. It is set ONLY
+    /// by a trusted relay (the cloud/bridge worker, for a connection it
+    /// authenticated: the owner cookie, or a redeemed invite ticket). The
+    /// relay overwrites any value the client sent. A server ignores it on
+    /// every connection that is not an authenticated tunnel (local sockets,
+    /// unix sockets, legacy share-link tunnels). Clients never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<RelayRole>,
     #[serde(flatten)]
     pub payload: Payload,
+}
+
+/// Who a relayed client frame speaks for (see [`Frame::role`]). `Owner`
+/// is the portal owner, `Approver` an invite with the approve right,
+/// `Viewer` a read-only invite. UI effect: none (a routing and
+/// authorization field; no client renders it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayRole {
+    Owner,
+    Approver,
+    Viewer,
 }
 
 impl Frame {
@@ -60,6 +81,7 @@ impl Frame {
             id: Some(id),
             session: None,
             seq: 0,
+            role: None,
             payload,
         }
     }
@@ -70,6 +92,7 @@ impl Frame {
             id: None,
             session,
             seq,
+            role: None,
             payload,
         }
     }
@@ -136,13 +159,110 @@ pub enum Payload {
     /// Abort the session's active run (JoinHandle-abort parity with the
     /// TUI's Esc).
     Interrupt { session_id: Uuid },
+    /// Run `command` in the session's shell, the terminal's `!command`
+    /// passthrough. It executes where the session's tools run (the server
+    /// host), under the same approval policy and permission rules as a
+    /// model-issued `bash` call; it is never a model turn. Refused for a
+    /// busy session (Conflict). Client effect: none until the server
+    /// answers; the server's reply is an `Error` or a `Note` with the
+    /// labelled output. `private` (`!!`) output is never sent to the model;
+    /// shared (`!`) output joins the conversation. See PROTOCOL_V2 section
+    /// 7b for who may send it and what is and is not checked.
+    Shell {
+        session_id: Uuid,
+        command: String,
+        /// `!!`: shown but never reaches the model (additive, default false).
+        #[serde(default)]
+        private: bool,
+    },
+    /// Steer one live sub-agent of a RUNNING session (PROTOCOL_V2 section 4,
+    /// H3d): `text` joins that child's own transcript at its next safe
+    /// boundary, so its next model turn carries it. `agent` is the swarm
+    /// row's `id`. Errors (requester only) when no such live child exists.
+    /// No broadcast on success: the swarm row is unchanged, the child's
+    /// transcript shows the message. UI effect: a composer action on a row.
+    SteerAgent {
+        session_id: Uuid,
+        agent: String,
+        text: String,
+    },
+    /// Stop one live sub-agent (PROTOCOL_V2 section 4, H3d). Only that child
+    /// ends: its parent run and siblings continue. The row turns `killed` in
+    /// place (a `tool` frame), and the parent's `delegate` call (or
+    /// `delegate_status`) reports the stop. Errors (requester only) when no
+    /// such live child exists. A kill while an approval ask of that child is
+    /// pending takes effect when the ask is answered or times out.
+    KillAgent { session_id: Uuid, agent: String },
+    /// Send a message to a RUNNING session: it is injected at the next safe
+    /// boundary (between model turns, after pending tool results) and the
+    /// run continues. An idle session refuses it (submit instead). Replies
+    /// `Steered` on success; the injected text persists as a `Task` event.
+    Steer { session_id: Uuid, text: String },
+    /// Hold a message for the session's NEXT run. While a run is active the
+    /// server keeps it in the session queue and starts it as a new run when
+    /// the current run finishes successfully (never after a failure or an
+    /// interrupt). Replies `QueueChanged` to the session's subscribers. An
+    /// idle session starts the run at once, exactly like `Submit`.
+    Enqueue { session_id: Uuid, text: String },
+    /// Remove one queued message by its position (0 = next to run). Replies
+    /// `QueueChanged`; an out-of-range index is an error.
+    Dequeue { session_id: Uuid, index: u32 },
+    /// Compact an IDLE session now (H9b, `/compact`): the older transcript is
+    /// summarized by the same routine autocompaction uses, ignoring the
+    /// threshold and the min-interval rule. Refused while a run is active
+    /// (error "session busy - compact when idle"). Replies with a correlated
+    /// `Note` (`compacted: N -> M tokens`, or the nothing-to-compact note),
+    /// then `ContextChanged` with the refreshed gauge.
+    Compact { session_id: Uuid },
+    /// Arm a scheduled wake for the session (H5a). One wake per session: a
+    /// new one replaces the old. Exactly one of `after_minutes` (one-shot,
+    /// 1..=10080) or `every_minutes` (recurring, 5..=10080) must be set, and
+    /// `prompt` must not be empty. When the wake fires on an idle session the
+    /// prompt starts a run through the same path a queued follow-up uses; on
+    /// a busy session it is queued. Replies by publishing `WakeChanged` to
+    /// subscribers; bad arguments are an error.
+    Wake {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        every_minutes: Option<u32>,
+        prompt: String,
+    },
+    /// Cancel the session's armed wake (publishes `WakeChanged { wake: None }`).
+    /// Errors when no wake is armed.
+    CancelWake { session_id: Uuid },
     /// Answer a pending approval (first responder wins).
     Approve {
         request_id: String,
         decision: Decision,
     },
+    /// Answer a proposed plan (H2b). `Approve` flips the session to `build`
+    /// and starts a run that executes the plan (`note`, when present, is
+    /// appended). `Revise` keeps `plan` and starts another plan run with the
+    /// `note` as the task (required). Errors when no plan is pending. Replies
+    /// with `PlanDecided` to subscribers, then the run's own frames.
+    DecidePlan {
+        session_id: Uuid,
+        decision: PlanDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     /// Mutate session/engine config for future turns.
     SetConfig { patch: ConfigPatch },
+    /// Ask which permission rules decide a hypothetical tool call in this
+    /// session (the rules as the session holds them now). `args` are the
+    /// call's JSON arguments, e.g. `{"command": "rm -rf x"}`. Answered by a
+    /// correlated `note` whose text is one line per rule (`matched` or `no
+    /// match (reason)`) and a final `result: allow|ask|deny|no rule` line.
+    /// UI effect: shows the note (the explain view / scrollback note); it
+    /// changes nothing. Scoped like `steer`.
+    ExplainRule {
+        session_id: Uuid,
+        tool: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
     /// Fork a session: copy its log under a fresh id (engine `fork`).
     Fork { session_id: Uuid },
     /// Create an empty session without submitting a task.
@@ -212,6 +332,14 @@ pub enum Payload {
         cheap_fallback: Option<String>,
         strong_fallback: Option<String>,
     },
+    /// Save a default model and provider to the server's config.toml
+    /// (`default_model` / `default_provider`) for FUTURE sessions. The
+    /// session the user is in keeps its own model; an explicit save is the
+    /// only way a default changes (decision 3, PLAN.md 10.2a). Local
+    /// connections only. Answered by a correlated `note`, or an `error`
+    /// when either value is empty, has a control character, or names a
+    /// provider the server does not know.
+    PersistDefaultModel { model: String, provider: String },
     /// Liveness check (answered by `pong`).
     Ping {},
 
@@ -236,14 +364,81 @@ pub enum Payload {
     /// Tool or subagent activity.
     Tool { activity: WireToolActivity },
     /// A mutating tool call awaits a decision; all attached clients see it.
-    ApprovalRequested { request_id: String, call: ToolCall },
+    /// `agent` names the asking sub-agent (H3b) and is absent for the run's
+    /// own calls. UI effect: append to the approval FIFO; the front shows
+    /// the ask, prefixed `[agent] ` when `agent` is present.
+    ApprovalRequested {
+        request_id: String,
+        call: ToolCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+    },
     /// The decision landed (echoed to every client).
     ApprovalResolved {
         request_id: String,
         decision: Decision,
     },
+    /// A steer was accepted and queued for injection into the active run.
+    /// UI effect: show `text` as a pending (dim) task echo until its
+    /// persisted `Event { event: SessionEvent::Task }` arrives with the same
+    /// text, which replaces the pending echo in transcript order.
+    Steered { text: String },
+    /// The session's queue changed (enqueue, dequeue, or a queued message
+    /// starting its run). `queued` is the full list, front first.
+    /// UI effect: REPLACE the queue chips above the composer with `queued`
+    /// (an empty list clears them). Snapshot's `LiveState.queued` resets
+    /// them the same way on attach.
+    QueueChanged { queued: Vec<String> },
+    /// The session's context occupancy was recomputed: after every run ends
+    /// (success, failure or abort) and after a `Compact`. `used` is the
+    /// estimated size of the next request in tokens; `window` is the
+    /// effective per-turn input window it is measured against.
+    /// UI effect: SET the status surface's context meter to `used / window`.
+    /// This is the context figure; cumulative tokens are not context.
+    /// Snapshot's `LiveState.context` shows the last value on attach.
+    ContextChanged { used: u64, window: u64 },
+    /// The session's armed wake changed: set, replaced, cancelled, fired (a
+    /// one-shot clears, a recurring one re-arms with a new `next_at_unix`).
+    /// UI effect: SET the status surface's wake line from `wake` ("wakes in
+    /// 12m", formatted client-side from `next_at_unix`); `None` clears it.
+    /// Snapshot's `LiveState.wake` shows it on attach.
+    WakeChanged { wake: Option<WakeWire> },
+    /// An event worth a push for devices that are not attached (H5a). Never
+    /// rendered in the transcript. UI effect: an attached client MAY show
+    /// `text` as a toast; the relay turns the frame into a push for detached
+    /// devices. Sent for run done / failed, proposed plans and fired wakes;
+    /// never for an interrupt. Approval requests are not notified yet (the
+    /// `approval` kind is reserved).
+    Notify { kind: NotifyKind, text: String },
+    /// A BACKGROUND sub-agent settled (PROTOCOL_V2 section 4, H3d): `agent`
+    /// is its swarm-row id, `ok` is false for a failure or a user kill, and
+    /// `brief` is the first 200 chars of its result. It comes with a
+    /// `Notify` (`done` or `failed`, text `sub-agent <label> finished` or
+    /// `... failed`). UI effect: the matching swarm row already shows its
+    /// final state; an attached client raises a toast when that agent is not
+    /// the focused view, and the last-note line takes the notify text.
+    /// Foreground sub-agents never send it. `delegate_status` polling stays
+    /// for the model.
+    AgentFinished {
+        agent: String,
+        ok: bool,
+        brief: String,
+    },
     /// Config mutated (echo of the applied patch).
+    /// UI effect: a `phase` in the patch updates the phase label on the
+    /// status surface (`plan` / `build`); a `rules` list replaces the
+    /// rules the settings view lists; the other fields as before.
     ConfigChanged { patch: ConfigPatch },
+    /// A plan-phase run finished with a plan: the run is paused and waits
+    /// for a decision. `items` is the proposed plan.
+    /// UI effect: BLOCKS on a decision exactly like an approval (the strip,
+    /// buttons or sheet per target), showing `items`. Queued follow-ups
+    /// wait until the decision. Snapshot's `LiveState.plan_pending` shows it
+    /// on attach.
+    PlanProposed { items: Vec<PlanItem> },
+    /// The plan decision landed (echoed to every client).
+    /// UI effect: CLEARS the plan decision block opened by `PlanProposed`.
+    PlanDecided { decision: PlanDecision },
     /// Answer to `list_sessions`.
     Sessions { sessions: Vec<SessionMetaWire> },
     /// Answer to `create_task`: the new session runs inside a dedicated
@@ -307,6 +502,16 @@ pub enum Payload {
         provider: String,
         key: String,
     },
+    /// Remove a provider's saved credential: the API key line in Modron's
+    /// env file and Modron's own stored sign-in tokens. Never another
+    /// tool's files; a credential that only another tool holds is refused.
+    /// Answered by a correlated `note` (what was removed, or the refusal)
+    /// and followed by a fresh `auth_providers` frame to the requester.
+    /// UI effect (every client): the provider's credentials row returns to
+    /// "not configured" (or to what remains, such as a shell-exported key),
+    /// and the note is shown. Running sessions keep the provider object they
+    /// were built with; removal does not stop them.
+    AuthRemove { session_id: Uuid, provider: String },
     /// The router's default-model picture: what is signed in, the
     /// derived recommendation, and the active fallback chains. The
     /// settings page prefills its defaults card from this.
@@ -319,6 +524,27 @@ pub enum Payload {
         cheap_fallback: Vec<String>,
         strong_fallback: Vec<String>,
     },
+    /// Ask for the model catalog (answered by `models`). Clients send it
+    /// when a model picker opens.
+    ModelsReq {},
+    /// The reply to `models_req`. UI effect (every client): the model
+    /// picker replaces its list with `models`, in the order given (the
+    /// server sorts available rows first, then provider, then id). Rows
+    /// with `available: false` are shown but cannot be selected; a
+    /// selectable row is switched with `set_config` (`ConfigPatch.model`).
+    Models { models: Vec<ModelWire> },
+    /// Ask for the configured personas (`[agents.<name>]` in config.toml),
+    /// answered by `personas`. Clients send it when a persona picker opens.
+    PersonasReq {},
+    /// The reply to `personas_req`. UI effect (every client): the persona
+    /// picker replaces its list with `personas`, in the order given (the
+    /// server sorts by name). The row whose name equals
+    /// `LiveState.persona` is marked current. A persona is switched with
+    /// `set_config` (`ConfigPatch.persona`); `ConfigChanged` echoes it. An
+    /// empty name clears the persona (back to the default prompt and lists;
+    /// a no-op when none is set).
+    /// Each row carries a one-line summary, never the full system prompt.
+    Personas { personas: Vec<PersonaWire> },
     /// An informational toast/scrollback note (slash-command results).
     Note { text: String },
     /// Answer to `ping`.
@@ -348,6 +574,42 @@ pub enum Decision {
     Deny,
 }
 
+/// The answer to a proposed plan (`DecidePlan` / `PlanDecided`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDecision {
+    /// Flip to `build` and execute the plan.
+    Approve,
+    /// Stay in `plan` and plan again with the note.
+    Revise,
+}
+
+impl Decision {
+    /// Every decision, in protocol order (approval sheet and strip rows).
+    pub const ALL: [Decision; 3] = [Decision::AllowOnce, Decision::AllowAll, Decision::Deny];
+
+    /// The shared approval-decision words (AGENTS.md invariant 1).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Decision::AllowOnce => "allow once",
+            Decision::AllowAll => "allow all",
+            Decision::Deny => "deny",
+        }
+    }
+}
+
+/// One permission rule on the wire (`[permissions]` in config.toml, the
+/// same grammar). `effect` is `"allow"`, `"ask"` or `"deny"`; `spec` is
+/// `tool` or `tool(pattern)`, e.g. `bash(cargo test*)` or `read`.
+///
+/// UI effect: the settings view lists each rule as `effect spec`. The
+/// server rejects a whole `ConfigPatch` when any entry does not parse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleWire {
+    pub effect: String,
+    pub spec: String,
+}
+
 /// Config mutations a client may request (all optional; `None` = leave).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -371,6 +633,41 @@ pub struct ConfigPatch {
     /// Standing goal prepended to submitted tasks (the /goal command).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// The run phase for future runs: `plan` (read-only) or `build`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    /// The whole permission rule set for future runs (`allow`/`ask`/`deny`
+    /// rules). When present it REPLACES the session's rules; an empty list
+    /// clears them. Any unparsable entry rejects the whole patch with an
+    /// error that names that rule, and nothing changes. Echoed back in
+    /// `ConfigChanged`; `LiveState.rules` reports the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<RuleWire>>,
+    /// The reasoning effort for future turns (`low` .. `max`). Absent leaves
+    /// it alone. UI effect (ConfigChanged, every client): shows
+    /// `effort <label>` next to the model on the status surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    /// Clears the session's effort back to the provider default (no label).
+    /// The "unset" form, because `effort` alone cannot say "none". Wins over
+    /// `effort` when both are sent. Absent or false leaves it alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_effort: bool,
+    /// Ask supporting providers for a readable reasoning summary on future
+    /// turns (H7b). Absent leaves it alone; `false` turns it off. Display
+    /// only: it does not change billing. Echoed in `ConfigChanged`.
+    /// UI effect: none on the status surface; clients still gate the
+    /// reasoning DISPLAY on their own opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<bool>,
+    /// The named model roles for future turns (H7c: `plan`, `subagent`,
+    /// `critic`, `summary`). Present REPLACES the whole set; an all-unset
+    /// value clears it. Absent leaves the roles alone. Echoed in
+    /// `ConfigChanged`; `LiveState.roles` reports the result. UI effect
+    /// (ConfigChanged, every client): the settings list shows the four roles
+    /// and their model ids, with unset roles shown as `router`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Box<ModelRoles>>,
 }
 
 /// The approval-mode knob (`ask`/`yolo`/`deny`), mirrored because the core
@@ -382,6 +679,17 @@ pub enum ApprovalModeWire {
     Deny,
     Ask,
     ApproveAll,
+}
+
+impl ApprovalModeWire {
+    /// The approval-mode word shown in every client's status surface.
+    pub const fn label(self) -> &'static str {
+        match self {
+            ApprovalModeWire::Deny => "deny",
+            ApprovalModeWire::Ask => "ask",
+            ApprovalModeWire::ApproveAll => "yolo",
+        }
+    }
 }
 
 /// Session list row (mirror of core `SessionMeta`, which is serde-stable —
@@ -405,6 +713,21 @@ pub struct SessionMetaWire {
     /// older servers (pre-grouping wire snapshots).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+}
+
+/// One configured persona on the wire (a `personas` row). The server sends
+/// the summary, never the system prompt itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaWire {
+    /// The `[agents.<name>]` key; the name `/agent <name>` selects.
+    pub name: String,
+    /// The forced model, when the persona sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// First line of the persona's system prompt: sanitized for display
+    /// and at most 80 characters. Empty when the persona has no prompt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
 }
 
 /// One changed file in a task's diff (from `git diff --numstat`).
@@ -437,6 +760,26 @@ pub struct RouterDefaults {
     pub strong_fallback: Vec<String>,
 }
 
+/// One model row of the catalog (reply to `models_req`). UI effect: a
+/// picker row. `available` is whether the model's provider is signed in;
+/// an unavailable row is shown dimmed and cannot be selected. `tier` is
+/// the catalog's routing tier, shown as a hint when present.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelWire {
+    /// The canonical model name, as sent to the provider (`ConfigPatch.model`).
+    pub id: String,
+    /// The catalog provider id, e.g. `anthropic`.
+    pub provider: String,
+    /// The display name. The catalog has no display names, so this is the id.
+    pub label: String,
+    /// Advertised context window in tokens, when the catalog knows it.
+    pub context_window: Option<u64>,
+    /// The provider is signed in (a key or sign-in is present).
+    pub available: bool,
+    /// `"cheap"` or `"strong"` when the catalog marks the model's tier.
+    pub tier: Option<String>,
+}
+
 /// One provider row for the onboarding/settings surfaces.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProviderWire {
@@ -445,6 +788,15 @@ pub struct AuthProviderWire {
     /// "api key" | "subscription (oauth)" | "not configured"
     pub status: String,
     pub oauth_capable: bool,
+}
+
+/// The session's context occupancy on the wire (H9b): the estimated size of
+/// the next request (`used`) and the effective window it is measured
+/// against (`window`), both in tokens. Mirror of core `ContextGauge`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextGaugeWire {
+    pub used: u64,
+    pub window: u64,
 }
 
 /// The live (non-persisted) half of a snapshot: what a fresh attach needs
@@ -460,6 +812,10 @@ pub struct AuthProviderWire {
 ///   allow and deny lists (the TUI's `RemoteLists`, the mobile tool
 ///   editor). Absent means the server has no entries, so the copy is
 ///   emptied; a SetConfig sends the whole list back.
+/// - `rules`: replace the client's copy of the permission rules (the
+///   settings view lists them as `effect spec`). Empty or absent means
+///   the session has no rules; a SetConfig `rules` patch sends the whole
+///   set back.
 ///
 /// The four config fields are optional on the wire (`skip_serializing_if`
 /// and serde defaults), so an older peer that omits them still parses,
@@ -487,6 +843,17 @@ pub struct LiveState {
     pub provider: String,
     /// Standing goal (the /goal command).
     pub goal: String,
+    /// Messages held for the next run, front first (see `Enqueue`). UI
+    /// effect: the queue chips above the composer; `QueueChanged` replaces
+    /// them. Omitted on the wire when empty (older peers never send it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<String>,
+    /// The session's context occupancy (see `ContextChanged`). UI effect:
+    /// sets the context meter on the status surface (`used / window`);
+    /// absent until the session has run or been compacted on this server,
+    /// and the client keeps its meter hidden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextGaugeWire>,
     /// The server's approval mode (see the struct docs: sets the label).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<ApprovalModeWire>,
@@ -499,6 +866,72 @@ pub struct LiveState {
     /// The server's tool deny list (see the struct docs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// The session's permission rules, in evaluation order (see
+    /// `RuleWire`). UI effect: replaces the rules listed in settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleWire>,
+    /// The session's run phase. UI effect: sets the phase label on the
+    /// status surface through the same mapping ConfigChanged uses. Absent
+    /// keeps the client's default (`build`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    /// The reasoning effort for future turns. UI effect: shows
+    /// `effort <label>` next to the model on the status surface through the
+    /// same mapping ConfigChanged uses. Absent means the provider default
+    /// and no label. Older peers omit it and still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    /// Whether future turns ask for a reasoning summary (H7b). Omitted when
+    /// off; older peers omit it and still parse. UI effect: none on the
+    /// status surface.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_summary: bool,
+    /// The named model roles in force (H7c). UI effect: the settings list
+    /// shows each role and its model id, unset roles as `router`. Omitted
+    /// when every role is unset; older peers omit it and still parse.
+    #[serde(default, skip_serializing_if = "ModelRoles::is_empty")]
+    pub roles: ModelRoles,
+    /// A proposed plan awaits a decision (see `PlanProposed`). UI effect:
+    /// shows the plan decision block on attach. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_pending: bool,
+    /// The session's armed wake (see `WakeChanged`). UI effect: the wake
+    /// line on the status surface. Absent when no wake is armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeWire>,
+    /// The session's current persona name (`/agent <name>`), absent when
+    /// none was switched to on this server. UI effect: marks the current
+    /// row in the persona picker; a Snapshot replaces the client's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+}
+
+/// A scheduled wake on the wire (H5a): when it next fires and what it runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeWire {
+    /// Epoch seconds of the next firing.
+    pub next_at_unix: u64,
+    /// Recurrence in minutes; absent for a one-shot wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_minutes: Option<u32>,
+    /// The task the wake runs when it fires.
+    pub prompt: String,
+}
+
+/// Why a `Notify` frame was sent (snake_case on the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyKind {
+    /// An approval is waiting for a decision. Reserved: not sent yet.
+    Approval,
+    /// A run completed.
+    Done,
+    /// A run failed.
+    Failed,
+    /// A plan is ready for review.
+    Plan,
+    /// A scheduled wake fired.
+    Wake,
 }
 
 /// An approval awaiting a decision.
@@ -506,6 +939,9 @@ pub struct LiveState {
 pub struct PendingApproval {
     pub request_id: String,
     pub call: ToolCall,
+    /// The asking sub-agent's label, when a child asked (H3b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +1017,20 @@ pub enum WireToolActivity {
         turns: u32,
         is_error: bool,
     },
+    /// Mirror of core `ToolActivity::SubagentState` (H3d): the row's state
+    /// word updates in place.
+    SubagentState {
+        id: String,
+        label: String,
+        state: AgentState,
+    },
+    /// Mirror of core `ToolActivity::BackgroundFinished` (H3d).
+    BackgroundFinished {
+        id: String,
+        label: String,
+        ok: bool,
+        brief: String,
+    },
 }
 
 impl From<&ToolActivity> for WireToolActivity {
@@ -631,6 +1081,22 @@ impl From<&ToolActivity> for WireToolActivity {
                 turns: *turns,
                 is_error: *is_error,
             },
+            ToolActivity::SubagentState { id, label, state } => Self::SubagentState {
+                id: id.clone(),
+                label: label.clone(),
+                state: *state,
+            },
+            ToolActivity::BackgroundFinished {
+                id,
+                label,
+                ok,
+                brief,
+            } => Self::BackgroundFinished {
+                id: id.clone(),
+                label: label.clone(),
+                ok: *ok,
+                brief: brief.clone(),
+            },
         }
     }
 }
@@ -676,6 +1142,20 @@ impl From<WireToolActivity> for ToolActivity {
                 tokens,
                 turns,
                 is_error,
+            },
+            WireToolActivity::SubagentState { id, label, state } => {
+                Self::SubagentState { id, label, state }
+            }
+            WireToolActivity::BackgroundFinished {
+                id,
+                label,
+                ok,
+                brief,
+            } => Self::BackgroundFinished {
+                id,
+                label,
+                ok,
+                brief,
             },
         }
     }
@@ -729,6 +1209,11 @@ pub struct WireSwarmRow {
     pub last_tool: Option<String>,
     /// `None` = still running.
     pub done: Option<bool>,
+    /// Lifecycle state (H3d): `running`, `waiting_approval`, `done`,
+    /// `failed` or `killed`. Absent from older servers, where it reads as
+    /// running (the `done` flag still decides done and failed).
+    #[serde(default)]
+    pub state: AgentState,
 }
 
 #[cfg(test)]
@@ -739,6 +1224,182 @@ mod tests {
     fn roundtrip(frame: &Frame) -> Frame {
         let json = serde_json::to_string(frame).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn shared_label_words_are_stable() {
+        assert_eq!(Decision::AllowOnce.label(), "allow once");
+        assert_eq!(Decision::AllowAll.label(), "allow all");
+        assert_eq!(Decision::Deny.label(), "deny");
+        assert_eq!(ApprovalModeWire::Deny.label(), "deny");
+        assert_eq!(ApprovalModeWire::Ask.label(), "ask");
+        assert_eq!(ApprovalModeWire::ApproveAll.label(), "yolo");
+    }
+
+    /// `auth_remove` carries the session and provider id intact and uses the
+    /// snake_case tag the relay table and clients match on.
+    #[test]
+    fn auth_remove_roundtrips_with_snake_case_tag() {
+        let session = Uuid::new_v4();
+        let frame = Frame::request(
+            9,
+            Payload::AuthRemove {
+                session_id: session,
+                provider: "anthropic".into(),
+            },
+        );
+        let tag = serde_json::to_value(&frame.payload).unwrap();
+        assert_eq!(tag["type"], "auth_remove");
+        match roundtrip(&frame).payload {
+            Payload::AuthRemove {
+                session_id,
+                provider,
+            } => {
+                assert_eq!(session_id, session);
+                assert_eq!(provider, "anthropic");
+            }
+            _ => panic!("auth_remove did not round-trip to AuthRemove"),
+        }
+    }
+
+    /// The model catalog frames use snake_case tags clients branch on, and
+    /// both round-trip with every row field intact.
+    #[test]
+    fn models_frames_roundtrip_with_snake_case_tags() {
+        let req = Frame::request(5, Payload::ModelsReq {});
+        let tag = serde_json::to_value(&req.payload).unwrap();
+        assert_eq!(tag["type"], "models_req");
+        assert!(matches!(roundtrip(&req).payload, Payload::ModelsReq {}));
+
+        let row = ModelWire {
+            id: "claude-haiku-4-5".into(),
+            provider: "anthropic".into(),
+            label: "claude-haiku-4-5".into(),
+            context_window: Some(200_000),
+            available: true,
+            tier: Some("cheap".into()),
+        };
+        let reply = Frame {
+            id: Some(5),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Models {
+                models: vec![
+                    row.clone(),
+                    ModelWire {
+                        id: "llama-3.3-70b".into(),
+                        provider: "ollama".into(),
+                        label: "llama-3.3-70b".into(),
+                        context_window: None,
+                        available: false,
+                        tier: None,
+                    },
+                ],
+            },
+        };
+        let tag = serde_json::to_value(&reply.payload).unwrap();
+        assert_eq!(tag["type"], "models");
+        match roundtrip(&reply).payload {
+            Payload::Models { models } => {
+                assert_eq!(models.len(), 2);
+                assert_eq!(models[0], row);
+                assert!(!models[1].available);
+                assert_eq!(models[1].context_window, None);
+                assert_eq!(models[1].tier, None);
+            }
+            other => panic!("expected models, got {other:?}"),
+        }
+    }
+
+    /// The persona frames use snake_case tags, round-trip every row field,
+    /// and never carry more than the name, model and one-line summary.
+    #[test]
+    fn personas_frames_roundtrip_with_snake_case_tags() {
+        let req = Frame::request(9, Payload::PersonasReq {});
+        let tag = serde_json::to_value(&req.payload).unwrap();
+        assert_eq!(tag["type"], "personas_req");
+        assert!(matches!(roundtrip(&req).payload, Payload::PersonasReq {}));
+
+        let rows = vec![
+            PersonaWire {
+                name: "reviewer".into(),
+                model: Some("claude-haiku-4-5".into()),
+                summary: "You review diffs for correctness.".into(),
+            },
+            PersonaWire {
+                name: "writer".into(),
+                model: None,
+                summary: String::new(),
+            },
+        ];
+        let reply = Frame {
+            id: Some(9),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Personas {
+                personas: rows.clone(),
+            },
+        };
+        let tag = serde_json::to_value(&reply.payload).unwrap();
+        assert_eq!(tag["type"], "personas");
+        match roundtrip(&reply).payload {
+            Payload::Personas { personas } => assert_eq!(personas, rows),
+            other => panic!("expected personas, got {other:?}"),
+        }
+        // An absent model and an empty summary stay off the wire.
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert!(json.get("model").is_none());
+        assert!(json.get("summary").is_none());
+    }
+
+    /// `LiveState.persona` is optional: a snapshot from an older server
+    /// (no key) parses to `None`, and a set persona round-trips.
+    #[test]
+    fn live_state_persona_is_optional_on_the_wire() {
+        let old: LiveState = serde_json::from_str(r#"{"running":false}"#).unwrap();
+        assert_eq!(old.persona, None);
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("persona").is_none());
+
+        let live = LiveState {
+            persona: Some("reviewer".into()),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["persona"], "reviewer");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.persona.as_deref(), Some("reviewer"));
+    }
+
+    /// The relayed role is optional and omitted when unset, so frames from
+    /// older clients (no `role` key) parse unchanged and new frames without a
+    /// role serialize exactly as before.
+    #[test]
+    fn relay_role_roundtrips_and_is_absent_when_unset() {
+        let old: Frame = serde_json::from_str(r#"{"type":"ping","id":3}"#).unwrap();
+        assert_eq!(old.role, None);
+        assert!(matches!(old.payload, Payload::Ping {}));
+
+        let plain = Frame::request(3, Payload::Ping {});
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("role").is_none(), "{json}");
+
+        for (text, role) in [
+            ("owner", RelayRole::Owner),
+            ("approver", RelayRole::Approver),
+            ("viewer", RelayRole::Viewer),
+        ] {
+            let parsed: Frame =
+                serde_json::from_str(&format!(r#"{{"type":"ping","id":4,"role":"{text}"}}"#))
+                    .unwrap();
+            assert_eq!(parsed.role, Some(role));
+            let back = roundtrip(&parsed);
+            assert_eq!(back.role, Some(role));
+        }
+        let bad = serde_json::from_str::<Frame>(r#"{"type":"ping","role":"admin"}"#);
+        assert!(bad.is_err(), "an unknown role is not a frame");
     }
 
     /// `forbidden` is a wire name clients can branch on: it serializes as
@@ -753,6 +1414,7 @@ mod tests {
             id: Some(9),
             session: None,
             seq: 0,
+            role: None,
             payload: Payload::Error {
                 message: "not allowed on a share link".into(),
                 kind: Some(ErrorKind::Forbidden),
@@ -873,6 +1535,306 @@ mod tests {
         }
     }
 
+    /// Steer (client) and Steered (server) carry their text and round-trip
+    /// with the snake_case tags the other clients use.
+    #[test]
+    fn steer_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let steer = Frame::request(
+            9,
+            Payload::Steer {
+                session_id: session,
+                text: "use the other crate".into(),
+            },
+        );
+        assert_roundtrip(&steer);
+        let json = serde_json::to_value(&steer).unwrap();
+        assert_eq!(json["type"], "steer");
+        assert_eq!(json["text"], "use the other crate");
+
+        let steered = Frame::event(
+            Some(session),
+            10,
+            Payload::Steered {
+                text: "use the other crate".into(),
+            },
+        );
+        assert_roundtrip(&steered);
+        let json = serde_json::to_value(&steered).unwrap();
+        assert_eq!(json["type"], "steered");
+        assert_eq!(json["text"], "use the other crate");
+    }
+
+    /// Enqueue / Dequeue (client) and QueueChanged (server) round-trip with
+    /// snake_case tags, and an older LiveState without `queued` still loads.
+    #[test]
+    fn queue_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let enqueue = Frame::request(
+            11,
+            Payload::Enqueue {
+                session_id: session,
+                text: "then run the tests".into(),
+            },
+        );
+        assert_roundtrip(&enqueue);
+        let json = serde_json::to_value(&enqueue).unwrap();
+        assert_eq!(json["type"], "enqueue");
+        assert_eq!(json["text"], "then run the tests");
+
+        let dequeue = Frame::request(
+            12,
+            Payload::Dequeue {
+                session_id: session,
+                index: 1,
+            },
+        );
+        assert_roundtrip(&dequeue);
+        let json = serde_json::to_value(&dequeue).unwrap();
+        assert_eq!(json["type"], "dequeue");
+        assert_eq!(json["index"], 1);
+
+        let changed = Frame::event(
+            Some(session),
+            13,
+            Payload::QueueChanged {
+                queued: vec!["a".into(), "b".into()],
+            },
+        );
+        assert_roundtrip(&changed);
+        let json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(json["type"], "queue_changed");
+        assert_eq!(json["queued"], serde_json::json!(["a", "b"]));
+    }
+
+    /// Compact (client) and ContextChanged (server) round-trip with snake_case
+    /// tags and carry their fields by name.
+    #[test]
+    fn compact_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let compact = Frame::request(
+            14,
+            Payload::Compact {
+                session_id: session,
+            },
+        );
+        assert_roundtrip(&compact);
+        let json = serde_json::to_value(&compact).unwrap();
+        assert_eq!(json["type"], "compact");
+        assert_eq!(json["session_id"], session.to_string());
+
+        let changed = Frame::event(
+            Some(session),
+            15,
+            Payload::ContextChanged {
+                used: 41_000,
+                window: 128_000,
+            },
+        );
+        assert_roundtrip(&changed);
+        let json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(json["type"], "context_changed");
+        assert_eq!(json["used"], 41_000);
+        assert_eq!(json["window"], 128_000);
+    }
+
+    /// Wake / CancelWake (client) and WakeChanged / Notify (server) round-trip
+    /// with snake_case tags; the optional arguments stay off the wire when
+    /// unset, and NotifyKind uses snake_case names.
+    #[test]
+    fn wake_and_notify_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let after = Frame::request(
+            20,
+            Payload::Wake {
+                session_id: session,
+                after_minutes: Some(15),
+                every_minutes: None,
+                prompt: "check the build".into(),
+            },
+        );
+        assert_roundtrip(&after);
+        let json = serde_json::to_value(&after).unwrap();
+        assert_eq!(json["type"], "wake");
+        assert_eq!(json["after_minutes"], 15);
+        assert!(json.get("every_minutes").is_none());
+
+        let every = Frame::request(
+            21,
+            Payload::Wake {
+                session_id: session,
+                after_minutes: None,
+                every_minutes: Some(30),
+                prompt: "poll".into(),
+            },
+        );
+        assert_roundtrip(&every);
+        let json = serde_json::to_value(&every).unwrap();
+        assert_eq!(json["every_minutes"], 30);
+        assert!(json.get("after_minutes").is_none());
+
+        let cancel = Frame::request(
+            22,
+            Payload::CancelWake {
+                session_id: session,
+            },
+        );
+        assert_roundtrip(&cancel);
+        assert_eq!(
+            serde_json::to_value(&cancel).unwrap()["type"],
+            "cancel_wake"
+        );
+
+        let changed = Frame::event(
+            Some(session),
+            23,
+            Payload::WakeChanged {
+                wake: Some(WakeWire {
+                    next_at_unix: 1_800_000_000,
+                    every_minutes: Some(30),
+                    prompt: "poll".into(),
+                }),
+            },
+        );
+        assert_roundtrip(&changed);
+        let json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(json["type"], "wake_changed");
+        assert_eq!(json["wake"]["next_at_unix"], 1_800_000_000u64);
+        assert_eq!(json["wake"]["every_minutes"], 30);
+
+        let cleared = Frame::event(Some(session), 24, Payload::WakeChanged { wake: None });
+        assert_roundtrip(&cleared);
+        let json = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(json["type"], "wake_changed");
+        assert!(json["wake"].is_null());
+
+        for (kind, tag) in [
+            (NotifyKind::Approval, "approval"),
+            (NotifyKind::Done, "done"),
+            (NotifyKind::Failed, "failed"),
+            (NotifyKind::Plan, "plan"),
+            (NotifyKind::Wake, "wake"),
+        ] {
+            let frame = Frame::event(
+                Some(session),
+                25,
+                Payload::Notify {
+                    kind,
+                    text: "done: abc".into(),
+                },
+            );
+            assert_roundtrip(&frame);
+            let json = serde_json::to_value(&frame).unwrap();
+            assert_eq!(json["type"], "notify");
+            assert_eq!(json["kind"], tag);
+            assert_eq!(json["text"], "done: abc");
+        }
+    }
+
+    /// A WakeWire omits `every_minutes` for a one-shot, and LiveState.wake is
+    /// absent when no wake is armed; an older LiveState without `wake` loads.
+    #[test]
+    fn live_state_wake_is_optional_on_the_wire() {
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("wake").is_none());
+
+        let filled = LiveState {
+            wake: Some(WakeWire {
+                next_at_unix: 42,
+                every_minutes: None,
+                prompt: "later".into(),
+            }),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["wake"]["next_at_unix"], 42);
+        assert!(json["wake"].get("every_minutes").is_none());
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.wake, filled.wake);
+
+        let old: LiveState = serde_json::from_value(serde_json::json!({"running": false})).unwrap();
+        assert!(old.wake.is_none());
+    }
+
+    /// Wake frames that omit the optional arguments still parse (an older
+    /// client), and a Notify without a known kind is rejected.
+    #[test]
+    fn wake_frame_arguments_default_to_none() {
+        let session = Uuid::new_v4();
+        let json = serde_json::json!({
+            "type": "wake",
+            "session_id": session,
+            "prompt": "ping"
+        });
+        let back: Payload = serde_json::from_value(json).unwrap();
+        match back {
+            Payload::Wake {
+                after_minutes,
+                every_minutes,
+                prompt,
+                ..
+            } => {
+                assert!(after_minutes.is_none() && every_minutes.is_none());
+                assert_eq!(prompt, "ping");
+            }
+            other => panic!("expected wake, got {other:?}"),
+        }
+        let bad = serde_json::json!({"type": "notify", "kind": "nope", "text": "x"});
+        assert!(serde_json::from_value::<Payload>(bad).is_err());
+    }
+
+    #[test]
+    fn live_state_context_is_omitted_when_none_and_optional_on_read() {
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("context").is_none());
+
+        let filled = LiveState {
+            context: Some(ContextGaugeWire {
+                used: 6_000,
+                window: 200_000,
+            }),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["context"]["used"], 6_000);
+        assert_eq!(json["context"]["window"], 200_000);
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.context,
+            Some(ContextGaugeWire {
+                used: 6_000,
+                window: 200_000,
+            })
+        );
+
+        // A LiveState from an older peer (no `context` key) still loads.
+        let old: LiveState =
+            serde_json::from_str(r#"{"running":false,"model":"m"}"#).expect("old live state loads");
+        assert!(old.context.is_none());
+    }
+
+    #[test]
+    fn live_state_queued_is_omitted_when_empty_and_optional_on_read() {
+        let empty = LiveState::default();
+        let json = serde_json::to_value(&empty).unwrap();
+        assert!(json.get("queued").is_none());
+
+        let filled = LiveState {
+            queued: vec!["next".into()],
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["queued"], serde_json::json!(["next"]));
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.queued, vec!["next".to_string()]);
+
+        // A LiveState from an older peer (no `queued` key) still loads.
+        let old: LiveState =
+            serde_json::from_str(r#"{"running":true,"model":"m"}"#).expect("old live state loads");
+        assert!(old.running);
+        assert!(old.queued.is_empty());
+    }
+
     #[test]
     fn server_events_roundtrip() {
         let session = Uuid::new_v4();
@@ -924,6 +1886,7 @@ mod tests {
                         name: "edit".into(),
                         arguments: serde_json::json!({"path": "a.rs"}),
                     },
+                    agent: None,
                 },
             ),
             Frame::event(
@@ -994,6 +1957,7 @@ mod tests {
                 id: Some(4),
                 session: None,
                 seq: 0,
+                role: None,
                 payload: Payload::Error {
                     message: "no such session".into(),
                     kind: None,
@@ -1067,6 +2031,17 @@ mod tests {
                 turns: 3,
                 is_error: false,
             },
+            ToolActivity::SubagentState {
+                id: "a".into(),
+                label: "explore".into(),
+                state: AgentState::WaitingApproval,
+            },
+            ToolActivity::BackgroundFinished {
+                id: "a".into(),
+                label: "explore".into(),
+                ok: false,
+                brief: "stopped".into(),
+            },
         ];
         for v in &variants {
             let wire = WireToolActivity::from(v);
@@ -1139,6 +2114,103 @@ mod tests {
         assert_eq!(back.session_id, summary.session_id);
         assert_eq!(back.answer, summary.answer);
         assert_eq!(back.turns, summary.turns);
+    }
+
+    #[test]
+    fn agent_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let steer = Frame::request(
+            3,
+            Payload::SteerAgent {
+                session_id: session,
+                agent: "a1".into(),
+                text: "narrow it".into(),
+            },
+        );
+        assert_roundtrip(&steer);
+        let json = serde_json::to_value(&steer).unwrap();
+        assert_eq!(json["type"], "steer_agent");
+        assert_eq!(json["agent"], "a1");
+
+        let kill = Frame::request(
+            4,
+            Payload::KillAgent {
+                session_id: session,
+                agent: "a1".into(),
+            },
+        );
+        assert_roundtrip(&kill);
+        assert_eq!(serde_json::to_value(&kill).unwrap()["type"], "kill_agent");
+
+        let finished = Frame::event(
+            Some(session),
+            7,
+            Payload::AgentFinished {
+                agent: "a1".into(),
+                ok: false,
+                brief: "stopped".into(),
+            },
+        );
+        assert_roundtrip(&finished);
+        let json = serde_json::to_value(&finished).unwrap();
+        assert_eq!(json["type"], "agent_finished");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["brief"], "stopped");
+    }
+
+    #[test]
+    fn swarm_row_state_is_additive_on_the_wire() {
+        let row = WireSwarmRow {
+            id: "a1".into(),
+            label: "delegate".into(),
+            turns: 0,
+            tokens: 0,
+            last_tool: None,
+            done: None,
+            state: AgentState::WaitingApproval,
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["state"], "waiting_approval");
+        assert_eq!(
+            serde_json::from_value::<WireSwarmRow>(json).unwrap(),
+            row,
+            "round trip"
+        );
+
+        // A row from an older server has no state: it reads as running and
+        // keeps its done flag.
+        let old: WireSwarmRow = serde_json::from_value(serde_json::json!({
+            "id": "a1",
+            "label": "explore",
+            "turns": 2,
+            "tokens": 5,
+            "done": true
+        }))
+        .expect("old row loads");
+        assert_eq!(old.state, AgentState::Running);
+        assert_eq!(old.done, Some(true));
+    }
+
+    #[test]
+    fn killed_state_and_background_settlement_serialize_snake_case() {
+        let killed = WireToolActivity::SubagentState {
+            id: "a1".into(),
+            label: "delegate".into(),
+            state: AgentState::Killed,
+        };
+        let json = serde_json::to_value(&killed).unwrap();
+        assert_eq!(json["kind"], "subagent_state");
+        assert_eq!(json["state"], "killed");
+        let settled = WireToolActivity::BackgroundFinished {
+            id: "a1".into(),
+            label: "delegate".into(),
+            ok: true,
+            brief: "ok".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&settled).unwrap()["kind"],
+            "background_finished"
+        );
     }
 
     #[test]
@@ -1245,6 +2317,110 @@ mod tests {
         }
     }
 
+    /// DecidePlan (client) and PlanProposed / PlanDecided (server) round-trip
+    /// with snake_case tags; `note` is omitted when absent.
+    #[test]
+    fn plan_frames_roundtrip_with_tags() {
+        let session = Uuid::new_v4();
+        let decide = Frame::request(
+            14,
+            Payload::DecidePlan {
+                session_id: session,
+                decision: PlanDecision::Revise,
+                note: Some("split step 2".into()),
+            },
+        );
+        assert_roundtrip(&decide);
+        let json = serde_json::to_value(&decide).unwrap();
+        assert_eq!(json["type"], "decide_plan");
+        assert_eq!(json["decision"], "revise");
+        assert_eq!(json["note"], "split step 2");
+
+        let bare = Frame::request(
+            15,
+            Payload::DecidePlan {
+                session_id: session,
+                decision: PlanDecision::Approve,
+                note: None,
+            },
+        );
+        assert_roundtrip(&bare);
+        let json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(json["decision"], "approve");
+        assert!(json.get("note").is_none());
+
+        let items = vec![PlanItem {
+            text: "add the parser".into(),
+            done_criteria: "parser tests pass".into(),
+            status: "pending".into(),
+        }];
+        let proposed = Frame::event(
+            Some(session),
+            16,
+            Payload::PlanProposed {
+                items: items.clone(),
+            },
+        );
+        assert_roundtrip(&proposed);
+        let json = serde_json::to_value(&proposed).unwrap();
+        assert_eq!(json["type"], "plan_proposed");
+        assert_eq!(json["items"][0]["text"], "add the parser");
+
+        let decided = Frame::event(
+            Some(session),
+            17,
+            Payload::PlanDecided {
+                decision: PlanDecision::Approve,
+            },
+        );
+        assert_roundtrip(&decided);
+        let json = serde_json::to_value(&decided).unwrap();
+        assert_eq!(json["type"], "plan_decided");
+        assert_eq!(json["decision"], "approve");
+    }
+
+    /// The phase rides ConfigPatch and LiveState; unset, both stay off the
+    /// wire, and older JSON without them still parses.
+    #[test]
+    fn phase_and_plan_pending_are_optional_on_the_wire() {
+        let patch = ConfigPatch {
+            phase: Some(Phase::Plan),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["phase"], "plan");
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back.phase, Some(Phase::Plan));
+
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(unset.get("phase").is_none());
+        let old: ConfigPatch = serde_json::from_str(r#"{"model":"m"}"#).expect("old patch loads");
+        assert_eq!(old.phase, None);
+        assert_eq!(old.model.as_deref(), Some("m"));
+
+        let live = LiveState {
+            phase: Some(Phase::Build),
+            plan_pending: true,
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["phase"], "build");
+        assert_eq!(json["plan_pending"], true);
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.phase, Some(Phase::Build));
+        assert!(back.plan_pending);
+
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("phase").is_none());
+        assert!(empty.get("plan_pending").is_none());
+
+        // A LiveState / ConfigPatch from an older peer (no plan fields).
+        let old_live: LiveState =
+            serde_json::from_str(r#"{"running":false,"model":"m"}"#).expect("old live loads");
+        assert_eq!(old_live.phase, None);
+        assert!(!old_live.plan_pending);
+    }
+
     #[test]
     fn message_helpers_exist_for_attachment_path() {
         // Guard that Submit's attachment type matches the core Message
@@ -1255,5 +2431,263 @@ mod tests {
         }];
         let message = Message::user_with_attachments("see attached", attachments);
         assert_eq!(message.attachments.len(), 1);
+    }
+
+    /// Permission rules ride ConfigPatch (replace-all), LiveState (report)
+    /// and ExplainRule (client request, correlated Note reply). Unset rules
+    /// stay off the wire, and older JSON without them still parses.
+    #[test]
+    fn rules_frames_roundtrip_and_stay_optional() {
+        let session = Uuid::new_v4();
+        let rule = |effect: &str, spec: &str| RuleWire {
+            effect: effect.into(),
+            spec: spec.into(),
+        };
+
+        let patch = ConfigPatch {
+            rules: Some(vec![rule("deny", "bash(rm -rf*)"), rule("allow", "read")]),
+            ..ConfigPatch::default()
+        };
+        let set = Frame::request(
+            21,
+            Payload::SetConfig {
+                patch: patch.clone(),
+            },
+        );
+        assert_roundtrip(&set);
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["patch"]["rules"][0]["effect"], "deny");
+        assert_eq!(json["patch"]["rules"][0]["spec"], "bash(rm -rf*)");
+        assert_eq!(json["patch"]["rules"][1]["spec"], "read");
+
+        // An absent rules field is "leave alone", and an empty list is a
+        // real clear: the two must stay distinct on the wire.
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(unset.get("rules").is_none());
+        let cleared = serde_json::to_value(ConfigPatch {
+            rules: Some(Vec::new()),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+        assert_eq!(cleared["rules"], serde_json::json!([]));
+
+        let live = LiveState {
+            rules: vec![rule("ask", "bash(git push*)")],
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["rules"][0]["effect"], "ask");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back, live);
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("rules").is_none());
+
+        let explain = Frame::request(
+            22,
+            Payload::ExplainRule {
+                session_id: session,
+                tool: "bash".into(),
+                args: serde_json::json!({"command": "rm -rf x"}),
+            },
+        );
+        assert_roundtrip(&explain);
+        let json = serde_json::to_value(&explain).unwrap();
+        assert_eq!(json["type"], "explain_rule");
+        assert_eq!(json["tool"], "bash");
+        assert_eq!(json["args"]["command"], "rm -rf x");
+
+        // `args` may be omitted; it then reads as JSON null.
+        let bare: Payload = serde_json::from_value(serde_json::json!({
+            "type": "explain_rule",
+            "session_id": session,
+            "tool": "read",
+        }))
+        .unwrap();
+        match bare {
+            Payload::ExplainRule { args, tool, .. } => {
+                assert_eq!(tool, "read");
+                assert!(args.is_null());
+            }
+            _ => panic!("expected explain_rule"),
+        }
+
+        let note = Frame::event(
+            Some(session),
+            23,
+            Payload::Note {
+                text: "allow read: matched\nresult: allow".into(),
+            },
+        );
+        assert_roundtrip(&note);
+    }
+
+    /// JSON written before the rules fields existed (a SetConfig without
+    /// `rules`, a Snapshot LiveState without `rules`) still deserializes.
+    #[test]
+    fn rules_absent_from_older_json_still_parses() {
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"model":"m1","approval_mode":"ask"}"#).unwrap();
+        assert_eq!(patch.model.as_deref(), Some("m1"));
+        assert_eq!(patch.rules, None);
+
+        let live: LiveState =
+            serde_json::from_str(r#"{"running":false,"model":"m1","provider":"mock"}"#).unwrap();
+        assert!(live.rules.is_empty());
+    }
+
+    /// H3b: `agent` is additive. Old JSON (no field) parses as a top-level
+    /// ask; a child's ask keeps its label through a roundtrip.
+    #[test]
+    fn approval_requested_agent_is_additive() {
+        let old: Payload = serde_json::from_str(
+            r#"{"type":"approval_requested","request_id":"r1",
+                "call":{"id":"c1","name":"edit","arguments":{}}}"#,
+        )
+        .unwrap();
+        match old {
+            Payload::ApprovalRequested { agent, .. } => assert!(agent.is_none()),
+            other => panic!("unexpected payload {other:?}"),
+        }
+        let child = Payload::ApprovalRequested {
+            request_id: "r2".into(),
+            call: ToolCall {
+                id: "c2".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            },
+            agent: Some("delegate".into()),
+        };
+        let json = serde_json::to_value(&child).unwrap();
+        assert_eq!(json["agent"], "delegate");
+        let top = serde_json::json!({"type":"approval_requested","request_id":"r3",
+            "call":{"id":"c3","name":"bash","arguments":{}}});
+        let back: Payload = serde_json::from_value(top).unwrap();
+        let reserialized = serde_json::to_value(&back).unwrap();
+        assert!(reserialized.get("agent").is_none(), "absent when None");
+    }
+
+    /// H7c: the roles fields round-trip, unset roles stay off the wire, an
+    /// empty roles value clears, and older peers' JSON (no roles) parses.
+    #[test]
+    fn roles_fields_round_trip_and_stay_optional_on_the_wire() {
+        let roles = ModelRoles {
+            plan: Some("plan-model".into()),
+            subagent: None,
+            critic: None,
+            summary: Some("summary-model".into()),
+        };
+        let patch = ConfigPatch {
+            roles: Some(Box::new(roles.clone())),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["roles"]["plan"], "plan-model");
+        assert!(
+            json["roles"].get("critic").is_none(),
+            "unset roles are omitted"
+        );
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back.roles, Some(Box::new(roles.clone())));
+
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(
+            unset.get("roles").is_none(),
+            "absent roles stay off the wire"
+        );
+        let clear = serde_json::to_value(ConfigPatch {
+            roles: Some(Box::new(ModelRoles::default())),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+        assert_eq!(clear["roles"], serde_json::json!({}));
+        let old: ConfigPatch = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+        assert_eq!(old.roles, None);
+
+        let empty_live = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty_live.get("roles").is_none());
+        let filled = LiveState {
+            roles,
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["roles"]["summary"], "summary-model");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.roles.summary.as_deref(), Some("summary-model"));
+        let old_live: LiveState = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old_live.roles.is_empty());
+    }
+
+    /// H7a: the effort fields round-trip, an unset patch stays off the wire,
+    /// and an older peer's JSON (no effort keys) still parses.
+    #[test]
+    fn effort_fields_round_trip_and_stay_optional_on_the_wire() {
+        let patch = ConfigPatch {
+            effort: Some(Effort::Xhigh),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&patch).unwrap();
+        assert_eq!(json["effort"], "xhigh");
+        assert!(json.get("clear_effort").is_none(), "false is omitted");
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back, patch);
+
+        let clear = ConfigPatch {
+            clear_effort: true,
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&clear).unwrap();
+        assert_eq!(json["clear_effort"], true);
+        assert!(json.get("effort").is_none());
+
+        let old: ConfigPatch = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+        assert_eq!(old.effort, None);
+        assert!(!old.clear_effort);
+    }
+
+    /// H7b: the reasoning-summary opt-in stays off the wire when unset and
+    /// round-trips when set; an older peer's JSON still parses.
+    #[test]
+    fn reasoning_summary_fields_round_trip_and_stay_optional_on_the_wire() {
+        let on = ConfigPatch {
+            reasoning_summary: Some(true),
+            ..ConfigPatch::default()
+        };
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["reasoning_summary"], true);
+        let back: ConfigPatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back, on);
+        let unset = serde_json::to_value(ConfigPatch::default()).unwrap();
+        assert!(unset.get("reasoning_summary").is_none());
+        let old: ConfigPatch = serde_json::from_value(serde_json::json!({"model": "m"})).unwrap();
+        assert_eq!(old.reasoning_summary, None);
+
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("reasoning_summary").is_none(), "false is omitted");
+        let live = LiveState {
+            reasoning_summary: true,
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["reasoning_summary"], true);
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert!(back.reasoning_summary);
+        let old: LiveState = serde_json::from_value(serde_json::json!({"running": false})).unwrap();
+        assert!(!old.reasoning_summary);
+    }
+
+    #[test]
+    fn live_state_effort_is_omitted_when_unset_and_optional_on_read() {
+        let empty = serde_json::to_value(LiveState::default()).unwrap();
+        assert!(empty.get("effort").is_none());
+        let filled = LiveState {
+            effort: Some(Effort::Max),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&filled).unwrap();
+        assert_eq!(json["effort"], "max");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.effort, Some(Effort::Max));
+        let old: LiveState = serde_json::from_value(serde_json::json!({"running": false})).unwrap();
+        assert_eq!(old.effort, None);
     }
 }

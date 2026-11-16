@@ -1052,10 +1052,10 @@ in a turn concurrently); what was missing was visibility.
 
 | ID | Item | Status | Evidence |
 |---|---|---|---|
-| H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | DONE | core lib.rs + subagent.rs |
-| H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | DONE | App.subagents + view; run.rs clears |
-| H3 | ACP: subagent events surface as tool_call / status notifications to the editor | DONE | acp.rs update mapping |
-| H4 | Parallel delegates verified: two delegate calls in ONE turn run concurrently (read-only dispatch), results land in transcript in call order, each child under its persona's forced model | DONE | interactivity::parallel_delegates_run_concurrently |
+| H1 | Subagent events: `ToolActivity::{SubagentStarted, SubagentProgress, SubagentFinished}` (additive); delegate/explore children emit tagged heartbeats through the parent's sink (child tool activity wrapped as progress; start/finish bracket the run) | ACTIVE | H1a steer inbox, H1b Steer/Steered, H1c Enqueue/Dequeue/QueueChanged + LiveState.queued DONE. Open: actor on frames, LiveState.steer_pending; a Submit racing a queued start drops that queued message with a Note (fix: requeue at front) |
+| H2 | TUI inspection: live subagent panel in the viewport — `⏵ [persona] turn N · tokens · last tool`, rows settle to done/failed, cleared on turn end | DONE | H2a engine plan phase + per-turn plan tail; H2b ConfigPatch.phase, LiveState.phase/plan_pending, PlanProposed / DecidePlan / PlanDecided, queue held while a plan is pending. Client rendering lands with C3 |
+| H3 | ACP: subagent events surface as tool_call / status notifications to the editor | ACTIVE | H3a live counters; H3b DONE: Approver takes ApprovalAsk { call, agent }, children ask through the parent approver (label on ApprovalRequested / PendingApproval, summary prefixed `[agent] `), delegate starts without its own prompt in Ask mode with an approver, so delegates run concurrently. H3c DONE: a child ask is forwarded only while the run that spawned it is live (process-wide run scope keyed by session; a guard ends it on every exit), enforced in core for every transport. H3d DONE: SteerAgent / KillAgent / AgentFinished; each child has its own steer inbox and kill switch in a process-wide registry keyed by swarm id; rows carry state (running, waiting approval, done, failed, killed); a killed foreground child returns "stopped by the user" to the parent and its tokens count; a background child finishing publishes AgentFinished and a Notify. Open: TUI and CLI tty approvers hold one slot, so concurrent child asks there deny the earlier one; a kill during a pending approval lands when the ask resolves; delegate_status ids (8 chars) differ from swarm ids; a killed child notifies as failed; app has no per-agent view yet |
+| H4 | Parallel delegates verified: two delegate calls in ONE turn run concurrently (read-only dispatch), results land in transcript in call order, each child under its persona's forced model | DONE | H4a DONE: EngineConfig.reviewer (config `review_model`, `review_max_rounds`), SessionEvent::Review, TranscriptEntry::Review, bounded fix rounds, review errors never fail a run. H4b DONE: the reviewed diff is `git diff HEAD` plus synthesized hunks for untracked files (40 files, 20 KB each, no symlinks, 60 KB total); rule-based claim checks recorded as findings under model `rules`, advisory, never extending a run |
 | V21 | Gates | DONE | **337 passed / 0 failed**, clippy clean |
 
 ## Final verdict — Phase 5h
@@ -1375,3 +1375,348 @@ Round 2 (same day): the low-severity findings and open items were worked
 through as well - see sections 7 and 8 of `docs/SECURITY_PLAN.md` for
 what was done, what is still open and why. Gate evidence: 922 tests pass,
 clippy and fmt clean on Linux.
+
+
+# Program U - unified NSH client, Cloudflare portal, harness gaps (opened 2026-11-15)
+
+Plan: PLAN.md section 10. Lead: the lead architect (single writer of this
+ledger). Workers are small-model agents given one packet each with an
+explicit file list; they do not commit. The lead reviews every diff, runs
+the gates (fmt, clippy -D warnings, test --workspace --exclude
+modron-desktop on Linux) and commits.
+
+Status values: TODO, ACTIVE, DONE, BLOCKED (with the blocker and who can
+clear it). A packet is DONE only with evidence (commit + gate result).
+
+## Rules for this program
+
+- Old clients (modron-tui views, modron-desktop, mobile/app TSX) are
+  frozen: no packet adds features to them. Shared logic goes to
+  modron-view, modron-protocol or the client core.
+- One packet = one worker = a disjoint file list. Engine packets
+  (crates/modron-core/src/engine.rs) run one at a time.
+- New protocol events are documented in docs/PROTOCOL_V2.md and in
+  modron-protocol doc comments before any client renders them.
+
+## Packets
+
+### Spikes
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| S1 | NSH web target in Rust: one transcript screen over the wasm client core; measure bundle size, load time, input | DONE | spikes/nsh-web/RESULTS.md. Rust-only app builds with `nsh package --target web` (nsh CLI 0.5.1, wasm32-unknown-unknown on the pinned toolchain). wasm 5.4 MB raw, 1.95 MB gzip, 1.40 MB brotli. Real DOM with a real text input, no canvas. First row at ~165 ms median in headless Chromium (desktop and iPhone 13 viewports, local server). 2,000-token stream holds 16.7 ms frames. modron-mobile-core type-checks for wasm32. Not tested: real phones, real soft keyboard, slow networks. Only one ARIA role present (accessibility gap) |
+| S2 | NSH terminal target: startup time, streaming at token rate, scrollback | DONE | spikes/nsh-tui/RESULTS.md. Renders headless via ratatui TestBackend; first frame ~1.9 ms in-process; 2,000-token stream mean 1.4-2.7 ms/frame; virtual_list pages 5,000 rows at ~0.8 ms. Open risks: 45 MB stripped binary (modron is ~4 MB), default features pull QuickJS (no-JS build not compiled yet), no Rust API found for pushing outside data into a running app (tokens were fed as paste input), Enter drops input focus |
+| S2b | NSH follow-up: compile without default features (no QuickJS), measure size; find the Rust API for feeding external events (signals + wake callback) | DONE | spikes/nsh-tui/RESULTS.md "Follow-up S2b". No-JS: `nsh-platform-tui` with default-features = false (0 quickjs crates, 343 packages); 34.1 MB stripped, 17.1 MB with opt-level z + fat LTO + cgu 1 + panic abort. External events: `nsh_core::element::spawn` awaiting a tokio mpsc receiver; wake callback drives every frame (2,000 tokens: draw mean 1.37 ms, send-to-visible p95 10 ms). Focus: `SubmitBehavior::Submit` keeps it. Remaining gap: 17 MB vs ~4 MB today |
+| S2c | Terminal binary size: attribution and trimming | DONE | spikes/nsh-tui/RESULTS.md "Follow-up S2c". 17.1 MB -> 11.4 MB stripped by turning off nsh-base highlight/editor/plot/rich-editor/emoji-picker/term and nsh-engine net (needs a small vendored nsh-platform-tui patch, in spikes/nsh-tui/vendor) plus ratatui default features. Download size: 4.8 MB gzip, 3.6 MB xz. Reference: ratatui-only app 0.46 MB. Caveats: measured on the headless build (no crossterm backend); turning off engine net must be re-checked against the app, which uses its own websocket client; upstreaming the feature gates would remove the vendored patch |
+| S3 | furrow snapshot/restore over R2 from a container | DONE | See row S3 under the app packets: spikes/furrow-r2/RESULTS.md |
+
+| E2E | Whole chain, real pieces: modron serve (mock) -> bridge (local wrangler dev) -> web app in headless Chromium | ACTIVE | e2e/run.mjs, e2e/FINDINGS.md. First run 2 of 11; it exposed that the remote-control tunnel never subscribed to its session, that share URLs carried a ws scheme, and that late viewers lost history over 96 KB. All three fixed in rc.rs by the lead; then 11 of 11 after an app layout fix: a fixed 600 pt transcript pushed the approval and stop controls below the viewport; the transcript now follows the window height. Console-error capture is on for every scenario. E2E-2 added portal UI, web feature and terminal scenarios: P1-P4 pass (sign-in through the UI, owner drives and approves, invite created / forbidden submit / revoked, offline row). W1-W6 and T1 fail, findings in e2e/FINDINGS.md: the serve treats the portal OWNER as a share link (the bridge forwards no role), so config and shell are refused; the web page panics on std Instant::now (the first panic behind the earlier closure error); a message sent while an approval waits goes out as submit, not steer (the client shows idle); a live page never requests the session list; the terminal app sometimes stays on connecting; S6b regressed (possibly the virtual list showing only visible rows) |
+
+| PARITY | Audit: everything crates/modron-tui does versus the new app | DONE | docs/APP_PARITY.md: 140 rows; DONE 52, PARTIAL 17, CORE-ONLY 15, MISSING 50, N/A 6; a 20-item ordered list of what must land before the old TUI is deleted (keys, multi-line entry and paste, Esc on an approval, input history, @file and !command, credentials, tool detail panel, scrollback keys, attachments, startup flags) |
+| PARITY-2 | Re-audit from the current code | DONE | docs/APP_PARITY.md rewritten over the same 140 rows: DONE 88 (+36), PARTIAL 27 (+10), CORE-ONLY 1 (-14), MISSING 16 (-34), N/A 7, DIFFERENT-BY-DECISION 1. 20 DONE rows have no test. Top gaps: terminal mouse (wheel, click, drag-copy), /issues (needs a server frame), /goal not shown and /context, pickers for persona / mode / sandbox / theme and rule removal, Esc on an idle composer and removing a credential |
+| PARITY-3 | Third audit from the current code | DONE | docs/APP_PARITY.md over the same 140 rows: DONE 108 (+20), PARTIAL 14, CORE-ONLY 1, MISSING 1, N/A 7, DIFFERENT-BY-DECISION 9. 11 DONE rows untested. The one MISSING row is a safety behaviour: the old TUI ignores approval keys typed just before the prompt appears (type-ahead guard). Deleting crates/modron-tui is blocked by a build dependency, not features: modron-cli calls modron_tui::run_with, so removing it changes what `modron` starts. Riskiest DONE rows (never exercised by a person): Esc interrupting a run, Ctrl+V image attach, Ctrl+C mid-turn |
+
+| PARITY-A | Terminal input: parity items 1, 2, 3, 4, 8 (keys), 9, 14, 15 | DONE | Full key map; multi-line composer (Shift+Enter, Ctrl+J, trailing backslash) with bracketed paste; Esc denies a pending approval; input history; PgUp/PgDn/Home/End scrollback with a follow marker; first Ctrl+C interrupts, second exits; session id in the header and a resume line on exit; /reasoning with a live tail. Open: the composer has no height cap; paging moves a fixed 10 lines; app-local strings need a shared home ("new output below", "press ctrl+c again to quit", the resume line); /reasoning is not in the shared slash table; the Backspace-dequeue live test is racy under load |
+| PARITY-D1 | App: parity items 5, 7, 11, 16, 17 and the composer cap | DONE | Ctrl+T tool detail panel; `!command` through the core shell call; `@file` completion on the terminal target (web keeps `@` as text); startup flags forwarded as config after attach (--working-dir and --sessions-dir only to a server the app spawns); unix socket preferred locally, --socket, tokens, --insecure-lan; composer capped at 6 lines. Open: no `!cmd` echo and dim output rows in the transcript; the @file index is built once per process; strings needing a shared home ("no tool activity yet", help rows) |
+| PARITY-D2 | App: parity items 6, 10, 12, 13, 18, 19 and three e2e defects | PARTIAL | DONE: credentials screen (masked key, server-side sign-in; auto-opens once only on a blank idle session), /review /btw /learn /plan <task> /goal /agent, /exit /quit /q, picker current marker and dimmed unavailable rows; e2e defects: one clock for native and wasm (the std Instant panic), session list requested on every connect, a stalled connect retries and a stale socket falls through. NOT DONE: attachments in the app (10), automations / worktree / allow / deny screens (18), /clear, toast expiry, idle hints, queue and steer formats still app-local. Decided under PLAN 10.2a: explicit save writes default model + provider to the server config (implementation: SHELL-2). 18 commands and aliases are missing from the shared slash table |
+| ROLE | Portal owner role reaches the serve; steer while an approval waits | DONE | Frame.role is stamped by the bridge (any client-supplied role is deleted first) and trusted by the serve only on a tunnel that authenticated with the host token; owner = everything for that one session, approver = approve / decide_plan, viewer = read; an exhaustive per-variant table decides every client frame, so a new variant cannot be forgotten. The client core now treats task events, deltas, tool starts and approval requests as "running", so a message sent during an approval wait is a steer. Caveat: a bridge without HOST_TOKEN accepts any agent tunnel |
+| SHELL-2 | Shell passthrough per PLAN 10.2a (`!` shared, `!!` private, no prompt for the owner); persist default model from the picker | DONE (crates and client core; app wiring open) | SessionEvent::UserShell { private }: a private command is shown in the transcript on every device and kept out of model context and compaction input (tested). The owner's command is refused only by the deny list, a deny rule (per segment), a pre_tool veto, a missing bash tool or an empty command. PersistDefaultModel writes default_model / default_provider to config.toml (local connections only). Side effects to know: the config writer (shared with router defaults) is now atomic and refuses to overwrite an unparsable file, but comments in config.toml are lost on rewrite; a saved default pins future sessions to that model, so they stop using the router. Open: app uses parse_shell_input for `!!` and offers the save control |
+| SLASH-TABLE | Shared slash table: aliases and the commands clients served on their own | DONE | SlashSpec.aliases; added worktree, reasoning, goal, btw, review, learn, agent, allow, deny, automations, exit (with their aliases); the canned prompts for /review, /btw, /learn, /plan live in modron-view, byte-equal to the old TUI (test); a test lists every old-TUI command as shared or TUI-only (clear, context, theme, issues) with reasons. Note: the prompts carry the old TUI's em dashes, so the client core's wording changed from its ASCII copies |
+| APP-3 | App: PLAN 10.2a decisions wired, attachments, screens, small items | PARTIAL | DONE: slash list merges the shared table with app entries (shared wins) and resolves aliases; `!` shared and `!!` private with their own row style; save-as-default in the model picker (Shift+S, web control); /allow and /deny; clipboard image paste on Linux with chips, Backspace drops a chip before a queued message. NOT DONE: clipboard image on macOS, web attach control, automations / tasks / worktree list screens and merge, /clear, note expiry, shared homes for "save as default" and the queue and steer formats. One model-picker test failed once under load and passed in two full reruns (timing-sensitive) |
+| APP-4/5 | App: remaining screens and parity items; test reliability | DONE (gaps listed) | Automations screen (list, add form, remove); tasks screen (create, open, merge; rows lack the ahead/files summary, which the snapshot does not carry); web attach control; macOS clipboard image path (written, untested: cannot run here) and text paste; /clear; notes expire after 2 s; goal in the status area; /context answers from the snapshot; Esc clears an idle draft; shared homes for the save-default, queue chip and steer echo strings. Defects fixed: clearing the staged chips did not republish the view (nothing in the core changed), and the "attached" notice was posted as an error that never expired. Test harness: steps now wait on observable state, not time (the model-picker test had failed once in each of three loaded runs) |
+| REL | `modron app` and shipping the app with releases | DONE (unverified outside this container) | `modron app [args]` finds modron-app-tui (MODRON_APP_BIN, next to modron, PATH), sets MODRON_BIN, passes arguments through and execs; exit 2 with instructions when absent; `modron` alone is unchanged. Release workflow builds the app with --locked and puts both binaries in one archive; upgrade swaps both; Homebrew formula and install.sh updated; app release profile is size-optimised but keeps unwinding (panic = "abort" would orphan a server the app started). NOT VERIFIED: CI, a release run, Homebrew, install.sh, upgrade against a real release. FINDING: `modron upgrade` does not verify the downloaded archive against SHA256SUMS (pre-existing) -> UPGRADE-SUM |
+| UPGRADE-SUM | `modron upgrade` verifies the archive checksum before swapping binaries | DONE | The release SHA256SUMS is fetched, parsed strictly and compared (constant time) with the streamed archive before any extraction; no skip flag; https-only redirects; install.sh checks SHA256SUMS too. Limits: detects corruption and a swapped archive, not a release where both files were replaced (needs signed releases). Not exercised against a real release |
+| APP-6 | App: tests for untested rows; remaining parity | PARTIAL | DONE: tests for 19 of the 20 untested rows (none was broken; the /reasoning toggle and the resume line printed on exit remain untested); the 80 percent context marker on the status line and in /context (the old TUI shows a marker, no note); "esc to interrupt", spinner and idle hints while running / idle; welcome lines on a blank idle session; /theme answers with a note. NOT DONE: pickers for /mode, /sandbox, /effort, /agent; removing rules and allow/deny entries; credential removal (the core has no call for it); help tabs and scrolling. Limit: the terminal loop wakes on events, so the spinner can pause during silent waits (not checked in a pty). NSH can swap tokens at runtime (ambient::set_tokens, set_color_scheme) but has no named themes: a theme switcher needs a second palette |
+| AUTH-REMOVE | Remove a saved credential over the wire (PLAN 10.2a) | DONE (crates and client core; app control pending in APP-7) | AuthRemove removes what Modron stored for a provider (its env-file key line, its own OAuth token file), local connections only; refuses a sign-in that only Codex CLI or Claude Code holds, and a key exported by the shell. Known limits: a running session keeps the provider it was built with, and the Anthropic subscription provider can write its token file back on a refresh, so removal does not fully stop a running subscription session. Pre-existing bug noted in the frozen TUI: its removal arm matches "chatgpt", not the registry id "openai-compat", so it never deletes the OpenAI token file |
+| APP-7 | App: pickers, removal, help, themes, leftovers | DONE (two gaps) | One picker screen for /mode, /sandbox, /effort, /agent, /theme, also opened from Settings rows; rule and allow/deny removal with confirmation; help in three tabs (General, Commands, Shortcuts), scrollable; themes dark / light / system applied at runtime and remembered (terminal: app.toml under the config dir; web: localStorage); tests for the /reasoning toggle and the exit resume line; the spinner ticks every 120 ms while running and not at all when idle. GAPS: the /agent picker has no persona names (the snapshot carries none); the credentials screen has no remove control yet (the core call landed after this worker checked) |
+| WIRE-2 | Personas and per-task summaries reach clients | DONE (crates and client core; app use pending) | PersonasReq / Personas (name, model, one-line summary; never the system prompt), LiveState.persona, owner-only through a tunnel; the client core keeps the latest TaskStatus per task and exposes task_rows with an "ahead N - M files" summary, refreshed in batches of ten |
+| APP-8 | App: persona picker rows, task summaries, credential removal | DONE | The /agent picker lists the server's personas and marks the current one (a persona cannot be cleared: the server refuses an empty name); the tasks screen shows the ahead / files summary and refreshes while it is visible, at most every 5 s; a signed-in provider row can be removed with confirmation. Untested: the refusal text for a sign-in that belongs to another tool |
+| APP-9 | App: approval type-ahead guard and last parity gaps | DONE | Decision keys (y/a/n, Esc; y/r for plans) and the web approval/plan controls are ignored for 300 ms after a prompt first shows (old TUI lib.rs:538, 962-973; no cue, as before); Ctrl+J and trailing backslash newlines, kitty keyboard flags where supported; Esc returns a scrolled transcript to the live tail, lines-above hint; /allow and /deny menus, /auth <provider>, /sandbox bubblewrap alias; /reasoning also sets the reasoning summary; tests for the 11 untested rows (none broken); e2e T2-T4 terminal scenarios. Open: app tests run single-threaded (app/.cargo/config.toml) to hide a parallel-only blank-screen flake, root cause unconfirmed; an intermittent browser page error 'closure invoked recursively or after being dropped' seen twice by the worker in e2e, not reproduced by the lead; Shift+Enter not covered under the pty; persona clearing needs modron-server hub.rs to accept an empty name |
+| WIRE-3 | Persona clearing; web socket handler detach; test harness lock order | DONE | An empty persona name restores the session's pre-persona config (hub.rs persona_base); the /agent picker's first row is 'no persona'. Web transport detaches its socket handlers on drop (the cause, by code reading, of the intermittent 'closure invoked recursively or after being dropped' page error). App test harnesses hold the serial lock as the last field; the RUST_TEST_THREADS pin is removed. Open: a few chat.rs unit tests touch globals without a lock; the e2e prebuilt modron binary predates the persona change |
+| TEST-4 | Persona e2e, Shift+Enter under the pty, unit-test lock | DONE | e2e W7 found the client core kept an empty persona name (fixed); T4 sends kitty Shift+Enter; chat.rs unit tests share one lock; suite 27 of 27 |
+| LIVE-1 | Live suite against a deployed bridge | DONE | e2e/live.mjs (E2E_LIVE_ENV). Preview worker modron-bridge-preview and the live modron-bridge (portal on, fresh secrets) both 6 of 6. The serve side uses a loopback forwarder: the Rust client ignores the container's HTTPS proxy (test-environment limit). First run right after setting secrets failed until they propagated |
+| S3 | furrow snapshot/restore over R2 | DONE | spikes/furrow-r2/RESULTS.md: works unpatched, exact round trip; sequential uploads about 105 KB/s; two-writer takeover untested |
+| C9-TUI | `modron` launches the NSH app; crates/modron-tui deleted | DONE | Flag mapping in modron-cli app.rs (tested); flags with no app equivalent print a note (--max-input-tokens, --max-total-tokens, --max-turns, --max-cost, --compact-threshold, --no-compact, --attach); lost: no-key fallback to the mock provider, startup upgrade notice; install.sh source fallback and `modron upgrade` now install the app binary; AGENTS.md parity contract rewritten. Root gates: 1294 tests (crate had 116), clippy and fmt clean; e2e 27 of 27 on the new binary. Upgrade path not tested against a real release |
+| CI-2 | Cloud image workflow; CI builds the web bundle and runs web tests | DONE (unverified in CI) | cloud-deploy.yml (manual dispatch, confirm string); container worker rewritten to a bearer-gated wake route. OPEN: `modron serve` cannot start remote control without a client frame, so a cloud run cannot reach the bridge yet; Containers config shape and Docker build context unverified; e2e paths now configurable (E2E_REPO, E2E_MODRON, E2E_APP_SRC, E2E_SCRATCH) but no CI job yet |
+| C6a | `modron serve --remote-control` opens the tunnel at start | DONE | Flag and MODRON_REMOTE_CONTROL; most recent session or a new one; share URL logged and written to --share-url-file; container entrypoint uses it; e2e R1 |
+| C6b | Remote-control tunnel reconnect | DONE | Backoff 1 s to 60 s with jitter, same share key, re-registers the host session; stops on stop, session end, shutdown, 401/403. OPEN: no client-visible reconnecting state (needs a protocol message); the bridge still tells viewers to run /remote-control again when the agent closes |
+| PUSH-1 | Web push in the bridge | DONE (real push services unverified) | VAPID + RFC 8291 with WebCrypto, RFC vectors in tests; owner or approver-invite subscriptions in the Directory DO; push per Notify, rate limited, endpoint allow-list; /app/sw.js served by the Worker; e2e P5. One lost-push run in about a dozen was not reproduced |
+| PUSH-2 | Web app "notify this device" control | DONE | Settings row on the web target; 12 unit tests, 7 web cases. OPEN: /i/<invite> redirects without the invite id, so an invited approver's page cannot subscribe (fix in handleInviteLink); the service worker's push handler is not exercised by tests; iOS detection is a user-agent approximation |
+| H7b-2 | Thinking-block replay (PLAN 10.7) and the spend-cap log fix | DONE (no live provider check) | provider_blocks on Message (additive), Anthropic thinking / redacted_thinking with signatures and Responses reasoning items stored and replayed to the same provider and api only, Anthropic only when the request turns thinking on (lead restriction); stripped from snapshots and live frames; the billed turn is logged before a spend-cap stop. Unverified: which earlier turns' blocks the API wants, interleaved thinking position, prompt-cache effect |
+| PARITY-B | Client core and wire support for parity items 5, 7, 10, 11, 16, 17 | DONE | Snapshot tool_detail rows (and a fix: the tracker was never cleared at turn end, so a new turn re-showed old rows); attachments on submit with type checks (no size cap exists on the server beyond the 256 MiB websocket limit); unix-socket transport, ?token= and device token helpers; startup setters. Shell frame, client method and refusals exist; execution is a stub pending an engine entry point (PARITY-C). --working-dir and --sessions-dir have no wire equivalent |
+| PARITY-C | Engine entry point for a user-issued bash call; server runs Shell through it | DONE (two owner decisions open) | Engine::run_user_shell takes the command through the same deny list, rules, approval mode, phase, approver, hooks and sandbox as a model-issued bash call; the server runs it in the session run slot (busy, interruptible, ends with TurnDone). Decided 2026-11-15 under PLAN 10.2a: `!cmd` reaches the model, `!!cmd` does not; the owner's own command is not approval-prompted but keeps the sandbox, deny list, deny rules and pre_tool veto (implementation: SHELL-2). Scoped (share-link) connections cannot use Shell at all |
+
+### Protocol
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| P1 | docs/PROTOCOL_V2.md: steer/queue, plan approval, sub-agent approvals and counters, reviewer verdict, pause/wake, actor+role | DONE | docs/PROTOCOL_V2.md (16ac999) |
+
+### Harness
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| H1 | Steer and queue messages during a run (engine, server hub, protocol) | ACTIVE | H1a engine SteerInbox DONE (3 tests). Open: H1b protocol Steer frame + server hub; H1c queue |
+| H2 | Enforced plan phase, approve step, per-turn plan re-injection | TODO | |
+| H3 | Sub-agents: approvals to parent, live counters, completion events, cap | TODO | |
+| H4 | Reviewer role + verdict event + non-LLM claim checks | TODO | |
+| H5 | Scheduled wakeups, pause reasons, completion/block notifications | ACTIVE | H5a DONE: Wake / CancelWake / WakeChanged, LiveState.wake, persisted and re-armed at start; Notify for done, failed, plan, wake. H5b DONE: Notify for approval requests (tool name only, never arguments), done text uses the session title. Open: SessionEvent::Paused; push delivery is the relay (C5) |
+| H6 | Hash-anchored line edits, measured with modron bench | ACTIVE | H6a edit_lines tool + read(line_hashes) DONE, on-demand, approval-gated, edit allow/deny entries cover it. Open: modron bench comparison before any default change |
+| H7 | Reasoning-effort parameter and named model roles | ACTIVE | H7a DONE: Effort (low..max) from config (`effort`, `--effort`) and ConfigPatch (effort / clear_effort) to every main-loop and escalation request; Anthropic `output_config.effort`, OpenAI-compatible `reasoning_effort`, Responses `reasoning.effort` (xhigh and max map to high there); status line shows `effort <level>`; sub-agents inherit. Not sent on compaction, reviewer or router calls. Not exercised against a live provider. H7c DONE: `[roles]` plan / subagent / critic / summary (config, ConfigPatch.roles, LiveState.roles). Precedence: a provider pin or persona model beats a role; a role beats the router; `--model` alone is not a pin. Open: H7d a role keeps the router tier's provider and only swaps the model, so a role model on a different provider is sent to the wrong one (needs a model-to-provider lookup, as /model has); sub-agents do not inherit roles; H7b |
+| H7d | Role models follow their provider (model-to-provider lookup injected like price_lookup; also for reviewer and escalation) | DONE | EngineConfig.provider_lookup wired from the router catalog (signed-in providers only); explicit `provider::model` wins; unknown falls back to the turn provider |
+| H7b | Anthropic thinking: request summaries when the user opted into reasoning display; decide on replaying thinking blocks | ACTIVE (H7b-1 DONE: with `reasoning_summary` on (config key, ConfigPatch.reasoning_summary, LiveState.reasoning_summary) the Anthropic provider sends `thinking: {type: adaptive, display: summarized}` to the model families that accept it and nothing to older or unknown ids; never budget_tokens, never disabled. NOT exercised against the live API. Open: clients do not yet send the opt-in when their reasoning display is turned on; replaying thinking blocks, see the finding) | Finding (Anthropic API reference, 2026-11): the provider drops every thinking block from responses and never replays them. That is valid (removing ALL thinking blocks keeps history consistent) but costs reasoning continuity across tool calls, and on current models thinking display defaults to omitted, so `/reasoning` shows nothing unless the request sets `thinking: {type: "adaptive", display: "summarized"}`. Replaying blocks would require an append-only transcript: the transient per-turn plan tail (H2a) and keep-tail client-side compaction both edit history and would have to change first. Design needed before any worker packet |
+| H8 | Command and path permission rules + explain command | DONE | H8a matcher, H8b engine gate + [permissions] config, H8c rules reach serve/daemon/acp sessions (shared build path), ConfigPatch.rules / LiveState.rules / ExplainRule. Evals stay rule-free |
+| H9a | Token waste: whitespace runs in the on-demand stub and delegate_status descriptions; stale default_registry doc | DONE | stub and delegate_status descriptions fixed |
+| H9b | Real compact command and true context occupancy over the protocol | DONE | Engine compact_session + context_gauge; Compact frame, ContextChanged, LiveState.context. Known: Compact vs Submit is check-then-act; the gauge is None until the first run or compaction in a server process |
+| H9c | Hooks: turn-end and session-start events | DONE | session_start and turn_end hooks: observe-only, never block; do not disable speculative reads |
+| H9d | MCP over HTTP | DONE | MCP Streamable HTTP client: [mcp.servers.x] url + headers with ${ENV} expansion, JSON or SSE replies, session id, one re-initialize on 404, body cap. stdio unchanged. CLI connects by transport (connect_mcp_server). Out of scope: legacy SSE transport, OAuth, server-initiated requests |
+| H9e | Web fetch tool | DONE | webfetch tool: on-demand, approval-gated, SSRF checks with a pinned resolved address, no redirects, refused under a sandbox, body wrapped in untrusted-content markers. Ignores HTTP proxies by design (a proxy would bypass the address pin) |
+
+### Client
+
+| ID | Packet | Status | Evidence / blocker |
+|---|---|---|---|
+| C1 | Client core: approval/sandbox/decision labels into modron-view; mobile/rust-core consumes them | DONE | 16ac999; labels in modron-protocol / modron-view, client core delegates |
+| C2 | Oculus tokens as one NSH theme file (shadcn cssVars), light and dark | DONE | 43c3dbe; app/theme/oculus.json + check.py. Owner to confirm: chart colours, mono font, tool colour, large radius |
+| C3 | NSH app in Rust: sessions, chat, approvals, settings (replaces App.tsx) | ACTIVE | C3a chat screen on the terminal target; C3b client core speaks the v2 frames (steer, queue, plan decision, compact, phase, context label, rules). C3c DONE: `modron-app-tui --url ws://host:port [--token] [--session]` drives a live session (driver thread around RemoteClient; Enter = send/steer, Alt+Enter = queue, y/r on a pending plan, /compact); queue chips, steer echoes, plan block rendered. C3d DONE: one target-neutral key router (terminal and web), web-only tappable stop / approval / plan / queue controls, live tool rows, turn summary, swarm rows, notes and errors from the snapshot, Oculus theme applied on web (asserted) and terminal. C3e DONE: the client core adopts the session from the first snapshot when none is attached (share links can send), refusals reach last_error and the screen, dequeue (Backspace on an empty composer; pressable chips on web), STOP_LABEL / QUEUE_LABEL / COMPOSER_PLACEHOLDER / compact_tokens live in modron-view. C4d DONE: screen stack (Ctrl+O sessions, F2 settings, Esc backs out), sessions screen with type-to-filter, attach and new session, settings screen cycling approval mode, phase and effort and showing model, sandbox, context and rules; web header controls; labels live in the client core. C3f DONE: slash suggestions and execution (every shared-table command is served by a local action or a core call), help screen generated from the key table the router tests iterate, model picker over the router defaults, delete session with inline confirmation, a sub-agent screen with steer and kill. WIRE-CATALOG DONE: ModelsReq / Models carry the router catalog (id, provider, context window, availability, tier) and the client core folds it into picker rows; /sessions, /compact, /effort, /plan, /build are in the shared slash table. Open: the app picker still reads router defaults (switch it to the catalog rows); app-local strings "started by modron-app", "connected <url>", "no session to continue" need a shared home; 1M context renders as "1000k ctx"; Ctrl+A opens the first running agent only and the agent screen shows the chat transcript beneath it; portal sign-in on web; Ctrl+O may be browser-reserved on web; no visual review yet; the queue chip and steer echo formats and the terminal key hints are still app-local literals; modron-view docs show swarm tokens as `1.2k tok` but the code prints raw counts |
+| C4 | Portal: Worker serves the web build; owner sign-in; linked GitHub accounts; session directory; invite links | ACTIVE | C4a DONE: app/ builds for the web (`nsh package --target web`, needs the nsh CLI and wasm-bindgen CLI 0.2.130) with the same chat screen; `?url=ws://..&token=..&session=..` connects through the client core wasm transport, no url = demo. wasm 5.56 MB raw / 1.51 MB brotli; bundle 12.5 MB in 98 files. app/web-test.js (headless Chromium): demo and live against a scripted websocket server pass. Open: web key hook (Esc, y/a/n, y/r, Alt+Enter not wired on web), theme not confirmed to render, a live-test flake seen by the worker (3 of ~17 runs missed the submit; 8 of 8 clean since), C4b DONE: the bridge serves the bundle from Workers Static Assets under /app/ (sync with cloud/bridge/scripts/sync-app.sh; 25 MiB per-file limit, the wasm fits); /s/<key> redirects to /app/?url=ws(s)://host/ws/<key>, ?classic=1 keeps the inline viewer; the first viewer hello replays the buffer. 12 checks pass under local `wrangler dev`. Open (cloud/bridge/NOTES.md): the app never attaches without session= so a submit through a share link would start a new session and be refused (fix in the app: adopt the session id from the first snapshot); snapshots over 96 KB are not buffered for late viewers; not run end to end against a real modron serve; C4c DONE: OWNER_TOKEN / HOST_TOKEN gates, Directory Durable Object (sessions, owner cookies stored hashed, invites, one-time tickets, sign-in rate limit), POST /auth, /api/sessions, host registration API, signed invite links with viewer / approver roles enforced on viewer sockets in the bridge; with OWNER_TOKEN set a bare share-key socket is refused. 57 checks pass under local wrangler dev. C4f DONE: modron serve sends MODRON_HOST_TOKEN on the tunnel upgrade and registers / heartbeats / deletes its session in the directory (never blocks the tunnel; 503 disables, 401 stops). C5a DONE: sessions with no heartbeat for 5 minutes are listed offline and swept after 30 days; /api/me; /api/sessions rows carry online, updated_at and open_url; / redirects to /app/ when the portal is on. C4g DONE: the web app is the portal front end: with no url it asks /api/me and shows the demo (503), a masked sign-in (401) or the portal session list (200; rows open their open_url, offline rows cannot be opened, refresh, sign out); Settings gains a share section that creates, lists and revokes viewer / approver invites; the model picker lists the wire catalog. The token is never stored (asserted in web tests). Open: invites for offline sessions are still allowed, the 15 s auto refresh and clipboard copy are not browser-tested, no visual review, app sessions and sign-in screens (C4d), linked GitHub (C4e). Deploy needs the owner Cloudflare login |
+| C5 | Tandem: multi-device attach, replay on reconnect, push for approvals | TODO | |
+| C6 | Cloud runs: container runs modron serve; sleep/restore; handoff | TODO | Depends on S3; deploy needs the owner's Cloudflare login |
+| C7 | Terminal target from the NSH app | ACTIVE | C7a DONE: `modron-app-tui` with no arguments connects to ws://127.0.0.1:7699 (MODRON_URL), or starts `modron serve` itself (MODRON_BIN, next to the app, PATH), logs it to the state dir, and stops it on exit unless --keep-server; --demo, --new, --continue; picks the latest session for the working directory; reconnects with backoff; terminal restored on exit and panic. Lead smoke under a pty: server started, task submitted, approval shown, Ctrl+C exits 0, alternate screen left, no server left running. Open: make it the default UI of `modron` (ship the app with the binary), `!` shell passthrough, `@file`, attachments, parity review against crates/modron-tui, size (S2c) |
+| C8 | Phone packaging (iOS, Android) | BLOCKED | Needs macOS/Xcode and signing (owner) |
+| C9 | Delete modron-tui views, modron-desktop, mobile/app TSX, bridge inline viewer; rewrite the AGENTS.md parity contract | ACTIVE | C9a DONE (eedc245): modron-desktop removed, assets in app/assets. Open: TUI views, mobile/app TSX, bridge inline viewer, AGENTS.md contract rewrite - after C3/C7 |
+| C10 | CI: nsh check / nsh test; drop the gpui exclusion | ACTIVE | CI job `app` added: fmt, clippy, test and a wasm32 type-check in app/ (not yet seen green in CI). Open: build the web bundle and run web-test.js in CI (needs the nsh CLI and wasm-bindgen CLI), mobile/app |
+
+## Log
+
+- 2026-11-15: program opened; plan and decisions recorded in PLAN.md
+  section 10.
+- 2026-11-15: wave 1 (four workers). C1, P1, H9a done; H1a, H6a, H8a
+  landed. Lead review changed three things in H8a (a lone `&` is a
+  compound operator, a path with `..` never matches an allow pattern,
+  MCP-style tool names parse) and gated `edit_lines` in the engine (the
+  worker could not touch engine.rs). Gates on Linux, excluding
+  modron-desktop: fmt clean, clippy clean, 955 tests pass.
+- NSH crates are published at 0.5.1 on crates.io (nsh-core, nsh-base,
+  nsh-engine, nsh-testing, nsh-platform-tui); this container has glibc
+  2.39, so S2 can run here.
+- 2026-11-15: wave 2. H1b, H8b, C2 landed. Lead changes: an ask rule
+  no longer lets a gated tool reach the approver in Deny mode; test
+  struct literals outside the worker's file list repaired. The
+  speculative read driver is disarmed whenever a rule set is present
+  (it runs reads before the gate). PROTOCOL_VERSION stays 1 until the
+  v2 set is complete. Gates: fmt clean, clippy clean, 969 tests pass.
+- 2026-11-15: wave 3. H1c, H2a, H3a landed. The frozen desktop client
+  got no-op match arms for the new frames (it has an exhaustive Payload
+  match and is compiled on macOS CI); NOT compiled here (gpui needs GUI
+  libraries this container lacks) - needs a macOS CI pass. Gates on
+  Linux excluding modron-desktop: fmt clean, clippy clean, 985 tests.
+- 2026-11-15: C9a (desktop removed) and S2 (terminal spike) closed. S2
+  verdict: the NSH terminal backend is fast enough; the blockers to
+  retire before C7 are binary size, a no-JS feature set that compiles,
+  and an external-event path into the reactive graph (S2b).
+- 2026-11-15: wave 4. H2b and H9c landed (H2 closed). Gates on Linux,
+  full workspace (desktop is gone): fmt clean, clippy clean, 1004 tests.
+- 2026-11-15: wave 5. H4a and H8c landed (H8 closed). Lead added the
+  `review_model` / `review_max_rounds` config keys. Gates: fmt clean,
+  clippy clean, 1036 tests pass (full workspace).
+- 2026-11-15: S2b closed. The NSH terminal target is viable for C7
+  with a no-JS build; binary size (17 MB at best) is the accepted cost
+  unless the owner objects. Docs mismatch noted: `SurfaceOptions.runtime`
+  does not exist in 0.5.1.
+- 2026-11-15: wave 6. H9b and H9e landed. The container ran out of
+  disk mid-wave (build caches): the H9b worker stopped with one test
+  type error, which the lead fixed; .gitignore was found truncated to
+  zero bytes and was restored from the index. Gates: fmt clean, clippy
+  clean, 1063 tests pass.
+- 2026-11-15: C3a landed: first screen of the unified NSH app, on the
+  terminal target. App gates (in app/): fmt clean, clippy clean, 7
+  tests pass. The app is its own workspace, so root gates do not cover
+  it yet (C10).
+- 2026-11-15: wave 7. C3b and H5a landed. Gates (root workspace):
+  fmt clean, clippy clean, 1093 tests pass. wasm32 target is not
+  installed here, so the client core wasm check did not run.
+- 2026-11-15: H5b landed. Gates: fmt clean, clippy clean, 1096 tests.
+- 2026-11-15: C3c landed. App gates (app/): fmt clean, clippy clean,
+  16 tests pass. Live smoke by the lead: `modron serve --provider mock`
+  plus `modron-app-tui --url ws://127.0.0.1:7711` under a pty: connected,
+  a typed task was submitted, the mock run reached a bash approval and
+  the app showed the three decision labels.
+- 2026-11-15: S1 closed: the NSH web target is viable for the portal
+  (C4) in Rust. Open questions moved to C4: accessibility roles, real
+  device testing, load over a real network (1.4 MB brotli wasm).
+- 2026-11-15: wave 9 (harness half). H3b and H9d landed; the lead
+  wired HTTP servers into the three CLI connect sites. Gates: fmt
+  clean, clippy clean, 1123 tests pass.
+- 2026-11-15: H3c and H4b landed (H4 closed), commit ad59658. Gates:
+  fmt clean, clippy clean, 1147 tests pass.
+- 2026-11-15: C4a landed. App gates: fmt clean, clippy clean, wasm32
+  lib check clean, 19 tests pass, web-test.js passes (3 of 3 lead
+  reruns). Stale build artifacts in app/target gave a false compile
+  failure once; `cargo clean -p modron-app` cleared it.
+- 2026-11-15: C4b landed (local only; nothing deployed).
+- 2026-11-15: C3d and S2c landed. App gates: fmt, clippy, wasm32
+  check clean; 34 tests pass; web-test.js 6 of 6 cases (lead reran
+  twice). S2c: the size floor found is 11.4 MB stripped; the NSH
+  runtime itself (nsh_core + nsh_base) is about 46 percent of it.
+- 2026-11-15: docs/PORTAL.md (owner sign-in, session directory, invite
+  links, linked GitHub, push) and the `app` CI job added.
+- 2026-11-15: C4c landed (local only; nothing deployed). Lead reran
+  test/portal.mjs (all checks pass) and tsc (clean), and confirmed the
+  role filter keys on the flattened frame `type`.
+- 2026-11-15: C3e and C4f landed. Root gates: fmt clean, clippy clean,
+  1163 tests pass. App gates: fmt, clippy, wasm32 check clean, 44 tests
+  pass, web-test.js 8 of 8.
+- 2026-11-15: H7 split. H7a (effort parameter end to end) is with a
+  worker; H7b (thinking display and block replay) is recorded as a
+  design item, see its row.
+- 2026-11-15: H7a landed. Gates: fmt clean, clippy clean, 1177 tests.
+- 2026-11-15: first end-to-end run. Three real defects in the remote
+  path were found and fixed (see E2E row); 145 server tests pass. The
+  scripted-fake tests had not caught them because each side was tested
+  against the other's assumed behaviour.
+- 2026-11-15: C4d landed. Root gates: fmt clean, clippy clean, 1184
+  tests pass (this also covers the rc.rs tunnel fix). App gates: fmt,
+  clippy, wasm32 check clean; 71 tests pass; web-test.js 11 of 11. The
+  app is 2,713 source lines for chat, sessions and settings on two
+  targets.
+- 2026-11-15: e2e 11 of 11. App gates against committed crates: fmt,
+  clippy, wasm32 check clean; 72 tests pass.
+- 2026-11-15: H3d landed after the owner approved the one acp.rs match
+  arm a worker had been denied. Root gates: fmt clean, clippy clean,
+  1201 tests pass. App: 72 tests pass against the new crates.
+- 2026-11-15: H7c and the docs refresh landed (README corrected,
+  docs/CONFIG.md added). Gates: fmt clean, clippy clean, 1217 tests.
+  Docs worker findings recorded: with no model configured the Anthropic
+  default is claude-opus-5-5; cloud/bridge/README.md is stale on the
+  host token and C4d.
+- 2026-11-15: H7d and C5a landed. Gates: clippy clean, core + cli 442
+  tests pass (worker ran the workspace: 1226). Bridge: tsc clean,
+  portal 82 checks, local checks, e2e 11 of 11 unmodified.
+- 2026-11-15: C3f landed. Root gates: fmt clean, clippy clean, 1226
+  tests. App: fmt, clippy, wasm32 check clean; 93 tests; web-test.js 15
+  of 15. The app is 4,087 source lines for chat, sessions, settings,
+  help, model picker, slash commands and the sub-agent screen on two
+  targets. The frozen mobile/app fixture got `..Default::default()`: it
+  named every snapshot field and so has not compiled since the client
+  core gained fields (C3b); it is not built in CI and was edited blind.
+- 2026-11-15: WIRE-CATALOG landed. Gates: fmt clean, clippy clean,
+  1234 tests pass.
+- 2026-11-15: C7a landed. App gates: fmt, clippy, wasm32 check clean;
+  113 tests; web-test.js 15 of 15. The app's local slash entries were
+  removed in favour of the shared table (two tests had failed on the
+  duplicates) and `/effort off` is accepted.
+- 2026-11-15: C4g landed. Root gates: fmt clean, clippy clean, 1239
+  tests. App: fmt, clippy, wasm32 check clean; 126 tests; web-test.js
+  19 of 19. The two server-backed terminal tests shared one HOME and
+  collided when run in parallel; they now hold a lock (3 clean reruns).
+  They skip when the prebuilt server binary is absent, so CI does not
+  run them yet.
+- 2026-11-15: parity audit recorded. e2e reran 11 of 11 against the
+  portal front end after the harness learned that the app's /api/me
+  probe answers 401 or 503 on non-owner pages (expected, not errors).
+- 2026-11-15: PARITY-B landed. Gates: clippy clean, 1255 tests pass,
+  client core wasm check passes.
+- 2026-11-15: PARITY-A landed. App gates: fmt, clippy, wasm32 check
+  clean; 143 tests (two clean runs); web-test.js 21 of 21 twice.
+- 2026-11-15: PARITY-C landed. Gates: fmt clean, clippy clean, 1269
+  tests pass.
+- 2026-11-15: PARITY-D1 landed. App gates: fmt, clippy, wasm32 check
+  clean; 166 tests; web-test.js 22 of 22. The app is 7,854 source
+  lines. Remaining must-haves from docs/APP_PARITY.md: 6 (credentials
+  and onboarding), 10 (attachments in the app), 12 (task-submitting
+  commands), 13 (picker details), 18 (screens for automations,
+  worktree, agent, allow/deny), 19 (small items), 20 (themes).
+- 2026-11-15: E2E-2 recorded. 14 of 22 scenarios pass; the eight
+  failures are real findings, not harness problems, except S6b which
+  is undiagnosed.
+- 2026-11-15: ROLE and PARITY-D2 landed together. Root gates: fmt
+  clean, clippy clean, 1283 tests. App: fmt, clippy, wasm32 check
+  clean; 186 tests; web-test.js 24 of 24 twice. Lead changes: two app
+  live tests and three web cases expected a submit while the scripted
+  stream implied a running session (now a steer); the first-run
+  credentials screen was covering sessions with history and is limited
+  to blank idle sessions. e2e after the fixes: W3 (settings through
+  the portal) passes; W1, W2, W4, W5, W6 still fail (click timeouts,
+  history not shown) and are not yet diagnosed.
+- 2026-11-15: owner set a standing rule (PLAN 10.2a): compare Claude
+  Code and oh-my-pi, decide, record, proceed. Three open decisions
+  closed under it.
+- 2026-11-15: SHELL-2 landed. Gates: fmt clean, clippy clean, 1298
+  tests pass; client core wasm check passes.
+- 2026-11-15: E2E-DIAG landed. Full suite twice: 20 of 22 pass both
+  times. Causes found: the first-run credentials screen covered blank
+  sessions whose provider needs no sign-in (app; fixed); a web user had
+  no way to scroll the transcript, so old rows were unreachable (app;
+  wheel and touch scrolling added); W5 expected a session list through
+  the tunnel, which the role table refuses by design (test reframed,
+  the app now shows the refusal). OPEN: W6, after a local run the page
+  stops sending frames and pings (suspect the client core send path);
+  T1, the terminal app idles on "connecting" although the serve
+  answers. The harness now kills its process groups on exit, signal
+  and exception. App gates: fmt, clippy, wasm32 check clean; 190
+  tests; web-test.js 26 of 26.
+- 2026-11-15: CONNECT closed: neither open e2e failure was a product
+  defect. W6 waited for a correlated reply on the wrong connection and
+  the evidence was truncated (40 frames kept); T1 searched the raw
+  terminal bytes for a string the app never writes whole. Both tests
+  now check what a user would see. Kept from the investigation: a send
+  on a closed connection sets last_error; MODRON_APP_TRACE logs the
+  driver's stages; five client-core tests for send paths. Full e2e:
+  22 of 22 (worker twice, lead once), no leftover processes. Core 110
+  tests, app 190, web-test.js 26 of 26.
+- 2026-11-15: SLASH-TABLE landed. Dependent tests 436 pass, clippy
+  clean. Lead made two shared rows client-neutral (/exit, /plan [task]).
+- 2026-11-15: APP-3 landed. App gates: fmt, clippy, wasm32 check
+  clean; 210 tests (two clean runs after one flaky failure);
+  web-test.js 27 of 27. The app is 9,507 source lines.
+- 2026-11-15: PARITY-2 recorded. Two "ledger claims not found" in the
+  audit were checked by the lead and are in the code.
+- 2026-11-15: APP-4 and APP-5 landed together. App gates: fmt, clippy,
+  wasm32 check clean; 231 tests, three consecutive full runs green;
+  web-test.js 29 of 29 on three consecutive runs. Client core 119
+  tests, clippy clean.
+- 2026-11-15: full e2e against the current tree: 21 of 22, the one
+  failure being W4, which still expected an approval prompt for the
+  owner's shell command. Rewritten to PLAN 10.2a (no prompt, `!!`
+  private frame, runs in deny mode) and passing: 22 of 22.
+- 2026-11-15: REL landed. modron-cli 102 tests, clippy clean; workflow
+  YAML parses; manual check with a stand-in app binary passed.
+- 2026-11-15: UPGRADE-SUM landed. modron-cli 123 tests, clippy clean.
+- 2026-11-15: APP-6 landed. App gates: fmt, clippy, wasm32 check
+  clean; 250 tests (worker three runs, lead one); web-test.js 29 of 29
+  (worker three runs, lead two). Client core 122 tests.
+- 2026-11-15: AUTH-REMOVE landed. core + protocol + server 579 tests,
+  clippy clean.
+- 2026-11-15: APP-7 landed. App gates: fmt, clippy, wasm32 check
+  clean; 270 tests (worker three runs, lead one); web-test.js 30 of
+  30. The credentials web case typed the key before the masked field
+  had focus and failed about one run in six; it now waits for the
+  field and its value (seven clean runs). Client core 129 tests. The
+  app is 12,197 source lines.
+- 2026-11-16: full e2e against the current tree: 21 of 22; W3 still
+  drove Settings by cycling rows, which now open pickers. Rewritten to
+  pick the values; passes. T1 rerun against a freshly built terminal
+  binary.
+- 2026-11-16: WIRE-2 landed. Gates: fmt clean, clippy clean, 1381
+  tests pass; client core wasm check passes.
+- 2026-11-16: APP-8 landed. App gates: fmt, clippy, wasm32 check
+  clean; 283 tests; web-test.js 32 of 32 (worker three runs, lead two).
+  Client core 135 tests.
+- 2026-11-16: H7b-1 landed. Gates: fmt clean, clippy clean, 1391
+  tests pass.
+- 2026-11-16: PARITY-3 recorded.
+- 2026-11-16: APP-9 landed. App gates: fmt, clippy, wasm32 check
+  clean; 305 tests (lead two runs); web-test.js 33 of 33 (two runs);
+  client core 137 tests; full e2e 26 of 26 (lead two runs).
+- 2026-11-16: WIRE-3 landed. Root gates (worker): fmt, clippy clean,
+  1394 tests. Lead: app 307 tests in 12 parallel runs, web-test.js 34
+  of 34 (two runs), full e2e 26 of 26 (three runs), fmt and clippy
+  clean in app and client core (native and wasm32).
+- 2026-11-16: owner decisions recorded in PLAN 10.2b. TEST-4, LIVE-1,
+  S3, C9-TUI, CI-2 landed. Lead gates: root fmt, clippy clean, 1294
+  tests; e2e 27 of 27; live suite 6 of 6 on preview and live bridges.
+- 2026-11-16: C6a, C6b, PUSH-1, PUSH-2, H7b-2 landed. Lead gates: root
+  fmt, clippy clean, 1328 tests; app 319 tests, web-test.js 41 of 41;
+  client core 138; e2e 29 of 29. PR 2 CI green on e8b6a26 (first green
+  run of the app job, after adding clang and llvm for the wasm32 build).

@@ -44,6 +44,7 @@ fn tool_call_response(
         }],
         usage,
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -51,6 +52,7 @@ fn text_response(text: String, usage: Usage) -> TurnResponse {
     TurnResponse {
         text,
         tool_calls: Vec::new(),
+        provider_blocks: Vec::new(),
         usage,
         stop_reason: StopReason::EndTurn,
     }
@@ -77,6 +79,7 @@ fn mock_engine(
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             ..EngineConfig::default()
         },

@@ -1,19 +1,39 @@
 {
   // modron remote-control bridge: a transport-only relay. `modron serve`
   // connects as the agent side of a session; any browser/phone opens
-  // /s/<key> to watch and drive it. One command deploys it:
+  // /s/<key> (redirects to the web app at /app/) to watch and drive it.
+  // One command deploys it (owner's own Cloudflare login):
   //   npx wrangler deploy
   // (from this directory, after `npx wrangler login`).
-  // Secret, not in this file: PUBLISH_TOKEN (required for /pages publish).
-  //   npx wrangler secret put PUBLISH_TOKEN
+  // Secrets, not in this file (see README "Portal" and "Secrets"):
+  //   npx wrangler secret put PUBLISH_TOKEN   (required for /pages publish)
+  //   npx wrangler secret put OWNER_TOKEN     (portal sign-in; unset = 503)
+  //   npx wrangler secret put HOST_TOKEN      (host registration + /agent)
+  //   npx wrangler secret put VAPID_PUBLIC_KEY  (web push; unset = 503)
+  //   npx wrangler secret put VAPID_PRIVATE_KEY (web push; README "Web push")
+  //   npx wrangler secret put VAPID_SUBJECT    (mailto: or https: contact)
+  // Static assets: the unified web app bundle lives in public/app/ and is
+  // NOT committed; `sh scripts/sync-app.sh` copies it there after
+  // `nsh package --target web -o dist` in app/. run_worker_first keeps the
+  // Worker in front of every request so it can set cache and MIME headers.
   "name": "modron-bridge",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "not_found_handling": "none"
+  },
   "durable_objects": {
     "bindings": [
       {
         "name": "BRIDGE",
         "class_name": "SessionBridge"
+      },
+      {
+        "name": "DIRECTORY",
+        "class_name": "Directory"
       }
     ]
   },
@@ -21,6 +41,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["SessionBridge"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["Directory"]
     }
   ]
 }

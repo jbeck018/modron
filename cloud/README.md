@@ -20,15 +20,39 @@ On the machine running `modron serve` (TUI or `modron chat`):
 /remote-control wss://modron-bridge.<you>.workers.dev
 ```
 
-Open the printed URL on any device - the bridge's built-in viewer at
-`/s/<key>` shows the transcript and live streaming as a minimal chat log
-(approvals and a composer still belong to the full client; roadmap
-phase 3). Trust model: the share key IS the credential
+Open the printed URL on any device. `/s/<key>` redirects to the unified web
+app at `/app/`, which connects to the session's viewer socket. The minimal
+inline viewer is still reachable at `/s/<key>?classic=1` as a fallback.
+The web app's bundle is built in `app/` and copied into the bridge with
+`cloud/bridge/scripts/sync-app.sh` before deploying (see
+cloud/bridge/README.md). Trust model: the share key IS the credential
 (Claude Code share-link semantics); treat the URL as the secret.
 Publishing a `/pages` page additionally requires `Authorization: Bearer
 <PUBLISH_TOKEN>`, a deploy-time secret set with `npx wrangler secret put
 PUBLISH_TOKEN`; clients read it from `MODRON_PUBLISH_TOKEN` (see
 cloud/bridge/README.md).
+
+Deploying takes `npx wrangler deploy` from your own Cloudflare login;
+nothing in this repository deploys on your behalf.
+
+## Owner portal (optional, opt-in)
+
+The bridge can also serve an owner portal: sign in with a token, see the
+sessions your hosts registered, and mint invite links with a viewer or
+approver role. It is off until you set two Wrangler secrets, and a bridge
+without them behaves exactly as above (share links work, with no sign-in).
+
+```sh
+npx wrangler secret put OWNER_TOKEN   # owner sign-in and invite signing
+npx wrangler secret put HOST_TOKEN    # hosts register sessions and dial /agent
+```
+
+Setting `OWNER_TOKEN` turns off bare share-key viewer sockets (they need an
+invite or a sign-in), so check existing share links before you set it. Setting
+`HOST_TOKEN` needs an upgraded `modron serve` that sends the bearer. The routes,
+the host registration contract and the compatibility rules are in
+cloud/bridge/README.md ("Portal"). Nothing here deploys anything: `npx wrangler
+deploy` from your own login is still the only way to publish it.
 
 ## Roadmap
 
@@ -36,4 +60,12 @@ cloud/bridge/README.md).
   itself runs in the cloud against a cloned repo (the sprite-machine
   Workspace DO pattern) - same relay in front.
 - Phase 3: the web viewer moves to the nsh web target sharing
-  modron-mobile-core (same protocol client in wasm).
+  modron-mobile-core (same protocol client in wasm). Packet C4b serves that
+  app from the bridge; the classic inline viewer remains as a fallback.
+
+## Cloud containers (phase 2, scaffold)
+
+`cloud/container/` holds the image and the Worker that wakes one `modron serve`
+per cloud run. It is deployed by hand-triggered GitHub Actions only: see
+`cloud/container/README.md` for the repository secrets, the trigger and the
+known gaps (the serve tunnel is not started by the container yet).

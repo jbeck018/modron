@@ -24,7 +24,7 @@ jobs:
         with:
           key: release-gate
       - name: Tests (offline — the mock provider is the acceptance harness)
-        run: cargo test --workspace --exclude modron-desktop
+        run: cargo test --workspace
 
   build:
     name: build ${{ matrix.target }}
@@ -34,7 +34,7 @@ jobs:
       matrix:
         include:
           # install.sh expects modron-<arch>-<os>.tar.gz archives containing
-          # a single `modron` binary — keep names in sync with install.sh.
+          # `modron` and `modron-app-tui` — keep names in sync with install.sh.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive_os: unknown-linux-gnu
@@ -54,19 +54,27 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
-      # -p modron-cli: ship the CLI, not the desktop crate (macOS-only gpui).
       - name: Build release binary
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --target "$TARGET" -p modron-cli
-      - name: Package (modron-<arch>-<os>.tar.gz with a `modron` binary)
+      # The terminal app is its own workspace (app/). Same pinned toolchain,
+      # separate cache. A failure here fails the job before any archive.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app
+          key: release-app-${{ matrix.target }}
+      - name: Build terminal app (modron-app-tui)
+        run: cargo build --release --locked --manifest-path app/Cargo.toml --bin modron-app-tui
+      - name: Package (modron-<arch>-<os>.tar.gz with `modron` and `modron-app-tui`)
         env:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p stage
           cp "target/$TARGET/release/modron" stage/modron
+          cp app/target/release/modron-app-tui stage/modron-app-tui
           ARCHIVE="modron-$TARGET.tar.gz"
-          tar -czf "$ARCHIVE" -C stage modron
+          tar -czf "$ARCHIVE" -C stage modron modron-app-tui
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           cat "$ARCHIVE.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"

@@ -1,0 +1,34 @@
+   Compiling rustls v0.23.46
+   Compiling percent-encoding v2.3.2
+   Compiling form_urlencoded v1.2.2
+   Compiling url v2.5.8
+   Compiling tokio-rustls v0.26.6
+   Compiling tungstenite v0.28.0
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling tokio-tungstenite v0.28.0
+   Compiling nsh-core v0.5.1
+   Compiling nsh-engine v0.5.1
+   Compiling nsh-base v0.5.1
+   Compiling nsh-platform-tui v0.5.1 (/home/user/modron/spikes/nsh-tui/vendor/nsh-platform-tui)
+error[E0433]: cannot find `net` in `nsh_engine`
+   --> vendor/nsh-platform-tui/src/app.rs:313:43
+    |
+313 |         config.network = Some(nsh_engine::net::network());
+    |                                           ^^^ could not find `net` in `nsh_engine`
+    |
+note: found an item that was configured out
+   --> /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nsh-engine-0.5.1/src/lib.rs:22:9
+    |
+ 21 | #[cfg(feature = "net")]
+    |       --------------- the item is gated behind the `net` feature
+ 22 | pub mod net;
+    |         ^^^
+help: a struct with a similar name exists
+    |
+313 -         config.network = Some(nsh_engine::net::network());
+313 +         config.network = Some(nsh_engine::Net::network());
+    |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `nsh-platform-tui` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

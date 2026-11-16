@@ -314,6 +314,7 @@ impl OaiStreamAccumulator {
             tool_calls,
             usage,
             stop_reason: map_stop_reason(self.finish_reason.as_deref()),
+            provider_blocks: Vec::new(),
         })
     }
 }
@@ -422,7 +423,22 @@ pub fn build_body(req: &TurnRequest) -> Value {
                 .collect(),
         );
     }
+    // Reasoning effort (H7a): `reasoning_effort`, absent when unset.
+    if let Some(effort) = req.effort {
+        body["reasoning_effort"] = json!(reasoning_effort_word(effort));
+    }
     body
+}
+
+/// Chat-completions `reasoning_effort` word (H7a): the API knows three
+/// levels, so `xhigh` and `max` both map to `high`.
+fn reasoning_effort_word(effort: modron_core::Effort) -> &'static str {
+    use modron_core::Effort;
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High | Effort::Xhigh | Effort::Max => "high",
+    }
 }
 
 /// Parse a `/chat/completions` response body into a [`TurnResponse`].
@@ -485,6 +501,7 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
         tool_calls,
         usage,
         stop_reason: map_stop_reason(choice.finish_reason.as_deref()),
+        provider_blocks: Vec::new(),
     })
 }
 
@@ -629,6 +646,8 @@ mod tests {
                 }),
             }],
             max_tokens: 8192,
+            effort: None,
+            reasoning_summary: false,
         }
     }
 
@@ -646,6 +665,8 @@ mod tests {
             )],
             tools: Vec::new(),
             max_tokens: 128,
+            effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let content = &body["messages"][0]["content"];
@@ -667,9 +688,36 @@ mod tests {
             messages: vec![modron_core::Message::user("plain")],
             tools: Vec::new(),
             max_tokens: 128,
+            effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         assert_eq!(body["messages"][0]["content"], "plain");
+    }
+
+    #[test]
+    fn effort_is_absent_from_the_body_when_unset() {
+        let body = build_body(&sample_request());
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn effort_maps_to_reasoning_effort_with_xhigh_and_max_as_high() {
+        use modron_core::Effort;
+        for (effort, word) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Xhigh, "high"),
+            (Effort::Max, "high"),
+        ] {
+            let mut req = sample_request();
+            req.effort = Some(effort);
+            let body = build_body(&req);
+            assert_eq!(body["reasoning_effort"], word, "effort {effort:?}");
+            assert_eq!(body["max_tokens"], 8192, "rest of the body unchanged");
+        }
     }
 
     #[test]
@@ -714,6 +762,8 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 16,
+            effort: None,
+            reasoning_summary: false,
         };
         let body = build_body(&req);
         let messages = body["messages"].as_array().unwrap();

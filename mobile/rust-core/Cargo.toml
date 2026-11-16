@@ -28,8 +28,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # the shared code, so the wrapper uses futures-timer here and browser
 # setTimeout on wasm (std Instant panics on wasm32-unknown-unknown).
 futures-timer = "3"
+# net + io-util: the unix-socket transport (line framing, UnixStream).
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
+    "net",
+    "io-util",
 ] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 

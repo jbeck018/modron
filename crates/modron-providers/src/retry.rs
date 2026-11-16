@@ -379,6 +379,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -399,6 +400,8 @@ mod tests {
                     messages: vec![Message::user("hi")],
                     tools: vec![],
                     max_tokens: 16,
+                    effort: None,
+                    reasoning_summary: false,
                 }),
                 tx,
             )
@@ -445,6 +448,8 @@ mod tests {
                     messages: vec![Message::user("hi")],
                     tools: vec![],
                     max_tokens: 16,
+                    effort: None,
+                    reasoning_summary: false,
                 }),
                 tx,
             )
@@ -496,6 +501,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: StopReason::EndTurn,
+                provider_blocks: Vec::new(),
             })
         }
     }
@@ -507,6 +513,8 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
             max_tokens: 16,
+            effort: None,
+            reasoning_summary: false,
         })
     }
 
@@ -645,6 +653,7 @@ mod tests {
                         tool_calls: Vec::new(),
                         usage: Usage::default(),
                         stop_reason: StopReason::EndTurn,
+                        provider_blocks: Vec::new(),
                     })
                 }
             }
@@ -844,6 +853,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: Usage::default(),
                     stop_reason: StopReason::EndTurn,
+                    provider_blocks: Vec::new(),
                 })
             }
         }
@@ -865,6 +875,8 @@ mod tests {
                 messages: vec![],
                 tools: vec![],
                 max_tokens: 16,
+                effort: None,
+                reasoning_summary: false,
             }))
             .await
             .unwrap();

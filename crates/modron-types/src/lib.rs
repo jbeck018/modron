@@ -32,6 +32,66 @@ pub struct Message {
     /// ride with the message; providers encode them per their wire format.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// Provider-native blocks kept for replay (H7b-2): Anthropic thinking
+    /// and redacted-thinking blocks, OpenAI Responses reasoning items. Only
+    /// the provider and api that produced a block replays it; clients never
+    /// see this field (the server strips it at the send boundary).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_blocks: Vec<ProviderBlock>,
+}
+
+/// One provider-native content block, stored verbatim (H7b-2). `payload` is
+/// the provider's JSON exactly as received, replayed unchanged and never
+/// interpreted by the harness. `index` is the block's position in the
+/// provider's content list for the turn, so replay keeps the original order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderBlock {
+    /// Provider id that produced the block (e.g. "anthropic", "openai").
+    pub provider: String,
+    /// Wire api of that provider (e.g. "messages", "responses").
+    pub api: String,
+    /// Provider block type (e.g. "thinking", "redacted_thinking", "reasoning").
+    pub kind: String,
+    pub index: u32,
+    pub payload: serde_json::Value,
+}
+
+impl ProviderBlock {
+    /// The one replay rule (H7b-2, PLAN 10.7 rule 3): a block goes back to a
+    /// request only when the provider and api that produced it are the
+    /// request's target. Every provider request builder filters through
+    /// [`replayable_blocks`], which uses this predicate.
+    pub fn replays_to(&self, provider: &str, api: &str) -> bool {
+        self.provider == provider && self.api == api
+    }
+}
+
+/// The blocks of `message` that may be replayed to `provider` / `api`, in
+/// original order (ascending `index`, stable for equal indices).
+pub fn replayable_blocks<'a>(
+    message: &'a Message,
+    provider: &str,
+    api: &str,
+) -> Vec<&'a ProviderBlock> {
+    let mut blocks: Vec<&ProviderBlock> = message
+        .provider_blocks
+        .iter()
+        .filter(|block| block.replays_to(provider, api))
+        .collect();
+    blocks.sort_by_key(|block| block.index);
+    blocks
+}
+
+impl SessionEvent {
+    /// Drop the provider-native blocks of a message before the event leaves
+    /// the server (H7b-2, PLAN 10.7 rule 6). Clients never see
+    /// `provider_blocks`: snapshots, live frames and ACP call this at the
+    /// send boundary; the stored line keeps them.
+    pub fn strip_provider_blocks(&mut self) {
+        if let SessionEvent::Message { message, .. } = self {
+            message.provider_blocks.clear();
+        }
+    }
 }
 
 /// A multimodal attachment on a user message (Phase 7).
@@ -60,6 +120,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             attachments: Vec::new(),
+            provider_blocks: Vec::new(),
         }
     }
     /// A user message with multimodal attachments (Phase 7).
@@ -77,6 +138,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             attachments: Vec::new(),
+            provider_blocks: Vec::new(),
         }
     }
     pub fn tool_result(call_id: impl Into<String>, outcome: &ToolOutcome) -> Self {
@@ -86,6 +148,7 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             attachments: Vec::new(),
+            provider_blocks: Vec::new(),
         }
     }
 }
@@ -236,6 +299,20 @@ pub enum SessionEvent {
     Task {
         text: String,
     },
+    /// A shell command the user ran with `!` or `!!` (not a model tool
+    /// call). A non-private entry joins the model context as a labelled user
+    /// message. A `private` entry (`!!`) is shown in the transcript but never
+    /// reaches the model, the compaction summary, or any other context
+    /// builder. Additive variant: older logs carry such commands as `Task`
+    /// text and load unchanged.
+    UserShell {
+        command: String,
+        output: String,
+        #[serde(default)]
+        is_error: bool,
+        #[serde(default)]
+        private: bool,
+    },
     Message {
         parent_id: Option<u64>,
         message: Message,
@@ -326,6 +403,58 @@ pub enum SessionEvent {
         #[serde(default)]
         uncaptured: bool,
     },
+    /// Independent reviewer verdict (H4a), appended once per reviewer round
+    /// at normal run completion. `Skipped` records that no review ran
+    /// (no diff, provider error, unparsable output). Additive variant: older
+    /// logs without it load unchanged.
+    Review {
+        verdict: ReviewVerdict,
+        #[serde(default)]
+        findings: Vec<Finding>,
+        model: String,
+    },
+}
+
+/// The reviewer's verdict for one review round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    Pass,
+    NeedsFix,
+    Skipped,
+}
+
+/// Reviewer finding severity (P0 = most severe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+impl Severity {
+    /// Upper-case wire label (`P0`..`P3`) for model-facing text.
+    pub fn code(self) -> &'static str {
+        match self {
+            Severity::P0 => "P0",
+            Severity::P1 => "P1",
+            Severity::P2 => "P2",
+            Severity::P3 => "P3",
+        }
+    }
+}
+
+/// One reviewer finding: a real defect the diff introduces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub severity: Severity,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    pub text: String,
 }
 
 /// One measurable subtask of the standing plan.
@@ -342,6 +471,115 @@ pub struct PlanItem {
 
 fn default_plan_status() -> String {
     "pending".to_string()
+}
+
+/// The run's phase (H2a). `Build` is the normal mode. `Plan` is an
+/// engine-enforced read-only phase: every approval-gated tool is refused
+/// (even under ApproveAll or an allow rule), ungated read-only tools still
+/// run, the finish gate is skipped, and every turn carries the current plan
+/// plus a phase line as a transient tail message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    #[default]
+    Build,
+    Plan,
+}
+
+/// Reasoning effort (H7a): how hard the model should think on a turn.
+/// `None` on a request means the provider default (no field is sent).
+/// Providers map the five levels onto their own wire vocabulary (see each
+/// provider module); `label()` is the canonical user-facing word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    /// The canonical word: `low`, `medium`, `high`, `xhigh` or `max`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+}
+
+impl std::str::FromStr for Effort {
+    /// The message names the five accepted values.
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Effort::Low),
+            "medium" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            "xhigh" => Ok(Effort::Xhigh),
+            "max" => Ok(Effort::Max),
+            _ => Err(format!(
+                "unknown effort `{raw}` (use low, medium, high, xhigh or max)"
+            )),
+        }
+    }
+}
+
+/// Named model roles (H7c): one optional model id per kind of work, so a
+/// run can pin different work to different models. `None` = the role is
+/// unset and the router decides as before. Precedence (see the engine):
+/// a pin (`--provider`, a persona's forced model) > a role > the router.
+/// Model ids resolve through the run's selector provider, the same way the
+/// escalation and reviewer turns do; an unresolvable id falls back to the
+/// router with a warning.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRoles {
+    /// Main-loop turns while the run phase is `plan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Default model for `delegate` children without a persona model.
+    /// `explore` is not affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
+    /// Independent reviewer pass model. Setting it enables one review round
+    /// when no explicit reviewer is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critic: Option<String>,
+    /// Compaction summary model (instead of the cheap-tier route).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl ModelRoles {
+    /// True when no role is set (the router decides everything).
+    pub fn is_empty(&self) -> bool {
+        self.plan.is_none()
+            && self.subagent.is_none()
+            && self.critic.is_none()
+            && self.summary.is_none()
+    }
+}
+
+/// Lifecycle state of one sub-agent (PROTOCOL_V2 section 4, H3d). Snake case
+/// on the wire. `Running` is the default, so older rows without the field
+/// read as running until their finish arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    #[default]
+    Running,
+    /// The child's approval ask is pending with the parent's approver.
+    WaitingApproval,
+    Done,
+    Failed,
+    /// Stopped by a user `KillAgent`. Sticky: a later finish keeps it.
+    Killed,
 }
 
 /// Tool-activity notification (Phase-1d T0, additive): fired around every
@@ -382,6 +620,23 @@ pub enum ToolActivity {
         turns: u32,
         is_error: bool,
     },
+    /// A subagent's state changed (H3d): `WaitingApproval` while its ask is
+    /// pending, `Running` once answered, `Killed` just before a user stop's
+    /// finish. Row UI effect: the swarm row's state word updates in place.
+    SubagentState {
+        id: String,
+        label: String,
+        state: AgentState,
+    },
+    /// A BACKGROUND subagent settled (H3d): `ok` is false for a failure and
+    /// for a kill. `brief` is the first 200 chars of its result. Drives the
+    /// `AgentFinished` push and its `Notify`; a foreground child never sends it.
+    BackgroundFinished {
+        id: String,
+        label: String,
+        ok: bool,
+        brief: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -397,6 +652,103 @@ pub struct RunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn thinking_block(provider: &str, api: &str, index: u32) -> ProviderBlock {
+        ProviderBlock {
+            provider: provider.into(),
+            api: api.into(),
+            kind: "thinking".into(),
+            index,
+            payload: json!({"type": "thinking", "thinking": "t", "signature": "S/+=="}),
+        }
+    }
+
+    #[test]
+    fn replay_keeps_only_the_producing_provider_and_api_in_order() {
+        let mut message = Message::assistant("done");
+        message.provider_blocks = vec![
+            thinking_block("anthropic", "messages", 2),
+            thinking_block("chatgpt", "responses", 0),
+            thinking_block("anthropic", "messages", 0),
+            thinking_block("anthropic", "legacy", 1),
+        ];
+        let kept = replayable_blocks(&message, "anthropic", "messages");
+        assert_eq!(kept.iter().map(|b| b.index).collect::<Vec<_>>(), vec![0, 2]);
+        assert!(replayable_blocks(&message, "openai-compat", "chat").is_empty());
+        assert_eq!(replayable_blocks(&message, "chatgpt", "responses").len(), 1);
+    }
+
+    #[test]
+    fn provider_blocks_are_stored_but_absent_when_empty() {
+        let plain = serde_json::to_string(&Message::assistant("hi")).unwrap();
+        assert!(!plain.contains("provider_blocks"), "{plain}");
+        let mut with = Message::assistant("hi");
+        with.provider_blocks = vec![thinking_block("anthropic", "messages", 0)];
+        let line = serde_json::to_string(&SessionEvent::Message {
+            parent_id: None,
+            message: with,
+        })
+        .unwrap();
+        assert!(line.contains("\"provider_blocks\""), "{line}");
+        assert!(line.contains("S/+=="), "signature bytes stored: {line}");
+    }
+
+    /// The Message shape as it was before H7b-2 (no provider_blocks field).
+    #[derive(Deserialize)]
+    struct OldMessage {
+        role: Role,
+        content: String,
+        #[serde(default)]
+        tool_calls: Vec<ToolCall>,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        attachments: Vec<Attachment>,
+    }
+
+    #[test]
+    fn a_line_written_with_blocks_parses_in_a_build_without_the_field() {
+        // Forward compatibility: an old binary reads a new line, ignoring the
+        // unknown field, and loses only the blocks.
+        let mut with = Message::assistant("answer");
+        with.provider_blocks = vec![thinking_block("anthropic", "messages", 0)];
+        let line = serde_json::to_string(&with).unwrap();
+        let old: OldMessage = serde_json::from_str(&line).expect("old shape reads new line");
+        assert_eq!(old.content, "answer");
+        assert_eq!(old.role, Role::Assistant);
+        assert!(old.tool_calls.is_empty() && old.tool_call_id.is_none());
+        assert!(old.attachments.is_empty());
+    }
+
+    #[test]
+    fn strip_removes_blocks_from_the_wire_form_only() {
+        let mut with = Message::assistant("answer");
+        with.provider_blocks = vec![thinking_block("anthropic", "messages", 0)];
+        let stored = SessionEvent::Message {
+            parent_id: None,
+            message: with,
+        };
+        let mut wire = stored.clone();
+        wire.strip_provider_blocks();
+        let wire_line = serde_json::to_string(&wire).unwrap();
+        assert!(!wire_line.contains("provider_blocks"), "{wire_line}");
+        let stored_line = serde_json::to_string(&stored).unwrap();
+        assert!(stored_line.contains("provider_blocks"), "{stored_line}");
+    }
+
+    #[test]
+    fn an_old_format_line_loads_with_no_blocks() {
+        let line = r#"{"role":"assistant","content":"hi","tool_calls":[]}"#;
+        let message: Message = serde_json::from_str(line).unwrap();
+        assert!(message.provider_blocks.is_empty());
+        let old_line =
+            r#"{"type":"message","parent_id":null,"message":{"role":"assistant","content":"hi"}}"#;
+        match serde_json::from_str::<SessionEvent>(old_line).unwrap() {
+            SessionEvent::Message { message, .. } => assert!(message.provider_blocks.is_empty()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 
     /// The session log format is the wire/replay contract: an event must
     /// round-trip without change (serde defaults keep old logs loadable).

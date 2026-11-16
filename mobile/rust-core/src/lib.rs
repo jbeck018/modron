@@ -36,6 +36,7 @@
 //! The nsh shell that consumes this lives in `mobile/app` (Track 2 of the
 //! mobile spike); the findings live in `mobile/SPIKE.md`.
 
+pub mod attach;
 pub mod client;
 pub mod error;
 pub mod view;
@@ -50,12 +51,25 @@ pub(crate) use transport_native as transport;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use transport_web as transport;
 
+pub use attach::attachment_from_bytes;
+#[cfg(not(target_arch = "wasm32"))]
+pub use client::default_socket_path;
 pub use client::{
-    default_url, ConnectOptions, KeepaliveConfig, RemoteClient, CLIENT_NAME, UNDECODABLE_NOTE,
+    default_url, device_token_from_env, parse_shell_input, split_url_token, ConnectOptions,
+    KeepaliveConfig, RemoteClient, ShellInput, CLIENT_NAME, DEVICE_TOKEN_ENV, UNDECODABLE_NOTE,
 };
 pub use error::ClientError;
+pub use modron_protocol::{ApprovalModeWire, ConfigPatch, SessionMetaWire};
+pub use modron_types::{Attachment, Effort, Phase, SandboxPolicy};
+pub use modron_view::{QUEUE_LABEL, STOP_LABEL};
 pub use view::{
-    approval_mode_label, connection_label, entry_lines, ConnectionState, DecisionOption,
-    OAuthProgressView, PendingApprovalView, RenderedRow, SessionViewModel, ViewModelSnapshot,
-    DECISION_LABELS,
+    approval_mode_label, approval_mode_next, connection_label, context_label, effort_next,
+    entry_lines, model_row_text, phase_label, phase_next, sandbox_next, session_row,
+    ConnectionState, DecisionOption, ModelRowView, OAuthProgressView, PendingApprovalView,
+    PendingPlanView, PlanDecisionOption, RenderedRow, SessionViewModel, ViewModelSnapshot,
+    DECISION_LABELS, EFFORT_UNSET_LABEL, FILTER_LABEL, IDLE_LABEL, NEW_SESSION_LABEL,
+    PLAN_DECISION_LABELS, RULES_NONE_LABEL, RUNNING_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL,
+    SESSIONS_NO_MATCH_LABEL, SETTINGS_LABEL, SETTING_APPROVAL_LABEL, SETTING_COMPACT_LABEL,
+    SETTING_CONTEXT_LABEL, SETTING_EFFORT_LABEL, SETTING_MODEL_LABEL, SETTING_PHASE_LABEL,
+    SETTING_PROVIDER_LABEL, SETTING_RULES_LABEL, SETTING_SANDBOX_LABEL,
 };

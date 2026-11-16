@@ -115,6 +115,7 @@ fn tool_call_response(id: &str, text: &str, usage: Usage) -> TurnResponse {
         }],
         usage,
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -124,6 +125,7 @@ fn text_response(text: &str, usage: Usage) -> TurnResponse {
         tool_calls: vec![],
         usage,
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -532,6 +534,7 @@ async fn compaction_uses_the_model_window_not_the_global_cap() {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::ToolUse,
+            provider_blocks: Vec::new(),
         })
         .then_response(TurnResponse {
             text: "TASK: force compaction\nDECISIONS: none\nEDITS: none\nOPEN ITEMS: none".into(),
@@ -542,6 +545,7 @@ async fn compaction_uses_the_model_window_not_the_global_cap() {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         })
         .then_response(TurnResponse {
             text: "done".into(),
@@ -552,6 +556,7 @@ async fn compaction_uses_the_model_window_not_the_global_cap() {
                 cached_input_tokens: 0,
             },
             stop_reason: StopReason::EndTurn,
+            provider_blocks: Vec::new(),
         });
 
     let mut registry = modron_core::ToolRegistry::new();

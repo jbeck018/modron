@@ -22,6 +22,8 @@ pub mod goal;
 pub mod hooks;
 pub mod judge;
 pub mod memory;
+pub mod permissions;
+pub mod review;
 pub mod rewind;
 pub mod sandbox;
 /// Speculative mid-stream execution subsystem (private to the crate; the
@@ -60,8 +62,9 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 pub use modron_types::{
-    Attachment, Message, PlanItem, Role, RunSummary, SandboxPolicy, SessionEvent, SessionId,
-    SessionMeta, StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec, Usage,
+    replayable_blocks, AgentState, Attachment, Effort, Message, ModelRoles, PlanItem,
+    ProviderBlock, Role, RunSummary, SandboxPolicy, SessionEvent, SessionId, SessionMeta,
+    StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec, Usage,
 };
 
 /// Context handed to a tool execution.
@@ -214,23 +217,24 @@ impl ToolRegistry {
         // `tool_search`. Dropping them entirely would make them
         // uncallable on strict providers; full schemas would pay their
         // cost on every request.
-        let mut v: Vec<_> = self
-            .tools
-            .values()
-            .map(|t| {
-                let spec = t.spec();
-                if self.on_demand.contains(&spec.name) {
-                    ToolSpec {
-                        description: "on-demand tool — call tool_search for its full                                       schema and usage"
-                            .into(),
-                        parameters: serde_json::json!({"type": "object"}),
-                        ..spec
+        let mut v: Vec<_> =
+            self.tools
+                .values()
+                .map(|t| {
+                    let spec = t.spec();
+                    if self.on_demand.contains(&spec.name) {
+                        ToolSpec {
+                            description:
+                                "on-demand tool — call tool_search for its full schema and usage"
+                                    .into(),
+                            parameters: serde_json::json!({"type": "object"}),
+                            ..spec
+                        }
+                    } else {
+                        spec
                     }
-                } else {
-                    spec
-                }
-            })
-            .collect();
+                })
+                .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -255,6 +259,16 @@ pub struct TurnRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
+    /// Reasoning effort (H7a). `None` = the provider default; every
+    /// provider omits its effort field entirely in that case, so the request
+    /// bytes match a build without the setting.
+    pub effort: Option<Effort>,
+    /// Ask the provider for a readable reasoning summary (default `false`).
+    /// Only a provider that supports it acts on this (Anthropic, for the
+    /// models in its supported table); every other provider ignores it, and
+    /// `false` keeps the request bytes identical to a build without it.
+    /// Display visibility only: it does not change billing or behaviour.
+    pub reasoning_summary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +278,9 @@ pub struct TurnResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
     pub stop_reason: StopReason,
+    /// Provider-native blocks to keep with the assistant message (H7b-2).
+    /// Empty for providers that keep nothing.
+    pub provider_blocks: Vec<ProviderBlock>,
 }
 
 #[async_trait]
@@ -399,6 +416,13 @@ pub struct ModelChoice {
 /// embedder router (Phase 3) and the Jev adapter plug in.
 pub trait ModelSelector: Send + Sync {
     fn select(&self, req: &SelectRequest) -> ModelChoice;
+
+    /// True when every selection is an explicit pin (a `--provider` pin or a
+    /// persona's forced model). Configured [`ModelRoles`] yield to a pin
+    /// (H7c precedence: pin > role > router). Default `false`.
+    fn pinned(&self) -> bool {
+        false
+    }
 }
 
 /// Verdict of an async decision model (Phase-3b M0): which tier should take
@@ -527,10 +551,104 @@ pub enum ApprovalMode {
     ApproveAll,
 }
 
+/// One approval question: the pending call plus WHO is asking. `agent` is
+/// `None` for the top-level run and `Some(label)` for a delegated child (the
+/// same label the swarm rows use, e.g. `delegate` or `persona`). Clients show
+/// it so a child's ask is never mistaken for the parent's own call.
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalAsk<'a> {
+    pub call: &'a ToolCall,
+    pub agent: Option<&'a str>,
+}
+
 /// Interactive approver for Ask-mode mutating tools (Phase-1c I2): given the
-/// pending call, return `true` to execute it. The CLI wires a `/dev/tty`
+/// pending ask, return `true` to execute it. The CLI wires a `/dev/tty`
 /// y/N/a prompt; `None` keeps the block-and-explain behavior.
-pub type Approver = dyn Fn(&ToolCall) -> bool + Send + Sync;
+pub type Approver = dyn Fn(&ApprovalAsk<'_>) -> bool + Send + Sync;
+
+/// H3c: identifies one live top-level run of one session. A token is taken
+/// while the spawning run is executing; its child's asks are forwarded to the
+/// parent approver only while that same run is still live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunToken {
+    session: SessionId,
+    run: u64,
+}
+
+impl RunToken {
+    /// The session this run belongs to (H3d: sub-agents register under it).
+    pub fn session(&self) -> SessionId {
+        self.session
+    }
+}
+
+/// H3c: the registry of live top-level runs. It is process-wide rather than
+/// held on `EngineConfig`: the server clones one template config into every
+/// session, so an engine-held handle would be shared across sessions. Runs
+/// are keyed by session and numbered from a process-unique counter, so runs
+/// of different sessions never match each other and a finished run's number
+/// is never reused.
+pub struct RunScope {
+    next: std::sync::atomic::AtomicU64,
+    active: std::sync::Mutex<std::collections::BTreeMap<SessionId, u64>>,
+}
+
+static RUN_SCOPE: RunScope = RunScope {
+    next: std::sync::atomic::AtomicU64::new(1),
+    active: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+};
+
+/// The process-wide run registry (see [`RunScope`]).
+pub fn run_scope() -> &'static RunScope {
+    &RUN_SCOPE
+}
+
+impl RunScope {
+    fn live(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<SessionId, u64>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Mark a run of `session` live until the returned guard drops. The run
+    /// loop holds the guard for its whole body, so every exit (normal end,
+    /// `?` error, panic, task abort) ends the run.
+    pub(crate) fn begin(&self, session: SessionId) -> RunGuard {
+        let run = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.live().insert(session, run);
+        RunGuard { session, run }
+    }
+
+    /// The token of the run `session` is executing right now, if any.
+    pub fn token(&self, session: SessionId) -> Option<RunToken> {
+        self.live()
+            .get(&session)
+            .map(|&run| RunToken { session, run })
+    }
+
+    /// True only while the token's own run is still the live run of its
+    /// session. A later run, or no run, makes it false.
+    pub fn is_live(&self, token: RunToken) -> bool {
+        self.live().get(&token.session) == Some(&token.run)
+    }
+}
+
+/// Ends its run on drop (see [`RunScope::begin`]). A guard whose run was
+/// already superseded removes nothing.
+#[must_use = "dropping the guard ends the run"]
+pub(crate) struct RunGuard {
+    session: SessionId,
+    run: u64,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        let mut live = run_scope().live();
+        if live.get(&self.session) == Some(&self.run) {
+            live.remove(&self.session);
+        }
+    }
+}
 
 /// Live-delta sink for streaming turns (Phase-1c I1): called for each
 /// [`StreamDelta`] as the provider emits it. Never blocks the engine; the
@@ -553,6 +671,12 @@ pub struct ApprovalPolicy {
     /// Tools always blocked, whatever the mode says (any tool class).
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Permission rules (`allow` / `ask` / `deny` patterns, see
+    /// [`permissions`]). Evaluated per call with its arguments, after the
+    /// deny list and before the mode fast path. Not serialized: the CLI builds
+    /// it from the `[permissions]` config table at startup.
+    #[serde(default, skip)]
+    pub rules: permissions::RuleSet,
 }
 
 /// Pricing hook for USD spend caps (Phase-1b A3): given a model name, return
@@ -560,6 +684,70 @@ pub struct ApprovalPolicy {
 /// `None` from the lookup means "no price known" — that turn counts as $0
 /// with a warning, never a made-up number.
 pub type PriceLookup = dyn Fn(&str) -> Option<(f64, f64)> + Send + Sync;
+
+/// Model-to-provider lookup for the configured model roles (`roles`,
+/// `review_model`, `escalate_on_check_failure`): given a model id, return the
+/// provider id that serves it. The CLI wires the router catalog, so modron-core
+/// never depends on modron-router. `None` from the lookup keeps the provider
+/// the selector chose for the turn. See [`EngineConfig::provider_lookup`].
+pub type ProviderLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
+
+/// Messages typed while a run is active. The engine drains this at safe
+/// boundaries (between model turns) and appends each as a user message.
+#[derive(Default)]
+pub struct SteerInbox(std::sync::Mutex<std::collections::VecDeque<String>>);
+
+impl SteerInbox {
+    /// Empty inbox.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue one steer message (FIFO).
+    pub fn push(&self, text: String) {
+        self.lock().push_back(text);
+    }
+
+    /// Take every queued message, oldest first, leaving the inbox empty.
+    pub fn drain(&self) -> Vec<String> {
+        self.lock().drain(..).collect()
+    }
+
+    /// True when no message is waiting.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<String>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The run's phase (H2a): defined in modron-types so the protocol can
+/// carry it; re-exported here so every `modron_core::Phase` path keeps working.
+pub use modron_types::Phase;
+
+/// Independent reviewer configuration (H4a). `model` is a model id resolved
+/// through the run's selector provider (the escalation path); `max_rounds`
+/// bounds how many `NeedsFix` findings are fed back to the main model per
+/// run (default 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerConfig {
+    pub model: String,
+    pub max_rounds: u32,
+}
+
+impl Default for ReviewerConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            max_rounds: 1,
+        }
+    }
+}
+
+/// Injected reviewer diff source (see [`EngineConfig::review_diff_source`]).
+pub type ReviewDiffSource = dyn Fn() -> Option<String> + Send + Sync;
 
 #[derive(Clone)]
 pub struct EngineConfig {
@@ -592,6 +780,12 @@ pub struct EngineConfig {
     /// tokens). `None` = no pricing known; caps cannot trip (with a warning
     /// if a cap was requested).
     pub price_lookup: Option<Arc<PriceLookup>>,
+    /// Which provider serves a configured model role (`roles`, the reviewer
+    /// and the escalation model). `None` (default) keeps every role on the
+    /// turn's provider, as before. Precedence: an explicit `provider::model`
+    /// in the config string > this lookup (only when that provider is
+    /// registered) > the turn's provider.
+    pub provider_lookup: Option<Arc<ProviderLookup>>,
     /// Lifecycle hooks around every tool call (Phase-1b H1, additive).
     /// `None` commands = no hooks, no behavior change.
     pub hooks: hooks::HookConfig,
@@ -621,6 +815,16 @@ pub struct EngineConfig {
     /// success; any failure keeps the pre-escalation answer. Bound: one per
     /// run (a resume grants a fresh bound, like the gate rounds).
     pub escalate_on_check_failure: Option<String>,
+    /// Independent reviewer pass (H4a, additive, `None` = off). At normal
+    /// run completion, when a file-mutating tool ran in a Build-phase run,
+    /// one tool-less provider call on `model` reviews the `git diff`; a
+    /// `NeedsFix` verdict feeds its findings back for up to `max_rounds`
+    /// rounds. See [`ReviewerConfig`].
+    pub reviewer: Option<ReviewerConfig>,
+    /// Test seam for the reviewer's diff (H4a). `None` (default) runs
+    /// `git diff --no-color` in `working_dir`; `Some` returns the diff text
+    /// (or `None` for "no diff") without touching git.
+    pub review_diff_source: Option<Arc<ReviewDiffSource>>,
     /// OS sandbox applied to mutating tool subprocesses (Phase-1b A2,
     /// additive; default [`SandboxPolicy::Off`]).
     pub sandbox: SandboxPolicy,
@@ -659,6 +863,28 @@ pub struct EngineConfig {
     /// reads it. Engine-held so it survives across chat turns.
     pub background_subagents:
         Arc<std::sync::Mutex<std::collections::HashMap<String, BackgroundDelegate>>>,
+    /// Steer inbox (additive): messages pushed here while a run is active
+    /// are drained between model turns and appended as user messages (see
+    /// `Engine::run_loop`). `None` (default) = no steering.
+    pub steer: Option<Arc<SteerInbox>>,
+    /// Run phase (H2a, additive; default [`Phase::Build`]). `Phase::Plan`
+    /// makes the engine refuse every approval-gated tool and skip the finish
+    /// gate; see [`Phase`]. Applies to the runs started after the config is
+    /// set (the TUI/CLI sets it per run).
+    pub phase: Phase,
+    /// Reasoning effort for the main, self-check and escalation turns (H7a,
+    /// default `None` = provider default). Not sent on compaction, reviewer
+    /// or router/judge requests. Sub-agents inherit it from the parent.
+    pub effort: Option<Effort>,
+    /// Named model roles (H7c, additive; default empty = the router decides
+    /// everything). See [`ModelRoles`] for each role's semantics.
+    pub roles: ModelRoles,
+    /// Ask supporting providers for a readable reasoning summary on the
+    /// main, self-check and escalation turns (default `false`). Set from
+    /// config `reasoning_summary` and the session's `ConfigPatch`. Sub-agents
+    /// inherit it. Not sent on compaction, reviewer or router/judge requests.
+    /// Changes the displayed thinking only, never billing.
+    pub reasoning_summary: bool,
 }
 
 /// Per-tier ordered fallback candidates for [`EngineConfig::tier_fallbacks`].
@@ -687,6 +913,13 @@ pub enum BackgroundStatus {
         turns: u32,
         is_error: bool,
     },
+    /// Stopped by a user `KillAgent` (H3d): `delegate_status` reports it as
+    /// killed, with the tokens and turns it spent before the stop.
+    Killed {
+        brief: String,
+        tokens: u64,
+        turns: u32,
+    },
 }
 
 impl Default for EngineConfig {
@@ -704,12 +937,15 @@ impl Default for EngineConfig {
             approvals: ApprovalPolicy::default(),
             max_cost_usd: None,
             price_lookup: None,
+            provider_lookup: None,
             hooks: hooks::HookConfig::default(),
             resume_from_event: None,
             resume_skip_end: None,
             resume_skip_ranges: Vec::new(),
             self_check_on_finish: false,
             escalate_on_check_failure: None,
+            reviewer: None,
+            review_diff_source: None,
             sandbox: SandboxPolicy::Off,
             approver: None,
             on_delta: None,
@@ -718,6 +954,11 @@ impl Default for EngineConfig {
             personas: Default::default(),
             tier_fallbacks: None,
             background_subagents: Arc::new(std::sync::Mutex::new(Default::default())),
+            steer: None,
+            phase: Phase::Build,
+            effort: None,
+            roles: ModelRoles::default(),
+            reasoning_summary: false,
         }
     }
 }
@@ -738,17 +979,23 @@ impl std::fmt::Debug for EngineConfig {
             .field("approvals", &self.approvals)
             .field("max_cost_usd", &self.max_cost_usd)
             .field("price_lookup", &self.price_lookup.is_some())
+            .field("provider_lookup", &self.provider_lookup.is_some())
             .field("hooks", &self.hooks)
             .field("resume_from_event", &self.resume_from_event)
             .field("resume_skip_end", &self.resume_skip_end)
             .field("resume_skip_ranges", &self.resume_skip_ranges)
             .field("escalate_on_check_failure", &self.escalate_on_check_failure)
+            .field("reviewer", &self.reviewer)
+            .field("review_diff_source", &self.review_diff_source.is_some())
             .field("sandbox", &self.sandbox)
             .field("approver", &self.approver.is_some())
             .field("on_delta", &self.on_delta.is_some())
             .field("on_tool_event", &self.on_tool_event.is_some())
             .field("async_router", &self.async_router.is_some())
             .field("personas", &self.personas.keys().collect::<Vec<_>>())
+            .field("effort", &self.effort)
+            .field("roles", &self.roles)
+            .field("reasoning_summary", &self.reasoning_summary)
             .field("tier_fallbacks", &self.tier_fallbacks.is_some())
             .field(
                 "background_subagents",
@@ -756,6 +1003,31 @@ impl std::fmt::Debug for EngineConfig {
             )
             .finish()
     }
+}
+
+/// The session's context occupancy (H9b): what the NEXT provider request
+/// would carry, against the effective per-turn input window. `used` is the
+/// pre-flight estimate (system prompt + tool specs + the transcript a resume
+/// would rebuild); `window` is the cap the compaction trigger uses
+/// (the selected model's window, never above `max_input_tokens`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextGauge {
+    pub used: u64,
+    pub window: u64,
+}
+
+/// Result of a manual compaction ([`Engine::compact_session`]). `compacted`
+/// is false when there was nothing older than the kept tail to summarize;
+/// nothing is written in that case. `usage` is the summarizer call's
+/// provider-reported usage (zero when no call was made); it is also
+/// persisted as a `Usage` event.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompactOutcome {
+    pub compacted: bool,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub usage: Usage,
+    pub note: String,
 }
 
 #[derive(Clone)]
@@ -774,6 +1046,35 @@ impl std::fmt::Debug for Engine {
             .field("tools", &self.tools.specs().len())
             .field("config", &self.config)
             .finish()
+    }
+}
+
+/// What a user-issued `!command` produced (see [`Engine::run_user_shell`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserShellOutcome {
+    /// Whether the command passed every gate and the bash tool ran it.
+    pub allowed: bool,
+    /// The bash tool's output (exit code line included), capped. Empty when
+    /// the command did not run.
+    pub output: String,
+    /// The bash tool reported an error (non-zero exit, timeout), or the
+    /// command was refused.
+    pub is_error: bool,
+    /// Why the command did not run: the deny list or a deny rule, a vetoing
+    /// hook, a missing bash tool, or an empty command. Approval mode, ask
+    /// rules and the plan phase never refuse a user-typed command.
+    pub refused_reason: Option<String>,
+}
+
+impl UserShellOutcome {
+    /// An outcome for a command that did not run.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            allowed: false,
+            output: String::new(),
+            is_error: true,
+            refused_reason: Some(reason.into()),
+        }
     }
 }
 

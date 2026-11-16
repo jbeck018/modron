@@ -124,6 +124,23 @@ fn render_events<'a>(
             SessionEvent::Task { text } => {
                 push_line(&mut out, &format!("[TASK] {text}"));
             }
+            SessionEvent::UserShell {
+                command,
+                output,
+                private,
+                ..
+            } => {
+                // A private `!!` command never reaches the summarizer.
+                if !private {
+                    push_line(
+                        &mut out,
+                        &format!(
+                            "[USER] {}",
+                            crate::engine::user_shell_transcript(command, output)
+                        ),
+                    );
+                }
+            }
             SessionEvent::Plan { items } => {
                 // The latest plan survives compaction as its status table
                 // (the run's tracked state must not vanish mid-goal).
@@ -171,6 +188,7 @@ fn render_events<'a>(
             // the file state they protect is reflected in tool results.
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
+            | SessionEvent::Review { .. }
             | SessionEvent::Usage { .. } => {}
         }
     }
@@ -220,7 +238,10 @@ pub fn split_older_tail(
 fn is_transcript_item(event: &SessionEvent) -> bool {
     matches!(
         event,
-        SessionEvent::Task { .. } | SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
+        SessionEvent::Task { .. }
+            | SessionEvent::Message { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::UserShell { private: false, .. }
     )
 }
 
@@ -267,7 +288,7 @@ fn push_line(out: &mut String, line: &str) {
 mod tests {
     use super::*;
     use crate::estimate_tokens;
-    use crate::{Message, ToolCall, ToolOutcome, Usage};
+    use crate::{Message, Role, ToolCall, ToolOutcome, Usage};
     use serde_json::json;
 
     fn task_event(text: &str) -> SessionEvent {
@@ -325,6 +346,43 @@ mod tests {
             tool_result_event("c1"),
             user_event("thanks"),
         ]
+    }
+
+    #[test]
+    fn provider_blocks_change_neither_boundary_nor_summary_input() {
+        // H7b-2: blocks ride with their message and die with it at
+        // compaction. The boundary and the rendered summary input are the
+        // same with and without blocks, so rewind and compaction indices hold.
+        let plain = sample_events();
+        let mut with_blocks = sample_events();
+        for event in &mut with_blocks {
+            if let SessionEvent::Message { message, .. } = event {
+                if message.role == Role::Assistant {
+                    message.provider_blocks.push(crate::ProviderBlock {
+                        provider: "anthropic".into(),
+                        api: "messages".into(),
+                        kind: "thinking".into(),
+                        index: 0,
+                        payload: json!({
+                            "type": "thinking",
+                            "thinking": "secret reasoning",
+                            "signature": "SIG-DO-NOT-SUMMARIZE"
+                        }),
+                    });
+                }
+            }
+        }
+        for skip in 0..=plain.len() {
+            let (older_a, tail_a) = split_older_tail(&plain, skip);
+            let (older_b, tail_b) = split_older_tail(&with_blocks, skip);
+            assert_eq!(older_a.len(), older_b.len(), "older count at skip {skip}");
+            assert_eq!(tail_a.len(), tail_b.len(), "tail count at skip {skip}");
+        }
+        assert_eq!(
+            older_transcript_text(&plain, 1),
+            older_transcript_text(&with_blocks, 1)
+        );
+        assert!(!older_transcript_text(&with_blocks, 0).contains("SIG-DO-NOT-SUMMARIZE"));
     }
 
     #[test]

@@ -256,7 +256,8 @@ models at zero markup, BYOK + local models. Feature snapshot vs Modron:
    **Backlog A3.**
 4. **Surface breadth** (IDE/desktop/cloud/mobile): we will not chase this.
    Our answer is terminal-first + the planned ACP server (Zed) — one protocol
-   instead of six GUI codebases.
+   instead of six GUI codebases. (Superseded 2026-11-15 by section 10: one
+   NSH client codebase for every surface, still one protocol.)
 
 **Marketplace posture:** Kilo ships a curated Skills/Agents/Plugins gallery.
 Modron consumes the SKILL.md open standard already — run a compatibility pass
@@ -267,3 +268,187 @@ against popular community skills instead of building a marketplace.
 
 `LEDGER.md` — the live work ledger. Single writer: the lead architect.
 Workers report; the lead verifies against acceptance criteria and records evidence.
+
+## 10. Program U - unified client, Cloudflare portal, harness gaps (2026-11-15)
+
+Goal: a harness as easy to use as Claude Code or pi, reachable from any
+device, running locally, in the cloud, or both in tandem. Three things
+change: (a) every UI surface is rebuilt as ONE NSH app (https://nsh.dev,
+Rust UI framework with web, iOS, Android, desktop and terminal backends);
+(b) Cloudflare becomes the hub (portal, relay, cloud runs); (c) the harness
+closes the gaps found against pi, oh-my-pi, jcode and dirge. Those four
+projects are references for gaps only: nothing is adopted as a dependency
+and no code is copied (dirge is GPL-3.0).
+
+### 10.1 Target shape
+
+- One client app (NSH, screens written in Rust). It only speaks
+  modron-protocol and never embeds the agent. Targets: web (the portal)
+  first, then phone, terminal, desktop.
+- A session host that runs anywhere: `modron serve` on a local machine
+  tunnelling out through the bridge, or in a Cloudflare container against
+  a cloned repo.
+- Cloudflare as the hub: one Durable Object per session relays frames and
+  stores the event log so any number of devices attach, drop and resume.
+- The existing ratatui TUI, gpui-kit desktop and TSX mobile clients are
+  frozen (no new features) and deleted once the NSH app covers them. The
+  Oculus theme and the main functionality carry over. Status 2026-11-16: the ratatui
+  TUI crate is deleted (packet C9-TUI); plain `modron` and `modron tui` start the app.
+
+### 10.2 Decisions (owner interview, 2026-11-15)
+
+| Area | Decision |
+|---|---|
+| Hosting | Self-deploy into each user's own Cloudflare account; single owner first |
+| Identity | One owner sign-in; any number of linked GitHub accounts and orgs; each repo or session picks the identity it clones and pushes as |
+| Secrets | Worker secrets, injected into the container at start |
+| Guests | Per-session invite links (viewer or approver), scoped and revocable, in v1; no guest accounts |
+| UI language | Rust on NSH for every surface, including the terminal |
+| Surface order | Web portal, then phone; desktop later |
+| Tandem | Many devices drive one session; approvals answerable from any device with push; multi-person via invite links |
+| Handoff | Any direction (local to cloud, cloud to local). furrow (github.com/Agent-Field/furrow) over R2 after a spike; a pushed session branch is the fallback |
+| Writer model | One host runs the agent and owns the files; a handoff moves the host and the previous host stays attached as a full driver. Two hosts editing separate copies at once is out of scope |
+| Idle cloud | Snapshot, sleep, restore on the next message or wakeup |
+| Old clients | Delete and rebuild; keep the theme and main functionality |
+
+### 10.2a Standing rule for product decisions (owner, 2026-11-15)
+
+When a behaviour question comes up that the plan does not settle, the
+lead compares how Claude Code and oh-my-pi handle it, picks the better
+option for Modron, records the decision and the reason in LEDGER.md, and
+proceeds. The owner is told, not asked.
+
+Decisions made under this rule:
+
+| Question | Claude Code | oh-my-pi / pi | Decision |
+|---|---|---|---|
+| Does the model see `!command` output? | Yes: bash-mode output joins the conversation | `!cmd` yes, `!!cmd` no | `!cmd` is added to the conversation; `!!cmd` runs and shows its output but never reaches the model |
+| Does a user-typed command need approval? | No: the user typed it | No | No prompt for the owner's own command. It still runs in the sandbox and still honours the deny list, deny rules and pre_tool hooks (the owner's own hard limits). Approval mode, ask rules and the plan phase restrict the model, not the user. Guests cannot send it |
+| What does saving a model from the picker do? | The /model choice becomes the default for later sessions | The choice is kept as the default; roles are separate config | Selecting a model changes the current session only; an explicit save (Shift+S, or a control) writes default model + provider to the server config, as the old terminal UI did. Explicit, because one server feeds several devices and a silent default change from a phone would surprise the laptop |
+| Does the terminal app capture the mouse (wheel, click, drag-copy)? | No: it leaves selection and copy to the terminal | Mixed; fullscreen with its own handling | No capture. The terminal's own selection and copy keep working, which is what users expect from Claude Code; scrolling is PgUp/PgDn/Home/End. Revisit only if users ask |
+| Keep `/issues`? | No equivalent | No equivalent | Not carried over. It reads a server-side file through the old in-process UI; no client can serve it without a new frame, and neither reference has it |
+| Esc on an idle composer | Clears the draft (double Esc) | Clears the draft | Esc clears the draft when nothing else claims the key (approval, plan, suggestions, running) |
+| Theme switching | /theme offers several themes (dark, light, colour-blind variants, ANSI) | Themes are selectable | Offer a /theme picker with what exists: Oculus dark, Oculus light and "system" (follow the terminal or browser appearance). No custom theme files for now; NSH can swap tokens at runtime, so a further palette is a data change |
+| Removing a saved credential | /logout | /logout | Add it: a client can remove a provider credential it could have added. Local connections only, like adding one |
+| Enter while a run is active | The message is taken as guidance for the running turn | Enter steers; a second key queues | Enter steers the running turn; Alt+Enter queues a follow-up (docs/PROTOCOL_V2.md section 2) |
+| What `/settings` opens | A settings view | A settings view | The Settings screen (the old terminal UI opened its credentials wizard, which is now `/auth`) |
+| Approval keys typed just before the prompt appears | Not accepted as an answer | Not accepted as an answer | Keep the old terminal UI's guard: a decision key pressed within a short window of the prompt appearing is ignored, so type-ahead cannot approve a command by accident |
+
+### 10.2b Owner decisions, 2026-11-16 (answered directly)
+
+- Plain `modron` launches the NSH app; crates/modron-tui is deleted, no
+  fallback flag.
+- The live bridge runs current code with the portal on (owner and host
+  tokens set); bare share links need a sign-in or an invite.
+- A pull request is opened for this branch and taken through merge.
+- The cloud-run image is built and deployed from GitHub Actions, manually
+  triggered (.github/workflows/cloud-deploy.yml).
+- Handoff ships both ways: git session branch by default, furrow over R2
+  as an opt-in setting (spikes/furrow-r2/RESULTS.md).
+- Thinking-block replay: design the append-only transcript here first,
+  then build; old sessions stay readable.
+- Web push for approvals is built now.
+- edit_lines stays opt-in until benchmarked; the owner will add a
+  provider key for `modron bench`.
+
+### 10.3 What survives, what goes
+
+Keep: modron-protocol, modron-view, modron-server, mobile/rust-core (becomes
+the single client core; already builds to wasm), the bridge Worker and its
+per-session Durable Object, the Oculus palette as the one theme.
+
+Discard at parity: crates/modron-tui view code, crates/modron-desktop,
+mobile/app/App.tsx, the bridge's inline HTML viewer. Status 2026-11-16: crates/modron-tui and
+crates/modron-desktop are deleted.
+
+### 10.4 Harness gaps to close (in priority order)
+
+| # | Gap today | Build |
+|---|---|---|
+| H1 | No steering: a message sent mid-run is refused | Steer (inject at next safe boundary) and queue (after the run) as protocol frames |
+| H2 | No real plan mode; plan re-shown per message, not per turn | Enforced read-only plan phase, approve step, per-turn plan re-injection |
+| H3 | Sub-agents throttled: approval-gated so sequential in Ask mode, children cannot ask, no live counters, no completion push, cap 4 | Approvals routed to the parent session, live turn/token counters, completion events, steerable per-agent view |
+| H4 | No independent reviewer; finish gate only re-runs verify | Reviewer role reading the diff, verdict event before the turn reports done, cheap non-LLM claim checks |
+| H5 | Background work thin: interval automations only, no notifications | Scheduled wakeups, pause reasons, push on completion or block |
+| H6 | Edit is exact string replace only | Hash-anchored line edits; default only if `modron bench` shows a gain |
+| H7 | No reasoning-effort control; only cheap/strong tiers | Effort parameter and named roles (plan, sub-agent, critic, summary) |
+| H8 | Permissions by tool name only | Command and path rules, plus an explain-this-decision command |
+| H9 | Small defects: /compact is a no-op, /context reports cumulative tokens, hooks only pre/post tool, MCP stdio only, no web fetch | Fix each |
+
+### 10.5 Build order
+
+1. Spikes (S1-S3): NSH web target in Rust (bundle size, load time, mobile
+   Safari input); NSH terminal target (startup, streaming, scrollback);
+   furrow over R2 from a container.
+2. Protocol v2 (P1): events for steer/queue, plan approval, sub-agent
+   approvals and counters, reviewer verdicts, pause/wake, actor and role on
+   every event. Both tracks build against it. See docs/PROTOCOL_V2.md.
+3. Harness track (H1-H9), each measured with `modron bench` / `modron eval`.
+4. Client track (C1-C10): client core and theme, NSH app, portal (owner
+   sign-in, linked GitHub, session list, invite links), tandem, cloud runs
+   with sleep/restore and handoff, terminal, phone, CI.
+5. Delete the old clients.
+
+### 10.6 Risks
+
+- NSH is pre-1.0 (0.5.x is "not yet a recorded compatibility baseline")
+  and its web and terminal targets are on the critical path. Pin exact
+  versions. Fallback for web: a plain web front end over the same wasm
+  client core. The terminal is committed to NSH by owner decision; the
+  spike decides how much must be worked around or upstreamed.
+- furrow is very early (v0.3.x), has no Cloudflare support, and does not
+  merge concurrent edits; R2 via its S3-compatible mode is unverified.
+- AGENTS.md's parity contract describes three clients; it is rewritten
+  when the NSH app lands (one codebase, divergence by target only).
+
+Packet-level status and evidence: LEDGER.md, "Program U".
+
+### 10.7 Design: thinking-block replay (H7b-2)
+
+Finding first: the session log is already append-only (JSONL, one
+SessionEvent per line; compaction, steering, tasks and private shell all
+append; nothing rewrites a session file). So no storage rewrite is
+needed; the work is carrying provider blocks through the message model.
+
+Rules:
+
+1. Shape. `Message` gains one additive field, `provider_blocks`
+   (serde default, skipped when empty): an ordered list of
+   `{ provider, api, kind, index, payload }`. `payload` is the provider's
+   JSON, stored and replayed byte-for-byte, never interpreted. `index`
+   places the block among the turn's text and tool calls. A field, not a
+   new SessionEvent variant: older binaries drop whole lines of an
+   unknown type (and fork re-serializes through the typed enum), but
+   they ignore unknown fields, so old builds keep reading new sessions
+   and only lose the blocks.
+2. Capture. Anthropic: keep `thinking` blocks with their `signature`
+   and `redacted_thinking` blocks from the stream (the signature delta
+   is dropped today). OpenAI Responses: request
+   `reasoning.encrypted_content` and keep reasoning items. OpenAI-
+   compatible chat: nothing to keep.
+3. Replay. When building a request, a block is sent only if its
+   `provider` and `api` match the request's target; otherwise it is
+   left out and the turn degrades to today's behaviour. This covers
+   model switches, escalation and reviewer requests on another provider.
+   Blocks go back in their original order inside the same assistant
+   turn, before the tool calls they preceded.
+4. Compaction. Blocks live and die with their message: a compacted
+   message takes its blocks with it. The compaction boundary and the
+   rewind indices do not change, because no new event kind is counted.
+5. Atomic turns. The assistant message (with blocks) is appended
+   before any early exit; the spend-cap stop currently breaks before
+   the append and loses a billed turn. Fix that first.
+6. Clients. Snapshots and live events strip `provider_blocks` at the
+   server: clients never need them, payloads can be large, and
+   redacted blocks are opaque by definition. The reasoning display
+   keeps using summaries.
+7. Tests. Stream fixtures with signatures round-trip to the next
+   request unchanged; a provider switch drops them; compaction drops
+   them with their message; an old-format session loads; a session
+   written with blocks loads in a build without the field (fixture);
+   snapshot frames carry no blocks; one live check against a real
+   provider when a key is available (thinking plus tool use over two
+   turns).
+
+Unverified until the live check: the effect of replayed blocks on
+prompt-cache prefixes.

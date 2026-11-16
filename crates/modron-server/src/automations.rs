@@ -118,7 +118,7 @@ fn private_file_options() -> std::fs::OpenOptions {
 /// swallowed by the loader's unwrap_or_default and PERMANENTLY wipe the
 /// registry (cycle-2 audit L3). The temp file is created 0600 so the
 /// registry is never readable by other local users.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         private_dir_builder().create(parent)?;
     }
@@ -200,7 +200,7 @@ pub async fn remove(state: &ServerState, name: &str) -> Result<bool> {
     Ok(removed)
 }
 
-fn now_epoch() -> u64 {
+pub(crate) fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -254,6 +254,9 @@ fn select_due(
 pub fn spawn_scheduler(state: Arc<ServerState>) {
     tokio::spawn(async move {
         let state = state;
+        // Scheduled wakes (H5a) come back from their registry first, so a
+        // wake that came due while the server was down fires now, once.
+        crate::wake::rearm_all(&state, crate::wake::system_clock()).await;
         let mut running: HashMap<String, SessionId> = HashMap::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;

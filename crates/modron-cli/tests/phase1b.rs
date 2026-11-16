@@ -28,6 +28,7 @@ fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> Tur
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::ToolUse,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -41,6 +42,7 @@ fn text_response(text: &str) -> TurnResponse {
             cached_input_tokens: 0,
         },
         stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
     }
 }
 
@@ -132,6 +134,7 @@ async fn approve_all_executes_mutating_tools() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         };
     });
 
@@ -178,6 +181,7 @@ async fn seatbelt_sandbox_blocks_network_allows_workspace_writes() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         };
         cfg.sandbox = modron_core::SandboxPolicy::Seatbelt;
     });
@@ -226,10 +230,12 @@ async fn pre_tool_hook_vetoes_the_tool() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         };
         cfg.hooks = HookConfig {
             pre_tool: Some("echo no-writes-allowed >&2; exit 1".to_string()),
             post_tool: None,
+            ..Default::default()
         };
     });
 
@@ -280,6 +286,7 @@ async fn checkpoint_then_rewind_restores_file_and_truncates_transcript() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         };
     });
 
@@ -321,6 +328,7 @@ async fn checkpoint_then_rewind_restores_file_and_truncates_transcript() {
                 non_interactive: true,
                 allow: Vec::new(),
                 deny: Vec::new(),
+                ..Default::default()
             },
             resume_from_event: Some(outcome.truncated_at_event),
             ..EngineConfig::default()
@@ -352,6 +360,7 @@ async fn rewind_deletes_files_the_agent_created() {
             non_interactive: true,
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         };
     });
     let summary = engine.run_task("create a file").await.unwrap();
