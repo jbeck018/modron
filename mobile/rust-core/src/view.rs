@@ -37,14 +37,14 @@
 
 use modron_protocol::{
     ApprovalModeWire, ContextGaugeWire, Decision, LiveState, ModelWire, PendingApproval,
-    PlanDecision, RuleWire, SessionMetaWire, WireRunSummary,
+    PersonaWire, PlanDecision, RuleWire, SessionMetaWire, TaskFileStat, WireRunSummary,
 };
 use modron_types::{Effort, Phase, PlanItem, Role, SessionEvent, ToolActivity, ToolCall, Usage};
 use modron_view::{
     compact_tokens, replay, ActivityTracker, ReplayFolder, SwarmRow, ToolEvent, TranscriptEntry,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -497,6 +497,68 @@ pub fn task_row(meta: &SessionMetaWire, running: bool) -> String {
     format!("{title} \u{b7} {branch} \u{b7} {state}")
 }
 
+/// The latest `task_status` answer kept per task session: what the task
+/// summary line needs (the branch and running state stay on the meta row).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStatusRecord {
+    pub ahead: u64,
+    pub files: Vec<TaskFileStat>,
+}
+
+/// One task row for the tasks screen: the [`task_row`] text plus the
+/// summary from the task's latest status (empty until one arrives).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRowView {
+    pub session_id: Uuid,
+    /// `title - branch - running|idle` ([`task_row`]).
+    pub text: String,
+    /// `ahead 3 - 5 files (+120 -14)` ([`task_status_summary`]), or empty
+    /// when no `task_status` answer has arrived for this task.
+    pub summary: String,
+}
+
+/// The task summary line: commits ahead of the base, the changed-file
+/// count and the summed added/deleted lines. Only what the status carries.
+pub fn task_status_summary(ahead: u64, files: &[TaskFileStat]) -> String {
+    let added: u64 = files.iter().fold(0, |sum, f| sum.saturating_add(f.added));
+    let deleted: u64 = files.iter().fold(0, |sum, f| sum.saturating_add(f.deleted));
+    let count = if files.len() == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", files.len())
+    };
+    format!("ahead {ahead} - {count} (+{added} -{deleted})")
+}
+
+/// The persona picker's one-line text: `name - summary`, or the name alone
+/// when the persona has no prompt summary.
+pub fn persona_row_text(persona: &PersonaWire) -> String {
+    if persona.summary.is_empty() {
+        persona.name.clone()
+    } else {
+        format!("{} - {}", persona.name, persona.summary)
+    }
+}
+
+/// One persona picker row. `current` is the session's persona name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaRowView {
+    pub name: String,
+    /// `name - summary` ([`persona_row_text`]).
+    pub text: String,
+    pub current: bool,
+}
+
+/// One persona picker row for `persona`, marked current when its name is
+/// the session's current persona.
+pub fn persona_row(persona: &PersonaWire, current: Option<&str>) -> PersonaRowView {
+    PersonaRowView {
+        name: persona.name.clone(),
+        text: persona_row_text(persona),
+        current: current == Some(persona.name.as_str()),
+    }
+}
+
 /// The inline confirmation for merging a task's branch into its base.
 pub fn merge_confirm_text(branch: &str) -> String {
     format!("merge {branch} into its base? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
@@ -916,6 +978,15 @@ pub struct SessionViewModel {
     pub router_defaults: Option<modron_protocol::RouterDefaults>,
     /// The model catalog (answers to `models_req`), in the server's order.
     pub models: Vec<ModelWire>,
+    /// The configured personas (answers to `personas_req`), in server order.
+    #[serde(default)]
+    pub personas: Vec<PersonaWire>,
+    /// The session's current persona (`LiveState.persona`, `ConfigPatch`).
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// The latest `task_status` answer per task session.
+    #[serde(default)]
+    pub task_statuses: BTreeMap<Uuid, TaskStatusRecord>,
     /// Last seen server seq for this session (reconnect resumes past it).
     pub last_seq: u64,
     pub turns_completed: u32,
@@ -1097,6 +1168,14 @@ pub struct ViewModelSnapshot {
     /// The model picker rows, one per catalog entry, in the server's
     /// order ([`model_row`]). Unavailable rows are listed but not selectable.
     pub models: Vec<ModelRowView>,
+    /// The persona picker rows, in server order; `current` marks the
+    /// session's persona ([`persona_row`]). Empty when none are configured.
+    #[serde(default)]
+    pub personas: Vec<PersonaRowView>,
+    /// The tasks screen rows: every task session in list order, each with
+    /// its summary ([`TaskRowView`]).
+    #[serde(default)]
+    pub task_rows: Vec<TaskRowView>,
     pub last_seq: u64,
     pub last_error: Option<String>,
     pub last_note: Option<String>,
@@ -1200,6 +1279,29 @@ impl ViewModelSnapshot {
                 .models
                 .iter()
                 .map(|model| model_row(model, &vm.model, &vm.provider))
+                .collect(),
+            personas: vm
+                .personas
+                .iter()
+                .map(|persona| persona_row(persona, vm.persona.as_deref()))
+                .collect(),
+            task_rows: vm
+                .sessions
+                .iter()
+                .filter(|meta| meta.task_branch.as_deref().is_some_and(|b| !b.is_empty()))
+                .map(|meta| {
+                    let running = meta.task_state.as_deref() == Some("running")
+                        || (vm.running && vm.session_id == Some(meta.id));
+                    TaskRowView {
+                        session_id: meta.id,
+                        text: task_row(meta, running),
+                        summary: vm
+                            .task_statuses
+                            .get(&meta.id)
+                            .map(|status| task_status_summary(status.ahead, &status.files))
+                            .unwrap_or_default(),
+                    }
+                })
                 .collect(),
             last_seq: vm.last_seq,
             last_error: vm.last_error.clone(),
@@ -1446,6 +1548,7 @@ pub(crate) fn fold_snapshot(
     vm.model = live.model.clone();
     vm.provider = live.provider.clone();
     vm.goal = live.goal.clone();
+    vm.persona = live.persona.clone();
     // H1-H9b: queue, steer echoes, phase, plan, context and rules are the
     // snapshot's whole truth (a reattach never keeps stale values).
     vm.queued = live.queued.clone();
@@ -2571,6 +2674,47 @@ mod app4_shared_copy_tests {
             interval_minutes: 30,
             last_run: last_run.map(String::from),
         }
+    }
+
+    /// The task summary is `ahead N - F files (+added -deleted)`, with the
+    /// singular form for one file and zeros when nothing changed.
+    #[test]
+    fn task_status_summary_formats_ahead_files_and_lines() {
+        let file = |added, deleted| TaskFileStat {
+            path: "p".into(),
+            added,
+            deleted,
+        };
+        assert_eq!(
+            task_status_summary(3, &[file(100, 10), file(20, 4)]),
+            "ahead 3 - 2 files (+120 -14)"
+        );
+        assert_eq!(
+            task_status_summary(1, &[file(5, 0)]),
+            "ahead 1 - 1 file (+5 -0)"
+        );
+        assert_eq!(task_status_summary(0, &[]), "ahead 0 - 0 files (+0 -0)");
+    }
+
+    /// A persona row shows `name - summary`, the name alone without a
+    /// summary, and marks only the current persona.
+    #[test]
+    fn persona_rows_show_the_summary_and_mark_the_current_one() {
+        let with = PersonaWire {
+            name: "reviewer".into(),
+            model: None,
+            summary: "Review diffs.".into(),
+        };
+        let bare = PersonaWire {
+            name: "writer".into(),
+            model: None,
+            summary: String::new(),
+        };
+        assert_eq!(persona_row_text(&with), "reviewer - Review diffs.");
+        assert_eq!(persona_row_text(&bare), "writer");
+        assert!(persona_row(&with, Some("reviewer")).current);
+        assert!(!persona_row(&bare, Some("reviewer")).current);
+        assert!(!persona_row(&with, None).current);
     }
 
     fn task_meta(title: &str, branch: Option<&str>) -> SessionMetaWire {

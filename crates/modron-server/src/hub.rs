@@ -348,6 +348,9 @@ pub struct SessionHandle {
     model: Mutex<String>,
     provider: Mutex<String>,
     goal: Mutex<String>,
+    /// The persona last switched to (`/agent <name>`, a ConfigPatch
+    /// `persona`); `None` until one is set on this server.
+    persona: Mutex<Option<String>>,
     /// This session's engine clone (sinks + adoption store wired in
     /// [`SessionHub::ensure_session`]). Mutex-guarded so a concurrent
     /// SetConfig can never interleave with a Submit cloning it.
@@ -515,6 +518,7 @@ impl SessionHandle {
             model: lock(&self.model).clone(),
             provider: lock(&self.provider).clone(),
             goal: lock(&self.goal).clone(),
+            persona: lock(&self.persona).clone(),
             queued: lock(&self.queue).iter().cloned().collect(),
             context: lock(&self.context).map(|gauge| ContextGaugeWire {
                 used: gauge.used,
@@ -1295,6 +1299,7 @@ impl SessionHandle {
             config.approvals.deny.extend(spec.deny);
         }
         let goal_label = patch.goal.clone();
+        let persona_label = patch.persona.clone();
 
         // Everything validated: commit the config, the selector and the
         // labels in one step.
@@ -1308,6 +1313,9 @@ impl SessionHandle {
         }
         if let Some(goal) = goal_label {
             *lock(&self.goal) = goal;
+        }
+        if let Some(persona) = persona_label {
+            *lock(&self.persona) = Some(persona);
         }
         Ok(())
     }
@@ -1455,6 +1463,15 @@ impl SessionHub {
         *lock(&self.inner.template) = Some(engine);
     }
 
+    /// The configured personas (`[agents.<name>]`), read from the engine
+    /// template every session starts from. Empty before a template is set.
+    pub fn personas(&self) -> std::collections::BTreeMap<String, modron_core::PersonaSpec> {
+        lock(&self.inner.template)
+            .as_ref()
+            .map(|engine| engine.config.personas.clone())
+            .unwrap_or_default()
+    }
+
     /// The handle for a live session, if one exists.
     /// Drop a session's live handle (deleted sessions): subscribers keep
     /// their channels but no new frames flow.
@@ -1551,6 +1568,7 @@ impl SessionHub {
             model: Mutex::new(engine.config.default_model.clone()),
             provider: Mutex::new(engine.config.default_provider.clone()),
             goal: Mutex::new(String::new()),
+            persona: Mutex::new(None),
             engine: Mutex::new(engine),
             steer,
             queue: Mutex::new(VecDeque::new()),
@@ -2459,6 +2477,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(handle.engine_cell().config.phase, Phase::Plan);
+    }
+
+    /// A persona switch is remembered for the live state (the picker's
+    /// current marker), an unknown persona is refused and leaves it alone,
+    /// and the template lists the configured personas.
+    #[test]
+    fn persona_patch_reaches_the_live_state() {
+        use modron_core::PersonaSpec;
+        let hub = SessionHub::empty();
+        let mut personas = std::collections::BTreeMap::new();
+        personas.insert(
+            "reviewer".to_string(),
+            PersonaSpec {
+                system: Some("Review.".into()),
+                model: None,
+                provider: None,
+                allow: Vec::new(),
+                deny: Vec::new(),
+            },
+        );
+        hub.set_engine(Engine {
+            selector: Arc::new(StaticSelector::new("mock-model", "mock")),
+            providers: Default::default(),
+            tools: Arc::new(ToolRegistry::new()),
+            store: Arc::new(InMemoryStore::new()),
+            config: EngineConfig {
+                default_model: "mock-model".into(),
+                default_provider: "mock".into(),
+                personas,
+                ..EngineConfig::default()
+            },
+        });
+        assert_eq!(hub.personas().len(), 1);
+
+        let id = SessionId::new_v4();
+        let handle = hub.ensure_session(id, None);
+        assert_eq!(handle.live_state().persona, None);
+        assert!(handle
+            .apply_config(&ConfigPatch {
+                persona: Some("ghost".into()),
+                ..ConfigPatch::default()
+            })
+            .is_err());
+        assert_eq!(handle.live_state().persona, None);
+        handle
+            .apply_config(&ConfigPatch {
+                persona: Some("reviewer".into()),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        assert_eq!(handle.live_state().persona.as_deref(), Some("reviewer"));
     }
 
     /// H7c: a roles patch replaces the engine's roles and reaches the live

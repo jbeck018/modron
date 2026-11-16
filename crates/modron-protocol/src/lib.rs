@@ -533,6 +533,16 @@ pub enum Payload {
     /// with `available: false` are shown but cannot be selected; a
     /// selectable row is switched with `set_config` (`ConfigPatch.model`).
     Models { models: Vec<ModelWire> },
+    /// Ask for the configured personas (`[agents.<name>]` in config.toml),
+    /// answered by `personas`. Clients send it when a persona picker opens.
+    PersonasReq {},
+    /// The reply to `personas_req`. UI effect (every client): the persona
+    /// picker replaces its list with `personas`, in the order given (the
+    /// server sorts by name). The row whose name equals
+    /// `LiveState.persona` is marked current. A persona is switched with
+    /// `set_config` (`ConfigPatch.persona`); `ConfigChanged` echoes it.
+    /// Each row carries a one-line summary, never the full system prompt.
+    Personas { personas: Vec<PersonaWire> },
     /// An informational toast/scrollback note (slash-command results).
     Note { text: String },
     /// Answer to `ping`.
@@ -694,6 +704,21 @@ pub struct SessionMetaWire {
     /// older servers (pre-grouping wire snapshots).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+}
+
+/// One configured persona on the wire (a `personas` row). The server sends
+/// the summary, never the system prompt itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaWire {
+    /// The `[agents.<name>]` key; the name `/agent <name>` selects.
+    pub name: String,
+    /// The forced model, when the persona sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// First line of the persona's system prompt: sanitized for display
+    /// and at most 80 characters. Empty when the persona has no prompt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
 }
 
 /// One changed file in a task's diff (from `git diff --numstat`).
@@ -860,6 +885,11 @@ pub struct LiveState {
     /// line on the status surface. Absent when no wake is armed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeWire>,
+    /// The session's current persona name (`/agent <name>`), absent when
+    /// none was switched to on this server. UI effect: marks the current
+    /// row in the persona picker; a Snapshot replaces the client's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 /// A scheduled wake on the wire (H5a): when it next fires and what it runs.
@@ -1266,6 +1296,67 @@ mod tests {
             }
             other => panic!("expected models, got {other:?}"),
         }
+    }
+
+    /// The persona frames use snake_case tags, round-trip every row field,
+    /// and never carry more than the name, model and one-line summary.
+    #[test]
+    fn personas_frames_roundtrip_with_snake_case_tags() {
+        let req = Frame::request(9, Payload::PersonasReq {});
+        let tag = serde_json::to_value(&req.payload).unwrap();
+        assert_eq!(tag["type"], "personas_req");
+        assert!(matches!(roundtrip(&req).payload, Payload::PersonasReq {}));
+
+        let rows = vec![
+            PersonaWire {
+                name: "reviewer".into(),
+                model: Some("claude-haiku-4-5".into()),
+                summary: "You review diffs for correctness.".into(),
+            },
+            PersonaWire {
+                name: "writer".into(),
+                model: None,
+                summary: String::new(),
+            },
+        ];
+        let reply = Frame {
+            id: Some(9),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Personas {
+                personas: rows.clone(),
+            },
+        };
+        let tag = serde_json::to_value(&reply.payload).unwrap();
+        assert_eq!(tag["type"], "personas");
+        match roundtrip(&reply).payload {
+            Payload::Personas { personas } => assert_eq!(personas, rows),
+            other => panic!("expected personas, got {other:?}"),
+        }
+        // An absent model and an empty summary stay off the wire.
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert!(json.get("model").is_none());
+        assert!(json.get("summary").is_none());
+    }
+
+    /// `LiveState.persona` is optional: a snapshot from an older server
+    /// (no key) parses to `None`, and a set persona round-trips.
+    #[test]
+    fn live_state_persona_is_optional_on_the_wire() {
+        let old: LiveState = serde_json::from_str(r#"{"running":false}"#).unwrap();
+        assert_eq!(old.persona, None);
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("persona").is_none());
+
+        let live = LiveState {
+            persona: Some("reviewer".into()),
+            ..LiveState::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["persona"], "reviewer");
+        let back: LiveState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.persona.as_deref(), Some("reviewer"));
     }
 
     /// The relayed role is optional and omitted when unset, so frames from

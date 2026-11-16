@@ -334,6 +334,10 @@ pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTie
         Payload::SetConfig { .. }
         | Payload::RouterDefaultsReq {}
         | Payload::ModelsReq {}
+        // The persona list is the same class as the model catalog: owner
+        // only on a relayed tunnel (approvers and viewers do not pick
+        // personas).
+        | Payload::PersonasReq {}
         | Payload::AuthProvidersReq {} => Ok(Owner),
         Payload::NewSession { .. }
         | Payload::ListSessions {}
@@ -380,6 +384,7 @@ pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTie
         | Payload::OAuthProgress { .. }
         | Payload::RouterDefaults { .. }
         | Payload::Models { .. }
+        | Payload::Personas { .. }
         | Payload::Note { .. }
         | Payload::Pong {}
         | Payload::Error { .. } => Err("frames of this type are server-to-client"),
@@ -757,6 +762,9 @@ async fn dispatch_frame(
         }
         Payload::ModelsReq {} => {
             handle_models_req(state, ctx, request_id);
+        }
+        Payload::PersonasReq {} => {
+            handle_personas_req(state, ctx, request_id);
         }
         Payload::AuthProvidersReq {} | Payload::AuthProviders { .. } => {
             // AuthProvidersReq is the documented request shape; the
@@ -1210,6 +1218,41 @@ fn handle_models_req(_state: &Arc<ServerState>, ctx: &mut ConnCtx, request_id: O
     });
     send(ctx, reply(request_id, None, Payload::Models { models }));
 }
+
+/// The persona rows for `personas_req`: the configured personas sorted by
+/// name, each with its forced model and a one-line summary. The full system
+/// prompt never leaves the server.
+fn handle_personas_req(state: &Arc<ServerState>, ctx: &mut ConnCtx, request_id: Option<u64>) {
+    let personas = persona_rows(&state.hub.personas());
+    send(ctx, reply(request_id, None, Payload::Personas { personas }));
+}
+
+/// The wire rows for a persona map (the map is already sorted by name).
+pub(crate) fn persona_rows(
+    personas: &std::collections::BTreeMap<String, modron_core::PersonaSpec>,
+) -> Vec<modron_protocol::PersonaWire> {
+    personas
+        .iter()
+        .map(|(name, spec)| modron_protocol::PersonaWire {
+            name: name.clone(),
+            model: spec.model.clone(),
+            summary: persona_summary(spec.system.as_deref()),
+        })
+        .collect()
+}
+
+/// The first line of a system prompt, trimmed, display-sanitized and capped
+/// at 80 characters. Empty when the persona has no prompt.
+pub(crate) fn persona_summary(system: Option<&str>) -> String {
+    let first = system.unwrap_or("").lines().next().unwrap_or("").trim();
+    modron_view::sanitize_display(first)
+        .chars()
+        .take(PERSONA_SUMMARY_MAX)
+        .collect()
+}
+
+/// Character cap for a persona summary on the wire.
+pub(crate) const PERSONA_SUMMARY_MAX: usize = 80;
 
 /// Catalog rows with `available` from `signed_in(provider)`, sorted
 /// available first, then provider, then id. Takes the catalog and the
@@ -2241,6 +2284,8 @@ fn variant_name(payload: &Payload) -> &'static str {
         Payload::RouterDefaults { .. } => "router_defaults",
         Payload::ModelsReq {} => "models_req",
         Payload::Models { .. } => "models",
+        Payload::PersonasReq {} => "personas_req",
+        Payload::Personas { .. } => "personas",
         Payload::AuthSetKey { .. } => "auth_set_key",
         Payload::AuthRemove { .. } => "auth_remove",
         Payload::AuthProviders { .. } | Payload::AuthProvidersReq {} => "auth_providers",
@@ -2957,6 +3002,11 @@ mod tests {
                 Payload::ModelsReq {},
                 [false, true, false, false],
             ),
+            (
+                "personas_req",
+                Payload::PersonasReq {},
+                [false, true, false, false],
+            ),
         ]
     }
 
@@ -3001,8 +3051,56 @@ mod tests {
         "ping",
         "router_defaults_req",
         "models_req",
+        "personas_req",
         "persist_default_model",
     ];
+
+    /// The persona summary is the first line of the prompt, display-safe
+    /// (no bidi or control characters) and capped at 80 characters.
+    #[test]
+    fn persona_summary_is_the_first_line_sanitized_and_capped() {
+        assert_eq!(
+            persona_summary(Some("  You review diffs.\nSecond line.")),
+            "You review diffs."
+        );
+        assert_eq!(persona_summary(Some("a\u{202E}b")), "a?b");
+        assert_eq!(persona_summary(None), "");
+        assert_eq!(persona_summary(Some("")), "");
+        let long = "x".repeat(200);
+        assert_eq!(persona_summary(Some(&long)).chars().count(), 80);
+    }
+
+    /// Rows come out sorted by name with their model and summary, and the
+    /// full system prompt never reaches the wire.
+    #[test]
+    fn persona_rows_are_sorted_and_never_carry_the_prompt() {
+        use modron_core::PersonaSpec;
+        let mut personas = std::collections::BTreeMap::new();
+        let spec = |system: &str, model: Option<&str>| PersonaSpec {
+            system: Some(system.to_string()),
+            model: model.map(String::from),
+            provider: None,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        };
+        personas.insert(
+            "writer".to_string(),
+            spec("Write prose.\nSECRET-BODY", None),
+        );
+        personas.insert(
+            "reviewer".to_string(),
+            spec("Review code.\nSECRET-BODY", Some("claude-haiku-4-5")),
+        );
+        let rows = persona_rows(&personas);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "reviewer");
+        assert_eq!(rows[0].model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(rows[0].summary, "Review code.");
+        assert_eq!(rows[1].name, "writer");
+        assert_eq!(rows[1].model, None);
+        let wire = serde_json::to_string(&rows).unwrap();
+        assert!(!wire.contains("SECRET-BODY"), "the prompt leaked: {wire}");
+    }
 
     #[test]
     fn relay_table_covers_every_client_variant() {

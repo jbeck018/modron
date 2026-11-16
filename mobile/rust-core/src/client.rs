@@ -24,7 +24,7 @@ use crate::error::ClientError;
 use crate::transport;
 use crate::view::{
     fold_snapshot, fold_turn_done, fold_turn_unfinished, FoldState, OAuthProgressView,
-    PendingApprovalView, PendingPlanView, SessionViewModel, ViewModelSnapshot,
+    PendingApprovalView, PendingPlanView, SessionViewModel, TaskStatusRecord, ViewModelSnapshot,
 };
 use modron_protocol::{
     ApprovalModeWire, ConfigPatch, ContextGaugeWire, Decision, Frame, Payload, PlanDecision,
@@ -376,6 +376,26 @@ struct CoreState {
     /// True when `vm.session_id` came from a frame rather than from an
     /// explicit command (see [`accept_session`]).
     adopted: bool,
+    /// Where the next [`RemoteClient::refresh_task_statuses`] call starts in
+    /// the task list (round robin, so every task is asked in turn).
+    task_status_cursor: usize,
+}
+
+/// Most `task_status` requests one [`RemoteClient::refresh_task_statuses`]
+/// call sends. A longer task list is covered over several calls.
+pub const TASK_STATUS_REFRESH_BATCH: usize = 10;
+
+/// The next round-robin batch of task ids: at most
+/// [`TASK_STATUS_REFRESH_BATCH`] ids starting at `cursor` (wrapping), and
+/// the cursor the following call starts from. Empty list, empty batch.
+fn next_task_status_batch(ids: &[Uuid], cursor: usize) -> (Vec<Uuid>, usize) {
+    if ids.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let start = cursor % ids.len();
+    let count = ids.len().min(TASK_STATUS_REFRESH_BATCH);
+    let batch = (0..count).map(|i| ids[(start + i) % ids.len()]).collect();
+    (batch, (start + count) % ids.len())
 }
 
 /// The session a frame belongs to: its envelope's `session`, or for a
@@ -1190,6 +1210,40 @@ impl RemoteClient {
         ))
     }
 
+    /// Request the configured personas for the persona picker; the rows
+    /// land in `state().personas`, the current one marked.
+    pub fn request_personas(&self) -> Result<(), ClientError> {
+        self.send_frame(Frame::request(
+            self.next_request_id(),
+            Payload::PersonasReq {},
+        ))
+    }
+
+    /// Ask for the status of the task sessions, at most
+    /// [`TASK_STATUS_REFRESH_BATCH`] per call: the next batch starts where
+    /// the previous call stopped, so a long list is covered over several
+    /// calls. Answers land in each task row's `summary` (`state().task_rows`).
+    /// Returns how many requests were sent.
+    pub fn refresh_task_statuses(&self) -> Result<usize, ClientError> {
+        let picked: Vec<Uuid> = {
+            let mut st = self.shared.state.lock().unwrap();
+            let ids: Vec<Uuid> = st
+                .vm
+                .sessions
+                .iter()
+                .filter(|meta| meta.task_branch.as_deref().is_some_and(|b| !b.is_empty()))
+                .map(|meta| meta.id)
+                .collect();
+            let (picked, next) = next_task_status_batch(&ids, st.task_status_cursor);
+            st.task_status_cursor = next;
+            picked
+        };
+        for id in &picked {
+            self.task_status(*id)?;
+        }
+        Ok(picked.len())
+    }
+
     /// Persist router defaults into the server's config; the outcome
     /// lands as a note.
     pub fn persist_router(
@@ -1489,7 +1543,28 @@ fn implies_run(payload: &Payload) -> bool {
 
 fn fold_frame(shared: &Shared, frame: Frame) {
     let mut st = shared.state.lock().unwrap();
-    let CoreState { vm, fold, adopted } = &mut *st;
+    let CoreState {
+        vm, fold, adopted, ..
+    } = &mut *st;
+
+    // A task's status is keyed by its own session id, so it is recorded
+    // before the attached-session gate: a share link that adopted another
+    // session still keeps every task's summary.
+    if let Payload::TaskStatus {
+        session_id,
+        ahead,
+        files,
+        ..
+    } = &frame.payload
+    {
+        vm.task_statuses.insert(
+            *session_id,
+            TaskStatusRecord {
+                ahead: *ahead,
+                files: files.clone(),
+            },
+        );
+    }
 
     if let Some(id) = frame_session(&frame) {
         if !accept_session(vm, adopted, id) {
@@ -1582,6 +1657,9 @@ fn fold_frame(shared: &Shared, frame: Frame) {
             });
         }
         Payload::Models { models } => vm.models = models,
+        // The persona picker's rows; the current marker comes from the
+        // session's persona, not from this list.
+        Payload::Personas { personas } => vm.personas = personas,
         // A task creation adopts the fresh session (the desktop does the
         // same); status and merge answers land as scrollback notes.
         Payload::TaskCreated {
@@ -1689,6 +1767,9 @@ fn apply_config(vm: &mut SessionViewModel, patch: &ConfigPatch) {
     if let Some(goal) = &patch.goal {
         vm.goal = goal.clone();
     }
+    if let Some(persona) = &patch.persona {
+        vm.persona = Some(persona.clone());
+    }
     if let Some(phase) = patch.phase {
         vm.phase = phase;
     }
@@ -1751,6 +1832,157 @@ mod tests {
         assert!(validate_ws_url("http://127.0.0.1:7699", false).is_err());
         assert!(validate_ws_url("ws://", false).is_err());
         assert!(validate_ws_url("ws:///path", false).is_err());
+    }
+
+    /// The persona reply folds into the picker rows, and the current marker
+    /// follows the snapshot's persona and then a `ConfigChanged` switch.
+    #[test]
+    fn personas_reply_marks_the_current_persona() {
+        use modron_protocol::{LiveState, PersonaWire};
+        let session = Uuid::new_v4();
+        let snapshot = Frame {
+            id: None,
+            session: Some(session),
+            seq: 1,
+            role: None,
+            payload: Payload::Snapshot {
+                session_id: session,
+                last_seq: 1,
+                events: Vec::new(),
+                live: LiveState {
+                    persona: Some("reviewer".into()),
+                    ..LiveState::default()
+                },
+            },
+        };
+        let catalog = Frame {
+            id: Some(9),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Personas {
+                personas: vec![
+                    PersonaWire {
+                        name: "reviewer".into(),
+                        model: None,
+                        summary: "Review diffs.".into(),
+                    },
+                    PersonaWire {
+                        name: "writer".into(),
+                        model: Some("claude-haiku-4-5".into()),
+                        summary: String::new(),
+                    },
+                ],
+            },
+        };
+        let snap = folded_all(vec![snapshot.clone(), catalog.clone()]);
+        assert_eq!(snap.personas.len(), 2);
+        assert_eq!(snap.personas[0].text, "reviewer - Review diffs.");
+        assert!(snap.personas[0].current);
+        assert_eq!(snap.personas[1].text, "writer");
+        assert!(!snap.personas[1].current);
+
+        let switched = Frame {
+            id: None,
+            session: Some(session),
+            seq: 2,
+            role: None,
+            payload: Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    persona: Some("writer".into()),
+                    ..ConfigPatch::default()
+                },
+            },
+        };
+        let snap = folded_all(vec![snapshot, catalog, switched]);
+        assert!(!snap.personas[0].current);
+        assert!(snap.personas[1].current);
+    }
+
+    /// The batch helper asks for at most ten tasks per call, round robin:
+    /// a 25-task list is covered over three calls, the last one wrapping.
+    #[test]
+    fn task_status_batches_are_capped_and_round_robin() {
+        let ids: Vec<Uuid> = (0..25).map(Uuid::from_u128).collect();
+        let (first, cursor) = next_task_status_batch(&ids, 0);
+        assert_eq!(first, ids[0..10].to_vec());
+        assert_eq!(cursor, 10);
+        let (second, cursor) = next_task_status_batch(&ids, cursor);
+        assert_eq!(second, ids[10..20].to_vec());
+        assert_eq!(cursor, 20);
+        let (third, cursor) = next_task_status_batch(&ids, cursor);
+        let wrapped: Vec<Uuid> = ids[20..25]
+            .iter()
+            .chain(ids[0..5].iter())
+            .copied()
+            .collect();
+        assert_eq!(third, wrapped);
+        assert_eq!(cursor, 5);
+        assert_eq!(next_task_status_batch(&[], 3), (Vec::new(), 0));
+    }
+
+    /// Task rows carry the summary of the latest status for their own
+    /// session, a status for another task folds without touching the rest,
+    /// and a task with no status yet has an empty summary. Non-task sessions
+    /// get no row.
+    #[test]
+    fn task_status_folds_into_the_task_rows() {
+        use modron_protocol::{SessionMetaWire, TaskFileStat};
+        let meta = |n: u128, branch: Option<&str>| SessionMetaWire {
+            id: Uuid::from_u128(n),
+            title: format!("task {n}"),
+            created_at: String::new(),
+            updated_at: String::new(),
+            message_count: 0,
+            task_branch: branch.map(String::from),
+            task_state: None,
+            working_dir: None,
+        };
+        let listed = Frame {
+            id: Some(3),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Sessions {
+                sessions: vec![
+                    meta(1, Some("task/one")),
+                    meta(2, None),
+                    meta(3, Some("task/three")),
+                ],
+            },
+        };
+        let status = Frame {
+            id: Some(4),
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::TaskStatus {
+                session_id: Uuid::from_u128(1),
+                worktree: "/wt/one".into(),
+                branch: "task/one".into(),
+                running: false,
+                ahead: 3,
+                files: vec![
+                    TaskFileStat {
+                        path: "a.rs".into(),
+                        added: 100,
+                        deleted: 10,
+                    },
+                    TaskFileStat {
+                        path: "b.rs".into(),
+                        added: 20,
+                        deleted: 4,
+                    },
+                ],
+            },
+        };
+        let snap = folded_all(vec![listed, status]);
+        assert_eq!(snap.task_rows.len(), 2, "the plain session has no row");
+        assert_eq!(snap.task_rows[0].session_id, Uuid::from_u128(1));
+        assert_eq!(snap.task_rows[0].summary, "ahead 3 - 2 files (+120 -14)");
+        assert_eq!(snap.task_rows[0].text, "task 1 \u{b7} task/one \u{b7} idle");
+        assert_eq!(snap.task_rows[1].session_id, Uuid::from_u128(3));
+        assert_eq!(snap.task_rows[1].summary, "");
     }
 
     /// The catalog reply folds into the picker rows: the session's model

@@ -196,6 +196,46 @@ Who may send it: local connections only. It is refused for every relayed
 role (owner, approver, viewer) over a remote-control tunnel, like
 `PersistRouter`. UI effect: none until the `note` arrives.
 
+## 7a2. Personas and task summaries
+
+```
+PersonasReq {}                                 // client
+Personas { personas: Vec<PersonaWire> }        // server
+PersonaWire { name, model?, summary }
+LiveState.persona: Option<String>              // server, in snapshot
+ConfigPatch.persona: Option<String>            // client, set_config
+TaskStatus { session_id, worktree, branch, running, ahead, files }
+```
+
+`PersonasReq` is answered from the personas the server was configured with
+(`[agents.<name>]` in config.toml, the engine template's persona map). Rows
+are sorted by name. `model` is the persona's forced model, absent when it
+sets none. `summary` is the first line of the persona's system prompt,
+trimmed, display-sanitized (control and bidi characters become `?`) and
+capped at 80 characters; it is empty when the persona has no prompt. The
+full system prompt is never sent. UI effect: the persona picker lists these
+rows as `name - summary` (the name alone when the summary is empty) and
+marks the row whose name equals `LiveState.persona` as current. A persona is
+switched with `ConfigPatch.persona` (the `/agent` command); the server
+answers with `ConfigChanged` echoing it, and the snapshot's `persona` is
+the server's current value (absent until one is set on this server).
+
+Who may send it: local connections and the owner of a trusted
+remote-control tunnel, like `ModelsReq`. Approvers and viewers are refused
+over a tunnel.
+
+Task summaries are a client fold, not a new frame. A client asks for each
+task's status with `GetTaskStatus { session_id }` (answered by
+`TaskStatus`) and keeps the latest answer per session. UI effect on the
+tasks screen: each task row shows the summary
+`ahead N - F files (+added -deleted)` (`1 file` for one file; added and
+deleted are summed over `files`). The summary is empty until a status
+arrives for that task. A `TaskStatus` is keyed by its own session id, so it
+is kept even when the client is attached to another session. Clients ask
+for at most ten task statuses per refresh and cover longer lists over
+several refreshes (round robin), so a long task list cannot flood the
+server.
+
 ## 7b. Shell passthrough
 
 ```
