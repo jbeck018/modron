@@ -9,6 +9,13 @@
 //       permission, a second tap unsubscribes, a viewer invite hides it,
 //       an approver invite subscribes with its invite, iOS tab hint. The push
 //       service is stubbed in the page (no real push service is reached).
+//   (c1..c7) Cloud screen (PLAN 10.10) on a scripted bridge: the entry hidden
+//       on 503, a masked token POSTed and listed, a refused token showing
+//       GitHub's status, remove asks first, the repo picker's query and paging,
+//       a run started with {account, repo, branch}, stop / wake / open routes,
+//       one shared line when runs are not configured.
+//   (v1) vault (PLAN 10.9 item 3): the credentials rows read the vault, a key
+//       is PUT over HTTPS (never a session frame), removal DELETEs.
 // The page is served by a Node site (startSite) on one origin: the built
 // bundle under / and /app/, and the portal's routes (/api/*, /auth) answered
 // from a scripted state. Uses only Node built-ins and the preinstalled
@@ -93,6 +100,76 @@ function startSite(port, state) {
           return json(res, 405, { error: 'method not allowed' });
         }
         if (!owner) return json(res, 401, { error: 'unauthorized' });
+        // Cloud (PLAN 10.10): linked GitHub accounts, the repo picker, runs.
+        // The vault (PLAN 10.9): the credentials list, a key PUT and a DELETE.
+        if (p === '/api/github/accounts' && req.method === 'GET') {
+          state.accountGets += 1;
+          if (state.cloud === 'off') return json(res, 503, { error: 'vault not configured' });
+          return json(res, 200, { accounts: state.accounts });
+        }
+        if (p === '/api/github/accounts' && req.method === 'POST') {
+          const input = JSON.parse(body || '{}');
+          state.accountPosts.push(input);
+          if (state.refusedTokens.includes(input.token)) {
+            return json(res, 400, { error: 'GitHub refused the token', github_status: 401 });
+          }
+          const row = { id: `a${state.accounts.length + 1}`, login: 'octocat', kind: 'token' };
+          state.accounts.push(row);
+          return json(res, 201, row);
+        }
+        const account = /^\/api\/github\/accounts\/([^/]+)$/.exec(p);
+        if (account && req.method === 'DELETE') {
+          state.accounts = state.accounts.filter((a) => a.id !== account[1]);
+          state.accountDeletes.push(account[1]);
+          return send(res, 204, '');
+        }
+        if (p === '/api/github/repos' && req.method === 'GET') {
+          const q = url.searchParams.get('q') || '';
+          const page = Number(url.searchParams.get('page') || '1');
+          state.repoQueries.push({ q, page, account: url.searchParams.get('account') });
+          const all = state.repos.filter((r) => r.full_name.includes(q));
+          const repos = all.slice((page - 1) * REPO_PAGE, page * REPO_PAGE);
+          return json(res, 200, { repos, next_page: page * REPO_PAGE < all.length ? page + 1 : null });
+        }
+        if (p === '/api/runs' && req.method === 'GET') {
+          if (state.runsOff) return json(res, 503, { error: 'cloud runs are not configured' });
+          return json(res, 200, { runs: state.runs });
+        }
+        if (p === '/api/runs' && req.method === 'POST') {
+          if (state.runsOff) return json(res, 503, { error: 'cloud runs are not configured' });
+          const input = JSON.parse(body || '{}');
+          state.runPosts.push(input);
+          const row = { id: `r${state.runs.length + 1}`, repo: input.repo, account: input.account,
+            branch: input.branch, state: 'starting', reason: '', created_at: '2026-11-16T09:00:00Z', session_url: '' };
+          state.runs.push(row);
+          return json(res, 201, row);
+        }
+        const run = /^\/api\/runs\/([^/]+)\/(stop|wake)$/.exec(p);
+        if (run && req.method === 'POST') {
+          const row = state.runs.find((r) => r.id === run[1]);
+          state.runActions.push({ id: run[1], action: run[2] });
+          if (row) row.state = run[2] === 'stop' ? 'stopped' : 'running';
+          return send(res, 204, '');
+        }
+        if (p === '/api/credentials' && req.method === 'GET') {
+          if (state.vault === 'off') return json(res, 503, { error: 'vault not configured' });
+          return json(res, 200, { credentials: state.credentials });
+        }
+        const credential = /^\/api\/credentials\/([^/]+)$/.exec(p);
+        if (credential && req.method === 'PUT') {
+          const input = JSON.parse(body || '{}');
+          state.vaultPuts.push({ id: credential[1], body: input });
+          const row = state.credentials.find((c) => c.id === credential[1]);
+          if (row) row.set = true;
+          else state.credentials.push({ id: credential[1], set: true });
+          return send(res, 204, '');
+        }
+        if (credential && req.method === 'DELETE') {
+          state.vaultDeletes.push(credential[1]);
+          const row = state.credentials.find((c) => c.id === credential[1]);
+          if (row) row.set = false;
+          return send(res, 204, '');
+        }
         if (p === '/api/sessions' && req.method === 'GET') return json(res, 200, state.sessions);
         if (p === '/api/invites' && req.method === 'GET') {
           const sid = url.searchParams.get('session_id');
@@ -243,7 +320,8 @@ function startWsServer(opts = {}) {
 // The browser logs every failed HTTP answer as a console error. The portal's
 // probes answer 401, 429 or 503 on purpose, so those log lines are allowed;
 // any other error, and any page error, still fails a case.
-const EXPECTED_STATUS = /Failed to load resource: the server responded with a status of (401|429|503)\b/;
+// 400 is the bridge's answer to a refused GitHub token (the page shows its note).
+const EXPECTED_STATUS = /Failed to load resource: the server responded with a status of (400|401|429|503)\b/;
 function watchErrors(page, errors) {
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('console', (m) => {
@@ -371,8 +449,21 @@ async function testInviteFromSettings(browser, site) {
 
 function newSiteState(portal) {
   return { portal, rateLimited: false, sessions: PORTAL_ROWS, invites: [], invitePosts: [], deletes: [], loggedOut: 0,
-    push: 'on', pushKeyRequests: [], pushPosts: [], pushDeletes: [] };
+    push: 'on', pushKeyRequests: [], pushPosts: [], pushDeletes: [],
+    cloud: 'on', accountGets: 0, accounts: [], accountPosts: [], accountDeletes: [], refusedTokens: ['ghp_refused'],
+    repos: REPOS, repoQueries: [], runs: [], runsOff: false, runPosts: [], runActions: [],
+    vault: 'on', credentials: [{ id: 'anthropic', set: false }, { id: 'openai', set: false }], vaultPuts: [], vaultDeletes: [] };
 }
+
+// The Cloud fixtures: five repos, two to a page (the bridge pages 50).
+const REPO_PAGE = 2;
+const REPOS = [
+  { full_name: 'acme/app', private: false, default_branch: 'main', pushed_at: '2026-11-14T08:00:00Z' },
+  { full_name: 'acme/api', private: true, default_branch: 'dev', pushed_at: '2026-11-13T08:00:00Z' },
+  { full_name: 'acme/web', private: false, default_branch: 'main', pushed_at: '2026-11-12T08:00:00Z' },
+  { full_name: 'acme/docs', private: false, default_branch: 'main', pushed_at: '2026-11-11T08:00:00Z' },
+  { full_name: 'acme/tools', private: false, default_branch: 'main', pushed_at: '2026-11-10T08:00:00Z' },
+];
 
 // Web push fixtures: the bridge's VAPID public key (65 bytes from 0x04) and the
 // browser's subscription keys, as the stub hands them out.
@@ -1393,6 +1484,226 @@ async function testAttachSendsOneImage(browser, base) {
   }
 }
 
+// A leaf element whose whole text is `text` (the web controls are text).
+async function waitLeaf(page, text) {
+  await page.waitForFunction((t) => [...document.querySelectorAll('*')].some((el) => el.childElementCount === 0 && el.textContent.trim() === t), text, { timeout: TIMEOUT });
+}
+
+// Waits until `pred()` holds (the scripted site records each request).
+async function waitUntil(pred, what) {
+  const end = Date.now() + TIMEOUT;
+  while (!pred()) {
+    if (Date.now() > end) throw new Error('timed out waiting for ' + what);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+// The owner's portal list, with the Cloud screen open (the probe answered 200).
+async function openCloud(page) {
+  await waitLeaf(page, 'cloud');
+  await tapLabel(page, 'cloud');
+  await page.waitForFunction(() => document.body.innerText.includes('github accounts'), null, { timeout: TIMEOUT });
+}
+
+// Waits until the masked field has the focus, then types `text` into it.
+async function typeMasked(page, text) {
+  await page.waitForFunction(() => document.activeElement && document.activeElement.type === 'password', null, { timeout: TIMEOUT });
+  await page.keyboard.type(text);
+  await page.waitForFunction((t) => document.activeElement.value === t, text, { timeout: TIMEOUT });
+}
+
+// The Cloud entry is not drawn where the accounts route answers 503.
+async function testCloudHiddenOn503(browser, site) {
+  site.state.cloud = 'off';
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'fix router', { timeout: TIMEOUT });
+    await waitUntil(() => site.state.accountGets >= 1, 'the accounts probe');
+    await page.waitForTimeout(200);
+    if (await page.getByText('cloud', { exact: true }).count()) throw new Error('the cloud entry showed on a 503');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// A masked token is POSTed and never shown; a refused token shows GitHub's
+// status from the 400, and the next token links the account.
+async function testCloudAddAccount(browser, site) {
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await tapLabel(page, 'add account');
+    await typeMasked(page, 'ghp_refused');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('GitHub refused the token (status 401)'), null, { timeout: TIMEOUT });
+    await waitUntil(() => site.state.accountPosts.length === 1, 'the refused POST');
+    if (!sameBody(site.state.accountPosts[0], { token: 'ghp_refused' })) throw new Error('POST body was ' + JSON.stringify(site.state.accountPosts[0]));
+    if ((await page.content()).includes('ghp_refused')) throw new Error('the refused token stayed on the page');
+    await tapLabel(page, 'add account');
+    await typeMasked(page, 'ghp_good');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('octocat \u00b7 token'), null, { timeout: TIMEOUT });
+    await waitUntil(() => site.state.accountPosts.length === 2, 'the second POST');
+    if (!sameBody(site.state.accountPosts[1], { token: 'ghp_good' })) throw new Error('POST body was ' + JSON.stringify(site.state.accountPosts[1]));
+    if ((await page.content()).includes('ghp_good')) throw new Error('the token stayed on the page');
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// Remove asks y / n first, then DELETEs that account.
+async function testCloudRemoveAccount(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await page.waitForFunction(() => document.body.innerText.includes('octocat \u00b7 token'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'remove');
+    await page.waitForFunction(() => document.body.innerText.includes('remove octocat? y / n'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'y');
+    await waitUntil(() => site.state.accountDeletes.includes('a1'), 'the DELETE');
+    await page.waitForFunction(() => document.body.innerText.includes('no github accounts yet'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// The picker sends its text as `q` once it pauses (one request, not one per
+// key), and asks for the next page when its last row is selected.
+async function testCloudRepoPicker(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await tapLabel(page, 'choose a repo');
+    await page.waitForFunction(() => document.body.innerText.includes('acme/app \u00b7 public'), null, { timeout: TIMEOUT });
+    await waitUntil(() => site.state.repoQueries.some((r) => r.q === '' && r.page === 1 && r.account === 'a1'), 'the first page');
+    await page.keyboard.type('ac');
+    await waitUntil(() => site.state.repoQueries.some((r) => r.q === 'ac' && r.page === 1), 'the filtered page');
+    if (site.state.repoQueries.some((r) => r.q === 'a')) throw new Error('a query went out per key: ' + JSON.stringify(site.state.repoQueries));
+    // Two rows on the first page: the second is the last, so selecting it pages on.
+    await page.waitForFunction(() => document.body.innerText.includes('acme/api \u00b7 private'), null, { timeout: TIMEOUT });
+    await page.keyboard.press('ArrowDown');
+    await waitUntil(() => site.state.repoQueries.some((r) => r.q === 'ac' && r.page === 2), 'the next page');
+    await page.waitForFunction(() => document.body.innerText.includes('acme/docs \u00b7 public'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// A pick fills the run's repo and default branch; the branch can be edited;
+// start posts {account, repo, branch} and the run's row appears.
+async function testCloudStartRun(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await tapLabel(page, 'choose a repo');
+    await page.waitForFunction(() => document.body.innerText.includes('acme/app \u00b7 public'), null, { timeout: TIMEOUT });
+    await page.getByText('acme/app', { exact: false }).first().click();
+    await page.waitForFunction(() => document.body.innerText.includes('repo: acme/app'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.querySelector('input') && document.querySelector('input').value === 'main', null, { timeout: TIMEOUT });
+    await page.locator('input').first().fill('dev');
+    await page.waitForFunction(() => document.querySelector('input').value === 'dev', null, { timeout: TIMEOUT });
+    await tapLabel(page, 'start run');
+    await waitUntil(() => site.state.runPosts.length === 1, 'the start POST');
+    if (!sameBody(site.state.runPosts[0], { account: 'a1', repo: 'acme/app', branch: 'dev' })) {
+      throw new Error('start body was ' + JSON.stringify(site.state.runPosts[0]));
+    }
+    await page.waitForFunction(() => document.body.innerText.includes('acme/app \u00b7 dev \u00b7 starting'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// A running run offers stop and open; a failed one offers wake. Each control
+// hits its route; open goes to the run's session address.
+async function testCloudRunActions(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  site.state.runs = [
+    { id: 'r1', repo: 'acme/app', account: 'a1', branch: 'main', state: 'running', reason: '', created_at: '2026-11-15T10:20:30Z', session_url: '/app/?opened=run1' },
+    { id: 'r2', repo: 'acme/api', account: 'a1', branch: 'dev', state: 'failed', reason: 'exit 2', created_at: '2026-11-14T08:00:00Z', session_url: '' },
+  ];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await page.waitForFunction(() => document.body.innerText.includes('acme/api \u00b7 dev \u00b7 failed \u00b7 exit 2'), null, { timeout: TIMEOUT });
+    if (await page.getByText('open', { exact: true }).count() !== 1) throw new Error('only the run with a session offers open');
+    await tapLabel(page, 'wake');
+    await waitUntil(() => site.state.runActions.some((a) => a.id === 'r2' && a.action === 'wake'), 'the wake route');
+    await page.getByText('stop', { exact: true }).first().click();
+    await waitUntil(() => site.state.runActions.some((a) => a.id === 'r1' && a.action === 'stop'), 'the stop route');
+    await page.getByText('open', { exact: true }).first().click();
+    await page.waitForURL(/opened=run1/, { timeout: TIMEOUT });
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// The runs route answers 503 (no cloud runner): one shared line says so.
+async function testCloudRunsNotConfigured(browser, site) {
+  site.state.runsOff = true;
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await page.waitForFunction(() => document.body.innerText.includes('the bridge has no cloud runner yet'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// The vault (PLAN 10.9 item 3) on a live page: the API-key row reads the vault,
+// a key goes to the bridge (PUT, never a session frame), removal DELETEs.
+async function testVaultKeyRows(browser, site) {
+  const ws = await startWsServer({ providers: [
+    { id: 'anthropic', label: 'Anthropic', status: 'not configured', oauth_capable: true },
+    { id: 'openai', label: 'OpenAI', status: 'not configured', oauth_capable: false },
+  ] });
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/?url=' + encodeURIComponent(ws.url) + '&session=' + SESSION, site.base);
+  try {
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('the key is stored for your cloud hosts'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: paste an API key'), null, { timeout: TIMEOUT });
+    await typeMasked(page, 'sk-vault-1');
+    await page.keyboard.press('Enter');
+    await waitUntil(() => site.state.vaultPuts.length === 1, 'the vault PUT');
+    if (!sameBody(site.state.vaultPuts[0], { id: 'openai', body: { key: 'sk-vault-1' } })) {
+      throw new Error('PUT was ' + JSON.stringify(site.state.vaultPuts[0]));
+    }
+    if (ws.received.includes('auth_set_key')) throw new Error('the key went over the session socket');
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: saved in the vault'), null, { timeout: TIMEOUT });
+    if ((await page.content()).includes('sk-vault-1')) throw new Error('the key stayed on the page');
+    await tapLabel(page, 'remove');
+    await page.waitForFunction(() => document.body.innerText.includes('remove OpenAI credentials? y / n'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'y');
+    await waitUntil(() => site.state.vaultDeletes.includes('openai'), 'the vault DELETE');
+    if (ws.received.includes('auth_remove')) throw new Error('the removal went over the session socket');
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: TIMEOUT });
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
 (async () => {
   const sitePort = await freePort();
   // The portal is off here (/api/me 503), so no-url pages are the demo.
@@ -1464,6 +1775,22 @@ async function testAttachSendsOneImage(browser, base) {
       const s = await portalSite('on'); try { await testPushApproverInvite(browser, s); } finally { s.close(); } }],
     ['(w7) push: an iPhone tab without push shows unavailable with the Home Screen hint', async () => {
       const s = await portalSite('on'); try { await testPushIosTabHint(browser, s); } finally { s.close(); } }],
+    ['(c1) cloud: the entry is not drawn where the accounts route answers 503', async () => {
+      const s = await portalSite('on'); try { await testCloudHiddenOn503(browser, s); } finally { s.close(); } }],
+    ['(c2) cloud: a masked token is POSTed and not shown; a refused token shows GitHub status', async () => {
+      const s = await portalSite('on'); try { await testCloudAddAccount(browser, s); } finally { s.close(); } }],
+    ['(c3) cloud: remove asks y / n, then DELETEs the account', async () => {
+      const s = await portalSite('on'); try { await testCloudRemoveAccount(browser, s); } finally { s.close(); } }],
+    ['(c4) cloud: the repo picker sends its text as q once, and pages at the last row', async () => {
+      const s = await portalSite('on'); try { await testCloudRepoPicker(browser, s); } finally { s.close(); } }],
+    ['(c5) cloud: a pick fills the run; start posts {account, repo, branch} and the run shows', async () => {
+      const s = await portalSite('on'); try { await testCloudStartRun(browser, s); } finally { s.close(); } }],
+    ['(c6) cloud: stop, wake and open hit their routes; open goes to the session address', async () => {
+      const s = await portalSite('on'); try { await testCloudRunActions(browser, s); } finally { s.close(); } }],
+    ['(c7) cloud: runs answered 503 shows the shared not-configured line', async () => {
+      const s = await portalSite('on'); try { await testCloudRunsNotConfigured(browser, s); } finally { s.close(); } }],
+    ['(v1) vault: the key row reads the vault, a key is PUT and never a session frame, removal DELETEs', async () => {
+      const s = await portalSite('on'); try { await testVaultKeyRows(browser, s); } finally { s.close(); } }],
   ];
   more.push(...portal);
   for (const [name, run] of more) {

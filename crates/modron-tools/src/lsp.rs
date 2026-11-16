@@ -287,6 +287,7 @@ impl LspServer {
     ) -> Option<LspServer> {
         // D9: provider secrets never reach the language server's environment.
         let mut command = std::process::Command::new(bin);
+        modron_core::hooks::scrub_std_command(&mut command);
         scrub_std_command(&mut command);
         let mut child = command
             .args(args)

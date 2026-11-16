@@ -655,6 +655,107 @@ pub fn portal_session_row(title: &str, host_label: &str, online: bool, updated_a
     row
 }
 
+/// Cloud runs (web, owner only; PLAN 10.10): the Cloud screen's words.
+pub const CLOUD_LABEL: &str = "cloud";
+pub const CLOUD_ACCOUNTS_LABEL: &str = "github accounts";
+pub const CLOUD_ACCOUNTS_EMPTY_LABEL: &str = "no github accounts yet";
+pub const CLOUD_ACCOUNT_ADD_LABEL: &str = "add account";
+pub const CLOUD_TOKEN_PLACEHOLDER: &str = "paste a GitHub access token";
+pub const CLOUD_TOKEN_HINT: &str = "github token";
+pub const CLOUD_RUN_LABEL: &str = "new run";
+pub const CLOUD_ACCOUNT_PICK_LABEL: &str = "account";
+pub const CLOUD_NO_ACCOUNT_LABEL: &str = "add a GitHub account first";
+pub const CLOUD_REPO_PICK_LABEL: &str = "choose a repo";
+pub const CLOUD_BRANCH_LABEL: &str = "branch";
+pub const CLOUD_START_LABEL: &str = "start run";
+pub const CLOUD_RUNS_LABEL: &str = "runs";
+pub const CLOUD_RUNS_EMPTY_LABEL: &str = "no runs yet";
+pub const CLOUD_STOP_LABEL: &str = "stop";
+pub const CLOUD_WAKE_LABEL: &str = "wake";
+pub const CLOUD_OPEN_LABEL: &str = "open";
+pub const CLOUD_NOT_CONFIGURED_LABEL: &str = "the bridge has no cloud runner yet";
+pub const CLOUD_FAILED_LABEL: &str = "cloud request failed";
+pub const CLOUD_REPOS_EMPTY_LABEL: &str = "no repos match";
+pub const CLOUD_PRIVATE_LABEL: &str = "private";
+pub const CLOUD_PUBLIC_LABEL: &str = "public";
+pub const RUN_STARTING_LABEL: &str = "starting";
+pub const RUN_RUNNING_LABEL: &str = "running";
+pub const RUN_SLEEPING_LABEL: &str = "sleeping";
+pub const RUN_STOPPED_LABEL: &str = "stopped";
+pub const RUN_FAILED_LABEL: &str = "failed";
+/// The credentials rows whose key is in the owner's vault (web, owner).
+pub const VAULT_SAVED_LABEL: &str = "saved in the vault";
+pub const VAULT_NOTE_LABEL: &str = "the key is stored for your cloud hosts";
+pub const VAULT_SAVE_FAILED_LABEL: &str = "could not save the key";
+
+/// The inline confirmation for removing a linked GitHub account.
+pub fn cloud_account_remove_text(login: &str) -> String {
+    format!("remove {login}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
+/// The words for a run's state from the bridge's state word. An unknown
+/// state shows as the bridge sent it.
+pub fn run_state_label(state: &str) -> String {
+    match state {
+        "starting" => RUN_STARTING_LABEL,
+        "running" => RUN_RUNNING_LABEL,
+        "sleeping" => RUN_SLEEPING_LABEL,
+        "stopped" => RUN_STOPPED_LABEL,
+        "failed" => RUN_FAILED_LABEL,
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// A refused GitHub token: GitHub's status when the bridge sent one. The
+/// token itself is never shown.
+pub fn token_refused_line(github_status: Option<u16>) -> String {
+    match github_status {
+        Some(status) => format!("GitHub refused the token (status {status})"),
+        None => "GitHub refused the token".to_string(),
+    }
+}
+
+/// One linked account row: the login and its kind (`token`, `oauth`).
+pub fn account_line(login: &str, kind: &str) -> String {
+    if kind.is_empty() {
+        login.to_string()
+    } else {
+        format!("{login} \u{b7} {kind}")
+    }
+}
+
+/// One repo picker row: the full name, private or public, and the last push.
+pub fn repo_line(full_name: &str, private: bool, pushed_at: &str) -> String {
+    let visibility = if private {
+        CLOUD_PRIVATE_LABEL
+    } else {
+        CLOUD_PUBLIC_LABEL
+    };
+    if pushed_at.is_empty() {
+        format!("{full_name} \u{b7} {visibility}")
+    } else {
+        format!(
+            "{full_name} \u{b7} {visibility} \u{b7} {}",
+            short_time(pushed_at)
+        )
+    }
+}
+
+/// One run row: `repo · branch · state (· reason) · started`.
+pub fn run_line(repo: &str, branch: &str, state: &str, reason: &str, created_at: &str) -> String {
+    let mut row = format!("{repo} \u{b7} {branch} \u{b7} {}", run_state_label(state));
+    if !reason.trim().is_empty() {
+        row.push_str(" \u{b7} ");
+        row.push_str(reason.trim());
+    }
+    if !created_at.is_empty() {
+        row.push_str(" \u{b7} ");
+        row.push_str(&short_time(created_at));
+    }
+    row
+}
+
 /// One invite row: its role and when it expires.
 pub fn invite_row(role: &str, expires_at: &str) -> String {
     format!("{role} \u{b7} expires {}", short_time(expires_at))
@@ -2959,5 +3060,67 @@ mod removal_tests {
         );
         assert_eq!(PICKER_NONE_LABEL, RULES_NONE_LABEL);
         assert_eq!(REMOVE_LABEL, "remove");
+    }
+}
+
+#[cfg(test)]
+mod cloud_view_tests {
+    use super::*;
+
+    #[test]
+    fn run_states_map_to_the_shared_words_and_unknown_passes_through() {
+        assert_eq!(run_state_label("starting"), "starting");
+        assert_eq!(run_state_label("running"), "running");
+        assert_eq!(run_state_label("sleeping"), "sleeping");
+        assert_eq!(run_state_label("stopped"), "stopped");
+        assert_eq!(run_state_label("failed"), "failed");
+        assert_eq!(run_state_label("paused"), "paused");
+    }
+
+    #[test]
+    fn run_rows_show_repo_branch_state_reason_and_time() {
+        assert_eq!(
+            run_line(
+                "acme/app",
+                "main",
+                "failed",
+                "out of memory",
+                "2026-11-15T10:20:30Z"
+            ),
+            "acme/app \u{b7} main \u{b7} failed \u{b7} out of memory \u{b7} 2026-11-15 10:20"
+        );
+        assert_eq!(
+            run_line("a/b", "dev", "running", "  ", ""),
+            "a/b \u{b7} dev \u{b7} running"
+        );
+    }
+
+    #[test]
+    fn repo_and_account_rows_format_their_fields() {
+        assert_eq!(
+            repo_line("acme/app", true, "2026-11-14T08:00:00Z"),
+            "acme/app \u{b7} private \u{b7} 2026-11-14 08:00"
+        );
+        assert_eq!(repo_line("acme/site", false, ""), "acme/site \u{b7} public");
+        assert_eq!(account_line("octocat", "token"), "octocat \u{b7} token");
+        assert_eq!(account_line("octocat", ""), "octocat");
+    }
+
+    #[test]
+    fn a_refused_token_names_githubs_status_only() {
+        assert_eq!(
+            token_refused_line(Some(401)),
+            "GitHub refused the token (status 401)"
+        );
+        assert_eq!(token_refused_line(None), "GitHub refused the token");
+        assert!(!token_refused_line(Some(401)).contains("ghp_"));
+    }
+
+    #[test]
+    fn the_account_removal_confirmation_uses_the_shared_yes_and_no() {
+        assert_eq!(
+            cloud_account_remove_text("octocat"),
+            "remove octocat? y / n"
+        );
     }
 }

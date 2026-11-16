@@ -146,6 +146,22 @@ pub enum UiAction {
     /// Settings web push (web): subscribe this device when it is off, or
     /// unsubscribe it when it is on. The page decides which from its state.
     TogglePush,
+    /// Cloud (web, owner; PLAN 10.10). The account and run calls go over
+    /// HTTPS to the bridge; the page's timers and replies live in `web.rs`.
+    /// `CloudRefresh` lists the accounts and the runs (the screen's timer
+    /// refreshes the runs only, from `web.rs`).
+    CloudRefresh,
+    /// Link a GitHub account by its access token (the bridge checks it).
+    AddAccount(SecretKey),
+    RemoveAccount(String),
+    /// Start a run for an account, a repo and a branch.
+    StartRun {
+        account: String,
+        repo: String,
+        branch: String,
+    },
+    StopRun(String),
+    WakeRun(String),
     /// `!command` (shared: the output may reach the model) and `!!command`
     /// (private: shown, never sent to the model). The core's `shell` and
     /// `shell_private`; a bare `!` gives the core's usage refusal.
@@ -275,7 +291,21 @@ impl UiAction {
                 | UiAction::RevokeInvite(_)
                 | UiAction::CopyInvite(_)
                 | UiAction::TogglePush
+                | UiAction::CloudRefresh
+                | UiAction::AddAccount(_)
+                | UiAction::RemoveAccount(_)
+                | UiAction::StartRun { .. }
+                | UiAction::StopRun(_)
+                | UiAction::WakeRun(_)
         )
+    }
+
+    /// The actions the web host sends to the owner's vault instead of the
+    /// session socket, while the vault is here (PLAN 10.9 item 3): a key
+    /// entry and a key removal. The terminal never sets the vault, so these
+    /// keep their session route there.
+    pub fn is_vault(&self) -> bool {
+        matches!(self, UiAction::SetKey(_) | UiAction::AuthRemove(_))
     }
 }
 
@@ -987,6 +1017,26 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
             };
         }
         Screen::Automations | Screen::Tasks => return route_list_screen_key(key, facts),
+        Screen::Cloud => {
+            // The masked token entry and the branch field have the DOM focus
+            // and take their own keys (the composer passes them through).
+            return match key {
+                Key::Escape => Routed::Nav(NavStep::CloudEsc),
+                _ => composer,
+            };
+        }
+        Screen::CloudRepos => {
+            return match key {
+                Key::Escape if facts.filter_active => Routed::Nav(NavStep::ClearFilter),
+                Key::Escape => Routed::Nav(NavStep::Back),
+                Key::Enter => Routed::Nav(NavStep::PickRepo(facts.selected_index)),
+                Key::Up => Routed::Nav(NavStep::Move(-1)),
+                Key::Down => Routed::Nav(NavStep::Move(1)),
+                Key::Backspace => Routed::Nav(NavStep::FilterBack),
+                Key::Char(c) => Routed::Nav(NavStep::Filter(c)),
+                _ => Routed::Ignored,
+            };
+        }
         Screen::Auth => {
             return match key {
                 Key::Escape if facts.auth_keying => Routed::Nav(NavStep::AuthCancelKey),
@@ -1359,6 +1409,8 @@ pub struct Host {
     nav: Nav,
     /// The owner portal's actions, taken by the web host (`take_portal`).
     portal: VecDeque<UiAction>,
+    /// The owner's vault answered here (web): key entry and removal go to it.
+    vault_on: bool,
     /// Rows of the tool detail the snapshot held at the last push.
     tool_len: usize,
     /// The latest snapshot as the driver sent it; the shown copy is derived
@@ -1409,6 +1461,7 @@ pub fn link() -> (Host, Client) {
             seen_rows: 0,
             nav: Nav::default(),
             portal: VecDeque::new(),
+            vault_on: false,
             tool_len: 0,
             tool_panel: None,
             raw: None,
@@ -1597,7 +1650,9 @@ impl Host {
                 UiAction::Clear => self.clear_view(),
                 UiAction::Context => self.context_note(),
                 UiAction::Exit => QUIT.store(true, Ordering::SeqCst),
-                action if action.is_portal() => self.portal.push_back(action),
+                action if action.is_portal() || (self.vault_on && action.is_vault()) => {
+                    self.portal.push_back(action)
+                }
                 action => return Some(action),
             }
         }
@@ -1659,6 +1714,66 @@ impl Host {
     pub fn set_share_note(&mut self, note: Option<String>) {
         self.nav.set_share_note(note);
         self.notify();
+    }
+
+    /// The Cloud screen's state (web, owner): the accounts route answered 200
+    /// (`false` hides the Cloud entry and closes its screens).
+    pub fn set_cloud_available(&mut self, available: bool) {
+        self.nav.set_cloud_available(available);
+        self.notify();
+    }
+
+    pub fn set_cloud_accounts(&mut self, rows: Vec<crate::cloud::AccountRow>) {
+        self.nav.set_cloud_accounts(rows);
+        self.notify();
+    }
+
+    pub fn set_cloud_runs(&mut self, rows: Vec<crate::cloud::RunRow>) {
+        self.nav.set_cloud_runs(rows);
+        self.notify();
+    }
+
+    pub fn set_cloud_note(&mut self, note: Option<String>) {
+        self.nav.set_cloud_note(note);
+        self.notify();
+    }
+
+    pub fn set_cloud_repos(
+        &mut self,
+        rows: Vec<crate::cloud::RepoRow>,
+        next_page: Option<u32>,
+        append: bool,
+    ) {
+        self.nav.set_cloud_repos(rows, next_page, append);
+        self.notify();
+    }
+
+    /// The owner's vault (web): its key list, or `None` when there is none.
+    /// While it is set, key entry and removal go to the bridge.
+    pub fn set_vault(&mut self, rows: Option<Vec<(String, bool)>>) {
+        self.vault_on = rows.is_some();
+        self.nav.set_vault(rows);
+        self.notify();
+    }
+
+    pub fn set_vault_note(&mut self, note: Option<String>) {
+        self.nav.set_vault_note(note);
+        self.notify();
+    }
+
+    /// The repo picker's query while it is on top (the server's `q`).
+    pub fn cloud_query(&self) -> Option<String> {
+        self.nav.cloud_query()
+    }
+
+    /// The account the repo picker lists.
+    pub fn cloud_account_id(&self) -> Option<String> {
+        self.nav.cloud_account_id()
+    }
+
+    /// The repo page the picker needs next, when its end is in view.
+    pub fn cloud_next_page_due(&self) -> Option<u32> {
+        self.nav.cloud_next_page_due()
     }
 
     /// The Settings web push row (web host): `None` hides it.
@@ -3743,5 +3858,29 @@ mod credential_remove_key_tests {
             route_key(Key::Char('d'), false, false, facts, ""),
             Routed::Nav(NavStep::AskAuthRemove(1))
         );
+    }
+}
+
+#[cfg(test)]
+mod vault_route_tests {
+    use super::*;
+
+    /// With the vault set, a key entry goes to the bridge (the portal queue);
+    /// without it the key goes to the session as before (the terminal's way).
+    #[test]
+    fn a_key_entry_goes_to_the_vault_only_while_the_vault_is_set() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let secret = || SecretKey { provider: "openai".into(), key: "sk-test".into() };
+        let (mut host, client) = link();
+        client.actions.send(UiAction::SetKey(secret())).ok();
+        assert!(matches!(host.try_action(), Some(UiAction::SetKey(_))), "session route");
+        assert!(host.take_portal().is_none());
+
+        host.set_vault(Some(vec![("openai".into(), false)]));
+        client.actions.send(UiAction::SetKey(secret())).ok();
+        client.actions.send(UiAction::AuthRemove("openai".into())).ok();
+        assert!(host.try_action().is_none(), "the vault takes both");
+        assert!(matches!(host.take_portal(), Some(UiAction::SetKey(_))));
+        assert!(matches!(host.take_portal(), Some(UiAction::AuthRemove(_))));
     }
 }

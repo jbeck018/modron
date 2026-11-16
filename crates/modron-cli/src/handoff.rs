@@ -305,7 +305,14 @@ pub async fn export(
             }
             // Forced: each handoff replaces the previous one on these refs.
             // The log prefix rule, not the ref history, decides ownership.
-            git(
+            // The cloud container's git token (PLAN 10.10) rides in this one
+            // git call's environment, never on its command line.
+            let token_env = remote_git_env(std::env::var(GIT_TOKEN_ENV).ok().as_deref());
+            let envs: Vec<(&str, &str)> = token_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            git_env(
                 &top,
                 &[
                     "push",
@@ -314,6 +321,7 @@ pub async fn export(
                     &format!("+{tree_ref}"),
                     &format!("+{bundle_ref}"),
                 ],
+                &envs,
             )?;
             Some(remote.to_string())
         }
@@ -609,6 +617,89 @@ fn incoming_title(extract: &Path, id: SessionId) -> Option<String> {
     let text = std::fs::read_to_string(extract.join(format!("{id}.meta.json"))).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     value.get("title")?.as_str().map(str::to_string)
+}
+
+/// The environment variable `modron serve` reads its git token from when it
+/// runs as a cloud run (cloud/container/entrypoint.sh). It is scrubbed from
+/// every tool child (crates/modron-core hooks.rs); only this module's git
+/// calls use it.
+pub const GIT_TOKEN_ENV: &str = "MODRON_GIT_TOKEN";
+
+/// Environment for one git call that talks to a remote: with a token, it goes
+/// as an HTTP Basic `Authorization` header through `GIT_CONFIG_*`, the same
+/// form the container entrypoint uses for its clone. Empty without a token.
+pub(crate) fn remote_git_env(token: Option<&str>) -> Vec<(String, String)> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return Vec::new();
+    };
+    let basic = base64_encode(format!("x-access-token:{token}").as_bytes());
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "http.extraHeader".to_string(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("Authorization: Basic {basic}"),
+        ),
+    ]
+}
+
+/// Standard base64 with padding (RFC 4648), for the one header above.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod token_env_tests {
+    use super::{base64_encode, remote_git_env};
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn token_travels_as_a_git_config_header_only_when_set() {
+        assert!(remote_git_env(None).is_empty());
+        assert!(remote_git_env(Some("")).is_empty());
+        let env = remote_git_env(Some("tok"));
+        let value = env
+            .iter()
+            .find(|(k, _)| k == "GIT_CONFIG_VALUE_0")
+            .map(|(_, v)| v.clone())
+            .expect("header value");
+        assert_eq!(
+            value,
+            format!(
+                "Authorization: Basic {}",
+                base64_encode(b"x-access-token:tok")
+            )
+        );
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_KEY_0" && v == "http.extraHeader"));
+    }
 }
 
 #[cfg(test)]

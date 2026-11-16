@@ -1,6 +1,7 @@
 # modron cloud runtime: runs `modron serve` inside a Cloudflare Container.
-# The entrypoint clones a repo (GITHUB_TOKEN, used once) and starts
-# `modron serve` bound to loopback. See cloud/container/README.md.
+# The entrypoint clones the run's repo (the git token arrives per run in the
+# environment, from the bridge's wake body) and starts `modron serve` bound to
+# loopback. See cloud/container/README.md.
 #
 # Build from the REPO ROOT (the build needs the workspace manifest):
 #   docker build -f cloud/container/Dockerfile -t modron-cloud .
@@ -31,7 +32,7 @@ COPY cloud/container/entrypoint.sh /entrypoint.sh
 RUN chmod 0755 /entrypoint.sh
 
 # Non-secret marker read by modron serve (portal host kind). Secrets are
-# never set here: they arrive as container env at start.
+# never set here: the per-run values arrive as container env at start.
 ENV MODRON_HOST_KIND=cloud
 
 WORKDIR /workspace

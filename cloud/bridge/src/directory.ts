@@ -62,6 +62,35 @@ export type PushRow = {
 
 export type IssuedTicket = { ticket: string; viewer_key: string; role: Role };
 
+// A linked GitHub account (PLAN 10.10). The token is sealed (vault.ts,
+// associated data = the account id); the row never holds the plaintext.
+export type GithubAccountRow = {
+  id: string;
+  login: string;
+  kind: string;
+  nonce: ArrayBuffer;
+  ciphertext: ArrayBuffer;
+  created_at: number;
+};
+
+export type RunView = RunRow & { viewer_key: string | null };
+
+// A cloud run (runs.ts). The git token is not stored: it is unsealed from the
+// account at each wake.
+export type RunRow = {
+  id: string;
+  repo: string;
+  account_id: string;
+  branch: string;
+  state: string;
+  reason: string | null;
+  created_at: number;
+  session_id: string | null;
+  // The handoff ref the run was started with ("" = none), so a wake after a
+  // stop imports the same handoff again.
+  handoff_ref: string;
+};
+
 // A stored provider key (vault.ts): ciphertext only, never the plaintext.
 export type CredentialRow = {
   provider_id: string;
@@ -127,6 +156,26 @@ export class Directory extends DurableObject<object> {
         nonce BLOB NOT NULL,
         ciphertext BLOB NOT NULL,
         updated_at INTEGER NOT NULL)`);
+      // GitHub accounts (github.ts): token sealed, login and kind in clear.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS github_accounts (
+        id TEXT PRIMARY KEY,
+        login TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        nonce BLOB NOT NULL,
+        ciphertext BLOB NOT NULL,
+        created_at INTEGER NOT NULL)`);
+      // Cloud runs (runs.ts). session_id is set when the host registers a
+      // session carrying this run id (see linkRunSession).
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        repo TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT,
+        created_at INTEGER NOT NULL,
+        session_id TEXT,
+        handoff_ref TEXT NOT NULL DEFAULT '')`);
     });
   }
 
@@ -314,5 +363,81 @@ export class Directory extends DurableObject<object> {
   async listCredentials(): Promise<CredentialRow[]> {
     return this.sql.exec<CredentialRow>("SELECT provider_id, nonce, ciphertext, updated_at FROM credentials").toArray();
   }
-}
 
+  // --- GitHub accounts (github.ts) ---
+
+  async listGithubAccounts(): Promise<Array<Omit<GithubAccountRow, "nonce" | "ciphertext">>> {
+    return this.sql
+      .exec<Omit<GithubAccountRow, "nonce" | "ciphertext">>("SELECT id, login, kind, created_at FROM github_accounts ORDER BY created_at, rowid")
+      .toArray();
+  }
+
+  async countGithubAccounts(): Promise<number> {
+    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM github_accounts").toArray()[0]?.n ?? 0;
+  }
+
+  async getGithubAccount(id: string): Promise<GithubAccountRow | null> {
+    return this.sql.exec<GithubAccountRow>("SELECT * FROM github_accounts WHERE id = ?", id).toArray()[0] ?? null;
+  }
+
+  async putGithubAccount(row: GithubAccountRow): Promise<void> {
+    this.sql.exec(
+      "INSERT INTO github_accounts (id, login, kind, nonce, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      row.id, row.login, row.kind, row.nonce, row.ciphertext, row.created_at,
+    );
+  }
+
+  // Returns false when no such account exists.
+  async deleteGithubAccount(id: string): Promise<boolean> {
+    const existed = this.sql.exec("SELECT 1 AS one FROM github_accounts WHERE id = ?", id).toArray().length > 0;
+    this.sql.exec("DELETE FROM github_accounts WHERE id = ?", id);
+    return existed;
+  }
+
+  // --- cloud runs (runs.ts) ---
+
+  async putRun(row: RunRow): Promise<void> {
+    this.sql.exec(
+      `INSERT INTO runs (id, repo, account_id, branch, state, reason, created_at, session_id, handoff_ref)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      row.id, row.repo, row.account_id, row.branch, row.state, row.reason, row.created_at, row.session_id, row.handoff_ref,
+    );
+  }
+
+  // Both reads carry viewer_key from the linked session (null when the run
+  // has no session or the session is not registered).
+  async getRun(id: string): Promise<RunView | null> {
+    return this.sql
+      .exec<RunView>(
+        `SELECT r.*, s.viewer_key AS viewer_key FROM runs r
+         LEFT JOIN sessions s ON s.id = r.session_id WHERE r.id = ?`, id)
+      .toArray()[0] ?? null;
+  }
+
+  // Newest first, at most 100 rows.
+  async listRuns(): Promise<RunView[]> {
+    return this.sql
+      .exec<RunView>(
+        `SELECT r.*, s.viewer_key AS viewer_key FROM runs r
+         LEFT JOIN sessions s ON s.id = r.session_id
+         ORDER BY r.created_at DESC, r.rowid DESC LIMIT 100`)
+      .toArray();
+  }
+
+  // Sets state and reason. Returns false when no such run exists.
+  async setRunState(id: string, state: string, reason: string | null): Promise<boolean> {
+    const existed = this.sql.exec("SELECT 1 AS one FROM runs WHERE id = ?", id).toArray().length > 0;
+    if (existed) this.sql.exec("UPDATE runs SET state = ?, reason = ? WHERE id = ?", state, reason, id);
+    return existed;
+  }
+
+  // A host registered a session carrying this run id: the run is running and
+  // linked to the session. Only a run that has not stopped or failed moves.
+  async linkRunSession(id: string, sessionId: string): Promise<boolean> {
+    const updated = this.sql.exec(
+      "UPDATE runs SET state = 'running', reason = NULL, session_id = ? WHERE id = ? AND state IN ('starting', 'running', 'sleeping')",
+      sessionId, id,
+    );
+    return updated.rowsWritten > 0;
+  }
+}

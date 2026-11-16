@@ -12,7 +12,8 @@
 use std::{cell::RefCell, rc::Rc};
 
 use modron_mobile_core::view::{
-    invite_row, COPIED_LABEL, PUSH_BLOCKED_LABEL, PUSH_FAILED_LABEL, PUSH_NOT_ALLOWED_LABEL,
+    invite_row, token_refused_line, CLOUD_FAILED_LABEL, CLOUD_NOT_CONFIGURED_LABEL, COPIED_LABEL,
+    PUSH_BLOCKED_LABEL, PUSH_FAILED_LABEL, PUSH_NOT_ALLOWED_LABEL, VAULT_SAVE_FAILED_LABEL,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use wasm_bindgen::{prelude::*, JsCast};
@@ -20,6 +21,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::{
     chat::{host_key, link, Client, Host, UiAction},
+    cloud::{self, AccountRow, RepoRow, QUERY_PAUSE_MS, RUNS_REFRESH_MS},
     demo::Player,
     nav::{InviteLine, Screen},
     portal::{self, Mode},
@@ -49,6 +51,25 @@ enum Reply {
     /// A Settings push tap finished: the endpoint now subscribed (None when
     /// off), or the shared reason it did not change.
     PushDone(Result<Option<String>, &'static str>),
+    /// The owner's accounts (the load-time probe, and each refresh).
+    CloudAccounts(u16, String),
+    /// The runs listing (the timer, and each refresh).
+    CloudRuns(u16, String),
+    /// A token was sent for a new account (its refusal shows GitHub's status).
+    CloudAdded(u16, String),
+    /// A remove, start, stop or wake answered with this status.
+    CloudChanged(u16),
+    /// One page of repos for the query and page asked for.
+    CloudRepos {
+        q: String,
+        page: u32,
+        status: u16,
+        body: String,
+    },
+    /// The vault's key list (the load-time probe, and each refresh).
+    Vault(u16, String),
+    /// A key was saved or removed: its status.
+    VaultChanged(u16),
 }
 
 /// The two feeds the page's timer advances, and the portal's states.
@@ -77,6 +98,7 @@ struct Web {
     replies: UnboundedReceiver<Reply>,
     reply_tx: UnboundedSender<Reply>,
     push: PushState,
+    cloud: CloudState,
 }
 
 fn now() -> f64 {
@@ -113,6 +135,7 @@ impl Web {
         while let Some(action) = self.host.take_portal() {
             self.portal_action(action);
         }
+        self.tick_cloud();
         self.refresh_if_due();
     }
 
@@ -179,6 +202,96 @@ impl Web {
                 self.push.endpoint = probe.endpoint;
                 self.push.browser = Some(probe.browser);
                 self.refresh_push();
+            }
+            Reply::CloudAccounts(status, body) => match status {
+                200 => {
+                    if let Some(accounts) = cloud::parse_accounts(&body) {
+                        self.host.set_cloud_available(true);
+                        let rows = cloud::account_rows(&accounts)
+                            .into_iter()
+                            .map(|(id, login, text)| AccountRow { id, login, text })
+                            .collect();
+                        self.host.set_cloud_accounts(rows);
+                    }
+                }
+                401 | 403 | 503 => self.host.set_cloud_available(false),
+                _ => {}
+            },
+            Reply::CloudRuns(status, body) => match status {
+                200 => {
+                    if let Some(runs) = cloud::parse_runs(&body) {
+                        self.host.set_cloud_note(None);
+                        self.host.set_cloud_runs(cloud::run_rows(&runs));
+                    }
+                }
+                503 => {
+                    self.host.set_cloud_runs(Vec::new());
+                    self.host.set_cloud_note(Some(CLOUD_NOT_CONFIGURED_LABEL.to_string()));
+                }
+                401 | 403 => self.host.set_cloud_available(false),
+                _ => {}
+            },
+            Reply::CloudAdded(status, body) => match status {
+                200 | 201 => {
+                    self.host.set_cloud_note(None);
+                    self.list_accounts();
+                }
+                400 => {
+                    let note = token_refused_line(cloud::refused_status(&body));
+                    self.host.set_cloud_note(Some(note));
+                }
+                401 | 403 => self.host.set_cloud_available(false),
+                503 => self.host.set_cloud_note(Some(CLOUD_NOT_CONFIGURED_LABEL.to_string())),
+                _ => self.host.set_cloud_note(Some(CLOUD_FAILED_LABEL.to_string())),
+            },
+            Reply::CloudChanged(status) => match status {
+                200 | 201 | 204 => {
+                    self.host.set_cloud_note(None);
+                    self.list_accounts();
+                    self.list_runs();
+                }
+                401 | 403 => self.host.set_cloud_available(false),
+                503 => self.host.set_cloud_note(Some(CLOUD_NOT_CONFIGURED_LABEL.to_string())),
+                _ => self.host.set_cloud_note(Some(CLOUD_FAILED_LABEL.to_string())),
+            },
+            Reply::CloudRepos { q, page, status, body } => {
+                // Only the page the feed still waits for counts; a page of an
+                // older query is dropped.
+                let current = match self.cloud.feed.as_mut() {
+                    Some(feed) if feed.q == q && feed.page == page => {
+                        feed.loading = false;
+                        true
+                    }
+                    _ => false,
+                };
+                if current {
+                    match status {
+                        200 => {
+                            if let Some(parsed) = cloud::parse_repos(&body) {
+                                let rows = cloud::repo_rows(&parsed.repos)
+                                    .into_iter()
+                                    .map(|(full_name, default_branch, text)| RepoRow {
+                                        full_name,
+                                        default_branch,
+                                        text,
+                                    })
+                                    .collect();
+                                self.host.set_cloud_repos(rows, parsed.next_page, page > 1);
+                            }
+                        }
+                        401 | 403 => self.host.set_cloud_available(false),
+                        _ => self.host.set_cloud_note(Some(CLOUD_FAILED_LABEL.to_string())),
+                    }
+                }
+            }
+            Reply::Vault(status, body) => {
+                let rows = (status == 200).then(|| cloud::credential_rows(&body)).flatten();
+                self.host.set_vault(rows);
+            }
+            Reply::VaultChanged(status) => {
+                let saved = matches!(status, 200 | 201 | 204);
+                self.host.set_vault_note((!saved).then(|| VAULT_SAVE_FAILED_LABEL.to_string()));
+                self.list_vault();
             }
             Reply::PushDone(result) => {
                 self.push.busy = false;
@@ -271,6 +384,45 @@ impl Web {
             }
             UiAction::CopyInvite(url) => copy_text(url, tx),
             UiAction::TogglePush => self.toggle_push(),
+            UiAction::CloudRefresh => {
+                self.cloud.runs_at = now();
+                self.list_accounts();
+                self.list_runs();
+            }
+            UiAction::AddAccount(secret) => {
+                let body = cloud::add_account_body(&secret.key);
+                request("POST", cloud::accounts_url(), Some(body), tx, |s, b| {
+                    Reply::CloudAdded(s, b)
+                });
+            }
+            UiAction::RemoveAccount(id) => {
+                request("DELETE", cloud::account_url(&id), None, tx, |s, _| Reply::CloudChanged(s));
+            }
+            UiAction::StartRun { account, repo, branch } => {
+                let body = cloud::start_run_body(&account, &repo, &branch);
+                request("POST", cloud::runs_url(), Some(body), tx, |s, _| Reply::CloudChanged(s));
+            }
+            UiAction::StopRun(id) => {
+                request("POST", cloud::run_action_url(&id, "stop"), None, tx, |s, _| {
+                    Reply::CloudChanged(s)
+                });
+            }
+            UiAction::WakeRun(id) => {
+                request("POST", cloud::run_action_url(&id, "wake"), None, tx, |s, _| {
+                    Reply::CloudChanged(s)
+                });
+            }
+            // The vault (PLAN 10.9 item 3): while the host has one, a key
+            // entry or removal goes over HTTPS to the bridge, not the session.
+            UiAction::SetKey(secret) => {
+                let body = cloud::credential_body(&secret.key);
+                let url = cloud::credential_url(&secret.provider);
+                request("PUT", url, Some(body), tx, |s, _| Reply::VaultChanged(s));
+            }
+            UiAction::AuthRemove(provider) => {
+                let url = cloud::credential_url(&provider);
+                request("DELETE", url, None, tx, |s, _| Reply::VaultChanged(s));
+            }
             _ => {}
         }
     }
@@ -318,6 +470,110 @@ impl Web {
         self.push.busy = true;
         self.push.error = None;
         self.refresh_push();
+    }
+}
+
+/// The Cloud screen's and the vault's page state (web host).
+#[derive(Default)]
+struct CloudState {
+    /// When the runs list last refreshed (ms), for the screen's timer.
+    runs_at: f64,
+    /// The repo picker's paging, while the picker is on top.
+    feed: Option<RepoFeed>,
+}
+
+/// The repo picker's paging: the query and page asked for, and whether a
+/// page is in flight. The text the picker shows, and when it last changed,
+/// is the pause before a new query goes out.
+struct RepoFeed {
+    q: String,
+    page: u32,
+    loading: bool,
+    seen_q: String,
+    seen_at: f64,
+}
+
+impl Web {
+    fn list_accounts(&self) {
+        request("GET", cloud::accounts_url(), None, self.reply_tx.clone(), |s, b| {
+            Reply::CloudAccounts(s, b)
+        });
+    }
+
+    fn list_runs(&self) {
+        request("GET", cloud::runs_url(), None, self.reply_tx.clone(), |s, b| {
+            Reply::CloudRuns(s, b)
+        });
+    }
+
+    fn list_vault(&self) {
+        request("GET", cloud::credentials_url(), None, self.reply_tx.clone(), |s, b| {
+            Reply::Vault(s, b)
+        });
+    }
+
+    /// The Cloud screen's timers: the runs list refreshes every
+    /// [`RUNS_REFRESH_MS`] while it shows, and the repo picker runs its feed.
+    fn tick_cloud(&mut self) {
+        let at = now();
+        match self.host.screen() {
+            Screen::Cloud => {
+                if at - self.cloud.runs_at >= RUNS_REFRESH_MS {
+                    self.cloud.runs_at = at;
+                    self.list_runs();
+                }
+            }
+            Screen::CloudRepos => self.tick_repo_picker(at),
+            _ => self.cloud.feed = None,
+        }
+    }
+
+    /// The picker's feed: the first page at once; a new query once the text
+    /// has not changed for [`QUERY_PAUSE_MS`] (the list is then replaced);
+    /// the next page when the last row is in view.
+    fn tick_repo_picker(&mut self, at: f64) {
+        let (Some(q), Some(account)) = (self.host.cloud_query(), self.host.cloud_account_id())
+        else {
+            return;
+        };
+        let next = {
+            let feed = self.cloud.feed.get_or_insert_with(|| RepoFeed {
+                q: String::new(),
+                page: 0,
+                loading: false,
+                seen_q: q.clone(),
+                seen_at: at,
+            });
+            if feed.seen_q != q {
+                feed.seen_q = q.clone();
+                feed.seen_at = at;
+            }
+            let settled = at - feed.seen_at >= QUERY_PAUSE_MS;
+            if feed.page == 0 || (feed.q != q && settled) {
+                let replace = feed.page != 0;
+                feed.q = q.clone();
+                feed.page = 1;
+                feed.loading = true;
+                Some((q, 1, replace))
+            } else if !feed.loading {
+                self.host.cloud_next_page_due().map(|page| {
+                    feed.page = page;
+                    feed.loading = true;
+                    (feed.q.clone(), page, false)
+                })
+            } else {
+                None
+            }
+        };
+        if let Some((q, page, replace)) = next {
+            if replace {
+                self.host.set_cloud_repos(Vec::new(), None, false);
+            }
+            let url = cloud::repos_url(&account, &q, page);
+            request_with("GET", url, None, self.reply_tx.clone(), move |status, body| {
+                Reply::CloudRepos { q, page, status, body }
+            });
+        }
     }
 }
 
@@ -550,6 +806,25 @@ fn request(
     });
 }
 
+/// [`request`] with an answer that carries the call's own values (a page of
+/// repos answers with its query and page). The closure lives in the request's
+/// future only.
+fn request_with<F>(
+    method: &str,
+    url: String,
+    body: Option<String>,
+    tx: UnboundedSender<Reply>,
+    answer: F,
+) where
+    F: FnOnce(u16, String) -> Reply + 'static,
+{
+    let method = method.to_string();
+    spawn_local(async move {
+        let (status, text) = fetch(&method, &url, body).await.unwrap_or((0, String::new()));
+        let _ = tx.send(answer(status, text));
+    });
+}
+
 /// `fetch` with `credentials: include`. A relative `url` is same-origin.
 async fn fetch(method: &str, url: &str, body: Option<String>) -> Result<(u16, String), JsValue> {
     let init = web_sys::RequestInit::new();
@@ -630,6 +905,12 @@ pub fn start() -> Client {
             let _ = tx.send(Reply::PushProbe(probe_push(browser, probe_invite).await));
         });
     }
+    // The owner's Cloud screen and vault (PLAN 10.9, 10.10): a 200 here shows
+    // them; any other answer hides them.
+    request("GET", cloud::accounts_url(), None, reply_tx.clone(), |s, b| {
+        Reply::CloudAccounts(s, b)
+    });
+    request("GET", cloud::credentials_url(), None, reply_tx.clone(), |s, b| Reply::Vault(s, b));
     let feed = match LiveOptions::from_query(&query) {
         Ok(Some(options)) => {
             let (live, actions, out) = Live::channels();
@@ -648,7 +929,14 @@ pub fn start() -> Client {
         }
     };
     let push = PushState { invite, ..PushState::default() };
-    let web = Rc::new(RefCell::new(Web { host, feed, replies, reply_tx, push }));
+    let web = Rc::new(RefCell::new(Web {
+        host,
+        feed,
+        replies,
+        reply_tx,
+        push,
+        cloud: CloudState::default(),
+    }));
     listen_keys(web.clone());
     listen_scroll(web.clone());
     if let Some(window) = web_sys::window() {

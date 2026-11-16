@@ -19,7 +19,9 @@ use modron_mobile_core::view::{
     AUTOMATION_INTERVAL_LABEL, AUTOMATION_NAME_LABEL, AUTOMATION_PROMPT_LABEL, TASK_TITLE_LABEL,
     TASK_TITLE_NEEDED,
 };
-use modron_mobile_core::view::{credential_remove_confirm_text, PersonaRowView};
+use modron_mobile_core::view::{
+    cloud_account_remove_text, credential_remove_confirm_text, PersonaRowView,
+};
 use modron_mobile_core::{
     phase_next, ApprovalModeWire, Effort, SandboxPolicy, ViewModelSnapshot, EFFORT_UNSET_LABEL,
     RULES_NONE_LABEL, SETTING_APPROVAL_LABEL, SETTING_COMPACT_LABEL, SETTING_CONTEXT_LABEL,
@@ -36,6 +38,7 @@ const TASK_REFRESH_EVERY: Duration = Duration::from_secs(5);
 use uuid::Uuid;
 
 use crate::chat::UiAction;
+use crate::cloud::{self, AccountRow, CloudView, RepoRow, RunRow};
 use crate::help::{self, HelpTab, HELP_VISIBLE};
 use crate::portal::{self, PortalLine, PortalRow};
 use crate::push::PushView;
@@ -72,6 +75,12 @@ pub enum Screen {
     /// A list of values (`/mode`, `/sandbox`, `/effort`, `/agent`, `/theme`,
     /// or their Settings rows): type to filter, Enter applies and closes.
     Picker,
+    /// Cloud runs (web, owner, from the portal or `/cloud`; PLAN 10.10): the
+    /// linked GitHub accounts, the new-run form and the runs list.
+    Cloud,
+    /// The repo picker for a new run: the repos of the chosen account, typed
+    /// to filter (the host sends the text as the server's `q`).
+    CloudRepos,
 }
 
 /// One navigation step. Keys and taps both become steps; [`Nav::apply`]
@@ -176,6 +185,22 @@ pub enum NavStep {
     HelpScroll(isize),
     /// Home (top) or End (bottom) on the help rows.
     HelpEdge(bool),
+    /// Esc on the Cloud screen: close the token entry, else back one screen.
+    CloudEsc,
+    /// The "add account" control: open the masked token entry.
+    CloudAddOpen,
+    /// The token entry was submitted (the view has sent the token): close it.
+    CloudAddDone,
+    /// The account control: the next linked account for a new run.
+    CloudPickAccount,
+    /// `d` (or the remove control) on a linked account: asks first (row index).
+    AskAccountRemove(usize),
+    /// A tap on a repo row (the picker): use that repo and its default branch.
+    PickRepo(usize),
+    /// The open control of a run (row index): open its session.
+    CloudOpenRun(usize),
+    /// The branch field's text changed.
+    SetBranch(String),
 }
 
 /// Which list a picker shows. [`picker_rows`] builds its rows; a row's action
@@ -564,12 +589,29 @@ pub struct NavView {
     pub help_tab: HelpTab,
     pub help_rows: Vec<String>,
     pub help_scroll: usize,
+    /// The Cloud screen's state (web, owner; see [`CloudView`]).
+    pub cloud: CloudView,
+    /// The owner's vault is here: the credentials rows show it, and the
+    /// note line under them.
+    pub vault: bool,
+    pub vault_note: Option<String>,
+    /// The portal is the root, so the Cloud screens draw as portal screens.
+    pub portal_root: bool,
 }
 
 impl NavView {
-    /// Whether the owner portal (sign-in or the list) is the screen.
+    /// Whether the owner portal (sign-in or the list) is the screen. The
+    /// Cloud screens count when the portal is the root under them.
     pub fn is_portal(&self) -> bool {
         matches!(self.screen, Screen::SignIn | Screen::Portal)
+            || (self.portal_root && matches!(self.screen, Screen::Cloud | Screen::CloudRepos))
+    }
+
+    /// The start action for the new run, when an account, a repo and a
+    /// branch are set (the Cloud screen's start control).
+    pub fn cloud_start_action(&self) -> Option<UiAction> {
+        let (account, repo, branch) = self.cloud.start_parts()?;
+        Some(UiAction::StartRun { account, repo, branch })
     }
 }
 
@@ -649,6 +691,13 @@ pub struct Nav {
     /// The help tab on show and its first visible row.
     help_tab: HelpTab,
     help_scroll: usize,
+    /// The Cloud screen's state (web host; see [`CloudView`]).
+    cloud: CloudView,
+    /// The vault's key list (`(provider, set)`), when the owner has a vault
+    /// here; the credentials rows then read their state from it.
+    vault: Option<Vec<(String, bool)>>,
+    /// The vault's last refusal or failure (shared words), until the next try.
+    vault_note: Option<String>,
 }
 
 /// The inline form's state. `values` has one text per field of the kind.
@@ -674,6 +723,88 @@ impl Nav {
     /// Whether the portal (sign-in or list) is the app's screen.
     pub fn is_portal(&self) -> bool {
         matches!(self.root, Screen::SignIn | Screen::Portal)
+    }
+
+    /// The Cloud screen's state: the bridge's accounts route answered (or not).
+    /// Losing it closes the Cloud screens.
+    pub fn set_cloud_available(&mut self, available: bool) {
+        self.cloud.available = available;
+        if !available {
+            self.stack.retain(|s| !matches!(s, Screen::Cloud | Screen::CloudRepos));
+        }
+    }
+
+    pub fn set_cloud_accounts(&mut self, rows: Vec<AccountRow>) {
+        self.cloud.accounts = rows;
+        self.cloud.account = self.cloud.account.min(self.cloud.accounts.len().saturating_sub(1));
+    }
+
+    pub fn set_cloud_runs(&mut self, rows: Vec<RunRow>) {
+        self.cloud.runs = rows;
+    }
+
+    pub fn set_cloud_note(&mut self, note: Option<String>) {
+        self.cloud.note = note;
+    }
+
+    /// One page of repos: the first page replaces the list, a later page
+    /// follows it. `next_page` is the page after it (None at the end).
+    pub fn set_cloud_repos(&mut self, rows: Vec<RepoRow>, next_page: Option<u32>, append: bool) {
+        if append {
+            self.cloud.repos.extend(rows);
+        } else {
+            self.cloud.repos = rows;
+        }
+        self.cloud.next_page = next_page;
+        self.clamp();
+    }
+
+    /// The vault's key list (`None` when there is no vault to read).
+    pub fn set_vault(&mut self, rows: Option<Vec<(String, bool)>>) {
+        self.vault = rows;
+        self.apply_vault();
+    }
+
+    pub fn set_vault_note(&mut self, note: Option<String>) {
+        self.vault_note = note;
+    }
+
+    /// The API-key rows show the vault's state: saved, or not configured.
+    /// Subscription rows keep the core's state.
+    fn apply_vault(&mut self) {
+        let Some(rows) = &self.vault else { return };
+        for row in self.auth.iter_mut().filter(|r| !r.oauth_capable) {
+            if let Some((_, set)) = rows.iter().find(|(id, _)| *id == row.id) {
+                row.status = if *set {
+                    modron_mobile_core::view::VAULT_SAVED_LABEL.to_string()
+                } else {
+                    modron_mobile_core::view::AUTH_NOT_CONFIGURED.to_string()
+                };
+            }
+        }
+    }
+
+    /// The repo picker's filter, while it is on top (the host's `q`).
+    pub fn cloud_query(&self) -> Option<String> {
+        (self.top() == Screen::CloudRepos).then(|| self.filter.clone())
+    }
+
+    /// The chosen account's id (the repo picker's account).
+    pub fn cloud_account_id(&self) -> Option<String> {
+        self.cloud.chosen_account().map(|a| a.id.clone())
+    }
+
+    /// The page the repo picker needs next: the last row is selected and
+    /// more pages follow.
+    pub fn cloud_next_page_due(&self) -> Option<u32> {
+        let at_end = self.top() == Screen::CloudRepos
+            && !self.cloud.repos.is_empty()
+            && self.selected + 1 >= self.cloud.repos.len();
+        if at_end {
+            self.cloud.next_page
+        } else {
+            None
+        }
     }
 
     /// Makes `screen` the bottom of the stack and clears what is above it.
@@ -773,6 +904,7 @@ impl Nav {
         self.sandbox_label = snapshot.sandbox.clone();
         self.effort_label = snapshot.effort_label.clone();
         self.auth = auth_rows(snapshot);
+        self.apply_vault();
         self.auth_progress = snapshot.oauth.clone();
         self.models = model_rows(snapshot);
         self.agents = snapshot.agents.clone();
@@ -893,6 +1025,7 @@ impl Nav {
                 | Screen::Automations
                 | Screen::Tasks
                 | Screen::Picker
+                | Screen::CloudRepos
         )
     }
 
@@ -1036,6 +1169,8 @@ impl Nav {
             Screen::Automations => self.visible_automations().len(),
             Screen::Tasks => self.visible_tasks().len(),
             Screen::Picker => self.visible_picker().len(),
+            Screen::Cloud => 0,
+            Screen::CloudRepos => self.cloud.repos.len(),
         }
     }
 
@@ -1125,6 +1260,14 @@ impl Nav {
                 if self.top() == screen || screen == Screen::Chat || screen == Screen::Agent {
                     return Vec::new();
                 }
+                // The Cloud screens need the bridge's accounts (and, for a
+                // run, one account): without them they do not open.
+                if screen == Screen::Cloud && !self.cloud.available {
+                    return Vec::new();
+                }
+                if screen == Screen::CloudRepos && self.cloud.accounts.is_empty() {
+                    return Vec::new();
+                }
                 self.push(screen);
                 match screen {
                     Screen::Sessions => return vec![UiAction::ListSessions],
@@ -1135,6 +1278,15 @@ impl Nav {
                     }
                     Screen::Settings if self.share_active() => return vec![UiAction::ListInvites],
                     Screen::Help => self.help_scroll = 0,
+                    // The accounts and runs; the host fetches the repos itself.
+                    Screen::Cloud => {
+                        self.cloud.adding = false;
+                        return vec![UiAction::CloudRefresh];
+                    }
+                    Screen::CloudRepos => {
+                        self.cloud.repos.clear();
+                        self.cloud.next_page = None;
+                    }
                     Screen::Auth => return vec![UiAction::ListAuth],
                     Screen::Automations => return vec![UiAction::ListAutomations],
                     // The list and, when a row is selected, its status.
@@ -1257,6 +1409,48 @@ impl Nav {
                     });
                 }
             }
+            NavStep::CloudEsc => {
+                if self.cloud.adding {
+                    self.cloud.adding = false;
+                } else if self.top() == Screen::Cloud {
+                    self.stack.pop();
+                    self.filter.clear();
+                    self.selected = 0;
+                }
+            }
+            NavStep::CloudAddOpen if self.top() == Screen::Cloud => self.cloud.adding = true,
+            NavStep::CloudAddDone => self.cloud.adding = false,
+            NavStep::CloudPickAccount if self.top() == Screen::Cloud => {
+                let count = self.cloud.accounts.len();
+                if count > 0 {
+                    self.cloud.account = (self.cloud.account + 1) % count;
+                }
+            }
+            NavStep::AskAccountRemove(index) if self.top() == Screen::Cloud => {
+                if let Some(row) = self.cloud.accounts.get(index).cloned() {
+                    self.pending = Some(Pending {
+                        text: cloud_account_remove_text(&row.login),
+                        actions: vec![UiAction::RemoveAccount(row.id), UiAction::CloudRefresh],
+                    });
+                }
+            }
+            NavStep::PickRepo(index) if self.top() == Screen::CloudRepos => {
+                if let Some(row) = self.cloud.repos.get(index).cloned() {
+                    self.cloud.branch = row.default_branch.clone();
+                    self.cloud.repo = Some(row);
+                    self.stack.pop();
+                    self.filter.clear();
+                    self.selected = 0;
+                }
+            }
+            NavStep::CloudOpenRun(index) if self.top() == Screen::Cloud => {
+                let url =
+                    self.cloud.runs.get(index).and_then(|r| cloud::open_target(&r.session_url));
+                if let Some(url) = url {
+                    return vec![UiAction::OpenUrl(url)];
+                }
+            }
+            NavStep::SetBranch(text) => self.cloud.branch = text,
             NavStep::OpenPortal(index) if self.top() == Screen::Portal => {
                 if let Some(url) =
                     self.visible_portal().get(index).and_then(|l| portal::open_target(l))
@@ -1518,6 +1712,10 @@ impl Nav {
             help_tab: self.help_tab,
             help_rows: help::tab_lines(self.help_tab),
             help_scroll: self.help_scroll.min(self.help_max_scroll()),
+            cloud: self.cloud.clone(),
+            vault: self.vault.is_some(),
+            vault_note: self.vault_note.clone(),
+            portal_root: self.is_portal(),
             form: self.form.as_ref().map(|f| FormView {
                 kind: f.kind,
                 labels: f.kind.labels(),
@@ -2759,5 +2957,156 @@ mod persona_task_auth_tests {
         nav.apply(NavStep::Open(Screen::Auth));
         nav.apply(NavStep::AskAuthRemove(0));
         assert_eq!(nav.view().confirm, None);
+    }
+}
+
+#[cfg(test)]
+mod cloud_nav_tests {
+    use super::*;
+    use crate::cloud::{AccountRow, RepoRow};
+    use modron_mobile_core::view::VAULT_SAVED_LABEL;
+
+    fn account(id: &str, login: &str) -> AccountRow {
+        AccountRow { id: id.into(), login: login.into(), text: format!("{login} \u{b7} token") }
+    }
+
+    fn repo(full_name: &str, branch: &str) -> RepoRow {
+        RepoRow {
+            full_name: full_name.into(),
+            default_branch: branch.into(),
+            text: full_name.into(),
+        }
+    }
+
+    /// A portal-root nav with the bridge answering and one linked account.
+    fn cloud_nav() -> Nav {
+        let mut nav = Nav::default();
+        nav.set_root(Screen::Portal);
+        nav.set_cloud_available(true);
+        nav.set_cloud_accounts(vec![account("a1", "octocat")]);
+        nav
+    }
+
+    #[test]
+    fn the_cloud_screen_opens_only_when_the_bridge_answered() {
+        let mut nav = Nav::default();
+        assert!(nav.apply(NavStep::Open(Screen::Cloud)).is_empty());
+        assert_eq!(nav.top(), Screen::Chat);
+        nav.set_cloud_available(true);
+        assert_eq!(nav.apply(NavStep::Open(Screen::Cloud)), vec![UiAction::CloudRefresh]);
+        assert_eq!(nav.top(), Screen::Cloud);
+        // A refusal later closes the Cloud screens.
+        nav.set_cloud_available(false);
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+
+    #[test]
+    fn the_repo_picker_needs_an_account_and_a_pick_fills_the_run() {
+        let mut nav = Nav::default();
+        nav.set_cloud_available(true);
+        assert!(nav.apply(NavStep::Open(Screen::CloudRepos)).is_empty(), "no account yet");
+        nav = cloud_nav();
+        nav.apply(NavStep::Open(Screen::Cloud));
+        nav.apply(NavStep::Open(Screen::CloudRepos));
+        assert_eq!(nav.top(), Screen::CloudRepos);
+        nav.set_cloud_repos(vec![repo("acme/app", "main")], None, false);
+        nav.apply(NavStep::PickRepo(0));
+        assert_eq!(nav.top(), Screen::Cloud, "a pick closes the picker");
+        let view = nav.view();
+        assert_eq!(view.cloud.branch, "main", "the branch starts at the default");
+        assert_eq!(
+            view.cloud_start_action(),
+            Some(UiAction::StartRun {
+                account: "a1".into(),
+                repo: "acme/app".into(),
+                branch: "main".into()
+            })
+        );
+        nav.apply(NavStep::SetBranch("dev".into()));
+        assert_eq!(
+            nav.view().cloud_start_action(),
+            Some(UiAction::StartRun {
+                account: "a1".into(),
+                repo: "acme/app".into(),
+                branch: "dev".into()
+            })
+        );
+        nav.apply(NavStep::SetBranch(" ".into()));
+        assert_eq!(nav.view().cloud_start_action(), None, "a blank branch starts nothing");
+    }
+
+    #[test]
+    fn esc_closes_the_token_entry_before_it_leaves_the_screen() {
+        let mut nav = cloud_nav();
+        nav.apply(NavStep::Open(Screen::Cloud));
+        nav.apply(NavStep::CloudAddOpen);
+        assert!(nav.view().cloud.adding);
+        nav.apply(NavStep::CloudEsc);
+        assert!(!nav.view().cloud.adding);
+        assert_eq!(nav.top(), Screen::Cloud);
+        nav.apply(NavStep::CloudEsc);
+        assert_eq!(nav.top(), Screen::Portal, "back to the portal list");
+    }
+
+    #[test]
+    fn removing_an_account_asks_first_and_then_sends_the_remove() {
+        let mut nav = cloud_nav();
+        nav.apply(NavStep::Open(Screen::Cloud));
+        nav.apply(NavStep::AskAccountRemove(0));
+        assert_eq!(nav.view().confirm.as_deref(), Some("remove octocat? y / n"));
+        assert_eq!(
+            nav.apply(NavStep::Confirm),
+            vec![UiAction::RemoveAccount("a1".into()), UiAction::CloudRefresh]
+        );
+    }
+
+    #[test]
+    fn the_repo_filter_is_the_query_and_it_pages_at_the_last_row() {
+        let mut nav = cloud_nav();
+        nav.apply(NavStep::Open(Screen::Cloud));
+        nav.apply(NavStep::Open(Screen::CloudRepos));
+        assert_eq!(nav.cloud_query().as_deref(), Some(""));
+        nav.apply(NavStep::Filter('a'));
+        assert_eq!(nav.cloud_query().as_deref(), Some("a"));
+        nav.apply(NavStep::ClearFilter);
+        assert_eq!(nav.cloud_query().as_deref(), Some(""));
+        nav.set_cloud_repos(
+            vec![repo("acme/app", "main"), repo("acme/api", "dev")],
+            Some(2),
+            false,
+        );
+        assert_eq!(nav.cloud_next_page_due(), None, "the first row is not the end");
+        nav.apply(NavStep::Move(1));
+        assert_eq!(nav.cloud_next_page_due(), Some(2), "the last row asks for the next page");
+        nav.set_cloud_repos(vec![repo("acme/web", "main")], None, true);
+        assert_eq!(nav.view().cloud.repos.len(), 3, "a later page appends");
+        assert_eq!(nav.cloud_next_page_due(), None);
+    }
+
+    #[test]
+    fn the_vault_sets_the_api_key_rows_and_leaves_subscriptions_alone() {
+        let rows = vec![
+            AuthRow {
+                id: "openai".into(),
+                label: "OpenAI".into(),
+                status: "not configured".into(),
+                oauth_capable: false,
+            },
+            AuthRow {
+                id: "anthropic".into(),
+                label: "Anthropic".into(),
+                status: "subscription (oauth)".into(),
+                oauth_capable: true,
+            },
+        ];
+        let mut nav = Nav { auth: rows, ..Nav::default() };
+        nav.set_vault(Some(vec![("openai".into(), true), ("anthropic".into(), true)]));
+        assert_eq!(nav.auth[0].status, VAULT_SAVED_LABEL);
+        assert_eq!(nav.auth[1].status, "subscription (oauth)");
+        assert!(nav.view().vault);
+        nav.set_vault(Some(vec![("openai".into(), false)]));
+        assert_eq!(nav.auth[0].status, "not configured");
+        nav.set_vault(None);
+        assert!(!nav.view().vault);
     }
 }

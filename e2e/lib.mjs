@@ -171,7 +171,8 @@ export function copyApp() {
 // provider (default mock) and portalCredentials (--portal-credentials) are for
 // the vault scenario (C1). For a real provider the serve's environment drops
 // OPENAI_API_KEY, so only the vault can supply it. extraEnv is merged last.
-export async function startServe(name, { bridgeWs, hostToken, config, remoteControl, provider = 'mock', portalCredentials = false, extraEnv = {} } = {}) {
+// runId: --run-id (a cloud run's serve, PLAN 10.10): its portal session carries the id.
+export async function startServe(name, { bridgeWs, hostToken, config, remoteControl, provider = 'mock', portalCredentials = false, runId, extraEnv = {} } = {}) {
   const home = join(SCRATCH, 'h-' + name);
   const work = join(home, 'w');
   mkdirSync(join(work, '.modron'), { recursive: true }); // remote-control needs a project marker
@@ -192,9 +193,48 @@ export async function startServe(name, { bridgeWs, hostToken, config, remoteCont
   const shareUrlFile = remoteControl ? join(home, 'share-url') : null;
   if (remoteControl) args.push('--remote-control', remoteControl, '--share-url-file', shareUrlFile);
   if (portalCredentials) args.push('--portal-credentials');
+  if (runId) args.push('--run-id', runId);
   const child = spawnLogged('serve-' + name, MODRON, args, { cwd: work, env, log });
   await waitUntil(() => portOpen(port), 60000, `serve ${name} listening (log ${log})`);
   return { name, port, ws: `ws://127.0.0.1:${port}`, log, shareUrlFile, home, pid: child.pid };
+}
+
+// The cloud scenario's two fakes on 127.0.0.1 (PLAN 10.10): GitHub (GET /user,
+// GET /user/repos, one repo) and the container worker (POST /wake, /stop).
+// Every call is recorded; the wake body carries the git token, by design.
+export async function startFakeCloud({ ghToken, wakeToken, login = 'modron-e2e' }) {
+  const wakes = [];
+  const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+  const gh = createHttpServer((req, res) => {
+    if ((req.headers.authorization || '') !== `Bearer ${ghToken}`) return json(res, 401, { message: 'Bad credentials' });
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (url.pathname === '/user') return json(res, 200, { login });
+    if (url.pathname === '/user/repos') {
+      const page = Number(url.searchParams.get('page') || '1');
+      const repo = { full_name: `${login}/app`, private: false, default_branch: 'main', pushed_at: new Date().toISOString() };
+      return json(res, 200, page === 1 ? [repo] : []);
+    }
+    return json(res, 404, { message: 'Not Found' });
+  });
+  const ct = createHttpServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const parsed = body ? JSON.parse(body) : null;
+      wakes.push({ path: req.url, auth: req.headers.authorization || '', body: parsed });
+      if ((req.headers.authorization || '') !== `Bearer ${wakeToken}`) return json(res, 401, { error: 'unauthorized' });
+      if (req.url === '/wake') return json(res, 202, { running: true });
+      if (req.url === '/stop') return json(res, 200, { running: false });
+      return json(res, 404, { error: 'not found' });
+    });
+  });
+  for (const srv of [gh, ct]) await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return {
+    gh: `http://127.0.0.1:${gh.address().port}`,
+    ct: `http://127.0.0.1:${ct.address().port}`,
+    wakes,
+    close: () => { gh.close(); ct.close(); },
+  };
 }
 
 // A fake OpenAI-compatible endpoint on 127.0.0.1. Every request's path and

@@ -204,6 +204,11 @@ enum Command {
         /// MODRON_PORTAL_CREDENTIALS=1 (the cloud container sets it).
         #[arg(long = "portal-credentials")]
         portal_credentials: bool,
+        /// The cloud run this serve belongs to (PLAN 10.10). Its portal
+        /// session carries the id, so the owner's run list links the run to
+        /// the session. Also set by env MODRON_RUN_ID; [a-z0-9-], 1 to 64.
+        #[arg(long = "run-id", value_name = "ID")]
+        run_id: Option<String>,
     },
     /// Manage paired remote devices (Phase 3): mint, list, revoke the
     /// bearer tokens remote clients send in their hello frame.
@@ -765,6 +770,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         share_url_file,
         handoff_on_exit,
         portal_credentials,
+        run_id,
     }) = &cli.command
     {
         // The flag wins over MODRON_REMOTE_CONTROL (see rc::resolve_remote_control).
@@ -852,6 +858,11 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
                 remote_control: remote,
                 share_url_file: share_url_file.clone(),
                 handoff_on_exit: on_exit,
+                run_id: run_id.clone().or_else(|| {
+                    std::env::var("MODRON_RUN_ID")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                }),
                 ..modron_server::ServeOptions::default()
             },
         )

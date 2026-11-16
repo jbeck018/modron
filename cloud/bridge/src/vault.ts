@@ -70,24 +70,36 @@ async function vaultAesKey(vaultSecret: string): Promise<CryptoKey> {
   );
 }
 
-// Seals one value for one provider id with a fresh nonce.
-export async function sealCredential(vaultSecret: string, providerId: string, value: string): Promise<Sealed> {
+// Seals one value under an associated-data label (a provider id for
+// provider keys, an account id for GitHub tokens) with a fresh nonce.
+export async function sealValue(vaultSecret: string, aad: string, value: string): Promise<Sealed> {
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: nonce, additionalData: enc.encode(providerId), tagLength: 128 },
+    { name: "AES-GCM", iv: nonce, additionalData: enc.encode(aad), tagLength: 128 },
     await vaultAesKey(vaultSecret),
     enc.encode(value),
   );
   return { nonce, ciphertext: new Uint8Array(ct) };
 }
 
-// Opens a sealed value. Throws on a wrong VAULT_KEY, a wrong provider id, or
-// any change to the nonce or ciphertext. Callers catch and report "unreadable".
-export async function openCredential(vaultSecret: string, providerId: string, sealed: Sealed): Promise<string> {
+// Opens a sealed value under the same label. Throws on a wrong VAULT_KEY, a
+// wrong label, or any change to the nonce or ciphertext. Callers catch and
+// report "unreadable".
+export async function openValue(vaultSecret: string, aad: string, sealed: Sealed): Promise<string> {
   const pt = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: sealed.nonce, additionalData: enc.encode(providerId), tagLength: 128 },
+    { name: "AES-GCM", iv: sealed.nonce, additionalData: enc.encode(aad), tagLength: 128 },
     await vaultAesKey(vaultSecret),
     sealed.ciphertext,
   );
   return dec.decode(pt);
+}
+
+// Seals one provider key for one provider id.
+export function sealCredential(vaultSecret: string, providerId: string, value: string): Promise<Sealed> {
+  return sealValue(vaultSecret, providerId, value);
+}
+
+// Opens one provider key sealed for `providerId`.
+export function openCredential(vaultSecret: string, providerId: string, sealed: Sealed): Promise<string> {
+  return openValue(vaultSecret, providerId, sealed);
 }

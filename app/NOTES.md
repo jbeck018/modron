@@ -301,3 +301,20 @@ the screen only when the host's actions are pumped (`Harness::action`), since
   scripted site. Delivery to a device and the service worker's `push` handler
   are not exercised.
 - The bridge-side redirect gap above.
+
+## Cloud screen and vault (C6e, C6f; PLAN 10.9 item 3, 10.10)
+
+- Web only, owner only, drawn only where the bridge answers: the Cloud entry
+  (`/cloud`, or the portal list's `cloud` control) shows when
+  `GET /api/github/accounts` answers 200; the credentials rows read the vault
+  when `GET /api/credentials` answers 200. Any 401, 403 or 503 hides them.
+- Target-neutral logic: `src/cloud.rs` (rows, URLs, bodies, the vault list).
+  Shared words and formatters: `mobile/rust-core/src/view.rs` (`CLOUD_*`,
+  `RUN_*`, `VAULT_*`, `run_line`, `repo_line`, `token_refused_line`).
+- The repo picker reuses the list filter (`Screen::CloudRepos`). The host sends
+  the text as `q` after `QUERY_PAUSE_MS` without a change, and pages when the
+  last row is selected (`web.rs`, `tick_repo_picker`).
+- `SetKey` and `AuthRemove` go to the bridge (not the session socket) only
+  while `Host::set_vault` holds a vault (`chat.rs`, `UiAction::is_vault`). The
+  terminal never sets it, so its key route is unchanged.
+- Runs refresh every `RUNS_REFRESH_MS` while the Cloud screen shows.

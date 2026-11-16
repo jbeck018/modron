@@ -30,6 +30,13 @@ use modron_mobile_core::view::{
 use crate::help::{HELP_TABS, HELP_VISIBLE};
 use crate::nav::{FormKind, NavStep, NavView, PickerRow, Screen};
 use modron_mobile_core::view::REMOVE_LABEL;
+use modron_mobile_core::view::{
+    CLOUD_ACCOUNTS_EMPTY_LABEL, CLOUD_ACCOUNTS_LABEL, CLOUD_ACCOUNT_ADD_LABEL,
+    CLOUD_ACCOUNT_PICK_LABEL, CLOUD_BRANCH_LABEL, CLOUD_LABEL, CLOUD_NO_ACCOUNT_LABEL,
+    CLOUD_OPEN_LABEL, CLOUD_REPOS_EMPTY_LABEL, CLOUD_REPO_PICK_LABEL, CLOUD_RUNS_EMPTY_LABEL,
+    CLOUD_RUNS_LABEL, CLOUD_RUN_LABEL, CLOUD_START_LABEL, CLOUD_STOP_LABEL, CLOUD_TOKEN_HINT,
+    CLOUD_TOKEN_PLACEHOLDER, CLOUD_WAKE_LABEL, VAULT_NOTE_LABEL,
+};
 
 /// Picker rows the list shows at once (a longer list is filtered, not scrolled).
 const PICKER_SLOTS: usize = 16;
@@ -47,6 +54,10 @@ const INVITE_SLOTS: usize = 8;
 const AUTOMATION_SLOTS: usize = 12;
 const TASK_SLOTS: usize = 12;
 const FORM_SLOTS: usize = 3;
+/// Cloud slots: accounts, runs, and one page of repos (the picker's page).
+const CLOUD_ACCOUNT_SLOTS: usize = 8;
+const CLOUD_RUN_SLOTS: usize = 12;
+const CLOUD_REPO_SLOTS: usize = 50;
 
 /// Web controls for the list screens and their forms. App copy: the
 /// terminal does not draw these (its keys are the hints above each list).
@@ -128,6 +139,14 @@ fn chat_frame(
         .child(when(move || nav.with(|n| n.screen == Screen::Tasks), {
             let actions = actions.clone();
             move || tasks_body(nav, actions.clone())
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Cloud), {
+            let actions = actions.clone();
+            move || cloud_body(nav, actions.clone())
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::CloudRepos), {
+            let actions = actions.clone();
+            move || cloud_repos_body(nav, actions.clone())
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Help), {
             let actions = actions.clone();
@@ -396,6 +415,17 @@ fn auth_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl I
     }
     column = column
         .child(when(move || nav.with(|n| n.auth_progress.is_some()), move || auth_progress(nav)));
+    // The vault's note (the keys above are stored for the cloud hosts).
+    column = column.child(when(
+        move || nav.with(|n| n.vault),
+        move || text(VAULT_NOTE_LABEL).text_color(muted()),
+    ));
+    column = column.child(when(
+        move || nav.with(|n| n.vault_note.is_some()),
+        move || {
+            text(move || nav.with(|n| n.vault_note.clone().unwrap_or_default())).text_color(muted())
+        },
+    ));
     let confirm_actions = actions.clone();
     column
         .child(when(
@@ -441,6 +471,299 @@ fn auth_row(
     } else {
         row
     }
+}
+
+/// A tap-able text control: a bold line that sends `press` (web only).
+fn cloud_button(
+    label: impl Fn() -> String + 'static,
+    press: impl Fn() + 'static,
+) -> impl IntoElement {
+    view()
+        .role(AccessibilityRole::Button)
+        .px(px(8.0))
+        .on_press(press)
+        .child(text(label).text_color(move || token_ink(style_token(Style::Bold))))
+}
+
+/// The Cloud screen (web, owner; PLAN 10.10): the linked GitHub accounts
+/// (add by token, remove with a y / n), the new-run form (account, repo,
+/// branch, start) and the runs list (open, stop, wake). Every control is a
+/// tap; the note line carries the shared words for a refusal or a failure.
+fn cloud_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column.child(text(CLOUD_LABEL).font_weight(FontWeight::BOLD));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.note.is_some()),
+        move || {
+            text(move || nav.with(|n| n.cloud.note.clone().unwrap_or_default())).text_color(muted())
+        },
+    ));
+    column = column.child(text(CLOUD_ACCOUNTS_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.accounts.is_empty()),
+        move || text(CLOUD_ACCOUNTS_EMPTY_LABEL).text_color(muted()),
+    ));
+    for i in 0..CLOUD_ACCOUNT_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.cloud.accounts.len() > i),
+            move || cloud_account_row(nav, i, actions.clone()),
+        ));
+    }
+    column = column.child(when(move || nav.with(|n| !n.cloud.adding), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                || CLOUD_ACCOUNT_ADD_LABEL.to_string(),
+                move || {
+                    let _ = actions.send(UiAction::Nav(NavStep::CloudAddOpen));
+                },
+            )
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| n.cloud.adding), {
+        let actions = actions.clone();
+        move || cloud_token_entry(actions.clone())
+    }));
+    column = column.child(text(CLOUD_RUN_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.accounts.is_empty()),
+        move || text(CLOUD_NO_ACCOUNT_LABEL).text_color(muted()),
+    ));
+    column = column.child(when(move || nav.with(|n| n.cloud.accounts.len() > 1), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                move || {
+                    nav.with(|n| {
+                        let login =
+                            n.cloud.chosen_account().map(|a| a.login.clone()).unwrap_or_default();
+                        format!("{CLOUD_ACCOUNT_PICK_LABEL}: {login}")
+                    })
+                },
+                move || {
+                    let _ = actions.send(UiAction::Nav(NavStep::CloudPickAccount));
+                },
+            )
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| !n.cloud.accounts.is_empty()), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                move || {
+                    nav.with(|n| match &n.cloud.repo {
+                        Some(repo) => format!("{CLOUD_REPO_PICK_LABEL}: {}", repo.full_name),
+                        None => CLOUD_REPO_PICK_LABEL.to_string(),
+                    })
+                },
+                move || {
+                    let _ = actions.send(UiAction::Nav(NavStep::Open(Screen::CloudRepos)));
+                },
+            )
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| n.cloud.repo.is_some()), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            input()
+                .placeholder(CLOUD_BRANCH_LABEL)
+                .value(move || nav.with(|n| n.cloud.branch.clone()))
+                .on_change(move |s: &str| {
+                    let _ = actions.send(UiAction::Nav(NavStep::SetBranch(s.to_string())));
+                })
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| n.cloud_start_action().is_some()), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                || CLOUD_START_LABEL.to_string(),
+                move || {
+                    if let Some(action) = nav.with(|n| n.cloud_start_action()) {
+                        let _ = actions.send(action);
+                    }
+                },
+            )
+        }
+    }));
+    column = column.child(text(CLOUD_RUNS_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.runs.is_empty()),
+        move || text(CLOUD_RUNS_EMPTY_LABEL).text_color(muted()),
+    ));
+    for i in 0..CLOUD_RUN_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.cloud.runs.len() > i),
+            move || cloud_run_row(nav, i, actions.clone()),
+        ));
+    }
+    column.child(confirm_line(nav, actions))
+}
+
+/// One linked account: its line, and a remove control (it asks y / n).
+fn cloud_account_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let line =
+        move || nav.with(|n| n.cloud.accounts.get(i).map(|a| a.text.clone()).unwrap_or_default());
+    view()
+        .flex_row()
+        .child(text(line).text_color(move || token_ink(style_token(Style::Plain))))
+        .child(tap(REMOVE_LABEL, actions, UiAction::Nav(NavStep::AskAccountRemove(i))))
+}
+
+/// One run: its line, then open (when it has a session), stop and wake as
+/// its state offers them.
+fn cloud_run_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let line =
+        move || nav.with(|n| n.cloud.runs.get(i).map(|r| r.text.clone()).unwrap_or_default());
+    let open_actions = actions.clone();
+    let stop_actions = actions.clone();
+    let wake_actions = actions;
+    view()
+        .flex_col()
+        .child(text(line).text_color(move || token_ink(style_token(Style::Plain))))
+        .child(
+            view()
+                .flex_row()
+                .child(when(
+                    move || {
+                        nav.with(|n| n.cloud.runs.get(i).is_some_and(|r| !r.session_url.is_empty()))
+                    },
+                    move || {
+                        let actions = open_actions.clone();
+                        cloud_button(
+                            || CLOUD_OPEN_LABEL.to_string(),
+                            move || {
+                                let _ = actions.send(UiAction::Nav(NavStep::CloudOpenRun(i)));
+                            },
+                        )
+                    },
+                ))
+                .child(when(
+                    move || nav.with(|n| n.cloud.runs.get(i).is_some_and(|r| r.stop)),
+                    move || {
+                        let actions = stop_actions.clone();
+                        cloud_button(
+                            || CLOUD_STOP_LABEL.to_string(),
+                            move || {
+                                if let Some(id) =
+                                    nav.with(|n| n.cloud.runs.get(i).map(|r| r.id.clone()))
+                                {
+                                    let _ = actions.send(UiAction::StopRun(id));
+                                }
+                            },
+                        )
+                    },
+                ))
+                .child(when(
+                    move || nav.with(|n| n.cloud.runs.get(i).is_some_and(|r| r.wake)),
+                    move || {
+                        let actions = wake_actions.clone();
+                        cloud_button(
+                            || CLOUD_WAKE_LABEL.to_string(),
+                            move || {
+                                if let Some(id) =
+                                    nav.with(|n| n.cloud.runs.get(i).map(|r| r.id.clone()))
+                                {
+                                    let _ = actions.send(UiAction::WakeRun(id));
+                                }
+                            },
+                        )
+                    },
+                )),
+        )
+}
+
+/// The masked token entry for "add account" (the same widget as the key
+/// entry). The field is cleared on every submit; Enter and the save control
+/// send the same action.
+fn cloud_token_entry(actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let token = signal(String::new());
+    let submit = actions.clone();
+    let press = actions;
+    let field = input()
+        .masked(true)
+        .auto_focus(true)
+        .submit_behavior(SubmitBehavior::Submit)
+        .placeholder(CLOUD_TOKEN_PLACEHOLDER)
+        .value(move || token.get())
+        .on_change(move |s: &str| token.set(s.to_string()))
+        .on_submit(move |s: &str| {
+            send_token(&submit, s);
+            token.set(String::new());
+        });
+    view().flex_col().child(text(CLOUD_TOKEN_HINT).text_color(muted())).child(field).child(
+        cloud_button(
+            || AUTH_KEY_SAVE_HINT.to_string(),
+            move || {
+                let value = token.get();
+                token.set(String::new());
+                send_token(&press, &value);
+            },
+        ),
+    )
+}
+
+/// Sends the token for a new linked account and closes the entry. An empty
+/// token sends nothing and keeps the entry open.
+fn send_token(actions: &UnboundedSender<UiAction>, value: &str) {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return;
+    }
+    let _ = actions
+        .send(UiAction::AddAccount(SecretKey { provider: "github".to_string(), key: value }));
+    let _ = actions.send(UiAction::Nav(NavStep::CloudAddDone));
+}
+
+/// The repo picker (web, owner): the filter line (sent to the server as
+/// `q`), one row per repo, and the list's end. A tap on a row uses that repo.
+fn cloud_repos_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    column = column.child(text(CLOUD_REPO_PICK_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.repos.is_empty() && n.cloud.next_page.is_none()),
+        move || text(CLOUD_REPOS_EMPTY_LABEL).text_color(muted()),
+    ));
+    for i in 0..CLOUD_REPO_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.cloud.repos.len() > i),
+            move || cloud_repo_row(nav, i, actions.clone()),
+        ));
+    }
+    column
+}
+
+/// One repo row: a press uses that repo (the picker closes).
+fn cloud_repo_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let line =
+        move || nav.with(|n| n.cloud.repos.get(i).map(|r| r.text.clone()).unwrap_or_default());
+    view()
+        .role(AccessibilityRole::Button)
+        .on_press(move || {
+            let _ = actions.send(UiAction::Nav(NavStep::PickRepo(i)));
+        })
+        .child(text(line).text_color(move || token_ink(style_token(Style::Plain))))
 }
 
 /// The browser sign-in progress: the stage, the message, the URL to open
@@ -997,10 +1320,18 @@ fn portal_frame(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> imp
             let actions = actions.clone();
             move || sign_in_body(nav, actions.clone())
         }))
-        .child(when(
-            move || nav.with(|n| n.screen == Screen::Portal),
-            move || portal_body(nav, actions.clone()),
-        ))
+        .child(when(move || nav.with(|n| n.screen == Screen::Portal), {
+            let actions = actions.clone();
+            move || portal_body(nav, actions.clone())
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Cloud), {
+            let actions = actions.clone();
+            move || cloud_body(nav, actions.clone())
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::CloudRepos), {
+            let actions = actions.clone();
+            move || cloud_repos_body(nav, actions.clone())
+        }))
 }
 
 /// The owner sign-in: a masked token input (the page never shows or keeps
@@ -1057,6 +1388,10 @@ fn portal_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl
         .flex_row()
         .child(text(SESSIONS_LABEL).font_weight(FontWeight::BOLD))
         .child(tap(REFRESH_LABEL, actions.clone(), UiAction::RefreshPortal))
+        .child(when(move || nav.with(|n| n.cloud.available), {
+            let actions = actions.clone();
+            move || tap(CLOUD_LABEL, actions.clone(), UiAction::Nav(NavStep::Open(Screen::Cloud)))
+        }))
         .child(tap(SIGN_OUT_LABEL, actions.clone(), UiAction::SignOut));
     let mut column = view().flex_col().child(header);
     column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));

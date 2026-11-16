@@ -20,7 +20,7 @@
 
 use crate::dispatch::Outbound;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -251,6 +251,43 @@ pub async fn refresh_portal_credentials_logged(bridge_base: &str, host_token: &s
 /// `cloud`; `local` when unset.
 pub const HOST_KIND_ENV: &str = "MODRON_HOST_KIND";
 
+/// The cloud run this process serves (PLAN 10.10), set once at start by
+/// `modron serve --run-id`. One serve process is one run, so a process-wide
+/// value is the right scope: every portal registration it makes carries it.
+static SERVE_RUN_ID: OnceLock<String> = OnceLock::new();
+
+/// A run id as the bridge accepts it: [a-z0-9-], 1 to 64 characters.
+pub fn check_run_id(value: &str) -> Result<()> {
+    let ok = !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!("run id must match [a-z0-9-]{{1,64}}"))
+    }
+}
+
+/// Records the run this process serves. Refused when a different id is
+/// already set; repeating the same id is a no-op.
+pub fn set_serve_run_id(value: &str) -> Result<()> {
+    check_run_id(value)?;
+    if SERVE_RUN_ID.set(value.to_string()).is_err()
+        && SERVE_RUN_ID.get().map(String::as_str) != Some(value)
+    {
+        return Err(anyhow!(
+            "a different run id is already set for this process"
+        ));
+    }
+    Ok(())
+}
+
+fn serve_run_id() -> Option<String> {
+    SERVE_RUN_ID.get().cloned()
+}
+
 /// Environment lookup, injected so tests never mutate the process env.
 pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
@@ -379,6 +416,8 @@ struct PortalHost {
     token: String,
     host_label: String,
     host_kind: &'static str,
+    /// The cloud run this session belongs to (see [`set_serve_run_id`]).
+    run_id: Option<String>,
     state: Arc<ServerState>,
     timing: RegistrationTiming,
 }
@@ -444,6 +483,7 @@ fn start_registration(
         viewer_key: viewer_key(key),
         token,
         host_label: host_label(lookup),
+        run_id: serve_run_id(),
         host_kind: if env_value(lookup, HOST_KIND_ENV).as_deref() == Some("cloud") {
             "cloud"
         } else {
@@ -520,6 +560,29 @@ async fn registration_loop(host: PortalHost, mut stop: oneshot::Receiver<()>) {
     }
 }
 
+/// The JSON body of one directory PUT. `run_id` is included only for a cloud
+/// run's session (the bridge moves the run to running on it).
+fn entry_body(
+    title: &str,
+    host_label: &str,
+    host_kind: &str,
+    viewer_key: &str,
+    run_id: Option<&str>,
+    running: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "title": title,
+        "host_label": host_label,
+        "host_kind": host_kind,
+        "viewer_key": viewer_key,
+        "state": if running { "running" } else { "idle" },
+    });
+    if let Some(run) = run_id {
+        body["run_id"] = serde_json::Value::String(run.to_string());
+    }
+    body
+}
+
 /// One PUT of the session's directory entry.
 async fn put_entry(
     client: &reqwest::Client,
@@ -527,13 +590,15 @@ async fn put_entry(
     host: &PortalHost,
     running: bool,
 ) -> PutOutcome {
-    let body = serde_json::json!({
-        "title": session_title(&host.state, host.session).await,
-        "host_label": host.host_label,
-        "host_kind": host.host_kind,
-        "viewer_key": host.viewer_key,
-        "state": if running { "running" } else { "idle" },
-    });
+    let title = session_title(&host.state, host.session).await;
+    let body = entry_body(
+        &title,
+        &host.host_label,
+        host.host_kind,
+        &host.viewer_key,
+        host.run_id.as_deref(),
+        running,
+    );
     let response = client
         .put(url)
         .header(AUTHORIZATION, format!("Bearer {}", host.token))
@@ -1256,6 +1321,31 @@ pub fn start_remote_control(
     }
     let _ = tunnel_url;
     Ok(open_url)
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::{check_run_id, entry_body};
+
+    #[test]
+    fn registration_body_carries_run_id_only_for_a_run() {
+        let with = entry_body("t", "lbl", "cloud", "abcd", Some("run-1"), true);
+        assert_eq!(with["run_id"], "run-1");
+        assert_eq!(with["state"], "running");
+        let without = entry_body("t", "lbl", "local", "abcd", None, false);
+        assert!(without.get("run_id").is_none());
+        assert_eq!(without["state"], "idle");
+        assert_eq!(without["viewer_key"], "abcd");
+    }
+
+    #[test]
+    fn run_ids_follow_the_bridge_rule() {
+        assert!(check_run_id("3f2a-run-1").is_ok());
+        assert!(check_run_id("").is_err());
+        assert!(check_run_id("Has Upper").is_err());
+        assert!(check_run_id("a/b").is_err());
+        assert!(check_run_id(&"a".repeat(65)).is_err());
+    }
 }
 
 #[cfg(test)]

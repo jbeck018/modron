@@ -95,6 +95,7 @@ impl Tool for InteractTool {
             // tmux server, which takes its environment from the client that
             // started it; a server that is already running keeps its own.
             let mut tmux = tokio::process::Command::new("tmux");
+            modron_core::hooks::scrub_tokio_command(&mut tmux);
             scrub_tokio_command(&mut tmux);
             tmux.args(&cmd)
                 .current_dir(&ctx.working_dir)

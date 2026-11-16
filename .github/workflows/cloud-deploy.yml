@@ -3,7 +3,10 @@ name: Cloud container deploy
 # Manual only: nothing here runs on push or on a schedule. It builds the
 # modron cloud image from the repo root as a gate, then deploys the Worker
 # and Container in cloud/container/ into the Cloudflare account whose
-# credentials are repository secrets. See cloud/container/README.md.
+# credentials are repository secrets. The Worker takes one runtime secret,
+# WAKE_TOKEN (the bridge sends the same value). Per-run values and GitHub
+# tokens come from the bridge at wake time, not from here. See
+# cloud/container/README.md.
 
 on:
   workflow_dispatch:
@@ -78,13 +81,8 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       WORKER_NAME: modron-container-${{ inputs.environment }}
-      # Runtime secrets, read by the step below. Unset repository secrets
-      # become empty and that secret is skipped with a notice.
-      SECRET_BRIDGE_URL: ${{ secrets.BRIDGE_URL }}
-      # Repository secret names cannot start with GITHUB_, hence CLOUD_.
-      SECRET_GITHUB_REPO: ${{ secrets.CLOUD_GITHUB_REPO }}
-      SECRET_GITHUB_TOKEN: ${{ secrets.CLOUD_GITHUB_TOKEN }}
-      SECRET_MODRON_HOST_TOKEN: ${{ secrets.MODRON_HOST_TOKEN }}
+      # The one runtime secret, read by the step below. An unset repository
+      # secret is skipped with a notice (wake then answers 503).
       SECRET_WAKE_TOKEN: ${{ secrets.WAKE_TOKEN }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -109,7 +107,7 @@ jobs:
         working-directory: cloud/container
         run: |
           set -eu
-          for name in BRIDGE_URL GITHUB_REPO GITHUB_TOKEN MODRON_HOST_TOKEN WAKE_TOKEN; do
+          for name in WAKE_TOKEN; do
             var="SECRET_$name"
             value="${!var:-}"
             if [ -z "$value" ]; then
@@ -123,5 +121,5 @@ jobs:
         run: |
           {
             echo "### Deployed $WORKER_NAME"
-            echo "Runtime secrets were set from repository secrets; unset ones were skipped (see notices)."
+            echo "WAKE_TOKEN was set from the repository secret (or skipped, see notices). The bridge holds the same value."
           } >> "$GITHUB_STEP_SUMMARY"

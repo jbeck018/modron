@@ -297,6 +297,7 @@ here is not read by `modron`.
 | `MODRON_GOAL_MAX_ITERATIONS` | Iteration cap for `--goal` runs. Default `10`. A non-numeric value is ignored. |
 | `RUST_LOG` | Tracing filter. Replaces the default `info`, or `debug` with `--verbose`. |
 | `MODRON_HANDOFF_ON_EXIT` | `modron serve`: `1` or `true` turns on `--handoff-on-exit`. |
+| `MODRON_RUN_ID` | `modron serve`: the cloud run this serve belongs to (same as `--run-id`; PLAN 10.10). Letters a-z, digits and dashes, 1 to 64. The portal registration then carries it. |
 | `MODRON_FURROW_BIN` | `modron handoff` with `carrier = "furrow"`: path of the furrow binary (default: `furrow` on PATH). |
 | `FURROW_RECOVERY_KEY` | `modron handoff` with `carrier = "furrow"`: the workspace recovery key (required). Furrow's own variables are listed under `[handoff]`. |
 

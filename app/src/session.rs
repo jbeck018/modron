@@ -773,6 +773,12 @@ fn apply(client: &RemoteClient, action: UiAction) {
         | UiAction::RevokeInvite(_)
         | UiAction::CopyInvite(_)
         | UiAction::TogglePush
+        | UiAction::CloudRefresh
+        | UiAction::AddAccount(_)
+        | UiAction::RemoveAccount(_)
+        | UiAction::StartRun { .. }
+        | UiAction::StopRun(_)
+        | UiAction::WakeRun(_)
         | UiAction::Clear
         | UiAction::Context => Ok(()),
     };

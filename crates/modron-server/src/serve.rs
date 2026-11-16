@@ -53,6 +53,9 @@ pub struct ServeOptions {
     /// How long the on-exit hook may take before shutdown goes on without it.
     /// `None` = [`DEFAULT_HANDOFF_TIMEOUT`].
     pub handoff_timeout: Option<Duration>,
+    /// The cloud run this process serves (`modron serve --run-id`, PLAN 10.10).
+    /// Stored for the portal registration; `None` = not a cloud run.
+    pub run_id: Option<String>,
 }
 
 /// Time the on-exit hand-off may take before `modron serve` exits without it.
@@ -279,6 +282,9 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
     // Remote control at start, once the listeners are up (same tunnel path
     // as the `remote_control` frame). A failure here stops the accept loops
     // before the error goes back to the caller.
+    if let Some(run) = &options.run_id {
+        crate::rc::set_serve_run_id(run)?;
+    }
     let mut serve_session = None;
     if let Some(bridge) = &options.remote_control {
         match crate::rc::start_serve_remote_control(

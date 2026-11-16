@@ -20,7 +20,7 @@ use modron_mobile_core::view::{
 use modron_mobile_core::{ApprovalModeWire, Effort, Phase, SandboxPolicy};
 use modron_view::slash::{slash_lookup, SLASH_COMMANDS};
 
-use crate::chat::UiAction;
+use crate::chat::{UiAction, WEB_CONTROLS};
 use crate::nav::{NavStep, PickerKind, Screen};
 use crate::theme::Choice;
 
@@ -51,6 +51,20 @@ pub const LOCAL: &[Entry] = &[
     },
 ];
 
+/// The app's own commands for this target: [`LOCAL`], plus `/cloud` on the
+/// web (the owner's Cloud screen; the terminal has no bridge to show it).
+pub fn local_entries() -> Vec<Entry> {
+    let mut entries = LOCAL.to_vec();
+    if WEB_CONTROLS {
+        entries.push(Entry {
+            name: "cloud",
+            usage: "/cloud",
+            about: "cloud runs: github accounts, runs",
+        });
+    }
+    entries
+}
+
 /// The shared table as entries, in its order.
 fn table_entries() -> Vec<Entry> {
     SLASH_COMMANDS.iter().map(|c| Entry { name: c.name, usage: c.usage, about: c.about }).collect()
@@ -73,7 +87,7 @@ pub fn merge(shared: &[Entry], local: &[Entry]) -> Vec<Entry> {
 /// Every command: the shared table in its order, then the app's own rows
 /// the table does not name. Each name appears once.
 pub fn all() -> Vec<Entry> {
-    merge(&table_entries(), LOCAL)
+    merge(&table_entries(), &local_entries())
 }
 
 /// The suggestions for the composer text: none unless the text is a slash
@@ -97,7 +111,7 @@ pub fn is_exact(text: &str) -> bool {
         return false;
     };
     let word = word.to_lowercase();
-    slash_lookup(&word).is_some() || LOCAL.iter().any(|l| l.name == word)
+    slash_lookup(&word).is_some() || local_entries().iter().any(|l| l.name == word)
 }
 
 /// The composer text that completes `name`: the word, with a trailing space
@@ -201,6 +215,7 @@ pub fn run(line: &str) -> UiAction {
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,
         "tasks" => UiAction::Nav(NavStep::Open(Screen::Tasks)),
+        "cloud" if WEB_CONTROLS => UiAction::Nav(NavStep::Open(Screen::Cloud)),
         "allow" | "deny" if args.is_empty() => {
             UiAction::Nav(NavStep::OpenToolList(word == "allow"))
         }
@@ -235,9 +250,16 @@ mod tests {
 
     #[test]
     fn every_local_command_is_mapped() {
-        for entry in LOCAL {
+        for entry in local_entries() {
             assert!(!is_unknown(&run(&format!("/{}", entry.name))), "/{}", entry.name);
         }
+    }
+
+    #[test]
+    fn cloud_is_a_web_only_command() {
+        // The native tests are the terminal target: no /cloud there.
+        assert!(is_unknown(&run("/cloud")));
+        assert!(!local_entries().iter().any(|e| e.name == "cloud"));
     }
 
     #[test]

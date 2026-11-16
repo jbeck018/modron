@@ -61,15 +61,38 @@ renders the list and opens `/app/?url=wss://host/ws/<viewer key>`.
   `approver` socket may also send `approve` and `decide_plan`. Everything
   else needs the owner cookie.
 
-## Linked GitHub accounts
+## Linked GitHub accounts (PLAN 10.10)
 
-- One GitHub OAuth app per deployment (`GITHUB_CLIENT_ID`,
-  `GITHUB_CLIENT_SECRET` as Worker secrets; callback `/auth/github`).
-- While signed in, the owner can link any number of accounts; each stores
-  login, scopes and the access token encrypted with a key derived from
-  `OWNER_TOKEN` (AES-GCM, random nonce). Tokens never reach a browser.
-- A cloud run picks one identity; the Worker injects that token into the
-  container at start (C6). Local hosts keep using their own git setup.
+Built in the bridge (`cloud/bridge/README.md`, "GitHub accounts and cloud
+runs"). v1 takes a pasted access token (a fine-grained PAT with read access to
+the repos the owner wants to run). The bridge checks it once with GitHub
+`GET /user`, stores the login, and seals the token under `VAULT_KEY` with the
+account id as associated data. Up to 10 accounts. Owner only; viewers and
+invited approvers get 403. Routes: `GET`/`POST /api/github/accounts`,
+`DELETE /api/github/accounts/<id>`, `GET /api/github/repos` (filter `q`, paged
+by 50). GitHub OAuth (needs an OAuth app's client id) is later.
+
+Tokens never reach a browser. GitHub is called only at `https://api.github.com`
+with a 10 second timeout and the `modron-bridge` user agent.
+
+## Cloud runs and secrets (PLAN 10.10)
+
+`POST /api/runs { account, repo, branch?, handoff_ref? }` records a run and
+calls the container worker's `POST /wake` with the run's environment: the
+bridge's origin, the host token, the repo, the branch, the account's git token
+and the handoff ref (`cloud/container/README.md` lists the fields). The run
+moves `starting` to `running` when the serve it starts registers a session
+carrying the run id (`run_id` on the host registration), and `session_url` is
+the portal's open path for that session. `POST /api/runs/<id>/stop` and
+`/wake` call the worker's `/stop` and `/wake`. States: starting, running,
+sleeping, stopped, failed (with a short reason that names the status only).
+
+Secrets: the bridge holds `VAULT_KEY`, `CONTAINER_URL` (https) and
+`WAKE_TOKEN` as Worker secrets, next to `HOST_TOKEN`. Without them the run
+routes answer 503 "cloud runs are not configured". The container Worker holds
+only `WAKE_TOKEN`. The repository secrets `BRIDGE_URL`, `CLOUD_GITHUB_REPO`,
+`CLOUD_GITHUB_TOKEN` and `MODRON_HOST_TOKEN` are no longer used.
+
 
 ## Provider keys (vault, C6d)
 
@@ -106,15 +129,13 @@ attached, which this design intends.
 Deploying any of it needs the owner's `wrangler login`; nothing in this
 plan is deployed from CI or by an agent.
 
-## Cloud runs (C6): container deploy status
+## Cloud runs (C6): status
 
-Status 2026-11-16: scaffold. The image and a manually triggered deploy
-workflow exist (`.github/workflows/cloud-deploy.yml`, `cloud/container/`), but
-no cloud run has been deployed or tested end to end yet. The container starts
-`modron serve --remote-control <bridge-url>`, which opens the tunnel at start
-with no client attached. The container's runtime secrets are the Worker secrets listed in
-`cloud/container/README.md`; `HOST_TOKEN` on the bridge must equal the
-`MODRON_HOST_TOKEN` the container receives. Nothing is deployed by CI on push.
+Status 2026-11-16: the bridge routes, the container worker and the serve side
+(`modron serve --run-id`) are built and tested locally (`cloud/bridge/test/cloud.mjs`;
+the e2e scenario P6 runs a real serve against the bridge). The deploy workflow
+(`.github/workflows/cloud-deploy.yml`) is manual and builds the image as a gate.
+No cloud run has been deployed to a live Cloudflare Container yet.
 
 Presence survives drops: a tunnel (however it was opened) redials with backoff
 (1 s doubling to 60 s, jittered, reset after a 30 s connection) on the same

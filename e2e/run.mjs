@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import {
   freePort, MODRON, REPO, Local, SCRATCH, api, bodyText, clickContains, clickText, copyApp, inviteUrlIn,
   killEverything, taggedCount, launchBrowser, liveCount, newestMtime, openViewer, ownerCookie, ownerCookieFrom, refused, sleep,
-  shot, snapshotViewer, startBridge, startFakeOpenAi, startServe, stopProc, tail, toHttp, typeAndSend, waitBody,
+  shot, snapshotViewer, startBridge, startFakeCloud, startFakeOpenAi, startServe, stopProc, tail, toHttp, typeAndSend, waitBody,
   waitPastPromptGuard, waitUntil, wsFrames,
 } from './lib.mjs';
 
@@ -1071,6 +1071,74 @@ if (!want('T2') && !want('T3') && !want('T4')) {
     ptyChecks(s, r);
   });
 }
+
+// P6 -------------------------------------------------------------------------
+// Cloud run (PLAN 10.10). The owner links a GitHub account, starts a run; the
+// fake container records the wake body. This script then plays the container
+// entrypoint with the wake body's values: a real `modron serve --remote-control
+// --run-id <id>` registers with the bridge, the run list shows it running with
+// a session_url, and that URL opens the session in the browser.
+await scenario('P6', 'cloud run: account, run start, a real serve registers the run, its session_url opens', async (s) => {
+  const ghToken = 'tok-e2e-' + hex();
+  const wakeToken = hex();
+  const fake = await startFakeCloud({ ghToken, wakeToken });
+  const cb = track(bridges, await startBridge('cloud', {
+    OWNER_TOKEN: OWNER, HOST_TOKEN: HOST, VAULT_KEY: hex(), WAKE_TOKEN: wakeToken,
+    MODRON_TEST_HOOKS: '1', GITHUB_API_ORIGIN: fake.gh, CONTAINER_URL: fake.ct,
+  }));
+  const cookie = await ownerCookie(cb.base, OWNER);
+  const jar = { name: cookie.split('=')[0], value: cookie.slice(cookie.indexOf('=') + 1), url: cb.base };
+  const post = async (path, body) => {
+    const r = await fetch(cb.base + path, {
+      method: 'POST',
+      headers: { cookie, origin: cb.base, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* not JSON */ }
+    return { status: r.status, json, text };
+  };
+
+  const acct = await post('/api/github/accounts', { token: ghToken });
+  s.check(acct.status === 201 && acct.json && acct.json.login === 'modron-e2e', 'adding the GitHub account failed: ' + acct.status + ' ' + acct.text.slice(0, 120));
+  if (!acct.json) return;
+  const run = await post('/api/runs', { account: acct.json.id, repo: 'modron-e2e/app', branch: 'main' });
+  s.check(run.status === 201 && run.json && run.json.state === 'starting', 'starting the run failed: ' + run.status + ' ' + run.text.slice(0, 120));
+  s.check(!run.text.includes(ghToken), 'the run row carries the git token');
+  const wake = fake.wakes.find((w) => w.path === '/wake');
+  s.check(wake && wake.auth === `Bearer ${wakeToken}`, 'the container did not get /wake with the wake bearer');
+  if (!run.json || !wake) return;
+  s.check(wake.body.run_id === run.json.id && wake.body.git_token === ghToken && wake.body.host_token === HOST,
+    'the wake body does not carry the run id, git token and host token');
+
+  // The container's entrypoint, played here: a real serve for this run.
+  const sv = track(serves, await startServe('cloud', {
+    bridgeWs: cb.ws, hostToken: wake.body.host_token, remoteControl: cb.ws, runId: wake.body.run_id,
+  }));
+  void sv;
+
+  const linked = await waitUntil(async () => {
+    const r = await api(cb.base, cookie, 'GET', '/api/runs');
+    const row = r.json && Array.isArray(r.json.runs) ? r.json.runs.find((x) => x.id === run.json.id) : null;
+    return row && row.state === 'running' && row.session_url ? row : null;
+  }, 60000, 'run running with a session');
+  s.check(linked !== null, 'the run never turned running with a session_url');
+  if (!linked) return;
+  s.check(linked.session_url.startsWith('/app/?url=ws'), 'session_url is not the portal open path: ' + linked.session_url);
+  const listed = await api(cb.base, cookie, 'GET', '/api/sessions');
+  const row = Array.isArray(listed.json) ? listed.json.find((x) => x.open_url === linked.session_url) : null;
+  s.check(row !== null && row.online === true, 'the run session is not listed online in /api/sessions');
+  s.check(!JSON.stringify(await api(cb.base, cookie, 'GET', '/api/runs')).includes(ghToken), 'the run list carries the git token');
+
+  const v = track(viewers, await openViewer(browser, cb.base + linked.session_url, 'cloud-run', jar));
+  await soft(s, waitBody(v, (t) => t.includes('connected'), 40000, 'cloud session connected'), 'the session_url did not open the session');
+  await shot(v, 'p6-cloud');
+
+  const stopped = await post(`/api/runs/${run.json.id}/stop`, {});
+  s.check(stopped.status === 200 && stopped.json && stopped.json.state === 'stopped', 'stop did not answer stopped');
+  s.check(fake.wakes.some((w) => w.path === '/stop' && w.body && w.body.run_id === run.json.id), 'the container did not get /stop');
+});
 
 // H1 -------------------------------------------------------------------------
 // Handoff between two hosts, git carrier (docs/HANDOFF.md). Host A runs a
