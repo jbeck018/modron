@@ -42,6 +42,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      # A C dependency is compiled for wasm32: cc-rs needs clang and an
+      # unversioned llvm-ar, which the runner image does not provide.
+      - name: Install clang and llvm (wasm32 C toolchain)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm
       - name: Web target type-check
         run: cargo check --lib --target wasm32-unknown-unknown
       # release.yml builds the app with --locked; CI's runs do not, so check
