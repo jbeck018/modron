@@ -32,8 +32,9 @@ unset GITHUB_TOKEN
 cd /workspace/repo
 
 # Loopback only: nothing listens on a public interface. --bridge sets the
-# relay base for share/publish. It does NOT open a tunnel: a client must
-# send a remote_control frame for a live session (see cloud/container/README.md).
+# relay base for share/publish. --remote-control opens the tunnel at start,
+# with no client attached, for the repo's session (see cloud/container/README.md).
 exec modron serve \
   --listen 127.0.0.1:7699 \
-  --bridge "$BRIDGE"
+  --bridge "$BRIDGE" \
+  --remote-control "$BRIDGE"

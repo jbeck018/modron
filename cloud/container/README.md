@@ -46,6 +46,18 @@ The run first builds the image from the repo root as a gate, then runs
 `wrangler deploy` in `cloud/container`, then sets the runtime secrets. Nothing
 runs on push.
 
+## Remote control at start
+
+The entrypoint runs `modron serve --remote-control "$BRIDGE_URL"`, so the
+container opens its own tunnel to the bridge as soon as it is listening, with
+no client attached. The tunnel is for the most recent session in the cloned
+repo's store, or a new one when there is none (worktree task sessions are
+skipped). The repo has a `.git` entry, so serve creates the `.modron` project
+marker and logs that it did. The tunnel authenticates with
+`MODRON_HOST_TOKEN`, which must equal the bridge's `HOST_TOKEN`, so the session
+appears in the owner's portal list. The tunnel does not reconnect after the
+bridge drops it: restart the container to reopen it.
+
 ## What gets created in the Cloudflare account
 
 - A Worker `modron-container-<environment>` with a Durable Object class
@@ -69,14 +81,10 @@ Durable Object storage are removed with the Worker.
 
 ## Known gaps
 
-- **`modron serve` does not dial the bridge by itself.** `--bridge` only sets
-  the relay base for share and publish. The tunnel starts when a client sends
-  a `remote_control` frame for a live session, and that needs a session plus
-  a `.modron` project marker in the working directory. Nothing in this
-  scaffold sends that frame, so a container started by the Worker is not yet
-  reachable through the bridge. Needs a small in-container dialer or a
-  protocol-level start; see `crates/modron-server/src/dispatch.rs`
-  (`Payload::RemoteControl`).
+- **No tunnel reconnect.** The tunnel opened at start (see "Remote control at
+  start") is not redialled if the bridge closes it or the network drops, and
+  neither is a tunnel a client opened. Until that is added, a dropped tunnel
+  leaves the container running but unreachable until it restarts.
 - **Build context unverified.** The Dockerfile copies from the repo root, but
   `image: ./Dockerfile` in `wrangler.jsonc` may use `cloud/container/` as the
   context. The CI gate builds from the root, so Dockerfile errors show up there.

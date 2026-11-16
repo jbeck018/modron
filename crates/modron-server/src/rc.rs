@@ -470,9 +470,15 @@ pub async fn run_tunnel_with(
     let host_token = env_value(&*lookup, HOST_TOKEN_ENV);
     let request = tunnel_request(&agent_url, host_token.as_deref())
         .with_context(|| format!("preparing the remote-control bridge request at {bridge_base}"))?;
-    let (socket, _) = connect_async(request)
-        .await
-        .with_context(|| format!("connecting to the remote-control bridge at {bridge_base}"))?;
+    let (socket, _) = connect_async(request).await.map_err(|e| {
+        // The transport error's own chain is the useful part; the share key
+        // and the host token must never reach a log line.
+        let cause = redact(
+            &error_chain(&e),
+            &[&key, host_token.as_deref().unwrap_or("")],
+        );
+        anyhow!("connecting to the remote-control bridge at {bridge_base}: {cause}")
+    })?;
     let (mut sink, mut stream) = socket.split();
 
     // Server->relay writer: drains the connection's outbound frames (the
@@ -695,6 +701,157 @@ async fn publish_page_with_lookup(
     Ok(format!("{base_url}/p/{id}"))
 }
 
+/// Check a bridge URL for the tunnel: `ws://` or `wss://` only (the same
+/// rule the `remote_control` frame applies), and plaintext only to loopback
+/// (see [`check_bridge_transport`]).
+pub fn check_tunnel_bridge(bridge_base: &str) -> Result<()> {
+    if !bridge_base.starts_with("ws://") && !bridge_base.starts_with("wss://") {
+        return Err(anyhow!(
+            "bridge url must start with ws:// or wss:// (deploy cloud/bridge first)"
+        ));
+    }
+    // The share key and the whole transcript travel over this socket: plaintext
+    // only to loopback.
+    check_bridge_transport(bridge_base)
+}
+
+/// Every message of an error and its sources, joined with `: `.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// `text` with each non-empty secret replaced by `<redacted>`.
+fn redact(text: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text.to_string(), |acc, secret| {
+            acc.replace(secret, "<redacted>")
+        })
+}
+
+/// Environment variable naming a bridge to open remote control against at
+/// `modron serve` start (the `--remote-control` flag wins over it).
+pub const REMOTE_CONTROL_ENV: &str = "MODRON_REMOTE_CONTROL";
+
+/// The bridge URL `modron serve` opens at start: the flag when given,
+/// else the environment variable. Empty counts as unset (for both).
+pub fn resolve_remote_control(flag: Option<&str>, env: Option<&str>) -> Option<String> {
+    [flag, env]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// The project marker `serve --remote-control` needs before it can open a
+/// tunnel: the `.modron` directory in the working directory (the same rule
+/// the `remote_control` frame applies). An existing marker is kept. Without
+/// one, a git repository (`.git` present, as a directory or a worktree
+/// file) gets the marker created; anything else is refused, because remote
+/// control hands the agent its working directory. Returns true when this
+/// call created the marker.
+pub fn prepare_project_marker(working_dir: &Path) -> Result<bool> {
+    let marker = working_dir.join(".modron");
+    if marker.exists() {
+        return Ok(false);
+    }
+    if !working_dir.join(".git").exists() {
+        return Err(anyhow!(
+            "serve --remote-control needs a project in its working directory: run it inside a \
+             git repository, or create an empty .modron directory there yourself"
+        ));
+    }
+    std::fs::create_dir_all(&marker)
+        .with_context(|| format!("creating the project marker {}", marker.display()))?;
+    Ok(true)
+}
+
+/// The session `serve --remote-control` opens its tunnel for: the most
+/// recently updated session that is not a worktree task's (task sessions
+/// run inside their worktree, not the server's). `None` when there is none.
+/// The store records no working directory, so "for this directory" means
+/// "in this server's store", which is one repository per serve.
+pub fn choose_serve_session(
+    sessions: &[modron_core::SessionMeta],
+    is_task: impl Fn(&SessionId) -> bool,
+) -> Option<SessionId> {
+    sessions
+        .iter()
+        .filter(|meta| !is_task(&meta.id))
+        .max_by_key(|meta| meta.updated_at)
+        .map(|meta| meta.id)
+}
+
+/// Write `contents` plus a newline to `path`, readable by the owner only.
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening the share url file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `mode` applies only on creation: tighten a file that already existed.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting the share url file {}", path.display()))?;
+    }
+    file.write_all(format!("{contents}\n").as_bytes())
+        .with_context(|| format!("writing the share url file {}", path.display()))
+}
+
+/// `modron serve --remote-control`: at start, open remote control for one
+/// session without any client. The session is the most recent non-task
+/// session in the store, or a new one when there is none. The tunnel
+/// starts through [`start_remote_control`], the same path the
+/// `remote_control` frame takes. Logs the share URL at info level and, when
+/// `share_file` is given, writes it there (0600). Call after the listeners
+/// are bound and [`prepare_project_marker`] has passed.
+pub async fn start_serve_remote_control(
+    state: &Arc<ServerState>,
+    bridge_base: &str,
+    share_file: Option<&Path>,
+) -> Result<String> {
+    let sessions = state
+        .store
+        .list()
+        .await
+        .context("listing sessions for remote control")?;
+    let session = match choose_serve_session(&sessions, |id| state.tasks.get(id).is_some()) {
+        Some(session) => session,
+        None => {
+            state
+                .store
+                .create_session("remote session")
+                .await
+                .context("creating the remote-control session")?
+                .id
+        }
+    };
+    // Same live-session setup a Submit to a known session does.
+    crate::dispatch::ensure_session_for(state, session);
+    let url = start_remote_control(state, session, &state.working_dir, bridge_base)?;
+    tracing::info!(%session, share_url = %url, "remote control open (serve --remote-control)");
+    if let Some(path) = share_file {
+        write_private_file(path, &url)?;
+    }
+    Ok(url)
+}
+
 /// Register a remote-control tunnel for `session`: validates the session,
 /// mints the share key, spawns the tunnel task. Returns the open URL.
 pub fn start_remote_control(
@@ -703,14 +860,7 @@ pub fn start_remote_control(
     working_dir: &Path,
     bridge_base: &str,
 ) -> Result<String> {
-    if !bridge_base.starts_with("ws://") && !bridge_base.starts_with("wss://") {
-        return Err(anyhow!(
-            "bridge url must start with ws:// or wss:// (deploy cloud/bridge first)"
-        ));
-    }
-    // The share key and the whole transcript travel over this socket: plaintext
-    // only to loopback.
-    check_bridge_transport(bridge_base)?;
+    check_tunnel_bridge(bridge_base)?;
     if !working_dir.join(".modron").exists() {
         return Err(anyhow!(
             "remote-control hands the agent its working directory - run from inside a \
@@ -728,7 +878,9 @@ pub fn start_remote_control(
     let bridge = bridge_base.to_string();
     let tunnel_task = tokio::spawn(async move {
         if let Err(e) = run_tunnel(state_moved, session, bridge, key).await {
-            tracing::warn!(%session, error = %e, "remote-control tunnel ended");
+            // `{:#}` keeps the whole chain (the transport cause), not just
+            // the outermost context.
+            tracing::warn!(%session, error = format!("{e:#}"), "remote-control tunnel ended");
         }
     });
     // Abort the previous tunnel for this session, if any: a re-registration
@@ -940,5 +1092,127 @@ mod key_tests {
             local,
             format!("http://127.0.0.1:8787/s/{}", viewer_key(key))
         );
+    }
+}
+
+#[cfg(test)]
+mod serve_start_tests {
+    use super::*;
+    use modron_core::SessionMeta;
+
+    #[test]
+    fn flag_wins_over_env_and_empty_counts_as_unset() {
+        let wss = "wss://bridge.example";
+        assert_eq!(
+            resolve_remote_control(Some(wss), Some("wss://env.example")).as_deref(),
+            Some(wss)
+        );
+        assert_eq!(
+            resolve_remote_control(None, Some("wss://env.example")).as_deref(),
+            Some("wss://env.example")
+        );
+        assert_eq!(
+            resolve_remote_control(Some(""), Some("wss://env.example")).as_deref(),
+            Some("wss://env.example")
+        );
+        assert_eq!(
+            resolve_remote_control(Some(wss), Some("")).as_deref(),
+            Some(wss)
+        );
+        assert_eq!(resolve_remote_control(None, None), None);
+        assert_eq!(resolve_remote_control(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn serve_bridge_follows_the_frame_rule() {
+        assert!(check_tunnel_bridge("wss://bridge.example").is_ok());
+        assert!(check_tunnel_bridge("ws://127.0.0.1:9000").is_ok());
+        assert!(check_tunnel_bridge("ws://bridge.example").is_err());
+        // The frame refuses http(s) for the tunnel even though publish takes it.
+        assert!(check_tunnel_bridge("https://bridge.example").is_err());
+        assert!(check_tunnel_bridge("bridge.example").is_err());
+        assert!(check_tunnel_bridge("").is_err());
+    }
+
+    #[test]
+    fn redaction_removes_secrets_and_skips_empty_ones() {
+        let text = "failed for agent/SECRETKEY with token TOKEN";
+        assert_eq!(
+            redact(text, &["SECRETKEY", "TOKEN"]),
+            "failed for agent/<redacted> with token <redacted>"
+        );
+        assert_eq!(redact(text, &[""]), text);
+    }
+
+    #[test]
+    fn error_chain_keeps_every_cause() {
+        #[derive(Debug)]
+        struct Cause;
+        impl std::fmt::Display for Cause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Connection refused")
+            }
+        }
+        impl std::error::Error for Cause {}
+        #[derive(Debug)]
+        struct Outer(Cause);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("IO error")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        assert_eq!(error_chain(&Outer(Cause)), "IO error: Connection refused");
+    }
+
+    #[test]
+    fn project_marker_is_kept_created_for_git_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // Neither a marker nor a git repository: refused, nothing created.
+        assert!(prepare_project_marker(dir.path()).is_err());
+        assert!(!dir.path().join(".modron").exists());
+        // A git repository (a `.git` entry) gets the marker, and says so.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(prepare_project_marker(dir.path()).unwrap());
+        assert!(dir.path().join(".modron").is_dir());
+        // An existing marker is kept as it is.
+        assert!(!prepare_project_marker(dir.path()).unwrap());
+        // A worktree-style `.git` file counts as a repository too.
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join(".git"), "gitdir: /x").unwrap();
+        assert!(prepare_project_marker(worktree.path()).unwrap());
+    }
+
+    /// A session row updated `hour` o'clock on 2026-11-16 (UTC).
+    fn meta(id: u128, hour: u32) -> SessionMeta {
+        let at = format!("2026-11-16T{hour:02}:00:00Z");
+        serde_json::from_value(serde_json::json!({
+            "id": SessionId::from_u128(id),
+            "title": format!("s{id}"),
+            "created_at": at,
+            "updated_at": at,
+            "message_count": 0,
+        }))
+        .expect("a session row")
+    }
+
+    #[test]
+    fn serve_resumes_the_most_recent_non_task_session() {
+        let sessions = vec![meta(1, 0), meta(2, 5), meta(3, 9)];
+        let task = SessionId::from_u128(3);
+        // Newest is a task session, so the next newest wins.
+        assert_eq!(
+            choose_serve_session(&sessions, |id| *id == task),
+            Some(SessionId::from_u128(2))
+        );
+        assert_eq!(
+            choose_serve_session(&sessions, |_| false),
+            Some(SessionId::from_u128(3))
+        );
+        assert_eq!(choose_serve_session(&[], |_| false), None);
     }
 }

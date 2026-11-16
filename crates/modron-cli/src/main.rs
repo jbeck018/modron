@@ -156,6 +156,18 @@ enum Command {
         /// on loopback. Use this behind tailscale-serve or cloudflared.
         #[arg(long)]
         require_token: bool,
+        /// Open remote control at start, with no client: a tunnel to this
+        /// bridge (wss://host) for the most recent session in the working
+        /// directory (a new one when there is none). Also set by env
+        /// MODRON_REMOTE_CONTROL; this flag wins. Needs a git repository in
+        /// the working directory (its .modron marker is created) or an
+        /// existing .modron directory.
+        #[arg(long = "remote-control", value_name = "BRIDGE_URL")]
+        remote_control: Option<String>,
+        /// With --remote-control: write the share URL to this file (0600) at
+        /// start, so a launcher can read it.
+        #[arg(long = "share-url-file", value_name = "PATH")]
+        share_url_file: Option<std::path::PathBuf>,
         /// Browser origin allowed to open the WebSocket (repeatable, exact
         /// match, e.g. https://app.example.com). Default: none - every
         /// upgrade that carries an Origin header is refused.
@@ -664,8 +676,16 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         bridge,
         require_token,
         allow_origin,
+        remote_control,
+        share_url_file,
     }) = &cli.command
     {
+        // The flag wins over MODRON_REMOTE_CONTROL (see rc::resolve_remote_control).
+        let env_bridge = std::env::var(modron_server::rc::REMOTE_CONTROL_ENV).ok();
+        let remote = modron_server::rc::resolve_remote_control(
+            remote_control.as_deref(),
+            env_bridge.as_deref(),
+        );
         let mcp = spawn_mcp_servers(&cfg).await?;
         let agent = build_agent_with(
             &cli,
@@ -681,6 +701,8 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
                 bridge_base: bridge.clone(),
                 require_token: *require_token,
                 allowed_origins: allow_origin.clone(),
+                remote_control: remote,
+                share_url_file: share_url_file.clone(),
                 ..modron_server::ServeOptions::default()
             },
         )

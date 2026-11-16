@@ -1,4 +1,4 @@
-# Remote control — `modron serve`
+# Remote control - `modron serve`
 
 The remote-control server (Phases 2+3) runs the Modron engine as a
 long-lived process so clients anywhere (desktop, phone, another machine)
@@ -174,6 +174,44 @@ host. Plaintext `ws://` (or `http://`) is accepted only when the host is
 loopback (`localhost`, `127.0.0.0/8`, `[::1]`); any other host is refused,
 because the share key, publish token and transcript would cross the
 network in clear.
+
+### Open at start (`serve --remote-control`)
+
+`modron serve --remote-control <bridge-url>` opens the tunnel itself, when
+the server starts, with no client attached. `MODRON_REMOTE_CONTROL` sets the
+same thing from the environment; the flag wins when both are set. The bridge
+URL must be `ws://` or `wss://` (the same rule as `/remote-control`), and
+plaintext `ws://` only for a loopback host. A bad URL exits non-zero before
+anything is bound.
+
+At start, after the listeners are up, the server picks the session for the
+tunnel: the most recently updated session in its store that is not a worktree
+task's, or a new one when there is none. The store records no working
+directory, so "the session for this directory" means "the session in this
+server's store": run one serve per repository. The tunnel then starts through
+the same code the `remote_control` frame uses, with the same checks, the same
+`MODRON_HOST_TOKEN` and the same portal registration.
+
+The project marker rule is the one `/remote-control` uses: the agent is handed
+its working directory, so that directory must be a project, not an empty one.
+A `.modron` directory marks it. With the flag, serve creates `.modron` when the
+working directory is a git repository (a `.git` directory or worktree file) and
+logs that it did; a directory that is neither, with no marker, is refused.
+
+The share URL is logged at info level. `--share-url-file <path>` also writes it
+to that file, mode 0600, so a launcher can read it. The file needs the flag.
+
+The tunnel does not reconnect. A tunnel the bridge closes, or one whose socket
+drops, ends and is not redialled, whether it was opened at start or by a
+`remote_control` frame. Restart the server to reopen it. A bridge that cannot
+be reached at start logs a warning (with the transport cause, never the share
+key) and nothing retries it. The server keeps running either way.
+
+```sh
+MODRON_HOST_TOKEN=... modron serve --listen 127.0.0.1:7699 \
+  --remote-control wss://modron-bridge.example.workers.dev \
+  --share-url-file ~/.modron/share-url
+```
 
 ## Notes and limits
 

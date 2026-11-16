@@ -859,3 +859,185 @@ async fn host_token_never_appears_in_tunnel_errors() {
         "token leaked: {err:#}"
     );
 }
+
+/// An engine over an in-memory store whose working directory is `dir`.
+fn serve_engine(dir: &std::path::Path) -> Engine {
+    let store: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::new());
+    Engine {
+        selector: Arc::new(modron_core::testing::StaticSelector::new(
+            "mock-model",
+            "mock",
+        )),
+        providers: Default::default(),
+        tools: Arc::new(modron_core::ToolRegistry::new()),
+        store,
+        config: EngineConfig {
+            default_model: "mock-model".into(),
+            default_provider: "mock".into(),
+            working_dir: dir.to_path_buf(),
+            ..EngineConfig::default()
+        },
+    }
+}
+
+/// `modron serve` options that touch nothing outside `dir`: WebSocket off,
+/// the Unix socket and the clients directory under `dir`.
+fn serve_options(dir: &std::path::Path) -> modron_server::ServeOptions {
+    modron_server::ServeOptions {
+        listen: Some("disabled".into()),
+        socket: Some(dir.join("serve.sock")),
+        clients_dir: Some(dir.join("clients")),
+        ..modron_server::ServeOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn serve_flag_opens_the_tunnel_at_start_and_writes_the_share_file() {
+    let bridge = FakeBridge::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let share_file = dir.path().join("share-url");
+    let options = modron_server::ServeOptions {
+        remote_control: Some(bridge.base.clone()),
+        share_url_file: Some(share_file.clone()),
+        ..serve_options(dir.path())
+    };
+    let server = modron_server::bind_server(serve_engine(dir.path()), &options)
+        .await
+        .unwrap();
+
+    // No client attached: the tunnel dials the bridge on its own.
+    eventually("the tunnel's websocket", || bridge.ws_auth().len() == 1).await;
+    let agent_key = server
+        .state
+        .rc_keys
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .cloned()
+        .expect("one session has a share key");
+    assert_eq!(server.state.rc_tunnels.lock().unwrap().len(), 1);
+    // The git repository got its project marker.
+    assert!(dir.path().join(".modron").is_dir());
+
+    // The share file holds the viewer page for that tunnel, never the agent key.
+    let http = bridge.base.replacen("ws://", "http://", 1);
+    let shared = std::fs::read_to_string(&share_file).unwrap();
+    assert_eq!(
+        shared.trim(),
+        format!("{http}/s/{}", viewer_key(&agent_key))
+    );
+    assert!(!shared.contains(&agent_key));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&share_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    for tunnel in server.state.rc_tunnels.lock().unwrap().values() {
+        tunnel.abort();
+    }
+    server.shutdown();
+    bridge.close_tunnel();
+}
+
+#[tokio::test]
+async fn serve_without_the_flag_dials_nothing() {
+    let bridge = FakeBridge::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let server = modron_server::bind_server(serve_engine(dir.path()), &serve_options(dir.path()))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(bridge.ws_auth().is_empty());
+    assert!(server.state.rc_keys.lock().unwrap().is_empty());
+    assert!(server.state.rc_tunnels.lock().unwrap().is_empty());
+    assert!(!dir.path().join(".modron").exists());
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn serve_flag_with_an_invalid_bridge_fails_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    // https is publish's scheme; the tunnel takes ws:// or wss://.
+    let options = modron_server::ServeOptions {
+        remote_control: Some("https://bridge.example".into()),
+        ..serve_options(dir.path())
+    };
+    let err = modron_server::bind_server(serve_engine(dir.path()), &options)
+        .await
+        .err()
+        .expect("an https bridge is refused");
+    assert!(err.to_string().contains("ws://"), "{err}");
+    assert!(!dir.path().join("serve.sock").exists());
+    assert!(!dir.path().join(".modron").exists());
+}
+
+#[tokio::test]
+async fn serve_flag_refuses_a_directory_that_is_not_a_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = modron_server::ServeOptions {
+        remote_control: Some("ws://127.0.0.1:9".into()),
+        ..serve_options(dir.path())
+    };
+    let err = modron_server::bind_server(serve_engine(dir.path()), &options)
+        .await
+        .err()
+        .expect("a plain directory is refused");
+    assert!(err.to_string().contains("git repository"), "{err}");
+    assert!(!dir.path().join("serve.sock").exists());
+}
+
+#[tokio::test]
+async fn share_url_file_needs_the_remote_control_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = modron_server::ServeOptions {
+        share_url_file: Some(dir.path().join("share-url")),
+        ..serve_options(dir.path())
+    };
+    let err = modron_server::bind_server(serve_engine(dir.path()), &options)
+        .await
+        .err()
+        .expect("a share file without a tunnel is refused");
+    assert!(err.to_string().contains("--remote-control"), "{err}");
+}
+
+#[tokio::test]
+async fn unreachable_bridge_error_carries_the_transport_cause_without_the_key() {
+    // A loopback port with nothing listening on it.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let bridge = format!("ws://127.0.0.1:{port}");
+    let key = modron_server::rc::share_key();
+    let state = test_state();
+    let session = state.store.create_session("t").await.unwrap().id;
+    let result = run_tunnel_with(
+        env_with(&[]),
+        fast_timing(),
+        state,
+        session,
+        bridge.clone(),
+        key.clone(),
+    )
+    .await;
+    let err = format!("{:#}", result.expect_err("nothing listens there"));
+    assert!(
+        err.starts_with(&format!(
+            "connecting to the remote-control bridge at {bridge}: "
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains("refused"),
+        "the transport cause is shown: {err}"
+    );
+    assert!(!err.contains(&key), "the share key never appears: {err}");
+}
