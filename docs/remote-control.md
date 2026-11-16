@@ -9,7 +9,7 @@ running task, and a run keeps going with zero clients attached.
 ```
 +----------------+        WebSocket (JSON frames)      +----------------------+
 | remote client  | <-----------------------------------> |    modron serve      |
-| (TUI/GUI/web)  |                                       |  SessionHub          |
+| (app/web)      |                                       |  SessionHub          |
 +----------------+                                       |  - broadcast/seq     |
                                                          |  - approvals         |
 +----------------+        Unix socket (NDJSON frames)    |  - interrupt         |
@@ -179,12 +179,12 @@ network in clear.
 
 - Sessions and transcripts are the shared JSONL store
   (`~/.modron/sessions`): `modron sessions list`, `--resume`, and the
-  TUI see everything the server creates.
+  app see everything the server creates.
 - Attach snapshots carry the full persisted log plus the live view
   (streaming buffers, grouped tool activity, pending approval, cumulative
   usage, model/provider/goal labels).
 - Approve-rest: answering one request with `allow_all` auto-approves
-  every later mutating call in that session (the TUI's `a`).
+  every later mutating call in that session (the app's `a`).
 - A run whose task panics would leave the run slot occupied until restart;
   engine failures are reported as `turn_failed` frames, never slots.
 - v1 wire format is JSON over WS/NDJSON; a binary codec can replace the

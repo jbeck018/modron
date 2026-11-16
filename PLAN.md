@@ -292,7 +292,8 @@ and no code is copied (dirge is GPL-3.0).
   stores the event log so any number of devices attach, drop and resume.
 - The existing ratatui TUI, gpui-kit desktop and TSX mobile clients are
   frozen (no new features) and deleted once the NSH app covers them. The
-  Oculus theme and the main functionality carry over.
+  Oculus theme and the main functionality carry over. Status 2026-11-16: the ratatui
+  TUI crate is deleted (packet C9-TUI); plain `modron` and `modron tui` start the app.
 
 ### 10.2 Decisions (owner interview, 2026-11-15)
 
@@ -333,6 +334,23 @@ Decisions made under this rule:
 | What `/settings` opens | A settings view | A settings view | The Settings screen (the old terminal UI opened its credentials wizard, which is now `/auth`) |
 | Approval keys typed just before the prompt appears | Not accepted as an answer | Not accepted as an answer | Keep the old terminal UI's guard: a decision key pressed within a short window of the prompt appearing is ignored, so type-ahead cannot approve a command by accident |
 
+### 10.2b Owner decisions, 2026-11-16 (answered directly)
+
+- Plain `modron` launches the NSH app; crates/modron-tui is deleted, no
+  fallback flag.
+- The live bridge runs current code with the portal on (owner and host
+  tokens set); bare share links need a sign-in or an invite.
+- A pull request is opened for this branch and taken through merge.
+- The cloud-run image is built and deployed from GitHub Actions, manually
+  triggered (.github/workflows/cloud-deploy.yml).
+- Handoff ships both ways: git session branch by default, furrow over R2
+  as an opt-in setting (spikes/furrow-r2/RESULTS.md).
+- Thinking-block replay: design the append-only transcript here first,
+  then build; old sessions stay readable.
+- Web push for approvals is built now.
+- edit_lines stays opt-in until benchmarked; the owner will add a
+  provider key for `modron bench`.
+
 ### 10.3 What survives, what goes
 
 Keep: modron-protocol, modron-view, modron-server, mobile/rust-core (becomes
@@ -340,7 +358,8 @@ the single client core; already builds to wasm), the bridge Worker and its
 per-session Durable Object, the Oculus palette as the one theme.
 
 Discard at parity: crates/modron-tui view code, crates/modron-desktop,
-mobile/app/App.tsx, the bridge's inline HTML viewer.
+mobile/app/App.tsx, the bridge's inline HTML viewer. Status 2026-11-16: crates/modron-tui and
+crates/modron-desktop are deleted.
 
 ### 10.4 Harness gaps to close (in priority order)
 

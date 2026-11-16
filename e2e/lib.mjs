@@ -5,17 +5,23 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { cpSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 
-export const REPO = '/home/user/modron';
+// Paths: the repository is this file's parent; the prebuilt server and web
+// bundle default to this machine's staging directory and can be pointed
+// elsewhere (CI) with E2E_MODRON, E2E_APP_SRC and E2E_SCRATCH.
+export const REPO = process.env.E2E_REPO || dirname(dirname(fileURLToPath(import.meta.url)));
 export const BRIDGE_DIR = join(REPO, 'cloud/bridge');
 export const WRANGLER = join(BRIDGE_DIR, 'node_modules/.bin/wrangler');
-export const MODRON = '/tmp/claude-0/e2e/modron';
-export const APP_SRC = '/tmp/claude-0/e2e/app';
+const STAGE = process.env.E2E_SCRATCH || '/tmp/claude-0/e2e';
+mkdirSync(STAGE, { recursive: true });
+export const MODRON = process.env.E2E_MODRON || join(STAGE, 'modron');
+export const APP_SRC = process.env.E2E_APP_SRC || join(STAGE, 'app');
 // Short scratch root: the modron Unix socket path must stay under 108 bytes.
-export const SCRATCH = mkdtempSync('/tmp/claude-0/e2e/run-');
+export const SCRATCH = mkdtempSync(join(STAGE, 'run-'));
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

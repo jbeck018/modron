@@ -18,93 +18,79 @@ LEDGER.md; frozen cross-crate contracts live in crates/modron-core/src/lib.rs.
    cargo-deny's wildcard ban rejects version-less path deps.
 7. Docs and commit messages in plain ASCII.
 
-## UI/UX parity contract (TUI <-> desktop <-> mobile)
+## UI/UX parity contract (terminal target <-> web target)
 
-Status 2026-11-15 (Program U, PLAN.md section 10): every client is being
-rebuilt as ONE NSH app under `app/`. `crates/modron-desktop` has been
-removed (its brand assets live in `app/assets/`, the tokens in
-`app/theme/oculus.json`). The TUI and `mobile/app` are frozen: no new
-features, shared logic only. Until the NSH app lands, read "desktop" below
-as the NSH app's desktop target; the invariants and the divergence table
-still bind the TUI, mobile, and the new app. New protocol frames follow
-docs/PROTOCOL_V2.md.
+Status 2026-11-16 (Program U, PLAN.md section 10): the old terminal UI
+(crates/modron-tui) is deleted. There is ONE interactive client, the NSH app
+under `app/`, with two targets: a terminal binary (`modron-app-tui`, started
+by `modron tui`, by bare `modron` on a terminal, or by `modron app`) and a web
+bundle (`app/src/web.rs`). Shared logic lives in crates/modron-view (grouped
+tool activity, transcript replay, microcopy), crates/modron-protocol (wire
+vocabulary) and mobile/rust-core (client core: state, connection, attach).
+`mobile/app` (TSX) is frozen: no new features, shared logic only, and it is not
+a parity target. New protocol frames follow docs/PROTOCOL_V2.md.
 
-The TUI (crates/modron-tui), the desktop app (crates/modron-desktop), and the
-mobile clients (mobile/) are views over the same session state. Where they
-CAN match, they MUST match; agents keep them in sync by rule, not by memory.
-The shared substrate is crates/modron-view (grouped tool activity, transcript
-replay) and crates/modron-protocol (wire vocabulary) — logic goes there, never
-forked per client.
+Where the two targets CAN match, they MUST match. Agents keep them in sync by
+rule, not by memory.
 
-### Shared invariants (must be identical in every client)
+### Shared invariants (identical in both targets)
 
-1. **Copy and microcopy.** Labels, hints, and formatted strings come from
-   modron-view or shared constants: tool summary lines (`⏺ 21 tools · glob
-   ×9 · read ×8 …`), per-event rows (`✓ read — 2.1 KB`, `● bash …`), swarm
-   rows (`⏵ [label] done · 3 turns · 1.2k tok · last: read`), byte
-   formatting (`human_bytes`), interrupt affordance ("esc to interrupt" /
-   the GUI's stop control), approval decisions (allow once / allow all /
-   deny), mode names (ask / yolo / deny), theme-independent wording.
-2. **Grouping semantics.** Tool activity is grouped exactly as
-   modron-view::ActivityTracker does (one collapsed summary line per turn +
-   an expandable detail panel); transcripts render replay()/TranscriptEntry
-   order (task echo, assistant text, tool summary, swarm block, model and
-   usage notes). No client reimplements grouping or replay.
+1. **Copy and microcopy.** Labels, hints and formatted strings come from
+   modron-view or mobile/rust-core: tool summary lines, per-event rows, swarm
+   rows, byte formatting, the interrupt affordance, approval decisions (allow
+   once / allow all / deny), mode names (ask / yolo / deny). Grep the constants;
+   do not retype them.
+2. **Grouping and replay.** Tool activity is grouped by modron-view's
+   ActivityTracker (one summary line per turn, plus an expandable detail
+   panel). Transcripts render replay() / TranscriptEntry order. No target
+   reimplements grouping or replay.
 3. **Interaction semantics.** Submit sends the task; interrupt aborts the
-   active run; approvals resolve on the three decisions with allow-all
-   sticky for the rest of the run; modal/list behaviors match (Esc backs out
-   one screen; type-to-filter filters; Esc clears the filter before
-   closing); /model-equivalent model switches pin the model AND follow the
-   provider; config changes apply to future turns only.
-4. **Status surface.** The same facts are visible at all times: connection
-   state, current model/provider, cumulative tokens (and cache %), turn and
-   tool counts, approval mode, running/idle.
-5. **Streaming behavior.** Assistant text streams into a visible in-flight
-   buffer; reasoning streams only when the user opted in; buffers commit to
-   history at TurnDone and clear on abort.
-6. **State mapping.** Every protocol event has one defined UI effect per the
-   modron-protocol docs (Snapshot resets, Delta appends, Tool updates the
-   tracker, ApprovalRequested blocks on a decision, ConfigChanged updates
-   labels).
+   active run; approvals resolve on the three decisions, with allow-all sticky
+   for the rest of the run; Esc backs out one screen; type-to-filter filters,
+   and Esc clears the filter before closing; a model switch pins the model AND
+   follows the provider; config changes apply to future turns only.
+4. **Status surface.** These facts are visible at all times: connection state,
+   current model and provider, cumulative tokens (and cache %), turn and tool
+   counts, approval mode, running or idle.
+5. **Streaming.** Assistant text streams into a visible in-flight buffer;
+   reasoning streams only when the user opted in; buffers commit to history at
+   TurnDone and clear on abort.
+6. **State mapping.** Every protocol event has one defined effect, as documented
+   in modron-protocol (Snapshot resets, Delta appends, Tool updates the tracker,
+   ApprovalRequested blocks on a decision, ConfigChanged updates labels).
 
-### Normative divergence table (allowed differences — anything not listed here must match)
+### Normative divergence table (terminal target vs web target)
 
-| Concern | TUI | Desktop / mobile |
+| Concern | Terminal target (`modron-app-tui`) | Web target (`app/src/web.rs`) |
 |---|---|---|
-| Input | Terminal keys (esc, ctrl+t, shift+tab, `\` line continuation, `!` shell passthrough, `@file`) | Mouse + native shortcuts; a stop button instead of esc; `!`/`@` optional |
-| Scrollback & selection | Alt-screen + internal scrollback, pgup/pgdn, push-time wrapping at terminal width, terminal mouse selection | Native scrolling/selection; reflows with window (content model stays width-independent) |
-| Approval surface | Inline status strip, y/n/a keys | Strip/buttons (desktop), sheet (mobile) |
-| Tool detail panel | ctrl+t overlay, click-to-open | Panel/drawer, click-to-open |
-| Theming | ANSI/ratatui palette themes | System appearance + semantic roles mapped to native colors |
-| Platform chrome | None (fullscreen terminal) | Native menus, dock, safe areas (mobile), virtual keyboard handling |
-| Remote-control registration | /remote-control <bridge-url> slash command (opens a tunnel through the deployed cloud/bridge relay; prints the share URL) | Desktop: /remote-control via the slash popup + share button; mobile: /remote-control <bridge-url> slash, the share URL lands in the note line (chat header carries share/fork/task controls; the protocol command and relay are shared) |
-| Layout | Single column, status line + live strip | Sidebar + panes / mobile stack |
-| Per-turn meta (model switches, usage notes) | Dim scrollback lines after each turn | Desktop: centered divider chip on model CHANGE only, per-turn usage folded into the status bar; mobile: usage notes |
+| Input | Terminal keys (Esc, Ctrl+T, Shift+Tab, Ctrl+J newline, Ctrl+V image paste, `!` and `!!` shell passthrough) | Mouse and native shortcuts; a stop control instead of Esc; an attach control for images |
+| Scrollback and selection | Alt screen; PgUp/PgDn/Home/End scroll; terminal selection; wraps at terminal width | Wheel and native scrolling; reflows with the window (content model stays width-independent) |
+| Approval surface | Inline status strip, y / n / a keys | Strip with buttons |
+| Tool detail panel | Ctrl+T panel, Up/Down to move a row | Tap on the turn summary toggles it |
+| Theming | ANSI palette, Oculus tokens | System appearance, semantic roles mapped to browser colors |
+| Platform chrome | None (fullscreen terminal) | Browser chrome |
+| Remote-control registration | `/remote-control <bridge-url>` slash command, prints the share URL | The same command, from the slash popup or the share control |
+| Presentation of per-turn meta | Lines after each turn | Set by the web view in app/src/chat.rs; the words are the shared ones |
 
 Divergence covers PRESENTATION and KEYS only. The words, the states, the
-ordering, and the semantics do not diverge.
-
-Closed by the 2026-11-12 audit (these were capability drift, now fixed):
-TUI serves /share (+/publish alias), /new, /settings and lists every
-executable command in its completion/help; TUI remote mode sends fork /
-tasks / publish / automations frames over the wire and folds live
-persisted events; mobile renders the live tool view, gates reasoning
-behind an opt-in toggle, says "allow all", shows the remote-control share
-URL, and can reconnect after a drop. AuthProviders requests use
-`AuthProvidersReq`; `Payload::Error` carries a machine-readable `kind`.
+ordering and the semantics do not diverge. A row not listed here must match.
 
 ### Process rules for agents
 
-1. When you change user-visible copy, grouping, or state mapping, grep both
-   clients for the affected strings/behavior and update them in the same
-   commit, with tests in both.
-2. Never duplicate a format function or grouping rule locally; import it
-   from modron-view. If it needs to change, change it there.
-3. A new interactive affordance lands in every client in the same increment,
-   or gets an explicit row added to the divergence table above in the same
-   commit. No silent one-sided features.
-4. New protocol events get a defined AppState/TUI effect documented in
-   modron-protocol's doc comment before any client renders them.
-5. Visual regression tests guard the invariants (the TUI already asserts its
-   design in view tests; the desktop app asserts AppState projections; add
-   the equivalent wherever a new client lands).
+1. When you change user-visible copy, grouping or state mapping, change the
+   shared source (modron-view, mobile/rust-core, modron-protocol), then grep
+   `app/` for the affected strings or behavior and update both targets in the
+   same commit, with tests for both.
+2. Never duplicate a format function or grouping rule locally; import it from
+   modron-view or mobile/rust-core. If it needs to change, change it there.
+3. A new interactive affordance lands in both targets in the same increment,
+   or gets an explicit row in the divergence table in the same commit. No
+   silent one-sided features.
+4. New protocol events get a defined effect documented in modron-protocol's doc
+   comment before any target renders them.
+5. Regression tests guard the invariants: the app's Rust tests assert AppState
+   and terminal-view projections, and `app/web-test.js` checks the web target.
+   Add the equivalent wherever a new target lands.
+6. Do not add a third client. A new client is a new target of `app/`.
+7. Comments in app/ and mobile/rust-core that cite crates/modron-tui paths are
+   history references (commit `0ac5423`); do not mass-edit them.

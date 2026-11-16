@@ -76,6 +76,15 @@ enum SandboxChoice {
 }
 
 impl SandboxChoice {
+    /// The word `modron-app-tui --sandbox` takes for this choice.
+    fn app_word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Seatbelt => "seatbelt",
+            Self::Bubblewrap => "bwrap",
+        }
+    }
+
     fn policy(self) -> modron_core::SandboxPolicy {
         match self {
             Self::Off => modron_core::SandboxPolicy::Off,
@@ -90,8 +99,8 @@ enum Command {
     /// Interactive multi-turn session: type tasks, stream answers, one
     /// shared session (`/exit` to quit, Ctrl-D also works).
     Chat,
-    /// Full terminal UI: inline viewport, live tool lines, esc-to-interrupt,
-    /// inline approval prompts (y/n/a).
+    /// Start the terminal app (`modron-app-tui`), the same as bare `modron`
+    /// on a terminal. Old flags are mapped to the app's (see `modron app`).
     Tui,
     /// Router tooling (offline): score the selector against the held-out
     /// eval set and report accuracy + estimated cost delta vs. always-strong.
@@ -452,6 +461,20 @@ async fn main() {
     }
 }
 
+/// Does this invocation start the terminal app? `modron tui`, or bare `modron`
+/// (no task and no other subcommand).
+fn app_entry(cli: &Cli) -> bool {
+    cli.task.is_none() && matches!(cli.command, None | Some(Command::Tui))
+}
+
+/// Replace this process with the terminal app for `cli`. Returns only by
+/// exiting (the app's exit code, or 2 when the app binary is missing).
+fn exec_app(cli: &Cli) -> ! {
+    let rust_log = std::env::var_os("RUST_LOG");
+    let request = app::request_from_cli(cli, rust_log.as_deref());
+    std::process::exit(app::launch_request(&request))
+}
+
 /// Will this invocation run the interactive TUI (bare `modron`, `modron
 /// tui`, or post-onboarding on a TTY)? Decided before tracing initializes
 /// so logs can be routed away from stderr before the viewport takes over.
@@ -518,6 +541,26 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     }
     // Source saved API keys from onboarding (Phase 12).
     crate::onboarding::source_env_file();
+    // The interactive entry points start the terminal app (`modron-app-tui`,
+    // see `modron app`): `modron tui`, and bare `modron` with no task.
+    if app_entry(&cli) {
+        use std::io::IsTerminal as _;
+        if matches!(cli.command, Some(Command::Tui)) || std::io::stdout().is_terminal() {
+            let mut app_cli = cli.clone();
+            // First run with no provider key: onboarding picks one (bare only).
+            let needs_onboarding = cli.command.is_none()
+                && cli.provider.is_none()
+                && cli.connect.is_none()
+                && !onboarding::has_any_key();
+            if needs_onboarding && onboarding::run_onboarding()? == "mock" {
+                app_cli.provider = Some(ProviderChoice::Mock);
+            }
+            exec_app(&app_cli);
+        }
+        // Bare `modron` with piped stdout: help, as before.
+        Cli::command().print_help()?;
+        return Ok(());
+    }
     let cfg = config::load();
 
     let sessions_dir = cli
@@ -696,164 +739,9 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     if let Some(Command::Chat) = cli.command {
         return run_chat(&cli, &cfg).await;
     }
-    // `modron tui` — inline-viewport UI (Phase-1d). The sinks are created
-    // inside the TUI, so the agent is built through the closure.
-    if let Some(Command::Tui) = cli.command {
-        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-        let mcp = spawn_mcp_servers(&cfg).await?;
-        let notice = modron_upgrade_notice();
-        return modron_tui::run_with(
-            |sinks| {
-                let build = |cli: &Cli| {
-                    build_agent_with(
-                        cli,
-                        &cfg,
-                        interactive,
-                        AgentSinks {
-                            approver: Some(sinks.approver.clone()),
-                            on_delta: Some(sinks.on_delta.clone()),
-                            on_tool_event: Some(sinks.on_tool_event.clone()),
-                        },
-                        &mcp,
-                    )
-                };
-                let agent = match build(&cli) {
-                    Ok(agent) => agent,
-                    Err(err) => {
-                        // No-key startup guarantee: the TUI always opens.
-                        eprintln!(
-                            "warning: {err:#}\n  opening in mock (demo) mode — \
-                             add a key via onboarding or `modron doctor`"
-                        );
-                        let mut demo = cli.clone();
-                        demo.provider = Some(ProviderChoice::Mock);
-                        demo.model = None;
-                        // The retry can still fail for non-provider reasons
-                        // (unknown --agent, bad [router] mode) — surface the
-                        // error instead of panicking mid-startup.
-                        build(&demo)?
-                    }
-                };
-                Ok((agent.engine, agent.resume))
-            },
-            String::new(),
-            notice,
-            cli.connect.as_ref().map(|target| modron_tui::RemoteSpec {
-                target: target.clone(),
-                resume: cli.resume,
-            }),
-        )
-        .await
-        .map_err(|err| anyhow::anyhow!("{err:#}"));
-    }
-
     let Some(task) = cli.task.clone() else {
-        // Claude Code / Codex convention: bare `modron` opens the TUI when
-        // a terminal is attached; piped invocations get help.
-        use std::io::IsTerminal as _;
-        if std::io::stdout().is_terminal() {
-            let interactive = std::io::stdin().is_terminal();
-            // First-run onboarding (Phase 12): if no provider key exists,
-            // show the friendly setup screen instead of erroring later.
-            // An explicit --provider choice (especially mock) IS a
-            // configuration — never intercept it with onboarding.
-            if cli.provider.is_none() && cli.connect.is_none() && !onboarding::has_any_key() {
-                let provider = onboarding::run_onboarding()?;
-                let mut onboarded = cli.clone();
-                onboarded.provider = None; // let config drive it
-                if provider == "mock" {
-                    onboarded.provider = Some(ProviderChoice::Mock);
-                }
-                let mcp = spawn_mcp_servers(&cfg).await?;
-                let notice = modron_upgrade_notice();
-                return modron_tui::run_with(
-                    |sinks| {
-                        let build = |cli: &Cli| {
-                            build_agent_with(
-                                cli,
-                                &cfg,
-                                true,
-                                AgentSinks {
-                                    approver: Some(sinks.approver.clone()),
-                                    on_delta: Some(sinks.on_delta.clone()),
-                                    on_tool_event: Some(sinks.on_tool_event.clone()),
-                                },
-                                &mcp,
-                            )
-                        };
-                        let agent = match build(&onboarded) {
-                            Ok(agent) => agent,
-                            Err(err) => {
-                                // No-key startup guarantee: the TUI always opens.
-                                eprintln!(
-                                    "warning: {err:#}\n  opening in mock (demo) mode — \
-                                     add a key via onboarding or `modron doctor`"
-                                );
-                                let mut demo = onboarded.clone();
-                                demo.provider = Some(ProviderChoice::Mock);
-                                demo.model = None;
-                                build(&demo)?
-                            }
-                        };
-                        Ok((agent.engine, agent.resume))
-                    },
-                    tui_model_label(&onboarded, &cfg),
-                    notice,
-                    None,
-                )
-                .await
-                .map_err(|err| anyhow::anyhow!("{err:#}"));
-            }
-            let mcp = spawn_mcp_servers(&cfg).await?;
-            let notice = modron_upgrade_notice();
-            let effective_cli = if cli.yolo {
-                let mut c = cli.clone();
-                c.approve_all = true;
-                c
-            } else {
-                cli.clone()
-            };
-            return modron_tui::run_with(
-                |sinks| {
-                    let build = |cli: &Cli| {
-                        build_agent_with(
-                            cli,
-                            &cfg,
-                            interactive,
-                            AgentSinks {
-                                approver: Some(sinks.approver.clone()),
-                                on_delta: Some(sinks.on_delta.clone()),
-                                on_tool_event: Some(sinks.on_tool_event.clone()),
-                            },
-                            &mcp,
-                        )
-                    };
-                    let agent = match build(&effective_cli) {
-                        Ok(agent) => agent,
-                        Err(err) => {
-                            // No-key startup guarantee: the TUI always opens.
-                            eprintln!(
-                                "warning: {err:#}\n  opening in mock (demo) mode — \
-                                 add a key via onboarding or `modron doctor`"
-                            );
-                            let mut demo = effective_cli.clone();
-                            demo.provider = Some(ProviderChoice::Mock);
-                            demo.model = None;
-                            build(&demo)?
-                        }
-                    };
-                    Ok((agent.engine, agent.resume))
-                },
-                tui_model_label(&cli, &cfg),
-                notice,
-                cli.connect.as_ref().map(|target| modron_tui::RemoteSpec {
-                    target: target.clone(),
-                    resume: cli.resume,
-                }),
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("{err:#}"));
-        }
+        // Unreachable for `None`/`tui` (handled above); other subcommands
+        // without a task print help.
         Cli::command().print_help()?;
         return Ok(());
     };
@@ -1067,19 +955,6 @@ fn default_model_for_provider(pid: &str) -> Option<String> {
 
 /// The TUI status-line model label: explicit flag > config > "mock" for
 /// demo runs, else empty (the engine's internal default).
-fn tui_model_label(cli: &Cli, cfg: &config::Config) -> String {
-    cli.model
-        .clone()
-        .or_else(|| cfg.default_model.clone())
-        .unwrap_or_else(|| {
-            if matches!(cli.provider, Some(ProviderChoice::Mock)) {
-                "mock".to_string()
-            } else {
-                String::new()
-            }
-        })
-}
-
 /// Assemble provider + tools + store + config from flags/config (Phase-1c
 /// I3 refactor): one construction path for the one-shot run and chat mode.
 /// - `interactive`: attach the /dev/tty approver when a terminal is present,
@@ -2941,10 +2816,6 @@ fn parse_judge_mode(mode: Option<&str>) -> anyhow::Result<modron_core::JudgeMode
 
 /// Startup update check (Phase 6e): cached 24h, 2s live timeout, never
 /// fails the caller.
-fn modron_upgrade_notice() -> Option<String> {
-    crate::upgrade::startup_update_notice()
-}
-
 /// Char-safe truncation for one-line UI summaries.
 fn short(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -3500,8 +3371,22 @@ fn print_usage_row(model: &str, usage: &Usage, cost: f64) {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn only_bare_modron_and_modron_tui_start_the_app() {
+        let entry = |line: &[&str]| app_entry(&Cli::try_parse_from(line).unwrap());
+        assert!(entry(&["modron"]));
+        assert!(entry(&["modron", "--connect", "unix"]));
+        assert!(entry(&["modron", "tui"]));
+        assert!(!entry(&["modron", "hello there"]), "print mode");
+        assert!(!entry(&["modron", "chat"]));
+        assert!(!entry(&["modron", "acp"]));
+        assert!(!entry(&["modron", "serve"]));
+        assert!(!entry(&["modron", "doctor"]));
+        assert!(!entry(&["modron", "upgrade"]));
+    }
+
     #[tokio::test]
-    async fn restart_writes_a_zero_marker_so_resume_starts_fresh() {
+    async fn restart_writes_a_zero_marker_so_resume_starts_fresh_so_resume_starts_fresh() {
         use modron_store::JsonlSessionStore;
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlSessionStore::new(dir.path());

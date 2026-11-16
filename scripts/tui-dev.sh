@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Hot-reload TUI dev loop: rebuilds on any source change, then launches the
-# TUI. Exit the TUI (ctrl+c) to rebuild; ctrl+c again to stop the loop.
+# Hot-reload dev loop for the terminal app: rebuilds modron and the app
+# (app/) on any source change, then launches `modron tui`, which starts the
+# app. Exit the app (ctrl+c) to rebuild; ctrl+c again to stop the loop.
 # Requires fswatch (brew install fswatch); falls back to manual rebuilds.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,13 +14,16 @@ shift || true
 build() {
   local out status=0
   out="$(cargo build --release 2>&1)" || status=1
+  if [ "$status" -eq 0 ]; then
+    out="$(cd app && cargo build --release --bin modron-app-tui 2>&1)" || status=1
+  fi
   printf '%s\n' "$out" | grep -E "^(error|warning: unused)" || true
   return "$status"
 }
 
 wait_for_change() {
   if command -v fswatch >/dev/null; then
-    fswatch -1 crates/*/src >/dev/null 2>&1 || true
+    fswatch -1 crates/*/src app/src >/dev/null 2>&1 || true
   else
     read -rp "press enter to rebuild and relaunch…"
   fi
@@ -33,7 +37,8 @@ until build; do
 done
 
 while true; do
-  ./target/release/modron tui --provider "$PROVIDER" --approve-all "$@" || true
+  MODRON_APP_BIN="$PWD/app/target/release/modron-app-tui" \
+    ./target/release/modron tui --provider "$PROVIDER" --approve-all "$@" || true
   echo "── TUI exited — rebuilding on source changes (ctrl+c to stop) ──"
   wait_for_change
   until build; do

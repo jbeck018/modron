@@ -271,7 +271,7 @@ here is not read by `modron`.
 
 Keys and base URLs are read when a provider is built. The provider is built when
 its key is set, or, for `chatgpt`, when a stored sign-in exists. Saved keys
-written by `modron auth set` (and by `/auth` in the TUI) are kept in
+written by `modron auth set` (and by `/auth` in the app) are kept in
 `~/.config/modron/env`, which is sourced at every launch.
 
 | Provider id | Key | Base URL override | Default endpoint |
@@ -290,7 +290,7 @@ written by `modron auth set` (and by `/auth` in the TUI) are kept in
 
 `--provider` accepts only `anthropic`, `openai-compat`, `chatgpt`, `zai` and
 `mock`. The other ids work through `default_provider`, through `/model` in the
-TUI, and through the router, once their key is set.
+app and chat, and through the router, once their key is set.
 
 Z.ai Coding Plan keys work only on the coding endpoint. Set
 `ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4` for them.
@@ -302,7 +302,7 @@ Z.ai Coding Plan keys work only on the coding endpoint. Set
 | `MODRON_HOST_TOKEN` | `modron serve` | Bearer token sent on the bridge tunnel. Needed when the bridge has `HOST_TOKEN` set. Never shown in error text. |
 | `MODRON_HOST_KIND` | `modron serve` | `cloud` marks the session's host as cloud. Any other value, or unset, means local. |
 | `MODRON_PUBLISH_TOKEN` | `modron serve` (`/share`) | Bearer token for publishing a page to the bridge. Without it, publishing fails before any request is sent. |
-| `MODRON_DEVICE_TOKEN` | TUI `--connect ws://...` | Device token for a `modron serve` that requires one. A `token` URL parameter wins over it. |
+| `MODRON_DEVICE_TOKEN` | `modron --connect ws://...` | Device token for a `modron serve` that requires one. A `token` URL parameter wins over it. |
 
 ### Upgrade
 
@@ -344,6 +344,6 @@ while any sandbox is active.
 | `~/.modron/daemon.sock` | Daemon socket. |
 | `~/.modron/serve.sock` | Unix socket of `modron serve`. |
 | `~/.modron/bench/*.jsonl` | `modron bench` baselines. |
-| `~/.modron/logs/modron.log` | Log file for the TUI, which keeps stderr clear. |
+| `~/.modron/logs/modron.log` | Log file for interactive `modron` runs, which keeps stderr clear. |
 | `~/.modron/update-check.json` | Cache for the once-a-day update check. |
 | `.modron/worktrees/` | Git worktrees for `delegate` with `isolate`, under the working directory. |

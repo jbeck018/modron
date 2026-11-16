@@ -391,28 +391,36 @@ fn install_verified(
         let _ = std::fs::rename(&backup, current.join("modron"));
         anyhow!("cannot install the new binary: {e}")
     })?;
-    // The release archive may also carry the terminal app (release.yml). It
-    // is replaced only when one is installed next to modron; an archive
-    // without it (older releases) leaves an installed app untouched.
+    // The release archive carries the terminal app (release.yml) and `modron
+    // app` needs it next to modron, so it is installed whether or not an older
+    // one is there. An archive without it (older releases) leaves an installed
+    // app untouched.
     let new_app = staging.join(APP_BIN);
-    if new_app.is_file() && current.join(APP_BIN).is_file() {
+    if new_app.is_file() {
+        let existed = current.join(APP_BIN).exists();
         swap_in(current, APP_BIN, &new_app)
-            .map_err(|e| anyhow!("modron was upgraded, but {APP_BIN} was not replaced: {e}"))?;
-        println!("replaced {APP_BIN} ({})", current.join(APP_BIN).display());
+            .map_err(|e| anyhow!("modron was upgraded, but {APP_BIN} was not installed: {e}"))?;
+        let verb = if existed { "replaced" } else { "installed" };
+        println!("{verb} {APP_BIN} ({})", current.join(APP_BIN).display());
     }
     Ok(current.join("modron"))
 }
 
 /// Replace `dir/name` with `new_file` (same filesystem: the staging folder
-/// lives under `dir`). The previous file is kept as `name.bak`; a failed
-/// install restores it.
+/// lives under `dir`). A previous file is kept as `name.bak`; a failed
+/// install restores it. With no previous file, the new one is just installed.
 fn swap_in(dir: &std::path::Path, name: &str, new_file: &std::path::Path) -> anyhow::Result<()> {
     let installed = dir.join(name);
     let backup = dir.join(format!("{name}.bak"));
     let _ = std::fs::remove_file(&backup);
-    std::fs::rename(&installed, &backup)?;
+    let had_previous = installed.exists();
+    if had_previous {
+        std::fs::rename(&installed, &backup)?;
+    }
     if let Err(e) = std::fs::rename(new_file, &installed) {
-        let _ = std::fs::rename(&backup, &installed);
+        if had_previous {
+            let _ = std::fs::rename(&backup, &installed);
+        }
         return Err(anyhow!("cannot install the new {name}: {e}"));
     }
     Ok(())
@@ -484,6 +492,20 @@ mod tests {
             b"old app"
         );
         assert!(!new_file.exists());
+    }
+
+    #[test]
+    fn swap_in_installs_a_new_file_when_none_is_installed_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staging");
+        std::fs::create_dir_all(&staged).unwrap();
+        let new_file = staged.join(APP_BIN);
+        std::fs::write(&new_file, b"new app").unwrap();
+
+        swap_in(dir.path(), APP_BIN, &new_file).unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join(APP_BIN)).unwrap(), b"new app");
+        assert!(!dir.path().join(format!("{APP_BIN}.bak")).exists());
     }
 
     #[test]
@@ -606,6 +628,69 @@ mod tests {
     fn sums_line(archive: &Path, name: &str) -> String {
         let digest = crate::checksums::to_hex(&crate::checksums::sha256_file(archive).unwrap());
         format!("{digest}  {name}\n")
+    }
+
+    /// Build `root/<name>` as a gzipped tar holding `modron` and the app
+    /// binary, both as small shell scripts.
+    #[cfg(unix)]
+    fn archive_with_app(root: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let src = root.join(format!("src-{name}"));
+        std::fs::create_dir_all(&src).unwrap();
+        for file in ["modron", APP_BIN] {
+            let path = src.join(file);
+            std::fs::write(&path, format!("#!/bin/sh\necho \"{file} 9.9.9\"\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let archive = root.join(name);
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .args(["modron", APP_BIN])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        archive
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_with_the_app_installs_the_app_even_when_none_was_installed() {
+        let root = tempfile::tempdir().unwrap();
+        let (current, staging) = installed_dir(root.path());
+        let archive = archive_with_app(root.path(), "download.tar.gz");
+        let sums = sums_line(&archive, ARCHIVE);
+
+        install_verified(&current, &staging, &archive, ARCHIVE, &sums).unwrap();
+
+        let app = std::fs::read_to_string(current.join(APP_BIN)).unwrap();
+        assert!(app.contains("modron-app-tui 9.9.9"), "{app}");
+        assert!(!current.join(format!("{APP_BIN}.bak")).exists());
+        assert!(std::fs::read_to_string(current.join("modron"))
+            .unwrap()
+            .contains("modron 9.9.9"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_with_the_app_replaces_an_installed_app_and_keeps_it_as_bak() {
+        let root = tempfile::tempdir().unwrap();
+        let (current, staging) = installed_dir(root.path());
+        std::fs::write(current.join(APP_BIN), b"old app").unwrap();
+        let archive = archive_with_app(root.path(), "download.tar.gz");
+        let sums = sums_line(&archive, ARCHIVE);
+
+        install_verified(&current, &staging, &archive, ARCHIVE, &sums).unwrap();
+
+        assert!(std::fs::read_to_string(current.join(APP_BIN))
+            .unwrap()
+            .contains("modron-app-tui 9.9.9"));
+        assert_eq!(
+            std::fs::read(current.join(format!("{APP_BIN}.bak"))).unwrap(),
+            b"old app"
+        );
     }
 
     #[cfg(unix)]

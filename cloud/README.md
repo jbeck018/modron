@@ -62,3 +62,10 @@ deploy` from your own login is still the only way to publish it.
 - Phase 3: the web viewer moves to the nsh web target sharing
   modron-mobile-core (same protocol client in wasm). Packet C4b serves that
   app from the bridge; the classic inline viewer remains as a fallback.
+
+## Cloud containers (phase 2, scaffold)
+
+`cloud/container/` holds the image and the Worker that wakes one `modron serve`
+per cloud run. It is deployed by hand-triggered GitHub Actions only: see
+`cloud/container/README.md` for the repository secrets, the trigger and the
+known gaps (the serve tunnel is not started by the container yet).

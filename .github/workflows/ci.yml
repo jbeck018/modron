@@ -20,9 +20,9 @@ concurrency:
 
 jobs:
   app:
-    name: NSH app (terminal target)
+    name: NSH app (terminal target + web bundle)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: app
@@ -48,6 +48,40 @@ jobs:
       # that app/Cargo.lock is current without building anything.
       - name: Lockfile is current (release builds use --locked)
         run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # Web bundle and browser tests (app/README.md, "Web bundle" and "Tests").
+      # wasm-bindgen is cached by its pinned version; the Rust build cache is
+      # the rust-cache step above.
+      - name: Cache wasm-bindgen CLI 0.2.130
+        id: wasm-bindgen-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-0.2.130-${{ runner.os }}
+      - name: Install wasm-bindgen CLI 0.2.130
+        if: steps.wasm-bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - name: Check wasm-bindgen version
+        run: wasm-bindgen --version | grep -q '0.2.130'
+      # The installer has no documented version pin; the version check below
+      # fails the job if it installs anything other than 0.5.1.
+      - name: Install NSH CLI (nsh.dev installer)
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check NSH CLI version (0.5.1)
+        run: nsh --version | grep -q '0\.5\.1'
+      - name: Build web bundle (nsh package --target web)
+        run: nsh package --target web -o dist < /dev/null
+      # web-test.js does require('playwright') with no package in app/, so
+      # Playwright is installed beside it and found through NODE_PATH.
+      - name: Install Playwright 1.63.0 and Chromium
+        run: |
+          npm install --prefix "$RUNNER_TEMP/playwright" playwright@1.63.0
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright" install --with-deps chromium
+          echo "NODE_PATH=$RUNNER_TEMP/playwright/node_modules" >> "$GITHUB_ENV"
+      - name: Browser tests (web-test.js)
+        run: node web-test.js
 
   test:
     name: test + clippy + fmt (${{ matrix.os }})

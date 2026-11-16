@@ -7,8 +7,8 @@ work ledger is [LEDGER.md](LEDGER.md); the configuration reference is
 [docs/CONFIG.md](docs/CONFIG.md).
 
 Status: version 0.1.3 (`[workspace.package]` in Cargo.toml). One `modron` binary
-provides one-shot runs, a multi-turn REPL (`modron chat`), a fullscreen terminal UI
-(`modron tui`, also the default when you run `modron` alone in a terminal), a
+provides one-shot runs, a multi-turn REPL (`modron chat`), the terminal app
+(`modron tui`, also the default when you run `modron` alone in a terminal; it starts `modron-app-tui`), a
 remote-control server (`modron serve`), and an editor protocol server (`modron acp`).
 Work in progress on the clients and remote access is tracked in LEDGER.md, Program U.
 
@@ -19,10 +19,10 @@ One line per feature. The detail is in the linked document.
 - **Steer and queue during a run.** A message sent to a running session is injected at
   the next safe point, between model turns. A queued message starts as the next run
   after a successful finish. Protocol frames `steer`, `enqueue` and `dequeue`; the NSH
-  app uses them, the built-in TUI does not. See [docs/PROTOCOL_V2.md](docs/PROTOCOL_V2.md) section 2.
+  app uses them, the old terminal UI never did. See [docs/PROTOCOL_V2.md](docs/PROTOCOL_V2.md) section 2.
 - **Plan phase.** In the `plan` phase every gated tool is refused and the model records
   a plan with the `plan` tool. A client then approves it (the run switches to build and
-  executes the plan) or asks for a revision. The TUI's `/plan` only adds a plan-first
+  executes the plan) or asks for a revision. The `/plan` command only adds a plan-first
   instruction to the prompt; it does not set the phase. See PROTOCOL_V2.md section 3.
 - **Sub-agents (`delegate`).** A subtask runs as a child with its own transcript, an
   optional persona, and optional `background` and `isolate` modes. Several delegate calls
@@ -83,7 +83,7 @@ first, re-run onboarding to re-import.
 [key]` (omit the key or pass `-` and it is read from stdin, so piped secrets
 never touch shell history or `ps`), `auth status` (masked), and `auth logout
 [provider]`. Saved keys live in `~/.config/modron/env` (mode 0600), sourced on
-every launch. The TUI's `/auth` opens the same manager mid-session.
+every launch. The `/auth` command opens the same manager mid-session.
 
 ## Daemon (persistent sessions)
 
@@ -131,7 +131,7 @@ This catches a corrupted or truncated download and an archive replaced without t
 manifest changing. It does NOT protect against an attacker who can replace both the
 archive and `SHA256SUMS` in the release; that needs signed releases, which this project
 does not have yet. Downgrades are refused, and redirects are followed only to https.
-The TUI and chat show
+`modron chat` shows
 an upgrade notice when a newer release exists. The check runs at most once per
 24h and is cached in `~/.modron/update-check.json`.
 
@@ -179,32 +179,21 @@ and the transcript (compaction and memory included) carries context across
 lines. `/exit` or Ctrl-D quits. The session id prints for `--resume`. A token
 line with the exchange count and the cumulative total follows each answer.
 
-### The TUI (`modron tui`)
+### The terminal app (`modron tui`)
 
-The TUI takes over the terminal (alternate screen) and keeps its own scrollback,
-paged with PgUp and PgDn. It is the built-in client and is frozen: it gets no new
-features (see [Clients](#clients)).
+`modron tui`, and bare `modron` in a terminal, start the terminal target of the NSH
+app (`modron-app-tui`; see `modron app` and [app/README.md](app/README.md) for its
+flags, keys and server choice). It takes over the terminal and connects to a running
+`modron serve`, or starts one. The old built-in terminal UI (`crates/modron-tui`) was
+deleted on 2026-11-16; git history at commit `0ac5423` has it.
 
-- **Esc** interrupts the running turn. Partial work stays persisted and resumable.
-- **y / n / a** answer inline approval prompts. `a` approves for the rest of the run.
-- **shift+tab** flips the approval mode between `ask` and `yolo`.
-- **ctrl+t** opens this turn's grouped tool activity in a panel (Esc closes it).
-- **ctrl+o** toggles transcript detail (compact or full tool output).
-- **ctrl+j** inserts a newline in the input.
-- **ctrl+v** pastes a clipboard image as an attachment.
-- **ctrl+c** aborts a running turn; when idle it quits.
-- **`!cmd`** runs a shell command in the workspace. Its output goes to the
-  scrollback and never reaches the model. It needs no approval, because you typed
-  it. Esc cancels it.
-- **`@path`** attaches a workspace file to the task. Tab completes the path. The
-  file walk respects `.gitignore`.
-- **/help** (or a bare `?`) opens a tabbed help window: General, Commands and
-  Shortcuts.
-- Slash commands include `/model`, `/mode`, `/plan`, `/goal`, `/compact`, `/fork`,
-  `/tasks`, `/share` (alias `/publish`), `/remote-control` (alias `/rc`), `/auth`,
-  `/settings`, `/new`, `/sessions`, `/context`, `/sandbox`, `/reasoning`, `/agent`,
-  `/allow`, `/deny`, `/review` and `/theme`. `/help` lists them all.
-- Transient notes appear as toasts above the input and expire.
+Old flags map to the app: `--resume` and `--connect` pick the session and the server;
+`--yolo`, `--effort`, `--goal`, `--agent`, `--sandbox`, `--allow` and `--deny` reach the
+app's config. Flags with no app equivalent (`--max-turns`, `--max-cost`, `--attach`,
+compaction flags) are named on stderr and ignored.
+
+The slash commands are shared with the app (`crates/modron-view/src/slash.rs`); `/help`
+lists them. Transient notes appear in the status area and expire.
 
 ## Live usage
 
@@ -289,7 +278,7 @@ described in [docs/CONFIG.md](docs/CONFIG.md).
 ## Subcommands
 
 ```sh
-modron tui                      # fullscreen terminal UI (bare `modron` on a terminal does the same)
+modron tui                      # terminal app, modron-app-tui (bare `modron` on a terminal does the same)
 modron chat                     # interactive multi-turn session
 modron serve [--listen ADDR] [--bridge URL] [--require-token] [--allow-origin ORIGIN]
                                 # remote-control server; see "Remote access"
@@ -407,14 +396,13 @@ marker stores the truncation point that a rewind created. Workspace memory lives
 The terminal, web and mobile clients are views over the same session state. The
 protocol they share is in [docs/PROTOCOL_V2.md](docs/PROTOCOL_V2.md).
 
-- **Terminal UI (`modron tui`, `crates/modron-tui`).** The built-in client and the default
-  interactive front end. It is frozen: no new features, only shared logic changes.
-- **NSH app (`app/`).** The unified client that is replacing the TUI and the other clients.
-  One chat screen runs on two targets: a terminal binary (`modron-app-tui`) and a web bundle.
-  It connects to a running `modron serve`. It is not at parity with `modron tui` yet. The
-  ledger lists these as open: a model picker, help, slash commands, deleting a session,
-  sign-in on the web, the web key bindings for Esc, y/a/n, y/r and Alt+Enter, and the terminal
-  target that would replace `modron tui` (C7, not started). Run it with a server up:
+- **NSH app (`app/`).** The one interactive client, with two targets: a terminal binary
+  (`modron-app-tui`, started by `modron tui`, bare `modron` on a terminal, or `modron app`)
+  and a web bundle. Both connect to a running `modron serve`, share their logic with
+  `crates/modron-view` and `mobile/rust-core`, and follow the parity contract in
+  AGENTS.md. `mobile/app` (TSX) is frozen. Open items are listed in LEDGER.md.
+
+  Run it with a server up:
 
   ```sh
   modron serve --listen 127.0.0.1:7000          # loopback clients need no token
@@ -455,8 +443,8 @@ protocol they share is in [docs/PROTOCOL_V2.md](docs/PROTOCOL_V2.md).
   <name>` revokes one. `--require-token` asks for a token on every connection, even on loopback.
   Browser origins are refused unless named with `--allow-origin` (exact match, repeatable).
 - **Drive a server from a client.** `modron --connect ws://host:port` (or `--connect unix`)
-  starts the TUI or chat against a running server, and `--resume` reattaches to a session.
-- **Share a session.** In a TUI connected to a server, `/remote-control <bridge url>` opens a
+  starts the terminal app or chat against a running server, and `--resume` reattaches to a session.
+- **Share a session.** In a client connected to a server, `/remote-control <bridge url>` opens a
   tunnel through a bridge and prints a share URL. Open it on any device. The share link is the
   credential for that one session: anyone who has it can watch and drive the session, so treat it
   as a secret. `/s/<key>` on the bridge redirects to the web app at `/app/`. `/s/<key>?classic=1`
@@ -535,7 +523,6 @@ crates/modron-router      model selection, learned and heuristic routers, model 
 crates/modron-mcp         MCP client over stdio and Streamable HTTP
 crates/modron-server      remote-control server (modron serve): session hub, bridge tunnel,
                            wakes, publishing
-crates/modron-tui         the terminal UI (modron tui); frozen
 crates/modron-cli         the modron binary: CLI, config, daemon, onboarding, subcommands
 
 app/                      NSH client: terminal and web targets (see app/README.md)

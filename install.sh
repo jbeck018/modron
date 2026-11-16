@@ -109,9 +109,14 @@ if [ "$INSTALLED" -ne 1 ]; then
   else
     git clone --depth 1 --branch "$VERSION" "https://github.com/$REPO.git" "$SRC"
   fi
-  # -p modron-cli: the CLI only (the desktop crate needs GUI system libs).
+  # -p modron-cli: the CLI only. The terminal app (`modron app`) is its own
+  # workspace under app/; tags that predate it have no app/ and skip it.
   (cd "$SRC" && cargo build --release --locked -p modron-cli)
   cp "$SRC/target/release/modron" "$INSTALL_DIR/modron"
+  if [ -f "$SRC/app/Cargo.toml" ]; then
+    (cd "$SRC/app" && cargo build --release --locked --bin modron-app-tui)
+    cp "$SRC/app/target/release/modron-app-tui" "$INSTALL_DIR/modron-app-tui"
+  fi
   info "built and installed from source"
 fi
 

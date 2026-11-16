@@ -1,10 +1,12 @@
 # Modron app parity audit (old terminal UI retirement)
 
+> **Note (2026-11-16, packet C9-TUI):** the reference crate `crates/modron-tui/` has been removed, and `modron` / `modron tui` now start the app. File:line citations to `crates/modron-tui/...` below refer to git history at commit `0ac5423` (for example `git show 0ac5423:crates/modron-tui/src/lib.rs`).
+
 Packet PARITY-3. Read-only audit, rewritten 2026-11-16. No cargo run, no test run, no commit. Supersedes the PARITY-2 audit (rewritten 2026-11-15).
 
 ## Scope and state
 
-- Old TUI: `crates/modron-tui/` (all `src/...` citations below are relative to it). Frozen. Its citations were kept from PARITY-2; the ones used for changed rows were re-read and still match.
+- Old TUI: `crates/modron-tui/` at commit `0ac5423`, removed 2026-11-16 (all `src/...` citations below are relative to it). Frozen. Its citations were kept from PARITY-2; the ones used for changed rows were re-read and still match.
 - New app: `app/` (`app/src/...`, `app/tests/...`, `app/web-test.js`, `app/README.md`, `app/NOTES.md`, `app/src/bin/modron-app-tui.rs`). Client core: `mobile/rust-core/src/{client.rs,view.rs,attach.rs}`. Shared table: `crates/modron-view/src/slash.rs`. Protocol: `crates/modron-protocol/src/lib.rs`. Server cited where a row depends on it: `crates/modron-server/src/dispatch.rs`, `crates/modron-server/src/hub.rs`. Engine: `crates/modron-core/src/engine.rs`.
 - Baseline: HEAD `0567616` ("App: persona picker rows, task summaries, credential removal"). The working tree was clean when read (`git status --short` empty). Every item the PARITY-2 audit marked "(in progress)" is now committed.
 - Line numbers refer to HEAD. Test names were taken from the source (`#[test]` functions in `app/src`, `app/tests`, `mobile/rust-core/src`, `crates/modron-view/src`, `crates/modron-protocol/src`). A cited test exists; it was not run.
@@ -255,7 +257,7 @@ Ordered by how often a daily terminal user would hit the gap. Work types: "app" 
 14. **Ctrl+V on the web** (PARTIAL; app, web only). Shows a note; the browser has no clipboard read here. Work: app.
 15. **Caret and input scroll** (PARTIAL; app). NSH draws the caret; no visual test. Work: app (visual test).
 
-Crate dependency: `crates/modron-cli` depends on `modron-tui` (`crates/modron-cli/Cargo.toml:18`) and calls `modron_tui::run_with` at `crates/modron-cli/src/main.rs:705` (`modron tui`) and at 769 and 816 (read, not run). Deleting the crate is therefore a change to the `modron` command, not only a removal; REL says bare `modron` is unchanged.
+Crate dependency: `crates/modron-cli` depends on `modron-tui` (`crates/modron-cli/Cargo.toml:18`) and calls `modron_tui::run_with` at `crates/modron-cli/src/main.rs:705` (`modron tui`) and at 769 and 816 (read, not run). Deleting the crate is therefore a change to the `modron` command, not only a removal; REL says bare `modron` is unchanged. Resolved 2026-11-16 (C9-TUI): the dependency is gone, and bare `modron` and `modron tui` start the app.
 
 ## Different by decision
 
