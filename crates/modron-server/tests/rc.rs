@@ -326,23 +326,26 @@ async fn scoped_ping_keeps_the_tunnel_open() {
     ));
 }
 
-// ---- Portal host registration (host token on the tunnel, session directory) ----
+// ---- Portal host registration and redial (host token on the tunnel, session directory) ----
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use futures::StreamExt as _;
+use futures::{SinkExt as _, StreamExt as _};
 use modron_server::rc::{
-    run_tunnel_with, viewer_key, EnvLookup, RegistrationTiming, HOST_KIND_ENV, HOST_TOKEN_ENV,
+    backoff_delay, connect_failure_text, redial_log_due, run_tunnel_timed, schedule_after,
+    viewer_key, EnvLookup, ReconnectTiming, RegistrationTiming, HOST_KIND_ENV, HOST_TOKEN_ENV,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::handshake::server::{
-    Request as WsRequest, Response as WsResponse,
+    ErrorResponse, Request as WsRequest, Response as WsResponse,
 };
+use tokio_tungstenite::tungstenite::http;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// One request the fake bridge's HTTP side received.
 #[derive(Clone, Debug)]
@@ -359,32 +362,46 @@ struct FakeShared {
     http: Mutex<Vec<Recorded>>,
     /// The `Authorization` header of each WebSocket upgrade (None = absent).
     ws_auth: Mutex<Vec<Option<String>>>,
+    /// The request path of each WebSocket upgrade.
+    ws_paths: Mutex<Vec<String>>,
     /// Statuses for successive PUTs; 204 once the queue is empty.
     put_statuses: Mutex<VecDeque<u16>>,
+    /// When set, WebSocket upgrades are refused with this status.
+    ws_refuse: Mutex<Option<u16>>,
+    /// Text frames the agent sent over its socket, in order.
+    agent_frames: Mutex<Vec<String>>,
+    /// The live agent socket's outbound queue (test to agent), if one is up.
+    to_agent: Mutex<Option<mpsc::UnboundedSender<String>>>,
 }
 
 /// A fake bridge on one loopback port: plain HTTP routes for registration,
-/// and the `/agent/<key>` WebSocket, which stays open until `close_tunnel`.
+/// and the `/agent/<key>` WebSocket. `drop_tunnel` closes every open agent
+/// socket (the bridge side of a dropped connection); the port keeps
+/// accepting, so the agent can redial.
 struct FakeBridge {
     base: String,
     shared: Arc<FakeShared>,
-    close: Arc<Notify>,
+    close: broadcast::Sender<()>,
 }
 
 impl FakeBridge {
     async fn start() -> Self {
-        let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on("127.0.0.1:0").await
+    }
+
+    async fn start_on(addr: &str) -> Self {
+        let listener = TokioListener::bind(addr).await.unwrap();
         let base = format!("ws://{}", listener.local_addr().unwrap());
         let shared = Arc::new(FakeShared::default());
-        let close = Arc::new(Notify::new());
-        let (shared_for_accept, close_for_accept) = (Arc::clone(&shared), Arc::clone(&close));
+        let (close, _) = broadcast::channel(4);
+        let (accept_shared, accept_close) = (Arc::clone(&shared), close.clone());
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
-                let (shared, close) = (
-                    Arc::clone(&shared_for_accept),
-                    Arc::clone(&close_for_accept),
-                );
-                tokio::spawn(serve_conn(sock, shared, close));
+                tokio::spawn(serve_conn(
+                    sock,
+                    Arc::clone(&accept_shared),
+                    accept_close.subscribe(),
+                ));
             }
         });
         Self {
@@ -417,6 +434,24 @@ impl FakeBridge {
         self.shared.ws_auth.lock().unwrap().clone()
     }
 
+    fn ws_paths(&self) -> Vec<String> {
+        self.shared.ws_paths.lock().unwrap().clone()
+    }
+
+    /// How many snapshots the agent has sent over all its sockets.
+    fn snapshots(&self) -> usize {
+        self.shared
+            .agent_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|text| {
+                serde_json::from_str::<Frame>(text)
+                    .is_ok_and(|frame| matches!(frame.payload, Payload::Snapshot { .. }))
+            })
+            .count()
+    }
+
     fn queue_put_statuses(&self, statuses: &[u16]) {
         self.shared
             .put_statuses
@@ -425,44 +460,93 @@ impl FakeBridge {
             .extend(statuses.iter().copied());
     }
 
-    fn close_tunnel(&self) {
-        self.close.notify_one();
+    fn refuse_upgrades(&self, status: u16) {
+        *self.shared.ws_refuse.lock().unwrap() = Some(status);
+    }
+
+    fn drop_tunnel(&self) {
+        let _ = self.close.send(());
+    }
+
+    /// A viewer's hello, relayed the way the bridge relays it (role stamped).
+    fn send_viewer_hello(&self) {
+        let frame = Frame::request(
+            9,
+            Payload::Hello {
+                client: "viewer".into(),
+                protocol: modron_protocol::PROTOCOL_VERSION,
+                token: None,
+            },
+        );
+        let mut value = serde_json::to_value(&frame).unwrap();
+        value["role"] = "viewer".into();
+        let sender = self
+            .shared
+            .to_agent
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a live agent socket");
+        sender.send(value.to_string()).unwrap();
     }
 }
 
 /// Route one connection: a WebSocket upgrade goes to the agent socket,
 /// anything else is a plain HTTP request.
-async fn serve_conn(sock: TcpStream, shared: Arc<FakeShared>, close: Arc<Notify>) {
+async fn serve_conn(sock: TcpStream, shared: Arc<FakeShared>, mut close: broadcast::Receiver<()>) {
     let head = peek_head(&sock).await;
     if head.to_ascii_lowercase().contains("upgrade: websocket") {
         let shared_for_cb = Arc::clone(&shared);
         // The Err type is fixed by tungstenite's handshake Callback.
         #[allow(clippy::result_large_err)]
-        let callback = move |req: &WsRequest, resp: WsResponse| {
-            let auth = req
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            shared_for_cb.ws_auth.lock().unwrap().push(auth);
-            Ok(resp)
-        };
+        let callback =
+            move |req: &WsRequest, resp: WsResponse| -> Result<WsResponse, ErrorResponse> {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                shared_for_cb.ws_auth.lock().unwrap().push(auth);
+                shared_for_cb
+                    .ws_paths
+                    .lock()
+                    .unwrap()
+                    .push(req.uri().path().to_string());
+                let refuse = *shared_for_cb.ws_refuse.lock().unwrap();
+                match refuse {
+                    Some(status) => Err(http::Response::builder()
+                        .status(status)
+                        .body(Some("refused".to_string()))
+                        .unwrap()),
+                    None => Ok(resp),
+                }
+            };
         let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(sock, callback).await else {
             return;
         };
+        let (to_agent_tx, mut to_agent_rx) = mpsc::unbounded_channel::<String>();
+        *shared.to_agent.lock().unwrap() = Some(to_agent_tx);
         loop {
             tokio::select! {
-                _ = close.notified() => {
+                _ = close.recv() => {
                     let _ = ws.close(None).await;
                     break;
                 }
-                msg = ws.next() => {
-                    if !matches!(msg, Some(Ok(_))) {
+                msg = ws.next() => match msg {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        shared.agent_frames.lock().unwrap().push(text.to_string());
+                    }
+                    Some(Ok(_)) => {}
+                    _ => break,
+                },
+                Some(text) = to_agent_rx.recv() => {
+                    if ws.send(WsMessage::Text(text.into())).await.is_err() {
                         break;
                     }
                 }
             }
         }
+        *shared.to_agent.lock().unwrap() = None;
     } else {
         serve_http(sock, shared).await;
     }
@@ -564,6 +648,16 @@ fn fast_timing() -> RegistrationTiming {
     }
 }
 
+/// Redials in milliseconds: the injected clock for every reconnect test.
+fn fast_reconnect() -> ReconnectTiming {
+    ReconnectTiming {
+        initial: Duration::from_millis(10),
+        cap: Duration::from_millis(40),
+        stable: Duration::from_millis(200),
+        log_interval: Duration::from_secs(60),
+    }
+}
+
 /// Poll `ok` until it holds, failing the test after 5 seconds.
 async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -575,12 +669,21 @@ async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
-/// Open a tunnel for a fresh session on `bridge`. Returns the state, the
-/// session, the share key and the tunnel task.
-async fn open_tunnel(
-    bridge: &FakeBridge,
+/// Stop a tunnel the way `start_remote_control`'s replacement and
+/// `forget_session_state` do: abort the task.
+async fn stop(task: JoinHandle<anyhow::Result<()>>) {
+    task.abort();
+    let _ = task.await;
+}
+
+/// Open a tunnel for a fresh session on `base`, with its share key minted
+/// (as `start_remote_control` does). Returns the state, the session, the
+/// share key and the tunnel task.
+async fn open_tunnel_to(
+    base: String,
     lookup: EnvLookup,
     timing: RegistrationTiming,
+    reconnect: ReconnectTiming,
     title: &str,
 ) -> (
     Arc<ServerState>,
@@ -592,15 +695,31 @@ async fn open_tunnel(
     let session = state.store.create_session(title).await.unwrap().id;
     state.hub.ensure_session(session, Some(session));
     let key = modron_server::rc::share_key();
-    let task = tokio::spawn(run_tunnel_with(
+    state.rc_keys.lock().unwrap().insert(session, key.clone());
+    let task = tokio::spawn(run_tunnel_timed(
         lookup,
         timing,
+        reconnect,
         Arc::clone(&state),
         session,
-        bridge.base.clone(),
+        base,
         key.clone(),
     ));
     (state, session, key, task)
+}
+
+async fn open_tunnel(
+    bridge: &FakeBridge,
+    lookup: EnvLookup,
+    timing: RegistrationTiming,
+    title: &str,
+) -> (
+    Arc<ServerState>,
+    SessionId,
+    String,
+    JoinHandle<anyhow::Result<()>>,
+) {
+    open_tunnel_to(bridge.base.clone(), lookup, timing, fast_reconnect(), title).await
 }
 
 #[tokio::test]
@@ -618,8 +737,7 @@ async fn host_token_is_sent_on_the_tunnel_handshake_only_when_set() {
         with_token.ws_auth(),
         vec![Some("Bearer tok-123".to_string())]
     );
-    with_token.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
 
     let without = FakeBridge::start().await;
     let (_state, _session, _key, task) =
@@ -628,8 +746,7 @@ async fn host_token_is_sent_on_the_tunnel_handshake_only_when_set() {
     assert_eq!(without.ws_auth(), vec![None], "no header without a token");
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(without.puts().is_empty(), "no registration without a token");
-    without.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
 }
 
 #[tokio::test]
@@ -662,8 +779,7 @@ async fn registration_put_carries_exactly_the_five_fields() {
     assert_eq!(body["viewer_key"], viewer_key(&key).as_str());
     assert_eq!(body["state"], "idle");
 
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
 }
 
 #[tokio::test]
@@ -675,8 +791,7 @@ async fn a_session_without_a_title_is_named_by_its_short_id() {
     let body: serde_json::Value = serde_json::from_str(&bridge.puts()[0].body).unwrap();
     let short = &session.simple().to_string()[..8];
     assert_eq!(body["title"], format!("session {short}").as_str());
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
 }
 
 #[tokio::test]
@@ -718,8 +833,7 @@ async fn running_state_change_is_pushed_and_puts_stay_debounced() {
         );
     }
 
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
 }
 
 #[tokio::test]
@@ -733,12 +847,11 @@ async fn heartbeat_repeats_the_put_while_the_tunnel_is_up() {
     )
     .await;
     eventually("three PUTs", || bridge.puts().len() >= 3).await;
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
 }
 
 #[tokio::test]
-async fn closing_the_tunnel_deletes_the_entry() {
+async fn a_dropped_socket_deletes_the_entry_before_the_redial_puts_it_again() {
     let bridge = FakeBridge::start().await;
     let (_state, session, _key, task) = open_tunnel(
         &bridge,
@@ -748,13 +861,17 @@ async fn closing_the_tunnel_deletes_the_entry() {
     )
     .await;
     eventually("the first PUT", || !bridge.puts().is_empty()).await;
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    bridge.drop_tunnel();
+    eventually("the DELETE of the dropped connection", || {
+        bridge.deletes().len() == 1
+    })
+    .await;
 
     let deletes = bridge.deletes();
-    assert_eq!(deletes.len(), 1, "one DELETE on close");
     assert_eq!(deletes[0].path, format!("/api/host/sessions/{session}"));
     assert_eq!(deletes[0].auth.as_deref(), Some("Bearer tok-del"));
+    eventually("the redial's PUT", || bridge.puts().len() >= 2).await;
+    stop(task).await;
 }
 
 #[tokio::test]
@@ -772,8 +889,7 @@ async fn portal_not_configured_turns_registration_off_for_the_tunnel() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(bridge.puts().len(), 1, "no retries after 503");
     assert!(!task.is_finished(), "the tunnel itself stays up");
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
     assert!(bridge.deletes().is_empty(), "nothing to delete after 503");
 }
 
@@ -796,8 +912,7 @@ async fn refused_host_token_stops_registration_with_no_further_requests() {
     eventually("the 401 PUT", || bridge.puts().len() == 1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(bridge.puts().len(), 1, "no retries after 401");
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
     assert!(
         bridge.deletes().is_empty(),
         "no DELETE after a refused token"
@@ -817,8 +932,7 @@ async fn other_failures_are_retried_on_the_next_heartbeat() {
     )
     .await;
     eventually("a retried PUT", || bridge.puts().len() >= 2).await;
-    bridge.close_tunnel();
-    task.await.unwrap().unwrap();
+    stop(task).await;
 }
 
 #[tokio::test]
@@ -836,28 +950,256 @@ async fn host_token_never_appears_in_tunnel_errors() {
     let text = format!("{err:#}");
     assert!(!text.contains("token-secret"), "token leaked: {text}");
     assert!(text.contains(HOST_TOKEN_ENV), "{text}");
+    assert!(bridge.ws_auth().is_empty(), "no dial with a bad header");
+}
 
-    // A refused connection with a valid token: the error names the bridge only.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = format!("ws://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let state = test_state();
-    let session = state.store.create_session("dead").await.unwrap().id;
-    state.hub.ensure_session(session, Some(session));
-    let err = run_tunnel_with(
-        env_with(&[(HOST_TOKEN_ENV, "token-secret-2")]),
-        fast_timing(),
-        state,
-        session,
-        dead,
-        modron_server::rc::share_key(),
-    )
-    .await
-    .unwrap_err();
+#[tokio::test]
+async fn unreachable_bridge_error_names_the_bridge_and_never_the_key_or_token() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let bridge = format!("ws://127.0.0.1:{port}");
+    let key = modron_server::rc::share_key();
+    let err = tokio_tungstenite::connect_async(format!("{bridge}/agent/{key}"))
+        .await
+        .expect_err("nothing listens there");
+    let text = connect_failure_text(&bridge, &key, Some("tok-secret-9"), &err);
     assert!(
-        !format!("{err:#}").contains("token-secret-2"),
-        "token leaked: {err:#}"
+        text.starts_with(&format!(
+            "connecting to the remote-control bridge at {bridge}: "
+        )),
+        "{text}"
     );
+    assert!(
+        text.contains("refused"),
+        "the transport cause is shown: {text}"
+    );
+    assert!(!text.contains(&key), "the share key never appears: {text}");
+    assert!(
+        !text.contains("tok-secret-9"),
+        "the token never appears: {text}"
+    );
+}
+
+#[tokio::test]
+async fn bridge_down_at_start_is_redialled_until_it_comes_up_and_registers() {
+    // Reserve a port, then leave it with nothing listening.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (_state, session, key, task) = open_tunnel_to(
+        format!("ws://127.0.0.1:{port}"),
+        env_with(&[(HOST_TOKEN_ENV, "tok")]),
+        fast_timing(),
+        fast_reconnect(),
+        "down at start",
+    )
+    .await;
+    // Several refused dials go by, each after one injected backoff step.
+    tokio::time::sleep(fast_reconnect().cap * 4).await;
+    assert!(
+        !task.is_finished(),
+        "a refused dial is retried, not given up"
+    );
+
+    let bridge = FakeBridge::start_on(&format!("127.0.0.1:{port}")).await;
+    eventually("the tunnel connects", || !bridge.ws_auth().is_empty()).await;
+    eventually("the registration", || !bridge.puts().is_empty()).await;
+    assert_eq!(bridge.ws_paths(), vec![format!("/agent/{key}")]);
+    assert_eq!(
+        bridge.puts()[0].path,
+        format!("/api/host/sessions/{session}")
+    );
+    stop(task).await;
+}
+
+#[tokio::test]
+async fn dropped_socket_redials_with_the_same_key_and_a_late_viewer_gets_a_snapshot() {
+    let bridge = FakeBridge::start().await;
+    let (_state, session, key, task) = open_tunnel(
+        &bridge,
+        env_with(&[(HOST_TOKEN_ENV, "tok")]),
+        fast_timing(),
+        "redial",
+    )
+    .await;
+    eventually("the first connection", || bridge.ws_auth().len() == 1).await;
+    eventually("the first snapshot", || bridge.snapshots() >= 1).await;
+
+    bridge.drop_tunnel();
+    eventually("the redial", || bridge.ws_auth().len() == 2).await;
+    eventually("the reconnect's snapshot", || bridge.snapshots() >= 2).await;
+    assert_eq!(
+        bridge.ws_paths(),
+        vec![format!("/agent/{key}"), format!("/agent/{key}")],
+        "the redial reuses the share key"
+    );
+    assert!(!task.is_finished(), "the tunnel keeps running");
+
+    // The re-registration carries the same directory entry.
+    eventually("the redial's PUT", || {
+        bridge
+            .puts()
+            .last()
+            .is_some_and(|p| p.path == format!("/api/host/sessions/{session}"))
+    })
+    .await;
+    let viewer = viewer_key(&key);
+    for put in bridge.puts() {
+        let body: serde_json::Value = serde_json::from_str(&put.body).unwrap();
+        assert_eq!(body["viewer_key"], viewer.as_str());
+    }
+
+    // A viewer that attaches after the reconnect gets a fresh snapshot.
+    let before = bridge.snapshots();
+    bridge.send_viewer_hello();
+    eventually("the late viewer's snapshot", || bridge.snapshots() > before).await;
+    stop(task).await;
+}
+
+#[tokio::test]
+async fn a_refused_host_token_ends_the_tunnel_and_is_never_redialled() {
+    let bridge = FakeBridge::start().await;
+    bridge.refuse_upgrades(401);
+    let (_state, _session, _key, task) = open_tunnel(
+        &bridge,
+        env_with(&[(HOST_TOKEN_ENV, "tok-bad")]),
+        fast_timing(),
+        "401 upgrade",
+    )
+    .await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the tunnel gives up on a refusal")
+        .expect("the task does not panic");
+    let text = format!("{:#}", outcome.unwrap_err());
+    assert!(text.contains(HOST_TOKEN_ENV), "the fix is named: {text}");
+    assert!(!text.contains("tok-bad"), "the token never appears: {text}");
+
+    tokio::time::sleep(fast_reconnect().cap * 5).await;
+    assert_eq!(bridge.ws_auth().len(), 1, "no redial after a refused token");
+}
+
+#[tokio::test]
+async fn a_stopped_tunnel_is_never_redialled() {
+    let bridge = FakeBridge::start().await;
+    let (_state, _session, _key, task) = open_tunnel(
+        &bridge,
+        env_with(&[(HOST_TOKEN_ENV, "tok")]),
+        fast_timing(),
+        "stop",
+    )
+    .await;
+    eventually("the first connection", || bridge.ws_auth().len() == 1).await;
+    stop(task).await;
+    bridge.drop_tunnel();
+    tokio::time::sleep(fast_reconnect().cap * 5).await;
+    assert_eq!(bridge.ws_auth().len(), 1, "no redial after a stop");
+}
+
+#[tokio::test]
+async fn a_forgotten_session_key_ends_the_tunnel_without_a_redial() {
+    let bridge = FakeBridge::start().await;
+    let (state, session, _key, task) = open_tunnel(
+        &bridge,
+        env_with(&[(HOST_TOKEN_ENV, "tok")]),
+        fast_timing(),
+        "deleted",
+    )
+    .await;
+    eventually("the first connection", || bridge.ws_auth().len() == 1).await;
+    // What deleting the session does to its server-side state (see
+    // `forget_session_state`), minus the abort the supervisor does not need.
+    state.rc_keys.lock().unwrap().remove(&session);
+    bridge.drop_tunnel();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the tunnel ends once its key is gone")
+        .expect("the task does not panic");
+    outcome.expect("a stopped tunnel is not an error");
+    tokio::time::sleep(fast_reconnect().cap * 5).await;
+    assert_eq!(bridge.ws_auth().len(), 1, "no redial for a deleted session");
+}
+
+#[tokio::test]
+async fn server_shutdown_stops_the_tunnel_for_good() {
+    let bridge = FakeBridge::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let options = modron_server::ServeOptions {
+        remote_control: Some(bridge.base.clone()),
+        ..serve_options(dir.path())
+    };
+    let server = modron_server::bind_server(serve_engine(dir.path()), &options)
+        .await
+        .unwrap();
+    eventually("the tunnel's websocket", || bridge.ws_auth().len() == 1).await;
+
+    server.shutdown();
+    bridge.drop_tunnel();
+    tokio::time::sleep(fast_reconnect().cap * 5).await;
+    assert_eq!(bridge.ws_auth().len(), 1, "no redial after shutdown");
+}
+
+#[test]
+fn backoff_doubles_to_the_cap_and_jitter_stays_within_half_to_full() {
+    let timing = ReconnectTiming::default();
+    let full: Vec<u64> = (0..8)
+        .map(|n| backoff_delay(&timing, n, 1.0).as_secs())
+        .collect();
+    assert_eq!(full, [1, 2, 4, 8, 16, 32, 60, 60]);
+    let half: Vec<u128> = (0..8)
+        .map(|n| backoff_delay(&timing, n, 0.0).as_millis())
+        .collect();
+    assert_eq!(half, [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+    assert_eq!(backoff_delay(&timing, 500, 1.0), Duration::from_secs(60));
+    assert_eq!(backoff_delay(&timing, 3, 0.5), Duration::from_secs(6));
+    assert_eq!(
+        backoff_delay(&timing, 0, f64::NAN),
+        Duration::from_millis(500)
+    );
+}
+
+#[test]
+fn a_connection_up_for_the_stable_window_resets_the_schedule() {
+    let timing = ReconnectTiming::default();
+    let mut failures = 0u32;
+    let mut delays = Vec::new();
+    for _ in 0..4 {
+        delays.push(backoff_delay(&timing, failures, 1.0).as_secs());
+        failures += 1;
+    }
+    // A dial that stayed up 30 s starts the schedule over.
+    failures = schedule_after(failures, Duration::from_secs(30), &timing);
+    assert_eq!(failures, 0);
+    delays.push(backoff_delay(&timing, failures, 1.0).as_secs());
+    assert_eq!(delays, [1, 2, 4, 8, 1]);
+    assert_eq!(schedule_after(7, Duration::from_secs(29), &timing), 7);
+}
+
+#[test]
+fn redials_at_the_cap_log_at_most_once_a_minute() {
+    let timing = ReconnectTiming::default();
+    assert!(redial_log_due(
+        Duration::from_secs(4),
+        &timing,
+        Some(Duration::from_millis(1))
+    ));
+    assert!(redial_log_due(Duration::from_secs(60), &timing, None));
+    assert!(!redial_log_due(
+        Duration::from_secs(60),
+        &timing,
+        Some(Duration::from_secs(59))
+    ));
+    assert!(redial_log_due(
+        Duration::from_secs(60),
+        &timing,
+        Some(Duration::from_secs(60))
+    ));
 }
 
 /// An engine over an in-memory store whose working directory is `dir`.
@@ -940,7 +1282,7 @@ async fn serve_flag_opens_the_tunnel_at_start_and_writes_the_share_file() {
         tunnel.abort();
     }
     server.shutdown();
-    bridge.close_tunnel();
+    bridge.drop_tunnel();
 }
 
 #[tokio::test]
@@ -1005,39 +1347,4 @@ async fn share_url_file_needs_the_remote_control_flag() {
         .err()
         .expect("a share file without a tunnel is refused");
     assert!(err.to_string().contains("--remote-control"), "{err}");
-}
-
-#[tokio::test]
-async fn unreachable_bridge_error_carries_the_transport_cause_without_the_key() {
-    // A loopback port with nothing listening on it.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let bridge = format!("ws://127.0.0.1:{port}");
-    let key = modron_server::rc::share_key();
-    let state = test_state();
-    let session = state.store.create_session("t").await.unwrap().id;
-    let result = run_tunnel_with(
-        env_with(&[]),
-        fast_timing(),
-        state,
-        session,
-        bridge.clone(),
-        key.clone(),
-    )
-    .await;
-    let err = format!("{:#}", result.expect_err("nothing listens there"));
-    assert!(
-        err.starts_with(&format!(
-            "connecting to the remote-control bridge at {bridge}: "
-        )),
-        "{err}"
-    );
-    assert!(
-        err.contains("refused"),
-        "the transport cause is shown: {err}"
-    );
-    assert!(!err.contains(&key), "the share key never appears: {err}");
 }

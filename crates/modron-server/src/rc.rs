@@ -9,8 +9,10 @@
 //! web/phone page on the other side of the relay sends ClientMsg frames
 //! (hello, attach, submit, approve...) which flow through the SAME
 //! `handle_frame` dispatch as every other client, and ServerMsg frames
-//! (snapshot, deltas, tool events, approvals) flow back out. The tunnel
-//! lives until the server stops or the socket closes.
+//! (snapshot, deltas, tool events, approvals) flow back out. A dropped or
+//! unreachable socket is redialled with backoff (see [`ReconnectTiming`]),
+//! with the same share key, until the tunnel is stopped or the bridge refuses
+//! the host token.
 //!
 //! Trust model: possession of the share key is the credential (like
 //! Claude Code share links). Tunnel frames are trusted because the key
@@ -29,6 +31,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::dispatch::{handle_frame, handle_relayed_frame, ConnCtx, Flow, ServerState};
@@ -432,11 +435,141 @@ async fn put_entry(
     }
 }
 
-/// Run the tunnel for one session until the socket closes or the server
-/// shuts down. Frames from the relay are dispatched exactly like local
-/// client frames; outbound frames (snapshot, deltas, events) are relayed
-/// to the bridge. With `MODRON_HOST_TOKEN` set, the session is also
-/// registered in the portal directory for as long as the tunnel lives.
+/// Redial schedule of a tunnel. Production uses [`Default`]; tests shorten
+/// it, the same injected-clock pattern as [`RegistrationTiming`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconnectTiming {
+    /// The first redial delay, before jitter.
+    pub initial: Duration,
+    /// The longest nominal delay between two dials.
+    pub cap: Duration,
+    /// A connection that stayed up this long starts the schedule over.
+    pub stable: Duration,
+    /// While redials sit at the cap, at most one log line per this interval.
+    pub log_interval: Duration,
+}
+
+impl Default for ReconnectTiming {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_secs(1),
+            cap: Duration::from_secs(60),
+            stable: Duration::from_secs(30),
+            log_interval: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The delay before the redial that follows `failures` consecutive failures
+/// (0 = the first redial): `initial` doubled per failure, capped at `cap`,
+/// then jittered into `[nominal / 2, nominal]` by `jitter` (0.0 to 1.0).
+pub fn backoff_delay(timing: &ReconnectTiming, failures: u32, jitter: f64) -> Duration {
+    let factor = 2u32.checked_pow(failures).unwrap_or(u32::MAX);
+    let nominal = timing
+        .initial
+        .checked_mul(factor)
+        .unwrap_or(timing.cap)
+        .min(timing.cap);
+    let jitter = if jitter.is_finite() {
+        jitter.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    nominal.mul_f64(0.5 + 0.5 * jitter)
+}
+
+/// The failure count to use after a dial that was up for `up_for`: a
+/// connection that stayed up for `stable` starts the schedule over.
+pub fn schedule_after(failures: u32, up_for: Duration, timing: &ReconnectTiming) -> u32 {
+    if up_for >= timing.stable {
+        0
+    } else {
+        failures
+    }
+}
+
+/// Whether a redial log line is due. Below the cap every attempt logs; at
+/// the cap at most one line per `log_interval` (`since_last` is the time
+/// since the previous line, `None` when there was none).
+pub fn redial_log_due(
+    delay: Duration,
+    timing: &ReconnectTiming,
+    since_last: Option<Duration>,
+) -> bool {
+    if delay < timing.cap {
+        return true;
+    }
+    match since_last {
+        None => true,
+        Some(since) => since >= timing.log_interval,
+    }
+}
+
+/// A random jitter in `[0.0, 1.0]` from the UUID generator (no new dependency).
+fn jitter_unit() -> f64 {
+    uuid::Uuid::new_v4().as_u128() as f64 / u128::MAX as f64
+}
+
+/// The message for a bridge that refused the tunnel's handshake for good.
+/// Names the fix and never a token value.
+pub fn refusal_message(status: u16) -> String {
+    format!(
+        "the bridge refused the remote-control tunnel ({status}): the host token is missing or \
+         wrong; set {HOST_TOKEN_ENV} to the bridge's HOST_TOKEN secret and start remote control \
+         again (it is not retried)"
+    )
+}
+
+/// A failed dial, with the share key and the host token redacted.
+pub fn connect_failure_text(
+    bridge_base: &str,
+    key: &str,
+    host_token: Option<&str>,
+    error: &WsError,
+) -> String {
+    // The transport error's own chain is the useful part; the share key and
+    // the host token must never reach a log line.
+    let cause = redact(&error_chain(error), &[key, host_token.unwrap_or("")]);
+    format!("connecting to the remote-control bridge at {bridge_base}: {cause}")
+}
+
+/// Where a tunnel dials, fixed for its whole life (every redial reuses the
+/// same share key, so existing share links and portal entries keep working).
+struct TunnelTarget {
+    session: SessionId,
+    bridge_base: String,
+    key: String,
+    agent_url: String,
+    host_token: Option<String>,
+}
+
+/// How one dial of the tunnel ended.
+enum Dial {
+    /// The socket was up for `up_for`, then closed or failed.
+    Ended { up_for: Duration },
+    /// The handshake was refused for good (401/403): never redialled.
+    Refused(u16),
+    /// The dial itself failed (unreachable, or a handshake error): redialled.
+    Failed(String),
+}
+
+/// True while `key` is still the share key minted for `session`. Ends a
+/// tunnel whose session was deleted (its key is forgotten) or whose remote
+/// control was restarted with a new key.
+fn key_is_current(state: &ServerState, session: SessionId, key: &str) -> bool {
+    state
+        .rc_keys
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&session)
+        .is_some_and(|current| current == key)
+}
+
+/// Run the tunnel for one session until it is stopped. Frames from the relay
+/// are dispatched exactly like local client frames; outbound frames
+/// (snapshot, deltas, events) are relayed to the bridge. With
+/// `MODRON_HOST_TOKEN` set, the session is also registered in the portal
+/// directory for as long as each connection lives.
 pub async fn run_tunnel(
     state: Arc<ServerState>,
     session: SessionId,
@@ -455,10 +588,40 @@ pub async fn run_tunnel(
 }
 
 /// [`run_tunnel`] with the environment and the registration timing
-/// injected (tests use this).
+/// injected (tests use this); the redial schedule is the default one.
 pub async fn run_tunnel_with(
     lookup: EnvLookup,
     timing: RegistrationTiming,
+    state: Arc<ServerState>,
+    session: SessionId,
+    bridge_base: String,
+    key: String,
+) -> Result<()> {
+    run_tunnel_timed(
+        lookup,
+        timing,
+        ReconnectTiming::default(),
+        state,
+        session,
+        bridge_base,
+        key,
+    )
+    .await
+}
+
+/// The tunnel supervisor. Dials the bridge, serves the connection until it
+/// closes, and redials with exponential backoff and jitter (see
+/// [`ReconnectTiming`]). The same share key and session are reused on every
+/// dial, and each connection re-registers the portal entry and sends a fresh
+/// snapshot to its viewers (the handshake's Attach). It returns `Ok` when the
+/// tunnel is stopped (the session's key was forgotten; a stopped tunnel task
+/// is aborted, never returns). It returns `Err` only when the bridge refuses
+/// the host token (401/403) or the request cannot be built; neither is
+/// retried. A stop is an abort of the task (see [`start_remote_control`]).
+pub async fn run_tunnel_timed(
+    lookup: EnvLookup,
+    timing: RegistrationTiming,
+    reconnect: ReconnectTiming,
     state: Arc<ServerState>,
     session: SessionId,
     bridge_base: String,
@@ -468,17 +631,81 @@ pub async fn run_tunnel_with(
     // message or a log line, only the bridge base.
     let (agent_url, _open_url) = tunnel_urls(&bridge_base, &key);
     let host_token = env_value(&*lookup, HOST_TOKEN_ENV);
-    let request = tunnel_request(&agent_url, host_token.as_deref())
+    // A bad header is a configuration error: checked once, never redialled.
+    tunnel_request(&agent_url, host_token.as_deref())
         .with_context(|| format!("preparing the remote-control bridge request at {bridge_base}"))?;
-    let (socket, _) = connect_async(request).await.map_err(|e| {
-        // The transport error's own chain is the useful part; the share key
-        // and the host token must never reach a log line.
-        let cause = redact(
-            &error_chain(&e),
-            &[&key, host_token.as_deref().unwrap_or("")],
-        );
-        anyhow!("connecting to the remote-control bridge at {bridge_base}: {cause}")
-    })?;
+    let target = TunnelTarget {
+        session,
+        bridge_base,
+        key,
+        agent_url,
+        host_token,
+    };
+    let mut failures = 0u32;
+    let mut last_logged: Option<Instant> = None;
+    loop {
+        if !key_is_current(&state, session, &target.key) {
+            tracing::info!(%session, "remote-control tunnel stopped");
+            return Ok(());
+        }
+        let delay = match dial_once(&target, &lookup, timing, &state).await {
+            Dial::Refused(status) => return Err(anyhow!(refusal_message(status))),
+            Dial::Ended { up_for } => {
+                failures = schedule_after(failures, up_for, &reconnect);
+                let delay = backoff_delay(&reconnect, failures, jitter_unit());
+                tracing::info!(%session, ?delay, "remote-control tunnel dropped; redialling");
+                delay
+            }
+            Dial::Failed(cause) => {
+                let delay = backoff_delay(&reconnect, failures, jitter_unit());
+                let since = last_logged.map(|at| at.elapsed());
+                if redial_log_due(delay, &reconnect, since) {
+                    tracing::info!(
+                        %session,
+                        attempt = failures + 1,
+                        ?delay,
+                        error = %cause,
+                        "remote-control bridge unreachable; retrying"
+                    );
+                    last_logged = Some(Instant::now());
+                }
+                delay
+            }
+        };
+        failures = failures.saturating_add(1);
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// One dial: connect, serve the connection until it ends, and report how it
+/// went.
+async fn dial_once(
+    target: &TunnelTarget,
+    lookup: &EnvLookup,
+    timing: RegistrationTiming,
+    state: &Arc<ServerState>,
+) -> Dial {
+    let session = target.session;
+    let request = match tunnel_request(&target.agent_url, target.host_token.as_deref()) {
+        Ok(request) => request,
+        Err(e) => return Dial::Failed(format!("{e:#}")),
+    };
+    let socket = match connect_async(request).await {
+        Ok((socket, _)) => socket,
+        Err(WsError::Http(response)) if matches!(response.status().as_u16(), 401 | 403) => {
+            return Dial::Refused(response.status().as_u16());
+        }
+        Err(e) => {
+            return Dial::Failed(connect_failure_text(
+                &target.bridge_base,
+                &target.key,
+                target.host_token.as_deref(),
+                &e,
+            ))
+        }
+    };
+    let up_since = Instant::now();
+    tracing::info!(%session, "remote-control tunnel connected");
     let (mut sink, mut stream) = socket.split();
 
     // Server->relay writer: drains the connection's outbound frames (the
@@ -490,13 +717,19 @@ pub async fn run_tunnel_with(
     // With the host token the bridge's relayed `role` is trusted (see
     // `ConnCtx::trusted_tunnel`); without it this is the legacy share-link
     // relay and the role field is ignored.
-    let mut ctx = if host_token.is_some() {
+    let trusted = target.host_token.is_some();
+    let mut ctx = if trusted {
         ConnCtx::trusted_tunnel(out_tx, session)
     } else {
         ConnCtx::scoped(out_tx, session)
     };
 
-    // Handshake + eager subscribe before handing the sink to the writer.
+    // Handshake: these two frames are requests TO this server, on behalf of
+    // the tunnel, so they go through the same dispatch as every relayed frame
+    // (once the writer is draining). The tunnel's connection is subscribed to
+    // its session and the snapshot and every live frame flow to the bridge.
+    // Writing them into the sink instead would send them to the viewers as if
+    // the agent had said them, and subscribe nothing.
     let hello = modron_protocol::Frame::request(
         0,
         modron_protocol::Payload::Hello {
@@ -512,12 +745,6 @@ pub async fn run_tunnel_with(
             last_seq: 0,
         },
     );
-    // These two frames are requests TO this server, on behalf of the
-    // tunnel: they go through the same dispatch as every relayed frame
-    // (below, once the writer is draining), so the tunnel's connection is
-    // subscribed to its session and the snapshot and every live frame flow
-    // to the bridge. Writing them into the sink instead would send them to
-    // the viewers as if the agent had said them, and subscribe nothing.
 
     let writer = tokio::spawn(async move {
         while let Some(outbound) = out_rx.recv().await {
@@ -536,22 +763,26 @@ pub async fn run_tunnel_with(
     });
 
     for frame in [hello, attach] {
-        if handle_frame(&state, &mut ctx, true, frame).await == Flow::Close {
+        if handle_frame(state, &mut ctx, true, frame).await == Flow::Close {
             drop(ctx);
             let _ = writer.await;
-            return Ok(());
+            return Dial::Ended {
+                up_for: up_since.elapsed(),
+            };
         }
     }
 
-    // Portal registration, only with a host token (see HOST_TOKEN_ENV).
-    let registration = host_token.and_then(|token| {
+    // Portal registration, only with a host token (see HOST_TOKEN_ENV). It
+    // lives with this connection: the entry is DELETEd before a redial and
+    // PUT again by the next one, so the directory always matches the socket.
+    let registration = target.host_token.clone().and_then(|token| {
         start_registration(
-            &*lookup,
+            &**lookup,
             timing,
-            Arc::clone(&state),
+            Arc::clone(state),
             session,
-            &bridge_base,
-            &key,
+            &target.bridge_base,
+            &target.key,
             token,
         )
     });
@@ -573,7 +804,7 @@ pub async fn run_tunnel_with(
                     0,
                     modron_protocol::Payload::Ping {},
                 );
-                if handle_frame(&state, &mut ctx, true, ping).await == Flow::Close {
+                if handle_frame(state, &mut ctx, true, ping).await == Flow::Close {
                     break;
                 }
                 continue;
@@ -589,7 +820,7 @@ pub async fn run_tunnel_with(
         // on what the relay happened to buffer. A snapshot resets a client's
         // view, so viewers already attached are unaffected.
         let joined = matches!(frame.payload, modron_protocol::Payload::Hello { .. });
-        if handle_relayed_frame(&state, &mut ctx, frame).await == Flow::Close {
+        if handle_relayed_frame(state, &mut ctx, frame).await == Flow::Close {
             break;
         }
         if joined {
@@ -600,7 +831,7 @@ pub async fn run_tunnel_with(
                     last_seq: 0,
                 },
             );
-            if handle_frame(&state, &mut ctx, true, resync).await == Flow::Close {
+            if handle_frame(state, &mut ctx, true, resync).await == Flow::Close {
                 break;
             }
         }
@@ -610,7 +841,9 @@ pub async fn run_tunnel_with(
     if let Some(registration) = registration {
         registration.finish().await;
     }
-    Ok(())
+    Dial::Ended {
+        up_for: up_since.elapsed(),
+    }
 }
 
 /// The share key minted for a session by /remote-control, if any.
@@ -880,7 +1113,9 @@ pub fn start_remote_control(
         if let Err(e) = run_tunnel(state_moved, session, bridge, key).await {
             // `{:#}` keeps the whole chain (the transport cause), not just
             // the outermost context.
-            tracing::warn!(%session, error = format!("{e:#}"), "remote-control tunnel ended");
+            // Only a refused token or a bad request ends a tunnel by itself
+            // (see run_tunnel_timed); log that once, at error.
+            tracing::error!(%session, error = format!("{e:#}"), "remote-control tunnel ended");
         }
     });
     // Abort the previous tunnel for this session, if any: a re-registration

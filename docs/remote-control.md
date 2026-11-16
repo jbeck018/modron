@@ -201,11 +201,20 @@ logs that it did; a directory that is neither, with no marker, is refused.
 The share URL is logged at info level. `--share-url-file <path>` also writes it
 to that file, mode 0600, so a launcher can read it. The file needs the flag.
 
-The tunnel does not reconnect. A tunnel the bridge closes, or one whose socket
-drops, ends and is not redialled, whether it was opened at start or by a
-`remote_control` frame. Restart the server to reopen it. A bridge that cannot
-be reached at start logs a warning (with the transport cause, never the share
-key) and nothing retries it. The server keeps running either way.
+A tunnel reconnects on its own, however it was opened (at start or by a
+`remote_control` frame). When the socket drops, or the bridge cannot be reached,
+the tunnel redials with exponential backoff and jitter: 1 s, doubling, capped at
+60 s, each delay jittered between half and all of its nominal value. A
+connection that stayed up 30 s resets the schedule. Every redial reuses the same
+share key and session, so existing share links, portal entries and invites keep
+working; each new connection re-registers the portal entry (the entry is removed
+when the socket drops and put back on reconnect) and sends viewers a fresh
+snapshot. The redials log at info, at most one line per attempt, and once a
+minute while they sit at the cap. Redialling stops when the tunnel is stopped,
+when its session is deleted, or when the server shuts down. A bridge that
+refuses the host token (401 or 403) ends the tunnel for good, logged once at
+error with the fix (set `MODRON_HOST_TOKEN` to the bridge's `HOST_TOKEN`); it is
+never retried. The server keeps running either way.
 
 ```sh
 MODRON_HOST_TOKEN=... modron serve --listen 127.0.0.1:7699 \

@@ -97,9 +97,9 @@ plan is deployed from CI or by an agent.
 
 Status 2026-11-16: scaffold. The image and a manually triggered deploy
 workflow exist (`.github/workflows/cloud-deploy.yml`, `cloud/container/`), but
-no cloud run works end to end yet. `modron serve` does not dial the bridge by
-itself: a tunnel starts only when a client sends `remote_control` for a live
-session. The container's runtime secrets are the Worker secrets listed in
+no cloud run has been deployed or tested end to end yet. The container starts
+`modron serve --remote-control <bridge-url>`, which opens the tunnel at start
+with no client attached. The container's runtime secrets are the Worker secrets listed in
 `cloud/container/README.md`; `HOST_TOKEN` on the bridge must equal the
 `MODRON_HOST_TOKEN` the container receives. Nothing is deployed by CI on push.
 

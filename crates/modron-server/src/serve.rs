@@ -60,10 +60,20 @@ pub struct BoundServer {
 }
 
 impl BoundServer {
-    /// Abort every accept loop (integration tests use this to tear down).
+    /// Abort every accept loop and every remote-control tunnel (tunnels
+    /// redial on their own, so they must be stopped here too). Integration
+    /// tests use this to tear down.
     pub fn shutdown(&self) {
         for task in &self.tasks {
             task.abort();
+        }
+        let tunnels = self
+            .state
+            .rc_tunnels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for tunnel in tunnels.values() {
+            tunnel.abort();
         }
     }
 }
