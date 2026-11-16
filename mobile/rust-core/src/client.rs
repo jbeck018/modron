@@ -1778,7 +1778,8 @@ fn apply_config(vm: &mut SessionViewModel, patch: &ConfigPatch) {
         vm.goal = goal.clone();
     }
     if let Some(persona) = &patch.persona {
-        vm.persona = Some(persona.clone());
+        // An empty name is the clear: no persona, same as a fresh snapshot.
+        vm.persona = Some(persona.clone()).filter(|p| !p.is_empty());
     }
     if let Some(phase) = patch.phase {
         vm.phase = phase;
@@ -1904,9 +1905,26 @@ mod tests {
                 },
             },
         };
-        let snap = folded_all(vec![snapshot, catalog, switched]);
+        let snap = folded_all(vec![snapshot.clone(), catalog.clone(), switched.clone()]);
         assert!(!snap.personas[0].current);
         assert!(snap.personas[1].current);
+
+        // An empty name clears: no row is current and the persona is absent.
+        let cleared = Frame {
+            id: None,
+            session: Some(session),
+            seq: 3,
+            role: None,
+            payload: Payload::ConfigChanged {
+                patch: ConfigPatch {
+                    persona: Some(String::new()),
+                    ..ConfigPatch::default()
+                },
+            },
+        };
+        let snap = folded_all(vec![snapshot, catalog, switched, cleared]);
+        assert!(snap.personas.iter().all(|p| !p.current));
+        assert_eq!(snap.persona, None);
     }
 
     /// The batch helper asks for at most ten tasks per call, round robin:

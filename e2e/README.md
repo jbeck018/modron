@@ -22,7 +22,7 @@ terminal app under a pty for T1. Findings are in `FINDINGS.md`.
 ```sh
 node /home/user/modron/e2e/run.mjs                 # every scenario
 node /home/user/modron/e2e/run.mjs --only P1,P2    # some steps (see below)
-node /home/user/modron/e2e/run.mjs --only S7,W     # prefixes: S7 = S7a..S7d, W = W1..W6
+node /home/user/modron/e2e/run.mjs --only S7,W     # prefixes: S7 = S7a..S7d, W = W1..W7
 ```
 
 Output is one PASS, FAIL or SKIP line per step and a summary. A failing step
@@ -51,7 +51,9 @@ processes` in the summary must be 0.
 | W4 | `!echo ...` asks for approval, output shows; after `/mode deny`, the shell command is refused. |
 | W5 | Ctrl+O sessions list; a new session; back to the first; each shows its own transcript. |
 | W6 | `/compact` on a session with history: a before/after note or "nothing to compact". |
+| W7 | Agent picker: the serve's own config (`[agents.reviewer]`, written to its HOME by `startServe({ config })`) is picked; `/agent` again and "no persona" clears it. Checks the echo, a fresh snapshot without `live.persona`, and the picker's current mark on "no persona". Fails on the mark (FINDINGS F16). |
 | T1 | `modron-app-tui --provider mock` under a pty with a private HOME and MODRON_URL: connected, typed task reaches the approval, Esc denies, Ctrl+C twice exits with the resume line, no server left. |
+| T2-T4b | The same pty driver in other modes: T2 Esc window and deny, T3 one Ctrl+C interrupts, T4 Ctrl+J and Shift+Enter make a three-line task, T4b a trailing backslash continues the line. |
 
 Dependencies: P2 needs P1, P3 and P4 need P2, and the W steps and P1 each
 start their own serve. `--only` does not start a missing step, so pick
@@ -104,6 +106,11 @@ a directory of your choice and point the suite at it:
 
     pip install --target /tmp/claude-0/e2e/pyte pyte==0.8.2
     E2E_PYTE_DIR=/tmp/claude-0/e2e/pyte node e2e/run.mjs --only T1
+
+The driver also answers the terminal queries the app sends at startup, as a
+kitty-capable terminal would: `CSI ? u` gets `CSI ? 1 u` and `CSI c` gets
+`CSI ? 62 c` (pump() in tui_pty.py). crossterm then enables the kitty keyboard
+protocol, which lets T4 send Shift+Enter as `CSI 13;2u`.
 
 T1 also needs a terminal binary newer than app/src
 (`cd app && cargo build --bin modron-app-tui`); otherwise it is skipped.

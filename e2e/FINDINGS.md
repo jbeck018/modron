@@ -27,7 +27,9 @@ Full-suite results are at the end of this file (two runs).
 | W4 shell passthrough | PASS | F10 |
 | W5 sessions screen over the tunnel | PASS (reframed) | F12 |
 | W6 /compact | PASS | F13 (closed: test read the wrong connection) |
+| W7 agent picker: set a persona, then "no persona" clears it | FAIL | F16 (picker not marked after the clear; server state correct) |
 | T1 terminal app under a pty | PASS | F14 (closed: test read raw bytes, not the screen) |
+| T4 Ctrl+J and Shift+Enter, three-line draft | PASS | Shift+Enter in kitty encoding; pty answers the kitty query (see README) |
 
 ## Findings
 
@@ -163,6 +165,21 @@ approval, a run, and two queued messages. It passes.
 ### F15. Doc drift: effort levels. OPEN (docs/, outside this packet)
 `docs/PROTOCOL_V2.md` section 7 lists `effort` as low, medium, high. The code
 has six levels (mobile/rust-core/src/view.rs: low, medium, high, xhigh, max).
+
+### F16. Clearing the persona leaves the picker unmarked (W7). OPEN (mobile/rust-core, outside this packet)
+- Server: `persona: ""` clears the persona (crates/modron-server/src/hub.rs
+  ~1293-1373). The snapshot after the clear has no `live.persona`, which the
+  W7 check reads: the server side is correct.
+- Client: `ConfigChanged` folds the patch into the view model at
+  mobile/rust-core/src/client.rs:1780 as `vm.persona = Some(persona.clone())`.
+  An empty name becomes `Some("")`, not `None`. The picker marks "no persona"
+  only when `persona.is_none()` (app/src/nav.rs ~296), so after the clear no row
+  is marked current until the next snapshot. Reviewer is no longer marked
+  either, so the picker shows no current row at all.
+- Reproduce: `cd e2e && E2E_PYTE_DIR=/tmp/claude-0/e2e/pyte node run.mjs --only W7`.
+  The failing check is "the agent picker does not mark 'no persona' as current".
+- Suggested fix (not made here, the file is outside this packet): map an empty
+  name to `None` in that fold, with a unit test in mobile/rust-core.
 
 ### H1. Harness left processes behind. FIXED in this packet
 - Each child is in its own process group (lib.mjs `spawnLogged`).

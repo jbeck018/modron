@@ -2684,6 +2684,12 @@ mod tests {
     use super::*;
     use crate::nav::Screen;
 
+    /// Serializes the tests that touch this module's process-global state (the
+    /// chat statics, the prompt guard, the clipboard offer, `link()`). Each such
+    /// test holds it for its whole body. Poison is recovered: a panicking test
+    /// must not fail the rest.
+    pub(crate) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     const NONE: KeyFacts = KeyFacts {
         removable: false,
         approval_options: None,
@@ -2732,6 +2738,7 @@ mod tests {
 
     #[test]
     fn key_names_map_to_keys() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(key_of("Enter"), Key::Enter);
         assert_eq!(key_of("Escape"), Key::Escape);
         assert_eq!(key_of("y"), Key::Char('y'));
@@ -2744,6 +2751,7 @@ mod tests {
 
     #[test]
     fn esc_returns_a_scrolled_transcript_to_the_tail_after_everything_else() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let scrolled = KeyFacts { scrolled_up: true, ..NONE };
         assert_eq!(
             route_key(Key::Escape, false, false, scrolled.clone(), ""),
@@ -2778,6 +2786,7 @@ mod tests {
 
     #[test]
     fn lines_above_is_what_the_view_does_not_show() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // 100 rows, 20 visible, at the tail: none above.
         assert_eq!(lines_above(100, 0, 20), 80);
         // Scrolled 30 rows up: 50 rows sit above the 20 shown.
@@ -2791,6 +2800,7 @@ mod tests {
 
     #[test]
     fn a_fresh_prompt_ignores_its_decision_keys_and_passes_them_nowhere() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // Inside the window, y / a / n and Esc (deny) are consumed: Ignored,
         // never Composer and never an action.
         for c in ['y', 'a', 'n'] {
@@ -2814,6 +2824,7 @@ mod tests {
 
     #[test]
     fn once_the_window_is_closed_the_same_keys_decide() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Char('y'), false, false, approval(3), ""),
             Routed::Action(UiAction::Decide(0))
@@ -2830,6 +2841,7 @@ mod tests {
 
     #[test]
     fn the_guard_is_about_prompts_not_about_the_screen() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // Off the chat screen the guard does not apply (no approval there).
         let settings = KeyFacts { screen: Screen::Settings, ..NONE };
         for key in [Key::Char('y'), Key::Escape] {
@@ -2843,6 +2855,7 @@ mod tests {
 
     #[test]
     fn letters_reach_the_composer_when_nothing_is_pending() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for c in ['y', 'a', 'n', 'r', 'x', ' '] {
             assert_eq!(route_key(Key::Char(c), false, false, NONE, ""), composer(), "{c}");
         }
@@ -2851,6 +2864,7 @@ mod tests {
 
     #[test]
     fn transcript_leaves_the_controls_on_a_short_window() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // At 720 px the transcript is 390 px, so the composer and the
         // approval and Stop rows fit below it (e2e S4 and S7d).
         assert_eq!(fit_transcript_height(720.0), 390.0);
@@ -2874,6 +2888,7 @@ mod tests {
 
     #[test]
     fn escape_with_an_approval_denies_it_before_anything_else() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // Deny is the third decision ("n"), the last option in protocol order.
         let deny = Routed::Action(UiAction::Decide(2));
         assert_eq!(route_key(Key::Escape, false, false, approval(3), ""), deny);
@@ -2889,6 +2904,7 @@ mod tests {
 
     #[test]
     fn escape_with_a_plan_pending_does_nothing_destructive() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Escape, false, false, plan(), ""), Routed::Ignored);
         let both = KeyFacts { running: true, slash_len: 2, ..plan() };
         assert_eq!(route_key(Key::Escape, false, false, both, "/"), Routed::Ignored);
@@ -2896,6 +2912,7 @@ mod tests {
 
     #[test]
     fn escape_closes_open_suggestions_before_it_interrupts() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let open = KeyFacts { slash_len: 2, ..running() };
         assert_eq!(
             route_key(Key::Escape, false, false, open, "/"),
@@ -2905,6 +2922,7 @@ mod tests {
 
     #[test]
     fn escape_interrupts_a_running_turn_and_does_nothing_idle() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Escape, false, false, running(), ""),
             Routed::Action(UiAction::Interrupt)
@@ -2914,6 +2932,7 @@ mod tests {
 
     #[test]
     fn alt_enter_queues_the_draft_and_empty_or_command_drafts_do_not() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Enter, true, true, NONE, "  next task  "),
             Routed::Action(UiAction::Queue("next task".into()))
@@ -2924,12 +2943,14 @@ mod tests {
 
     #[test]
     fn enter_reaches_the_composer_so_shift_enter_can_add_a_line() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Enter, false, false, approval(3), "x"), Routed::Composer);
         assert_eq!(route_key(Key::Enter, false, false, NONE, "a\nb"), Routed::Composer);
     }
 
     #[test]
     fn up_and_down_recall_only_on_an_empty_or_recalled_single_line() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let saved = KeyFacts { history_len: 2, ..NONE };
         assert_eq!(
             route_key(Key::Up, false, false, saved.clone(), ""),
@@ -2962,6 +2983,7 @@ mod tests {
 
     #[test]
     fn page_keys_scroll_and_home_end_scroll_only_on_an_empty_composer() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::PageUp, false, false, NONE, "x"), Routed::Scroll(ScrollStep::Up));
         assert_eq!(
             route_key(Key::PageDown, false, false, NONE, ""),
@@ -2978,6 +3000,7 @@ mod tests {
 
     #[test]
     fn shift_tab_flips_the_approval_mode_and_caret_keys_stay_in_the_composer() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::BackTab, false, false, NONE, ""),
             Routed::Action(UiAction::CycleMode)
@@ -2989,12 +3012,14 @@ mod tests {
 
     #[test]
     fn chords_pass_to_the_composer() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Char('a'), false, true, approval(3), ""), composer());
         assert_eq!(route_key(Key::Escape, false, true, NONE, ""), composer());
     }
 
     #[test]
     fn approval_keys_decide_their_options_in_order() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Char('y'), false, false, approval(3), ""),
             Routed::Action(UiAction::Decide(0))
@@ -3011,11 +3036,13 @@ mod tests {
 
     #[test]
     fn an_approval_key_beyond_the_option_count_is_the_composers() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Char('n'), false, false, approval(2), ""), composer());
     }
 
     #[test]
     fn an_approval_takes_precedence_over_a_plan() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let both = KeyFacts { approval_options: Some(3), plan_pending: true, ..NONE };
         assert_eq!(
             route_key(Key::Char('y'), false, false, both.clone(), ""),
@@ -3026,6 +3053,7 @@ mod tests {
 
     #[test]
     fn plan_keys_approve_and_revise_with_the_draft_as_note() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Char('y'), false, false, plan(), "ignored"),
             Routed::Action(UiAction::DecidePlan { approve: true, note: None })
@@ -3041,6 +3069,7 @@ mod tests {
 
     #[test]
     fn a_revise_with_an_empty_draft_has_no_note() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Char('r'), false, false, plan(), "   "),
             Routed::Action(UiAction::DecidePlan { approve: false, note: None })
@@ -3049,12 +3078,14 @@ mod tests {
 
     #[test]
     fn plan_pending_leaves_other_letters_to_the_composer() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Char('a'), false, false, plan(), ""), composer());
         assert_eq!(route_key(Key::Char('n'), false, false, plan(), ""), composer());
     }
 
     #[test]
     fn the_cursor_and_delete_keys_reach_the_composer_and_never_scroll_or_recall() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for draft in ["", "one line", "a\nb"] {
             for key in [Key::Left, Key::Right, Key::Delete] {
                 let facts = KeyFacts { history_len: 3, ..NONE };
@@ -3069,6 +3100,7 @@ mod tests {
 
     #[test]
     fn up_and_down_on_a_multi_line_draft_reach_the_composer_not_recall() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for key in [Key::Up, Key::Down] {
             let facts = KeyFacts { history_len: 3, ..NONE };
             assert_eq!(route_key(key, false, false, facts, "a\nb"), composer(), "{key:?}");
@@ -3077,6 +3109,7 @@ mod tests {
 
     #[test]
     fn the_reasoning_tail_is_the_last_two_lines_and_only_when_opted_in() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = ViewModelSnapshot {
             streaming_reasoning: "one\ntwo\nthree".into(),
             ..Default::default()
@@ -3088,6 +3121,7 @@ mod tests {
 
     #[test]
     fn the_header_shows_the_first_eight_characters_of_the_session() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let id = uuid::Uuid::from_u128(0x1234_abcd_0000_4000_8000_0000_0000_0000);
         let s = ViewModelSnapshot { session_id: Some(id), ..Default::default() };
         assert_eq!(Model::from_snapshot(&s).session, "1234abcd");
@@ -3096,6 +3130,7 @@ mod tests {
 
     #[test]
     fn a_blank_idle_session_shows_the_welcome_banner() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let welcome = modron_mobile_core::view::welcome_lines("m1", env!("CARGO_PKG_VERSION"));
         let blank = ViewModelSnapshot { model: "m1".into(), ..Default::default() };
         assert_eq!(Model::from_snapshot(&blank).lines.len(), welcome.len());
@@ -3108,6 +3143,7 @@ mod tests {
 
     #[test]
     fn the_header_hint_and_spinner_follow_the_running_state_only() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(hint_text(true, false, 0), RUNNING_HINT);
         assert_eq!(hint_text(false, true, 8), idle_hint(8));
         assert_eq!(hint_text(false, false, 8), "", "typing hides the idle hint");
@@ -3117,6 +3153,7 @@ mod tests {
 
     #[test]
     fn backspace_on_an_empty_composer_dequeues_the_last_message() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Backspace, false, false, queued(3), ""),
             Routed::Action(UiAction::Dequeue(2))
@@ -3129,21 +3166,25 @@ mod tests {
 
     #[test]
     fn backspace_does_nothing_with_an_empty_queue() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Backspace, false, false, NONE, ""), composer());
     }
 
     #[test]
     fn backspace_with_composer_text_edits_the_text() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Backspace, false, false, queued(2), "fix"), composer());
     }
 
     #[test]
     fn backspace_with_a_chord_is_the_composers() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Backspace, false, true, queued(2), ""), composer());
     }
 
     #[test]
     fn backspace_dequeues_while_an_approval_waits() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let both = KeyFacts { approval_options: Some(3), queued: 2, ..NONE };
         assert_eq!(
             route_key(Key::Backspace, false, false, both.clone(), ""),
@@ -3153,6 +3194,7 @@ mod tests {
 
     #[test]
     fn plan_answer_for_matches_the_key_rule() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             plan_answer_for(true, "note"),
             UiAction::DecidePlan { approve: true, note: None }
@@ -3178,6 +3220,7 @@ mod tests {
 
     #[test]
     fn f2_opens_settings_and_ctrl_o_opens_sessions_from_any_screen() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for facts in [NONE, sessions(false), settings(None), approval(3)] {
             assert_eq!(
                 route_key(Key::F2, false, false, facts.clone(), ""),
@@ -3192,6 +3235,7 @@ mod tests {
 
     #[test]
     fn host_key_maps_arrows_and_f2_and_leaves_other_names_alone() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(host_key("ArrowUp"), Key::Up);
         assert_eq!(host_key("ArrowDown"), Key::Down);
         assert_eq!(host_key("F2"), Key::F2);
@@ -3205,6 +3249,7 @@ mod tests {
 
     #[test]
     fn esc_clears_a_filter_before_it_closes_sessions() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Escape, false, false, sessions(true), ""),
             Routed::Nav(NavStep::ClearFilter)
@@ -3217,6 +3262,7 @@ mod tests {
 
     #[test]
     fn esc_closes_settings_and_interrupts_only_on_chat() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Escape, false, false, settings(None), ""),
             Routed::Nav(NavStep::Back)
@@ -3229,6 +3275,7 @@ mod tests {
 
     #[test]
     fn sessions_typing_filters_and_n_or_jk_act_only_on_an_empty_filter() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Char('n'), false, false, sessions(false), ""),
             Routed::Nav(NavStep::NewSession)
@@ -3257,6 +3304,7 @@ mod tests {
 
     #[test]
     fn enter_on_a_session_attaches_the_selected_row() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Enter, false, false, sessions(false), ""),
             Routed::Nav(NavStep::Attach(uuid::Uuid::from_u128(7)))
@@ -3267,6 +3315,7 @@ mod tests {
 
     #[test]
     fn enter_on_settings_sends_the_row_action_or_nothing() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let effort = UiAction::SetEffort(Some(Effort::Low));
         assert_eq!(
             route_key(Key::Enter, false, false, settings(Some(effort.clone())), ""),
@@ -3277,6 +3326,7 @@ mod tests {
 
     #[test]
     fn arrows_move_on_sessions_and_settings() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for facts in [sessions(false), settings(None)] {
             assert_eq!(
                 route_key(Key::Up, false, false, facts.clone(), ""),
@@ -3291,6 +3341,7 @@ mod tests {
 
     #[test]
     fn backspace_edits_the_sessions_filter_and_is_a_no_op_on_settings() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Backspace, false, false, sessions(true), ""),
             Routed::Nav(NavStep::FilterBack)
@@ -3303,17 +3354,20 @@ mod tests {
 
     #[test]
     fn letters_on_settings_are_consumed_not_typed() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Char('a'), false, false, settings(None), ""), Routed::Ignored);
     }
 
     #[test]
     fn a_chord_passes_to_the_composer_on_every_screen() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Char('a'), false, true, sessions(false), ""), Routed::Composer);
         assert_eq!(route_key(Key::Escape, false, true, settings(None), ""), Routed::Composer);
     }
 
     #[test]
     fn chat_keys_are_unchanged_by_the_new_screens() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(route_key(Key::Up, false, false, NONE, ""), Routed::Ignored);
         assert_eq!(route_key(Key::Char('n'), false, false, NONE, ""), Routed::Composer);
     }
@@ -3329,6 +3383,7 @@ mod auth_key_tests {
 
     #[test]
     fn enter_activates_a_row_and_esc_backs_out_unless_a_key_is_being_typed() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             route_key(Key::Enter, false, false, auth(false), ""),
             Routed::Nav(NavStep::Activate)
@@ -3345,6 +3400,7 @@ mod auth_key_tests {
 
     #[test]
     fn while_a_key_is_typed_its_keys_go_to_the_masked_input() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for key in [Key::Char('s'), Key::Enter, Key::Backspace, Key::Up] {
             assert_eq!(route_key(key, false, false, auth(true), ""), Routed::Composer, "{key:?}");
         }
@@ -3352,6 +3408,7 @@ mod auth_key_tests {
 
     #[test]
     fn the_secret_key_never_prints() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let secret = SecretKey { provider: "openai".into(), key: "sk-live-1234".into() };
         let shown = format!("{secret:?}");
         assert!(shown.contains("openai"));
@@ -3372,6 +3429,7 @@ mod first_run_tests {
     /// and Esc closes it on the terminal host's route (no connection needed).
     #[test]
     fn esc_closes_the_first_run_credentials_screen() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (mut host, _client) = link();
         let snapshot = ViewModelSnapshot {
             providers: vec![AuthProviderWire {
@@ -3397,6 +3455,7 @@ mod wheel_tests {
 
     #[test]
     fn wheel_pixels_map_to_rows_toward_the_older_end() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(rows_for_pixels(0.0), 0);
         assert_eq!(rows_for_pixels(f64::NAN), 0);
         // Wheel up (negative delta) reads older rows: a positive row count.
@@ -3415,6 +3474,7 @@ mod shell_input_tests {
 
     #[test]
     fn bang_is_shared_and_double_bang_is_private() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             submit_action("!ls -la"),
             UiAction::Shell { command: "ls -la".into(), private: false }
@@ -3428,18 +3488,21 @@ mod shell_input_tests {
 
     #[test]
     fn a_bare_bang_sends_an_empty_command_for_the_core_usage_refusal() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(submit_action("!"), UiAction::Shell { command: String::new(), private: false });
         assert_eq!(submit_action("!!"), UiAction::Shell { command: String::new(), private: true });
     }
 
     #[test]
     fn plain_text_and_commands_are_not_shell() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(submit_action("hello !x"), UiAction::Send("hello !x".into()));
         assert_eq!(submit_action("/help"), slash::run("/help"));
     }
 
     #[test]
     fn shell_rows_put_the_command_first_and_dim_the_output() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let entry = TranscriptEntry::Shell {
             command: "ls".into(),
             lines: vec!["a.txt".into(), "b.txt".into()],
@@ -3455,6 +3518,7 @@ mod shell_input_tests {
 
     #[test]
     fn private_rows_keep_the_shared_mark() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let entry = TranscriptEntry::Shell {
             command: "env".into(),
             lines: vec![],
@@ -3527,6 +3591,7 @@ mod attachment_tests {
 
     #[test]
     fn ctrl_v_pastes_and_backspace_drops_a_chip_before_a_queued_message() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let chip = KeyFacts { attachments: 1, queued: 2, ..Default::default() };
         assert_eq!(
             route_key(Key::Backspace, false, false, chip, ""),
@@ -3545,6 +3610,7 @@ mod attachment_tests {
 
     #[test]
     fn chips_show_name_and_the_shared_size() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(chip_label("pic.png", 1229), "[img pic.png \u{b7} 1.2 KB]");
     }
 }
@@ -3557,6 +3623,7 @@ mod view_floor_tests {
 
     #[test]
     fn a_note_lasts_two_seconds_and_an_error_never_expires() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
         assert!(!note_expired(start, start + Duration::from_millis(1999)));
         assert!(note_expired(start, start + Duration::from_millis(2000)));
@@ -3574,12 +3641,14 @@ mod view_floor_tests {
 
     #[test]
     fn clearing_past_the_end_of_the_history_hides_nothing_more() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let raw = ViewModelSnapshot::default();
         assert!(shown_copy(&raw, 5, false).history.is_empty());
     }
 
     #[test]
     fn the_clipboard_text_is_offered_once() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         offer_text("pasted".to_string());
         assert_eq!(take_offered_text().as_deref(), Some("pasted"));
         assert_eq!(take_offered_text(), None);
@@ -3600,6 +3669,7 @@ mod esc_tests {
 
     #[test]
     fn esc_precedence_covers_every_state() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // A pending approval is denied first, even with text in the composer.
         assert_eq!(
             esc(KeyFacts { approval_options: Some(3), ..idle() }, "hi"),
@@ -3630,6 +3700,7 @@ mod esc_tests {
 
     #[test]
     fn esc_never_detaches_the_staged_chips() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // Chips alone: nothing happens.
         assert_eq!(esc(KeyFacts { attachments: 2, ..idle() }, ""), Routed::Ignored);
         // Chips with text: only the text goes (Detach is Backspace's, never Esc's).
@@ -3643,6 +3714,7 @@ mod tick_tests {
 
     #[test]
     fn a_running_turn_asks_for_the_animation_period_and_an_idle_app_asks_for_nothing() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(tick_deadline(true), Some(ANIM_PERIOD));
         assert_eq!(tick_deadline(false), None);
     }
@@ -3654,6 +3726,7 @@ mod credential_remove_key_tests {
 
     #[test]
     fn d_on_the_credentials_screen_asks_to_remove_the_selected_row() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let facts = KeyFacts { screen: Screen::Auth, selected_index: 1, ..Default::default() };
         assert_eq!(
             route_key(Key::Char('d'), false, false, facts, ""),

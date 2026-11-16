@@ -3,7 +3,7 @@
 // Playwright viewer helpers. No npm installs; Playwright is preinstalled.
 import { spawn, spawnSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
-import { cpSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
@@ -159,10 +159,15 @@ export function copyApp() {
 
 // ---- modron serve ----------------------------------------------------------
 
-export async function startServe(name, { bridgeWs, hostToken } = {}) {
+export async function startServe(name, { bridgeWs, hostToken, config } = {}) {
   const home = join(SCRATCH, 'h-' + name);
   const work = join(home, 'w');
   mkdirSync(join(work, '.modron'), { recursive: true }); // remote-control needs a project marker
+  if (config) {
+    // The serve reads ~/.config/modron/config.toml under this run's own HOME.
+    mkdirSync(join(home, '.config', 'modron'), { recursive: true });
+    writeFileSync(join(home, '.config', 'modron', 'config.toml'), config);
+  }
   const port = await freePort();
   const env = { ...process.env, HOME: home };
   delete env.MODRON_HOST_TOKEN;

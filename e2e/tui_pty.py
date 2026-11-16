@@ -65,6 +65,14 @@ def pump(seconds):
             if not data:
                 return
             buf += data
+            # crossterm's supports_keyboard_enhancement() writes CSI ? u and
+            # CSI c and waits for an answer. Answer as a kitty-capable terminal
+            # would (flags 1 = disambiguate; DA1 ends the wait), so the app
+            # enables the kitty keyboard protocol and Shift+Enter is reported.
+            if b"\x1b[?u" in data:
+                os.write(fd, b"\x1b[?1u")
+            if b"\x1b[c" in data:
+                os.write(fd, b"\x1b[?62c")
             stream.feed(data)
 
 
@@ -191,6 +199,10 @@ if mode == "t4" and res["connected"]:
     os.write(fd, b"\x0a")  # Ctrl+J
     os.write(fd, b"line two")
     res["typed2"] = wait_for(lambda: "linetwo" in recent(), 10)
+    # Shift+Enter in kitty encoding (CSI 13;2u) adds the third line.
+    os.write(fd, b"\x1b[13;2u")
+    os.write(fd, b"line three")
+    res["typed3"] = wait_for(lambda: "linethree" in recent(), 10)
     os.write(fd, b"\r")
     res["sent"].append("task")
     res["approval"] = wait_approval(60)

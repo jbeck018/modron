@@ -517,9 +517,9 @@ await scenario('P4', 'offline marking: a stopped serve is listed offline and can
 // the portal owner: a share link is read-only for configuration and shell
 // (docs/remote-control.md, dispatch.rs "not allowed on a share link").
 let ownerCk = null;
-async function sharedSession(name, title) {
+async function sharedSession(name, title, extra = {}) {
   const b = await ensurePortalHooks();
-  const sv = track(serves, await startServe(name, { bridgeWs: b.ws, hostToken: HOST }));
+  const sv = track(serves, await startServe(name, { bridgeWs: b.ws, hostToken: HOST, ...extra }));
   const lx = track(locals, new Local(sv));
   await lx.connect();
   const sid = await lx.newSession(title);
@@ -668,6 +668,40 @@ await scenario('W6', 'compact: /compact on a session with history shows a before
   }
 });
 
+// W7: the agent picker sets a persona and its first row, "no persona", clears
+// it. The serve's own config.toml defines the one persona ([agents.reviewer]).
+await scenario('W7', 'agent picker: a persona is set from the picker and "no persona" clears it', async (s) => {
+  const { lx, sid, vw } = await sharedSession('w7', 'e2e w7', {
+    config: '[agents.reviewer]\nsystem = "E2E review persona: check the diff."\n',
+  });
+  await typeAndSend(vw, '/agent');
+  await soft(s, waitBody(vw, (t) => t.includes('no persona') && t.includes('reviewer - E2E review'), 20000, 'agent picker rows'),
+    'the agent picker did not list "no persona" and the configured persona');
+  const setMark = lx.frames.length;
+  await clickContains(vw, 'reviewer - E2E review');
+  await soft(s, lx.waitFor((f) => JSON.stringify(f).includes('"persona":"reviewer"'), 15000, 'persona echo', setMark),
+    'server did not echo persona "reviewer"');
+  const withPersona = await soft(s, lx.attach(sid), 'no snapshot after the persona switch');
+  s.check(withPersona?.live?.persona === 'reviewer',
+    `session persona after the pick is ${JSON.stringify(withPersona?.live?.persona)}, not "reviewer"`);
+
+  await typeAndSend(vw, '/agent');
+  await soft(s, waitBody(vw, (t) => t.includes('no persona'), 20000, 'agent picker reopened'), 'the agent picker did not reopen');
+  const clearMark = lx.frames.length;
+  await clickContains(vw, 'no persona');
+  await soft(s, lx.waitFor((f) => JSON.stringify(f).includes('"persona":""'), 15000, 'persona clear echo', clearMark),
+    'server did not echo the empty persona name');
+  const cleared = await soft(s, lx.attach(sid), 'no snapshot after the clear');
+  s.check(cleared?.live && cleared.live.persona === undefined,
+    `session persona after the clear is ${JSON.stringify(cleared?.live?.persona)}, not absent`);
+
+  await typeAndSend(vw, '/agent');
+  await soft(s, waitBody(vw, (t) => /●\s*no persona/.test(t), 20000, 'no persona marked'),
+    'the agent picker does not mark "no persona" as current after the clear');
+  const marked = await bodyText(vw);
+  s.check(!/●\s*reviewer/.test(marked), 'the agent picker still marks "reviewer" as current');
+});
+
 // ---- T1: terminal app under a pty (only with a fresh binary) -----------------
 const TUI_BIN = join(REPO, 'app/target/debug/modron-app-tui');
 const tuiFresh = existsSync(TUI_BIN) && newestMtime(join(REPO, 'app/src')) < statSync(TUI_BIN).mtimeMs;
@@ -792,16 +826,16 @@ if (!want('T2') && !want('T3') && !want('T4')) {
     ptyChecks(s, r);
   });
 
-  await scenario('T4', 'terminal app: Ctrl+J makes a two-line draft that is submitted as one task', async (s) => {
+  await scenario('T4', 'terminal app: Ctrl+J and Shift+Enter make a three-line draft submitted as one task', async (s) => {
     const port = await freePort();
     const p = startPty('t4', port);
     const r0 = await awaitMark(p, 'm1');
     if (!r0) throw new Error('no approval for the Ctrl+J task');
     // The serve's side: it writes each session to <home>/.modron/sessions as
     // JSON lines, and a task's newline is stored as the two characters \n.
-    s.check(await storedWithin(p, 'line one\\nline two'), 'the server did not store the Ctrl+J task as one two-line task');
+    s.check(await storedWithin(p, 'line one\\nline two\\nline three'), 'the server did not store the Ctrl+J and Shift+Enter task as one three-line task');
     const r = await ptyResult(p);
-    s.check(r.typed1 && r.typed2, 'the two lines were not typed into the composer');
+    s.check(r.typed1 && r.typed2 && r.typed3, 'the three lines were not typed into the composer');
     ptyChecks(s, r);
   });
 
