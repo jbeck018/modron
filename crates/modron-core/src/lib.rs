@@ -19,6 +19,7 @@ pub mod compact;
 pub mod context;
 pub mod engine;
 pub mod goal;
+pub mod handoff;
 pub mod hooks;
 pub mod judge;
 pub mod memory;

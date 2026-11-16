@@ -715,6 +715,9 @@ impl Engine {
                  check the id against `modron --resume <id>` of a completed run"
             )));
         }
+        if let Some(refusal) = crate::handoff::run_refusal(session_id, &events) {
+            return Err(Error::Session(refusal));
+        }
         // Rewind support (C2): when `resume_from_event` is set, events after
         // that index stay in the append-only log but never re-enter context.
         // With `resume_skip_end` only the abandoned range `[cut, end)` is
@@ -2294,6 +2297,13 @@ impl Engine {
         if command.is_empty() {
             return Ok(UserShellOutcome::refused("usage: !<shell command>"));
         }
+        // A handed-off session takes no `!` command either: the log would
+        // diverge from the host that owns it now (C6c).
+        if let Ok(stored) = self.store.load(session_id).await {
+            if let Some(refusal) = crate::handoff::run_refusal(session_id, &stored) {
+                return Err(Error::Session(refusal));
+            }
+        }
         if self.tools.get("bash").is_none() {
             return Ok(UserShellOutcome::refused(
                 "no `bash` tool is registered; shell passthrough needs it",
@@ -3180,6 +3190,11 @@ impl Engine {
     /// The caller must ensure no run is active on the session; this method
     /// does not take a run lock.
     pub async fn compact_session(&self, session_id: SessionId) -> Result<CompactOutcome> {
+        if let Ok(stored) = self.store.load(session_id).await {
+            if let Some(refusal) = crate::handoff::run_refusal(session_id, &stored) {
+                return Err(Error::Session(refusal));
+            }
+        }
         let events = self.rewound_events(session_id).await?;
         let tool_specs = self.tools.specs_prompt();
         let system = self.assemble_system(&tool_specs);
@@ -3393,6 +3408,8 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
             }
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
+            // An ownership fact is not conversation content (C6c).
+            | SessionEvent::HandedOff { .. }
             // A review verdict is not conversation content: its feedback
             // is persisted as its own `Message` event.
             | SessionEvent::Review { .. }

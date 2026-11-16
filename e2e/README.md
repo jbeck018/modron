@@ -35,6 +35,22 @@ process the run starts is in its own process group and is killed on exit
 (SIGTERM, then SIGKILL). Re-run with no leftovers; `left-over tracked
 processes` in the summary must be 0.
 
+## CI (GitHub Actions job `e2e`, `.github/workflows/ci.yml`)
+
+The job builds its own inputs (`modron`, `modron-app-tui`, the web bundle),
+stages them under `$RUNNER_TEMP/e2e`, installs `cloud/bridge` (`npm ci`),
+Playwright 1.63.0 with Chromium, and `pyte==0.8.2` into `$RUNNER_TEMP/pyte`,
+then runs `node e2e/run.mjs` with:
+
+- `E2E_SCRATCH=$RUNNER_TEMP/e2e` (short root: the daemon socket stays under
+  108 bytes);
+- `E2E_PYTE_DIR=$RUNNER_TEMP/pyte`;
+- `E2E_NO_SKIP=1`: a skipped step (for example a stale terminal binary) fails
+  the job. Unset locally, skips are reported and do not fail the run.
+
+Any FAIL exits 1. On failure the job uploads `run-*/**/*.json`,
+`run-*/**/*.log` and `run-*/**/*.png` as the `e2e-results-<run id>` artifact.
+
 ## Scenarios
 
 | ID | What it checks |
@@ -47,6 +63,7 @@ processes` in the summary must be 0.
 | P4 | The serve is stopped; the bridge's test clock (`x-test-now`, `MODRON_TEST_HOOKS=1`, added by the page through `route`) is six minutes ahead; the session row shows offline and a press does not open it. Needs P2. |
 | R1 | `serve --remote-control` against the bridge with its own portal, NO client sends `remote_control`: the share-url file is written, the session shows online in the owner's portal list, the owner's browser opens it and runs a task (approval answered in the browser). Independent of the other steps. |
 | P5 | Web push: a serve's approval request (registered session) reaches a subscribed endpoint on a fake push service through the local bridge; the body decrypts (RFC 8291, node:crypto) to `approval needed: <tool>`, the title is the session title, and the VAPID JWT verifies. Own bridge with VAPID secrets and `PUSH_TEST_ORIGIN`; needs no other step. |
+| H1 | Handoff between two hosts (git carrier, shared bare remote): host A runs a task whose mock script writes `demo-output.txt`, exports the session with `modron handoff export --remote origin`, and keeps serving; host B clones, imports, serves and resumes the same session, with the transcript and the file present; host A refuses a new run on the handed-off session with "was handed off to another host". Needs no other step. |
 | W1 | Steer (send while an approval waits) and queue (Alt+Enter); queue chip; the queued message starts its own run. |
 | W2 | `/plan`: the engine refuses gated tools (`plan phase: read-only`); no approval asked; `/build` returns. The mock never proposes a plan. |
 | W3 | Settings: effort and approval mode change; the server echoes them; the status line shows them. |

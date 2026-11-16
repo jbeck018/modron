@@ -98,6 +98,10 @@ pub struct Config {
     /// startup error rather than a silently ignored file.
     #[serde(default)]
     pub permissions: Option<PermissionsConfig>,
+    /// `[handoff]`: how a session moves between hosts (C6c). See
+    /// docs/HANDOFF.md.
+    #[serde(default)]
+    pub handoff: Option<HandoffConfig>,
 }
 
 /// Resolve the reasoning effort: the `--effort` flag wins over the config
@@ -150,6 +154,16 @@ impl PermissionsConfig {
         }
         Ok(RuleSet::new(rules))
     }
+}
+
+/// `[handoff]` section (C6c). `carrier` is `"git"` (default) or `"furrow"`.
+/// `furrow_store` is the furrow store URL (`s3://bucket/prefix` or a local
+/// directory) for the furrow carrier. Credentials are never read from here:
+/// furrow takes them from the environment (docs/CONFIG.md).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct HandoffConfig {
+    pub carrier: Option<String>,
+    pub furrow_store: Option<String>,
 }
 
 /// `[sessions]` section (Phase 6a). `ttl_days` enables auto-vacuum at
@@ -809,6 +823,18 @@ mod tests {
         assert!(!default.reasoning_summary);
         let on: Config = toml::from_str("reasoning_summary = true").unwrap();
         assert!(on.reasoning_summary);
+    }
+
+    /// C6c: `[handoff] carrier` loads; unset means the git carrier.
+    #[test]
+    fn handoff_carrier_loads_from_the_file() {
+        let default: Config = toml::from_str("").unwrap();
+        assert!(default.handoff.is_none());
+        let furrow: Config = toml::from_str("[handoff]\ncarrier = \"furrow\"\n").unwrap();
+        assert_eq!(
+            furrow.handoff.and_then(|h| h.carrier).as_deref(),
+            Some("furrow")
+        );
     }
 
     #[test]

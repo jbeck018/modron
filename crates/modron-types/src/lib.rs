@@ -413,6 +413,20 @@ pub enum SessionEvent {
         findings: Vec<Finding>,
         model: String,
     },
+    /// Ownership fact (C6c, additive): this host handed the session to another
+    /// host with `modron handoff export`. Appended as the LAST line of the
+    /// exporting host's log only; the bundle never carries it. While it is
+    /// the last event the host refuses runs, compaction and `!` commands on
+    /// the session (see `modron_core::handoff`). An import of a longer log
+    /// that continues past this line clears it. `to` is the optional target
+    /// host name; `carrier_ref` is the git ref the bundle was pushed to.
+    /// Clients fold it as a transcript note and nothing else.
+    HandedOff {
+        #[serde(default)]
+        to: Option<String>,
+        at: chrono::DateTime<chrono::Utc>,
+        carrier_ref: String,
+    },
 }
 
 /// The reviewer's verdict for one review round.

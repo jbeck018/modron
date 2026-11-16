@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use modron_core::Engine;
+use modron_core::{Engine, SessionId};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -46,10 +46,104 @@ pub struct ServeOptions {
     /// File the share URL is written to at start (0600). Requires
     /// `remote_control`.
     pub share_url_file: Option<PathBuf>,
+    /// Runs at shutdown (ctrl+c or SIGTERM) for the session that remote
+    /// control was started for, after that session's run is interrupted.
+    /// Needs `remote_control`. `None` = no hand-off at exit.
+    pub handoff_on_exit: Option<HandoffOnExit>,
+    /// How long the on-exit hook may take before shutdown goes on without it.
+    /// `None` = [`DEFAULT_HANDOFF_TIMEOUT`].
+    pub handoff_timeout: Option<Duration>,
+}
+
+/// Time the on-exit hand-off may take before `modron serve` exits without it.
+pub const DEFAULT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The hand-off run at shutdown: given the session, returns a one-line report
+/// for stdout, or an error for stderr. Runs on its own thread.
+#[derive(Clone)]
+pub struct HandoffOnExit(pub Arc<dyn Fn(SessionId) -> anyhow::Result<String> + Send + Sync>);
+
+impl std::fmt::Debug for HandoffOnExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HandoffOnExit")
+    }
+}
+
+/// What the on-exit hand-off came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffExit {
+    Done(String),
+    Failed(String),
+    TimedOut,
+}
+
+/// Runs the hook for `session` on a thread and waits at most `timeout`. A
+/// hook still running at the timeout is left behind; the process exits anyway.
+pub fn run_handoff_on_exit(
+    hook: &HandoffOnExit,
+    session: SessionId,
+    timeout: Duration,
+) -> HandoffExit {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hook = hook.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send((hook.0)(session));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(line)) => HandoffExit::Done(line),
+        Ok(Err(error)) => HandoffExit::Failed(format!("{error:#}")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => HandoffExit::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            HandoffExit::Failed("the hand-off thread stopped without a result".to_string())
+        }
+    }
+}
+
+/// Stops the serve session's run, then runs the hand-off. Every outcome is
+/// printed; none of them stops the shutdown.
+fn handoff_at_exit(server: &BoundServer, hook: &HandoffOnExit, timeout: Duration) {
+    let Some(session) = server.serve_session else {
+        eprintln!(
+            "modron serve: --handoff-on-exit has no remote-control session; nothing handed off"
+        );
+        return;
+    };
+    // Settle the log first: the run is aborted, so the export reads what was
+    // committed before the stop.
+    if let Some(handle) = server.state.hub.handle(&session) {
+        handle.interrupt();
+    }
+    match run_handoff_on_exit(hook, session, timeout) {
+        HandoffExit::Done(line) => println!("{line}"),
+        HandoffExit::Failed(error) => eprintln!("modron serve: handoff on exit failed: {error}"),
+        HandoffExit::TimedOut => eprintln!(
+            "modron serve: handoff on exit did not finish within {}s; exiting without it",
+            timeout.as_secs()
+        ),
+    }
+}
+
+/// Waits for ctrl+c, or SIGTERM on unix (what a container stop sends).
+async fn wait_for_stop() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    tokio::signal::ctrl_c().await.ok();
 }
 
 /// The addresses a server actually bound (returned by [`bind_server`]).
 pub struct BoundServer {
+    /// The session remote control was started for (`--remote-control`).
+    pub serve_session: Option<SessionId>,
     /// `ws://` endpoint, when the WS listener is enabled.
     pub ws_addr: Option<std::net::SocketAddr>,
     /// Unix-socket path, always bound.
@@ -185,19 +279,27 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
     // Remote control at start, once the listeners are up (same tunnel path
     // as the `remote_control` frame). A failure here stops the accept loops
     // before the error goes back to the caller.
+    let mut serve_session = None;
     if let Some(bridge) = &options.remote_control {
-        if let Err(e) =
-            crate::rc::start_serve_remote_control(&state, bridge, options.share_url_file.as_deref())
-                .await
+        match crate::rc::start_serve_remote_control(
+            &state,
+            bridge,
+            options.share_url_file.as_deref(),
+        )
+        .await
         {
-            for task in &tasks {
-                task.abort();
+            Ok((_url, session)) => serve_session = Some(session),
+            Err(e) => {
+                for task in &tasks {
+                    task.abort();
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     }
 
     Ok(BoundServer {
+        serve_session,
         ws_addr,
         unix_path,
         tasks,
@@ -234,7 +336,11 @@ pub async fn run_serve(engine: Engine, options: &ServeOptions) -> anyhow::Result
         std::process::id()
     );
 
-    tokio::signal::ctrl_c().await.ok();
+    wait_for_stop().await;
+    if let Some(hook) = &options.handoff_on_exit {
+        let timeout = options.handoff_timeout.unwrap_or(DEFAULT_HANDOFF_TIMEOUT);
+        handoff_at_exit(&server, hook, timeout);
+    }
     // Give in-flight frames a beat, then clean up.
     tokio::time::sleep(Duration::from_millis(50)).await;
     server.shutdown();
@@ -244,4 +350,56 @@ pub async fn run_serve(engine: Engine, options: &ServeOptions) -> anyhow::Result
     let _ = std::fs::remove_file(&pid_path);
     println!("modron serve stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod handoff_exit_tests {
+    use super::*;
+
+    fn hook(
+        f: impl Fn(SessionId) -> anyhow::Result<String> + Send + Sync + 'static,
+    ) -> HandoffOnExit {
+        HandoffOnExit(Arc::new(f))
+    }
+
+    #[test]
+    fn a_finished_hook_reports_its_line() {
+        let id = SessionId::nil();
+        let out = run_handoff_on_exit(
+            &hook(|s| Ok(format!("done {s}"))),
+            id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(out, HandoffExit::Done(format!("done {id}")));
+    }
+
+    #[test]
+    fn a_failing_hook_reports_its_error() {
+        let out = run_handoff_on_exit(
+            &hook(|_| Err(anyhow::anyhow!("store is read-only"))),
+            SessionId::nil(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(out, HandoffExit::Failed("store is read-only".to_string()));
+    }
+
+    #[test]
+    fn a_slow_hook_is_abandoned_at_the_timeout() {
+        let started = std::time::Instant::now();
+        let out = run_handoff_on_exit(
+            &hook(|_| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(String::new())
+            }),
+            SessionId::nil(),
+            Duration::from_millis(50),
+        );
+        assert_eq!(out, HandoffExit::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn the_default_timeout_is_thirty_seconds() {
+        assert_eq!(DEFAULT_HANDOFF_TIMEOUT, Duration::from_secs(30));
+    }
 }

@@ -149,6 +149,36 @@ is: engine default, then this section, then flags.
 |---|---|---|---|
 | `ttl_days` | integer | unset (never) | At startup, deletes sessions not updated for this many days. `modron sessions vacuum` still works without it. |
 
+## [handoff]
+
+How a session moves between hosts (`modron handoff export|import`, see
+[HANDOFF.md](HANDOFF.md)).
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `carrier` | string | `"git"` | `"git"` moves the working tree and the session log as git refs. `"furrow"` moves the working tree (ignored files included) as a furrow snapshot in `furrow_store`; the session bundle travels inside the snapshot. |
+| `furrow_store` | string | unset | Required with `carrier = "furrow"`. An `s3://bucket/prefix` URL or a local directory. Credentials are never read from this file (see the furrow variables below). Note: furrow 0.3.7's `clone` (used by import) accepts only `s3://` and `ssh://` URLs, so a local directory can be exported but not imported by the real furrow. |
+
+Furrow carrier, in short: modron runs the `furrow` CLI found on PATH, or the
+binary named by `MODRON_FURROW_BIN`. Furrow reads its own settings from the
+environment, and modron passes the environment through without reading it:
+
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (or
+  `AWS_DEFAULT_REGION`): S3 credentials and region.
+- `FURROW_S3_ENDPOINT`, `FURROW_S3_PATH_STYLE`, `FURROW_S3_ALLOW_HTTP`: an
+  S3-compatible endpoint (path style is automatic with a custom endpoint).
+- `FURROW_RECOVERY_KEY` (read by modron too, which requires it): the 64-hex
+  workspace key. Every host that exports or imports the same session must hold
+  the same key. Losing it makes the store unreadable.
+
+No value of these variables is printed or logged by modron; furrow's stderr is
+passed through with any of them removed.
+
+Serve-side option: `modron serve --handoff-on-exit` (or `MODRON_HANDOFF_ON_EXIT=1`)
+exports the session that remote control serves when serve stops (ctrl+c or
+SIGTERM), after its run is interrupted. It needs `--remote-control`. The export
+has 30 seconds; after that serve exits without it. See [HANDOFF.md](HANDOFF.md).
+
 ## [router]
 
 Model selection for each turn. `modron router eval` scores the selector offline.
@@ -266,6 +296,9 @@ here is not read by `modron`.
 | `MODRON_MAX_TOTAL_TOKENS` | Overrides `max_total_tokens`. |
 | `MODRON_GOAL_MAX_ITERATIONS` | Iteration cap for `--goal` runs. Default `10`. A non-numeric value is ignored. |
 | `RUST_LOG` | Tracing filter. Replaces the default `info`, or `debug` with `--verbose`. |
+| `MODRON_HANDOFF_ON_EXIT` | `modron serve`: `1` or `true` turns on `--handoff-on-exit`. |
+| `MODRON_FURROW_BIN` | `modron handoff` with `carrier = "furrow"`: path of the furrow binary (default: `furrow` on PATH). |
+| `FURROW_RECOVERY_KEY` | `modron handoff` with `carrier = "furrow"`: the workspace recovery key (required). Furrow's own variables are listed under `[handoff]`. |
 
 ### Provider credentials and endpoints
 

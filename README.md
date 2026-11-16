@@ -309,6 +309,17 @@ modron doctor                   # diagnose the setup
 modron upgrade                  # replace the binary with the latest release
 ```
 
+## Handoff between hosts
+
+`modron handoff export` moves one session from this host to another: it
+commits the working tree (not ignored files) and the session log to git refs
+`modron/handoff/<id>` and `modron/handoff/<id>-session`, pushes them to
+`origin`, and marks the session handed off here. On the other host,
+`modron handoff import <id>` fetches them, checks the tree out without
+switching branches, and restores the log. The cloud container accepts
+`HANDOFF_REF` and runs that import before `modron serve`. See
+[docs/HANDOFF.md](docs/HANDOFF.md).
+
 ## Memory, caching, compaction
 
 - **Memory (two tiers):** the workspace's `AGENTS.md` is loaded into the system prompt,

@@ -774,6 +774,7 @@ pub struct RenderedRow {
 pub fn entry_lines(entry: &TranscriptEntry) -> Vec<String> {
     match entry {
         TranscriptEntry::Task { text } => vec![format!("❯ {text}")],
+        TranscriptEntry::Note { text } => vec![text.clone()],
         TranscriptEntry::User { text } => vec![text.clone()],
         TranscriptEntry::Assistant { text } => vec![text.clone()],
         TranscriptEntry::ToolSummary { line, .. } => vec![line.clone()],

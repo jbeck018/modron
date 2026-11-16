@@ -1226,6 +1226,7 @@ dependencies = [
 name = "modron-view"
 version = "0.1.3"
 dependencies = [
+ "chrono",
  "modron-types",
  "serde",
  "serde_json",

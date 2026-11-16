@@ -40,4 +40,7 @@ pub use hub::{BroadcastingStore, RunFuture, SessionHandle, SessionHub};
 pub use pairing::{
     check_token, default_clients_dir, generate_token, grant, list, revoke, DeviceToken,
 };
-pub use serve::{bind_server, run_serve, BoundServer, ServeOptions};
+pub use serve::{
+    bind_server, run_handoff_on_exit, run_serve, BoundServer, HandoffExit, HandoffOnExit,
+    ServeOptions, DEFAULT_HANDOFF_TIMEOUT,
+};

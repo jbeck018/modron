@@ -452,3 +452,51 @@ Rules:
 
 Unverified until the live check: the effect of replayed blocks on
 prompt-cache prefixes.
+
+### 10.8 Design: handoff between hosts (C6c)
+
+One host owns the files at a time (10.2). A handoff moves three things
+from the current host to the next: the working tree, the session log,
+and ownership. Two carriers, chosen by `[handoff] carrier = "git" |
+"furrow"` (default git; owner decision 10.2b).
+
+1. `modron handoff export [--session ID]` on the current host, run
+   only when the session is idle (refused while a run is active):
+   - git carrier: commit everything `git status` shows (tracked changes
+     and untracked files that are not ignored) to branch
+     `modron/handoff/<session id>` with a fixed author and a message
+     naming the session, WITHOUT moving the user's branch or index
+     (build the commit from a temporary index, `git commit-tree`, update
+     only that ref), then push that ref. Ignored files do not travel;
+     the command lists how many were left behind.
+   - furrow carrier: `furrow` CLI snapshot of the working tree to the
+     configured store (S3 settings from the environment, never from
+     the config file); everything travels, including ignored files.
+   - Both: the session's JSONL log and its sidecars are written to a
+     bundle (`<id>.handoff.tar`, provider blocks included, no
+     credentials, no env files) stored with the carrier: on the git
+     carrier as a blob on a second ref `modron/handoff/<id>-session`
+     (never in the working tree), on furrow inside the snapshot's
+     metadata directory.
+   - It prints one line to give the next host: `modron handoff import
+     <carrier-ref>`.
+2. `modron handoff import <ref>` on the next host: fetch the ref,
+   check out the tree into the working directory (refused when the
+   directory has uncommitted changes of its own, unless `--force`),
+   restore the session log into the local store under the same session
+   id (refused when that id already exists with a different history,
+   unless it is a prefix of the incoming log), and print the resume
+   command. With `modron serve --remote-control` the session is then
+   reachable under a NEW share key; the portal lists it under the same
+   title.
+3. Ownership: export writes a `HandedOff { to, at, carrier_ref }` event
+   as the last line of the old host's log and the old host refuses new
+   runs for that session until an import brings it back (a newer log
+   with the old one as prefix). No distributed lock: the log's prefix
+   rule is the arbiter, and a diverged log is refused, not merged.
+4. Cloud: the container entrypoint accepts `HANDOFF_REF` and runs the
+   import before `modron serve --remote-control`; on idle sleep the
+   container runs the export so the next wake (or a laptop) can import.
+5. Out of scope for v1: live handoff during a run, merging diverged
+   trees, moving provider credentials.
+
