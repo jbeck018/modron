@@ -891,7 +891,12 @@ async function handleInviteLink(request: Request, env: Env, token: string): Prom
   const inner = `${wsScheme}//${url.host}/ws/${issued.viewer_key}?ticket=${issued.ticket}`;
   return new Response(null, {
     status: 302,
-    headers: { location: "/app/?url=" + encodeURIComponent(inner), "cache-control": "no-store" },
+    // The invite rides along so an approver's page can subscribe to push
+    // (the push routes accept an approver invite; viewers are refused).
+    headers: {
+      location: "/app/?url=" + encodeURIComponent(inner) + "&invite=" + encodeURIComponent(token),
+      "cache-control": "no-store",
+    },
   });
 }
 

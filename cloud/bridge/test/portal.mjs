@@ -285,7 +285,12 @@ try {
   // Redeem the viewer invite for a ticket: 302 to the app with the inner url.
   const redeem = await fetch(viewerInv.url, { redirect: "manual" });
   const loc = redeem.headers.get("location") || "";
-  const inner = decodeURIComponent(loc.slice("/app/?url=".length));
+  // The location also carries the invite (for push subscription): read the
+  // two parameters instead of slicing the string.
+  const locParams = new URL(loc, "http://x").searchParams;
+  const inner = locParams.get("url") || "";
+  check("the redirect carries the invite token", loc.startsWith("/app/?url=") && locParams.get("invite") === viewerInv.url.split("/i/")[1],
+    "loc " + loc.slice(0, 40));
   const ticketMatch = new RegExp(`^ws://127\\.0\\.0\\.1:${A.port}/ws/${viewerKey}\\?ticket=([0-9a-f]{64})$`).exec(inner);
   check("valid invite is 302 to /app/ with an encoded ws url and a 64-hex ticket",
     redeem.status === 302 && loc.startsWith("/app/?url=") && ticketMatch !== null, "status " + redeem.status + " loc " + loc);
