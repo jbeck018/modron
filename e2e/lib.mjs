@@ -330,8 +330,11 @@ export async function openViewer(browser, url, label, cookie = null) {
   // 401; the browser logs both as resource errors. Those two are
   // expected; every other console error still fails the step.
   const expected = /server responded with a status of (401|503)/;
+  // One more: an invited viewer's page asks for the push key and is
+  // refused (403) by design. Only that exact request is allowed.
+  const pushProbe = (m) => /status of 403/.test(m.text()) && /\/api\/push\/key(\?|$)/.test(m.location()?.url || '');
   page.on('console', (m) => {
-    if (m.type() === 'error' && !expected.test(m.text())) v.errors.push(m.text());
+    if (m.type() === 'error' && !expected.test(m.text()) && !pushProbe(m)) v.errors.push(m.text());
   });
   page.on('pageerror', (e) => v.errors.push('pageerror: ' + e.message));
   const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => { v.errors.push('goto: ' + e.message); return null; });
