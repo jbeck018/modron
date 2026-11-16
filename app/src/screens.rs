@@ -8,9 +8,8 @@ use modron_mobile_core::view::{
     AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL, AUTH_CODE_LABEL,
     AUTH_KEY_HINT, AUTH_KEY_PLACEHOLDER, AUTH_KEY_SAVE_HINT, AUTH_NO_PROVIDERS_LABEL,
     AUTH_VISIT_LABEL, AUTH_WAITING_LABEL, CONFIRM_NO_LABEL, CONFIRM_YES_LABEL, COPIED_LABEL,
-    COPY_LABEL, DELETE_LABEL, HELP_COMMANDS_HEADING, HELP_KEYS_HEADING, HELP_TITLE,
-    MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL, REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL,
-    SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
+    COPY_LABEL, DELETE_LABEL, HELP_TITLE, MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL,
+    REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL, SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
 };
 use modron_mobile_core::{
     FILTER_LABEL, NEW_SESSION_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL, SESSIONS_NO_MATCH_LABEL,
@@ -28,8 +27,14 @@ use modron_mobile_core::view::{
     TASK_NEW_LABEL,
 };
 
-use crate::help;
-use crate::nav::{FormKind, NavStep, NavView, Screen};
+use crate::help::{HELP_TABS, HELP_VISIBLE};
+use crate::nav::{FormKind, NavStep, NavView, PickerRow, Screen};
+use modron_mobile_core::view::REMOVE_LABEL;
+
+/// Picker rows the list shows at once (a longer list is filtered, not scrolled).
+const PICKER_SLOTS: usize = 16;
+/// The mark on the current picker value (a dot, as the old terminal drew it).
+const PICKER_CURRENT: &str = "\u{25cf} ";
 
 /// Visible slots: fixed counts keep NSH's cell layout static (see the chat
 /// body's notes). Rows past the slot count are not shown.
@@ -65,9 +70,12 @@ pub fn frame(
     window_h: Signal<f32>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
+    // The root paints the theme's background token, so a choice made in the
+    // picker (or the system appearance) reaches the whole page.
     view()
         .flex_col()
         .size_full()
+        .bg(move || token_ink("background"))
         .child(when(move || nav.with(|n| n.is_portal()), {
             let actions = actions.clone();
             move || portal_frame(nav, actions.clone())
@@ -121,7 +129,14 @@ fn chat_frame(
             let actions = actions.clone();
             move || tasks_body(nav, actions.clone())
         }))
-        .child(when(move || nav.with(|n| n.screen == Screen::Help), help_body))
+        .child(when(move || nav.with(|n| n.screen == Screen::Help), {
+            let actions = actions.clone();
+            move || help_body(nav, actions.clone())
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Picker), {
+            let actions = actions.clone();
+            move || picker_body(nav, actions.clone())
+        }))
 }
 
 /// The automations screen (`/automations`): the filter, the rows (the core's
@@ -662,8 +677,9 @@ fn settings_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> im
     ))
 }
 
-/// One settings row: `label: value`. On the web a tap sends the row's
-/// action (a read-only row sends nothing).
+/// One settings row: `label: value`. On the web a tap on the label sends the
+/// row's action (a read-only row sends nothing), and a removable row shows a
+/// remove control that asks first, as `d` does in the terminal.
 fn setting_row(
     nav: Signal<NavView>,
     i: usize,
@@ -680,19 +696,25 @@ fn setting_row(
             }
         })
     };
-    let row = view().child(text(line).text_color(move || {
+    let label = view().child(text(line).text_color(move || {
         token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
     }));
-    if WEB_CONTROLS {
-        row.role(AccessibilityRole::Button).on_press(move || {
+    let press = actions.clone();
+    let label = if WEB_CONTROLS {
+        label.role(AccessibilityRole::Button).on_press(move || {
             let action = nav.with(|n| n.settings.get(i).and_then(|r| r.action.clone()));
             if let Some(action) = action {
-                let _ = actions.send(action);
+                let _ = press.send(action);
             }
         })
     } else {
-        row
-    }
+        label
+    };
+    let remove = when(
+        move || WEB_CONTROLS && nav.with(|n| n.settings.get(i).is_some_and(|r| r.remove.is_some())),
+        move || tap(REMOVE_LABEL, actions.clone(), UiAction::Nav(NavStep::AskSettingRemove(i))),
+    );
+    view().flex_row().child(label).child(remove)
 }
 
 /// The model picker: the filter line, the rows (`model (role)`), and the
@@ -771,18 +793,101 @@ fn model_row(
     }
 }
 
-/// The help screen: the keys, then the slash commands. Both come from the
-/// app's one key table and the shared slash table (see `help::help_lines`).
-fn help_body() -> impl IntoElement {
+/// The help screen: three tabs (General, Commands, Shortcuts) over the rows
+/// of the app's key table and the shared slash table (`help::tab_lines`). The
+/// rows scroll: Up and Down, PgUp and PgDn, Home and End, and the wheel on
+/// the web. On the web a tap on a tab label opens it.
+fn help_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
     let mut column = view().flex_col();
     column = column.child(text(HELP_TITLE).font_weight(FontWeight::BOLD));
-    for line in help::help_lines() {
-        let heading = line == HELP_KEYS_HEADING || line == HELP_COMMANDS_HEADING;
-        let style = if heading { Style::Bold } else { Style::Plain };
-        column = column
-            .child(text(move || line.clone()).text_color(move || token_ink(style_token(style))));
+    let mut strip = view().flex_row();
+    for tab in HELP_TABS {
+        let tab_actions = actions.clone();
+        let active = move || nav.with(|n| n.help_tab == tab);
+        let label = view().px(px(8.0)).child(text(tab.label()).text_color(move || {
+            token_ink(style_token(if active() { Style::Bold } else { Style::Plain }))
+        }));
+        let cell = if WEB_CONTROLS {
+            label.role(AccessibilityRole::Button).on_press(move || {
+                let _ = tab_actions.send(UiAction::Nav(NavStep::HelpTo(tab)));
+            })
+        } else {
+            label
+        };
+        strip = strip.child(cell);
+    }
+    column = column.child(strip);
+    for i in 0..HELP_VISIBLE {
+        column = column.child(when(
+            move || nav.with(|n| n.help_rows.len() > n.help_scroll + i),
+            move || {
+                text(move || {
+                    nav.with(|n| n.help_rows.get(n.help_scroll + i).cloned().unwrap_or_default())
+                })
+                .text_color(move || token_ink(style_token(Style::Plain)))
+            },
+        ));
+    }
+    column.child(
+        text(move || {
+            nav.with(|n| {
+                let total = n.help_rows.len();
+                let first = if total == 0 { 0 } else { n.help_scroll + 1 };
+                let last = (n.help_scroll + HELP_VISIBLE).min(total);
+                format!("{}: {first}-{last} of {total}", n.help_tab.label().to_lowercase())
+            })
+        })
+        .text_color(muted()),
+    )
+}
+
+/// The picker: its title, the filter line and the rows that match the filter.
+/// The current value carries a dot, an unavailable row is dim. Enter (terminal)
+/// or a tap (web) applies the row and closes the picker.
+fn picker_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column
+        .child(text(move || nav.with(|n| n.picker_title.clone())).font_weight(FontWeight::BOLD));
+    column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    for i in 0..PICKER_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.picker.len() > i),
+            move || picker_row(nav, i, actions.clone()),
+        ));
     }
     column
+}
+
+fn picker_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let selected = move || nav.with(|n| n.selected == i);
+    let line = move || {
+        nav.with(|n| {
+            let row: Option<&PickerRow> = n.picker.get(i);
+            let marker = if n.selected == i { "> " } else { "  " };
+            let current = if row.is_some_and(|r| r.current) { PICKER_CURRENT } else { "" };
+            format!("{marker}{current}{}", row.map(|r| r.label.as_str()).unwrap_or_default())
+        })
+    };
+    let dim = move || nav.with(|n| n.picker.get(i).is_some_and(|r| !r.enabled));
+    let row = view().child(text(line).text_color(move || {
+        if dim() {
+            muted()()
+        } else {
+            token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
+        }
+    }));
+    if WEB_CONTROLS {
+        row.role(AccessibilityRole::Button).on_press(move || {
+            let _ = actions.send(UiAction::Nav(NavStep::PickRow(i)));
+        })
+    } else {
+        row
+    }
 }
 
 /// The sub-agent panel, drawn above the chat composer while the agent

@@ -683,6 +683,54 @@ async function testHeaderOpensScreens(browser, base) {
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   await page.close();
 }
+// The theme picker (Settings, theme row): a tap on "oculus light" paints the
+// light tokens (oculus.json: background #FFFFFF), a tap on "oculus dark" the
+// dark ones (#000000), and the dark choice is read back from localStorage
+// after a reload. Rows are matched by their text, which carries a dot when
+// current, so the match is a substring.
+async function tapText(page, label) {
+  await page.getByText(label).first().click();
+}
+// What the page paints: every distinct background, and the text colour of the
+// Settings row "phase: build" (a plain row, not the selected one).
+async function paintSummary(page) {
+  return page.evaluate(() => {
+    const all = [...document.querySelectorAll('*')];
+    const leaf = all.find((e) => e.childElementCount === 0 && e.textContent.includes('phase: build'));
+    return {
+      backgrounds: [...new Set(all.map((e) => getComputedStyle(e).backgroundColor))],
+      text: leaf ? getComputedStyle(leaf).color : null,
+    };
+  });
+}
+async function testThemePicker(browser, base) {
+  const { page, errors } = await openPage(browser, base + '/');
+  await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
+  await tapText(page, 'settings');
+  await page.waitForFunction(() => document.body.innerText.includes('approval mode: ask'), null, { timeout: TIMEOUT });
+  await tapText(page, 'theme: system');
+  await page.waitForFunction(() => document.body.innerText.includes('oculus light'), null, { timeout: TIMEOUT });
+  await tapText(page, 'oculus light');
+  await page.waitForFunction(() => document.body.innerText.includes('theme: oculus light'), null, { timeout: TIMEOUT });
+  let painted = await paintSummary(page);
+  if (!painted.backgrounds.includes('rgb(255, 255, 255)')) throw new Error('light theme paints ' + JSON.stringify(painted));
+  await tapText(page, 'theme: oculus light');
+  await page.waitForFunction(() => document.body.innerText.includes('oculus dark'), null, { timeout: TIMEOUT });
+  await tapText(page, 'oculus dark');
+  await page.waitForFunction(() => document.body.innerText.includes('theme: oculus dark'), null, { timeout: TIMEOUT });
+  painted = await paintSummary(page);
+  if (!painted.backgrounds.includes('rgb(0, 0, 0)')) throw new Error('dark theme paints ' + JSON.stringify(painted));
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
+  const saved = await page.evaluate(() => localStorage.getItem('modron.theme'));
+  if (saved !== 'oculus dark') throw new Error('saved theme is ' + saved);
+  await page.waitForFunction(
+    () => [...document.querySelectorAll('*')].some((e) => getComputedStyle(e).backgroundColor === 'rgb(0, 0, 0)'),
+    null, { timeout: TIMEOUT });
+  if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  await page.close();
+}
+
 // A session row is pressable: a tap sends an attach frame for that session.
 async function testSessionRowAttaches(browser, base) {
   const other = '9c2d7e10-1a2b-4c3d-8e4f-5a6b7c8d9e0f';
@@ -708,7 +756,10 @@ async function testEffortTapSendsConfig(browser, base) {
     const { page, errors } = await openLive(browser, base, ws);
     await tapLabel(page, 'settings');
     await page.waitForFunction(() => document.body.innerText.includes('effort: unset'), null, { timeout: TIMEOUT });
+    // The row opens the effort picker (the old terminal's menus); a tap on a level applies it.
     await tapLabel(page, 'effort: unset');
+    await page.waitForFunction(() => document.body.innerText.includes('xhigh'), null, { timeout: TIMEOUT });
+    await tapText(page, 'low');
     const frame = await waitFrame(ws, 'set_config', (f) => f.patch && f.patch.effort === 'low');
     if (frame.patch.effort !== 'low') throw new Error('effort patch was ' + JSON.stringify(frame.patch));
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -833,8 +884,11 @@ async function testCredentialsScreen(browser, base) {
     await page.waitForTimeout(100);
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.body.innerText.includes('OpenAI: paste an API key'), null, { timeout: TIMEOUT });
+    // Type only once the masked field has the focus, and send only once it
+    // holds the whole key: keys typed before the field is focused are lost.
+    await page.waitForFunction(() => document.activeElement && document.activeElement.type === 'password', null, { timeout: TIMEOUT });
     await page.keyboard.type('sk-test-123');
-    await page.waitForTimeout(100);
+    await page.waitForFunction(() => document.activeElement.value === 'sk-test-123', null, { timeout: TIMEOUT });
     await page.keyboard.press('Enter');
     const saved = await waitFrame(ws, 'auth_set_key', (f) => f.provider === 'openai');
     if (saved.key !== 'sk-test-123') throw new Error('auth_set_key sent the wrong key');
@@ -958,6 +1012,7 @@ async function testAttachSendsOneImage(browser, base) {
     ['(g) share link (no session in URL): submit is for the adopted session', () => testShareLinkSubmit(browser, base)],
     ['(h) queue chip press sends dequeue', () => testChipDequeue(browser, base)],
     ['(i) header controls open the sessions and settings screens', () => testHeaderOpensScreens(browser, base)],
+    ['(l) theme picker: light and dark repaint, the dark choice survives a reload', () => testThemePicker(browser, base)],
     ['(j) session row tap sends attach', () => testSessionRowAttaches(browser, base)],
     ['(k) effort tap sends set_config', () => testEffortTapSendsConfig(browser, base)],
     ['(l) typing /co shows the compact suggestion', () => testSlashSuggestions(browser, base)],

@@ -240,6 +240,10 @@ fn settings_shows_the_core_labels_and_enter_on_approval_mode_sends_the_mode() {
     assert!(screen.contains("compact"), "{screen}");
     h.key("ArrowDown");
     h.key("ArrowDown");
+    // Enter opens the approval mode picker; typing filters it and Enter applies.
+    h.key("Enter");
+    h.wait_for("approval mode picker", |s| s.contains("yolo") && s.contains("deny"));
+    h.type_text("yolo");
     h.key("Enter");
     assert_eq!(h.action(), Some(UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll)));
 }

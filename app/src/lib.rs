@@ -20,6 +20,7 @@ pub mod slash;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod startup;
 pub mod suggest;
+pub mod theme;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
@@ -117,12 +118,20 @@ pub fn App() -> impl IntoElement {
             // The composer's completed text (Tab, Enter on a partial command,
             // a tap on a suggestion) is applied once per sequence number.
             let mut applied = 0u64;
+            // The theme change is applied once per sequence number too, on
+            // the engine thread (NSH's colour scheme call needs its runtime).
+            let mut theme_applied = 0u64;
             while let Some(view) = rx.recv().await {
                 let (seq, text) = view.completion.clone();
                 if seq != applied {
                     applied = seq;
                     chat::set_draft(&text);
                     draft.set(text);
+                }
+                let change = view.theme_change;
+                if change.seq != theme_applied {
+                    theme_applied = change.seq;
+                    theme::change(change.choice, change.remember);
                 }
                 nav.set(view);
             }

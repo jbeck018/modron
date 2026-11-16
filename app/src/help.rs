@@ -2,7 +2,7 @@
 //! screen prints it, and the key-router test iterates it, so help cannot
 //! drift from behaviour. Slash commands come from [`crate::slash::all`].
 
-use modron_mobile_core::view::{HELP_COMMANDS_HEADING, HELP_KEYS_HEADING};
+use modron_mobile_core::view::WELCOME_TAGLINE;
 use modron_view::slash::{slash_help_lines, slash_lookup};
 use uuid::Uuid;
 
@@ -470,6 +470,39 @@ pub fn bindings() -> Vec<Binding> {
             draft: "",
             expect: || Routed::Nav(NavStep::Back),
         },
+        Binding {
+            label: "d (settings)",
+            what: "removes the selected permission rule or allow or deny entry (y confirms, n cancels)",
+            key: Key::Char('d'),
+            chord: false,
+            alt: false,
+            facts: || with(|f| {
+                f.screen = Screen::Settings;
+                f.removable = true;
+            }),
+            draft: "",
+            expect: || Routed::Nav(NavStep::AskSettingRemove(0)),
+        },
+        Binding {
+            label: "enter (pickers)",
+            what: "applies the highlighted row of /mode, /sandbox, /effort, /agent or /theme and closes the list",
+            key: Key::Enter,
+            chord: false,
+            alt: false,
+            facts: || with(|f| f.screen = Screen::Picker),
+            draft: "",
+            expect: || Routed::Nav(NavStep::PickRow(0)),
+        },
+        Binding {
+            label: "tab (help)",
+            what: "moves to the next help tab (Shift+Tab or Left goes back; Up, Down, PgUp, PgDn, Home and End scroll)",
+            key: Key::Tab,
+            chord: false,
+            alt: false,
+            facts: || with(|f| f.screen = Screen::Help),
+            draft: "",
+            expect: || Routed::Nav(NavStep::HelpCycle(1)),
+        },
     ]
 }
 
@@ -480,27 +513,76 @@ pub fn bindings() -> Vec<Binding> {
 pub const HOST_BINDINGS: &[(&str, &str)] =
     &[("ctrl+c", "interrupt the running turn; a second press within 2 s, or when idle, quits")];
 
-pub fn help_lines() -> Vec<String> {
-    // The list screens' keys (automations, tasks) come after the commands:
-    // help has no scroll, and this keeps the commands heading where it was on
-    // a 40-row terminal.
-    let (list_keys, keys): (Vec<Binding>, Vec<Binding>) = bindings()
-        .into_iter()
-        .partition(|b| matches!((b.facts)().screen, Screen::Automations | Screen::Tasks));
-    let mut lines = vec![HELP_KEYS_HEADING.to_string()];
-    lines.extend(keys.iter().map(|b| format!("{}   {}", b.label, b.what)));
-    lines.extend(HOST_BINDINGS.iter().map(|(label, what)| format!("{label}   {what}")));
-    lines.push(HELP_COMMANDS_HEADING.to_string());
-    lines.extend(slash_help_lines());
-    // The app's own rows only: a name the shared table lists is already above.
-    lines.extend(
-        slash::all()
-            .iter()
-            .filter(|e| slash_lookup(e.name).is_none())
-            .map(|e| format!("{} - {}", e.usage, e.about)),
-    );
-    lines.extend(list_keys.iter().map(|b| format!("{}   {}", b.label, b.what)));
-    lines
+/// The help tabs, in order: the old terminal's General, Commands and
+/// Shortcuts (crates/modron-tui/src/lib.rs, `HelpTab`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HelpTab {
+    #[default]
+    General,
+    Commands,
+    Shortcuts,
+}
+
+/// The tabs in display order.
+pub const HELP_TABS: [HelpTab; 3] = [HelpTab::General, HelpTab::Commands, HelpTab::Shortcuts];
+
+/// Rows of a help tab shown at once, and the rows a PgUp or PgDn moves.
+pub const HELP_VISIBLE: usize = 14;
+pub const HELP_PAGE: usize = 10;
+
+impl HelpTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            HelpTab::General => "General",
+            HelpTab::Commands => "Commands",
+            HelpTab::Shortcuts => "Shortcuts",
+        }
+    }
+
+    /// The tab `delta` steps away. The ring wraps at both ends, as the old
+    /// terminal's arrows did.
+    pub fn step(self, delta: isize) -> HelpTab {
+        let at = HELP_TABS.iter().position(|t| *t == self).unwrap_or(0) as isize;
+        HELP_TABS[(at + delta).rem_euclid(HELP_TABS.len() as isize) as usize]
+    }
+}
+
+/// The rows of one tab. Commands come from the shared slash table and the
+/// app's own rows; Shortcuts from the one key table, so help cannot drift
+/// from behaviour.
+pub fn tab_lines(tab: HelpTab) -> Vec<String> {
+    match tab {
+        HelpTab::General => vec![
+            WELCOME_TAGLINE.to_string(),
+            "Enter sends a task; Alt+Enter queues it behind the running turn.".to_string(),
+            "Esc interrupts a running turn. Shift+Tab flips the approval mode.".to_string(),
+            "/mode, /sandbox, /effort, /agent and /theme open a list: type to filter, Enter applies, Esc closes.".to_string(),
+            "Tab or Right and Shift+Tab or Left switch tabs; Up and Down, PgUp and PgDn, Home and End scroll.".to_string(),
+        ],
+        HelpTab::Commands => {
+            let mut lines: Vec<String> = Vec::new();
+            lines.extend(slash_help_lines());
+            // The app's own rows only: a name the shared table lists is already above.
+            lines.extend(
+                slash::all()
+                    .iter()
+                    .filter(|e| slash_lookup(e.name).is_none())
+                    .map(|e| format!("{} - {}", e.usage, e.about)),
+            );
+            lines
+        }
+        HelpTab::Shortcuts => {
+            // The list screens' keys come last, as they always have.
+            let (list_keys, keys): (Vec<Binding>, Vec<Binding>) = bindings()
+                .into_iter()
+                .partition(|b| matches!((b.facts)().screen, Screen::Automations | Screen::Tasks));
+            let mut lines: Vec<String> =
+                keys.iter().map(|b| format!("{}   {}", b.label, b.what)).collect();
+            lines.extend(HOST_BINDINGS.iter().map(|(label, what)| format!("{label}   {what}")));
+            lines.extend(list_keys.iter().map(|b| format!("{}   {}", b.label, b.what)));
+            lines
+        }
+    }
 }
 
 #[cfg(test)]
@@ -518,12 +600,31 @@ mod tests {
 
     #[test]
     fn help_lists_every_binding_and_every_command() {
-        let lines = help_lines();
+        let shortcuts = tab_lines(HelpTab::Shortcuts);
         for b in bindings() {
-            assert!(lines.iter().any(|l| l.starts_with(b.label)), "{}", b.label);
+            assert!(shortcuts.iter().any(|l| l.starts_with(b.label)), "{}", b.label);
         }
+        let commands = tab_lines(HelpTab::Commands);
         for e in slash::all() {
-            assert!(lines.iter().any(|l| l.starts_with(e.usage)), "{}", e.usage);
+            assert!(commands.iter().any(|l| l.starts_with(e.usage)), "{}", e.usage);
         }
+    }
+
+    #[test]
+    fn the_tabs_step_in_order_and_wrap_at_both_ends() {
+        assert_eq!(HelpTab::General.step(1), HelpTab::Commands);
+        assert_eq!(HelpTab::Commands.step(1), HelpTab::Shortcuts);
+        assert_eq!(HelpTab::Shortcuts.step(1), HelpTab::General);
+        assert_eq!(HelpTab::General.step(-1), HelpTab::Shortcuts);
+        assert_eq!(HelpTab::Shortcuts.step(-4), HelpTab::Commands);
+    }
+
+    #[test]
+    fn every_tab_has_rows_and_the_labels_are_the_old_three() {
+        for tab in HELP_TABS {
+            assert!(!tab_lines(tab).is_empty(), "{}", tab.label());
+        }
+        let labels: Vec<&str> = HELP_TABS.iter().map(|t| t.label()).collect();
+        assert_eq!(labels, ["General", "Commands", "Shortcuts"]);
     }
 }

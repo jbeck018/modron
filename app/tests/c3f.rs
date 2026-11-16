@@ -276,16 +276,20 @@ fn enter_completes_a_partial_command_then_runs_the_complete_one() {
 #[test]
 fn f1_and_a_question_mark_open_help_and_esc_closes_it() {
     let mut h = chat_with(vec![]);
+    // Help has three tabs: General opens first, Tab steps to Commands and on to Shortcuts.
     h.key("F1");
-    h.wait_for("help screen", |s| s.contains("slash commands") && s.contains("ctrl+o"));
-    assert!(h.screen().contains("/model [name]"), "{}", h.screen());
+    h.wait_for("help screen", |s| s.contains("General") && s.contains("Shortcuts"));
+    h.key("Tab");
+    h.wait_for("commands tab", |s| s.contains("/model [name]"));
+    h.key("Tab");
+    h.wait_for("shortcuts tab", |s| s.contains("ctrl+o"));
     h.key("Escape");
-    h.wait_for("chat again", |s| s.contains(CHAT_MARK) && !s.contains("slash commands"));
+    h.wait_for("chat again", |s| s.contains(CHAT_MARK) && !s.contains("Shortcuts"));
 
     h.key("?");
-    h.wait_for("help from the question mark", |s| s.contains("slash commands"));
+    h.wait_for("help from the question mark", |s| s.contains("Shortcuts"));
     h.key("Escape");
-    h.wait_for("chat after help", |s| s.contains(CHAT_MARK) && !s.contains("slash commands"));
+    h.wait_for("chat after help", |s| s.contains(CHAT_MARK) && !s.contains("Shortcuts"));
 }
 
 #[test]

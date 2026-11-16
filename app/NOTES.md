@@ -152,22 +152,33 @@ Literal copy still in app/src, not from the core or modron-view:
 - Strings with no shared home yet: "no tool activity yet" (Ctrl+T note), and
   the `!`, `@file` and Ctrl+T help rows.
 
-## APP-6 parity gaps (not done)
+## APP-7 remaining parity
 
-- Pickers for `/mode`, `/sandbox`, `/effort` and `/agent` are not built;
-  bare `/mode` and `/sandbox` still cycle. `/agent` lists nothing (the
-  snapshot has no persona list).
-- Removal: no rule removal in Settings or `/allow`/`/deny`; `ConfigPatch.rules`
-  replaces the whole set and could carry it. No credential sign-out: the core
-  has no logout or key-removal call (`mobile/rust-core/src/client.rs` has only
-  `remove_automation`). It would need a server frame.
-- Help tabs (General, Commands, Shortcuts) and scrolling are not built; help is
-  one page with Esc only.
-- The terminal loop only wakes on its own events, so the spinner and idle hint
-  advance while events arrive (a streaming turn) but may pause during a silent
-  wait. Not checked in a pty.
-- Theme switching: NSH exposes `ambient::set_tokens` and `set_color_scheme`
-  (`nsh-core-0.5.1/src/element/ambient.rs`) and `tailwind::set_theme`
-  (`nsh-core-0.5.1/src/tailwind/mod.rs`). A real switcher would load a second
-  palette file and call `set_tokens` on `/theme`; NSH does not own named themes.
-- The resume hint's print on exit is untested (the format is tested).
+Done: one list picker (`nav.rs` `Screen::Picker`, `picker_rows`) for /mode,
+/sandbox, /effort, /agent and /theme; Settings Enter opens the pickers (the
+old terminal's Settings screen had no per-row cycling; its bare commands
+opened menus, so Enter does too), and Left/Right cycling is gone; Shift+Tab
+still flips the mode. Permission-rule and allow/deny removal with `d` and a
+y/n confirmation (`ConfigPatch.rules` through `set_config`, `set_tool_lists`).
+Help has the old terminal's three tabs (General, Commands, Shortcuts), with
+scrolling and a wheel on the web. Themes: oculus dark, oculus light and
+system (`src/theme.rs`), saved to the config file or localStorage only when
+picked. The terminal loop ticks the spinner while a turn runs. Tests: the
+resume line on exit (`exit_lines`), the /reasoning and /thinking toggle
+mapping, the tick deadline (none when idle), the picker, removal, help tab
+and theme paths, and web-test (l) for the theme.
+
+Not done:
+- Credential removal: `RemoteClient::auth_remove` does not exist in
+  `mobile/rust-core/src/client.rs`, so the credentials screen has no remove
+  row. Needs the core method first.
+- The agent picker shows only "none": the snapshot carries no persona names,
+  so `PickerNow.personas` is always empty.
+- The spinner period is the app's 120 ms (`ANIM_PERIOD`); the old terminal's
+  poll is 50 ms (`crates/modron-tui/src/run.rs`), and its frame rate was not
+  read. Not checked in a pty.
+- The web `/theme` picker is checked headless only; the terminal picker is
+  checked by the headless harness, not in a pty.
+- Flake: web-test (s) (credentials: `auth_set_key sent the wrong key`) failed
+  in the first full run after the picker change and passed in the next three;
+  not diagnosed (the key entry's typing is the suspect).

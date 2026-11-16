@@ -142,12 +142,13 @@ pub fn welcome_lines(model: &str, version: &str) -> Vec<String> {
     ]
 }
 
-/// The `/theme` answer. The app ships one palette (`app/theme/oculus.json`,
-/// light and dark); the web follows the system appearance. Custom and named
-/// themes from the old TUI (crates/modron-tui/src/theme.rs) are not carried
-/// over, so the command says what exists instead of saying "unknown".
-pub const THEME_NOTE: &str =
-    "one theme: oculus, light and dark; the web follows the system appearance";
+/// The theme names the app offers (`/theme`, the Settings theme row and the
+/// picker). The Oculus palette ships dark and light; "system" follows the
+/// terminal's or browser's appearance. Custom themes from the old TUI
+/// (crates/modron-tui/src/theme.rs) are not carried over.
+pub const THEME_DARK_NAME: &str = "oculus dark";
+pub const THEME_LIGHT_NAME: &str = "oculus light";
+pub const THEME_SYSTEM_NAME: &str = "system";
 
 /// The percentage at which the context gauge warns: the old TUI's compaction
 /// trigger (crates/modron-tui/src/lib.rs, `status_spans`: `pct >= 80`).
@@ -261,6 +262,54 @@ pub const SETTING_COMPACT_LABEL: &str = "compact";
 /// Shown as the value of an unset effort, and of an empty rule list.
 pub const EFFORT_UNSET_LABEL: &str = "unset";
 pub const RULES_NONE_LABEL: &str = "none";
+/// Settings rows added with the pickers and the removable lists.
+pub const SETTING_THEME_LABEL: &str = "theme";
+pub const SETTING_AGENT_LABEL: &str = "agent";
+pub const SETTING_ALLOW_LABEL: &str = "allow";
+pub const SETTING_DENY_LABEL: &str = "deny";
+/// The picker row shown when the server lists no personas (the shared word
+/// for an empty list, as the rules row uses).
+pub const PICKER_NONE_LABEL: &str = "none";
+/// The web control that removes the row it sits on.
+pub const REMOVE_LABEL: &str = "remove";
+
+/// The inline confirmation before a settings row is removed. `line` is the
+/// row's shared text (`rules: allow read`, `allow: bash`).
+pub fn remove_confirm_text(line: &str) -> String {
+    format!("remove {line}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
+/// The permission rules without the one at `index`, as the wire rules a
+/// `ConfigPatch.rules` takes (it replaces the whole set). Each snapshot line
+/// is `effect spec`: the first space splits the two. None when `index` is not
+/// a row.
+pub fn rules_without(lines: &[String], index: usize) -> Option<Vec<RuleWire>> {
+    if index >= lines.len() {
+        return None;
+    }
+    Some(
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, line)| {
+                let (effect, spec) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+                RuleWire {
+                    effect: effect.to_string(),
+                    spec: spec.to_string(),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// A tool allow or deny list without the exact entry `tool`, in its order.
+pub fn tools_without(list: &[String], tool: &str) -> Vec<String> {
+    list.iter()
+        .filter(|entry| entry.as_str() != tool)
+        .cloned()
+        .collect()
+}
 
 // Packet C3f: the shared words of the slash commands, help, the model
 // picker, confirmations and the sub-agent screen. Every client shows these.
@@ -2611,5 +2660,80 @@ mod app4_shared_copy_tests {
     fn save_default_copy_leads_with_its_key() {
         assert!(SAVE_DEFAULT_HINT.starts_with(SAVE_DEFAULT_KEY));
         assert_eq!(SAVE_DEFAULT_LABEL, "save as default");
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn removing_a_rule_sends_the_rest_as_wire_rules_in_order() {
+        let rules = lines(&["allow read", "ask bash(git push*)", "deny bash(rm -rf *)"]);
+        let kept = rules_without(&rules, 1).expect("row 1");
+        assert_eq!(
+            kept,
+            vec![
+                RuleWire {
+                    effect: "allow".into(),
+                    spec: "read".into()
+                },
+                RuleWire {
+                    effect: "deny".into(),
+                    spec: "bash(rm -rf *)".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_the_last_rule_sends_an_empty_set_and_a_bad_index_sends_nothing() {
+        let rules = lines(&["allow read"]);
+        assert_eq!(rules_without(&rules, 0), Some(Vec::new()));
+        assert_eq!(rules_without(&rules, 1), None);
+        assert_eq!(rules_without(&[], 0), None);
+    }
+
+    #[test]
+    fn a_rule_line_without_a_spec_keeps_an_empty_spec() {
+        let rules = lines(&["allow", "deny read"]);
+        let kept = rules_without(&rules, 1).expect("row 1");
+        assert_eq!(
+            kept,
+            vec![RuleWire {
+                effect: "allow".into(),
+                spec: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_lists_drop_the_exact_entry_only() {
+        let list = lines(&["bash", "bashful", "read"]);
+        assert_eq!(tools_without(&list, "bash"), lines(&["bashful", "read"]));
+        assert_eq!(tools_without(&list, "ba"), list);
+        assert!(tools_without(&[], "bash").is_empty());
+    }
+
+    #[test]
+    fn the_removal_confirmation_names_the_row_and_the_keys() {
+        assert_eq!(
+            remove_confirm_text("allow bash"),
+            "remove allow bash? y / n"
+        );
+    }
+
+    #[test]
+    fn the_theme_names_and_picker_words_are_shared_strings() {
+        assert_eq!(
+            [THEME_DARK_NAME, THEME_LIGHT_NAME, THEME_SYSTEM_NAME],
+            ["oculus dark", "oculus light", "system"]
+        );
+        assert_eq!(PICKER_NONE_LABEL, RULES_NONE_LABEL);
+        assert_eq!(REMOVE_LABEL, "remove");
     }
 }

@@ -89,6 +89,20 @@ and its provider as the server's default for future sessions
 (`persist_default_model`). A refusal (for example over a portal tunnel) shows
 through the status line's error.
 
+Pickers: `/mode`, `/sandbox`, `/effort`, `/agent` and `/theme` with no argument
+open one list screen (`nav.rs` `Screen::Picker`, `picker_rows`). The current
+value carries a dot. Type to filter, Up/Down move, Enter applies and closes,
+Esc clears the filter, then closes. The Settings rows for approval mode,
+effort, sandbox, theme and agent open the same pickers on Enter (the old
+terminal's bare commands opened the same menus). `/mode yolo` and the other
+arguments still apply directly. Shift+Tab still flips the approval mode.
+Agent shows the shared "none" row until the snapshot names personas.
+
+Settings removal: `d` on a permission rule or an allow or deny entry asks
+first (y or n). A rule removal sends the rest of the set through
+`ConfigPatch.rules` (the setter replaces the whole set); a tool entry goes
+through `set_tool_lists`. On the web, a remove control sits beside the row.
+
 Images: Ctrl+V (terminal) reads an image from the system clipboard: `wl-paste`
 or `xclip` on Linux, `osascript` (a JavaScript-for-Automation script that writes the
 pasteboard's PNG, TIFF converted, to stdout) on macOS, bounded at 2 s per tool
@@ -148,7 +162,12 @@ empty; a scrolled view stays put and shows "new output below". Shift+Tab
 flips the approval mode. Ctrl+C interrupts a running turn; a second press
 within two seconds, or Ctrl+C when idle, quits. On exit the app prints the
 session id and the `modron-app-tui --session` command to resume it. The
-full table is `src/help.rs`; `/reasoning` shows the live reasoning tail.
+help screen (F1, `?`, `/help`) has three tabs, General, Commands and
+Shortcuts (the old terminal's tabs). Tab and Shift+Tab, or Left and Right,
+switch tabs; Up and Down, PgUp and PgDn, Home and End scroll (the wheel on
+the web); Esc closes. Shortcut rows come from the key table in `src/help.rs`,
+command rows from the shared slash table. `/reasoning` shows the live
+reasoning tail.
 
 Credentials (`/auth`, or the Settings auth row): the provider rows from the
 core, label and status verbatim. Enter on an OAuth-capable provider starts
@@ -222,6 +241,16 @@ and page text after Enter.
   (120 ms). The spinner stops when idle.
 - A blank idle session shows the welcome banner (`welcome_lines`); the first
   row replaces it.
-- `/theme` answers with `THEME_NOTE`: the one built-in theme (oculus, light
-  and dark), following the system appearance on the web. There is no theme
-  switch; see `NOTES.md` for what NSH would need.
+- Theme: `/theme`, or the Settings theme row, opens a picker with oculus dark,
+  oculus light and system (`src/theme.rs`; the names are in the core's
+  `view.rs`). Dark and light apply at once through NSH's `set_color_scheme`:
+  the Oculus tokens carry both values, and the root paints the `background`
+  token, so the whole page follows. "system" follows the terminal's or the
+  browser's appearance. The choice is saved only when picked: the terminal
+  writes `theme = "..."` to `$XDG_CONFIG_HOME/modron/app.toml` (or
+  `~/.config/modron/app.toml`), the web to localStorage key `modron.theme`.
+  A missing or unknown saved value means system. Tests inject no store, so
+  they touch no config.
+- The terminal loop wakes at the animation period while a turn runs
+  (`chat::tick_deadline`), so the spinner moves during silent waits; an idle
+  app has no deadline.

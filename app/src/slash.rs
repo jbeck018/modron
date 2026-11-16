@@ -14,14 +14,15 @@
 //! cannot be dropped silently.
 
 use modron_mobile_core::view::{
-    btw_task, learn_task, plan_task, AGENT_USAGE, BTW_USAGE, REVIEW_TASK, SLASH_NEEDS_ARG_PREFIX,
-    SLASH_UNKNOWN_LABEL, THEME_NOTE,
+    btw_task, learn_task, plan_task, BTW_USAGE, REVIEW_TASK, SLASH_NEEDS_ARG_PREFIX,
+    SLASH_UNKNOWN_LABEL,
 };
 use modron_mobile_core::{ApprovalModeWire, Effort, Phase, SandboxPolicy};
 use modron_view::slash::{slash_lookup, SLASH_COMMANDS};
 
 use crate::chat::UiAction;
-use crate::nav::{NavStep, Screen};
+use crate::nav::{NavStep, PickerKind, Screen};
+use crate::theme::Choice;
 
 /// One command row: what the suggestions and help show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,11 +40,15 @@ pub const LOCAL: &[Entry] = &[
     Entry { name: "btw", usage: "/btw <quick question>", about: "quick side question, no tools" },
     Entry { name: "learn", usage: "/learn [title]", about: "distill this session into a SKILL.md" },
     Entry { name: "goal", usage: "/goal [condition]", about: "stop condition for long runs" },
-    Entry { name: "agent", usage: "/agent <name>", about: "switch persona" },
+    Entry { name: "agent", usage: "/agent [name]", about: "switch persona (bare: pick one)" },
     Entry { name: "exit", usage: "/exit", about: "leave the app" },
     Entry { name: "clear", usage: "/clear", about: "clear the transcript view (nothing is sent)" },
     Entry { name: "context", usage: "/context", about: "context window, tokens and cache use" },
-    Entry { name: "theme", usage: "/theme", about: "the one built-in theme" },
+    Entry {
+        name: "theme",
+        usage: "/theme [name]",
+        about: "pick a theme: oculus dark, oculus light or system",
+    },
 ];
 
 /// The shared table as entries, in its order.
@@ -140,20 +145,21 @@ pub fn run(line: &str) -> UiAction {
         "model" if args.is_empty() => UiAction::Nav(NavStep::Open(Screen::Models)),
         "model" => UiAction::SelectModel(args.to_string()),
         "mode" => match args {
-            "" => UiAction::CycleMode,
+            "" => UiAction::Nav(NavStep::OpenPicker(PickerKind::Mode)),
             "ask" => UiAction::SetApprovalMode(ApprovalModeWire::Ask),
             "yolo" => UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll),
             "deny" => UiAction::SetApprovalMode(ApprovalModeWire::Deny),
             _ => usage("mode"),
         },
         "sandbox" => match args {
-            "" => UiAction::CycleSandbox,
+            "" => UiAction::Nav(NavStep::OpenPicker(PickerKind::Sandbox)),
             "off" => UiAction::SetSandbox(SandboxPolicy::Off),
             "seatbelt" => UiAction::SetSandbox(SandboxPolicy::Seatbelt),
             "bwrap" => UiAction::SetSandbox(SandboxPolicy::Bubblewrap),
             _ => usage("sandbox"),
         },
         "effort" => match args {
+            "" => UiAction::Nav(NavStep::OpenPicker(PickerKind::Effort)),
             "low" => UiAction::SetEffort(Some(Effort::Low)),
             "medium" => UiAction::SetEffort(Some(Effort::Medium)),
             "high" => UiAction::SetEffort(Some(Effort::High)),
@@ -170,12 +176,20 @@ pub fn run(line: &str) -> UiAction {
         "btw" => UiAction::Send(btw_task(args)),
         "learn" => UiAction::Send(learn_task(args)),
         "goal" => UiAction::SetGoal(args.to_string()),
-        "agent" | "persona" if args.is_empty() => UiAction::Notice(AGENT_USAGE.to_string()),
+        "agent" | "persona" if args.is_empty() => {
+            UiAction::Nav(NavStep::OpenPicker(PickerKind::Agent))
+        }
         "agent" | "persona" => UiAction::SetPersona(args.to_string()),
         "exit" | "quit" | "q" => UiAction::Exit,
         "clear" => UiAction::Clear,
         "context" => UiAction::Context,
-        "theme" => UiAction::Notice(THEME_NOTE.to_string()),
+        "theme" => match args {
+            "" => UiAction::Nav(NavStep::OpenPicker(PickerKind::Theme)),
+            name => match Choice::parse(name) {
+                Some(choice) => UiAction::Nav(NavStep::SetTheme(choice)),
+                None => usage("theme"),
+            },
+        },
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,
         "tasks" => UiAction::Nav(NavStep::Open(Screen::Tasks)),
@@ -263,10 +277,29 @@ mod tests {
     }
 
     #[test]
-    fn theme_answers_with_the_single_theme_note_and_is_not_unknown() {
-        assert_eq!(run("/theme"), UiAction::Notice(THEME_NOTE.to_string()));
-        assert_eq!(run("/theme dracula"), UiAction::Notice(THEME_NOTE.to_string()));
-        assert!(THEME_NOTE.contains("oculus") && THEME_NOTE.contains("system appearance"));
+    fn theme_bare_opens_the_picker_and_a_name_applies_it() {
+        assert_eq!(run("/theme"), UiAction::Nav(NavStep::OpenPicker(PickerKind::Theme)));
+        assert_eq!(run("/theme dark"), UiAction::Nav(NavStep::SetTheme(Choice::Dark)));
+        assert_eq!(run("/theme Oculus Light"), UiAction::Nav(NavStep::SetTheme(Choice::Light)));
+        assert_eq!(run("/theme system"), UiAction::Nav(NavStep::SetTheme(Choice::System)));
+        assert!(matches!(run("/theme dracula"), UiAction::Notice(_)));
+    }
+
+    #[test]
+    fn reasoning_and_thinking_both_toggle_the_reasoning_tail() {
+        assert_eq!(run("/reasoning"), UiAction::ToggleReasoning);
+        assert_eq!(run("/thinking"), UiAction::ToggleReasoning);
+    }
+
+    #[test]
+    fn the_picker_commands_open_their_pickers_and_their_arguments_apply_directly() {
+        assert_eq!(run("/mode"), UiAction::Nav(NavStep::OpenPicker(PickerKind::Mode)));
+        assert_eq!(run("/sandbox"), UiAction::Nav(NavStep::OpenPicker(PickerKind::Sandbox)));
+        assert_eq!(run("/effort"), UiAction::Nav(NavStep::OpenPicker(PickerKind::Effort)));
+        assert_eq!(run("/agent"), UiAction::Nav(NavStep::OpenPicker(PickerKind::Agent)));
+        assert_eq!(run("/mode yolo"), UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll));
+        assert_eq!(run("/effort high"), UiAction::SetEffort(Some(Effort::High)));
+        assert_eq!(run("/agent reviewer"), UiAction::SetPersona("reviewer".to_string()));
     }
 
     #[test]
@@ -275,7 +308,6 @@ mod tests {
         assert_eq!(run("/new"), UiAction::NewSession);
         assert_eq!(run("/settings"), UiAction::Nav(NavStep::Open(Screen::Settings)));
         assert_eq!(run("/mode yolo"), UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll));
-        assert_eq!(run("/mode"), UiAction::CycleMode);
         assert_eq!(run("/effort max"), UiAction::SetEffort(Some(Effort::Max)));
         assert_eq!(run("/build"), UiAction::SetPhase(Phase::Build));
         assert_eq!(run("/exit"), UiAction::Exit);

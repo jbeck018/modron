@@ -328,7 +328,10 @@ fn select_text(text: &str) {
 
 /// Starts the page's feed and returns the view's end of the link.
 pub fn start() -> Client {
-    let (host, client) = link();
+    let (mut host, client) = link();
+    // The saved theme (localStorage) shows at startup; it is not saved again.
+    crate::theme::install_store(std::sync::Arc::new(crate::theme::LocalStore));
+    host.restore_theme(crate::theme::saved_installed());
     let (reply_tx, replies) = unbounded_channel();
     let query = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
     let feed = match LiveOptions::from_query(&query) {

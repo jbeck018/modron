@@ -7,9 +7,10 @@
 //! table.
 
 use modron_mobile_core::view::{
-    auth_is_signed_in, auth_row_line, delete_confirm_text, kill_confirm_text, AgentRowView,
-    OAuthProgressView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT, MODEL_ROLE_FALLBACK,
-    MODEL_ROLE_STRONG, SETTING_AUTH_LABEL,
+    auth_is_signed_in, auth_row_line, delete_confirm_text, kill_confirm_text, remove_confirm_text,
+    sandbox_label, AgentRowView, OAuthProgressView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT,
+    MODEL_ROLE_FALLBACK, MODEL_ROLE_STRONG, PICKER_NONE_LABEL, SETTING_AGENT_LABEL,
+    SETTING_ALLOW_LABEL, SETTING_AUTH_LABEL, SETTING_DENY_LABEL, SETTING_THEME_LABEL,
 };
 use modron_mobile_core::view::{
     automation_interval_error, automation_row, merge_confirm_text, task_row,
@@ -17,17 +18,19 @@ use modron_mobile_core::view::{
     AUTOMATION_PROMPT_LABEL, TASK_TITLE_LABEL, TASK_TITLE_NEEDED,
 };
 use modron_mobile_core::{
-    approval_mode_next, effort_next, phase_next, sandbox_next, ViewModelSnapshot,
-    EFFORT_UNSET_LABEL, RULES_NONE_LABEL, SETTING_APPROVAL_LABEL, SETTING_COMPACT_LABEL,
-    SETTING_CONTEXT_LABEL, SETTING_EFFORT_LABEL, SETTING_MODEL_LABEL, SETTING_PHASE_LABEL,
-    SETTING_PROVIDER_LABEL, SETTING_RULES_LABEL, SETTING_SANDBOX_LABEL,
+    phase_next, ApprovalModeWire, Effort, SandboxPolicy, ViewModelSnapshot, EFFORT_UNSET_LABEL,
+    RULES_NONE_LABEL, SETTING_APPROVAL_LABEL, SETTING_COMPACT_LABEL, SETTING_CONTEXT_LABEL,
+    SETTING_EFFORT_LABEL, SETTING_MODEL_LABEL, SETTING_PHASE_LABEL, SETTING_PROVIDER_LABEL,
+    SETTING_RULES_LABEL, SETTING_SANDBOX_LABEL,
 };
 use modron_protocol::AutomationWire;
 use uuid::Uuid;
 
 use crate::chat::UiAction;
+use crate::help::{self, HelpTab, HELP_VISIBLE};
 use crate::portal::{self, PortalLine, PortalRow};
 use crate::slash;
+use crate::theme::{Choice, CHOICES};
 
 /// The screens. Chat is the root; the others open over it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,6 +59,9 @@ pub enum Screen {
     /// Task sessions (`/tasks`, `/worktree`): the list, the inline create
     /// form, attach, and the inline merge confirmation.
     Tasks,
+    /// A list of values (`/mode`, `/sandbox`, `/effort`, `/agent`, `/theme`,
+    /// or their Settings rows): type to filter, Enter applies and closes.
+    Picker,
 }
 
 /// One navigation step. Keys and taps both become steps; [`Nav::apply`]
@@ -131,6 +137,158 @@ pub enum NavStep {
     AskRemove(usize),
     /// `m` on a task row (or its merge control): ask first (row index).
     AskMerge(usize),
+    /// Open a picker over the screen beneath it (the bare command, or the
+    /// Settings row).
+    OpenPicker(PickerKind),
+    /// Enter, or a tap on a picker row (index into the filtered rows): apply
+    /// the row's action and close the picker.
+    PickRow(usize),
+    /// Save and draw the theme `Choice` (the picker's rows, `/theme <name>`).
+    SetTheme(Choice),
+    /// `d` on a removable Settings row (a rule, an allow or deny entry, or
+    /// its remove control): ask first (row index).
+    AskSettingRemove(usize),
+    /// Left and Right, Tab and Shift+Tab, or a tap on a help tab: step the
+    /// tab ring (negative steps back).
+    HelpCycle(isize),
+    /// Open a help tab (a tap on its label).
+    HelpTo(HelpTab),
+    /// Up and Down, PgUp and PgDn, or the wheel: move the help rows.
+    HelpScroll(isize),
+    /// Home (top) or End (bottom) on the help rows.
+    HelpEdge(bool),
+}
+
+/// Which list a picker shows. [`picker_rows`] builds its rows; a row's action
+/// is the one the bare command or the Settings row sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerKind {
+    /// Approval mode: ask, yolo (approve all), deny.
+    Mode,
+    /// Sandbox policy: off, seatbelt, bwrap.
+    Sandbox,
+    /// Reasoning effort: unset, then the five levels.
+    Effort,
+    /// Personas (`/agent <name>` applies directly).
+    Agent,
+    /// Theme: oculus dark, oculus light, system.
+    Theme,
+}
+
+/// One picker row: its label, whether it is the current value (drawn with a
+/// dot), whether Enter may pick it, and the action Enter sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerRow {
+    pub label: String,
+    pub current: bool,
+    pub enabled: bool,
+    pub action: Option<UiAction>,
+}
+
+/// The values a picker marks as current: the snapshot's labels (approval
+/// mode, sandbox, effort), the host's theme and the persona names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PickerNow {
+    pub mode: String,
+    pub sandbox: String,
+    pub effort: String,
+    pub theme: Choice,
+    pub personas: Vec<String>,
+}
+
+/// The theme change the view applies once: `seq` rises by one per change, and
+/// `remember` says whether the choice is saved (a restore on startup is not).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThemeChange {
+    pub seq: u64,
+    pub choice: Choice,
+    pub remember: bool,
+}
+
+/// The picker's title: the Settings row label it shares.
+pub fn picker_title(kind: PickerKind) -> &'static str {
+    match kind {
+        PickerKind::Mode => SETTING_APPROVAL_LABEL,
+        PickerKind::Sandbox => SETTING_SANDBOX_LABEL,
+        PickerKind::Effort => SETTING_EFFORT_LABEL,
+        PickerKind::Agent => SETTING_AGENT_LABEL,
+        PickerKind::Theme => SETTING_THEME_LABEL,
+    }
+}
+
+/// The rows of one picker, with the current value marked. Agent lists the
+/// personas the snapshot names; the snapshot carries none yet, so the row is
+/// the shared "none" and it is not selectable.
+pub fn picker_rows(kind: PickerKind, now: &PickerNow) -> Vec<PickerRow> {
+    let row = |label: String, current: bool, action: UiAction| PickerRow {
+        label,
+        current,
+        enabled: true,
+        action: Some(action),
+    };
+    match kind {
+        PickerKind::Mode => {
+            [ApprovalModeWire::Ask, ApprovalModeWire::ApproveAll, ApprovalModeWire::Deny]
+                .into_iter()
+                .map(|mode| {
+                    row(
+                        mode.label().to_string(),
+                        now.mode == mode.label(),
+                        UiAction::SetApprovalMode(mode),
+                    )
+                })
+                .collect()
+        }
+        PickerKind::Sandbox => {
+            [SandboxPolicy::Off, SandboxPolicy::Seatbelt, SandboxPolicy::Bubblewrap]
+                .into_iter()
+                .map(|policy| {
+                    let label = sandbox_label(policy);
+                    row(label.to_string(), now.sandbox == label, UiAction::SetSandbox(policy))
+                })
+                .collect()
+        }
+        PickerKind::Effort => {
+            let mut rows = vec![row(
+                EFFORT_UNSET_LABEL.to_string(),
+                now.effort.is_empty(),
+                UiAction::SetEffort(None),
+            )];
+            rows.extend(
+                [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max]
+                    .into_iter()
+                    .map(|e| {
+                        row(
+                            e.label().to_string(),
+                            now.effort == e.label(),
+                            UiAction::SetEffort(Some(e)),
+                        )
+                    }),
+            );
+            rows
+        }
+        PickerKind::Agent if now.personas.is_empty() => vec![PickerRow {
+            label: PICKER_NONE_LABEL.to_string(),
+            current: false,
+            enabled: false,
+            action: None,
+        }],
+        PickerKind::Agent => now
+            .personas
+            .iter()
+            .map(|name| row(name.clone(), false, UiAction::SetPersona(name.clone())))
+            .collect(),
+        PickerKind::Theme => CHOICES
+            .into_iter()
+            .map(|choice| {
+                row(
+                    choice.name().to_string(),
+                    now.theme == choice,
+                    UiAction::Nav(NavStep::SetTheme(choice)),
+                )
+            })
+            .collect(),
+    }
 }
 
 /// Which inline form is open.
@@ -214,6 +372,9 @@ pub struct SettingRow {
     pub label: String,
     pub value: String,
     pub action: Option<UiAction>,
+    /// The action a confirmed removal sends (permission rules and allow or
+    /// deny entries). None for rows that cannot be removed.
+    pub remove: Option<UiAction>,
 }
 
 impl SettingRow {
@@ -341,6 +502,16 @@ pub struct NavView {
     /// The snapshot's last note (a task's status or merge result) while it
     /// is still fresh; the host expires it (see `Host::push`).
     pub note: Option<String>,
+    /// The picker on top: its title and the rows that match the filter.
+    pub picker_title: String,
+    pub picker: Vec<PickerRow>,
+    /// The theme in use, and the change the view applies once.
+    pub theme: Choice,
+    pub theme_change: ThemeChange,
+    /// The help tab on show, its rows, and the first visible row.
+    pub help_tab: HelpTab,
+    pub help_rows: Vec<String>,
+    pub help_scroll: usize,
 }
 
 impl NavView {
@@ -402,6 +573,19 @@ pub struct Nav {
     form_error: Option<String>,
     /// The snapshot's last note, as the host passed it (expired by the host).
     last_note: Option<String>,
+    /// The snapshot's approval mode, sandbox and effort labels (the pickers
+    /// mark them as current).
+    mode_label: String,
+    sandbox_label: String,
+    effort_label: String,
+    /// The open picker's list, while one is on top.
+    picker: Option<PickerKind>,
+    /// The theme in use and the last change (see [`ThemeChange`]).
+    theme: Choice,
+    theme_change: ThemeChange,
+    /// The help tab on show and its first visible row.
+    help_tab: HelpTab,
+    help_scroll: usize,
 }
 
 /// The inline form's state. `values` has one text per field of the kind.
@@ -516,6 +700,10 @@ impl Nav {
             .collect();
         self.session = snapshot.session_id;
         self.settings = settings_rows(snapshot);
+        self.set_theme_row();
+        self.mode_label = snapshot.approval_mode_label.clone();
+        self.sandbox_label = snapshot.sandbox.clone();
+        self.effort_label = snapshot.effort_label.clone();
         self.auth = auth_rows(snapshot);
         self.auth_progress = snapshot.oauth.clone();
         self.models = model_rows(snapshot);
@@ -605,6 +793,7 @@ impl Nav {
                 | Screen::Portal
                 | Screen::Automations
                 | Screen::Tasks
+                | Screen::Picker
         )
     }
 
@@ -729,6 +918,7 @@ impl Nav {
             Screen::Settings => self.settings.len(),
             Screen::Automations => self.visible_automations().len(),
             Screen::Tasks => self.visible_tasks().len(),
+            Screen::Picker => self.visible_picker().len(),
         }
     }
 
@@ -747,6 +937,7 @@ impl Nav {
 
     fn leave_to_chat(&mut self) {
         self.stack.clear();
+        self.picker = None;
         self.filter.clear();
         self.selected = 0;
         self.pending = None;
@@ -826,6 +1017,7 @@ impl Nav {
                         return vec![UiAction::ListModels];
                     }
                     Screen::Settings if self.share_active() => return vec![UiAction::ListInvites],
+                    Screen::Help => self.help_scroll = 0,
                     Screen::Auth => return vec![UiAction::ListAuth],
                     Screen::Automations => return vec![UiAction::ListAutomations],
                     // The list and, when a row is selected, its status.
@@ -852,6 +1044,9 @@ impl Nav {
                 self.auth_key = None;
                 self.form = None;
                 self.form_error = None;
+                if self.top() == Screen::Picker {
+                    self.picker = None;
+                }
                 self.stack.pop();
                 self.filter.clear();
                 self.selected = 0;
@@ -984,6 +1179,55 @@ impl Nav {
                 return self.apply(NavStep::Activate);
             }
             NavStep::AuthCancelKey | NavStep::AuthKeyDone => self.auth_key = None,
+            NavStep::OpenPicker(kind) => {
+                self.push(Screen::Picker);
+                self.picker = Some(kind);
+                let now = self.picker_now();
+                self.selected = picker_rows(kind, &now).iter().position(|r| r.current).unwrap_or(0);
+            }
+            NavStep::PickRow(index) if self.top() == Screen::Picker => {
+                let rows = self.visible_picker();
+                let picked = rows.get(index).filter(|r| r.enabled).and_then(|r| r.action.clone());
+                if let Some(action) = picked {
+                    // The picker closes first: the screen beneath it (Chat or
+                    // Settings) is on top when the choice takes effect.
+                    self.stack.pop();
+                    self.picker = None;
+                    self.filter.clear();
+                    self.selected = 0;
+                    return match action {
+                        UiAction::Nav(step) => self.apply(step),
+                        other => vec![other],
+                    };
+                }
+            }
+            NavStep::SetTheme(choice) => self.change_theme(choice, true),
+            NavStep::AskSettingRemove(index) if self.top() == Screen::Settings => {
+                let found = self
+                    .settings
+                    .get(index)
+                    .and_then(|row| row.remove.clone().map(|action| (row.line(), action)));
+                if let Some((line, action)) = found {
+                    self.selected = index;
+                    self.pending =
+                        Some(Pending { text: remove_confirm_text(&line), actions: vec![action] });
+                }
+            }
+            NavStep::HelpCycle(delta) if self.top() == Screen::Help => {
+                self.help_tab = self.help_tab.step(delta);
+                self.help_scroll = 0;
+            }
+            NavStep::HelpTo(tab) if self.top() == Screen::Help => {
+                self.help_tab = tab;
+                self.help_scroll = 0;
+            }
+            NavStep::HelpScroll(delta) if self.top() == Screen::Help => {
+                let next = self.help_scroll as isize + delta;
+                self.help_scroll = next.clamp(0, self.help_max_scroll() as isize) as usize;
+            }
+            NavStep::HelpEdge(top) if self.top() == Screen::Help => {
+                self.help_scroll = if top { 0 } else { self.help_max_scroll() };
+            }
             NavStep::Confirm => {
                 return self.pending.take().map(|p| p.actions).unwrap_or_default();
             }
@@ -1004,6 +1248,61 @@ impl Nav {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// The picker rows that match the filter (the label), as the view shows
+    /// them. Empty when no picker is open.
+    fn visible_picker(&self) -> Vec<PickerRow> {
+        let Some(kind) = self.picker else {
+            return Vec::new();
+        };
+        let needle = self.filter.to_lowercase();
+        picker_rows(kind, &self.picker_now())
+            .into_iter()
+            .filter(|row| needle.is_empty() || row.label.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// The values the pickers mark as current.
+    fn picker_now(&self) -> PickerNow {
+        PickerNow {
+            mode: self.mode_label.clone(),
+            sandbox: self.sandbox_label.clone(),
+            effort: self.effort_label.clone(),
+            theme: self.theme,
+            personas: Vec::new(),
+        }
+    }
+
+    /// Whether `d` may ask to remove the selected Settings row.
+    pub fn settings_removable(&self) -> bool {
+        self.top() == Screen::Settings
+            && self.settings.get(self.selected).is_some_and(|row| row.remove.is_some())
+    }
+
+    /// The last help scroll position that still shows the tab's last row.
+    fn help_max_scroll(&self) -> usize {
+        help::tab_lines(self.help_tab).len().saturating_sub(HELP_VISIBLE)
+    }
+
+    /// Records a theme change: the view applies it once (see [`ThemeChange`]),
+    /// the Settings row and the picker's marker follow it.
+    fn change_theme(&mut self, choice: Choice, remember: bool) {
+        self.theme = choice;
+        self.theme_change = ThemeChange { seq: self.theme_change.seq + 1, choice, remember };
+        self.set_theme_row();
+    }
+
+    /// Shows the theme in use at startup, without saving it. The view draws
+    /// it on its next change (the first one arrives with the first view).
+    pub fn restore_theme(&mut self, choice: Choice) {
+        self.change_theme(choice, false);
+    }
+
+    fn set_theme_row(&mut self) {
+        for row in self.settings.iter_mut().filter(|row| row.label == SETTING_THEME_LABEL) {
+            row.value = self.theme.name().to_string();
+        }
     }
 
     /// The state the view renders.
@@ -1051,6 +1350,16 @@ impl Nav {
             tasks: self.visible_tasks().into_iter().cloned().collect(),
             tasks_total: self.tasks.len(),
             note: self.last_note.clone(),
+            picker_title: self
+                .picker
+                .map(|kind| picker_title(kind).to_string())
+                .unwrap_or_default(),
+            picker: if self.top() == Screen::Picker { self.visible_picker() } else { Vec::new() },
+            theme: self.theme,
+            theme_change: self.theme_change,
+            help_tab: self.help_tab,
+            help_rows: help::tab_lines(self.help_tab),
+            help_scroll: self.help_scroll.min(self.help_max_scroll()),
             form: self.form.as_ref().map(|f| FormView {
                 kind: f.kind,
                 labels: f.kind.labels(),
@@ -1063,7 +1372,13 @@ impl Nav {
 }
 
 fn row(label: &str, value: String, action: Option<UiAction>) -> SettingRow {
-    SettingRow { label: label.to_string(), value, action }
+    SettingRow { label: label.to_string(), value, action, remove: None }
+}
+
+/// A removable row: its shared label and value, and the action a confirmed
+/// removal sends.
+fn removable(label: &str, value: String, remove: UiAction) -> SettingRow {
+    SettingRow { label: label.to_string(), value, action: None, remove: Some(remove) }
 }
 
 /// The model picker's rows. The server's catalog (`models`, from
@@ -1124,8 +1439,10 @@ pub fn model_rows(s: &ViewModelSnapshot) -> Vec<ModelRow> {
 }
 
 /// The settings rows, in screen order. Values and labels come from the
-/// core's snapshot; each cycle action starts from the core's current value.
-/// The model row opens the picker.
+/// core's snapshot. Enter on approval mode, effort, sandbox, theme and agent
+/// opens its picker (the old terminal's bare commands opened the same menus);
+/// phase cycles, compact runs, auth opens the credentials screen. Permission
+/// rules and the allow and deny entries follow, each removable with `d`.
 pub fn settings_rows(s: &ViewModelSnapshot) -> Vec<SettingRow> {
     let effort = if s.effort_label.is_empty() {
         EFFORT_UNSET_LABEL.to_string()
@@ -1142,27 +1459,58 @@ pub fn settings_rows(s: &ViewModelSnapshot) -> Vec<SettingRow> {
         row(
             SETTING_APPROVAL_LABEL,
             s.approval_mode_label.clone(),
-            Some(UiAction::SetApprovalMode(approval_mode_next(s.approval_mode))),
+            Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Mode))),
         ),
         row(
             SETTING_PHASE_LABEL,
             s.phase_label.clone(),
             Some(UiAction::SetPhase(phase_next(s.phase))),
         ),
-        row(SETTING_EFFORT_LABEL, effort, Some(UiAction::SetEffort(effort_next(s.effort)))),
+        row(
+            SETTING_EFFORT_LABEL,
+            effort,
+            Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Effort))),
+        ),
         row(
             SETTING_SANDBOX_LABEL,
             s.sandbox.clone(),
-            Some(UiAction::SetSandbox(sandbox_next(s.sandbox_policy))),
+            Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Sandbox))),
         ),
         row(SETTING_CONTEXT_LABEL, s.context_label.clone(), None),
         row(SETTING_COMPACT_LABEL, String::new(), Some(UiAction::Compact)),
         row(SETTING_AUTH_LABEL, String::new(), Some(UiAction::Nav(NavStep::Open(Screen::Auth)))),
+        row(
+            SETTING_THEME_LABEL,
+            Choice::default().name().to_string(),
+            Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Theme))),
+        ),
+        row(
+            SETTING_AGENT_LABEL,
+            String::new(),
+            Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Agent))),
+        ),
     ];
     if s.rules.is_empty() {
         rows.push(row(SETTING_RULES_LABEL, RULES_NONE_LABEL.to_string(), None));
     } else {
-        rows.extend(s.rules.iter().map(|rule| row(SETTING_RULES_LABEL, rule.clone(), None)));
+        rows.extend(s.rules.iter().enumerate().map(|(index, rule)| {
+            removable(SETTING_RULES_LABEL, rule.clone(), UiAction::RemoveRule(index))
+        }));
+    }
+    for (label, list, allow) in
+        [(SETTING_ALLOW_LABEL, &s.allow_tools, true), (SETTING_DENY_LABEL, &s.deny_tools, false)]
+    {
+        if list.is_empty() {
+            rows.push(row(label, RULES_NONE_LABEL.to_string(), None));
+        } else {
+            rows.extend(list.iter().map(|tool| {
+                removable(
+                    label,
+                    tool.clone(),
+                    UiAction::RemoveToolRule { allow, tool: tool.clone() },
+                )
+            }));
+        }
     }
     rows
 }
@@ -1270,22 +1618,23 @@ mod tests {
     }
 
     #[test]
-    fn settings_rows_carry_the_core_labels_and_cycle_actions() {
+    fn settings_rows_carry_the_core_labels_and_open_their_pickers() {
         let rows = settings_rows(&snapshot());
         let lines: Vec<String> = rows.iter().map(SettingRow::line).collect();
         assert_eq!(lines[0], "model: claude-opus-5");
         assert_eq!(lines[2], "approval mode: ask");
         assert_eq!(lines[4], "effort: unset");
-        assert_eq!(lines.last().map(String::as_str), Some("rules: none"));
-        assert_eq!(rows[2].action, Some(UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll)));
-        assert_eq!(
-            rows[4].action,
-            Some(UiAction::SetEffort(Some(modron_mobile_core::Effort::Low)))
-        );
+        assert_eq!(lines[9], "theme: system");
+        assert_eq!(lines[lines.len() - 3..], ["rules: none", "allow: none", "deny: none"]);
+        assert_eq!(rows[2].action, Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Mode))));
+        assert_eq!(rows[4].action, Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Effort))));
+        assert_eq!(rows[5].action, Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Sandbox))));
         assert_eq!(rows[7].action, Some(UiAction::Compact));
+        assert_eq!(rows[9].action, Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Theme))));
         // The model row opens the picker (Packet C3f); provider stays read-only.
         assert_eq!(rows[0].action, Some(UiAction::Nav(NavStep::Open(Screen::Models))));
         assert_eq!(rows[1].action, None);
+        assert!(rows.iter().all(|r| r.remove.is_none()), "no removable rows without rules");
     }
 
     #[test]
@@ -1295,10 +1644,7 @@ mod tests {
         assert_eq!(nav.enter_setting(), None);
         nav.apply(NavStep::Open(Screen::Settings));
         nav.apply(NavStep::Move(2));
-        assert_eq!(
-            nav.enter_setting(),
-            Some(UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll))
-        );
+        assert_eq!(nav.enter_setting(), Some(UiAction::Nav(NavStep::OpenPicker(PickerKind::Mode))));
     }
 }
 
@@ -1851,6 +2197,181 @@ mod list_screen_tests {
             nav.apply(NavStep::Attach(Uuid::from_u128(1))),
             vec![UiAction::Attach(Uuid::from_u128(1))]
         );
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+    use modron_mobile_core::ViewModelSnapshot;
+
+    fn base() -> ViewModelSnapshot {
+        ViewModelSnapshot {
+            approval_mode_label: "ask".into(),
+            sandbox: "off".into(),
+            model: "claude-opus-5".into(),
+            provider: "anthropic".into(),
+            phase_label: "build".into(),
+            ..Default::default()
+        }
+    }
+
+    fn labels(nav: &Nav) -> Vec<String> {
+        nav.view().picker.iter().map(|r| r.label.clone()).collect()
+    }
+
+    fn settings_nav(s: &ViewModelSnapshot) -> Nav {
+        let mut nav = Nav::default();
+        nav.observe(s);
+        nav.apply(NavStep::Open(Screen::Settings));
+        nav
+    }
+
+    #[test]
+    fn the_mode_picker_marks_the_current_mode_and_enter_applies_and_closes() {
+        let mut nav = Nav::default();
+        nav.observe(&base());
+        nav.apply(NavStep::OpenPicker(PickerKind::Mode));
+        let view = nav.view();
+        assert_eq!(view.screen, Screen::Picker);
+        assert_eq!(view.picker_title, "approval mode");
+        assert_eq!(labels(&nav), ["ask", "yolo", "deny"]);
+        assert!(view.picker[0].current && !view.picker[1].current);
+        assert_eq!(view.selected, 0);
+        nav.apply(NavStep::Move(1));
+        let sent = nav.apply(NavStep::PickRow(1));
+        assert_eq!(sent, vec![UiAction::SetApprovalMode(ApprovalModeWire::ApproveAll)]);
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+
+    #[test]
+    fn a_picker_opened_from_settings_closes_back_to_settings() {
+        let mut nav = settings_nav(&base());
+        nav.apply(NavStep::OpenPicker(PickerKind::Sandbox));
+        assert_eq!(labels(&nav), ["off", "seatbelt", "bwrap"]);
+        let sent = nav.apply(NavStep::PickRow(2));
+        assert_eq!(sent, vec![UiAction::SetSandbox(modron_types::SandboxPolicy::Bubblewrap)]);
+        assert_eq!(nav.top(), Screen::Settings);
+    }
+
+    #[test]
+    fn typing_filters_and_esc_clears_the_filter_before_the_picker_closes() {
+        let mut nav = Nav::default();
+        nav.observe(&base());
+        nav.apply(NavStep::OpenPicker(PickerKind::Effort));
+        assert_eq!(labels(&nav), ["unset", "low", "medium", "high", "xhigh", "max"]);
+        nav.apply(NavStep::Filter('x'));
+        nav.apply(NavStep::Filter('h'));
+        nav.apply(NavStep::Filter('i'));
+        assert_eq!(labels(&nav), ["xhigh"]);
+        nav.apply(NavStep::ClearFilter);
+        assert_eq!(nav.top(), Screen::Picker);
+        assert_eq!(labels(&nav).len(), 6);
+        nav.apply(NavStep::Back);
+        assert_eq!(nav.top(), Screen::Chat);
+    }
+
+    #[test]
+    fn the_effort_picker_marks_the_set_level_and_unset_when_empty() {
+        let mut s = base();
+        s.effort_label = "high".into();
+        let mut nav = Nav::default();
+        nav.observe(&s);
+        nav.apply(NavStep::OpenPicker(PickerKind::Effort));
+        let marked: Vec<String> =
+            nav.view().picker.iter().filter(|r| r.current).map(|r| r.label.clone()).collect();
+        assert_eq!(marked, ["high"]);
+        assert_eq!(nav.view().selected, 3, "the current row is preselected");
+    }
+
+    #[test]
+    fn the_agent_picker_lists_none_and_enter_on_it_does_nothing() {
+        let mut nav = Nav::default();
+        nav.observe(&base());
+        nav.apply(NavStep::OpenPicker(PickerKind::Agent));
+        let view = nav.view();
+        assert_eq!(view.picker.len(), 1);
+        assert_eq!(view.picker[0].label, PICKER_NONE_LABEL);
+        assert!(!view.picker[0].enabled);
+        assert!(nav.apply(NavStep::PickRow(0)).is_empty());
+        assert_eq!(nav.top(), Screen::Picker);
+    }
+
+    #[test]
+    fn the_theme_picker_applies_once_and_restore_is_not_remembered() {
+        let mut nav = settings_nav(&base());
+        nav.apply(NavStep::OpenPicker(PickerKind::Theme));
+        assert_eq!(labels(&nav), ["oculus dark", "oculus light", "system"]);
+        assert!(nav.view().picker[2].current, "the theme in use is marked");
+        assert!(nav.apply(NavStep::PickRow(0)).is_empty());
+        let change = nav.view().theme_change;
+        assert_eq!(change, ThemeChange { seq: 1, choice: Choice::Dark, remember: true });
+        assert_eq!(nav.top(), Screen::Settings);
+        let view = nav.view();
+        assert!(view.settings.iter().any(|r| r.line() == "theme: oculus dark"));
+        nav.restore_theme(Choice::Light);
+        assert_eq!(
+            nav.view().theme_change,
+            ThemeChange { seq: 2, choice: Choice::Light, remember: false }
+        );
+    }
+
+    #[test]
+    fn d_asks_before_removing_a_rule_and_the_confirmation_sends_the_remove() {
+        let mut s = base();
+        s.rules = vec!["allow read".into(), "deny bash(rm -rf *)".into()];
+        let mut nav = settings_nav(&s);
+        let row = nav.settings.iter().position(|r| r.line() == "rules: deny bash(rm -rf *)");
+        let row = row.expect("the rule row");
+        nav.apply(NavStep::Move(row as isize - nav.selected() as isize));
+        assert!(nav.settings_removable());
+        nav.apply(NavStep::AskSettingRemove(row));
+        assert_eq!(nav.view().confirm.as_deref(), Some("remove rules: deny bash(rm -rf *)? y / n"));
+        assert_eq!(nav.apply(NavStep::Confirm), vec![UiAction::RemoveRule(1)]);
+        assert!(!nav.confirming());
+    }
+
+    #[test]
+    fn allow_and_deny_entries_are_removable_through_the_tool_lists() {
+        let mut s = base();
+        s.allow_tools = vec!["bash".into()];
+        s.deny_tools = vec!["webfetch".into()];
+        let nav = settings_nav(&s);
+        let allow = nav.settings.iter().position(|r| r.line() == "allow: bash").expect("allow row");
+        let deny =
+            nav.settings.iter().position(|r| r.line() == "deny: webfetch").expect("deny row");
+        assert_eq!(
+            nav.settings[allow].remove,
+            Some(UiAction::RemoveToolRule { allow: true, tool: "bash".into() })
+        );
+        assert_eq!(
+            nav.settings[deny].remove,
+            Some(UiAction::RemoveToolRule { allow: false, tool: "webfetch".into() })
+        );
+        assert!(nav.settings.iter().all(|r| r.label != "allow" || r.remove.is_some()));
+    }
+
+    #[test]
+    fn the_help_tabs_switch_and_the_rows_scroll_within_the_tab() {
+        let mut nav = Nav::default();
+        nav.apply(NavStep::Open(Screen::Help));
+        assert_eq!(nav.view().help_tab, HelpTab::General);
+        nav.apply(NavStep::HelpCycle(1));
+        assert_eq!(nav.view().help_tab, HelpTab::Commands);
+        let total = nav.view().help_rows.len();
+        assert!(total > HELP_VISIBLE, "the commands tab scrolls");
+        nav.apply(NavStep::HelpScroll(1000));
+        assert_eq!(nav.view().help_scroll, total - HELP_VISIBLE, "scroll stops at the last row");
+        assert_eq!(nav.view().help_rows.len(), total);
+        nav.apply(NavStep::HelpEdge(true));
+        assert_eq!(nav.view().help_scroll, 0);
+        nav.apply(NavStep::HelpEdge(false));
+        nav.apply(NavStep::HelpTo(HelpTab::Shortcuts));
+        assert_eq!(nav.view().help_scroll, 0, "a new tab starts at its top");
+        nav.apply(NavStep::HelpCycle(-1));
+        assert_eq!(nav.view().help_tab, HelpTab::Commands);
+        nav.apply(NavStep::Back);
         assert_eq!(nav.top(), Screen::Chat);
     }
 }

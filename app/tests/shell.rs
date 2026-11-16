@@ -183,6 +183,9 @@ fn help_lists_the_double_bang_prefix() {
     let mut h = Harness::new();
     h.push(&fixture());
     h.send(key("F1"));
+    // The keys live on the Shortcuts tab (Tab twice from General).
+    h.send(key("Tab"));
+    h.send(key("Tab"));
     h.wait_for("help", |s| s.contains("privately"));
     assert!(h.screen().contains("!!"), "{}", h.screen());
 }

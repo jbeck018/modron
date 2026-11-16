@@ -712,6 +712,25 @@ fn apply(client: &RemoteClient, action: UiAction) {
         }
         UiAction::RemoveAutomation(name) => client.remove_automation(name),
         UiAction::TaskStatusOf(session) => client.task_status(session),
+        // The rules setter replaces the whole set, so the rest is sent.
+        UiAction::RemoveRule(index) => {
+            match modron_mobile_core::view::rules_without(&client.state().rules, index) {
+                Some(rules) => {
+                    client.set_config(ConfigPatch { rules: Some(rules), ..Default::default() })
+                }
+                None => Ok(()),
+            }
+        }
+        UiAction::RemoveToolRule { allow, tool } => {
+            let state = client.state();
+            if allow {
+                let list = modron_mobile_core::view::tools_without(&state.allow_tools, &tool);
+                client.set_tool_lists(Some(list), None)
+            } else {
+                let list = modron_mobile_core::view::tools_without(&state.deny_tools, &tool);
+                client.set_tool_lists(None, Some(list))
+            }
+        }
         UiAction::MergeTask(session) => client.merge_task(session, None),
         UiAction::AttachFile { name, mime, bytes } => {
             // The same chip as Ctrl+V; a refusal from the core's type check is

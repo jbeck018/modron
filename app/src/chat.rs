@@ -37,10 +37,12 @@ use nsh_platform_tui::{Input, Modifiers};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
+use crate::help::HELP_PAGE;
 use crate::nav::{InviteLine, Nav, NavStep, NavView, Screen};
 use crate::portal::PortalRow;
 use crate::slash;
 use crate::suggest;
+use crate::theme::Choice;
 use std::collections::VecDeque;
 
 /// What the user asked the client to do. The host or the view sends these;
@@ -198,6 +200,14 @@ pub enum UiAction {
     /// the merge of its branch into the base (the core's `merge_task`).
     TaskStatusOf(Uuid),
     MergeTask(Uuid),
+    /// Settings: remove a permission rule by its row index (after y); the
+    /// remaining rules are sent as the whole set.
+    RemoveRule(usize),
+    /// Settings: remove an allow (`allow`) or deny entry by its tool name.
+    RemoveToolRule {
+        allow: bool,
+        tool: String,
+    },
 }
 
 /// Set by `/exit` (see [`UiAction::Exit`]); the terminal loop checks it.
@@ -482,6 +492,8 @@ pub fn host_key(name: &str) -> Key {
 /// The snapshot facts key routing needs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyFacts {
+    /// The Settings row under the cursor can be removed (`d` asks first).
+    pub removable: bool,
     /// Option count of the pending approval, when one is pending.
     pub approval_options: Option<usize>,
     /// Whether a proposed plan waits for a decision.
@@ -829,8 +841,32 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
         Screen::Help => {
             return match key {
                 Key::Escape => Routed::Nav(NavStep::Back),
+                Key::Tab | Key::Right => Routed::Nav(NavStep::HelpCycle(1)),
+                Key::BackTab | Key::Left => Routed::Nav(NavStep::HelpCycle(-1)),
+                Key::Up => Routed::Nav(NavStep::HelpScroll(-1)),
+                Key::Down => Routed::Nav(NavStep::HelpScroll(1)),
+                Key::PageUp => Routed::Nav(NavStep::HelpScroll(-(HELP_PAGE as isize))),
+                Key::PageDown => Routed::Nav(NavStep::HelpScroll(HELP_PAGE as isize)),
+                Key::Home => Routed::Nav(NavStep::HelpEdge(true)),
+                Key::End => Routed::Nav(NavStep::HelpEdge(false)),
                 _ => Routed::Ignored,
             };
+        }
+        Screen::Picker => {
+            return match key {
+                Key::Escape if facts.filter_active => Routed::Nav(NavStep::ClearFilter),
+                Key::Escape => Routed::Nav(NavStep::Back),
+                Key::Enter => Routed::Nav(NavStep::PickRow(facts.selected_index)),
+                Key::Up => Routed::Nav(NavStep::Move(-1)),
+                Key::Down => Routed::Nav(NavStep::Move(1)),
+                Key::Backspace => Routed::Nav(NavStep::FilterBack),
+                Key::Char(c) => Routed::Nav(NavStep::Filter(c)),
+                _ => Routed::Ignored,
+            };
+        }
+        // `d` removes the selected rule, allow or deny entry (after y).
+        Screen::Settings if matches!(key, Key::Char('d')) && facts.removable => {
+            return Routed::Nav(NavStep::AskSettingRemove(facts.selected_index));
         }
         Screen::Agent => {
             return match key {
@@ -887,6 +923,8 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
             None => Routed::Ignored,
         },
         Key::Enter => match &facts.enter_setting {
+            // Navigation steps (a picker, Auth, Models) are applied by the host.
+            Some(UiAction::Nav(step)) => Routed::Nav(step.clone()),
             Some(action) => Routed::Action(action.clone()),
             None => Routed::Ignored,
         },
@@ -1560,6 +1598,7 @@ impl Host {
             form_open: self.nav.form_open(),
             selected_task: self.nav.selected_task(),
             enter_setting: self.nav.enter_setting(),
+            removable: self.nav.settings_removable(),
             save_default: self.nav.save_default_action(),
             slash_len: if self.nav.suggestions_shown() { items.names.len() } else { 0 },
             file_mode: items.file,
@@ -1661,9 +1700,21 @@ impl Host {
     /// same offset change a PageUp or PageDown key makes, by rows.
     pub fn wheel(&mut self, delta_y: f64) {
         let rows = rows_for_pixels(delta_y);
-        if rows != 0 {
+        if rows == 0 {
+            return;
+        }
+        // The wheel moves the help rows on the help screen (up is toward the top).
+        if self.nav.top() == Screen::Help {
+            self.nav_step(NavStep::HelpScroll(-rows));
+        } else {
             self.scroll(ScrollStep::Lines(rows));
         }
+    }
+
+    /// Shows the theme in use at startup (the saved choice, not saved again).
+    pub fn restore_theme(&mut self, choice: Choice) {
+        self.nav.restore_theme(choice);
+        self.notify();
     }
 
     /// PageUp, PageDown, Home and End: moves the transcript's offset from
@@ -1787,6 +1838,13 @@ static HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 /// The header hint for a state: the interrupt hint while a turn runs, the
 /// rotating idle hint while the composer is empty, nothing once the user has
 /// typed.
+/// How soon the terminal loop must wake without an event: the animation
+/// period while a turn runs (the spinner advances on each wake), and no
+/// deadline when idle, so an idle app sleeps until input.
+pub fn tick_deadline(running: bool) -> Option<std::time::Duration> {
+    running.then_some(ANIM_PERIOD)
+}
+
 pub fn hint_text(running: bool, composer_empty: bool, tick: u64) -> String {
     if running {
         RUNNING_HINT.to_string()
@@ -2476,6 +2534,7 @@ mod tests {
     use crate::nav::Screen;
 
     const NONE: KeyFacts = KeyFacts {
+        removable: false,
         approval_options: None,
         plan_pending: false,
         queued: 0,
@@ -3323,5 +3382,16 @@ mod esc_tests {
         assert_eq!(esc(KeyFacts { attachments: 2, ..idle() }, ""), Routed::Ignored);
         // Chips with text: only the text goes (Detach is Backspace's, never Esc's).
         assert_eq!(esc(KeyFacts { attachments: 2, ..idle() }, "hi"), Routed::ClearDraft);
+    }
+}
+
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+
+    #[test]
+    fn a_running_turn_asks_for_the_animation_period_and_an_idle_app_asks_for_nothing() {
+        assert_eq!(tick_deadline(true), Some(ANIM_PERIOD));
+        assert_eq!(tick_deadline(false), None);
     }
 }

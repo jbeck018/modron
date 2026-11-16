@@ -121,6 +121,12 @@ mod terminal {
 
     /// The line printed after the terminal is restored, so the session can
     /// be reopened.
+    /// The lines printed after the terminal is restored: the resume hint for
+    /// the session the app was on (none when it never attached to one).
+    fn exit_lines(session: Option<Uuid>) -> Vec<String> {
+        session.map(resume_hint).into_iter().collect()
+    }
+
     fn resume_hint(id: Uuid) -> String {
         format!("session: {id} - resume with modron-app-tui --session {id}")
     }
@@ -261,8 +267,8 @@ mod terminal {
             Err(e) => (Err(e), None),
         };
         // The terminal is restored by now: the hint lands in the normal buffer.
-        if let Some(id) = session {
-            println!("{}", resume_hint(id));
+        for line in exit_lines(session) {
+            println!("{line}");
         }
         match outcome {
             Ok(None) => ExitCode::SUCCESS,
@@ -302,6 +308,14 @@ mod terminal {
         let status: Arc<Status> =
             live.as_ref().map(|live| Arc::clone(&live.status)).unwrap_or_default();
         let (mut host, client) = link();
+        // The saved theme (the config file) shows at startup. It is saved again
+        // only when the user picks one, so the file appears then.
+        if let Some(path) = modron_app::theme::FileStore::default_path() {
+            modron_app::theme::install_store(std::sync::Arc::new(modron_app::theme::FileStore {
+                path,
+            }));
+        }
+        host.restore_theme(modron_app::theme::saved_installed());
         *modron_app::CLIENT.lock().expect("client slot") = Some(client);
         let (wake_tx, wake_rx) = mpsc::channel::<()>();
         let mut options = AppOptions::default();
@@ -332,6 +346,12 @@ mod terminal {
                         redraw |= demo.pump(&mut host, start.elapsed().as_millis() as u64);
                     }
                 }
+                // A running turn wakes at the animation period, so the spinner moves
+                // during silent waits; an idle app waits for input (no deadline).
+                let wait = match modron_app::chat::tick_deadline(host.running()) {
+                    Some(tick) => wait.min(tick),
+                    None => wait,
+                };
                 if !redraw && event::poll(wait)? {
                     return Ok(match event::read()? {
                         Event::Key(k)
@@ -459,6 +479,13 @@ mod terminal {
             assert_eq!(ctrl_c(true, Some(t0), t2), CtrlC::Interrupt);
             // Idle after an interrupt: exit.
             assert_eq!(ctrl_c(false, Some(t0), t1), CtrlC::Exit);
+        }
+
+        #[test]
+        fn the_resume_line_prints_on_exit_only_for_an_attached_session() {
+            let id = Uuid::from_u128(0xdef);
+            assert_eq!(exit_lines(Some(id)), vec![resume_hint(id)]);
+            assert!(exit_lines(None).is_empty());
         }
 
         #[test]
