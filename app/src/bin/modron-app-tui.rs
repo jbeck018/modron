@@ -32,7 +32,10 @@ mod terminal {
 
     use crossterm::{
         event::{self, Event, KeyCode as K, KeyEvent, KeyEventKind, KeyModifiers as M},
-        event::{DisableBracketedPaste, EnableBracketedPaste},
+        event::{
+            DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+            PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        },
         execute,
         terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -131,11 +134,84 @@ mod terminal {
         format!("session: {id} - resume with modron-app-tui --session {id}")
     }
 
-    /// Raw mode off and the alternate screen left. Safe to call more than once,
-    /// and on every exit path (the panic hook calls it too).
+    /// One terminal mode change. Setup and restore are both built from these
+    /// steps (see [`setup_steps`] and [`restore_steps`]), so they cannot drift.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        RawOn,
+        AltOn,
+        PasteOn,
+        KeysOn,
+        KeysOff,
+        PasteOff,
+        AltOff,
+        RawOff,
+    }
+
+    /// The steps after raw mode is on, in order. Raw mode comes first because
+    /// the keyboard query reads the terminal's reply; the enhancement flags
+    /// only when the terminal reports it can take them.
+    fn setup_steps(keyboard: bool) -> Vec<Step> {
+        let mut steps = vec![Step::AltOn, Step::PasteOn];
+        if keyboard {
+            steps.push(Step::KeysOn);
+        }
+        steps
+    }
+
+    /// The restore steps, in the order they run: the reverse of the setup,
+    /// with the keyboard flags popped only when they were pushed.
+    fn restore_steps(keyboard: bool) -> Vec<Step> {
+        let mut steps = Vec::new();
+        if keyboard {
+            steps.push(Step::KeysOff);
+        }
+        steps.extend([Step::PasteOff, Step::AltOff, Step::RawOff]);
+        steps
+    }
+
+    /// Whether the keyboard enhancement flags are pushed (restored on exit).
+    static KEYS_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn run_steps(steps: &[Step]) -> io::Result<()> {
+        let mut out = io::stdout();
+        for step in steps {
+            match step {
+                Step::RawOn => terminal::enable_raw_mode()?,
+                Step::AltOn => execute!(out, EnterAlternateScreen)?,
+                Step::PasteOn => execute!(out, EnableBracketedPaste)?,
+                Step::KeysOn => execute!(
+                    out,
+                    PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    )
+                )?,
+                Step::KeysOff => execute!(out, PopKeyboardEnhancementFlags)?,
+                Step::PasteOff => execute!(out, DisableBracketedPaste)?,
+                Step::AltOff => execute!(out, LeaveAlternateScreen)?,
+                Step::RawOff => terminal::disable_raw_mode()?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw mode, alternate screen, bracketed paste, and (when the terminal
+    /// supports it, silently otherwise) the keyboard flags that make Shift+Enter
+    /// reportable. Returns whether the flags were pushed.
+    fn enter_terminal() -> io::Result<bool> {
+        run_steps(&[Step::RawOn])?;
+        let keyboard = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        run_steps(&setup_steps(keyboard))?;
+        KEYS_PUSHED.store(keyboard, std::sync::atomic::Ordering::SeqCst);
+        Ok(keyboard)
+    }
+
+    /// Raw mode off and the alternate screen left, the keyboard flags popped
+    /// when pushed. Safe to call more than once, and on every exit path (the
+    /// panic hook calls it too).
     fn restore_terminal() {
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
+        let keyboard = KEYS_PUSHED.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = run_steps(&restore_steps(keyboard));
     }
 
     /// Restores the terminal before the default panic report is printed, so
@@ -328,8 +404,7 @@ mod terminal {
         view.set_focused(true);
 
         let mut live = live;
-        terminal::enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        enter_terminal()?;
         let (start, mut demo) = (Instant::now(), Player::default());
         let mut last_ctrl_c: Option<Instant> = None;
         let result = (|| -> io::Result<()> {
@@ -447,6 +522,31 @@ mod terminal {
                 );
                 assert!(!release);
             }
+        }
+
+        #[test]
+        fn the_terminal_is_restored_in_the_mirror_order_of_its_setup() {
+            for keyboard in [false, true] {
+                // Setup is raw mode, then setup_steps; restore must undo each
+                // of them, in reverse order, and pop only what was pushed.
+                let mut setup = vec![Step::RawOn];
+                setup.extend(setup_steps(keyboard));
+                let undone: Vec<Step> = setup
+                    .iter()
+                    .rev()
+                    .map(|step| match step {
+                        Step::RawOn => Step::RawOff,
+                        Step::AltOn => Step::AltOff,
+                        Step::PasteOn => Step::PasteOff,
+                        Step::KeysOn => Step::KeysOff,
+                        other => panic!("setup has a restore step: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(restore_steps(keyboard), undone, "keyboard={keyboard}");
+            }
+            // Without the terminal's support nothing is pushed or popped.
+            assert!(!setup_steps(false).contains(&Step::KeysOn));
+            assert!(!restore_steps(false).contains(&Step::KeysOff));
         }
 
         #[test]

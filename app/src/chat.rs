@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use modron_mobile_core::view::{idle_hint, spinner_frame, RUNNING_HINT};
-use modron_mobile_core::view::{NEW_OUTPUT_BELOW_LABEL, NO_TOOLS_NOTE};
+use modron_mobile_core::view::{scrolled_up_hint, NEW_OUTPUT_BELOW_LABEL, NO_TOOLS_NOTE};
 use modron_mobile_core::Attachment;
 use modron_mobile_core::{
     parse_shell_input, ApprovalModeWire, Effort, Phase, RenderedRow, SandboxPolicy,
@@ -548,6 +548,12 @@ pub struct KeyFacts {
     pub form_open: bool,
     /// The task Enter would attach (Tasks only).
     pub selected_task: Option<Uuid>,
+    /// The approval type-ahead guard is open: a decision key that arrives
+    /// now is ignored (see [`APPROVAL_KEY_GUARD`]).
+    pub guarded: bool,
+    /// The transcript is scrolled up (Esc on an idle composer returns it to
+    /// the live tail).
+    pub scrolled_up: bool,
 }
 
 /// One transcript scroll step (the keys PageUp, PageDown, Home, End).
@@ -579,6 +585,52 @@ pub fn rows_for_pixels(delta_y: f64) -> isize {
     } else {
         -rows
     }
+}
+
+/// The approval type-ahead window: a decision key within this long of a
+/// prompt first showing is ignored. The old terminal's value
+/// (crates/modron-tui/src/lib.rs:538, APPROVAL_KEY_GUARD).
+pub const APPROVAL_KEY_GUARD: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The prompt on screen and when it first showed. A new request id (or a
+/// plan appearing) restarts the window; the slot is cleared when no prompt
+/// waits. Global because the web's tap handlers run outside the host.
+static PROMPT_SHOWN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+/// The identity of the prompt a snapshot shows: the front approval's request
+/// id, else the plan (a plan has no id of its own).
+pub fn prompt_key(snapshot: &ViewModelSnapshot) -> Option<String> {
+    if let Some(p) = &snapshot.pending_approval {
+        Some(format!("approval:{}", p.request_id))
+    } else if snapshot.plan_pending.is_some() {
+        Some("plan".to_string())
+    } else {
+        None
+    }
+}
+
+/// Records the prompt a snapshot shows at `now`: a new key starts its window.
+fn track_prompt(key: Option<String>, now: Instant) {
+    let mut slot = PROMPT_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    match key {
+        None => *slot = None,
+        Some(key) => {
+            if slot.as_ref().map(|(shown, _)| shown != &key).unwrap_or(true) {
+                *slot = Some((key, now));
+            }
+        }
+    }
+}
+
+/// Whether the type-ahead window is open at `now` (a prompt is on screen and
+/// first showed less than [`APPROVAL_KEY_GUARD`] ago). The web's approval and
+/// plan controls check it too.
+pub fn prompt_guard_open(now: Instant) -> bool {
+    PROMPT_SHOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(_, shown)| now < *shown + APPROVAL_KEY_GUARD)
 }
 
 /// Where a key goes.
@@ -637,6 +689,12 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
             Key::Char('n') | Key::Escape => Routed::Nav(NavStep::Cancel),
             _ => Routed::Ignored,
         };
+    }
+    // Type-ahead guard (old TUI lib.rs:962-973): a decision key that arrives
+    // while the prompt is fresh was typed before it was read. It is consumed,
+    // not passed to the composer, and the prompt stays.
+    if facts.guarded && facts.screen == Screen::Chat && !chord && is_decision_key(key, &facts) {
+        return Routed::Ignored;
     }
     match key {
         Key::F2 => return Routed::Nav(NavStep::Open(Screen::Settings)),
@@ -733,6 +791,20 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
     composer
 }
 
+/// Whether a key decides the pending approval (y, a, n, Esc = deny) or the
+/// pending plan (y, r). Only the keys the router would act on.
+fn is_decision_key(key: Key, facts: &KeyFacts) -> bool {
+    match key {
+        Key::Escape => facts.approval_options.is_some(),
+        Key::Char(c) => {
+            let name = c.to_string();
+            (facts.approval_options.is_some() && DECISION_KEYS.contains(&name.as_str()))
+                || (facts.plan_pending && PLAN_KEYS.contains(&name.as_str()))
+        }
+        _ => false,
+    }
+}
+
 /// The keys while the tool detail panel is open: Ctrl+T and Esc close it,
 /// Up and Down move a row, PageUp and PageDown a page, Home and End jump.
 /// Any other key is consumed.
@@ -771,8 +843,8 @@ pub fn submit_action(task: &str) -> UiAction {
 /// Esc, in precedence order: a pending approval is denied (its last option,
 /// the third decision); a pending plan stays pending; open command suggestions
 /// close; a running turn is interrupted; an idle composer with text is
-/// cleared; otherwise nothing happens (staged image chips are never cleared
-/// by Esc).
+/// cleared; a scrolled-up transcript returns to the live tail; otherwise
+/// nothing happens (staged image chips are never cleared by Esc).
 fn escape_route(facts: &KeyFacts, draft: &str) -> Routed {
     if let Some(count) = facts.approval_options {
         return match count {
@@ -791,6 +863,11 @@ fn escape_route(facts: &KeyFacts, draft: &str) -> Routed {
     }
     if !draft.is_empty() {
         return Routed::ClearDraft;
+    }
+    // An idle, empty composer with the transcript scrolled up: back to the
+    // live tail (old TUI: "esc live", lib.rs:3327-3329).
+    if facts.scrolled_up {
+        return Routed::Scroll(ScrollStep::Bottom);
     }
     Routed::Ignored
 }
@@ -1307,6 +1384,8 @@ pub fn link() -> (Host, Client) {
     }
     set_history_pos(None);
     set_scroll_offset(0);
+    track_prompt(None, Instant::now());
+    QUIT.store(false, Ordering::SeqCst);
     NEW_BELOW.store(false, Ordering::SeqCst);
     LINE_TOTAL.store(0, Ordering::SeqCst);
     let (snap_tx, snap_rx) = unbounded_channel();
@@ -1343,6 +1422,13 @@ impl Host {
     /// Sends a snapshot to the view and records what the key routing needs:
     /// whether an approval or a plan waits, and the sessions and settings.
     pub fn push(&mut self, snapshot: &ViewModelSnapshot) {
+        self.push_at(snapshot, Instant::now());
+    }
+
+    /// [`Host::push`] at the injected time `now` (starts the prompt's
+    /// type-ahead window when the prompt is new).
+    pub fn push_at(&mut self, snapshot: &ViewModelSnapshot, now: Instant) {
+        track_prompt(prompt_key(snapshot), now);
         self.pending = snapshot.pending_approval.as_ref().map(|p| p.options.len());
         self.plan_pending = snapshot.plan_pending.is_some();
         self.queued = snapshot.queued.len();
@@ -1574,10 +1660,16 @@ impl Host {
     /// or `None` when the key became an action or a screen step here.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn filter(&mut self, input: Input) -> Option<Input> {
+        self.filter_at(input, Instant::now())
+    }
+
+    /// [`Host::filter`] at the injected time `now` (the type-ahead guard).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn filter_at(&mut self, input: Input, now: Instant) -> Option<Input> {
         let Input::Key { key, modifiers, release: false } = &input else {
             return Some(input);
         };
-        if self.route(host_key(key), modifiers.alt, has_chord(modifiers)) {
+        if self.route_at(host_key(key), modifiers.alt, has_chord(modifiers), now) {
             None
         } else {
             Some(input)
@@ -1603,6 +1695,11 @@ impl Host {
     /// consumes the key (an action, a screen step, or an ignored key); false
     /// when the composer gets it.
     pub fn route(&mut self, key: Key, alt: bool, chord: bool) -> bool {
+        self.route_at(key, alt, chord, Instant::now())
+    }
+
+    /// [`Host::route`] at the injected time `now`.
+    pub fn route_at(&mut self, key: Key, alt: bool, chord: bool, now: Instant) -> bool {
         let draft = draft_text();
         let items = suggest::for_draft(&draft);
         self.nav.set_slash(items.names.clone());
@@ -1632,6 +1729,8 @@ impl Host {
             history_len: HISTORY.lock().map(|h| h.len()).unwrap_or(0),
             auth_keying: self.nav.auth_keying(),
             attachments: staged_count(),
+            guarded: prompt_guard_open(now),
+            scrolled_up: scroll_offset() > 0,
         };
         let routed = route_key(key, alt, chord, facts, &draft);
         // Typing or deleting changes the text: the suggestions show again.
@@ -1837,6 +1936,15 @@ pub(crate) fn record_sent(text: &str) {
 /// The view reports how many lines the transcript holds now.
 pub(crate) fn set_line_total(lines: usize) {
     LINE_TOTAL.store(lines, Ordering::SeqCst);
+}
+
+/// Rows the transcript shows at its current height (the view reports it).
+static VISIBLE_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+/// The lines above the view when it shows `visible` rows of `total`, ending
+/// `offset` rows above the newest. The terminal's "N lines above" count.
+pub fn lines_above(total: usize, offset: usize, visible: usize) -> usize {
+    total.saturating_sub(offset + visible)
 }
 
 /// Clears the composer after a revise note went out, once the plan is no
@@ -2172,6 +2280,11 @@ fn option_cell(
     let cell = view().child(text(label).text_color(move || token_ink(token)));
     if WEB_CONTROLS {
         cell.role(AccessibilityRole::Button).px(px(8.0)).on_press(move || {
+            // The same type-ahead window as the keys: a tap on a fresh
+            // prompt (a double tap on send, say) decides nothing.
+            if prompt_guard_open(Instant::now()) {
+                return;
+            }
             let action = action();
             arm_plan_clear(&action);
             let _ = actions.send(action);
@@ -2332,6 +2445,14 @@ pub fn screen(
     // The last scroll step the view applied (SCROLL_SEQ).
     let applied_scroll = std::cell::Cell::new(0u64);
     effect(move || {
+        let rows = transcript_px(
+            window_h.get(),
+            nav.with(|n| n.tool_panel.is_some()),
+            draft.with(|d| d.matches('\n').count() + 1),
+        ) / COMPOSER_LINE_H;
+        VISIBLE_ROWS.store(rows.max(1.0) as usize, Ordering::SeqCst);
+    });
+    effect(move || {
         let lines = model.with(|m| m.lines.len());
         set_line_total(lines);
         let (seq, offset) = nav.with(|n| (n.scroll_seq, n.scroll_offset));
@@ -2419,6 +2540,18 @@ pub fn screen(
                 ))
             }),
         )
+        .child(when(
+            move || nav.with(|n| n.scroll_offset > 0),
+            move || {
+                text(move || {
+                    let offset = nav.with(|n| n.scroll_offset);
+                    let total = model.with(|m| m.lines.len());
+                    let visible = VISIBLE_ROWS.load(Ordering::SeqCst);
+                    scrolled_up_hint(lines_above(total, offset, visible))
+                })
+                .text_color(move || token_ink("muted-foreground"))
+            },
+        ))
         .child(when(
             move || nav.with(|n| n.new_below && n.scroll_offset > 0),
             move || text(NEW_OUTPUT_BELOW_LABEL).text_color(move || token_ink("warning")),
@@ -2577,6 +2710,8 @@ mod tests {
         auth_keying: false,
         form_open: false,
         selected_task: None,
+        guarded: false,
+        scrolled_up: false,
     };
 
     fn approval(options: usize) -> KeyFacts {
@@ -2605,6 +2740,105 @@ mod tests {
         assert_eq!(key_of("ArrowUp"), Key::Other);
         assert_eq!(key_of("ArrowLeft"), Key::Other);
         assert_eq!(key_of(""), Key::Other);
+    }
+
+    #[test]
+    fn esc_returns_a_scrolled_transcript_to_the_tail_after_everything_else() {
+        let scrolled = KeyFacts { scrolled_up: true, ..NONE };
+        assert_eq!(
+            route_key(Key::Escape, false, false, scrolled.clone(), ""),
+            Routed::Scroll(ScrollStep::Bottom)
+        );
+        // Precedence: a non-empty draft clears first, then the tail.
+        assert_eq!(
+            route_key(Key::Escape, false, false, scrolled.clone(), "typed"),
+            Routed::ClearDraft
+        );
+        // A running turn is interrupted before the tail is reached.
+        let running_scrolled = KeyFacts { running: true, ..scrolled.clone() };
+        assert_eq!(
+            route_key(Key::Escape, false, false, running_scrolled, ""),
+            Routed::Action(UiAction::Interrupt)
+        );
+        // A pending approval is denied first.
+        let pending = KeyFacts { approval_options: Some(3), ..scrolled.clone() };
+        assert_eq!(
+            route_key(Key::Escape, false, false, pending, ""),
+            Routed::Action(UiAction::Decide(2))
+        );
+        // Open suggestions close first.
+        let suggesting = KeyFacts { slash_len: 4, ..scrolled };
+        assert_eq!(
+            route_key(Key::Escape, false, false, suggesting, "/"),
+            Routed::Nav(NavStep::SlashHide)
+        );
+        // Idle, live, empty: nothing.
+        assert_eq!(route_key(Key::Escape, false, false, NONE, ""), Routed::Ignored);
+    }
+
+    #[test]
+    fn lines_above_is_what_the_view_does_not_show() {
+        // 100 rows, 20 visible, at the tail: none above.
+        assert_eq!(lines_above(100, 0, 20), 80);
+        // Scrolled 30 rows up: 50 rows sit above the 20 shown.
+        assert_eq!(lines_above(100, 30, 20), 50);
+        assert_eq!(lines_above(10, 0, 20), 0);
+    }
+
+    fn guarded(facts: KeyFacts) -> KeyFacts {
+        KeyFacts { guarded: true, ..facts }
+    }
+
+    #[test]
+    fn a_fresh_prompt_ignores_its_decision_keys_and_passes_them_nowhere() {
+        // Inside the window, y / a / n and Esc (deny) are consumed: Ignored,
+        // never Composer and never an action.
+        for c in ['y', 'a', 'n'] {
+            assert_eq!(
+                route_key(Key::Char(c), false, false, guarded(approval(3)), ""),
+                Routed::Ignored,
+                "{c}"
+            );
+        }
+        assert_eq!(route_key(Key::Escape, false, false, guarded(approval(3)), ""), Routed::Ignored);
+        assert_eq!(route_key(Key::Char('r'), false, false, guarded(plan()), ""), Routed::Ignored);
+        assert_eq!(route_key(Key::Char('y'), false, false, guarded(plan()), ""), Routed::Ignored);
+        // Keys that are not decisions still reach the composer or their own use.
+        assert_eq!(route_key(Key::Char('x'), false, false, guarded(approval(3)), ""), composer());
+        assert_eq!(route_key(Key::Enter, false, false, guarded(approval(3)), "x"), composer());
+        assert_eq!(route_key(Key::Char('r'), false, false, guarded(approval(3)), ""), composer());
+        assert_eq!(route_key(Key::Char('n'), false, false, guarded(plan()), ""), composer());
+        // A chord is not a decision.
+        assert_eq!(route_key(Key::Char('a'), false, true, guarded(approval(3)), ""), composer());
+    }
+
+    #[test]
+    fn once_the_window_is_closed_the_same_keys_decide() {
+        assert_eq!(
+            route_key(Key::Char('y'), false, false, approval(3), ""),
+            Routed::Action(UiAction::Decide(0))
+        );
+        assert_eq!(
+            route_key(Key::Escape, false, false, approval(3), ""),
+            Routed::Action(UiAction::Decide(2))
+        );
+        assert_eq!(
+            route_key(Key::Char('y'), false, false, plan(), ""),
+            Routed::Action(UiAction::DecidePlan { approve: true, note: None })
+        );
+    }
+
+    #[test]
+    fn the_guard_is_about_prompts_not_about_the_screen() {
+        // Off the chat screen the guard does not apply (no approval there).
+        let settings = KeyFacts { screen: Screen::Settings, ..NONE };
+        for key in [Key::Char('y'), Key::Escape] {
+            assert_eq!(
+                route_key(key, false, false, guarded(settings.clone()), ""),
+                route_key(key, false, false, settings.clone(), ""),
+                "{key:?}"
+            );
+        }
     }
 
     #[test]

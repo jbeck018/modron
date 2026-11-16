@@ -10,8 +10,9 @@ use modron_mobile_core::client::TASK_STATUS_REFRESH_BATCH;
 use modron_mobile_core::view::{
     auth_is_signed_in, auth_row_line, delete_confirm_text, kill_confirm_text, remove_confirm_text,
     sandbox_label, AgentRowView, OAuthProgressView, MODEL_ROLE_CHEAP, MODEL_ROLE_CURRENT,
-    MODEL_ROLE_FALLBACK, MODEL_ROLE_STRONG, PICKER_NONE_LABEL, SETTING_AGENT_LABEL,
-    SETTING_ALLOW_LABEL, SETTING_AUTH_LABEL, SETTING_DENY_LABEL, SETTING_THEME_LABEL,
+    MODEL_ROLE_FALLBACK, MODEL_ROLE_STRONG, PERSONA_CLEAR_NOTE, PICKER_NONE_LABEL,
+    SETTING_AGENT_LABEL, SETTING_ALLOW_LABEL, SETTING_AUTH_LABEL, SETTING_DENY_LABEL,
+    SETTING_THEME_LABEL,
 };
 use modron_mobile_core::view::{
     automation_interval_error, automation_row, merge_confirm_text, AUTOMATION_FIELDS_NEEDED,
@@ -148,6 +149,12 @@ pub enum NavStep {
     /// Open a picker over the screen beneath it (the bare command, or the
     /// Settings row).
     OpenPicker(PickerKind),
+    /// Bare `/allow` (true) or `/deny` (false): Settings with the cursor on
+    /// that list's rows, where `d` removes an entry (the removal flow).
+    OpenToolList(bool),
+    /// `/auth <provider>`: the credentials screen, on that provider's row,
+    /// starting key entry or sign-in for it once its row is known.
+    AuthFor(String),
     /// Enter, or a tap on a picker row (index into the filtered rows): apply
     /// the row's action and close the picker.
     PickRow(usize),
@@ -530,6 +537,8 @@ pub struct NavView {
     pub note: Option<String>,
     /// The picker on top: its title and the rows that match the filter.
     pub picker_title: String,
+    /// A note under the picker's filter line (the agent picker's clear note).
+    pub picker_note: String,
     pub picker: Vec<PickerRow>,
     /// The theme in use, and the change the view applies once.
     pub theme: Choice,
@@ -589,6 +598,8 @@ pub struct Nav {
     auth_progress: Option<OAuthProgressView>,
     /// The provider whose masked key entry is open.
     auth_key: Option<String>,
+    /// The provider `/auth <provider>` named, until its row is on screen.
+    auth_target: Option<String>,
     /// The first-run check ran (see [`Nav::first_run`]).
     first_run_done: bool,
     automations: Vec<AutomationWire>,
@@ -945,7 +956,25 @@ impl Nav {
     /// carries provider rows (the driver requests them on connect). When
     /// nothing is signed in and Chat is showing, the credentials screen
     /// opens once. Returns the core calls to send.
+    /// Moves to the `/auth <provider>` row once it is listed, and starts key
+    /// entry or sign-in for it. None while the rows have not arrived. An id
+    /// the list does not have is dropped (the screen stays on the list).
+    fn resolve_auth_target(&mut self) -> Option<Vec<UiAction>> {
+        let provider = self.auth_target.clone()?;
+        if self.auth.is_empty() {
+            return None;
+        }
+        self.auth_target = None;
+        let index = self.auth.iter().position(|row| row.id == provider)?;
+        self.selected = index;
+        Some(self.apply(NavStep::Activate))
+    }
+
     pub fn first_run(&mut self, snapshot: &ViewModelSnapshot) -> Vec<UiAction> {
+        // `/auth <provider>` waits for the provider's row to arrive.
+        if let Some(actions) = self.resolve_auth_target() {
+            return actions;
+        }
         // The session's provider comes with its snapshot, which can arrive
         // after the provider rows: wait for it, or a mock session would be
         // judged as having no provider at all.
@@ -1255,6 +1284,22 @@ impl Nav {
                     self.auth_key = Some(row.id);
                 }
             }
+            NavStep::AuthFor(provider) => {
+                self.auth_target = Some(provider);
+                let mut actions = self.apply(NavStep::Open(Screen::Auth));
+                if let Some(resolved) = self.resolve_auth_target() {
+                    actions.extend(resolved);
+                }
+                return actions;
+            }
+            NavStep::OpenToolList(allow) => {
+                let label = if allow { SETTING_ALLOW_LABEL } else { SETTING_DENY_LABEL };
+                let actions = self.apply(NavStep::Open(Screen::Settings));
+                if let Some(index) = self.settings.iter().position(|row| row.label == label) {
+                    self.selected = index;
+                }
+                return actions;
+            }
             NavStep::ActivateRow(index) if self.top() == Screen::Auth => {
                 self.selected = index.min(self.auth.len().saturating_sub(1));
                 return self.apply(NavStep::Activate);
@@ -1438,6 +1483,11 @@ impl Nav {
                 .picker
                 .map(|kind| picker_title(kind).to_string())
                 .unwrap_or_default(),
+            picker_note: if self.top() == Screen::Picker && self.picker == Some(PickerKind::Agent) {
+                PERSONA_CLEAR_NOTE.to_string()
+            } else {
+                String::new()
+            },
             picker: if self.top() == Screen::Picker { self.visible_picker() } else { Vec::new() },
             theme: self.theme,
             theme_change: self.theme_change,
@@ -1982,6 +2032,37 @@ mod auth_tests {
     }
 
     #[test]
+    fn auth_for_a_provider_waits_for_its_row_then_starts_key_entry_or_sign_in() {
+        let mut nav = Nav::default();
+        assert_eq!(nav.apply(NavStep::AuthFor("openai".into())), vec![UiAction::ListAuth]);
+        assert_eq!(nav.top(), Screen::Auth);
+        let rows = snapshot(vec![
+            provider("anthropic", "Anthropic", "not configured", false),
+            provider("openai", "OpenAI", "not configured", false),
+        ]);
+        nav.observe(&rows);
+        assert!(nav.first_run(&rows).is_empty());
+        assert_eq!(nav.selected(), 1, "the provider's row is selected");
+        assert_eq!(nav.view().auth_key, Some("openai".into()), "key entry starts");
+    }
+
+    #[test]
+    fn auth_for_an_oauth_provider_starts_sign_in_and_an_unknown_one_does_nothing() {
+        let mut nav = Nav::default();
+        nav.apply(NavStep::AuthFor("openai".into()));
+        let rows = snapshot(vec![provider("openai", "OpenAI", "not configured", true)]);
+        nav.observe(&rows);
+        assert_eq!(nav.first_run(&rows), vec![UiAction::AuthStart("openai".into())]);
+
+        let mut nav = Nav::default();
+        nav.apply(NavStep::AuthFor("nope".into()));
+        nav.observe(&rows);
+        assert!(nav.first_run(&rows).is_empty());
+        assert_eq!(nav.selected(), 0);
+        assert_eq!(nav.view().auth_key, None);
+    }
+
+    #[test]
     fn first_run_asks_once_and_opens_the_screen_only_when_nothing_is_signed_in() {
         let mut nav = Nav::default();
         let empty = ViewModelSnapshot::default();
@@ -2426,6 +2507,22 @@ mod picker_tests {
     }
 
     #[test]
+    fn bare_allow_and_deny_open_settings_on_their_list_and_d_removes_from_there() {
+        let mut s = base();
+        s.allow_tools = vec!["bash".into()];
+        s.deny_tools = vec!["webfetch".into()];
+        let mut nav = Nav::default();
+        nav.observe(&s);
+        nav.apply(NavStep::OpenToolList(false));
+        assert_eq!(nav.top(), Screen::Settings);
+        assert_eq!(nav.settings[nav.selected()].line(), "deny: webfetch");
+        nav.apply(NavStep::AskSettingRemove(nav.selected()));
+        assert!(nav.view().confirm.is_some(), "the removal asks first");
+        nav.apply(NavStep::OpenToolList(true));
+        assert_eq!(nav.settings[nav.selected()].line(), "allow: bash");
+    }
+
+    #[test]
     fn allow_and_deny_entries_are_removable_through_the_tool_lists() {
         let mut s = base();
         s.allow_tools = vec!["bash".into()];
@@ -2542,6 +2639,17 @@ mod persona_task_auth_tests {
         let labels: Vec<String> = nav.view().picker.iter().map(|r| r.label.clone()).collect();
         assert_eq!(labels, vec![PICKER_NONE_LABEL.to_string()]);
         assert!(nav.apply(NavStep::PickRow(0)).is_empty());
+    }
+
+    #[test]
+    fn the_agent_picker_says_it_cannot_clear_the_persona_and_other_pickers_say_nothing() {
+        let mut nav = Nav::default();
+        nav.observe(&ViewModelSnapshot::default());
+        nav.apply(NavStep::OpenPicker(PickerKind::Agent));
+        assert_eq!(nav.view().picker_note, PERSONA_CLEAR_NOTE);
+        nav.apply(NavStep::Back);
+        nav.apply(NavStep::OpenPicker(PickerKind::Mode));
+        assert_eq!(nav.view().picker_note, "");
     }
 
     #[test]

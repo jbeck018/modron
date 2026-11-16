@@ -1,0 +1,5 @@
+# NSH views keep per-thread engine state, and a test thread that exits can race
+# the next test's view (the snapshot consumer is lost, the screen stays blank).
+# The app's test binaries therefore run one test at a time on one thread.
+[env]
+RUST_TEST_THREADS = "1"

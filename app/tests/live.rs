@@ -139,8 +139,11 @@ impl Harness {
         }
     }
 
+    /// Pushes a snapshot as if its prompt had shown a second ago, so the
+    /// approval type-ahead window (300 ms) is closed for the keys sent at
+    /// once. The window has its own tests in tests/chat.rs.
     fn push(&mut self, snapshot: &ViewModelSnapshot) {
-        self.host.push(snapshot);
+        self.host.push_at(snapshot, modron_app::clock::Instant::now() - Duration::from_secs(1));
     }
 
     /// The next action the view sent, waiting briefly for the engine.
@@ -526,6 +529,18 @@ fn start_server(session: Uuid, script: Script) -> (String, mpsc::Receiver<Payloa
     (url, report_rx)
 }
 
+/// Pumps the driver until the approval type-ahead window has closed (the
+/// app clock; see `chat::prompt_guard_open`).
+fn wait_past_guard(h: &mut Harness, live: &mut Live) {
+    let deadline = Instant::now() + TIMEOUT;
+    while modron_app::chat::prompt_guard_open(modron_app::clock::Instant::now()) {
+        live.pump(&mut h.host);
+        h.draw();
+        assert!(Instant::now() < deadline, "the type-ahead window never closed\n{}", h.screen());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Pumps the driver until the server reports the first request.
 fn next_request(h: &mut Harness, live: &mut Live, reports: &mpsc::Receiver<Payload>) -> Payload {
     let deadline = Instant::now() + TIMEOUT;
@@ -787,6 +802,9 @@ fn y_sends_the_approval_decision_over_the_wire() {
     .expect("spawn driver");
     let mut h = Harness::new();
     h.wait_for("approval labels", Some(&mut live), |s| s.contains("allow once"));
+    // A decision key inside the type-ahead window is ignored: wait it out
+    // (on the app clock) as a user reading the prompt would.
+    wait_past_guard(&mut h, &mut live);
     h.send(key("y"));
     match next_request(&mut h, &mut live, &reports) {
         Payload::Approve { request_id, .. } => assert_eq!(request_id, "req-1"),
@@ -827,6 +845,16 @@ fn a_server_one_protocol_ahead_is_refused_and_never_streams() {
     // header reads disconnected and the server's stream is not folded.
     h.wait_for("refused handshake", Some(&mut live), |s| s.contains("disconnected"));
     assert!(!h.screen().contains("Migrating the router now"), "{}", h.screen());
+}
+
+#[test]
+fn reasoning_on_asks_the_provider_for_a_summary() {
+    // The first toggle turns the display on, so the summary is asked for
+    // (the scripted server reports only the first request after the stream).
+    match wire_request(Script::default(), "/reasoning") {
+        Payload::SetConfig { patch } => assert_eq!(patch.reasoning_summary, Some(true)),
+        other => panic!("expected set_config, got {other:?}"),
+    }
 }
 
 #[test]

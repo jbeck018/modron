@@ -3,7 +3,7 @@
 //! reads time through [`Instant`]: milliseconds from `Date.now()` on the web,
 //! and from a process-start anchor on native.
 
-use std::ops::Add;
+use std::ops::{Add, Sub};
 use std::time::Duration;
 
 /// A point in time, in milliseconds since an arbitrary origin.
@@ -21,6 +21,14 @@ impl Add<Duration> for Instant {
 
     fn add(self, rhs: Duration) -> Instant {
         Instant(self.0 + rhs.as_secs_f64() * 1000.0)
+    }
+}
+
+impl Sub<Duration> for Instant {
+    type Output = Instant;
+
+    fn sub(self, rhs: Duration) -> Instant {
+        Instant(self.0 - rhs.as_secs_f64() * 1000.0)
     }
 }
 

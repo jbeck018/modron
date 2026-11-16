@@ -340,7 +340,40 @@ export function waitBody(v, pred, ms = 30000, label = 'page text') {
   }, ms, `${v.label}: ${label}`);
 }
 
+// The approval type-ahead guard (app/src/chat.rs APPROVAL_KEY_GUARD, 300 ms):
+// a tap on an approval option in the first 300 ms of its prompt is ignored.
+// Waits on the page clock until the window of the prompt on screen has
+// closed, as a user reading the prompt would. The observer stamps each
+// prompt when "allow once" first shows and clears the stamp when it goes.
+// Without an approval on screen (a picker's own "deny" row) it returns at once.
+export async function waitPastPromptGuard(v) {
+  await v.page.evaluate(() => {
+    const shown = () => !!document.body && document.body.innerText.includes('allow once');
+    if (window.__promptSeen === undefined) {
+      window.__promptSeen = null;
+      new MutationObserver(() => {
+        if (shown()) {
+          if (window.__promptSeen === null) window.__promptSeen = Date.now();
+        } else {
+          window.__promptSeen = null;
+        }
+      }).observe(document, { subtree: true, childList: true, characterData: true });
+    }
+    if (shown() && window.__promptSeen === null) window.__promptSeen = Date.now();
+  });
+  const open = await v.page.evaluate(() => window.__promptSeen !== null);
+  if (!open) return;
+  await v.page.waitForFunction(
+    () => window.__promptSeen === null || Date.now() - window.__promptSeen >= 300,
+    null,
+    { timeout: 15000 },
+  );
+}
+
+const APPROVAL_TAPS = new Set(['allow once', 'allow all', 'deny']);
+
 export async function clickText(v, text) {
+  if (APPROVAL_TAPS.has(text)) await waitPastPromptGuard(v);
   await v.page.getByText(text, { exact: true }).first().click({ timeout: 15000 });
 }
 

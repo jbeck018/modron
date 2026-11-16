@@ -270,6 +270,9 @@ pub const SETTING_DENY_LABEL: &str = "deny";
 /// The picker row shown when the server lists no personas (the shared word
 /// for an empty list, as the rules row uses).
 pub const PICKER_NONE_LABEL: &str = "none";
+/// The agent picker's note: there is no row that clears the persona, because
+/// the server refuses an empty persona name (app/src/nav.rs `picker_rows`).
+pub const PERSONA_CLEAR_NOTE: &str = "no clear row - the server refuses an empty persona name";
 /// The web control that removes the row it sits on.
 pub const REMOVE_LABEL: &str = "remove";
 
@@ -402,6 +405,17 @@ pub use modron_view::slash::{
 pub const NO_TOOLS_NOTE: &str = "no tool activity yet";
 pub const NEW_OUTPUT_BELOW_LABEL: &str = "new output below - end to follow";
 pub const CTRL_C_QUIT_HINT: &str = "press ctrl+c again to quit";
+
+/// The scrollback hint while the transcript is scrolled up, from the number
+/// of lines above the view (0 is the top of the session). The terminal
+/// (crates/modron-tui/src/lib.rs:3325-3329) and the app share these words.
+pub fn scrolled_up_hint(lines_above: usize) -> String {
+    if lines_above == 0 {
+        "\u{2191} top of session \u{00b7} pgdn scroll \u{00b7} esc live".to_string()
+    } else {
+        format!("\u{2191} {lines_above} lines above \u{00b7} pgup/pgdn scroll \u{00b7} esc live")
+    }
+}
 
 /// One credentials row: the core's label and status, verbatim, joined by
 /// `: ` (the same shape as the settings rows).
@@ -2632,6 +2646,28 @@ mod task_copy_tests {
     fn the_slug_collapses_separators_and_is_capped() {
         assert_eq!(skill_slug("  a -- b  "), "a-b");
         assert_eq!(skill_slug(&"x".repeat(80)).len(), 48);
+    }
+
+    #[test]
+    fn the_persona_picker_says_it_cannot_clear_the_persona() {
+        assert_eq!(
+            PERSONA_CLEAR_NOTE,
+            "no clear row - the server refuses an empty persona name"
+        );
+        assert!(PERSONA_CLEAR_NOTE.is_ascii());
+    }
+
+    #[test]
+    fn the_scrolled_up_hint_counts_the_lines_above_and_says_top_at_zero() {
+        assert_eq!(
+            scrolled_up_hint(0),
+            "\u{2191} top of session \u{00b7} pgdn scroll \u{00b7} esc live"
+        );
+        assert_eq!(
+            scrolled_up_hint(42),
+            "\u{2191} 42 lines above \u{00b7} pgup/pgdn scroll \u{00b7} esc live"
+        );
+        assert!(!scrolled_up_hint(1).is_ascii());
     }
 
     #[test]

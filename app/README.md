@@ -160,16 +160,35 @@ The multi-line composer grows to 6 lines and then scrolls inside itself; the
 transcript shrinks to match.
 
 Keys (the same on web, where the router sees DOM keys): Enter sends;
-Shift+Enter, Ctrl+J, or a line ending in `\` adds a line (the `\` is
-replaced by the line break). A pasted block arrives as one input and never
-submits. Alt+Enter queues. Esc denies a pending approval, else closes
-suggestions, else interrupts a running turn. y/a/n decide approvals. Up/Down
+Ctrl+J and a line ending in `\` always add a line (the `\` is replaced by
+the line break); Shift+Enter adds one where the terminal reports it (the app
+asks for the kitty keyboard flags and falls back silently). A pasted block
+arrives as one input and never submits. Alt+Enter queues. Esc takes the first
+of: deny a pending approval, keep a pending plan, close suggestions, interrupt
+a running turn, clear a non-empty draft, return a scrolled transcript to the
+live tail ("esc live"). y/a/n decide approvals and y/r a plan; the approval
+type-ahead guard (below) ignores them for 300 ms after the prompt first shows.
+Up/Down
 recall sent inputs (last 200) on an empty or recalled one-line composer.
 PageUp/PageDown page the transcript; Home/End jump when the composer is
 empty; a scrolled view stays put and shows "new output below". Shift+Tab
 flips the approval mode. Ctrl+C interrupts a running turn; a second press
 within two seconds, or Ctrl+C when idle, quits. On exit the app prints the
 session id and the `modron-app-tui --session` command to resume it. The
+approval type-ahead guard (`chat::route_key`, `APPROVAL_KEY_GUARD`, the old
+terminal's lib.rs:962-973) ignores a decision key (y, a, n, Esc on an
+approval; y, r on a plan) that arrives within 300 ms of a prompt first showing,
+measured on the app clock. The key is consumed, not sent to the composer, and
+the prompt stays. A new request id starts a new window; the web's option
+buttons apply the same window to taps. The old terminal shows no cue at that
+moment. A scrolled transcript shows its lines above the view ("N lines above",
+`mobile-core` `scrolled_up_hint`). `/allow` and `/deny` with no argument open
+the tool list in Settings (`d` removes an entry). `/auth <provider>` opens the
+credentials screen on that provider's row and starts key entry or sign-in.
+`/sandbox bubblewrap` is `bwrap`. `/reasoning` on also asks the provider for a
+reasoning summary (`set_reasoning_summary`); a refusal shows as the error line.
+The agent picker says there is no row that clears a persona (the server refuses
+an empty name). The
 help screen (F1, `?`, `/help`) has three tabs, General, Commands and
 Shortcuts (the old terminal's tabs). Tab and Shift+Tab, or Left and Right,
 switch tabs; Up and Down, PgUp and PgDn, Home and End scroll (the wheel on
@@ -223,10 +242,14 @@ The real server refuses browser Origins unless started with `--allow-origin`.
 
 ## Tests
 
-    cargo test                                        # headless NSH + scripted server
+    cargo test                                        # headless NSH + scripted server (one test thread: see .cargo/config.toml)
     cargo clippy --all-targets -- -D warnings
     cargo check --lib --target wasm32-unknown-unknown
     nsh package --target web -o dist && node web-test.js
+
+`app/.cargo/config.toml` sets `RUST_TEST_THREADS=1`: NSH views keep per-thread
+state, and parallel test threads made the chat harness flaky (a blank screen
+after a snapshot push). Each test still runs in its own view.
 
 `web-test.js` uses Playwright and headless Chromium (preinstalled). It serves
 `dist/Modron/` with `python3 -m http.server` and runs a scripted WebSocket

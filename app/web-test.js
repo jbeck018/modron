@@ -420,6 +420,33 @@ async function tapLabel(page, label) {
   await page.getByText(label, { exact: true }).first().click();
 }
 
+// The approval type-ahead guard (app/src/chat.rs, APPROVAL_KEY_GUARD, 300 ms):
+// a tap or key in the first 300 ms of a prompt is ignored. Waits on the page
+// clock until the window has closed, as a user reading the prompt would. The
+// observer stamps when "allow once" first shows; a prompt already on screen
+// is stamped now, which only makes the wait longer.
+async function waitPastPromptGuard(page) {
+  await page.evaluate(() => {
+    const shown = () => !!document.body && document.body.innerText.includes('allow once');
+    if (window.__promptSeen === undefined) {
+      window.__promptSeen = null;
+      new MutationObserver(() => {
+        if (shown()) {
+          if (window.__promptSeen === null) window.__promptSeen = Date.now();
+        } else {
+          window.__promptSeen = null;
+        }
+      }).observe(document, { subtree: true, childList: true, characterData: true });
+    }
+    if (shown() && window.__promptSeen === null) window.__promptSeen = Date.now();
+  });
+  await page.waitForFunction(
+    () => window.__promptSeen === null || Date.now() - window.__promptSeen >= 300,
+    null,
+    { timeout: TIMEOUT }
+  );
+}
+
 const APPROVAL = {
   type: 'approval_requested',
   request_id: 'req-1',
@@ -485,10 +512,51 @@ async function testApprovalTap(browser, base) {
     for (const label of ['allow all', 'deny']) {
       if (!text.includes(label)) throw new Error(`approval option missing: ${label}`);
     }
+    await waitPastPromptGuard(page);
     await tapLabel(page, 'allow once');
     const frame = await waitFrame(ws, 'approve');
     if (frame.request_id !== 'req-1') throw new Error('approve frame names ' + frame.request_id);
     if (frame.decision !== 'allow_once') throw new Error('decision was ' + frame.decision);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Approval type-ahead guard (chat.rs, the same window as the keys): a tap on
+// a fresh prompt decides nothing; a tap after the 300 ms window approves. An
+// init script records the page's clock when the prompt text first shows.
+async function testApprovalGuard(browser, base) {
+  const ws = await startWsServer({ after: [APPROVAL] });
+  try {
+    const query = `?url=${encodeURIComponent(ws.url)}&session=${SESSION}`;
+    const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
+    const errors = [];
+    watchErrors(page, errors);
+    await page.addInitScript(() => {
+      window.__promptSeen = null;
+      new MutationObserver(() => {
+        if (window.__promptSeen === null && document.body && document.body.innerText.includes('allow once')) {
+          window.__promptSeen = Date.now();
+        }
+      }).observe(document, { subtree: true, childList: true, characterData: true });
+    });
+    await page.goto(base + '/' + query, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => window.__promptSeen !== null, null, { timeout: TIMEOUT });
+    const early = await page.evaluate(() => Date.now() - window.__promptSeen < 300);
+    if (!early) throw new Error('the tap came after the 300 ms window: the guard case cannot run');
+    await tapLabel(page, 'allow once');
+    // Wait on the page's clock until the window has closed.
+    await page.waitForFunction(() => Date.now() - window.__promptSeen >= 300, null, { timeout: TIMEOUT });
+    // Absence check: an accepted tap's frame would have crossed the local
+    // socket by now; this short wait is the only time-based step in the case.
+    await new Promise((r) => setTimeout(r, 250));
+    if (ws.frames.some((f) => f.type === 'approve')) throw new Error('a tap inside the window approved');
+    await tapLabel(page, 'allow once');
+    const frame = await waitFrame(ws, 'approve');
+    if (frame.decision !== 'allow_once') throw new Error('decision was ' + frame.decision);
+    if (ws.frames.filter((f) => f.type === 'approve').length !== 1) throw new Error('more than one approve frame');
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     await page.close();
   } finally {
@@ -567,6 +635,7 @@ async function testEscDeniesApproval(browser, base) {
   try {
     const { page, errors } = await openLive(browser, base, ws);
     await page.waitForFunction(() => document.body.innerText.includes('allow once'), null, { timeout: TIMEOUT });
+    await waitPastPromptGuard(page);
     await page.keyboard.press('Escape');
     const frame = await waitFrame(ws, 'approve');
     if (frame.decision !== 'deny') throw new Error('esc decision was ' + frame.decision);
@@ -1066,6 +1135,7 @@ async function testAttachSendsOneImage(browser, base) {
     ['(c) stop control sends interrupt', () => testStopTap(browser, base)],
     ['(d) Esc on web sends interrupt', () => testEscapeInterrupts(browser, base)],
     ['(e) approval buttons send approve', () => testApprovalTap(browser, base)],
+    ['(e2) approval buttons ignore a tap in the first 300 ms of a prompt, then approve', () => testApprovalGuard(browser, base)],
     ['(f) theme primary colour applied on web', () => testThemeColour(browser, base)],
     ['(g) share link (no session in URL): submit is for the adopted session', () => testShareLinkSubmit(browser, base)],
     ['(h) queue chip press sends dequeue', () => testChipDequeue(browser, base)],

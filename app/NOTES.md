@@ -206,3 +206,51 @@ server (`agent_picker_asks_for_personas_and_enter_sends_the_chosen_one`,
 Note for headless tests: a navigation step (Enter on a slash command) reaches
 the screen only when the host's actions are pumped (`Harness::action`), since
 `Host::try_action` applies nav steps; the scripted driver does this in `pump`.
+
+# Packet APP-9: approval guard, newline keys, scroll, commands, e2e terminal modes
+
+## Done
+- Approval type-ahead guard in `chat::route_key` (terminal and web). Window
+  300 ms on the app clock, started when the prompt's request id (or the plan)
+  first shows; a queued second approval gets its own window. Decision keys
+  y/a/n and Esc (approval), y/r (plan) are consumed. Old TUI lib.rs:962-973
+  has no visible cue, so none is shown. Tests: `app/src/chat.rs` router tests,
+  `app/tests/chat.rs` (`a_decision_key_inside_the_window...`, queued, restart,
+  plan), `app/tests/live.rs` (`y_sends_the_approval_decision_over_the_wire`
+  waits past the window), `web-test.js` (e2e) and `waitPastPromptGuard` in
+  `e2e/lib.mjs` (every browser approval tap waits the window on the page clock).
+- Ctrl+J, trailing backslash, Shift+Enter: keyboard flags pushed only when
+  `supports_keyboard_enhancement` says yes, popped on every exit path next to
+  bracketed paste. Unit test over the ordered steps.
+- Esc on an idle empty composer returns a scrolled transcript to the tail;
+  "N lines above" hint via the shared `scrolled_up_hint`.
+- `/allow` / `/deny` bare open Settings on the list; `/auth <provider>` jumps to
+  its row; `/sandbox bubblewrap` = bwrap.
+- `/reasoning` on also calls `set_reasoning_summary(true)`; the live test checks
+  the wire request. A refusal shows through `last_error`.
+- Untested DONE rows (APP_PARITY.md): 1 to 5 and 9 have app tests in
+  `tests/chat.rs` (caret, Delete, Up/Down, /clear, /exit, context gauge). 6 to 8
+  (generative UI, turn-end usage, swarm summary) are covered by the existing
+  `tests/live.rs::turn_end_usage_swarm_and_generative_rows_render_from_the_core_entries`.
+  10 (protocol handshake refusal) is `a_server_one_protocol_ahead_is_refused...`.
+  11 (10 KiB `!command` cap) lives in the core: `crates/modron-core/src/engine.rs`
+  (the cap test near line 7300); an app test would only check a frame the server
+  already truncated, so none was added.
+- Persona clear: the agent picker shows `PERSONA_CLEAR_NOTE` (shared, in
+  `mobile/rust-core/src/view.rs`). Server change needed to allow clearing: accept
+  an empty persona name in the persona setter (`crates/` side) and have the app
+  send it as the "none" row.
+- E2E: T2 (Esc in the window ignored, past it the mock's next tool prompt
+  follows the denial), T3 (one Ctrl+C interrupts, app stays, second quits),
+  T4 (Ctrl+J draft, stored by the serve as one two-line task), T4b (trailing
+  backslash, same check). T4 and T4b read the serve's session store
+  (`<home>/.modron/sessions/*.jsonl`): the local client's `attach` did not
+  return the TUI's session.
+
+## Open
+- Browser `pageerror: closure invoked recursively or after being dropped`
+  appeared intermittently in the e2e viewers (T4 check once; S5 once, in
+  viewerB, at approval resolution). Not reproduced by `web-test.js` (33/33 in
+  three runs, no console errors). Not diagnosed.
+- Parallel chat tests were flaky until the single-thread config; the cause is
+  believed to be per-thread NSH state, not confirmed.

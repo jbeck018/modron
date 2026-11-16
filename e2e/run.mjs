@@ -2,8 +2,8 @@
 // (wrangler dev --local) -> real web app in headless Chromium.
 // Run:  node /home/user/modron/e2e/run.mjs      (see e2e/README.md)
 import { randomBytes } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   freePort, MODRON, REPO, Local, SCRATCH, api, bodyText, clickContains, clickText, copyApp, inviteUrlIn,
@@ -696,6 +696,124 @@ if (!want('T1')) {
     s.check(r.serve_left.length === 0, `server process left behind: ${r.serve_left.join(' | ')}`);
     s.check(!r.still_running, 'the app was still running after Ctrl+C twice');
     console.log(`   tui tail: ${r.tail.slice(-400).replace(/\s+/g, ' ')}`);
+  });
+}
+
+// ---- T2-T4: the same pty driver in other modes (e2e/tui_pty.py) -------------
+// Each mode runs one app under a pty. The driver writes its result JSON to
+// `out` and progress markers to `marks`; T4 waits on the markers and asks the
+// server itself through the suite's local client.
+function startPty(mode, port) {
+  const home = join(SCRATCH, `h-${mode}`);
+  const work = join(home, 'w');
+  const marks = join(SCRATCH, `marks-${mode}`);
+  mkdirSync(work, { recursive: true });
+  mkdirSync(marks, { recursive: true });
+  const cfgPath = join(SCRATCH, `tui-pty-${mode}.cfg.json`);
+  const out = join(SCRATCH, `tui-pty-${mode}.json`);
+  writeFileSync(cfgPath, JSON.stringify({ mode, marks, bin: TUI_BIN, serve_bin: MODRON, url: `ws://127.0.0.1:${port}`, home, cwd: work, out }));
+  const child = spawn('python3', ['-I', join(REPO, 'e2e/tui_pty.py'), cfgPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  const exited = new Promise((res) => child.on('exit', () => res()));
+  return { child, out, marks, home, stderr: () => stderr, exited };
+}
+
+async function ptyResult(p, ms = 170000) {
+  const timer = sleep(ms).then(() => 'timeout');
+  if ((await Promise.race([p.exited.then(() => 'exit'), timer])) === 'timeout') p.child.kill('SIGKILL');
+  if (!existsSync(p.out)) throw new Error(`pty driver produced no output: ${p.stderr()}`);
+  return JSON.parse(readFileSync(p.out, 'utf8'));
+}
+
+// The task's text in the serve's own session store (<home>/.modron/sessions).
+function storedWithin(p, needle, ms = 30000) {
+  const store = join(p.home, '.modron', 'sessions');
+  const stored = () => existsSync(store) && readdirSync(store)
+    .filter((f) => f.endsWith('.jsonl'))
+    .some((f) => readFileSync(join(store, f), 'utf8').includes(needle));
+  return (async () => {
+    const end = Date.now() + ms;
+    while (!stored()) {
+      if (Date.now() > end) return false;
+      await sleep(300);
+    }
+    return true;
+  })();
+}
+
+// Waits for the driver's approval marker; false when the app ends first.
+async function awaitMark(p, name) {
+  const ok = await waitFile(join(p.marks, name));
+  if (!ok) await ptyResult(p).catch(() => null);
+  return ok;
+}
+
+async function waitFile(path, ms = 120000) {
+  const end = Date.now() + ms;
+  while (!existsSync(path)) {
+    if (Date.now() > end) return false;
+    await sleep(200);
+  }
+  return true;
+}
+
+function ptyChecks(s, r) {
+  s.check(r.connected, 'the app never showed "connected"');
+  s.check(r.exit_code === 0, `the app did not exit 0 after Ctrl+C twice (exit ${r.exit_code}, still running: ${r.still_running})`);
+  s.check(r.resume_line, 'the resume line (--session) was not printed');
+  s.check(r.serve_left.length === 0, `server process left behind: ${r.serve_left.join(' | ')}`);
+  s.check(!r.still_running, 'the app was still running after Ctrl+C twice');
+}
+
+if (!want('T2') && !want('T3') && !want('T4')) {
+  // not selected
+} else if (!tuiFresh) {
+  for (const id of ['T2', 'T3', 'T4']) {
+    skipScenario(id, 'terminal app under a pty', existsSync(TUI_BIN) ? 'modron-app-tui is older than app/src' : 'modron-app-tui not built');
+  }
+} else {
+  await scenario('T2', 'terminal app: Esc inside the approval window is ignored; past it, Esc denies', async (s) => {
+    const port = await freePort();
+    const r = await ptyResult(startPty('t2', port));
+    s.check(r.approval, 'the typed task never reached an approval prompt');
+    s.check(r.early_ignored, `an Esc inside the 300 ms window was not ignored (tail: ${String(r.early_tail).slice(-200).replace(/\s+/g, ' ')})`);
+    s.check(r.prompt_cleared, 'the Esc past the window did not answer the prompt (no change of prompt)');
+    s.check(r.deny_seen, 'the next tool prompt did not follow the denial');
+    ptyChecks(s, r);
+  });
+
+  await scenario('T3', 'terminal app: one Ctrl+C interrupts the running turn and the app stays open; the second quits', async (s) => {
+    const port = await freePort();
+    const r = await ptyResult(startPty('t3', port));
+    s.check(r.approval, 'the typed task never reached an approval prompt (the running turn)');
+    s.check(r.interrupted, 'one Ctrl+C did not end the waiting turn');
+    s.check(r.alive_after_first, 'the app exited on the first Ctrl+C');
+    ptyChecks(s, r);
+  });
+
+  await scenario('T4', 'terminal app: Ctrl+J makes a two-line draft that is submitted as one task', async (s) => {
+    const port = await freePort();
+    const p = startPty('t4', port);
+    const r0 = await awaitMark(p, 'm1');
+    if (!r0) throw new Error('no approval for the Ctrl+J task');
+    // The serve's side: it writes each session to <home>/.modron/sessions as
+    // JSON lines, and a task's newline is stored as the two characters \n.
+    s.check(await storedWithin(p, 'line one\\nline two'), 'the server did not store the Ctrl+J task as one two-line task');
+    const r = await ptyResult(p);
+    s.check(r.typed1 && r.typed2, 'the two lines were not typed into the composer');
+    ptyChecks(s, r);
+  });
+
+  await scenario('T4b', 'terminal app: a trailing backslash continues the line; Enter submits both lines as one task', async (s) => {
+    const port = await freePort();
+    const p = startPty('t4b', port);
+    const r0 = await awaitMark(p, 'm1');
+    if (!r0) throw new Error('no approval for the backslash task');
+    s.check(await storedWithin(p, 'alpha\\nomega'), 'the server did not store the backslash task as one two-line task');
+    const r = await ptyResult(p);
+    s.check(r.typed1 && r.typed2, 'the backslash continuation was not typed into the composer');
+    ptyChecks(s, r);
   });
 }
 

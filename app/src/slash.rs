@@ -140,7 +140,15 @@ pub fn run(line: &str) -> UiAction {
         "settings" => UiAction::Nav(NavStep::Open(Screen::Settings)),
         "login" => UiAction::Nav(NavStep::Open(Screen::Auth)),
         "compress" => UiAction::Compact,
-        "auth" => UiAction::Nav(NavStep::Open(Screen::Auth)),
+        "auth" => match args {
+            "" | "add" | "manage" => UiAction::Nav(NavStep::Open(Screen::Auth)),
+            // `/auth <provider> ...`: the first word names the provider (the
+            // old terminal's `<provider> <key>` form pre-fills nothing here).
+            rest => {
+                let provider = rest.split_whitespace().next().unwrap_or_default();
+                UiAction::Nav(NavStep::AuthFor(provider.to_string()))
+            }
+        },
         "help" => UiAction::Nav(NavStep::Open(Screen::Help)),
         "model" if args.is_empty() => UiAction::Nav(NavStep::Open(Screen::Models)),
         "model" => UiAction::SelectModel(args.to_string()),
@@ -155,7 +163,7 @@ pub fn run(line: &str) -> UiAction {
             "" => UiAction::Nav(NavStep::OpenPicker(PickerKind::Sandbox)),
             "off" => UiAction::SetSandbox(SandboxPolicy::Off),
             "seatbelt" => UiAction::SetSandbox(SandboxPolicy::Seatbelt),
-            "bwrap" => UiAction::SetSandbox(SandboxPolicy::Bubblewrap),
+            "bwrap" | "bubblewrap" => UiAction::SetSandbox(SandboxPolicy::Bubblewrap),
             _ => usage("sandbox"),
         },
         "effort" => match args {
@@ -193,7 +201,9 @@ pub fn run(line: &str) -> UiAction {
         "build" => UiAction::SetPhase(Phase::Build),
         "fork" => UiAction::Fork,
         "tasks" => UiAction::Nav(NavStep::Open(Screen::Tasks)),
-        "allow" | "deny" if args.is_empty() => UiAction::ShowToolLists,
+        "allow" | "deny" if args.is_empty() => {
+            UiAction::Nav(NavStep::OpenToolList(word == "allow"))
+        }
         "allow" => UiAction::AddToolRule { allow: true, tool: args.to_string() },
         "deny" => UiAction::AddToolRule { allow: false, tool: args.to_string() },
         "automations" => UiAction::Nav(NavStep::Open(Screen::Automations)),
@@ -314,6 +324,12 @@ mod tests {
         assert_eq!(run("/clear"), UiAction::Clear);
         assert_eq!(run("/q"), UiAction::Exit);
         assert_eq!(run("/login"), UiAction::Nav(NavStep::Open(Screen::Auth)));
+        assert_eq!(run("/auth add"), UiAction::Nav(NavStep::Open(Screen::Auth)));
+        assert_eq!(run("/auth openai"), UiAction::Nav(NavStep::AuthFor("openai".into())));
+        assert_eq!(run("/allow"), UiAction::Nav(NavStep::OpenToolList(true)));
+        assert_eq!(run("/deny"), UiAction::Nav(NavStep::OpenToolList(false)));
+        assert_eq!(run("/sandbox bubblewrap"), UiAction::SetSandbox(SandboxPolicy::Bubblewrap));
+        assert_eq!(run("/sandbox bwrap"), UiAction::SetSandbox(SandboxPolicy::Bubblewrap));
         assert_eq!(run("/rc ws://x"), UiAction::RemoteControl("ws://x".into()));
         assert_eq!(run("/goal ship it"), UiAction::SetGoal("ship it".into()));
         assert_eq!(run("/goal"), UiAction::SetGoal(String::new()));

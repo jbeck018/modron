@@ -232,7 +232,7 @@ pub fn bindings() -> Vec<Binding> {
         },
         Binding {
             label: "shift+enter",
-            what: "new line in the composer (ctrl+j too; a line ending in \\ does the same)",
+            what: "new line in the composer; ctrl+j and a line ending in \\ always do it, shift+enter where the terminal reports it",
             key: Key::Enter,
             chord: false,
             alt: false,

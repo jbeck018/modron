@@ -874,6 +874,10 @@ fn picker_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl
     column = column
         .child(text(move || nav.with(|n| n.picker_title.clone())).font_weight(FontWeight::BOLD));
     column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| !n.picker_note.is_empty()),
+        move || text(move || nav.with(|n| n.picker_note.clone())).text_color(muted()),
+    ));
     for i in 0..PICKER_SLOTS {
         let actions = actions.clone();
         column = column.child(when(

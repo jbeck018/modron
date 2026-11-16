@@ -621,9 +621,12 @@ fn apply(client: &RemoteClient, action: UiAction) {
             None => Ok(()),
         },
         UiAction::ToggleReasoning => {
-            let shown = client.state().show_reasoning;
-            client.set_show_reasoning(!shown);
-            Ok(())
+            // The display follows the local toggle at once. The provider's
+            // reasoning summary follows it too (the core asks the server); a
+            // refusal (a portal tunnel's non-owner) shows as the error line.
+            let shown = !client.state().show_reasoning;
+            client.set_show_reasoning(shown);
+            client.set_reasoning_summary(shown)
         }
         UiAction::Compact => client.compact(),
         UiAction::Shell { command, private: false } => client.shell(command),
