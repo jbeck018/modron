@@ -358,6 +358,15 @@ pub enum Payload {
         live: LiveState,
     },
     /// One persisted-transcript event, replayed or appended live.
+    ///
+    /// Effects by variant (the shared fold in modron_view): every variant
+    /// is folded in log order. `HandedOff` (C6c, ownership fact, additive)
+    /// means this session moved to another host (`to`, `carrier_ref` name
+    /// the target and the git ref). It is not model content: clients show
+    /// one transcript note ([`modron_view::handoff_note`]) and change no
+    /// other state. The host that exported the session refuses runs on it
+    /// until an import brings a longer log; that refusal arrives as an error
+    /// reply, not as this event.
     Event { event: SessionEvent },
     /// A streaming delta (text or reasoning; never tool-call items).
     Delta { delta: WireDelta },

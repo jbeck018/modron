@@ -98,6 +98,10 @@ pub struct Config {
     /// startup error rather than a silently ignored file.
     #[serde(default)]
     pub permissions: Option<PermissionsConfig>,
+    /// `[handoff]`: how a session moves between hosts (C6c). See
+    /// docs/HANDOFF.md.
+    #[serde(default)]
+    pub handoff: Option<HandoffConfig>,
 }
 
 /// Resolve the reasoning effort: the `--effort` flag wins over the config
@@ -150,6 +154,13 @@ impl PermissionsConfig {
         }
         Ok(RuleSet::new(rules))
     }
+}
+
+/// `[handoff]` section (C6c). `carrier` is `"git"` (default) or `"furrow"`
+/// (accepted; its carrier is not built yet, so using it fails with a message).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct HandoffConfig {
+    pub carrier: Option<String>,
 }
 
 /// `[sessions]` section (Phase 6a). `ttl_days` enables auto-vacuum at
@@ -809,6 +820,18 @@ mod tests {
         assert!(!default.reasoning_summary);
         let on: Config = toml::from_str("reasoning_summary = true").unwrap();
         assert!(on.reasoning_summary);
+    }
+
+    /// C6c: `[handoff] carrier` loads; unset means the git carrier.
+    #[test]
+    fn handoff_carrier_loads_from_the_file() {
+        let default: Config = toml::from_str("").unwrap();
+        assert!(default.handoff.is_none());
+        let furrow: Config = toml::from_str("[handoff]\ncarrier = \"furrow\"\n").unwrap();
+        assert_eq!(
+            furrow.handoff.and_then(|h| h.carrier).as_deref(),
+            Some("furrow")
+        );
     }
 
     #[test]

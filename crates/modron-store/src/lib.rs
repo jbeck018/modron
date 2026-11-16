@@ -475,6 +475,85 @@ pub struct JsonlSessionStore {
 }
 
 impl JsonlSessionStore {
+    /// The transcript file of `id` (read by the handoff export; never written
+    /// there directly).
+    pub fn transcript_path(&self, id: SessionId) -> PathBuf {
+        self.inner.jsonl_path(id)
+    }
+
+    /// Replaces the session's transcript with `text` (complete JSONL lines),
+    /// for `modron handoff import`. The caller has already decided the
+    /// replacement is allowed (prefix rule, C6c). Written to a temp file and
+    /// renamed, under the session lock; the meta mirror and the caches are
+    /// rebuilt from the new content. `title` keeps the local title when `None`
+    /// and an existing meta file is present.
+    pub fn replace_transcript(&self, id: SessionId, text: &str, title: Option<&str>) -> Result<()> {
+        let inner = &self.inner;
+        inner.ensure_root()?;
+        let guard = inner.session_lock(id);
+        let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = inner.root.join(format!(
+            "{id}.jsonl.import.{}.{nanos}.{seq}.tmp",
+            std::process::id()
+        ));
+        let written = private_file_options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(text.as_bytes()));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Session(format!(
+                "could not write {}: {e}",
+                tmp.display()
+            )));
+        }
+        std::fs::rename(&tmp, inner.jsonl_path(id)).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::Session(format!("could not replace transcript for {id}: {e}"))
+        })?;
+        let (events, len) = inner.read_transcript(id)?;
+        let message_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SessionEvent::Message { .. } | SessionEvent::ToolResult { .. }
+                )
+            })
+            .count() as u32;
+        let now = chrono::Utc::now();
+        let mut meta = inner.read_meta(id).unwrap_or(SessionMeta {
+            id,
+            title: title.unwrap_or("handed-off session").to_string(),
+            created_at: now,
+            updated_at: now,
+            message_count: 0,
+        });
+        if let Some(title) = title {
+            meta.title = title.to_string();
+        }
+        meta.updated_at = now;
+        meta.message_count = message_count;
+        inner.write_meta(&meta)?;
+        let mut caches = inner.caches.lock().unwrap_or_else(|e| e.into_inner());
+        caches.handles.remove(&id);
+        caches.metas.insert(id, meta);
+        caches.counts.insert(
+            id,
+            CountEntry {
+                count: events.len() as u64,
+                len,
+            },
+        );
+        Ok(())
+    }
+
     /// Store rooted at `root` (e.g. `~/.modron/sessions/`).
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {

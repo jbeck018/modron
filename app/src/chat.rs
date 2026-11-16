@@ -1259,6 +1259,7 @@ pub fn style_of(entry: &TranscriptEntry) -> Style {
         // its output dim.
         TranscriptEntry::Shell { .. } => Style::Tool,
         TranscriptEntry::Model { .. }
+        | TranscriptEntry::Note { .. }
         | TranscriptEntry::Usage { .. }
         | TranscriptEntry::Compaction { .. } => Style::Meta,
         TranscriptEntry::User { .. }

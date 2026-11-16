@@ -189,6 +189,7 @@ fn render_events<'a>(
             SessionEvent::Checkpoint { .. }
             | SessionEvent::ModelSelected { .. }
             | SessionEvent::Review { .. }
+            | SessionEvent::HandedOff { .. }
             | SessionEvent::Usage { .. } => {}
         }
     }
@@ -383,6 +384,32 @@ mod tests {
             older_transcript_text(&with_blocks, 1)
         );
         assert!(!older_transcript_text(&with_blocks, 0).contains("SIG-DO-NOT-SUMMARIZE"));
+    }
+
+    #[test]
+    fn handed_off_fact_leaves_compaction_boundary_unchanged() {
+        let base = sample_events();
+        let mut with_fact = base.clone();
+        with_fact.push(SessionEvent::HandedOff {
+            to: None,
+            at: chrono::Utc::now(),
+            carrier_ref: "refs/heads/modron/handoff/x".into(),
+        });
+        assert!(!is_transcript_item(with_fact.last().unwrap()));
+        let (older, tail) = split_older_tail(&base, 2);
+        let (older_fact, tail_fact) = split_older_tail(&with_fact, 2);
+        // The boundary is unchanged. The fact lands in the tail slice as one
+        // more non-transcript event; no transcript item moves.
+        assert_eq!(older.len(), older_fact.len());
+        assert_eq!(tail.len() + 1, tail_fact.len());
+        assert!(
+            tail_fact.iter().filter(|e| is_transcript_item(e)).count()
+                == tail.iter().filter(|e| is_transcript_item(e)).count()
+        );
+        assert_eq!(
+            older_transcript_text(&base, 2),
+            older_transcript_text(&with_fact, 2)
+        );
     }
 
     #[test]

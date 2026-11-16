@@ -149,6 +149,15 @@ is: engine default, then this section, then flags.
 |---|---|---|---|
 | `ttl_days` | integer | unset (never) | At startup, deletes sessions not updated for this many days. `modron sessions vacuum` still works without it. |
 
+## [handoff]
+
+How a session moves between hosts (`modron handoff export|import`, see
+[HANDOFF.md](HANDOFF.md)).
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `carrier` | string | `"git"` | `"git"` moves the working tree and the session log as git refs. `"furrow"` is accepted here, but its carrier is not built yet: using it fails with a "not built yet" message. |
+
 ## [router]
 
 Model selection for each turn. `modron router eval` scores the selector offline.

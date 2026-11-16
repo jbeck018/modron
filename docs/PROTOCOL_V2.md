@@ -331,3 +331,18 @@ HandoffProgress { stage, message }
 One host owns the working directory at a time. During a handoff the
 session refuses submit/steer (queue is allowed) until the new host
 attaches as the agent side; every client stays attached throughout.
+
+Persisted event `handed_off` (C6c, `modron handoff export`, additive):
+
+```
+{"type":"handed_off","to":"laptop"|null,"at":"<RFC 3339>","carrier_ref":"refs/heads/modron/handoff/<id>"}
+```
+
+Written only as the last line of the exporting host's log; the bundle
+never carries it. Effect: one transcript note (`modron_view::handoff_note`),
+no other state. While it is the last line, the host refuses runs, compaction
+and `!` commands on the session (the refusal is an error reply that names
+`modron handoff import <ref>`). A longer log that continues past the line,
+imported by `modron handoff import`, clears it. Older clients skip the
+unknown `type` only where they read logs; the live `Event` frame needs a
+client built with this variant, as with every additive event.

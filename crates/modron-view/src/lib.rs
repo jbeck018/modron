@@ -518,6 +518,22 @@ pub enum TranscriptEntry {
         summary: String,
         findings: Vec<String>,
     },
+    /// A one-line note that is not a model turn: the session was handed to
+    /// another host ([`handoff_note`]).
+    Note { text: String },
+}
+
+/// The shared wording stem for a handed-off session (C6c). Every client shows
+/// the note built by [`handoff_note`], never its own words.
+pub const HANDOFF_NOTE: &str = "session handed off to another host";
+
+/// The handoff transcript note: `session handed off to another host (ref)`,
+/// or `... to <host> (ref)` when the export named the target.
+pub fn handoff_note(to: Option<&str>, carrier_ref: &str) -> String {
+    match to {
+        Some(host) => format!("{HANDOFF_NOTE} to {host} ({carrier_ref})"),
+        None => format!("{HANDOFF_NOTE} ({carrier_ref})"),
+    }
 }
 
 /// The one-line reviewer verdict shared by every client: `review: pass`,
@@ -703,6 +719,14 @@ impl ReplayFolder {
                     verdict: *verdict,
                     summary: review_summary(*verdict, findings.len()),
                     findings: findings.iter().map(finding_line).collect(),
+                });
+            }
+            SessionEvent::HandedOff {
+                to, carrier_ref, ..
+            } => {
+                self.flush_tools();
+                self.entries.push(TranscriptEntry::Note {
+                    text: handoff_note(to.as_deref(), carrier_ref),
                 });
             }
             SessionEvent::TurnTrace { .. } | SessionEvent::Checkpoint { .. } => {}
@@ -1103,6 +1127,7 @@ mod tests {
                 TranscriptEntry::GenerativeUi { .. } => "gen_ui",
                 TranscriptEntry::Plan { .. } => "plan",
                 TranscriptEntry::Review { .. } => "review",
+                TranscriptEntry::Note { .. } => "note",
             })
             .collect();
         assert_eq!(
@@ -1351,6 +1376,29 @@ mod shell_tests {
             vec!["$ echo hello [private]", "hello", "exit code: 0"]
         );
         assert_eq!(shell_rows("true", &[], false), vec!["$ true"]);
+    }
+
+    #[test]
+    fn replay_folds_a_handed_off_fact_into_one_note() {
+        let events = vec![
+            SessionEvent::Task { text: "t".into() },
+            SessionEvent::HandedOff {
+                to: None,
+                at: chrono::Utc::now(),
+                carrier_ref: "refs/heads/modron/handoff/x".into(),
+            },
+        ];
+        let entries = replay(&events);
+        assert_eq!(
+            entries.last(),
+            Some(&TranscriptEntry::Note {
+                text: "session handed off to another host (refs/heads/modron/handoff/x)".into(),
+            })
+        );
+        assert_eq!(
+            handoff_note(Some("laptop"), "r"),
+            "session handed off to another host to laptop (r)"
+        );
     }
 
     #[test]

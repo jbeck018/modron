@@ -15,6 +15,7 @@
 pub mod acp;
 pub mod app;
 pub mod daemon;
+mod handoff;
 pub mod onboarding;
 use daemon as modron_daemon;
 pub mod auth;
@@ -228,6 +229,13 @@ enum Command {
         #[arg(long)]
         session: Option<SessionId>,
     },
+    /// Hand a session to another host (C6c): `export` commits the working
+    /// tree and the session log to git refs, `import` takes them over. See
+    /// docs/HANDOFF.md.
+    Handoff {
+        #[command(subcommand)]
+        action: HandoffAction,
+    },
     /// Session management: list (default), vacuum old sessions, restart.
     Sessions {
         #[command(subcommand)]
@@ -246,6 +254,34 @@ enum Command {
         /// Show only the N most recent sessions.
         #[arg(long)]
         last: Option<usize>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum HandoffAction {
+    /// Export a session (default: the most recently updated one) and mark it
+    /// handed off here. Refused when the session is already handed off.
+    Export {
+        /// The session id (`modron sessions list` prints them).
+        #[arg(long)]
+        session: Option<SessionId>,
+        /// Remote to push the two handoff refs to.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Keep the refs local; nothing is pushed.
+        #[arg(long)]
+        no_push: bool,
+    },
+    /// Import a handoff: a `modron/handoff/<id>` ref or a session id. Fetches
+    /// from `--remote` when that remote exists, checks the tree out into the
+    /// working directory (the branch is not switched), and restores the log.
+    Import {
+        reference: String,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Allow a dirty working tree and overwrite ignored files.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -596,6 +632,9 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         return run_rewind(session, &sessions_dir, &working_dir).await;
     }
     // `modron sessions` — the store is inspectable (no silent state).
+    if let Some(Command::Handoff { action }) = &cli.command {
+        return run_handoff(action.clone(), &sessions_dir, &working_dir, &cfg).await;
+    }
     if let Some(Command::Sessions { action }) = &cli.command {
         match action {
             Some(SessionsAction::List) | None => {
@@ -2964,6 +3003,63 @@ fn entry_title_cli(label: &str) -> &str {
 /// truncation point. The truncation itself takes effect on the NEXT
 /// `--resume` of that session (the engine skips abandoned events); the
 /// append-only log is never rewritten.
+/// `modron handoff export|import` (C6c): the carrier comes from `[handoff]`.
+async fn run_handoff(
+    action: HandoffAction,
+    sessions_dir: &Path,
+    working_dir: &Path,
+    cfg: &config::Config,
+) -> anyhow::Result<()> {
+    let carrier_name = cfg.handoff.as_ref().and_then(|h| h.carrier.as_deref());
+    let carrier = handoff::Carrier::from_config(carrier_name)?;
+    match action {
+        HandoffAction::Export {
+            session,
+            remote,
+            no_push,
+        } => {
+            let remote = (!no_push).then_some(remote.as_str());
+            let report =
+                handoff::export(carrier, sessions_dir, working_dir, session, remote).await?;
+            println!(
+                "exported session {}: {} files, {} ignored files left behind",
+                report.session, report.files, report.ignored_left_behind
+            );
+            println!("  tree ref:   {}", report.tree_ref);
+            println!("  bundle ref: {}", report.bundle_ref);
+            match &report.pushed_to {
+                Some(remote) => println!("  pushed to:  {remote}"),
+                None => println!("  pushed to:  nothing (--no-push)"),
+            }
+            println!(
+                "on the next host, run: modron handoff import {}",
+                report.tree_ref
+            );
+        }
+        HandoffAction::Import {
+            reference,
+            remote,
+            force,
+        } => {
+            let report =
+                handoff::import(sessions_dir, working_dir, &reference, Some(&remote), force)
+                    .await?;
+            println!(
+                "imported session {}: {} files written, {} removed, log has {} events",
+                report.session, report.files_written, report.files_removed, report.events
+            );
+            if report.still_handed_off {
+                println!(
+                    "the session is still handed off from another host; it stays read-only here"
+                );
+            } else {
+                println!("resume with: modron --resume={}", report.session);
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_rewind(
     session: Option<SessionId>,
     sessions_dir: &Path,

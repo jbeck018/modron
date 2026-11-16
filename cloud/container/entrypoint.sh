@@ -27,9 +27,26 @@ else
   git clone --quiet "https://github.com/${REPO}.git" /workspace/repo
 fi
 
+cd /workspace/repo
+
+# Optional handoff import (C6c): HANDOFF_REF is a `modron/handoff/<id>` ref
+# or a session id from `modron handoff export` on another host. The import
+# fetches from origin, so the token is still set for it, then it is dropped.
+if [ -n "${HANDOFF_REF:-}" ]; then
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    basic="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=http.extraHeader \
+    GIT_CONFIG_VALUE_0="Authorization: Basic ${basic}" \
+      modron handoff import "$HANDOFF_REF" --remote origin
+    unset basic
+  else
+    modron handoff import "$HANDOFF_REF" --remote origin
+  fi
+fi
+
 # The agent process must not inherit the token.
 unset GITHUB_TOKEN
-cd /workspace/repo
 
 # Loopback only: nothing listens on a public interface. --bridge sets the
 # relay base for share/publish. --remote-control opens the tunnel at start,
