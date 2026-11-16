@@ -97,3 +97,26 @@ then has to get right.
 
     TMPDIR=/tmp/claude-0/bench-work/tmp ZAI_BASE_URL=http://127.0.0.1:18089/api/coding/paas/v4 ZAI_API_KEY=... \
       modron --provider zai eval --models glm-4.6 --suite edit --edit-tool edit_lines --delay-ms 1500
+
+## Addendum: OpenAI models (2026-11-16)
+
+Same 12 tasks, 3 rounds per arm, through `--provider openai-responses`
+(the chat-completions provider refused GPT-5 models at the time; fixed
+in the same change set). Arms ran concurrently.
+
+| model | arm | passed | tok/task | s/task | edit calls | tool errors |
+|---|---|---|---|---|---|---|
+| gpt-5.5 | edit | 36/36 | 13586 | 7.8 | 38 | 1 |
+| gpt-5.5 | edit_lines | 36/36 | 13644 | 7.6 | 33 | 0 |
+| gpt-5.4-mini | edit | 36/36 | 16078 | 5.7 | 34 | 2 |
+| gpt-5.4-mini | edit_lines | 34/36 | 13247 | 4.8 | 30 | 1 |
+
+Reading: on the strong model the two tools tie (edit_lines made fewer
+calls and no errors; tokens and time equal). On the small model
+edit_lines used about 18 percent fewer tokens but failed
+edit-10-blank-lines twice, the same task the Z.ai model failed every
+round. That task fails only with edit_lines and only on weaker models;
+it is not diagnosed (tool behaviour around blank lines, or the task).
+The recommendation stands: edit stays the default, edit_lines opt-in,
+and edit-10 is the thing to look at before revisiting.
+

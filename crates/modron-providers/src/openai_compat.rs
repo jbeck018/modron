@@ -18,6 +18,8 @@ use modron_core::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// OpenAI-compat provider id ([`ModelProvider::id`]).
@@ -33,6 +35,9 @@ pub struct OpenAiCompatProvider {
     api_key: String,
     base_url: String,
     http: Client,
+    /// Set once a server refused `max_tokens` in favour of
+    /// `max_completion_tokens`; remembered for this instance's lifetime.
+    completion_tokens: AtomicBool,
 }
 
 impl OpenAiCompatProvider {
@@ -44,6 +49,7 @@ impl OpenAiCompatProvider {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             http: build_client()?,
+            completion_tokens: AtomicBool::new(false),
         })
     }
 
@@ -71,6 +77,64 @@ impl OpenAiCompatProvider {
     /// Configured base URL (for diagnostics and factory tests).
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The JSON key that carries the output-token limit: `max_completion_tokens`
+    /// on OpenAI/Azure hosts or once a server has refused `max_tokens`,
+    /// `max_tokens` otherwise.
+    fn token_limit_key(&self) -> &'static str {
+        if self.completion_tokens.load(Ordering::Relaxed)
+            || host_takes_completion_tokens(&self.base_url)
+        {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        }
+    }
+
+    /// The one send path for both transports. The body carries `max_tokens`
+    /// from [`build_body`] and goes out under [`Self::token_limit_key`]. A 400
+    /// that refuses `max_tokens` in favour of `max_completion_tokens` is
+    /// resent once under the new name, and the choice is remembered.
+    async fn send_chat<T, F, Fut>(&self, body: Value, send: F) -> Result<T>
+    where
+        F: Fn(Value) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let key = self.token_limit_key();
+        match send(with_token_key(body.clone(), key)).await {
+            Err(err) if key == "max_tokens" && is_completion_tokens_refusal(&err) => {
+                tracing::info!(
+                    provider = PROVIDER_ID,
+                    "server refused max_tokens; retrying with max_completion_tokens"
+                );
+                self.completion_tokens.store(true, Ordering::Relaxed);
+                send(with_token_key(body, "max_completion_tokens")).await
+            }
+            result => result,
+        }
+    }
+
+    /// One streaming POST: the transport idle deadline plus the shared status
+    /// check (streaming failures arrive as a plain, non-SSE error body).
+    async fn post_stream(&self, url: &str, body: Value) -> Result<reqwest::Response> {
+        let mut request = self.http.post(url).json(&body);
+        if !self.api_key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+        let response = within_idle(PROVIDER_ID, STREAM_IDLE_TIMEOUT, async {
+            request
+                .send()
+                .await
+                .map_err(|err| crate::transport_error(PROVIDER_ID, err))
+        })
+        .await?;
+        check_status(PROVIDER_ID, response).await
+    }
+
+    /// One non-streaming POST returning the parsed JSON body.
+    async fn post_value(&self, url: &str, body: Value) -> Result<Value> {
+        post_json(&self.http, PROVIDER_ID, url, &self.bearer_headers(), &body).await
     }
 
     /// Streaming variant of [`ModelProvider::turn`] — LEDGER item S1
@@ -117,20 +181,9 @@ impl OpenAiCompatProvider {
             "sending streaming turn request"
         );
 
-        let mut request = self.http.post(&url).json(&body);
-        if !self.api_key.is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", self.api_key));
-        }
-        let response = within_idle(PROVIDER_ID, STREAM_IDLE_TIMEOUT, async {
-            request
-                .send()
-                .await
-                .map_err(|err| crate::transport_error(PROVIDER_ID, err))
-        })
-        .await?;
-        // Streaming failures arrive as a plain (non-SSE) error body; the
-        // shared status check maps them to the canonical error text.
-        let response = check_status(PROVIDER_ID, response).await?;
+        let response = self
+            .send_chat(body, |body| self.post_stream(&url, body))
+            .await?;
 
         let mut acc = OaiStreamAccumulator::default();
         drain_sse(
@@ -430,6 +483,42 @@ pub fn build_body(req: &TurnRequest) -> Value {
     body
 }
 
+/// Whether the base URL's host is one that requires `max_completion_tokens`
+/// (OpenAI itself and Azure OpenAI). Every other OpenAI-compatible server
+/// keeps `max_tokens`.
+fn host_takes_completion_tokens(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.openai.com" || host.ends_with(".openai.azure.com"))
+}
+
+/// True for a 400 whose error names `max_tokens` as unsupported and points at
+/// `max_completion_tokens` (OpenAI's `unsupported_parameter` refusal).
+fn is_completion_tokens_refusal(err: &Error) -> bool {
+    let Error::Provider { message, .. } = err else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.starts_with("http 400")
+        && lower.contains("unsupported")
+        && lower.contains("max_tokens")
+        && lower.contains("max_completion_tokens")
+}
+
+/// Rename the body's `max_tokens` key to `key` (no-op for `max_tokens`).
+fn with_token_key(mut body: Value, key: &str) -> Value {
+    if key != "max_tokens" {
+        if let Some(limit) = body
+            .as_object_mut()
+            .and_then(|object| object.remove("max_tokens"))
+        {
+            body[key] = limit;
+        }
+    }
+    body
+}
+
 /// Chat-completions `reasoning_effort` word (H7a): the API knows three
 /// levels, so `xhigh` and `max` both map to `high`.
 fn reasoning_effort_word(effort: modron_core::Effort) -> &'static str {
@@ -594,12 +683,10 @@ impl ModelProvider for OpenAiCompatProvider {
             "sending turn request"
         );
 
-        // POST + status-check + parse is the shared [`post_json`]; the
-        // Bearer header rides only when a key is set (2026-11-12 audit
-        // DRY fix — the inline scaffold was a verbatim twin of the
-        // responses provider's).
-        let headers = self.bearer_headers();
-        let value = post_json(&self.http, PROVIDER_ID, &url, &headers, &body).await?;
+        // POST + parse is the shared [`post_json`] (through `send_chat`).
+        let value = self
+            .send_chat(body, |body| self.post_value(&url, body))
+            .await?;
         let parsed = parse_response(value)?;
         tracing::debug!(
             provider = PROVIDER_ID,
@@ -896,5 +983,221 @@ mod tests {
         // Ollama-style override: base URL carries the version path.
         let overridden = provider.with_base_url("http://localhost:11434/v1");
         assert_eq!(overridden.base_url(), "http://localhost:11434/v1");
+    }
+
+    const REFUSAL: &str = r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}"#;
+    const CHAT_OK: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+    const SSE_OK: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
+
+    fn reply(status_line: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "{status_line}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Loopback chat server: answers each connection with the next canned
+    /// response and records the parsed JSON request body it received.
+    async fn serve_chat(
+        responses: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                        let declared = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if raw.len() >= end + 4 + declared {
+                            break;
+                        }
+                    }
+                }
+                let start = raw
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(raw.len(), |i| i + 4);
+                let body = serde_json::from_slice(&raw[start..]).unwrap_or(Value::Null);
+                recorded.lock().expect("record lock").push(body);
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (addr, seen)
+    }
+
+    #[test]
+    fn completion_tokens_host_rule() {
+        for url in [
+            "https://api.openai.com/v1",
+            "https://API.OpenAI.com/v1",
+            "https://myres.openai.azure.com/openai/v1",
+        ] {
+            assert!(host_takes_completion_tokens(url), "{url}");
+        }
+        for url in [
+            "https://api.openai.com.evil.test/v1",
+            "https://openrouter.ai/api/v1",
+            "https://api.z.ai/api/paas/v4",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:18090/v1",
+            "api.openai.com/v1",
+        ] {
+            assert!(!host_takes_completion_tokens(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn token_limit_key_follows_the_host_and_the_remembered_choice() {
+        let openai = OpenAiCompatProvider::new("k")
+            .unwrap()
+            .with_base_url("https://api.openai.com/v1");
+        assert_eq!(openai.token_limit_key(), "max_completion_tokens");
+        let zai = OpenAiCompatProvider::new("k")
+            .unwrap()
+            .with_base_url("https://api.z.ai/api/paas/v4");
+        assert_eq!(zai.token_limit_key(), "max_tokens");
+        zai.completion_tokens.store(true, Ordering::Relaxed);
+        assert_eq!(zai.token_limit_key(), "max_completion_tokens");
+    }
+
+    #[test]
+    fn with_token_key_renames_only_the_limit() {
+        let body = build_body(&sample_request());
+        let renamed = with_token_key(body.clone(), "max_completion_tokens");
+        assert!(renamed.get("max_tokens").is_none());
+        assert_eq!(renamed["max_completion_tokens"], 8192);
+        let mut expected = body.clone();
+        let object = expected.as_object_mut().unwrap();
+        object.remove("max_tokens");
+        object.insert("max_completion_tokens".into(), json!(8192));
+        assert_eq!(renamed, expected);
+        assert_eq!(with_token_key(body.clone(), "max_tokens"), body);
+    }
+
+    #[test]
+    fn refusal_detection_matches_only_the_max_tokens_400() {
+        let provider_error = |message: &str| Error::Provider {
+            provider: PROVIDER_ID.into(),
+            message: message.into(),
+        };
+        assert!(is_completion_tokens_refusal(&provider_error(&format!(
+            "HTTP 400 Bad Request: {REFUSAL}"
+        ))));
+        for message in [
+            format!("HTTP 429 Too Many Requests: {REFUSAL}"),
+            format!("HTTP 500 Internal Server Error: {REFUSAL}"),
+            "HTTP 400 Bad Request: Unsupported parameter: 'temperature' is not supported with this model.".to_string(),
+            "HTTP 400 Bad Request: max_tokens is too large".to_string(),
+        ] {
+            assert!(!is_completion_tokens_refusal(&provider_error(&message)), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_retries_once_on_refusal_and_remembers() {
+        let (addr, seen) = serve_chat(vec![
+            reply("HTTP/1.1 400 Bad Request", "application/json", REFUSAL),
+            reply("HTTP/1.1 200 OK", "application/json", CHAT_OK),
+            reply("HTTP/1.1 200 OK", "application/json", CHAT_OK),
+        ])
+        .await;
+        let provider = OpenAiCompatProvider::new("")
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let req = std::sync::Arc::new(sample_request());
+        provider
+            .turn(req.clone())
+            .await
+            .expect("retried turn succeeds");
+        provider.turn(req).await.expect("remembered turn succeeds");
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            3,
+            "one refused send, one retry, one more turn"
+        );
+        assert_eq!(bodies[0]["max_tokens"], 8192);
+        assert!(bodies[1].get("max_tokens").is_none());
+        assert_eq!(bodies[1]["max_completion_tokens"], 8192);
+        assert!(bodies[2].get("max_tokens").is_none());
+        assert_eq!(bodies[2]["max_completion_tokens"], 8192);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_other_400s_are_not_retried() {
+        let other =
+            r#"{"error":{"message":"Invalid value for 'temperature'.","param":"temperature"}}"#;
+        let (addr, seen) = serve_chat(vec![reply(
+            "HTTP/1.1 400 Bad Request",
+            "application/json",
+            other,
+        )])
+        .await;
+        let provider = OpenAiCompatProvider::new("")
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let err = provider
+            .turn(std::sync::Arc::new(sample_request()))
+            .await
+            .expect_err("an unrelated 400 is an error");
+        assert!(err.to_string().contains("HTTP 400"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "no retry");
+        assert_eq!(provider.token_limit_key(), "max_tokens");
+    }
+
+    #[tokio::test]
+    async fn streaming_retries_once_on_refusal_and_remembers() {
+        let (addr, seen) = serve_chat(vec![
+            reply("HTTP/1.1 400 Bad Request", "application/json", REFUSAL),
+            reply("HTTP/1.1 200 OK", "text/event-stream", SSE_OK),
+            reply("HTTP/1.1 200 OK", "text/event-stream", SSE_OK),
+        ])
+        .await;
+        let provider = OpenAiCompatProvider::new("")
+            .unwrap()
+            .with_base_url(format!("http://{addr}/v1"));
+        let req = sample_request();
+        for _ in 0..2 {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let parsed = provider
+                .turn_streaming_inner(&req, tx)
+                .await
+                .expect("streamed turn succeeds");
+            assert_eq!(parsed.text, "ok");
+        }
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0]["max_tokens"], 8192);
+        assert_eq!(bodies[1]["max_completion_tokens"], 8192);
+        assert!(bodies[1].get("max_tokens").is_none());
+        assert_eq!(bodies[2]["max_completion_tokens"], 8192);
+        assert_eq!(bodies[2]["stream"], true);
+        assert!(bodies[2].get("max_tokens").is_none());
     }
 }

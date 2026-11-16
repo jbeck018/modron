@@ -310,7 +310,7 @@ written by `modron auth set` (and by `/auth` in the app) are kept in
 | Provider id | Key | Base URL override | Default endpoint |
 |---|---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | Anthropic Messages API |
-| `openai-compat` | `OPENAI_API_KEY` (optional when `OPENAI_BASE_URL` is set) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`; a custom base URL makes the key optional, for keyless local servers such as Ollama |
+| `openai-compat` | `OPENAI_API_KEY` (optional when `OPENAI_BASE_URL` is set) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`; a custom base URL makes the key optional, for keyless local servers such as Ollama. The output limit is sent as `max_completion_tokens` on `api.openai.com` and Azure OpenAI hosts, and as `max_tokens` elsewhere; a server that refuses `max_tokens` with a `max_completion_tokens` hint is retried once and the choice is kept for the session |
 | `zai` | `ZAI_API_KEY` | `ZAI_BASE_URL` | `https://api.z.ai/api/paas/v4` |
 | `openai-responses` | `OPENAI_API_KEY` (required) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`, path `/responses`. The OpenAI Responses API with a plain API key: same request and stream code as `chatgpt`, reasoning items replayed; no ChatGPT account header, no token refresh. Its reasoning blocks are scoped to this provider id, separate from `chatgpt` |
 | `chatgpt` | none; uses a stored ChatGPT sign-in | none | ChatGPT backend |
