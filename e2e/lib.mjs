@@ -165,7 +165,9 @@ export function copyApp() {
 
 // ---- modron serve ----------------------------------------------------------
 
-export async function startServe(name, { bridgeWs, hostToken, config } = {}) {
+// remoteControl: a bridge ws(s) URL; the serve opens its tunnel at start
+// (--remote-control) and writes the share URL to shareUrlFile (returned).
+export async function startServe(name, { bridgeWs, hostToken, config, remoteControl } = {}) {
   const home = join(SCRATCH, 'h-' + name);
   const work = join(home, 'w');
   mkdirSync(join(work, '.modron'), { recursive: true }); // remote-control needs a project marker
@@ -181,9 +183,11 @@ export async function startServe(name, { bridgeWs, hostToken, config } = {}) {
   const log = join(SCRATCH, `serve-${name}.log`);
   const args = ['serve', '--listen', `127.0.0.1:${port}`, '--provider', 'mock', '--working-dir', work];
   if (bridgeWs) args.push('--bridge', bridgeWs);
+  const shareUrlFile = remoteControl ? join(home, 'share-url') : null;
+  if (remoteControl) args.push('--remote-control', remoteControl, '--share-url-file', shareUrlFile);
   spawnLogged('serve-' + name, MODRON, args, { cwd: work, env, log });
   await waitUntil(() => portOpen(port), 60000, `serve ${name} listening (log ${log})`);
-  return { name, port, ws: `ws://127.0.0.1:${port}`, log };
+  return { name, port, ws: `ws://127.0.0.1:${port}`, log, shareUrlFile };
 }
 
 // ---- local protocol client (the test drives serve like a TUI would) -------

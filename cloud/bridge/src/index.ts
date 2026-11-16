@@ -85,6 +85,13 @@ interface Env {
   // Test-only (set by test/portal.mjs, never in a deployment): accepts a
   // ttl_seconds field on POST /api/invites so expiry can be tested quickly.
   MODRON_TEST_HOOKS?: string;
+  // Web push (src/push.ts, README "Web push"). All three unset: /api/push/*
+  // answers 503 and nothing else changes. PUSH_TEST_ORIGIN is honoured only
+  // with MODRON_TEST_HOOKS (the e2e and test/push.mjs fake push service).
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
+  VAPID_SUBJECT?: string;
+  PUSH_TEST_ORIGIN?: string;
 }
 
 // constantTimeEquals (publish token, owner token, invite signatures) lives in
@@ -127,6 +134,14 @@ interface RegistryEntry {
 import { DurableObject } from "cloudflare:workers";
 import { Directory } from "./directory";
 import {
+  PUSH_WORKER,
+  importVapid,
+  parseNotify,
+  pushEndpointAllowed,
+  sendPush,
+  validSubscriptionKeys,
+} from "./push";
+import {
   KEY_RE,
   OWNER_COOKIE,
   TICKET_RE,
@@ -145,6 +160,7 @@ import {
   randomHex,
   readCookie,
   readJsonObject,
+  sessionOpenUrl,
   sessionView,
   sha256Hex,
 } from "./portal";
@@ -545,10 +561,54 @@ export class SessionBridge extends DurableObject {
       await this.state.storage.put("seen:agent", Date.now());
       return;
     }
+    // A Notify (docs/PROTOCOL_V2.md section 6) also becomes a Web Push for
+    // the subscribed devices. It runs in the background; the relay never waits.
+    // Not awaited, and not handed to waitUntil: with push off the call is
+    // skipped outright, so the relay path is unchanged.
+    if (pushConfigured(this.env) && message.length <= MAX_FRAME && message.includes('"notify"')) {
+      void this.pushNotify(message).catch((e: unknown) => {
+        console.error("web push: notify not sent:", e instanceof Error ? e.name : "error");
+      });
+    }
     if (message.length <= MAX_FRAME) {
       await this.appendAgentFrame(message).catch(() => { /* storage hiccup - still fan out live */ });
     }
     for (const viewer of this.viewers()) { try { viewer.send(message); } catch { /* gone */ } }
+  }
+
+  // Web Push for one Notify frame. At most one push per kind every
+  // PUSH_MIN_GAP_MS for this session; a 404 or 410 from the push service
+  // removes that subscription. Endpoints and keys are never logged.
+  async pushNotify(message: string): Promise<void> {
+    const env = this.env;
+    if (!pushConfigured(env)) return;
+    const note = parseNotify(message);
+    if (!note) return;
+    const now = Date.now();
+    const gate = "push:" + note.kind;
+    const last = (await this.state.storage.get<number>(gate)) ?? 0;
+    if (now - last < PUSH_MIN_GAP_MS) return;
+    const targets = await directory(env).pushTargets(note.session, now);
+    if (targets.subs.length === 0) return;
+    await this.state.storage.put(gate, now);
+    const keys = await importVapid(env.VAPID_PUBLIC_KEY!, env.VAPID_PRIVATE_KEY!, env.VAPID_SUBJECT!);
+    const testOrigin = testPushOrigin(env);
+    for (const sub of targets.subs) {
+      if (!pushEndpointAllowed(sub.endpoint, testOrigin)) continue;
+      const url = targets.session
+        ? sub.origin + sessionOpenUrl(sub.origin.replace(/^http/, "ws"), targets.session.viewer_key)
+        : sub.origin + "/app/";
+      const payload = JSON.stringify({ title: targets.session?.title ?? "modron", body: note.text, data: { url } });
+      let status: number;
+      try {
+        status = await sendPush(sub.endpoint, sub, payload, keys, now);
+      } catch (e) {
+        // Names only: the endpoint and the keys never reach the log.
+        console.error("web push: send failed:", e instanceof Error ? e.name : "error");
+        continue;
+      }
+      if (status === 404 || status === 410) await directory(env).deletePushSubscription(sub.id);
+    }
   }
 
   appendAgentFrame(text: string): Promise<void> {
@@ -861,6 +921,85 @@ function withGrant(request: Request, role: string | null): Request {
   return new Request(request, { headers });
 }
 
+// --- web push: /api/push/key, /api/push/subscribe (README "Web push") ---
+
+const PUSH_MIN_GAP_MS = 10 * 1000;
+
+function pushConfigured(env: Env): boolean {
+  return Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY && env.VAPID_SUBJECT);
+}
+
+// The test origin for fake push services, honoured only under MODRON_TEST_HOOKS.
+function testPushOrigin(env: Env): string | undefined {
+  return env.MODRON_TEST_HOOKS ? env.PUSH_TEST_ORIGIN : undefined;
+}
+
+// Who may use the push routes: the owner cookie (every session), or an
+// approver invite (its own session only). Viewer invites and no credential
+// are refused. The returned scope is the session id, or null for the owner.
+async function pushGrant(request: Request, env: Env, invite: string | null): Promise<{ scope: string | null } | Response> {
+  if (await ownerCookieLive(request, env)) return { scope: null };
+  if (invite === null) return plainResponse(401, "unauthorized");
+  const parsed = parseInviteToken(invite);
+  if (!parsed) return plainResponse(403, "invite is not valid");
+  const expected = await inviteSignature(env.OWNER_TOKEN ?? "", parsed.id);
+  if (!constantTimeEquals(expected, parsed.sig)) return plainResponse(403, "invite is not valid");
+  const row = await directory(env).activeInvite(parsed.id, requestNow(request, env));
+  if (!row) return plainResponse(410, "invite is not valid");
+  if (row.role !== "approver") return plainResponse(403, "only owners and approver invites may subscribe");
+  return { scope: row.session_id };
+}
+
+// GET /api/push/key[?invite=]: the VAPID public key the browser subscribes with.
+async function handlePushKey(request: Request, env: Env): Promise<Response> {
+  if (!pushConfigured(env)) return plainResponse(503, "web push is not configured");
+  if (request.method !== "GET") return plainResponse(405, "method not allowed");
+  const grant = await pushGrant(request, env, new URL(request.url).searchParams.get("invite"));
+  if (grant instanceof Response) return grant;
+  return jsonResponse(200, { key: env.VAPID_PUBLIC_KEY });
+}
+
+// POST /api/push/subscribe { endpoint, keys: { p256dh, auth }, invite? } and
+// DELETE /api/push/subscribe { endpoint, invite? }. Stored in the Directory
+// under a SHA-256 of the endpoint.
+async function handlePushSubscribe(request: Request, env: Env): Promise<Response> {
+  if (!pushConfigured(env)) return plainResponse(503, "web push is not configured");
+  if (request.method !== "POST" && request.method !== "DELETE") return plainResponse(405, "method not allowed");
+  const parsed = await readJsonObject(request, ["endpoint", "keys", "invite"]);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  if (typeof body.endpoint !== "string") return plainResponse(400, "endpoint must be a string");
+  if (body.invite !== undefined && typeof body.invite !== "string") return plainResponse(400, "invite must be a string");
+  const grant = await pushGrant(request, env, typeof body.invite === "string" ? body.invite : null);
+  if (grant instanceof Response) return grant;
+  const id = await sha256Hex(body.endpoint);
+  if (request.method === "DELETE") {
+    await directory(env).deletePushSubscription(id);
+    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+  }
+  if (!pushEndpointAllowed(body.endpoint, testPushOrigin(env))) {
+    return plainResponse(400, "endpoint is not a supported push service");
+  }
+  const keys = body.keys;
+  if (keys === null || typeof keys !== "object" || Array.isArray(keys)) return plainResponse(400, "keys must be an object");
+  const k = keys as Record<string, unknown>;
+  if (Object.keys(k).some((f) => f !== "p256dh" && f !== "auth")) return plainResponse(400, "unknown key field");
+  if (typeof k.p256dh !== "string" || typeof k.auth !== "string" || !validSubscriptionKeys(k.p256dh, k.auth)) {
+    return plainResponse(400, "keys must hold a p256dh point and an auth secret");
+  }
+  await directory(env).upsertPushSubscription({
+    id,
+    endpoint: body.endpoint,
+    origin: new URL(request.url).origin,
+    p256dh: k.p256dh,
+    auth: k.auth,
+    role: grant.scope === null ? "owner" : "approver",
+    session_id: grant.scope,
+    created_at: requestNow(request, env),
+  });
+  return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+}
+
 const router: ExportedHandler<Env> = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -888,6 +1027,17 @@ const router: ExportedHandler<Env> = {
       }
     }
     if (path === "/") return new Response("modron remote-control bridge - open a /s/<key> share link from modron");
+    // The web push receiver (README "Web push"). Served here, not from the
+    // bundle, so the bundle needs no extra file. Revalidated on every load.
+    if (path === "/app/sw.js" && (request.method === "GET" || request.method === "HEAD")) {
+      return new Response(request.method === "HEAD" ? null : PUSH_WORKER, {
+        headers: {
+          "content-type": "application/javascript; charset=utf-8",
+          "cache-control": "no-cache",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
     // The unified web app (static assets). Anything not in the bundle is a
     // plain 404 from the assets binding.
     if (path === "/app" || path.startsWith("/app/")) {
@@ -921,6 +1071,8 @@ const router: ExportedHandler<Env> = {
     if ((m = path.match(/^\/i\/([^/]+)$/)) && request.method === "GET") {
       return handleInviteLink(request, env, m[1]);
     }
+    if (path === "/api/push/key") return handlePushKey(request, env);
+    if (path === "/api/push/subscribe") return handlePushSubscribe(request, env);
     if (path.startsWith("/api/")) return plainResponse(404, "not found");
     // The agent tunnel: /agent/<agent key>, routed to the DO named by the
     // derived viewer key (see viewerKeyOf). With HOST_TOKEN set, the bearer

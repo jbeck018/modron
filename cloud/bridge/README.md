@@ -126,8 +126,9 @@ Design: `docs/PORTAL.md`. Step 1 of that plan is in this Worker: the
 secrets, the `Directory` object, owner sign-in, host registration,
 `/api/sessions`, `/api/me`, invite links, role enforcement on viewer sockets,
 the app's sessions screen (the list opens each session through `open_url`),
-and heartbeat-based staleness and removal (see "Staleness" below). Still to
-come: linked GitHub accounts (C4e), web push (C5), and passkeys (v2).
+and heartbeat-based staleness and removal (see "Staleness" below), and web
+push (see "Web push" below). Still to come: linked GitHub accounts (C4e) and
+passkeys (v2).
 
 ### Secrets
 
@@ -304,6 +305,71 @@ Expiry: invites are normally at least one hour (`ttl_hours`). With
 `MODRON_TEST_HOOKS=1` (set only by the test, never in a deployment)
 `POST /api/invites` also accepts `ttl_seconds` (1 to 3600), and the test waits
 about 2.2 seconds for a one-second invite to lapse.
+
+## Web push (approvals, plans, finished runs)
+
+Notify frames (docs/PROTOCOL_V2.md section 6: `approval`, `plan`, `done`,
+`failed`, `wake`) from a serve become Web Push messages for the devices
+subscribed to that session. The bridge forwards the frame unchanged to the
+viewers, and in the background it sends one push per subscription:
+
+- Payload (JSON, encrypted with RFC 8291 aes128gcm): `title` (the session
+  title, or `modron` when the session is not registered), `body` (the Notify
+  text exactly as the server wrote it: tool names only, never arguments),
+  and `data.url` (the session's portal URL, `<origin>/app/?url=...`).
+- Headers: `Authorization: vapid t=<ES256 JWT>, k=<public key>` (RFC 8292,
+  12 hour token), `TTL: 300`, `Urgency: high`.
+- At most one push per session and kind every 10 seconds (approval bursts
+  collapse to the first one).
+- A 404 or 410 from the push service deletes that subscription.
+- Only https endpoints on fcm.googleapis.com, updates.push.services.mozilla.com,
+  `*.push.apple.com` and `*.notify.windows.com` are accepted (400 otherwise).
+  Endpoints and keys are never logged.
+
+Secrets (Wrangler secrets, unset means `/api/push/*` answers 503 and nothing
+else changes):
+
+```sh
+npx wrangler secret put VAPID_PUBLIC_KEY    # base64url, 65-byte P-256 point
+npx wrangler secret put VAPID_PRIVATE_KEY   # base64url, 32-byte scalar
+npx wrangler secret put VAPID_SUBJECT       # mailto:you@example.com or https://...
+```
+
+Generate the pair once with Node (WebCrypto, no packages), then store the two
+printed values with `wrangler secret put`:
+
+```sh
+node -e 'crypto.subtle.generateKey({name:"ECDSA",namedCurve:"P-256"},true,["sign","verify"]).then(async k=>{const j=await crypto.subtle.exportKey("jwk",k.privateKey);const pub=Buffer.concat([Buffer.from([4]),Buffer.from(j.x,"base64url"),Buffer.from(j.y,"base64url")]);console.log("VAPID_PUBLIC_KEY="+pub.toString("base64url"));console.log("VAPID_PRIVATE_KEY="+j.d)})'
+```
+
+Routes (owner cookie, or an approver invite for its own session; viewer
+invites and no credential are refused, 401 without a credential, 403 for a
+viewer invite):
+
+| Route | Result |
+|---|---|
+| `GET /api/push/key[?invite=<id>.<sig>]` | 200 `{ "key": <VAPID_PUBLIC_KEY> }`; 503 when VAPID is unset |
+| `POST /api/push/subscribe` `{ endpoint, keys: { p256dh, auth }, invite? }` | 204; stored by a SHA-256 of the endpoint. An owner subscription gets every session; an approver invite gets its own session only |
+| `DELETE /api/push/subscribe` `{ endpoint, invite? }` | 204, idempotent |
+| `GET /app/sw.js` | the push receiver (show the push, a tap focuses or opens the session). Served by the Worker, so the bundle needs no extra file. No caching, no fetch handler |
+
+Storage: the Directory's `push_subscriptions` table (additive; no new binding).
+
+Test-only: `PUSH_TEST_ORIGIN` (a fake push service on 127.0.0.1) is honoured
+only with `MODRON_TEST_HOOKS=1`, like the clock hook.
+
+Tests (no Cloudflare account; real push services cannot be reached from
+tests, so the push service is a local fake):
+
+```sh
+node --experimental-strip-types --no-warnings test/push-unit.mjs  # RFC 8291 section 5 and appendix A, RFC 8292 example, allow-list, notify parsing
+node test/push.mjs   # wrangler dev x2: routes and their refusals, delivery and decryption, rate limit, 410 removal, 503 without VAPID
+```
+
+Not done: the web app's control (subscribe and unsubscribe from the
+settings screen), the iOS Home Screen hint, and the rule in docs/PORTAL.md
+that skips the owner's push while an owner socket is attached. The bridge
+sends for every Notify it sees, rate limited as above.
 
 ## Protocol notes
 

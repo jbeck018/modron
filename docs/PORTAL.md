@@ -73,10 +73,13 @@ renders the list and opens `/app/?url=wss://host/ws/<viewer key>`.
 
 ## Notifications (C5)
 
-The session object turns `notify` frames into Web Push for the owner's
-registered devices when no owner socket is attached (VAPID keys as Worker
-secrets; subscriptions in the Directory). Approval pushes carry the tool
-name only.
+Status (PUSH-1): the bridge side is built (cloud/bridge/README.md "Web
+push"): every Notify frame from a serve becomes a Web Push for the owner's
+subscribed devices, and for approver invites on their session. VAPID keys
+are Worker secrets; subscriptions live in the Directory. Approval pushes carry
+the tool name only. Not yet: the web app's subscribe control and the iOS
+Home Screen hint. Not yet: skipping the push while an owner socket is
+attached, which this design intends.
 
 ## Order of work
 
@@ -99,3 +102,11 @@ itself: a tunnel starts only when a client sends `remote_control` for a live
 session. The container's runtime secrets are the Worker secrets listed in
 `cloud/container/README.md`; `HOST_TOKEN` on the bridge must equal the
 `MODRON_HOST_TOKEN` the container receives. Nothing is deployed by CI on push.
+
+Presence survives drops: a tunnel (however it was opened) redials with backoff
+(1 s doubling to 60 s, jittered, reset after a 30 s connection) on the same
+share key, re-registers its directory entry on each new connection, and stops
+only when the session is deleted, the tunnel is stopped, or the server shuts
+down. A 401 or 403 from the bridge is never retried (see docs/remote-control.md).
+The redial state is logged, not sent to clients: the portal has no
+remote-control status field yet.

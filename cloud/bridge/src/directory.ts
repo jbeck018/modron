@@ -49,6 +49,17 @@ export type InviteRow = {
   uses: number;
 };
 
+export type PushRow = {
+  id: string;
+  endpoint: string;
+  origin: string;
+  p256dh: string;
+  auth: string;
+  role: "owner" | "approver";
+  session_id: string | null;
+  created_at: number;
+};
+
 export type IssuedTicket = { ticket: string; viewer_key: string; role: Role };
 
 export class Directory extends DurableObject<object> {
@@ -89,6 +100,18 @@ export class Directory extends DurableObject<object> {
         ip TEXT PRIMARY KEY,
         window_start INTEGER NOT NULL,
         attempts INTEGER NOT NULL)`);
+      // Web Push subscriptions (src/push.ts). id = SHA-256 of the endpoint.
+      // session_id NULL = the owner's device (every session); otherwise an
+      // approver's invite covers that one session.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id TEXT PRIMARY KEY,
+        endpoint TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        role TEXT NOT NULL,
+        session_id TEXT,
+        created_at INTEGER NOT NULL)`);
     });
   }
 
@@ -221,5 +244,39 @@ export class Directory extends DurableObject<object> {
     this.sql.exec("DELETE FROM tickets WHERE ticket = ?", ticket);
     if (!row || row.viewer_key !== viewerKey || row.expires_at <= now) return null;
     return row.role;
+  }
+
+  // --- web push ---
+
+  // The invite as it stands now: null when unknown, revoked or expired.
+  async activeInvite(inviteId: string, now: number): Promise<InviteRow | null> {
+    const invite = this.sql.exec<InviteRow>("SELECT * FROM invites WHERE id = ?", inviteId).toArray()[0];
+    if (!invite || invite.revoked !== 0 || invite.expires_at <= now) return null;
+    return invite;
+  }
+
+  async upsertPushSubscription(row: PushRow): Promise<void> {
+    this.sql.exec(
+      `INSERT OR REPLACE INTO push_subscriptions (id, endpoint, origin, p256dh, auth, role, session_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      row.id, row.endpoint, row.origin, row.p256dh, row.auth, row.role, row.session_id, row.created_at,
+    );
+  }
+
+  async deletePushSubscription(id: string): Promise<boolean> {
+    const existed = this.sql.exec("SELECT 1 AS one FROM push_subscriptions WHERE id = ?", id).toArray().length > 0;
+    this.sql.exec("DELETE FROM push_subscriptions WHERE id = ?", id);
+    return existed;
+  }
+
+  // Everything a Notify for `sessionId` needs: the session row (title and
+  // viewer key, when registered) and every subscription that covers it.
+  async pushTargets(sessionId: string, now: number): Promise<{ session: SessionRow | null; subs: PushRow[] }> {
+    this.sweepSessions(now);
+    const session = this.sql.exec<SessionRow>("SELECT * FROM sessions WHERE id = ?", sessionId).toArray()[0] ?? null;
+    const subs = this.sql
+      .exec<PushRow>("SELECT * FROM push_subscriptions WHERE session_id IS NULL OR session_id = ?", sessionId)
+      .toArray();
+    return { session, subs };
   }
 }

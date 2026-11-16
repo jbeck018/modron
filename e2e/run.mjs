@@ -1,7 +1,8 @@
 // Packet E2E: real `modron serve` (mock provider) -> real bridge Worker
 // (wrangler dev --local) -> real web app in headless Chromium.
 // Run:  node /home/user/modron/e2e/run.mjs      (see e2e/README.md)
-import { randomBytes } from 'node:crypto';
+import { createDecipheriv, createECDH, createVerify, generateKeyPairSync, hkdfSync, randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,7 +10,7 @@ import {
   freePort, MODRON, REPO, Local, SCRATCH, api, bodyText, clickContains, clickText, copyApp, inviteUrlIn,
   killEverything, taggedCount, launchBrowser, liveCount, newestMtime, openViewer, ownerCookie, ownerCookieFrom, refused, sleep,
   shot, snapshotViewer, startBridge, startServe, stopProc, tail, toHttp, typeAndSend, waitBody,
-  waitUntil, wsFrames,
+  waitPastPromptGuard, waitUntil, wsFrames,
 } from './lib.mjs';
 
 const hex = () => randomBytes(16).toString('hex');
@@ -511,6 +512,46 @@ await scenario('P4', 'offline marking: a stopped serve is listed offline and can
   await pOwner.page.unroute('**/api/sessions').catch(() => {});
 });
 
+// ---- R1: remote control at start (serve --remote-control, no client) --------
+// The serve opens its own tunnel: no client sends remote_control. The session
+// shows in the owner's portal list, and the owner's browser opens it and runs
+// a task (approvals answered in the browser).
+await scenario('R1', 'serve --remote-control opens the tunnel with no client; browser runs a task', async (s) => {
+  const rb = track(bridges, await startBridge('remote-flag', { OWNER_TOKEN: OWNER, HOST_TOKEN: HOST }));
+  const sr = track(serves, await startServe('r1', { remoteControl: rb.ws, hostToken: HOST }));
+  await soft(s, waitUntil(() => existsSync(sr.shareUrlFile), 60000, 'share url file'), 'serve wrote no share url file');
+  const share = existsSync(sr.shareUrlFile) ? readFileSync(sr.shareUrlFile, 'utf8').trim() : '';
+  s.check(share.startsWith(rb.base + '/s/'), `share url is not the bridge's viewer page: ${share}`);
+  s.check(tail(sr.log, 400).includes('remote control open'), 'serve did not log that remote control opened');
+
+  const cookie = await soft(s, ownerCookie(rb.base, OWNER), 'owner sign-in failed');
+  if (!cookie) return;
+  const row = await soft(s, waitUntil(async () => {
+    const r = await api(rb.base, cookie, 'GET', '/api/sessions');
+    return Array.isArray(r.json) ? r.json.find((x) => x.online === true) || null : null;
+  }, 60000, 'an online session in /api/sessions'), 'the serve never listed its session in the portal');
+  if (!row) return;
+  // openViewer takes the cookie as an object; `cookie` is "modron_owner=<value>".
+  const ownerCk = { name: 'modron_owner', value: cookie.slice(cookie.indexOf('=') + 1), url: rb.base };
+  const v = track(viewers, await openViewer(browser, rb.base + '/', 'owner-r1', ownerCk));
+  await soft(s, waitBody(v, (t) => t.includes(row.title) && t.includes('online'), 40000, 'session row online'),
+    'the portal list does not show the serve session as online');
+  await soft(s, clickContains(v, row.title).then(() =>
+    waitBody(v, (t) => t.includes('connected'), 30000, 'connected')), 'the browser did not open the session');
+
+  await soft(s, typeAndSend(v, 'e2e flag task').then(() => waitUntil(async () => {
+    const t = await bodyText(v);
+    if (t.includes('Demo complete.')) return true;
+    if (t.includes('allow once')) {
+      await waitPastPromptGuard(v);
+      await clickText(v, 'allow once').catch(() => {});
+    }
+    return null;
+  }, 120000, 'task finished in the browser')), 'the browser task did not finish');
+  await soft(s, waitBody(v, (t) => t.includes('e2e flag task'), 20000, 'task row'), 'task row not shown');
+  await shot(v, 'r1-owner');
+});
+
 // ---- W: workflow steps against a real serve (fresh serve per step) ----------
 // Each W step starts its own serve so the mock script (scripted tool turns
 // are consumed once per process) begins at its first turn. The steps run as
@@ -533,6 +574,102 @@ async function sharedSession(name, title, extra = {}) {
   await waitBody(vw, (t) => t.includes('connected'), 30000, 'connected').catch(() => {});
   return { sv, lx, sid, vw };
 }
+
+// P5 -------------------------------------------------------------------------
+// Web push (cloud/bridge/README.md "Web push"): an approval request from a
+// real serve becomes a push to a subscribed endpoint through the local bridge.
+// The push service is a fake on 127.0.0.1 (PUSH_TEST_ORIGIN, honoured only
+// under MODRON_TEST_HOOKS). The body is decrypted here with node:crypto and
+// must read exactly as the serve wrote it: "approval needed: <tool>".
+function decryptPush(body, ua, auth) {
+  const idlen = body[20];
+  const asPub = body.subarray(21, 21 + idlen);
+  const ct = body.subarray(21 + idlen);
+  const ikm = Buffer.from(hkdfSync('sha256', ua.computeSecret(asPub), auth,
+    Buffer.concat([Buffer.from('WebPush: info\0'), ua.getPublicKey(), asPub]), 32));
+  const salt = body.subarray(0, 16);
+  const cek = Buffer.from(hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: aes128gcm\0'), 16));
+  const nonce = Buffer.from(hkdfSync('sha256', ikm, salt, Buffer.from('Content-Encoding: nonce\0'), 12));
+  const d = createDecipheriv('aes-128-gcm', cek, nonce);
+  d.setAuthTag(ct.subarray(ct.length - 16));
+  const padded = Buffer.concat([d.update(ct.subarray(0, ct.length - 16)), d.final()]);
+  return padded.subarray(0, padded.length - 1).toString('utf8');
+}
+
+await scenario('P5', 'web push: a serve approval request reaches the subscribed endpoint, encrypted, with the exact text', async (s) => {
+  const posts = [];
+  const fakePush = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      posts.push({ url: req.url, headers: req.headers, body: Buffer.concat(chunks) });
+      res.writeHead(201);
+      res.end();
+    });
+  });
+  await new Promise((r) => fakePush.listen(0, '127.0.0.1', r));
+  try {
+    const pushOrigin = `http://127.0.0.1:${fakePush.address().port}`;
+    const vapid = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const vj = vapid.publicKey.export({ format: 'jwk' });
+    const vpub = Buffer.concat([Buffer.from([4]), Buffer.from(vj.x, 'base64url'), Buffer.from(vj.y, 'base64url')]).toString('base64url');
+    const vpriv = vapid.privateKey.export({ format: 'jwk' }).d;
+    const owner5 = hex();
+    const host5 = hex();
+    const pushB = track(bridges, await startBridge('push', {
+      OWNER_TOKEN: owner5, HOST_TOKEN: host5, VAPID_PUBLIC_KEY: vpub, VAPID_PRIVATE_KEY: vpriv,
+      VAPID_SUBJECT: 'https://modron.example.invalid', PUSH_TEST_ORIGIN: pushOrigin, MODRON_TEST_HOOKS: '1',
+    }));
+    const cookie5 = await ownerCookie(pushB.base, owner5);
+    const key = await api(pushB.base, cookie5, 'GET', '/api/push/key');
+    s.check(key.status === 200 && key.json.key === vpub, `key route answered ${key.status}`);
+    const ua = createECDH('prime256v1');
+    ua.generateKeys();
+    const auth = randomBytes(16);
+    const sub = await api(pushB.base, cookie5, 'POST', '/api/push/subscribe', {
+      endpoint: pushOrigin + '/push/p5',
+      keys: { p256dh: ua.getPublicKey().toString('base64url'), auth: auth.toString('base64url') },
+    });
+    s.check(sub.status === 204, `subscribe answered ${sub.status}`);
+
+    // hostToken: the serve registers its session, so the push carries the title and the portal URL.
+    const sp = track(serves, await startServe('p5push', { bridgeWs: pushB.ws, hostToken: host5 }));
+    const l5 = track(locals, new Local(sp));
+    await l5.connect();
+    const sid5 = await l5.newSession('e2e push');
+    await l5.rc(sid5, pushB.ws); // the tunnel carries the Notify frames to the bridge
+    const from = l5.frames.length;
+    await l5.run('e2e push task', sid5);
+    const req = await soft(s, l5.waitFor((f) => f.type === 'approval_requested' && f.session === sid5, 60000,
+      'approval_requested', from), 'the task never reached an approval');
+    const pushed = await waitUntil(() => posts.length > 0, 30000, 'push POST').catch(() => false);
+    s.check(Boolean(pushed), 'no push reached the subscribed endpoint through the bridge');
+    const post = posts[0];
+    if (post) {
+      s.check(post.url === '/push/p5', `push went to ${post.url}`);
+      s.check(post.headers['content-encoding'] === 'aes128gcm', 'push body is not aes128gcm');
+      const auth0 = String(post.headers.authorization || '');
+      const m = /^vapid t=([^,]+), k=(\S+)$/.exec(auth0);
+      s.check(Boolean(m) && m[2] === vpub, 'VAPID authorization header is missing or names another key');
+      if (m) {
+        const [h, p, sig] = m[1].split('.');
+        const claims = JSON.parse(Buffer.from(p, 'base64url').toString());
+        s.check(claims.aud === pushOrigin, `VAPID aud was ${claims.aud}`);
+        s.check(createVerify('SHA256').update(h + '.' + p).verify({ key: vapid.publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(sig, 'base64url')),
+          'VAPID JWT does not verify under the public key');
+      }
+      const payload = JSON.parse(decryptPush(post.body, ua, auth));
+      const expected = 'approval needed: ' + (req?.call?.name ?? '?');
+      s.check(payload.body === expected, `push body was "${payload.body}", expected "${expected}"`);
+      s.check(payload.title === 'e2e push', `push title was "${payload.title}"`);
+      s.check(String(payload.data?.url || '').startsWith(pushB.base + '/app/?url='), `push URL was ${payload.data?.url}`);
+    }
+    if (req) l5.approve(req.request_id);
+    l5.setAuto(true);
+  } finally {
+    fakePush.close();
+  }
+});
 
 await scenario('W1', 'steer and queue from the browser while an approval waits', async (s) => {
   const { lx, sid, vw } = await sharedSession('w1', 'e2e w1');

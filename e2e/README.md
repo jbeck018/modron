@@ -45,6 +45,8 @@ processes` in the summary must be 0.
 | P2 | Owner types a task in the portal session; the approval is answered in the browser; the run finishes. Needs P1 (same browser). |
 | P3 | Owner creates a viewer invite in Settings; a fresh context (no cookies) sees the transcript and cannot submit (`forbidden`); after Revoke, the same invite URL answers 410 and shows "invite is not valid". Needs P2. |
 | P4 | The serve is stopped; the bridge's test clock (`x-test-now`, `MODRON_TEST_HOOKS=1`, added by the page through `route`) is six minutes ahead; the session row shows offline and a press does not open it. Needs P2. |
+| R1 | `serve --remote-control` against the bridge with its own portal, NO client sends `remote_control`: the share-url file is written, the session shows online in the owner's portal list, the owner's browser opens it and runs a task (approval answered in the browser). Independent of the other steps. |
+| P5 | Web push: a serve's approval request (registered session) reaches a subscribed endpoint on a fake push service through the local bridge; the body decrypts (RFC 8291, node:crypto) to `approval needed: <tool>`, the title is the session title, and the VAPID JWT verifies. Own bridge with VAPID secrets and `PUSH_TEST_ORIGIN`; needs no other step. |
 | W1 | Steer (send while an approval waits) and queue (Alt+Enter); queue chip; the queued message starts its own run. |
 | W2 | `/plan`: the engine refuses gated tools (`plan phase: read-only`); no approval asked; `/build` returns. The mock never proposes a plan. |
 | W3 | Settings: effort and approval mode change; the server echoes them; the status line shows them. |
