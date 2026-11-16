@@ -402,3 +402,53 @@ crates/modron-desktop are deleted.
   when the NSH app lands (one codebase, divergence by target only).
 
 Packet-level status and evidence: LEDGER.md, "Program U".
+
+### 10.7 Design: thinking-block replay (H7b-2)
+
+Finding first: the session log is already append-only (JSONL, one
+SessionEvent per line; compaction, steering, tasks and private shell all
+append; nothing rewrites a session file). So no storage rewrite is
+needed; the work is carrying provider blocks through the message model.
+
+Rules:
+
+1. Shape. `Message` gains one additive field, `provider_blocks`
+   (serde default, skipped when empty): an ordered list of
+   `{ provider, api, kind, index, payload }`. `payload` is the provider's
+   JSON, stored and replayed byte-for-byte, never interpreted. `index`
+   places the block among the turn's text and tool calls. A field, not a
+   new SessionEvent variant: older binaries drop whole lines of an
+   unknown type (and fork re-serializes through the typed enum), but
+   they ignore unknown fields, so old builds keep reading new sessions
+   and only lose the blocks.
+2. Capture. Anthropic: keep `thinking` blocks with their `signature`
+   and `redacted_thinking` blocks from the stream (the signature delta
+   is dropped today). OpenAI Responses: request
+   `reasoning.encrypted_content` and keep reasoning items. OpenAI-
+   compatible chat: nothing to keep.
+3. Replay. When building a request, a block is sent only if its
+   `provider` and `api` match the request's target; otherwise it is
+   left out and the turn degrades to today's behaviour. This covers
+   model switches, escalation and reviewer requests on another provider.
+   Blocks go back in their original order inside the same assistant
+   turn, before the tool calls they preceded.
+4. Compaction. Blocks live and die with their message: a compacted
+   message takes its blocks with it. The compaction boundary and the
+   rewind indices do not change, because no new event kind is counted.
+5. Atomic turns. The assistant message (with blocks) is appended
+   before any early exit; the spend-cap stop currently breaks before
+   the append and loses a billed turn. Fix that first.
+6. Clients. Snapshots and live events strip `provider_blocks` at the
+   server: clients never need them, payloads can be large, and
+   redacted blocks are opaque by definition. The reasoning display
+   keeps using summaries.
+7. Tests. Stream fixtures with signatures round-trip to the next
+   request unchanged; a provider switch drops them; compaction drops
+   them with their message; an old-format session loads; a session
+   written with blocks loads in a build without the field (fixture);
+   snapshot frames carry no blocks; one live check against a real
+   provider when a key is available (thinking plus tool use over two
+   turns).
+
+Unverified until the live check: the effect of replayed blocks on
+prompt-cache prefixes.
