@@ -218,3 +218,28 @@ clippy -D warnings clean; wasm32 check clean. App: `cargo test` 190 passed,
 0 failed; clippy -D warnings clean; wasm32 lib check clean.
 T1 by pty (e2e/tui_pty-equivalent driver, rendered screen): 10 of 10 runs
 connected in about 0.05 s (raw-byte check before the fix: 0 of 10).
+
+## LIVE-1: deployed preview bridge (e2e/live.mjs)
+
+Date 2026-11-16. Three runs of `E2E_LIVE_ENV=<env> node e2e/live.mjs`: runs 2
+and 3 passed L1-L6 (6/6 each); run 1 failed L1 on a harness call-signature bug,
+since fixed, and passed L2-L6. Cleanup each run: invites revoked, host
+registrations removed, 0 chromium and 0 tracked processes left.
+
+F-LIVE-1 (test-environment limit). `modron serve` cannot dial a deployed bridge
+from a container whose HTTPS is re-signed by an egress proxy: tokio-tungstenite
+and reqwest use webpki roots only, and HTTPS_PROXY is not read. The serve log
+shows `WARN modron_server::rc: remote-control tunnel ended ... error=connecting
+to the remote-control bridge at wss://...`. Direct and proxied curl both reach
+the bridge (302); the presented chain is the proxy's Egress Gateway CA. The
+harness works around it with a loopback forwarder for serve-side traffic only.
+
+F-LIVE-2 (minor, diagnosability). The WARN line shows only the top-level
+context and hides the transport cause (here, certificate trust). Logging the
+error chain (`{:#}` on the anyhow error, if that is what rc.rs holds) would
+show the cause. Not verified against the source; observation from the log only.
+
+No product defect found in the portal path: sign-in gate, host bearer gate,
+registration listing, invite roles (viewer submit answered `forbidden`, approver
+approve works), revoke, and transcript replay after reload all behaved as in
+docs/PORTAL.md. Console errors: none beyond the expected 401 from /api/me.

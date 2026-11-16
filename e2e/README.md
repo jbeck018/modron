@@ -114,3 +114,27 @@ protocol, which lets T4 send Shift+Enter as `CSI 13;2u`.
 
 T1 also needs a terminal binary newer than app/src
 (`cd app && cargo build --bin modron-app-tui`); otherwise it is skipped.
+
+## Live deployed bridge (live.mjs)
+
+    E2E_LIVE_ENV=<env file> node e2e/live.mjs
+
+The env file holds `URL=`, `OWNER_TOKEN=` and `HOST_TOKEN=` lines. Without
+`E2E_LIVE_ENV` the script prints SKIP and exits 0. Tokens are never printed or
+written. Each run registers sessions and invites on the worker and removes
+them at the end (invite DELETE, host registration DELETE).
+
+| ID | What it checks |
+|---|---|
+| L1 | `/` redirects to `/app/`, `/app/` is text/html, the wasm asset is application/wasm with a cache header |
+| L2 | `/api/me` refused without a cookie; wrong token 401; owner token sets `modron_owner`; `/api/me` reports the owner |
+| L3 | host PUT refused without or with a wrong bearer; with HOST_TOKEN the row is listed online for the owner |
+| L4 | local `modron serve` (mock) to the bridge; owner signs in in Chromium, opens the session, sends a task, taps allow once; the mock answer shows |
+| L5 | owner mints viewer and approver invites; a fresh context with the viewer link is refused a submit; the approver approves |
+| L6 | reload mid-approval replays the transcript and re-shows the approval |
+
+Transport: the Rust serve client does not read HTTPS_PROXY and trusts only the
+webpki roots, so from a TLS-intercepting container it cannot dial the bridge.
+live.mjs therefore runs a loopback forwarder (Node `ws` and `fetch`, from
+cloud/bridge/node_modules) for the serve's tunnel and registration traffic.
+The browser and every portal or invite request go straight to the deployed URL.
