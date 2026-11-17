@@ -113,10 +113,32 @@ async fn add_provider_wizard() -> anyhow::Result<()> {
     set_key(opt.provider_id, key)
 }
 
+/// Web search keys for the `web_search` tool, accepted by `auth set` next to
+/// the providers. They are not providers: no chat model, no wizard entry.
+/// Returns (display name, env var) for a search id.
+fn search_key_env(id: &str) -> Option<(&'static str, &'static str)> {
+    match id {
+        "brave" => Some(("Brave Search", "BRAVE_API_KEY")),
+        "tavily" => Some(("Tavily", "TAVILY_API_KEY")),
+        "exa" => Some(("Exa", "EXA_API_KEY")),
+        _ => None,
+    }
+}
+
 /// Non-interactive: `modron auth set <provider> <key>`.
 fn set_key(provider: &str, key: &str) -> anyhow::Result<()> {
     if key.trim().is_empty() {
         anyhow::bail!("empty key");
+    }
+    if let Some((name, env_var)) = search_key_env(provider) {
+        let path = crate::onboarding::env_file()?;
+        modron_core::auth::set_key_in_env_file(&path, env_var, key)?;
+        std::env::set_var(env_var, key);
+        println!(
+            "✓ {name} key saved to {} (0600); web_search uses it when no earlier key is set",
+            path.display()
+        );
+        return Ok(());
     }
     let opt = crate::onboarding::option_for_provider(provider).ok_or_else(|| {
         anyhow!("unknown provider `{provider}` — run `modron auth add` to pick one")
@@ -267,4 +289,26 @@ async fn login() -> anyhow::Result<()> {
          (a saved API key stays the fallback; /auth → Anthropic → remove to go back)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_key_env;
+
+    #[test]
+    fn search_ids_map_to_the_web_search_env_vars() {
+        assert_eq!(
+            search_key_env("brave").map(|(_, v)| v),
+            Some("BRAVE_API_KEY")
+        );
+        assert_eq!(
+            search_key_env("tavily").map(|(_, v)| v),
+            Some("TAVILY_API_KEY")
+        );
+        assert_eq!(search_key_env("exa").map(|(_, v)| v), Some("EXA_API_KEY"));
+        assert!(
+            search_key_env("zai").is_none(),
+            "providers keep their own path"
+        );
+    }
 }

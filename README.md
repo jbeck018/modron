@@ -39,6 +39,11 @@ One line per feature. The detail is in the linked document.
   at the start of a run and after each turn. `pre_tool` can veto a call. See CONFIG.md.
 - **Reasoning effort.** `effort` in config or `--effort` (`low`, `medium`, `high`, `xhigh`,
   `max`). It is not yet checked against a live provider. See CONFIG.md.
+- **`web_search` tool.** On demand (found with `tool_search`) and approval-gated. It needs one of
+  `BRAVE_API_KEY`, `TAVILY_API_KEY` or `EXA_API_KEY` (the first one set is used, in that order);
+  with none set it refuses, and it never scrapes a search page. Returns up to 10 numbered
+  results (title, url, snippet) with optional `allowed_domains` and `blocked_domains`. Keys are
+  set with `modron auth set brave|tavily|exa`. See CONFIG.md.
 - **`edit_lines` and `webfetch` tools.** Both are on demand (found with `tool_search`) and
   approval-gated. `edit_lines` replaces a line range only if every line still matches the
   hash that `read` returned with `line_hashes`. `webfetch` fetches one public http(s) URL,
@@ -46,6 +51,8 @@ One line per feature. The detail is in the linked document.
   sandbox.
 - **MCP over HTTP.** `[mcp.servers.<name>]` accepts a `url` (Streamable HTTP) with header
   templates `${NAME}`, alongside stdio `command` servers. See CONFIG.md.
+  `modron mcp add playwright` writes a browser-automation preset entry (Playwright MCP through
+  `npx`) into the config; it refuses to replace an existing entry without `--force`.
 - **Wake and notify (protocol).** A session holds at most one scheduled wake (one-shot or
   recurring) through the `wake` and `cancel_wake` frames. The server sends `notify` frames
   for done, failed, plan, wake and approval requests. Push delivery to phones is not built.
@@ -102,6 +109,11 @@ sessions survive terminal close. RPC is newline-delimited JSON with the methods
 ```sh
 modron doctor    # check keys, config, git, PDF support, storage, terminal
 ```
+
+`modron doctor` also lists the project files Modron reads from other agents:
+rule files (`.cursor/rules`, `GEMINI.md`, ...), `.claude/commands`, and
+project MCP servers from `.mcp.json`. Those servers start only after
+`modron mcp trust <name>`; see [docs/CONFIG.md](docs/CONFIG.md).
 
 ## Attachments (multimodal)
 
@@ -353,7 +365,7 @@ switching branches, and restores the log. The cloud container accepts
 - **Tool tiering:** 14 essential tools stay in the request schema: `read`, `write`, `edit`,
   `bash`, `grep`, `glob`, `tool_search`, `skill`, `memory_search`, `diagnostics`, `verify`,
   `interact`, `delegate` and `plan`. The rest stay callable but off-prompt, and are found with
-  `tool_search`. These include `remember`, `read_minified`, `edit_lines`, `webfetch`, `explore`,
+  `tool_search`. These include `remember`, `read_minified`, `edit_lines`, `webfetch`, `web_search`, `explore`,
   `delegate_status`, `merge_worktree`, and MCP tools.
 - **`interact` tool:** a persistent tmux session (`start` / `send` / `capture`) for screen
   programs that bash cannot hold open, such as vim, ssh, and REPLs.
@@ -527,7 +539,7 @@ crates/modron-view        shared client view-models: tool activity grouping, tra
 crates/modron-providers   Anthropic Messages, OpenAI-compatible, ChatGPT Responses and
                            free-tier providers; retry and backoff
 crates/modron-tools       built-in tools (read, write, edit, edit_lines, bash, grep, glob,
-                           webfetch, interact, remember, memory_search, diagnostics, skill,
+                           webfetch, web_search, interact, remember, memory_search, diagnostics, skill,
                            explore, delegate, plan, verify), output reduction, tiered registry
 crates/modron-store       JSONL session store (append-only, corrupt-line tolerant)
 crates/modron-router      model selection, learned and heuristic routers, model catalog (pricing)

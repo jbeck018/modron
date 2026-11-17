@@ -23,6 +23,8 @@ pub mod auth;
 mod checksums;
 pub mod config;
 pub mod evals;
+mod mcp_preset;
+mod mcp_trust;
 pub mod upgrade;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -356,6 +358,14 @@ enum SessionsAction {
 
 #[derive(Subcommand, Clone)]
 enum McpAction {
+    /// Add a built-in server preset to the user config, e.g. `mcp add playwright`.
+    Add {
+        /// Preset name (see `modron mcp add --help` for the list).
+        preset: String,
+        /// Replace an existing entry with the same name.
+        #[arg(long)]
+        force: bool,
+    },
     /// Inspect one configured server by name.
     Info { name: String },
     /// Read one resource from a configured server (the `read_resource`
@@ -366,6 +376,23 @@ enum McpAction {
         /// The resource URI to read.
         uri: String,
     },
+    /// Trust a project MCP server (`.mcp.json` or `.cursor/mcp.json`) for the
+    /// current workspace, or every one with `--all`. Undeclared servers never
+    /// start; a changed definition needs trust again.
+    Trust {
+        /// Server name, as `modron mcp list` shows it.
+        name: Option<String>,
+        /// Trust every project server in this workspace.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Revoke trust for the current workspace: one server, or all of them.
+    Untrust {
+        /// Server name (omit for all).
+        name: Option<String>,
+    },
+    /// List project MCP servers with their trust state and source file.
+    List,
 }
 
 #[derive(Subcommand, Clone)]
@@ -874,6 +901,17 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         return crate::auth::run_auth(action).await;
     }
 
+    // `modron mcp add <preset>` — writes a preset server entry to config.toml.
+    if let Some(Command::Mcp {
+        action: McpAction::Add { preset, force },
+    }) = &cli.command
+    {
+        let path = crate::config::config_path()
+            .ok_or_else(|| anyhow::anyhow!("no home directory: cannot find config.toml"))?;
+        println!("{}", crate::mcp_preset::add_preset(&path, preset, *force)?);
+        return Ok(());
+    }
+
     // `modron mcp info …` — server inspection (Phase 5e).
     if let Some(Command::Mcp {
         action: McpAction::Read { name, uri },
@@ -886,6 +924,24 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     }) = cli.command
     {
         return run_mcp_info(&cfg, name).await;
+    }
+    if let Some(Command::Mcp {
+        action: McpAction::Trust { name, all },
+    }) = cli.command.clone()
+    {
+        return mcp_trust::run_trust(&cfg, name.as_deref(), all);
+    }
+    if let Some(Command::Mcp {
+        action: McpAction::Untrust { name },
+    }) = cli.command.clone()
+    {
+        return mcp_trust::run_untrust(name.as_deref());
+    }
+    if let Some(Command::Mcp {
+        action: McpAction::List,
+    }) = cli.command
+    {
+        return mcp_trust::run_list(&cfg);
     }
 
     // `modron bench` — multi-model measurement (Phase 5f).
@@ -1781,7 +1837,7 @@ pub(crate) fn load_attachment(path: &Path) -> anyhow::Result<modron_core::Attach
 /// `modron doctor` (Phase 8): diagnose the setup — API keys, config,
 /// git, PDF support, and the terminal. Every check prints ✓/✗ with an
 /// actionable fix; the exit code reflects overall health.
-fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
+fn run_doctor(cfg: &config::Config) -> anyhow::Result<()> {
     let mut healthy = true;
 
     println!("modron {} — environment check", env!("CARGO_PKG_VERSION"));
@@ -1895,6 +1951,12 @@ fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
             "unavailable (use chat or one-shot)"
         }
     );
+
+    // Project files (V1): rules, commands and project MCP servers with trust.
+    println!("\nproject files:");
+    for line in mcp_trust::doctor_lines(cfg) {
+        println!("{line}");
+    }
 
     println!();
     if healthy {
@@ -2018,11 +2080,24 @@ pub struct McpRegistration {
 /// Per-server schema cost is enforced here — a server whose tools would
 /// fatten the prompt past its budget is refused with an actionable error.
 async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegistration>> {
-    let Some(mcp) = &cfg.mcp else {
-        return Ok(Vec::new());
-    };
+    // Modron's own [mcp.servers] first, then project servers the user trusted
+    // for this workspace (V1). A name clash keeps the config entry.
+    let mut servers: Vec<(String, config::McpServerConfig)> = cfg
+        .mcp
+        .as_ref()
+        .map(|mcp| {
+            mcp.servers
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(workspace) = std::env::current_dir() {
+        let configured = mcp_trust::configured_names(cfg);
+        servers.extend(mcp_trust::trusted_servers(&workspace, &configured));
+    }
     let mut out = Vec::new();
-    for (name, server) in &mcp.servers {
+    for (name, server) in &servers {
         let (handle, tools) = connect_mcp_server(name, server).await?;
         let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
         let cap = server.max_schema_tokens.unwrap_or(20_000);
@@ -2267,6 +2342,8 @@ async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Res
 /// `modron mcp info <name>` (Phase 5e): spawn one configured server and
 /// print its tools (with schema costs), resources, and prompts.
 async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> {
+    let cfg = mcp_trust::with_project_server(cfg, &name)?;
+    let cfg = &cfg;
     let Some(mcp) = &cfg.mcp else {
         anyhow::bail!("no [mcp.servers] configured");
     };
@@ -2320,6 +2397,8 @@ async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> 
 /// (2026-11-12 audit: `read_resource` existed and was tested, but no
 /// surface could reach it).
 async fn run_mcp_read(cfg: &config::Config, name: String, uri: String) -> anyhow::Result<()> {
+    let cfg = mcp_trust::with_project_server(cfg, &name)?;
+    let cfg = &cfg;
     let handle = mcp_handle(cfg, &name).await?;
     let mut handle = handle.lock().await;
     let text = handle.read_resource(&uri).await?;

@@ -34,8 +34,9 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 ///
 /// Every new tool needs an explicit gated/ungated decision here: a tool that
 /// is not added to this list runs without approval.
-const MUTATING_TOOLS: [&str; 9] = [
+const MUTATING_TOOLS: [&str; 10] = [
     "webfetch",
+    "web_search",
     "bash",
     "write",
     "edit",
@@ -660,6 +661,10 @@ impl Engine {
             ));
         }
 
+        // A `/<name>` task naming `.claude/commands/<name>.md` is expanded
+        // here, so every client that submits the line gets the template (V1).
+        let expanded = context::expand_project_command(&self.config.working_dir, task);
+        let task = expanded.as_deref().unwrap_or(task);
         let meta = self.store.create_session(&session_title(task)).await?;
         self.store
             .append(
@@ -708,6 +713,8 @@ impl Engine {
             ));
         }
 
+        let expanded = context::expand_project_command(&self.config.working_dir, task);
+        let task = expanded.as_deref().unwrap_or(task);
         let events = self.store.load(session_id).await?;
         if events.is_empty() {
             return Err(Error::Session(format!(
@@ -1638,6 +1645,12 @@ impl Engine {
         } else {
             format!("{base}{memory_block}")
         };
+        // Other agents' rule files (.cursor/rules, copilot, GEMINI.md,
+        // .windsurfrules): text only, capped, empty when none exist (V1).
+        let system = format!(
+            "{system}{}",
+            context::project_rules_section(&self.config.working_dir)
+        );
         // Skills index (Phase 4): names + descriptions only; the model loads
         // a body via the `skill` tool when it wants the workflow.
         let system = match context::load_skills_index(&self.config.working_dir) {

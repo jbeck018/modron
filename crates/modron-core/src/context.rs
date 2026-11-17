@@ -255,6 +255,181 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+// ---------------------------------------------------------------------------
+// Other agents' project files (Program V, V1): rule files read as project
+// memory, and `.claude/commands/*.md` as prompt templates. Text only, every
+// read goes through `read_context_file` (regular file, stays inside its root).
+// ---------------------------------------------------------------------------
+
+/// Each rule file is capped at 16 KiB.
+pub const MAX_RULE_FILE_BYTES: usize = 16 * 1024;
+/// All rule files together are capped at 48 KiB.
+pub const MAX_RULES_TOTAL_BYTES: usize = 48 * 1024;
+/// A project command template is capped at 16 KiB.
+pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
+
+/// Rule files other agents read, relative to the working directory, in load
+/// order: `.cursor/rules/*.md` and `*.mdc` sorted by file name, then the
+/// single files. Only names are checked here; `read_rule_file` validates.
+pub fn project_rule_sources(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(dir.join(".cursor").join("rules")) {
+        let mut names: Vec<String> = read_dir
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".md") || name.ends_with(".mdc"))
+            .collect();
+        names.sort();
+        out.extend(
+            names
+                .into_iter()
+                .map(|name| format!(".cursor/rules/{name}")),
+        );
+    }
+    for fixed in [
+        ".github/copilot-instructions.md",
+        "GEMINI.md",
+        ".windsurfrules",
+    ] {
+        if dir.join(fixed).is_file() {
+            out.push(fixed.to_string());
+        }
+    }
+    out
+}
+
+/// Read one rule file (path relative to `dir`), capped at
+/// [`MAX_RULE_FILE_BYTES`]. Returns the text (front matter stripped) and
+/// whether the file was longer than the cap. `None` when refused or unreadable.
+fn read_rule_file(dir: &Path, rel: &str) -> Option<(String, bool)> {
+    // One byte past the cap tells us whether the file was cut.
+    let raw = read_context_file(&dir.join(rel), dir, MAX_RULE_FILE_BYTES + 1)?;
+    let truncated = raw.len() > MAX_RULE_FILE_BYTES;
+    let kept = truncate_bytes(&raw, MAX_RULE_FILE_BYTES);
+    Some((strip_front_matter(kept).trim().to_string(), truncated))
+}
+
+/// Drop a leading `---` ... `---` YAML front-matter block (Cursor `.mdc`
+/// rules). Text without a closed block is returned unchanged.
+fn strip_front_matter(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("---") else {
+        return text;
+    };
+    let Some(body) = rest
+        .strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\n'))
+    else {
+        return text;
+    };
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim() == "---" {
+            return &body[offset..];
+        }
+    }
+    text
+}
+
+/// The project-rules block appended to the system prompt: one `## <path>`
+/// section per rule file, with a visible note wherever a cap cut text.
+/// Empty when the directory has no rule files (no dead headers).
+pub fn project_rules_section(dir: &Path) -> String {
+    let mut body = String::new();
+    let mut used = 0usize;
+    let mut skipped = 0usize;
+    for rel in project_rule_sources(dir) {
+        let remaining = MAX_RULES_TOTAL_BYTES.saturating_sub(used);
+        if remaining == 0 {
+            skipped += 1;
+            continue;
+        }
+        let Some((text, cut)) = read_rule_file(dir, &rel) else {
+            continue;
+        };
+        let mut section = text;
+        let mut note = cut.then(|| {
+            format!(
+                "[truncated: {rel} is longer than {} KB; the rest is not loaded]",
+                MAX_RULE_FILE_BYTES / 1024
+            )
+        });
+        if section.len() > remaining {
+            section = truncate_bytes(&section, remaining).to_string();
+            note = Some(format!(
+                "[truncated: project rules are capped at {} KB in total]",
+                MAX_RULES_TOTAL_BYTES / 1024
+            ));
+        }
+        used += section.len();
+        body.push_str(&format!("\n\n## {rel}\n{section}"));
+        if let Some(note) = note {
+            body.push_str(&format!("\n{note}"));
+        }
+    }
+    if body.is_empty() {
+        return String::new();
+    }
+    if skipped > 0 {
+        body.push_str(&format!(
+            "\n\n[truncated: {skipped} more rule file(s) not loaded; project rules are capped at {} KB in total]",
+            MAX_RULES_TOTAL_BYTES / 1024
+        ));
+    }
+    format!("\n\n# Project rules (other agents' files)\nLoaded from the working directory; text only.{body}")
+}
+
+/// Directory holding project slash commands, `<dir>/.claude/commands`.
+fn command_dir(dir: &Path) -> std::path::PathBuf {
+    dir.join(".claude").join("commands")
+}
+
+/// A command name is a file stem of letters, digits, `-` and `_`. Anything
+/// else (a slash, a dot, a space) never names a file.
+fn valid_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Names of the project slash commands (`.claude/commands/<name>.md`), sorted.
+pub fn project_command_names(dir: &Path) -> Vec<String> {
+    let Ok(read_dir) = std::fs::read_dir(command_dir(dir)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = read_dir
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.file_name().to_string_lossy().to_string();
+            let stem = file.strip_suffix(".md")?.to_string();
+            (valid_command_name(&stem) && entry.path().is_file()).then_some(stem)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Expand a task that starts with `/<name>` when `.claude/commands/<name>.md`
+/// exists: the file body becomes the task, with every `$ARGUMENTS` replaced by
+/// the text after the command word. `None` when the task is not a project
+/// command (the caller then sends the task unchanged).
+pub fn expand_project_command(dir: &Path, task: &str) -> Option<String> {
+    let body = task.trim_start().strip_prefix('/')?;
+    let (word, args) = match body.split_once(char::is_whitespace) {
+        Some((word, args)) => (word, args.trim()),
+        None => (body, ""),
+    };
+    if !valid_command_name(word) {
+        return None;
+    }
+    let commands = command_dir(dir);
+    let path = commands.join(format!("{word}.md"));
+    let template = read_context_file(&path, &commands, MAX_COMMAND_BYTES)?;
+    tracing::debug!(command = word, "expanded project command");
+    Some(template.trim().replace("$ARGUMENTS", args))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +919,177 @@ mod skills_tests {
         let index = load_skills_index(repo.path());
         assert!(!index.contains("- evil:"), "{index}");
         assert!(index.contains("subagent-driven-development"), "{index}");
+    }
+}
+
+#[cfg(test)]
+mod project_files_tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn no_rule_files_yields_empty_section() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(project_rules_section(dir.path()).is_empty());
+        assert!(project_rule_sources(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn rule_sources_load_in_order_with_headings_and_front_matter_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".cursor/rules/b.mdc",
+            "---\nalwaysApply: true\n---\nUse tabs.\n",
+        );
+        write(dir.path(), ".cursor/rules/a.md", "Plain rule.\n");
+        write(dir.path(), ".cursor/rules/skip.txt", "not a rule");
+        write(
+            dir.path(),
+            ".github/copilot-instructions.md",
+            "Copilot line.\n",
+        );
+        write(dir.path(), "GEMINI.md", "Gemini line.\n");
+        write(dir.path(), ".windsurfrules", "Windsurf line.\n");
+
+        assert_eq!(
+            project_rule_sources(dir.path()),
+            vec![
+                ".cursor/rules/a.md",
+                ".cursor/rules/b.mdc",
+                ".github/copilot-instructions.md",
+                "GEMINI.md",
+                ".windsurfrules",
+            ]
+        );
+        let section = project_rules_section(dir.path());
+        assert!(
+            section.contains("# Project rules (other agents' files)"),
+            "{section}"
+        );
+        assert!(
+            section.contains("## .cursor/rules/a.md\nPlain rule."),
+            "{section}"
+        );
+        assert!(
+            section.contains("## .cursor/rules/b.mdc\nUse tabs."),
+            "{section}"
+        );
+        assert!(
+            !section.contains("alwaysApply"),
+            "front matter leaked: {section}"
+        );
+        assert!(section.contains("## GEMINI.md\nGemini line."), "{section}");
+        assert!(section.contains("## .windsurfrules"), "{section}");
+        let a = section.find("a.md").unwrap();
+        let b = section.find("b.mdc").unwrap();
+        assert!(a < b, "rules sorted by name");
+    }
+
+    #[test]
+    fn front_matter_strip_keeps_unclosed_block() {
+        assert_eq!(strip_front_matter("---\nno close\n"), "---\nno close\n");
+        assert_eq!(strip_front_matter("plain"), "plain");
+        assert_eq!(strip_front_matter("---\r\nk: v\r\n---\r\nbody"), "body");
+    }
+
+    #[test]
+    fn oversized_rule_file_is_capped_with_visible_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "x".repeat(MAX_RULE_FILE_BYTES + 500);
+        write(dir.path(), "GEMINI.md", &big);
+        let section = project_rules_section(dir.path());
+        assert!(
+            section.contains("[truncated: GEMINI.md is longer than 16 KB"),
+            "note missing"
+        );
+        assert!(
+            section.len() < MAX_RULE_FILE_BYTES + 400,
+            "cap not applied: {}",
+            section.len()
+        );
+    }
+
+    #[test]
+    fn total_rule_budget_is_capped_and_counts_skipped_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Four files of 15 KiB each: the total cap (48 KiB) cuts the fourth.
+        let chunk = "y".repeat(15 * 1024);
+        for name in ["a.md", "b.md", "c.md", "d.md"] {
+            write(dir.path(), &format!(".cursor/rules/{name}"), &chunk);
+        }
+        write(dir.path(), "GEMINI.md", "late file");
+        let section = project_rules_section(dir.path());
+        assert!(
+            section.contains("[truncated: project rules are capped at 48 KB in total]"),
+            "{section}"
+        );
+        assert!(
+            section.contains("1 more rule file(s) not loaded"),
+            "{section}"
+        );
+        assert!(!section.contains("late file"), "budget exceeded");
+        assert!(
+            section.len() < MAX_RULES_TOTAL_BYTES + 1024,
+            "{}",
+            section.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rule_symlink_outside_the_workspace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "TOP SECRET").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("GEMINI.md"))
+            .unwrap();
+        assert!(!project_rules_section(dir.path()).contains("TOP SECRET"));
+    }
+
+    #[test]
+    fn agents_md_loader_is_unchanged_by_rule_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "AGENTS.md", "agents rules");
+        write(dir.path(), "GEMINI.md", "gemini rules");
+        assert_eq!(load_memory(dir.path()), "agents rules");
+    }
+
+    #[test]
+    fn project_command_names_are_sorted_stems() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".claude/commands/triage.md", "t");
+        write(dir.path(), ".claude/commands/fix-bug.md", "f");
+        write(dir.path(), ".claude/commands/notes.txt", "n");
+        write(dir.path(), ".claude/commands/bad.name.md", "b");
+        assert_eq!(project_command_names(dir.path()), vec!["fix-bug", "triage"]);
+        assert!(project_command_names(tempfile::tempdir().unwrap().path()).is_empty());
+    }
+
+    #[test]
+    fn command_expands_arguments_and_passes_other_tasks_through() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".claude/commands/triage.md",
+            "Triage issue $ARGUMENTS.\nThen report on $ARGUMENTS.\n",
+        );
+        assert_eq!(
+            expand_project_command(dir.path(), "/triage 123 now").as_deref(),
+            Some("Triage issue 123 now.\nThen report on 123 now.")
+        );
+        assert_eq!(
+            expand_project_command(dir.path(), "/triage").as_deref(),
+            Some("Triage issue .\nThen report on .")
+        );
+        assert_eq!(expand_project_command(dir.path(), "/missing 1"), None);
+        assert_eq!(expand_project_command(dir.path(), "fix the build"), None);
+        assert_eq!(expand_project_command(dir.path(), "/../etc/passwd"), None);
+        assert_eq!(expand_project_command(dir.path(), "/"), None);
     }
 }
