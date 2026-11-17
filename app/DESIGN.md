@@ -71,9 +71,11 @@ the list row and the empty state. Text input is NSH's own `input()` (which
 (`search_field`) is a display field: the page's keys type into the filter,
 so a real input there would take the keys twice.
 
-Not yet adopted (no screen needs them): `nsh_base` Dialog, Sheet, Select,
-Switch, Tabs, Tooltip, Checkbox. When a screen needs one, wrap it the same
-way in `ui.rs`.
+From `nsh_base` (UX-3): `Switch` behind `ui::switch` (a 44 x 24 track, the
+thumb moves with the checked state, a 44 pt hit slop) and `Tab` / `Tabs`
+behind `ui::tab` and `ui::tab_list`. Not yet adopted (no screen needs them):
+`nsh_base` Dialog, Sheet, Select, Tooltip, Checkbox. When a screen needs one,
+wrap it the same way in `ui.rs`.
 
 - `screen(Bar, body)`: `Bar::new(title)` with `.back(nav, tx)` (the Esc
   action) and `.action(element)`; `Bar::blank()` for no header (sign-in);
@@ -89,6 +91,16 @@ way in `ui.rs`.
 - `list_row(title, subtitle, trailing, press)`: `.disabled(flag)` stops the
   press; `.style_when(.., |s| s.opacity(0.5))` dims a row whose press the
   navigation decides on (the portal's offline rows).
+- Settings and list rows (UX-3): `row(content, trailing, press)` is a 52 pt
+  pressable row whose press covers the content only, so its trailing control
+  (a destructive small button, a switch) takes its own presses;
+  `static_row(content, trailing)` does not press. `value_pair(label, value)`
+  is the label on the left and the value on the right. `choice_row(mark,
+  current, selected, dim, label, press)` is a picker row: the current value
+  carries the mark (the shared dot), an unavailable row is dim.
+- `section_title(line)` (13 pt medium, muted, above a card), `body(line)`
+  (16 pt, the foreground token), `field(label, value, active)` (a display
+  field for an inline form, ringed when it is the active field).
 - Tones: `Tone::{Success, Muted, Destructive, Warning}`.
 
 ## Rules for screens
@@ -172,9 +184,50 @@ Layout limits of NSH 0.5.1 (see the code comments):
 - `ui::list_row` always truncates its title, so a long suggestion shows an
   ellipsis (the full text is in the page).
 
+## Settings, credentials, pickers, lists, help, Cloud (web, UX-3): `app/src/ui_screens.rs`
+
+The bodies of the non-chat screens on the web. `screens.rs` chooses between
+these and the terminal's text bodies on `WEB_CONTROLS` (the terminal's bodies
+are unchanged). Phone first; each screen is wrapped in `ui::screen` at 400 pt
+(forms: settings, credentials, pickers, models, help, Cloud) or 720 pt (lists:
+sessions, tasks, automations).
+
+- Settings: the rows as one card; a row's label on the left and its value on
+  the right; removable rows carry a destructive small control that asks first
+  (the confirmation is drawn). The notify row is a static row with a switch
+  (disabled when it cannot be turned on); its hint and note sit under it. The
+  share section: the two invite roles (outline), the new link in a muted
+  monospace panel that scrolls sideways with a copy control, the invites in a
+  card with a destructive revoke each.
+- Credentials: the provider rows in a card (label left, status right; a
+  signed-in row has a remove control); the browser sign-in progress in a card;
+  the masked key entry in a card. The sign-in's Esc hint is not drawn (the
+  back control does the same).
+- Pickers (`picker`, `models`): the filter as a search field, the rows in a
+  card, the current value marked with the shared dot, an unavailable row dim.
+  `models` has the save-as-default control (outline).
+- Lists (sessions, tasks, automations): the filter as a search field, rows in a
+  card with their own control (delete, merge), the create control full width,
+  the inline form as a card of fields with save (default) and cancel (outline).
+  The form's keyboard hint is not drawn.
+- Help: the three tabs as a segmented control (`tab_list`), the rows in a card,
+  a footer caption for the rows shown.
+- Cloud: the accounts card (remove asks first), the token entry card (masked),
+  the new-run card (account and repo pickers as outline buttons, the branch
+  field, start as a default button), the runs card (open outline, stop
+  destructive, wake secondary). The repo picker is a search field and a card.
+- Agent panel (web): the row and its kill control in a card, above the
+  transcript.
+
+Words stay the shared ones. Keyboard-only hints are not drawn on the web where
+a visible control does the same: the form hints, the key hint on the save
+controls (the web uses the `save` word), the sign-in wait line's Esc hint.
+Their constants stay in the shared table.
+
 ## Known gaps
 
-- Settings, credentials, help, models, automations, tasks, cloud and the
-  local sessions list use the old text rows inside the scaffold.
 - The soft keyboard cannot be driven from Playwright: the sign-in card is
   centred and scrolls, but its behaviour with a real keyboard is unverified.
+- The terminal bodies that the web no longer draws (the old text rows in
+  `screens.rs`) remain as the terminal's path; a few of their web-only branches
+  are dead on the web and are kept for the terminal's shape.

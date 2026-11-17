@@ -16,13 +16,14 @@ use modron_mobile_core::{
     FILTER_LABEL, NEW_SESSION_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL, SESSIONS_NO_MATCH_LABEL,
     SETTINGS_LABEL,
 };
-use nsh_core::element::{input, AdaptiveColor};
+use nsh_core::element::{input, AdaptiveColor, AnyElement};
 use nsh_core::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::{self, style_token, token_ink, Model, SecretKey, Style, UiAction, WEB_CONTROLS};
 use crate::ui::{self, tok, Bar, Tone};
 use crate::ui_chat;
+use crate::ui_screens;
 use modron_mobile_core::view::{
     AUTOMATIONS_EMPTY_LABEL, AUTOMATIONS_NO_MATCH_LABEL, AUTOMATIONS_TITLE_LABEL,
     AUTOMATION_ADD_LABEL, AUTOMATION_FORM_HINT, SAVE_DEFAULT_HINT, SAVE_DEFAULT_LABEL,
@@ -42,30 +43,30 @@ use modron_mobile_core::view::{
 };
 
 /// Picker rows the list shows at once (a longer list is filtered, not scrolled).
-const PICKER_SLOTS: usize = 16;
+pub(crate) const PICKER_SLOTS: usize = 16;
 /// The mark on the current picker value (a dot, as the old terminal drew it).
-const PICKER_CURRENT: &str = "\u{25cf} ";
+pub(crate) const PICKER_CURRENT: &str = "\u{25cf} ";
 
 /// Visible slots: fixed counts keep NSH's cell layout static (see the chat
 /// body's notes). Rows past the slot count are not shown.
-const SESSION_SLOTS: usize = 12;
-const SETTING_SLOTS: usize = 24;
-const AUTH_SLOTS: usize = 12;
-const MODEL_SLOTS: usize = 16;
-const PORTAL_SLOTS: usize = 24;
-const INVITE_SLOTS: usize = 8;
-const AUTOMATION_SLOTS: usize = 12;
-const TASK_SLOTS: usize = 12;
-const FORM_SLOTS: usize = 3;
+pub(crate) const SESSION_SLOTS: usize = 12;
+pub(crate) const SETTING_SLOTS: usize = 24;
+pub(crate) const AUTH_SLOTS: usize = 12;
+pub(crate) const MODEL_SLOTS: usize = 16;
+pub(crate) const PORTAL_SLOTS: usize = 24;
+pub(crate) const INVITE_SLOTS: usize = 8;
+pub(crate) const AUTOMATION_SLOTS: usize = 12;
+pub(crate) const TASK_SLOTS: usize = 12;
+pub(crate) const FORM_SLOTS: usize = 3;
 /// Cloud slots: accounts, runs, and one page of repos (the picker's page).
-const CLOUD_ACCOUNT_SLOTS: usize = 8;
-const CLOUD_RUN_SLOTS: usize = 12;
-const CLOUD_REPO_SLOTS: usize = 50;
+pub(crate) const CLOUD_ACCOUNT_SLOTS: usize = 8;
+pub(crate) const CLOUD_RUN_SLOTS: usize = 12;
+pub(crate) const CLOUD_REPO_SLOTS: usize = 50;
 
 /// Web controls for the list screens and their forms. App copy: the
 /// terminal does not draw these (its keys are the hints above each list).
-const FORM_SAVE_LABEL: &str = "save";
-const FORM_CANCEL_LABEL: &str = "cancel";
+pub(crate) const FORM_SAVE_LABEL: &str = "save";
+pub(crate) const FORM_CANCEL_LABEL: &str = "cancel";
 /// The model picker's header word (web). The screen had none; its header now
 /// names it.
 const MODELS_TITLE: &str = "models";
@@ -156,7 +157,11 @@ fn chat_frame(
             move || {
                 ui::screen(
                     scaffold(nav, actions.clone(), SESSIONS_LABEL),
-                    sessions_body(nav, actions.clone()),
+                    if WEB_CONTROLS {
+                        ui_screens::sessions(nav, actions.clone()).into_element()
+                    } else {
+                        sessions_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -164,8 +169,12 @@ fn chat_frame(
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), SETTINGS_LABEL),
-                    settings_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), SETTINGS_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::settings(nav, actions.clone()).into_element()
+                    } else {
+                        settings_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -173,8 +182,12 @@ fn chat_frame(
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), MODELS_TITLE),
-                    models_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), MODELS_TITLE).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::models(nav, actions.clone()).into_element()
+                    } else {
+                        models_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -182,8 +195,12 @@ fn chat_frame(
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), AUTH_TITLE_LABEL),
-                    auth_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), AUTH_TITLE_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::credentials(nav, actions.clone()).into_element()
+                    } else {
+                        auth_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -192,7 +209,11 @@ fn chat_frame(
             move || {
                 ui::screen(
                     scaffold(nav, actions.clone(), AUTOMATIONS_TITLE_LABEL),
-                    automations_body(nav, actions.clone()),
+                    if WEB_CONTROLS {
+                        ui_screens::automations(nav, actions.clone()).into_element()
+                    } else {
+                        automations_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -201,7 +222,11 @@ fn chat_frame(
             move || {
                 ui::screen(
                     scaffold(nav, actions.clone(), TASKS_TITLE_LABEL),
-                    tasks_body(nav, actions.clone()),
+                    if WEB_CONTROLS {
+                        ui_screens::tasks(nav, actions.clone()).into_element()
+                    } else {
+                        tasks_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -209,8 +234,12 @@ fn chat_frame(
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), CLOUD_LABEL),
-                    cloud_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), CLOUD_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -218,8 +247,12 @@ fn chat_frame(
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), CLOUD_REPO_PICK_LABEL),
-                    cloud_repos_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), CLOUD_REPO_PICK_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud_repos(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_repos_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -227,8 +260,12 @@ fn chat_frame(
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), HELP_TITLE),
-                    help_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), HELP_TITLE).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::help(nav, actions.clone()).into_element()
+                    } else {
+                        help_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -236,8 +273,13 @@ fn chat_frame(
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), move || nav.with(|n| n.picker_title.clone())),
-                    picker_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), move || nav.with(|n| n.picker_title.clone()))
+                        .form(),
+                    if WEB_CONTROLS {
+                        ui_screens::picker(nav, actions.clone()).into_element()
+                    } else {
+                        picker_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -804,7 +846,7 @@ fn cloud_token_entry(actions: UnboundedSender<UiAction>) -> impl IntoElement {
 
 /// Sends the token for a new linked account and closes the entry. An empty
 /// token sends nothing and keeps the entry open.
-fn send_token(actions: &UnboundedSender<UiAction>, value: &str) {
+pub(crate) fn send_token(actions: &UnboundedSender<UiAction>, value: &str) {
     let value = value.trim().to_string();
     if value.is_empty() {
         return;
@@ -852,7 +894,7 @@ fn cloud_repo_row(
 
 /// The browser sign-in progress: the stage, the message, the URL to open
 /// and the device code, from the snapshot's `oauth` (the core's words).
-fn auth_progress(nav: Signal<NavView>) -> impl IntoElement {
+pub(crate) fn auth_progress(nav: Signal<NavView>) -> impl IntoElement {
     let head = move || {
         nav.with(|n| {
             n.auth_progress
@@ -892,7 +934,7 @@ fn auth_progress(nav: Signal<NavView>) -> impl IntoElement {
                 })
             },
         ))
-        .child(text(AUTH_WAITING_LABEL).text_color(muted()))
+        .when(!WEB_CONTROLS, |v| v.child(text(AUTH_WAITING_LABEL).text_color(muted())))
 }
 
 /// The masked key entry for the open provider (`input().masked(true)`, the
@@ -942,7 +984,7 @@ fn auth_key_entry(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> i
 
 /// Sends the key for the open provider and closes the entry. An empty key
 /// sends nothing and keeps the entry open.
-fn send_key(actions: &UnboundedSender<UiAction>, nav: Signal<NavView>, value: &str) {
+pub(crate) fn send_key(actions: &UnboundedSender<UiAction>, nav: Signal<NavView>, value: &str) {
     let value = value.trim().to_string();
     if value.is_empty() {
         return;
@@ -1396,10 +1438,10 @@ fn picker_row(
 /// screen is open: the row's text, its state, the kill control (web), and
 /// the inline confirmation. The composer below it steers (Enter sends a
 /// `steer_agent`). After the agent ends the row stays and kill is disabled.
-pub(crate) fn agent_panel(
-    nav: Signal<NavView>,
-    actions: UnboundedSender<UiAction>,
-) -> impl IntoElement {
+pub(crate) fn agent_panel(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> AnyElement {
+    if WEB_CONTROLS {
+        return ui_screens::agent_panel(nav, actions).into_element();
+    }
     let title = move || {
         nav.with(|n| {
             n.agent.as_ref().map(|a| a.text.clone()).unwrap_or_else(|| AGENT_NONE_LABEL.to_string())
@@ -1423,6 +1465,7 @@ pub(crate) fn agent_panel(
         .child(text(state).text_color(muted()))
         .child(kill)
         .child(confirm_line(nav, actions))
+        .into_element()
 }
 
 /// The portal root: the sign-in screen or the session list.
@@ -1442,8 +1485,12 @@ fn portal_frame(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> imp
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), CLOUD_LABEL),
-                    cloud_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), CLOUD_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -1451,8 +1498,12 @@ fn portal_frame(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> imp
             let actions = actions.clone();
             move || {
                 ui::screen(
-                    scaffold(nav, actions.clone(), CLOUD_REPO_PICK_LABEL),
-                    cloud_repos_body(nav, actions.clone()),
+                    scaffold(nav, actions.clone(), CLOUD_REPO_PICK_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud_repos(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_repos_body(nav, actions.clone()).into_element()
+                    },
                 )
             }
         }))
@@ -1656,7 +1707,7 @@ fn created_url_line(nav: Signal<NavView>) -> impl IntoElement {
 }
 
 /// The monospace stack for a link or a code line (the theme names no font).
-const MONO_STACK: &str = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+pub(crate) const MONO_STACK: &str = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
 /// One invite: its line and the revoke control (the id is read at press
 /// time, so the row always revokes the invite it shows).

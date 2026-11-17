@@ -423,6 +423,209 @@ pub fn empty_state(title: &'static str, line: &'static str, action: Option<AnyEl
     column
 }
 
+/// A section title over a card (shadcn's Label): 13 pt, medium, muted.
+pub fn section_title(line: &'static str) -> Text {
+    caption(line).font_weight(FontWeight::MEDIUM)
+}
+
+/// Body text in the foreground token, at the page's body size.
+pub fn body(line: impl IntoReactive<SharedString>) -> Text {
+    body_size(text(line)).text_color(tok("foreground"))
+}
+
+/// A row's two words: the label on the left, the value on the right (muted).
+pub fn value_pair(
+    label: impl IntoReactive<SharedString>,
+    value: impl IntoReactive<SharedString>,
+) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .flex_1()
+        .child(body(label).flex_1().truncate())
+        .child(
+            body_size(text(value)).text_color(tok("muted-foreground")).max_w(px(180.0)).truncate(),
+        )
+}
+
+/// The row's bar: the content at the page gutter, 52 pt at least, with a
+/// 1 pt line under it and an optional trailing control (it keeps its own
+/// touch target).
+fn row_bar(main: View, trailing: Option<AnyElement>) -> View {
+    let mut bar = view()
+        .flex_row()
+        .items_center()
+        .min_h(px(52.0))
+        .border_b_1()
+        .border_color(tok("border"))
+        .child(main);
+    if let Some(trailing) = trailing {
+        bar = bar.child(view().flex_row().items_center().pr(px(8.0)).child(trailing));
+    }
+    bar
+}
+
+fn row_main(content: impl IntoElement) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .flex_1()
+        .min_h(px(52.0))
+        .px(px(GUTTER))
+        .py(px(8.0))
+        .child(content)
+}
+
+/// A pressable list row: the whole content is the press target (hover, pressed
+/// and focus states), `trailing` is its own control beside it.
+pub fn row(
+    content: impl IntoElement,
+    trailing: Option<AnyElement>,
+    press: impl Fn() + 'static,
+) -> View {
+    let main = row_main(content)
+        .role(AccessibilityRole::Button)
+        .cursor_pointer()
+        .hover(|s| s.bg(tok("accent")))
+        .active(|s| s.bg(tok("muted")))
+        .focus_visible(|s| s.ring(px(2.0)).ring_color(tok("ring")))
+        .on_press(press);
+    row_bar(main, trailing)
+}
+
+/// A row that does not press (its content is read-only, or its control is).
+pub fn static_row(content: impl IntoElement, trailing: Option<AnyElement>) -> View {
+    row_bar(row_main(content), trailing)
+}
+
+/// A picker row: the current value carries `mark` (a dot) before its label,
+/// an unavailable row is dim, and the keyboard's selected row is tinted.
+pub fn choice_row(
+    mark: &'static str,
+    current: impl Fn() -> bool + 'static,
+    selected: impl Fn() -> bool + 'static,
+    dim: impl Fn() -> bool + 'static,
+    label: impl IntoReactive<SharedString>,
+    press: impl Fn() + 'static,
+) -> View {
+    let marked = text(move || if current() { mark.to_string() } else { String::new() })
+        .text_size(px(16.0))
+        .text_color(tok("primary"))
+        .w(px(16.0));
+    let title = body_size(text(label))
+        .text_color(
+            move || {
+                if dim() {
+                    token_ink("muted-foreground")
+                } else {
+                    token_ink("foreground")
+                }
+            },
+        )
+        .flex_1()
+        .truncate();
+    let content = view().flex_row().items_center().gap(px(8.0)).flex_1().child(marked).child(title);
+    row(content, None, press).style_when(selected, |s| s.bg(tok("accent")))
+}
+
+/// A switch with its label for screen readers (NSH's own on / off control,
+/// drawn as a 44 x 24 track). `on_change` runs on each press; the switch
+/// shows the value `checked` gives back.
+pub fn switch(
+    checked: impl Fn() -> bool + 'static,
+    disabled: impl Fn() -> bool + 'static,
+    label: &'static str,
+    on_change: impl Fn() + 'static,
+) -> impl IntoElement {
+    nsh_base::switch()
+        .checked(checked)
+        .disabled(disabled)
+        .accessibility_label(Some(SharedString::from(label)))
+        .hit_slop(EdgeInsets::all(px(10.0)))
+        .track_style(|s| {
+            s.w(px(44.0))
+                .h(px(24.0))
+                .rounded_full()
+                .bg(token_ink("input"))
+                .checked(|s| s.bg(token_ink("primary")))
+        })
+        .thumb_style(|s| {
+            s.w(px(20.0))
+                .h(px(20.0))
+                .rounded_full()
+                .bg(token_ink("background"))
+                .ml(px(2.0))
+                .checked(|s| s.ml(px(22.0)))
+        })
+        .on_change(move |_: &bool| on_change())
+        .child(view())
+}
+
+/// The tab list (a segmented control over `tabs`): a muted track, the tabs
+/// in one row.
+pub fn tab_list(tabs: impl IntoElement) -> View {
+    view()
+        .flex_row()
+        .p(px(4.0))
+        .rounded(px(radius()))
+        .bg(tok("muted"))
+        .child(nsh_base::tabs().flex_row().flex_1().child(tabs))
+}
+
+/// One tab of a [`tab_list`]: the label, the selected tab on the background
+/// token, a 44 pt target, a press that selects it.
+pub fn tab(
+    label: &'static str,
+    selected: impl Fn() -> bool + Clone + 'static,
+    press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let ink = selected.clone();
+    nsh_base::tab()
+        .selected(selected)
+        .on_press(move |_: &()| press())
+        .flex_1()
+        .min_h(px(TOUCH_H))
+        .items_center()
+        .justify_center()
+        .rounded(px(radius()))
+        .cursor_pointer()
+        .selected_style(|s| s.bg(token_ink("background")))
+        .focus_visible(|s| s.ring(px(2.0)).ring_color(tok("ring")))
+        .child(text(label).text_size(px(15.0)).font_weight(FontWeight::MEDIUM).text_color(
+            move || {
+                if ink() {
+                    token_ink("foreground")
+                } else {
+                    token_ink("muted-foreground")
+                }
+            },
+        ))
+}
+
+/// A labelled display field for an inline form: the label over a bordered
+/// box with the value (or nothing), ringed while it is the active field.
+pub fn field(
+    label: impl IntoReactive<SharedString>,
+    value: impl Fn() -> String + 'static,
+    active: impl Fn() -> bool + 'static,
+) -> View {
+    view().flex_col().gap(px(8.0)).child(caption(label).font_weight(FontWeight::MEDIUM)).child(
+        view()
+            .flex_row()
+            .items_center()
+            .min_h(px(TOUCH_H))
+            .px(px(12.0))
+            .rounded(px(radius()))
+            .border_1()
+            .border_color(tok("input"))
+            .bg(tok("background"))
+            .style_when(active, |s| s.ring(px(2.0)).ring_color(tok("ring")))
+            .child(body(value)),
+    )
+}
+
 /// The scaffold's header and its content, in one value. `Bar::new(title)`
 /// makes a titled screen; `Bar::blank()` shows no header (sign-in).
 pub struct Bar {
@@ -505,14 +708,16 @@ pub fn screen(bar: Bar, body: impl IntoElement) -> AnyElement {
         Some(_) => scroll().flex_1().child(content).into_element(),
         None => view().flex_1().flex_col().justify_center().child(content).into_element(),
     };
+    // A titled screen takes the height the header and the nav row leave (the
+    // frame stacks them above it); a blank one fills the window.
     let mut root = view()
         .flex_col()
-        .size_full()
         .bg(tok("background"))
         .pt_safe_area()
         .pl_safe_area()
         .pr_safe_area()
         .pb_safe_area();
+    root = if bar.title.is_some() { root.flex_1().w_full() } else { root.size_full() };
     if let Some(title) = bar.title {
         let mut row = gutter(view().flex_row().items_center().gap(px(4.0)).w_full())
             .min_h(px(HEADER_H))

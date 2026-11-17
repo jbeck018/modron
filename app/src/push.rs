@@ -5,8 +5,8 @@
 //! are in cloud/bridge/README.md ("Web push").
 
 use modron_mobile_core::view::{
-    push_line, PUSH_BLOCKED_LABEL, PUSH_HOME_SCREEN_HINT, PUSH_OFF_LABEL, PUSH_ON_LABEL,
-    PUSH_UNAVAILABLE_LABEL,
+    push_line, PUSH_BLOCKED_LABEL, PUSH_HOME_SCREEN_HINT, PUSH_LABEL, PUSH_OFF_LABEL,
+    PUSH_ON_LABEL, PUSH_UNAVAILABLE_LABEL,
 };
 use serde_json::json;
 
@@ -98,6 +98,12 @@ pub fn row_state(facts: &Facts) -> RowState {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PushView {
     pub line: String,
+    /// The row's label and value, apart (the web draws them as label and
+    /// value; `line` is their join, for the terminal).
+    pub label: &'static str,
+    pub value: &'static str,
+    /// Whether the value is on (the web's switch).
+    pub on: bool,
     pub tappable: bool,
     /// The iOS Home Screen hint, under an unavailable row.
     pub hint: Option<String>,
@@ -120,6 +126,9 @@ pub fn view(facts: &Facts, error: Option<&str>) -> Option<PushView> {
         .then_some(PUSH_BLOCKED_LABEL);
     Some(PushView {
         line: push_line(value),
+        label: PUSH_LABEL,
+        value,
+        on: state == RowState::On,
         tappable: matches!(state, RowState::Off | RowState::On),
         hint: (state == RowState::Unavailable).then(|| PUSH_HOME_SCREEN_HINT.to_string()),
         note: error.or(blocked).map(str::to_string),

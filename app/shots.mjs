@@ -193,7 +193,7 @@ async function main() {
             await page.keyboard.type('/auth');
             await page.waitForTimeout(300);
             await page.keyboard.press('Enter');
-            await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: T.TIMEOUT });
+            await page.waitForFunction(() => document.body.innerText.includes('not configured'), null, { timeout: T.TIMEOUT });
             await shoot(page, '08-credentials');
           });
           await step('help', async () => {
@@ -209,6 +209,78 @@ async function main() {
           await ctx.close();
         } finally {
           ws.close();
+          site.close();
+        }
+      }
+      // UX-3: the restyled screens on the owner's chat page: the settings pickers,
+      // the models, the agent picker, the help tabs, the lists and their forms,
+      // and the credentials key entry. Each state opens from a fresh page.
+      {
+        const site = await T.startSite(await T.freePort(), T.newSiteState('off'));
+        const ws = await T.startWsServer({ providers: PROVIDERS, sessions: LOCAL_SESSIONS });
+        try {
+          const { ctx, page } = await context(null, site);
+          const query = `?url=${encodeURIComponent(ws.url)}&session=${T.SESSION}`;
+          const open = async () => {
+            await page.goto(site.base + '/' + query, { waitUntil: 'domcontentloaded' });
+            await page.waitForFunction((s) => document.body.innerText.includes(s), T.STREAM, { timeout: T.TIMEOUT });
+          };
+          const settings = async () => {
+            await T.tapLabel(page, 'settings');
+            await page.waitForFunction(() => document.body.innerText.includes('approval mode'), null, { timeout: T.TIMEOUT });
+          };
+          const command = async (text) => {
+            await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: T.TIMEOUT });
+            await page.keyboard.type(text);
+            await page.waitForTimeout(300);
+            await page.keyboard.press('Enter');
+          };
+          const waitFor = (s) => page.waitForFunction((t) => document.body.innerText.includes(t), s, { timeout: T.TIMEOUT });
+          const states = [
+            ['21-settings-effort-picker', async () => { await settings(); await T.tapLabel(page, 'effort'); await waitFor('high'); }],
+            ['22-settings-mode-picker', async () => { await settings(); await T.tapLabel(page, 'approval mode'); await waitFor('yolo'); }],
+            ['23-settings-theme-picker', async () => { await settings(); await T.tapLabel(page, 'theme'); await waitFor('oculus light'); }],
+            ['24-models', async () => { await settings(); await T.tapLabel(page, 'model'); await waitFor('filter'); }],
+            ['25-agent-picker', async () => { await command('/agent'); await waitFor('no persona'); }],
+            ['26-help-shortcuts', async () => { await T.tapLabel(page, 'help'); await T.tapLabel(page, 'Shortcuts'); await waitFor('shortcuts: 1-'); }],
+            ['27-tasks', async () => { await command('/tasks'); await waitFor('new task'); }],
+            ['28-task-form', async () => { await command('/tasks'); await waitFor('new task'); await T.tapLabel(page, 'new task'); await waitFor('cancel'); }],
+            ['29-automations', async () => { await command('/automations'); await waitFor('add'); }],
+            ['30-credentials-key', async () => { await command('/auth'); await waitFor('OpenAI'); await T.tapLabel(page, 'OpenAI'); await waitFor('paste an API key'); }],
+          ];
+          for (const [name, run] of states) {
+            await step(name, async () => {
+              await open();
+              await run();
+              await shoot(page, name);
+            });
+          }
+          await ctx.close();
+        } finally {
+          ws.close();
+          site.close();
+        }
+      }
+      // UX-3: Cloud with a linked account, and its repo picker.
+      {
+        const state = { ...T.newSiteState('on'), accounts: [{ id: 'a1', login: 'octocat', kind: 'token' }] };
+        const site = await T.startSite(await T.freePort(), state);
+        try {
+          const { ctx, page } = await context(site.base, site);
+          await step('cloud-accounts', async () => {
+            await page.goto(site.base + '/app/', { waitUntil: 'domcontentloaded' });
+            await page.waitForFunction((s) => document.body.innerText.includes(s), 'fix router', { timeout: T.TIMEOUT });
+            await T.tapLabel(page, 'cloud');
+            await page.waitForFunction(() => document.body.innerText.includes('octocat'), null, { timeout: T.TIMEOUT });
+            await shoot(page, '31-cloud-accounts');
+          });
+          await step('cloud-repos', async () => {
+            await T.tapLabel(page, 'choose a repo');
+            await page.waitForFunction(() => document.body.innerText.includes('filter'), null, { timeout: T.TIMEOUT });
+            await shoot(page, '32-cloud-repos');
+          });
+          await ctx.close();
+        } finally {
           site.close();
         }
       }

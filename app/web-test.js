@@ -684,9 +684,9 @@ async function testPushTapSubscribes(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'default', answer: 'granted' } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: off');
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'off');
+    await tapPushSwitch(page);
+    await waitRow(page, 'notify this device', 'on');
     if (site.state.pushPosts.length !== 1) throw new Error('subscribe posts: ' + site.state.pushPosts.length);
     const post = site.state.pushPosts[0];
     if (!sameBody(post, expectedBody())) throw new Error('subscribe body was ' + JSON.stringify(post));
@@ -709,13 +709,12 @@ async function testPushDeniedStaysOff(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'default', answer: 'denied' } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: off');
+    await waitRow(page, 'notify this device', 'off');
+    await tapPushSwitch(page);
     await page.waitForFunction((s) => document.body.innerText.includes(s), PUSH_BLOCKED, { timeout: TIMEOUT });
     await waitForProbe(site, 0);
     if (site.state.pushPosts.length !== 0) throw new Error('a denied permission posted a subscription');
-    const text = await page.evaluate(() => document.body.innerText);
-    if (!text.includes('notify this device: off')) throw new Error('row left off was not shown');
+    if (!(await rowHas(page, 'notify this device', 'off'))) throw new Error('row left off was not shown');
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   } finally {
     await context.close();
@@ -732,9 +731,9 @@ async function testPushSecondTapUnsubscribes(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'granted', subscribed: true } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: on');
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'on');
+    await tapPushSwitch(page);
+    await waitRow(page, 'notify this device', 'off');
     const stub = await page.evaluate(() => window.__push);
     if (stub.unsubscribed !== 1) throw new Error('unsubscribe calls: ' + stub.unsubscribed);
     if (site.state.pushDeletes.length !== 1 || site.state.pushDeletes[0].endpoint !== PUSH_ENDPOINT || Object.keys(site.state.pushDeletes[0]).length !== 1) {
@@ -776,9 +775,9 @@ async function testPushApproverInvite(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { cookie: false, query: '&invite=approver-token', push: { permission: 'granted' } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: off');
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'off');
+    await tapPushSwitch(page);
+    await waitRow(page, 'notify this device', 'on');
     const post = site.state.pushPosts[0];
     if (!sameBody(post, expectedBody({ invite: 'approver-token' }))) throw new Error('approver body was ' + JSON.stringify(post));
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -796,7 +795,7 @@ async function testPushIosTabHint(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { noPush: true, ios: true } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: unavailable'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'unavailable');
     await page.waitForFunction(() => document.body.innerText.includes('add this page to the Home Screen first'), null, { timeout: TIMEOUT });
     if (site.state.pushPosts.length !== 0) throw new Error('an unavailable row posted');
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -872,6 +871,34 @@ async function openIdle(browser, base, ws) {
 // Clicks the page element whose whole text is `label`.
 async function tapLabel(page, label) {
   await page.getByText(label, { exact: true }).first().click();
+}
+
+// The web draws a settings or credential row's label and value apart (ui.rs
+// value_pair), so the page text has no "label: value" run. A row is checked by
+// its label leaf and a value leaf inside the same small row.
+const rowIncludes = ([label, value]) => {
+  const leaves = [...document.querySelectorAll('body *')].filter((e) => e.childElementCount === 0);
+  const words = (el) => [...el.querySelectorAll('*')].filter((e) => e.childElementCount === 0).map((e) => e.textContent.trim()).filter(Boolean);
+  return leaves.some((leaf) => {
+    if (leaf.textContent.trim() !== label) return false;
+    // The row is the nearest ancestor whose words are exactly the label and the value
+    // (a picker's header and rows share a larger ancestor, which holds more words).
+    for (let el = leaf.parentElement, i = 0; el && i < 5; el = el.parentElement, i++) {
+      const w = words(el);
+      if (w.length === 2 && w.includes(label) && w.includes(value)) return true;
+    }
+    return false;
+  });
+};
+async function waitRow(page, label, value) {
+  await page.waitForFunction(rowIncludes, [label, value], { timeout: TIMEOUT });
+}
+async function rowHas(page, label, value) {
+  return page.evaluate(rowIncludes, [label, value]);
+}
+// The push row's control is its switch (role switch, named by the row's label).
+async function tapPushSwitch(page) {
+  await page.getByRole('switch', { name: 'notify this device', exact: true }).click();
 }
 
 // The approval type-ahead guard (app/src/chat.rs, APPROVAL_KEY_GUARD, 300 ms):
@@ -1264,7 +1291,7 @@ async function testHeaderOpensScreens(browser, base) {
   await tapLabel(page, 'sessions');
   await page.waitForFunction(() => document.body.innerText.includes('write the release notes'), null, { timeout: TIMEOUT });
   await tapLabel(page, 'settings');
-  await page.waitForFunction(() => document.body.innerText.includes('approval mode: ask'), null, { timeout: TIMEOUT });
+  await waitRow(page, 'approval mode', 'ask');
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   await page.close();
 }
@@ -1277,11 +1304,11 @@ async function tapText(page, label) {
   await page.getByText(label).first().click();
 }
 // What the page paints: every distinct background, and the text colour of the
-// Settings row "phase: build" (a plain row, not the selected one).
+// Settings row "phase" (a plain row, not the selected one).
 async function paintSummary(page) {
   return page.evaluate(() => {
     const all = [...document.querySelectorAll('*')];
-    const leaf = all.find((e) => e.childElementCount === 0 && e.textContent.includes('phase: build'));
+    const leaf = all.find((e) => e.childElementCount === 0 && e.textContent.trim() === 'phase');
     return {
       backgrounds: [...new Set(all.map((e) => getComputedStyle(e).backgroundColor))],
       text: leaf ? getComputedStyle(leaf).color : null,
@@ -1292,17 +1319,17 @@ async function testThemePicker(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   await tapText(page, 'settings');
-  await page.waitForFunction(() => document.body.innerText.includes('approval mode: ask'), null, { timeout: TIMEOUT });
-  await tapText(page, 'theme: system');
+  await waitRow(page, 'approval mode', 'ask');
+  await tapLabel(page, 'theme');
   await page.waitForFunction(() => document.body.innerText.includes('oculus light'), null, { timeout: TIMEOUT });
   await tapText(page, 'oculus light');
-  await page.waitForFunction(() => document.body.innerText.includes('theme: oculus light'), null, { timeout: TIMEOUT });
+  await waitRow(page, 'theme', 'oculus light');
   let painted = await paintSummary(page);
   if (!painted.backgrounds.includes('rgb(255, 255, 255)')) throw new Error('light theme paints ' + JSON.stringify(painted));
-  await tapText(page, 'theme: oculus light');
+  await tapLabel(page, 'theme');
   await page.waitForFunction(() => document.body.innerText.includes('oculus dark'), null, { timeout: TIMEOUT });
   await tapText(page, 'oculus dark');
-  await page.waitForFunction(() => document.body.innerText.includes('theme: oculus dark'), null, { timeout: TIMEOUT });
+  await waitRow(page, 'theme', 'oculus dark');
   painted = await paintSummary(page);
   if (!painted.backgrounds.includes('rgb(0, 0, 0)')) throw new Error('dark theme paints ' + JSON.stringify(painted));
   await page.reload({ waitUntil: 'domcontentloaded' });
@@ -1338,16 +1365,16 @@ async function testSessionRowAttaches(browser, base) {
     ws.close();
   }
 }
-// The effort row is pressable: a tap on "effort: unset" sends set_config
+// The effort row is pressable: a tap on the effort row (unset) sends set_config
 // with effort low (unset -> low).
 async function testEffortTapSendsConfig(browser, base) {
   const ws = await startWsServer();
   try {
     const { page, errors } = await openLive(browser, base, ws);
     await tapLabel(page, 'settings');
-    await page.waitForFunction(() => document.body.innerText.includes('effort: unset'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'effort', 'unset');
     // The row opens the effort picker (the old terminal's menus); a tap on a level applies it.
-    await tapLabel(page, 'effort: unset');
+    await tapLabel(page, 'effort');
     await page.waitForFunction(() => document.body.innerText.includes('xhigh'), null, { timeout: TIMEOUT });
     await tapText(page, 'low');
     const frame = await waitFrame(ws, 'set_config', (f) => f.patch && f.patch.effort === 'low');
@@ -1464,7 +1491,7 @@ async function testCredentialsScreen(browser, base) {
     await page.keyboard.type('/auth');
     await page.waitForTimeout(300);
     await page.keyboard.press('Enter');
-    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'not configured');
 
     await page.waitForTimeout(300);
     await page.keyboard.press('Enter');
@@ -1532,7 +1559,7 @@ async function testCredentialRemove(browser, base) {
     await page.keyboard.type('/auth');
     await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
     await page.keyboard.press('Enter');
-    await page.waitForFunction((s) => document.body.innerText.includes(s), 'OpenAI: not configured', { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'not configured');
     const removes = await page.getByText('remove', { exact: true }).count();
     if (removes !== 1) throw new Error(`expected one remove control, saw ${removes}`);
     await tapLabel(page, 'remove');
@@ -1845,7 +1872,7 @@ async function testVaultKeyRows(browser, site) {
     await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.body.innerText.includes('the key is stored for your cloud hosts'), null, { timeout: TIMEOUT });
-    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'not configured');
     await page.waitForTimeout(300);
     await page.keyboard.press('ArrowDown');
     await page.waitForTimeout(100);
@@ -1858,14 +1885,14 @@ async function testVaultKeyRows(browser, site) {
       throw new Error('PUT was ' + JSON.stringify(site.state.vaultPuts[0]));
     }
     if (ws.received.includes('auth_set_key')) throw new Error('the key went over the session socket');
-    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: saved in the vault'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'saved in the vault');
     if ((await page.content()).includes('sk-vault-1')) throw new Error('the key stayed on the page');
     await tapLabel(page, 'remove');
     await page.waitForFunction(() => document.body.innerText.includes('remove OpenAI credentials? y / n'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'y');
     await waitUntil(() => site.state.vaultDeletes.includes('openai'), 'the vault DELETE');
     if (ws.received.includes('auth_remove')) throw new Error('the removal went over the session socket');
-    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'not configured');
     await assertNoSecrets(page);
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   } finally {

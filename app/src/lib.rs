@@ -25,6 +25,7 @@ pub mod suggest;
 pub mod theme;
 pub mod ui;
 pub mod ui_chat;
+pub mod ui_screens;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
