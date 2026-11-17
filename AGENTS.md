@@ -71,6 +71,7 @@ rule, not by memory.
 | Platform chrome | None (fullscreen terminal) | Browser chrome |
 | Remote-control registration | `/remote-control <bridge-url>` slash command, prints the share URL | The same command, from the slash popup or the share control |
 | Presentation of per-turn meta | Lines after each turn | Set by the web view in app/src/chat.rs; the words are the shared ones |
+| Chat chrome | Status surface lines around the transcript; Enter sends; `esc to interrupt` hint | Top bar (sessions, title and connection state with a details row, settings, help), status strip above a bordered composer, send / stop / queue / attach buttons; the Esc hint is not shown |
 | Push notifications | None (a terminal has no push service) | "notify this device" row in settings, web push through the bridge |
 | Cloud runs and vault keys (owner, bridge-served) | None: no Cloud entry, `/cloud` not offered, key entry stays on the session socket | Cloud screen from the portal list and `/cloud`; key rows write to the vault over HTTPS |
 

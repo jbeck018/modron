@@ -113,6 +113,17 @@ pub fn button(
     size: Size,
     press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    button_text(label, variant, size, press)
+}
+
+/// [`button`] with a reactive label, for words the core supplies at run time
+/// (an approval's or a plan's option labels).
+pub fn button_text(
+    label: impl IntoReactive<SharedString>,
+    variant: Variant,
+    size: Size,
+    press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
     let (fill, ink, edge) = match variant {
         Variant::Default => (Some("primary"), "primary-foreground", None),
         Variant::Secondary => (Some("secondary"), "secondary-foreground", None),

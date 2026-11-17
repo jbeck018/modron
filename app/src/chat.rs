@@ -30,7 +30,7 @@ use modron_mobile_core::{
     ViewModelSnapshot,
 };
 use modron_view::{TranscriptEntry, COMPOSER_PLACEHOLDER, QUEUE_LABEL, STOP_LABEL};
-use nsh_core::element::{input, AdaptiveColor};
+use nsh_core::element::{input, AdaptiveColor, AnyElement};
 use nsh_core::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use nsh_platform_tui::{Input, Modifiers};
@@ -43,7 +43,9 @@ use crate::portal::PortalRow;
 use crate::slash;
 use crate::suggest;
 use crate::theme::Choice;
+use crate::ui_chat;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 /// What the user asked the client to do. The host or the view sends these;
 /// the session driver (`crate::session`) turns them into core calls.
@@ -388,7 +390,7 @@ const QUEUE_SLOTS: usize = 4;
 const ATTACH_SLOTS: usize = 4;
 const STEER_SLOTS: usize = 3;
 const PLAN_LINE_SLOTS: usize = 12;
-const TOOL_SLOTS: usize = 6;
+pub(crate) const TOOL_SLOTS: usize = 6;
 const SWARM_SLOTS: usize = 4;
 /// Visible slots for the command suggestions (table rows, then local rows).
 const SLASH_SLOTS: usize = 16;
@@ -1143,7 +1145,7 @@ pub fn plan_answer(approve: bool) -> UiAction {
     action
 }
 
-fn arm_plan_clear(action: &UiAction) {
+pub(crate) fn arm_plan_clear(action: &UiAction) {
     if let UiAction::DecidePlan { note: Some(_), .. } = action {
         CLEAR_DRAFT.store(true, Ordering::SeqCst);
     }
@@ -1210,6 +1212,8 @@ pub struct Model {
     pub swarm_rows: Vec<String>,
     /// The core's last note and last error, in that order.
     pub notes: Vec<String>,
+    /// The core's last error, alone (web: an alert; `notes` holds it too).
+    pub error: Option<String>,
     /// The live reasoning tail (the last two lines), when reasoning display
     /// is on; empty otherwise.
     pub reasoning: String,
@@ -1246,6 +1250,7 @@ impl Model {
             running: s.running_label.clone(),
             is_running: s.running,
             status_line: s.status_line.clone(),
+            error: s.last_error.clone(),
             lines: if s.history.is_empty() && !s.running {
                 // A blank idle session shows the welcome banner; the first
                 // row (the task echo, a note) replaces it.
@@ -2147,7 +2152,7 @@ pub(crate) fn style_token(style: Style) -> &'static str {
 
 /// The colour token of a tool row, by its shared status mark: `✓` success,
 /// `✗` destructive, anything else (`● name …`) the tool colour.
-fn tool_row_token(line: &str) -> &'static str {
+pub(crate) fn tool_row_token(line: &str) -> &'static str {
     if line.starts_with('\u{2713}') {
         "success"
     } else if line.starts_with('\u{2717}') {
@@ -2346,12 +2351,12 @@ fn tool_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl 
     let line = text(move || model.with(|m| m.turn_summary.clone().unwrap_or_default()))
         .text_color(move || token_ink(tool_token("")));
     let head = if WEB_CONTROLS {
-        view()
-            .role(AccessibilityRole::Button)
-            .on_press(move || {
+        ui_chat::summary_row(
+            move || model.with(|m| m.turn_summary.clone().unwrap_or_default()),
+            move || {
                 let _ = actions.send(UiAction::Tools(ToolsStep::Toggle));
-            })
-            .child(line)
+            },
+        )
     } else {
         view().child(line)
     };
@@ -2495,17 +2500,17 @@ fn approval_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> i
 /// The web-only composer controls: Queue beside the composer (queues the
 /// composer text, as Alt+Enter does), and Stop while a turn runs.
 /// The attach control's label (web).
-const ATTACH_LABEL: &str = "attach";
+pub(crate) const ATTACH_LABEL: &str = "attach";
 
 /// Opens the browser's file chooser (web). The terminal has no chooser: its
 /// image path is Ctrl+V.
 #[cfg(target_arch = "wasm32")]
-fn open_file_picker(actions: UnboundedSender<UiAction>) {
+pub(crate) fn open_file_picker(actions: UnboundedSender<UiAction>) {
     crate::web::open_file_picker(actions);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn open_file_picker(_actions: UnboundedSender<UiAction>) {}
+pub(crate) fn open_file_picker(_actions: UnboundedSender<UiAction>) {}
 
 fn composer_controls(
     model: Signal<Model>,
@@ -2555,28 +2560,48 @@ fn composer_controls(
         .child(when(move || WEB_CONTROLS && model.with(|m| m.is_running), stop))
 }
 
-/// The chat body: the transcript, the live strips, the decision blocks and
+/// The transcript's height: on the web the chrome of the chat (the bar, the
+/// dock and its popovers), on the terminal the fixed reserve.
+fn transcript_height(
+    window: f32,
+    model: Signal<Model>,
+    nav: Signal<NavView>,
+    draft: Signal<String>,
+    details: bool,
+) -> f32 {
+    if WEB_CONTROLS {
+        crate::ui_chat::transcript_px(window, model, nav, draft, details)
+    } else {
+        transcript_px(
+            window,
+            nav.with(|n| n.tool_panel.is_some()),
+            draft.with(|d| d.matches('\n').count() + 1),
+        )
+    }
+}
+
+/// The chat body: the transcript, the live strips and the decision blocks and
 /// the composer. The status surface and navigation are drawn around it by
 /// `screens::frame`. `actions` receives the composer's own actions (Send,
 /// Queue, Compact) and the web controls' actions; decisions, interrupts and
-/// plan answers from the keys come from the host's key routing.
+/// plan answers from the keys come from the host's key routing. On the web
+/// the transcript, the dock and its popovers are `ui_chat`'s; the terminal
+/// keeps its own rows.
 pub fn screen(
     model: Signal<Model>,
     draft: Signal<String>,
     nav: Signal<NavView>,
     window_h: Signal<f32>,
+    details: Signal<bool>,
     actions: UnboundedSender<UiAction>,
-) -> impl IntoElement {
+) -> AnyElement {
     let submit_actions = actions.clone();
     let list_ref = element_ref();
     // The last scroll step the view applied (SCROLL_SEQ).
     let applied_scroll = std::cell::Cell::new(0u64);
+    let height = move || transcript_height(window_h.get(), model, nav, draft, details.get());
     effect(move || {
-        let rows = transcript_px(
-            window_h.get(),
-            nav.with(|n| n.tool_panel.is_some()),
-            draft.with(|d| d.matches('\n').count() + 1),
-        ) / COMPOSER_LINE_H;
+        let rows = height() / COMPOSER_LINE_H;
         VISIBLE_ROWS.store(rows.max(1.0) as usize, Ordering::SeqCst);
     });
     effect(move || {
@@ -2595,21 +2620,11 @@ pub fn screen(
             list_ref.scroll_to_index(index as u32, Percentage(1.0), Points(0.0), false);
         }
     });
-    let composer = input()
-        .auto_focus(true)
-        // Enter sends and keeps focus, so the next line can be typed at once.
-        // Shift+Enter and Ctrl+J add a line (NSH's multiline input), and a
-        // pasted block lands whole in the composer.
-        .multiline(true)
-        .max_h(px(COMPOSER_MAX_LINES as f32 * COMPOSER_LINE_H))
-        .submit_behavior(SubmitBehavior::Submit)
-        .placeholder(COMPOSER_PLACEHOLDER)
-        .value(move || draft.get())
-        .on_change(move |s: &str| {
-            set_draft(s);
-            draft.set(s.to_string());
-        })
-        .on_submit(move |s: &str| {
+    // Enter sends (the same path as the send control, below); the composer
+    // keeps focus, so the next line can be typed at once.
+    let submit: Rc<dyn Fn(&str)> = {
+        let actions = submit_actions.clone();
+        Rc::new(move |s: &str| {
             // The old TUI's line continuation: a line ending in a backslash
             // turns the backslash into a line break and does not submit.
             if let Some(head) = s.strip_suffix('\\') {
@@ -2626,7 +2641,7 @@ pub fn screen(
                 let agent =
                     nav.with(|n| n.agent.as_ref().filter(|a| a.running).map(|a| a.id.clone()));
                 if let (Some(agent), false) = (agent, task.is_empty()) {
-                    let _ = submit_actions.send(UiAction::SteerAgent { agent, text: task });
+                    let _ = actions.send(UiAction::SteerAgent { agent, text: task });
                 }
                 return;
             }
@@ -2635,54 +2650,123 @@ pub fn screen(
             }
             let action = submit_action(&task);
             if !action_is_empty(&action) {
-                let _ = submit_actions.send(action);
+                let _ = actions.send(action);
             }
-        });
+        })
+    };
+    let queue: Rc<dyn Fn()> = {
+        let actions = submit_actions.clone();
+        Rc::new(move || {
+            let task = draft_text().trim().to_string();
+            if task.is_empty() {
+                return;
+            }
+            set_draft("");
+            draft.set(String::new());
+            let _ = actions.send(UiAction::Queue(task));
+        })
+    };
+    let on_submit = submit.clone();
+    let composer = input()
+        .auto_focus(true)
+        // Shift+Enter and Ctrl+J add a line (NSH's multiline input), and a
+        // pasted block lands whole in the composer.
+        .multiline(true)
+        .max_h(px(COMPOSER_MAX_LINES as f32 * if WEB_CONTROLS { 24.0 } else { COMPOSER_LINE_H }))
+        .submit_behavior(SubmitBehavior::Submit)
+        .placeholder(COMPOSER_PLACEHOLDER)
+        .value(move || draft.get())
+        .on_change(move |s: &str| {
+            set_draft(s);
+            draft.set(s.to_string());
+        })
+        .on_submit(move |s: &str| on_submit(s));
+    let list = virtual_list(
+        move || model.with(|m| m.lines.len()),
+        move |at: Position| -> AnyElement {
+            if WEB_CONTROLS {
+                crate::ui_chat::cell(model, at).into_element()
+            } else {
+                transcript_row(model, at).into_element()
+            }
+        },
+    )
+    .element_ref(&list_ref)
+    // Opens at the newest row and stays there while it is at the end;
+    // scrolled up, what is visible stays put as rows arrive.
+    .initial_scroll_at_end()
+    // The web's rows differ in height (cards, code blocks) and the dock
+    // grows by more than a line at once (the approval sheet), so it follows
+    // from further away than the terminal's one-line rows need.
+    .follow_end(px(if WEB_CONTROLS { 320.0 } else { 24.0 }))
+    // An explicit height: a flex-grown virtual list gets zero rows in NSH
+    // 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4). On the web it follows the
+    // window less the chrome, so the composer stays on screen (the page
+    // itself does not scroll).
+    .h(move || px(height()));
+    let scroll_hint = when(
+        move || nav.with(|n| n.scroll_offset > 0),
+        move || {
+            text(move || {
+                let offset = nav.with(|n| n.scroll_offset);
+                let total = model.with(|m| m.lines.len());
+                let visible = VISIBLE_ROWS.load(Ordering::SeqCst);
+                scrolled_up_hint(lines_above(total, offset, visible))
+            })
+            .text_color(move || token_ink("muted-foreground"))
+        },
+    );
+    let new_below = when(
+        move || nav.with(|n| n.new_below && n.scroll_offset > 0),
+        move || text(NEW_OUTPUT_BELOW_LABEL).text_color(move || token_ink("warning")),
+    );
+    let agent_panel = when(move || nav.with(|n| n.screen == Screen::Agent), {
+        let actions = actions.clone();
+        move || crate::screens::agent_panel(nav, actions.clone())
+    });
+    if WEB_CONTROLS {
+        return view()
+            .flex_col()
+            .size_full()
+            .child(agent_panel)
+            .child(list)
+            .child(scroll_hint)
+            .child(new_below)
+            .child(when(
+                move || nav.with(|n| n.tool_panel.is_some()),
+                move || tool_panel(model, nav),
+            ))
+            .child(when(move || model.with(|m| m.turn_summary.is_some()), {
+                let actions = actions.clone();
+                move || tool_strip(model, actions.clone())
+            }))
+            .child(swarm_slots(model, nav, actions.clone()))
+            .child(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true))
+            .child(when(
+                move || model.with(|m| !m.reasoning.is_empty()),
+                move || crate::ui_chat::live_text(model, true),
+            ))
+            .child(when(
+                move || model.with(|m| !m.streaming.is_empty()),
+                move || crate::ui_chat::live_text(model, false),
+            ))
+            .child(crate::ui_chat::dock(
+                model,
+                draft,
+                nav,
+                actions.clone(),
+                composer,
+                crate::ui_chat::Hooks { submit, queue },
+            ))
+            .into_element();
+    }
     view()
         .flex_col()
         .size_full()
-        .child(when(move || nav.with(|n| n.screen == Screen::Agent), {
-            let actions = actions.clone();
-            move || crate::screens::agent_panel(nav, actions.clone())
-        }))
-        .child(
-            virtual_list(
-                move || model.with(|m| m.lines.len()),
-                move |at: Position| transcript_row(model, at),
-            )
-            .element_ref(&list_ref)
-            // Opens at the newest row and stays there while it is at the end;
-            // scrolled up, what is visible stays put as rows arrive.
-            .initial_scroll_at_end()
-            .follow_end(px(24.0))
-            // An explicit height: a flex-grown virtual list gets zero rows
-            // in NSH 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4). On the
-            // web it follows the window, so the composer and the Stop
-            // control stay on screen (the page itself does not scroll).
-            .h(move || {
-                px(transcript_px(
-                    window_h.get(),
-                    nav.with(|n| n.tool_panel.is_some()),
-                    draft.with(|d| d.matches('\n').count() + 1),
-                ))
-            }),
-        )
-        .child(when(
-            move || nav.with(|n| n.scroll_offset > 0),
-            move || {
-                text(move || {
-                    let offset = nav.with(|n| n.scroll_offset);
-                    let total = model.with(|m| m.lines.len());
-                    let visible = VISIBLE_ROWS.load(Ordering::SeqCst);
-                    scrolled_up_hint(lines_above(total, offset, visible))
-                })
-                .text_color(move || token_ink("muted-foreground"))
-            },
-        ))
-        .child(when(
-            move || nav.with(|n| n.new_below && n.scroll_offset > 0),
-            move || text(NEW_OUTPUT_BELOW_LABEL).text_color(move || token_ink("warning")),
-        ))
+        .child(agent_panel)
+        .child(list)
+        .child(scroll_hint)
+        .child(new_below)
         .child(when(move || nav.with(|n| n.tool_panel.is_some()), move || tool_panel(model, nav)))
         .child(when(move || model.with(|m| m.turn_summary.is_some()), {
             let actions = actions.clone();
@@ -2718,6 +2802,7 @@ pub fn screen(
         .child(queue_chips(model, actions.clone()))
         .child(composer)
         .child(composer_controls(model, draft, actions))
+        .into_element()
 }
 
 /// The live sub-agent rows. On the web each row is a button that opens its
@@ -2753,6 +2838,20 @@ fn swarm_slots(
     column
 }
 
+/// The first row of the suggestions window: `slots` rows around `selected`.
+pub(crate) fn slash_start(len: usize, selected: usize, slots: usize) -> usize {
+    if len <= slots {
+        0
+    } else {
+        selected.saturating_sub(slots - 1).min(len - slots)
+    }
+}
+
+/// A suggestion's text: the selected one carries `> `.
+pub(crate) fn slash_row_label(row: &str, selected: bool) -> String {
+    format!("{}{row}", if selected { "> " } else { "  " })
+}
+
 /// The suggestions above the composer: command suggestions (`usage - about`)
 /// or `@file` paths, the selected one marked with `> `, a window of
 /// SLASH_SLOTS rows around the selection. Esc hides them. On the web a tap
@@ -2763,15 +2862,8 @@ fn slash_list(
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
     let items = move || suggest::for_draft(&draft.get());
-    let start = move || {
-        let len = items().names.len();
-        let selected = nav.with(|n| n.slash_selected);
-        if len <= SLASH_SLOTS {
-            0
-        } else {
-            selected.saturating_sub(SLASH_SLOTS - 1).min(len - SLASH_SLOTS)
-        }
-    };
+    let start =
+        move || slash_start(items().names.len(), nav.with(|n| n.slash_selected), SLASH_SLOTS);
     let mut column = view().flex_col();
     for i in 0..SLASH_SLOTS {
         let actions = actions.clone();
@@ -2781,8 +2873,8 @@ fn slash_list(
                 let press = actions.clone();
                 let label = move || {
                     let at = start() + i;
-                    let marker = if nav.with(|n| n.slash_selected) == at { "> " } else { "  " };
-                    items().rows.get(at).map(|r| format!("{marker}{r}")).unwrap_or_default()
+                    let selected = nav.with(|n| n.slash_selected) == at;
+                    items().rows.get(at).map(|r| slash_row_label(r, selected)).unwrap_or_default()
                 };
                 let row = view()
                     .child(text(label).text_color(move || token_ink(style_token(Style::Plain))));

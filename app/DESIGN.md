@@ -104,10 +104,76 @@ way in `ui.rs`.
    the web. Never add a wrapper node on the terminal path.
 5. Check with `node shots.mjs <dir>` (README) in four variants.
 
+## Chat (web, UX-2): `app/src/ui_chat.rs`
+
+The chat draws its own bar and dock on the web (`chat::screen` and
+`screens::chat_frame` branch on `WEB_CONTROLS`; the terminal keeps its header,
+status line, strips and composer row). Words, roles, placeholders, keys and
+order are the shared ones. Layout, phone first:
+
+- Bar, 52 pt, border under it, inside the top safe area. Left: `sessions`
+  (compact ghost). Middle: `modron` over a status row (dot and connection
+  word). Right: `settings` and `help` (compact ghosts). The middle block is one
+  44 pt press target: a tap opens a details row under the bar with the
+  connection address and `session <id>`.
+- Banner under the bar, only while not connected: `connecting` (warning alert
+  with a skeleton line) or `disconnected` (destructive alert).
+- Transcript, the virtual list at the page gutter, 720 pt column on wide
+  windows. Tasks are secondary-token cards (the first and last rows of a run
+  carry the card's padding). Assistant text is body 16 pt, 1.5 leading,
+  paragraphs by the core's blank lines; a fenced code block is a bordered mono
+  panel that scrolls sideways (the fence lines are markup and are not shown).
+  The turn's tool summary is a compact bordered row, pressed to toggle the
+  detail panel; its detail rows are mono and indented. Model and usage notes
+  are centred captions. Shell output is mono. The in-flight text carries an
+  accent rule and commits with the turn; opted-in reasoning is muted italic
+  under a neutral rule. Both are web rows appended in `Model::from_snapshot`
+  (`Style::Stream`, `Style::Reasoning`), so the terminal's rows are unchanged.
+- Dock, pinned to the bottom above the safe area, border on top, page gutter:
+  1. status strip, 13 pt caption (below);
+  2. the core's error as a destructive alert; notes as captions;
+  3. staged images as chips with `remove`;
+  4. queued messages: a popover card, one 52 pt row each (a tap removes it);
+  5. suggestions: a popover card, five rows, the selected one marked, a tap
+     completes it;
+  6. the approval sheet: the tool, its summary, and `allow once` (default),
+     `allow all` (secondary), `deny` (destructive), full width in a row; the
+     plan sheet: its lines and `approve` (default) and `revise` (outline). Both
+     use the shared guard (`chat::prompt_guard_open`, 300 ms);
+  7. the composer: a bordered field, 16 pt, grows to six lines (24 pt each);
+  8. a row under it: `queue` and `attach` (ghost), then `send` (default,
+     disabled while empty) or, while a turn runs, `stop` (outline).
+
+Where the status surface's facts live:
+
+| Fact | Web |
+|---|---|
+| connection state | bar (dot and word) |
+| address, session id | details row (tap the bar's title block) |
+| running or idle, spinner | status strip, first |
+| model and effort, cumulative tokens, cache %, approval mode, phase, context | status strip (the core's status line, one caption) |
+| provider | status strip |
+| hint (esc to interrupt, or the idle hint) | status strip |
+| goal | status strip |
+| turn and tool counts | not shown: the core's status line has no turn count (the turn's tool summary row shows the tools) |
+
+Chat components: `ui::button_text` (a reactive label, for the core's option
+words; `ui::button` wraps it), and in `ui_chat`: `bar`, `banner`, `cell`,
+`dock`, `summary_row`, `transcript_px`, `blocks` (the fence parser, tested).
+
+Layout limits of NSH 0.5.1 (see the code comments):
+
+- `LineHeight` is not publicly re-exported, so leading is a point value
+  computed from the font size.
+- A virtual list needs an explicit height, and the popovers are in the flow,
+  not floated: `ui_chat::transcript_px` estimates the dock's height from the
+  state (popovers, composer lines, approval, plan). Re-measure after a change
+  to the dock.
+- `ui::list_row` always truncates its title, so a long suggestion shows an
+  ellipsis (the full text is in the page).
+
 ## Known gaps
 
-- Chat (`chat.rs`): the transcript and composer are not restyled; only the
-  status header and status line are inset, and the frame has safe areas.
 - Settings, credentials, help, models, automations, tasks, cloud and the
   local sessions list use the old text rows inside the scaffold.
 - The soft keyboard cannot be driven from Playwright: the sign-in card is

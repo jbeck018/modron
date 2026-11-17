@@ -246,6 +246,11 @@ pub const NEW_SESSION_LABEL: &str = "new session";
 pub const SESSIONS_EMPTY_LABEL: &str = "no sessions yet";
 pub const SESSIONS_NO_MATCH_LABEL: &str = "no sessions match";
 pub const FILTER_LABEL: &str = "filter";
+/// The chat bar's title (the app's name), the send control's word and the
+/// session id's word in the bar's details row (web, UX-2).
+pub const CHAT_TITLE_LABEL: &str = "modron";
+pub const SEND_LABEL: &str = "send";
+pub const SESSION_DETAIL_LABEL: &str = "session";
 /// The running/idle words, for a session row and the status surface.
 pub const RUNNING_LABEL: &str = "running";
 pub const IDLE_LABEL: &str = "idle";

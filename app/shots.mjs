@@ -25,6 +25,28 @@ const VARIANTS = {
   'desktop-dark': { viewport: { width: 1280, height: 800 }, colorScheme: 'dark' },
 };
 
+// UX-2: the chat's states. Each one is a bridge with the scripted snapshot
+// (committed events, live frames), the page query, and what to wait for.
+const TRANSCRIPT_EVENTS = [
+  { type: 'task', text: 'split the router into two crates' },
+  { type: 'message', parent_id: null, message: { role: 'assistant', content:
+    'The matcher is the largest piece, so it moves first.\n\nThe new entry point is:\n```rust\npub fn route(req: &Request) -> Option<Handler> {\n    table.get(&req.path).cloned()\n}\n```\nThen the tests run against both crates.' } },
+  { type: 'task', text: 'go' },
+  { type: 'message', parent_id: null, message: { role: 'assistant', content: 'Done. Both crates build and the router tests pass.' } },
+];
+const CHAT_STATES = [
+  { name: '12-chat-empty', server: { quiet: true }, wait: 'a token-efficient Rust coding agent' },
+  { name: '13-chat-transcript', server: { quiet: true, events: TRANSCRIPT_EVENTS }, wait: 'Both crates build' },
+  { name: '14-chat-approval', server: { after: [{ type: 'approval_requested', request_id: 'req-1', call: { id: 'c1', name: 'edit', arguments: { path: 'src/router.rs' } } }] }, wait: 'allow once' },
+  { name: '15-chat-plan', server: { quiet: true, after: [{ type: 'plan_proposed', items: [
+    { text: 'Add the endpoint', done_criteria: 'curl returns 200', status: 'pending' },
+    { text: 'Move the matcher', done_criteria: 'tests pass', status: 'pending' }] }] }, wait: 'revise' },
+  { name: '16-chat-queued', server: { quiet: true, after: [{ type: 'queue_changed', queued: ['run the migration after the tests', 'draft the release note'] }] }, wait: '[2] draft' },
+  { name: '17-chat-suggestions', server: { quiet: true }, wait: 'a token-efficient Rust coding agent', keys: '/co', wait2: '/compact - compact this session' },
+  { name: '18-chat-error', server: { quiet: true, after: [{ type: 'error', message: 'the provider refused the request (429)' }] }, wait: 'refused the request' },
+  { name: '19-chat-disconnected', server: { quiet: true }, url: 'ws://127.0.0.1:39998/', wait: 'disconnected' },
+];
+
 // Five sessions, two offline (the list's states).
 const FIVE = [
   { id: 'aaaa', title: 'fix router', host_label: 'laptop', host_kind: 'local', viewer_key: 'vk1', state: 'idle',
@@ -93,7 +115,7 @@ async function main() {
         const page = await ctx.newPage();
         page.on('pageerror', (e) => errorsSeen.push(`${variant}: ${e}`));
         page.on('console', (m) => {
-          if (m.type() === 'error' && !/status of 40[0-9]|status of 503|429/.test(m.text())) errorsSeen.push(`${variant}: console ${m.text()}`);
+          if (m.type() === 'error' && !/status of 40[0-9]|status of 503|429|WebSocket connection to 'ws:\/\/127\.0\.0\.1:39998/.test(m.text())) errorsSeen.push(`${variant}: console ${m.text()}`);
         });
         return { ctx, page };
       };
@@ -183,6 +205,30 @@ async function main() {
             await T.tapLabel(page, 'sessions');
             await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: T.TIMEOUT });
             await shoot(page, '10-sessions');
+          });
+          await ctx.close();
+        } finally {
+          ws.close();
+          site.close();
+        }
+      }
+      // UX-2: the chat's states, one bridge each.
+      for (const state of CHAT_STATES) {
+        const site = await T.startSite(await T.freePort(), T.newSiteState('off'));
+        const ws = await T.startWsServer({ providers: PROVIDERS, sessions: LOCAL_SESSIONS, ...state.server });
+        try {
+          const { ctx, page } = await context(null, site);
+          const url = state.url || ws.url;
+          const query = `?url=${encodeURIComponent(url)}&session=${T.SESSION}`;
+          await step(state.name, async () => {
+            await page.goto(site.base + '/' + query, { waitUntil: 'domcontentloaded' });
+            await page.waitForFunction((s) => document.body.innerText.includes(s), state.wait, { timeout: T.TIMEOUT });
+            if (state.keys) {
+              await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: T.TIMEOUT });
+              await page.keyboard.type(state.keys);
+              await page.waitForFunction((s) => document.body.innerText.includes(s), state.wait2, { timeout: T.TIMEOUT });
+            }
+            await shoot(page, state.name);
           });
           await ctx.close();
         } finally {

@@ -286,7 +286,7 @@ function startWsServer(opts = {}) {
             dropped = true;
             setTimeout(() => socket.destroy(), 1500);
           }
-          send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: opts.live || {} });
+          send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: opts.events || [], live: opts.live || {} });
           // quiet: no streamed text, so the session stays idle (attachments need an idle session).
           if (!opts.quiet) send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
           (opts.after || []).forEach((extra, i) => send({ session: SESSION, seq: 2 + i, ...extra }));
@@ -1023,12 +1023,17 @@ async function testApprovalGuard(browser, base) {
 async function testThemeColour(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
-  const colour = await page.evaluate(() => {
-    const leaf = [...document.querySelectorAll('*')].find(
-      (e) => e.childElementCount === 0 && e.textContent.includes('fix the router crate'));
-    return leaf ? getComputedStyle(leaf).color : null;
+  // UX-2: a task is a neutral card, so the primary shows where the design
+  // puts it (the focus ring, the primary buttons, the streaming rule). The
+  // probe is any element whose text, background or border takes the primary.
+  const found = await page.evaluate(() => {
+    const gold = 'rgb(217, 165, 32)';
+    return [...document.querySelectorAll('*')].some((e) => {
+      const s = getComputedStyle(e);
+      return s.color === gold || s.backgroundColor === gold || s.borderTopColor === gold || s.borderLeftColor === gold;
+    });
   });
-  if (colour !== 'rgb(217, 165, 32)') throw new Error('task row colour is ' + colour + ', want the oculus primary');
+  if (!found) throw new Error('no element takes the oculus primary (rgb(217, 165, 32))');
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   await page.close();
 }
@@ -1080,6 +1085,60 @@ async function testShiftEnterNewline(browser, base) {
     return frame;
   } finally {
     ws.close();
+  }
+}
+
+// The chat on a phone (UX-2): the send control is a real button at least 44 px
+// tall, the composer sits at the bottom of the window, the page does not
+// scroll sideways; a pending approval shows its three words as buttons.
+async function testChatWeb(browser, base) {
+  {
+    const ws = await startWsServer({ quiet: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      const errors = [];
+      watchErrors(page, errors);
+      await page.goto(base + '/?url=' + encodeURIComponent(ws.url) + '&session=' + SESSION, { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+      await page.locator('input:not([type=file]), textarea').first().click();
+      await page.keyboard.type('hi');
+      await page.waitForFunction(() => document.activeElement.value === 'hi', null, { timeout: TIMEOUT });
+      const r = await page.evaluate(() => {
+        const send = [...document.querySelectorAll('[role=button]')].find((e) => (e.innerText || '').trim() === 'send');
+        const field = document.querySelector('input:not([type=file]), textarea');
+        const box = send ? send.getBoundingClientRect() : null;
+        return {
+          sendHeight: box ? box.height : 0,
+          fieldBottom: field.getBoundingClientRect().bottom,
+          innerHeight: window.innerHeight,
+          overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+        };
+      });
+      if (r.sendHeight < 44) throw new Error(`send button is ${r.sendHeight} px tall (want 44)`);
+      if (r.fieldBottom > r.innerHeight || r.innerHeight - r.fieldBottom > 160) {
+        throw new Error(`composer bottom ${Math.round(r.fieldBottom)} is not pinned in ${r.innerHeight}`);
+      }
+      if (r.overflowX) throw new Error('the chat scrolls sideways on a phone');
+      if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+      await page.close();
+    } finally {
+      ws.close();
+    }
+  }
+  {
+    const ws = await startWsServer({ after: [APPROVAL] });
+    try {
+      const { page, errors } = await openLive(browser, base, ws);
+      await page.waitForFunction(() => document.body.innerText.includes('allow once'), null, { timeout: TIMEOUT });
+      const buttons = await page.evaluate(() => [...document.querySelectorAll('[role=button]')].map((e) => (e.innerText || '').trim()));
+      for (const want of ['allow once', 'allow all', 'deny']) {
+        if (!buttons.includes(want)) throw new Error(`approval word "${want}" is not a button (have ${buttons.join(' | ')})`);
+      }
+      if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+      await page.close();
+    } finally {
+      ws.close();
+    }
   }
 }
 
@@ -1857,6 +1916,7 @@ if (require.main === module) (async () => {
     ['(r) esc on a pending approval sends deny', () => testEscDeniesApproval(browser, base)],
     ['(w) mouse wheel over the transcript reaches the oldest row', () => testWheelScrollsTranscript(browser, base)],
     ['(l2) at 1280x720 and 390x844 every control and the composer are inside the window (approval, run, two queued)', () => testLayoutInViewport(browser, base)],
+    ['(x) chat on a phone: send is 44 px, the composer is pinned at the bottom, no sideways scroll, approval words are buttons', () => testChatWeb(browser, base)],
   ];
   // The portal cases: each on its own site (its own state) and context.
   const portal = [

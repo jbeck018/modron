@@ -399,7 +399,11 @@ export async function launchBrowser() {
 // `cookie` ({ name, value, url }) is set in the new context before the page
 // loads: an owner browser for the owner-only steps (config, shell, steer).
 export async function openViewer(browser, url, label, cookie = null) {
-  const ctx = await browser.newContext();
+  // A tall page: the transcript is a virtual list, so rows scrolled out of
+  // view are not in the DOM. The scenarios assert on what a session shows,
+  // not on how much fits a laptop screen, so the page is tall enough to hold
+  // a scenario's whole transcript.
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 2400 } });
   if (cookie) await ctx.addCookies([{ name: cookie.name, value: cookie.value, url: cookie.url }]);
   const page = await ctx.newPage();
   const v = { label, ctx, page, sockets: [], errors: [], finalUrl: '', requested: url };

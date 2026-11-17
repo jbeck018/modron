@@ -22,6 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::{self, style_token, token_ink, Model, SecretKey, Style, UiAction, WEB_CONTROLS};
 use crate::ui::{self, tok, Bar, Tone};
+use crate::ui_chat;
 use modron_mobile_core::view::{
     AUTOMATIONS_EMPTY_LABEL, AUTOMATIONS_NO_MATCH_LABEL, AUTOMATIONS_TITLE_LABEL,
     AUTOMATION_ADD_LABEL, AUTOMATION_FORM_HINT, SAVE_DEFAULT_HINT, SAVE_DEFAULT_LABEL,
@@ -111,16 +112,44 @@ fn chat_frame(
     window_h: Signal<f32>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
-    view()
+    // The web's chat draws its own bar (sessions, title and status, settings,
+    // help); the other screens keep the status header and the openers above
+    // their own scaffold. The terminal keeps its header and openers.
+    let details = signal(false);
+    let frame = view()
         .flex_col()
         .size_full()
-        .when(WEB_CONTROLS, |v| v.pt_safe_area().pl_safe_area().pr_safe_area().pb_safe_area())
-        .child(web_gutter(chat::header(model)))
-        .child(web_gutter(text(move || model.with(|m| m.status_line.clone())).text_color(muted())))
-        .child(nav_bar(actions.clone()))
+        .when(WEB_CONTROLS, |v| v.pt_safe_area().pl_safe_area().pr_safe_area().pb_safe_area());
+    let frame = if WEB_CONTROLS {
+        frame
+            .child(when(move || nav.with(|n| matches!(n.screen, Screen::Chat | Screen::Agent)), {
+                let actions = actions.clone();
+                move || ui_chat::bar(model, actions.clone(), details)
+            }))
+            .child(when(move || nav.with(|n| !matches!(n.screen, Screen::Chat | Screen::Agent)), {
+                let actions = actions.clone();
+                move || {
+                    view()
+                        .flex_col()
+                        .child(web_gutter(chat::header(model)))
+                        .child(web_gutter(
+                            text(move || model.with(|m| m.status_line.clone())).text_color(muted()),
+                        ))
+                        .child(nav_bar(actions.clone()))
+                }
+            }))
+    } else {
+        frame
+            .child(web_gutter(chat::header(model)))
+            .child(web_gutter(
+                text(move || model.with(|m| m.status_line.clone())).text_color(muted()),
+            ))
+            .child(nav_bar(actions.clone()))
+    };
+    frame
         .child(when(move || nav.with(|n| matches!(n.screen, Screen::Chat | Screen::Agent)), {
             let actions = actions.clone();
-            move || chat::screen(model, draft, nav, window_h, actions.clone())
+            move || chat::screen(model, draft, nav, window_h, details, actions.clone())
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Sessions), {
             let actions = actions.clone();
