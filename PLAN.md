@@ -585,3 +585,21 @@ target shows none of this (divergence row).
 Later: GitHub OAuth (needs an OAuth app's client id), per-run cost
 limits, more than one container size.
 
+
+### 10.11 Program V - parity gaps against oh-my-pi and oh-my-claudecode (2026-11-17)
+
+Owner request 2026-11-17: build all five gaps from the comparison. Decisions
+made under 10.2a (compare with Claude Code and oh-my-pi, decide, record).
+
+Already present (found while planning, so out of scope): AGENTS.md / CLAUDE.md
+memory, `.claude/skills`, session fork (`/fork`, protocol and store), rewind.
+
+| Id | Gap | Decision |
+|---|---|---|
+| V1 | Read other agents' config | Rules: also load `.cursor/rules/*.md*`, `.github/copilot-instructions.md`, `GEMINI.md`, `.windsurfrules` as project memory (text only, size capped, source named in the prompt). Commands: `.claude/commands/*.md` become slash commands. MCP: discover `.mcp.json` and `.cursor/mcp.json`, but a discovered server runs only after the user trusts it for that workspace (Claude Code asks the same; oh-my-pi does not). `modron doctor` lists what was found. |
+| V2 | Web search and browser | `web_search` is an on-demand tool with backends Brave, Tavily and Exa, chosen by which key is configured; no keyless scraping. Browser: no native CDP driver; `modron mcp add playwright` installs a preset MCP server entry (Claude Code's route; oh-my-pi ships its own Puppeteer). |
+| V3 | Team mode | `/team [N] <task>` and `modron team`: plan, N workers as `delegate` children in worktrees, merge, verify with the `[verify]` command and the reviewer, fix rounds up to a cap. `--until-verified` keeps going until verify passes or the cap or budget is hit. Reuses delegate, merge_worktree, the finish gate and the swarm rows; lands in both app targets. |
+| V4 | Session tree | Fork exists. Add: fork from an earlier turn (not only the tip), lineage stored on the session, and the sessions screen shows the parent. |
+| V5 | Subscription logins | Add a native ChatGPT (Codex) login so reuse of `~/.codex/auth.json` is not the only route. GitHub Copilot chat login is NOT built: it needs another product's client id; GitHub Models tokens stay the supported route. Owner can overrule. |
+
+Order: V1 and V2 in parallel (different crates), then V3, then V4 and V5.
