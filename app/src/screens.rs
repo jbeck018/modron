@@ -114,8 +114,8 @@ fn chat_frame(
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
     // The web's chat draws its own bar (sessions, title and status, settings,
-    // help); the other screens keep the status header and the openers above
-    // their own scaffold. The terminal keeps its header and openers.
+    // help); the other screens show one status caption above their own
+    // scaffold. The terminal keeps its header and openers.
     let details = signal(false);
     let frame = view()
         .flex_col()
@@ -129,15 +129,10 @@ fn chat_frame(
             }))
             .child(when(move || nav.with(|n| !matches!(n.screen, Screen::Chat | Screen::Agent)), {
                 let actions = actions.clone();
-                move || {
-                    view()
-                        .flex_col()
-                        .child(web_gutter(chat::header(model)))
-                        .child(web_gutter(
-                            text(move || model.with(|m| m.status_line.clone())).text_color(muted()),
-                        ))
-                        .child(nav_bar(actions.clone()))
-                }
+                // One status caption; the screen's own bar has "back", so
+                // the openers are not repeated here.
+                let _ = &actions;
+                move || ui_chat::screen_status(model)
             }))
     } else {
         frame

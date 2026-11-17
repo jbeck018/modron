@@ -517,6 +517,22 @@ pub fn dock(
         .child(column)
 }
 
+/// The status caption above a non-chat screen (web): the connection state
+/// word and the status strip's facts on one muted line, so the status
+/// surface stays in view outside the chat.
+pub(crate) fn screen_status(model: Signal<Model>) -> impl IntoElement {
+    ui::gutter(view().flex_col().w_full().pt(px(8.0))).child(
+        text(move || {
+            model.with(|m| {
+                join_facts(&[first_fact(&m.connection), &m.provider, &m.running, &m.status_line])
+            })
+        })
+        .text_size(px(13.0))
+        .line_height(px(18.2))
+        .text_color(ui::tok("muted-foreground")),
+    )
+}
+
 /// The status strip: the provider, the status line (model, tokens, cache,
 /// mode, phase, context), the standing goal and the hint, as one caption.
 fn status_strip(model: Signal<Model>) -> impl IntoElement {

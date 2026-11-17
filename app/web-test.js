@@ -1290,6 +1290,9 @@ async function testHeaderOpensScreens(browser, base) {
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   await tapLabel(page, 'sessions');
   await page.waitForFunction(() => document.body.innerText.includes('write the release notes'), null, { timeout: TIMEOUT });
+  // The openers live in the chat's bar; a screen has "back", not openers.
+  await tapLabel(page, 'back');
+  await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   await tapLabel(page, 'settings');
   await waitRow(page, 'approval mode', 'ask');
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
