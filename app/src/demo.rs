@@ -16,6 +16,7 @@ use crate::chat::Host;
 /// The demo's sessions: the one running, two idle, so both markers show.
 fn demo_sessions() -> Vec<SessionMetaWire> {
     let meta = |n: u128, title: &str, count: u32, running: bool| SessionMetaWire {
+        forked_from: None,
         id: Uuid::from_u128(n),
         title: title.into(),
         created_at: "2026-11-15T09:00:00Z".into(),

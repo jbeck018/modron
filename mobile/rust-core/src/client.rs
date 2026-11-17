@@ -572,6 +572,9 @@ impl RemoteClient {
             st.vm.connection = crate::view::ConnectionState::Connecting;
             st.vm.last_error = None;
             st.vm.sessions.clear();
+            // The next welcome carries this server's list; until then no
+            // project command is known (unknown `/word`s stay local).
+            st.vm.project_commands.clear();
             st.vm.pending_approvals.clear();
         }
         let _ = self.shared.closed_tx.send(false);
@@ -1161,10 +1164,16 @@ impl RemoteClient {
     /// Fork a session: the server copies its log under a fresh id and
     /// both sessions get a note.
     pub fn fork_session(&self, session_id: Uuid) -> Result<(), ClientError> {
+        self.fork_session_at(session_id, None)
+    }
+
+    /// Fork a session after user turn `turn` (1-based); `None` forks the
+    /// tip. The server refuses an out-of-range turn with an error frame.
+    pub fn fork_session_at(&self, session_id: Uuid, turn: Option<u32>) -> Result<(), ClientError> {
         self.explicit_session();
         self.send_frame(Frame::request(
             self.next_request_id(),
-            Payload::Fork { session_id },
+            Payload::Fork { session_id, turn },
         ))
     }
 
@@ -1352,7 +1361,7 @@ async fn establish(
         ))),
     };
     match handshake {
-        Ok((mut conn, server_version)) => {
+        Ok((mut conn, welcome)) => {
             let (tx, rx) = mpsc::unbounded_channel();
             let (close, close_rx) = oneshot::channel();
             // The generation check and the install happen under one lock,
@@ -1376,7 +1385,8 @@ async fn establish(
                     *slot = Some(Live { tx, close });
                     let mut st = shared.state.lock().unwrap();
                     st.vm.connection = crate::view::ConnectionState::Connected;
-                    st.vm.server_version = server_version;
+                    st.vm.server_version = welcome.server_version;
+                    st.vm.project_commands = welcome.commands;
                     true
                 }
             };
@@ -1594,10 +1604,12 @@ fn fold_frame(shared: &Shared, frame: Frame) {
         Payload::Welcome {
             server_version,
             protocol,
+            commands,
         } => {
             if protocol == PROTOCOL_VERSION {
                 vm.connection = crate::view::ConnectionState::Connected;
                 vm.server_version = server_version;
+                vm.project_commands = commands;
             }
         }
         Payload::Snapshot {
@@ -1848,6 +1860,29 @@ mod tests {
     /// The persona reply folds into the picker rows, and the current marker
     /// follows the snapshot's persona and then a `ConfigChanged` switch.
     #[test]
+    fn welcome_commands_fold_into_the_snapshot() {
+        use modron_protocol::PROTOCOL_VERSION;
+        let welcome = |commands: Vec<String>| Frame {
+            id: None,
+            session: None,
+            seq: 0,
+            role: None,
+            payload: Payload::Welcome {
+                server_version: "0.2.0".into(),
+                protocol: PROTOCOL_VERSION,
+                commands,
+            },
+        };
+        let snap = folded_all(vec![welcome(vec!["deploy".into(), "triage".into()])]);
+        assert_eq!(snap.project_commands, vec!["deploy", "triage"]);
+        assert_eq!(snap.server_version, "0.2.0");
+        // A welcome from a server that predates the list reads as none.
+        assert!(folded_all(vec![welcome(Vec::new())])
+            .project_commands
+            .is_empty());
+    }
+
+    #[test]
     fn personas_reply_marks_the_current_persona() {
         use modron_protocol::{LiveState, PersonaWire};
         let session = Uuid::new_v4();
@@ -1957,6 +1992,7 @@ mod tests {
     fn task_status_folds_into_the_task_rows() {
         use modron_protocol::{SessionMetaWire, TaskFileStat};
         let meta = |n: u128, branch: Option<&str>| SessionMetaWire {
+            forked_from: None,
             id: Uuid::from_u128(n),
             title: format!("task {n}"),
             created_at: String::new(),

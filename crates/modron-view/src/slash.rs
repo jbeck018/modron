@@ -78,8 +78,8 @@ pub const SLASH_COMMANDS: &[SlashSpec] = &[
     },
     SlashSpec {
         name: "fork",
-        usage: "/fork",
-        about: "branch the session log; the original is untouched",
+        usage: "/fork [turn]",
+        about: "branch the session log after a turn (default: the tip); the original is untouched",
         aliases: &[],
         scope: Scope::Session,
     },

@@ -140,6 +140,10 @@ impl SessionStore for MeteredStore {
         self.inner.fork(from).await
     }
 
+    async fn fork_at(&self, from: SessionId, turn: Option<u32>) -> Result<SessionId> {
+        self.inner.fork_at(from, turn).await
+    }
+
     async fn load_snapshot_locked(
         &self,
         id: SessionId,

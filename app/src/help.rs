@@ -576,7 +576,7 @@ pub fn tab_lines(tab: HelpTab) -> Vec<String> {
             lines.extend(
                 slash::all()
                     .iter()
-                    .filter(|e| slash_lookup(e.name).is_none())
+                    .filter(|e| slash_lookup(&e.name).is_none())
                     .map(|e| format!("{} - {}", e.usage, e.about)),
             );
             lines
@@ -616,7 +616,7 @@ mod tests {
         }
         let commands = tab_lines(HelpTab::Commands);
         for e in slash::all() {
-            assert!(commands.iter().any(|l| l.starts_with(e.usage)), "{}", e.usage);
+            assert!(commands.iter().any(|l| l.starts_with(e.usage.as_ref())), "{}", e.usage);
         }
     }
 

@@ -13,9 +13,12 @@
 //! `every_table_command_is_mapped` iterates the table, so a new command
 //! cannot be dropped silently.
 
+use std::borrow::Cow;
+use std::sync::Mutex;
+
 use modron_mobile_core::view::{
-    btw_task, learn_task, plan_task, BTW_USAGE, REVIEW_TASK, SLASH_NEEDS_ARG_PREFIX,
-    SLASH_UNKNOWN_LABEL,
+    btw_task, learn_task, plan_task, BTW_USAGE, PROJECT_COMMAND_ABOUT, REVIEW_TASK,
+    SLASH_NEEDS_ARG_PREFIX, SLASH_UNKNOWN_LABEL,
 };
 use modron_mobile_core::{ApprovalModeWire, Effort, Phase, SandboxPolicy};
 use modron_view::slash::{slash_lookup, SLASH_COMMANDS};
@@ -24,29 +27,92 @@ use crate::chat::{UiAction, WEB_CONTROLS};
 use crate::nav::{NavStep, PickerKind, Screen};
 use crate::theme::Choice;
 
-/// One command row: what the suggestions and help show.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One command row: what the suggestions and help show. `name` and `usage`
+/// are owned for a project command (its name arrives at run time).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    pub name: &'static str,
-    pub usage: &'static str,
+    pub name: Cow<'static, str>,
+    pub usage: Cow<'static, str>,
     pub about: &'static str,
+}
+
+/// The project command names the server listed in its last welcome
+/// (`.claude/commands`). Set from each snapshot; read by [`run`],
+/// [`is_exact`] and the list functions. Empty until a welcome lists some,
+/// so a `/word` is then a local notice (the safe default).
+static PROJECT_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Record the project command names of the current server (a snapshot's
+/// `project_commands`). An empty list clears them.
+pub fn set_project_commands(names: &[String]) {
+    if let Ok(mut known) = PROJECT_COMMANDS.lock() {
+        if known.as_slice() != names {
+            *known = names.to_vec();
+        }
+    }
+}
+
+/// The project command names last recorded by [`set_project_commands`].
+pub fn project_commands() -> Vec<String> {
+    PROJECT_COMMANDS.lock().map(|known| known.clone()).unwrap_or_default()
+}
+
+/// One popup row per project command, in the given order. Usage takes the
+/// command's arguments (`$ARGUMENTS` in the file), so completion adds a space.
+pub fn project_entries(names: &[String]) -> Vec<Entry> {
+    names
+        .iter()
+        .map(|name| Entry {
+            name: Cow::Owned(name.clone()),
+            usage: Cow::Owned(format!("/{name} [args]")),
+            about: PROJECT_COMMAND_ABOUT,
+        })
+        .collect()
 }
 
 /// Commands this app serves beyond the shared table. Empty: `/sessions`,
 /// `/compact`, `/effort`, `/plan` and `/build` moved into
 /// `modron_view::slash::SLASH_COMMANDS`, so every client lists them.
 pub const LOCAL: &[Entry] = &[
-    Entry { name: "review", usage: "/review", about: "review the working diff" },
-    Entry { name: "btw", usage: "/btw <quick question>", about: "quick side question, no tools" },
-    Entry { name: "learn", usage: "/learn [title]", about: "distill this session into a SKILL.md" },
-    Entry { name: "goal", usage: "/goal [condition]", about: "stop condition for long runs" },
-    Entry { name: "agent", usage: "/agent [name]", about: "switch persona (bare: pick one)" },
-    Entry { name: "exit", usage: "/exit", about: "leave the app" },
-    Entry { name: "clear", usage: "/clear", about: "clear the transcript view (nothing is sent)" },
-    Entry { name: "context", usage: "/context", about: "context window, tokens and cache use" },
     Entry {
-        name: "theme",
-        usage: "/theme [name]",
+        name: Cow::Borrowed("review"),
+        usage: Cow::Borrowed("/review"),
+        about: "review the working diff",
+    },
+    Entry {
+        name: Cow::Borrowed("btw"),
+        usage: Cow::Borrowed("/btw <quick question>"),
+        about: "quick side question, no tools",
+    },
+    Entry {
+        name: Cow::Borrowed("learn"),
+        usage: Cow::Borrowed("/learn [title]"),
+        about: "distill this session into a SKILL.md",
+    },
+    Entry {
+        name: Cow::Borrowed("goal"),
+        usage: Cow::Borrowed("/goal [condition]"),
+        about: "stop condition for long runs",
+    },
+    Entry {
+        name: Cow::Borrowed("agent"),
+        usage: Cow::Borrowed("/agent [name]"),
+        about: "switch persona (bare: pick one)",
+    },
+    Entry { name: Cow::Borrowed("exit"), usage: Cow::Borrowed("/exit"), about: "leave the app" },
+    Entry {
+        name: Cow::Borrowed("clear"),
+        usage: Cow::Borrowed("/clear"),
+        about: "clear the transcript view (nothing is sent)",
+    },
+    Entry {
+        name: Cow::Borrowed("context"),
+        usage: Cow::Borrowed("/context"),
+        about: "context window, tokens and cache use",
+    },
+    Entry {
+        name: Cow::Borrowed("theme"),
+        usage: Cow::Borrowed("/theme [name]"),
         about: "pick a theme: oculus dark, oculus light or system",
     },
 ];
@@ -57,8 +123,8 @@ pub fn local_entries() -> Vec<Entry> {
     let mut entries = LOCAL.to_vec();
     if WEB_CONTROLS {
         entries.push(Entry {
-            name: "cloud",
-            usage: "/cloud",
+            name: Cow::Borrowed("cloud"),
+            usage: Cow::Borrowed("/cloud"),
             about: "cloud runs: github accounts, runs",
         });
     }
@@ -67,7 +133,14 @@ pub fn local_entries() -> Vec<Entry> {
 
 /// The shared table as entries, in its order.
 fn table_entries() -> Vec<Entry> {
-    SLASH_COMMANDS.iter().map(|c| Entry { name: c.name, usage: c.usage, about: c.about }).collect()
+    SLASH_COMMANDS
+        .iter()
+        .map(|c| Entry {
+            name: Cow::Borrowed(c.name),
+            usage: Cow::Borrowed(c.usage),
+            about: c.about,
+        })
+        .collect()
 }
 
 /// Merge the shared table with the app's own list, de-duplicated by name.
@@ -78,21 +151,38 @@ pub fn merge(shared: &[Entry], local: &[Entry]) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::with_capacity(shared.len() + local.len());
     for entry in shared.iter().chain(local.iter()) {
         if !out.iter().any(|e| e.name == entry.name) {
-            out.push(*entry);
+            out.push(entry.clone());
         }
     }
     out
 }
 
 /// Every command: the shared table in its order, then the app's own rows
-/// the table does not name. Each name appears once.
+/// the table does not name, then the project commands the server listed
+/// (after the built-ins). Each name appears once.
 pub fn all() -> Vec<Entry> {
-    merge(&table_entries(), &local_entries())
+    all_with(&project_commands())
+}
+
+/// [`all`] for an explicit project command list (the tests use this form).
+pub fn all_with(commands: &[String]) -> Vec<Entry> {
+    let mut out = merge(&table_entries(), &local_entries());
+    for entry in project_entries(commands) {
+        if !out.iter().any(|e| e.name == entry.name) {
+            out.push(entry);
+        }
+    }
+    out
 }
 
 /// The suggestions for the composer text: none unless the text is a slash
 /// word with no arguments yet. Prefix matches, in table order.
 pub fn suggestions_for(text: &str) -> Vec<Entry> {
+    suggestions_with(text, &project_commands())
+}
+
+/// [`suggestions_for`] for an explicit project command list.
+pub fn suggestions_with(text: &str, commands: &[String]) -> Vec<Entry> {
     let Some(rest) = text.strip_prefix('/') else {
         return Vec::new();
     };
@@ -101,17 +191,24 @@ pub fn suggestions_for(text: &str) -> Vec<Entry> {
     }
     // Prefix matches over the merged list, in its order: a name shows once.
     let token = rest.to_lowercase();
-    all().into_iter().filter(|e| e.name.starts_with(&token)).collect()
+    all_with(commands).into_iter().filter(|e| e.name.starts_with(&token)).collect()
 }
 
 /// True when the text is exactly a command word (Enter then runs it
 /// instead of completing the selected suggestion).
 pub fn is_exact(text: &str) -> bool {
+    is_exact_with(text, &project_commands())
+}
+
+/// [`is_exact`] for an explicit project command list (a project command's
+/// name is matched as written: file names are case-sensitive).
+pub fn is_exact_with(text: &str, commands: &[String]) -> bool {
     let Some(word) = text.strip_prefix('/') else {
         return false;
     };
+    let is_project = commands.iter().any(|name| name == word);
     let word = word.to_lowercase();
-    slash_lookup(&word).is_some() || local_entries().iter().any(|l| l.name == word)
+    slash_lookup(&word).is_some() || local_entries().iter().any(|l| l.name == word) || is_project
 }
 
 /// The composer text that completes `name`: the word, with a trailing space
@@ -130,18 +227,27 @@ pub fn complete_text(name: &str) -> String {
 
 /// The action a submitted slash line means. `line` starts with `/`.
 pub fn run(line: &str) -> UiAction {
+    run_with(line, &project_commands())
+}
+
+/// [`run`] for an explicit project command list. A built-in word always wins;
+/// a listed project command is sent as the task (the engine expands it); any
+/// other word is the local unknown-command notice, not a model turn.
+pub fn run_with(line: &str, commands: &[String]) -> UiAction {
     let body = line.trim().strip_prefix('/').unwrap_or(line.trim());
     let (word, args) = match body.split_once(char::is_whitespace) {
         Some((word, args)) => (word, args.trim()),
         None => (body, ""),
     };
+    // Project command names are case-sensitive file names: matched as written.
+    let raw_word = word.to_string();
     // The shared table resolves first (a shared alias or renamed entry maps
     // to its own name); the arms below are the app's dispatch, including the
     // aliases the table does not carry.
     let word = word.to_lowercase();
     let word = slash_lookup(&word).map(|spec| spec.name.to_string()).unwrap_or(word);
     let usage = |name: &str| {
-        all()
+        all_with(commands)
             .iter()
             .find(|e| e.name == name)
             .map(|e| UiAction::Notice(format!("{SLASH_NEEDS_ARG_PREFIX}{}", e.usage)))
@@ -160,7 +266,10 @@ pub fn run(line: &str) -> UiAction {
             // old terminal's `<provider> <key>` form pre-fills nothing here).
             rest => {
                 let provider = rest.split_whitespace().next().unwrap_or_default();
-                UiAction::Nav(NavStep::AuthFor(provider.to_string()))
+                // `modron auth login --provider chatgpt` names the row the
+                // server lists as `openai-compat` ("OpenAI / ChatGPT").
+                let id = if provider == "chatgpt" { "openai-compat" } else { provider };
+                UiAction::Nav(NavStep::AuthFor(id.to_string()))
             }
         },
         "help" => UiAction::Nav(NavStep::Open(Screen::Help)),
@@ -217,7 +326,13 @@ pub fn run(line: &str) -> UiAction {
         // engine reads the `/team [N] <task>` form (a bare `/team` is usage).
         "team" if args.is_empty() => usage("team"),
         "team" => UiAction::Send(format!("/team {args}")),
-        "fork" => UiAction::Fork,
+        // `/fork` forks the tip; `/fork <n>` forks after user turn n. The
+        // number is sent as is: the server refuses 0 and out-of-range turns.
+        "fork" if args.is_empty() => UiAction::Fork(None),
+        "fork" => match args.parse::<u32>() {
+            Ok(turn) => UiAction::Fork(Some(turn)),
+            Err(_) => usage("fork"),
+        },
         "tasks" => UiAction::Nav(NavStep::Open(Screen::Tasks)),
         "cloud" if WEB_CONTROLS => UiAction::Nav(NavStep::Open(Screen::Cloud)),
         "allow" | "deny" if args.is_empty() => {
@@ -232,10 +347,11 @@ pub fn run(line: &str) -> UiAction {
         "share" | "publish" => UiAction::Share,
         "remote-control" | "rc" if args.is_empty() => usage("remote-control"),
         "remote-control" | "rc" => UiAction::RemoteControl(args.to_string()),
-        // Not a built-in: the line is a task. The engine expands a project
-        // command (`.claude/commands/<word>.md`) when one exists; otherwise
-        // the model reads the line as text.
-        _ => UiAction::Send(line.trim().to_string()),
+        // Not a built-in. A project command the server listed is a task (the
+        // engine expands `.claude/commands/<word>.md`); any other word is a
+        // typo, so it gets the local notice rather than a model turn.
+        _ if commands.contains(&raw_word) => UiAction::Send(line.trim().to_string()),
+        _ => UiAction::Notice(SLASH_UNKNOWN_LABEL.to_string()),
     }
 }
 
@@ -268,16 +384,87 @@ mod tests {
     }
 
     #[test]
+    fn auth_chatgpt_names_the_openai_compat_row() {
+        assert_eq!(run("/auth chatgpt"), UiAction::Nav(NavStep::AuthFor("openai-compat".into())));
+        assert_eq!(run("/auth anthropic"), UiAction::Nav(NavStep::AuthFor("anthropic".into())));
+    }
+
+    #[test]
+    fn fork_takes_an_optional_turn() {
+        assert_eq!(run("/fork"), UiAction::Fork(None));
+        assert_eq!(run("/fork 2"), UiAction::Fork(Some(2)));
+        // Zero and out-of-range turns are the server's to refuse, so they go out as numbers.
+        assert_eq!(run("/fork 0"), UiAction::Fork(Some(0)));
+        // Not a number: the usage line, nothing sent.
+        assert!(matches!(run("/fork two"), UiAction::Notice(_)));
+    }
+
+    #[test]
     fn cloud_is_a_web_only_command() {
         // The native tests are the terminal target: no /cloud there, so it is
-        // not a built-in and goes out as a task like any unknown word.
-        assert_eq!(run("/cloud"), sent("/cloud"));
+        // not a built-in and, not being a listed project command, is a local
+        // notice like any unknown word (never a model turn).
+        assert!(is_unknown(&run_with("/cloud", &[])));
         assert!(!local_entries().iter().any(|e| e.name == "cloud"));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_listed_project_command_is_sent_and_an_unlisted_word_is_a_notice() {
+        let known = names(&["deploy", "triage"]);
+        assert_eq!(run_with("/deploy staging", &known), sent("/deploy staging"));
+        assert_eq!(run_with("  /triage ", &known), sent("/triage"));
+        // A typo reaches no model: it is the local notice.
+        assert!(is_unknown(&run_with("/depoly staging", &known)));
+        // Project command names are case-sensitive file names.
+        assert!(is_unknown(&run_with("/Deploy", &known)));
+    }
+
+    #[test]
+    fn an_old_server_lists_nothing_so_every_unknown_word_is_a_notice() {
+        // A welcome without `commands` reads as an empty list.
+        assert!(is_unknown(&run_with("/deploy", &[])));
+        assert!(!is_exact_with("/deploy", &[]));
+    }
+
+    #[test]
+    fn a_built_in_word_wins_over_a_project_command_of_the_same_name() {
+        let known = names(&["help"]);
+        assert_eq!(run_with("/help", &known), run("/help"));
+        assert!(!matches!(run_with("/help", &known), UiAction::Send(_)));
+    }
+
+    #[test]
+    fn project_commands_list_after_the_built_ins_and_complete_with_args() {
+        let known = names(&["deploy"]);
+        let all = all_with(&known);
+        assert_eq!(all.last().map(|e| e.name.to_string()), Some("deploy".to_string()));
+        let deploy = all.last().unwrap();
+        assert_eq!(deploy.usage, "/deploy [args]");
+        assert_eq!(deploy.about, PROJECT_COMMAND_ABOUT);
+        // The popup filters the merged list by prefix, project rows included.
+        let rows: Vec<String> =
+            suggestions_with("/dep", &known).iter().map(|e| e.name.to_string()).collect();
+        assert_eq!(rows, vec!["deploy"]);
+        // Exact match: Enter runs it instead of completing.
+        assert!(is_exact_with("/deploy", &known));
+        assert!(!is_exact_with("/depl", &known));
+    }
+
+    #[test]
+    fn the_recorded_list_is_set_and_cleared_as_one_snapshot_changes() {
+        set_project_commands(&names(&["deploy"]));
+        assert_eq!(project_commands(), names(&["deploy"]));
+        set_project_commands(&[]);
+        assert!(project_commands().is_empty());
     }
 
     #[test]
     fn the_listed_commands_are_unique() {
-        let mut names: Vec<&str> = all().iter().map(|e| e.name).collect();
+        let mut names: Vec<String> = all().iter().map(|e| e.name.to_string()).collect();
         let len = names.len();
         names.sort_unstable();
         names.dedup();
@@ -286,20 +473,28 @@ mod tests {
 
     #[test]
     fn a_shared_entry_wins_over_a_local_one_with_the_same_name() {
-        let shared = [Entry { name: "review", usage: "/review [focus]", about: "shared" }];
+        let shared = [Entry {
+            name: Cow::Borrowed("review"),
+            usage: Cow::Borrowed("/review [focus]"),
+            about: "shared",
+        }];
         let local = [
-            Entry { name: "review", usage: "/review", about: "local" },
-            Entry { name: "exit", usage: "/exit", about: "leave" },
+            Entry {
+                name: Cow::Borrowed("review"),
+                usage: Cow::Borrowed("/review"),
+                about: "local",
+            },
+            Entry { name: Cow::Borrowed("exit"), usage: Cow::Borrowed("/exit"), about: "leave" },
         ];
         let merged = merge(&shared, &local);
-        let names: Vec<&str> = merged.iter().map(|e| e.name).collect();
+        let names: Vec<&str> = merged.iter().map(|e| e.name.as_ref()).collect();
         assert_eq!(names, vec!["review", "exit"]);
         assert_eq!(merged[0].about, "shared");
     }
 
     #[test]
     fn suggestions_never_show_a_name_twice() {
-        let names: Vec<&str> = suggestions_for("/").iter().map(|e| e.name).collect();
+        let names: Vec<String> = suggestions_for("/").iter().map(|e| e.name.to_string()).collect();
         let mut unique = names.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -307,13 +502,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_words_are_sent_as_tasks() {
-        // A project command (`.claude/commands/<word>.md`) is expanded by the
-        // engine at submit time; any other word reaches the model as text.
-        assert_eq!(run("/nope"), sent("/nope"));
-        assert_eq!(run("/fix-bug 123 now"), sent("/fix-bug 123 now"));
-        assert_eq!(run("  /remote  "), sent("/remote"));
-        assert!(!is_unknown(&run("/remote")));
+    fn unknown_words_are_local_notices_unless_listed() {
+        // Only a listed project command (`.claude/commands/<word>.md`) is sent;
+        // the engine expands it at submit time. Any other word is a typo and
+        // must not reach the model.
+        let known = names(&["fix-bug"]);
+        assert!(is_unknown(&run_with("/nope", &known)));
+        assert_eq!(run_with("/fix-bug 123 now", &known), sent("/fix-bug 123 now"));
+        assert!(is_unknown(&run_with("/fix-bugs 123", &known)));
+        assert!(is_unknown(&run_with("/nope", &[])));
     }
 
     #[test]
@@ -402,7 +599,8 @@ mod tests {
 
     #[test]
     fn typing_co_suggests_compact_and_completion_keeps_the_word() {
-        let names: Vec<&str> = suggestions_for("/co").iter().map(|e| e.name).collect();
+        let names: Vec<String> =
+            suggestions_for("/co").iter().map(|e| e.name.to_string()).collect();
         assert_eq!(names, vec!["compact", "context"]);
         assert_eq!(complete_text("model"), "/model ");
         assert_eq!(complete_text("help"), "/help");

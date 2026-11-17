@@ -263,8 +263,18 @@ pub enum Payload {
         #[serde(default)]
         args: serde_json::Value,
     },
-    /// Fork a session: copy its log under a fresh id (engine `fork`).
-    Fork { session_id: Uuid },
+    /// Fork a session: copy its log under a fresh id (engine `fork`). `turn`
+    /// (Program V4, additive) forks after user turn n, 1-based; absent = the
+    /// tip, which is what every pre-V4 client sends. The server refuses a
+    /// turn outside 1..=turns with an `error` frame. The reply is a `note`
+    /// (`forked <src> -> <new>`) on the requester's reply channel; the new
+    /// session's lineage (`SessionMetaWire::forked_from`) reaches clients on
+    /// the next `sessions` list.
+    Fork {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u32>,
+    },
     /// Create an empty session without submitting a task.
     NewSession {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,10 +354,18 @@ pub enum Payload {
     Ping {},
 
     // ---- server -> client ----
-    /// Handshake reply.
+    /// Handshake reply. `commands` (Program V, Part B, additive): the names
+    /// of the project commands in the server's working directory
+    /// (`.claude/commands/<name>.md`), sorted. Clients store them for the
+    /// slash popup and send a `/name` line only when the name is listed;
+    /// any other unknown `/word` is a local notice. Absent on servers that
+    /// predate it, which reads as an empty list. The list is read once per
+    /// connection: a command added later shows after a reconnect.
     Welcome {
         server_version: String,
         protocol: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<String>,
     },
     /// Full or incremental catch-up state for an `attach`: replayable
     /// persisted events plus the live (non-persisted) view.
@@ -701,6 +719,14 @@ impl ApprovalModeWire {
     }
 }
 
+/// Where a forked session came from (mirror of core `ForkOrigin`): the
+/// parent session id and the number of user turns the fork kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkOriginWire {
+    pub session_id: Uuid,
+    pub turn: u32,
+}
+
 /// Session list row (mirror of core `SessionMeta`, which is serde-stable —
 /// re-declared so the protocol owns its wire shape).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -713,6 +739,11 @@ pub struct SessionMetaWire {
     /// Set when the session is a worktree task: the task branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_branch: Option<String>,
+    /// Lineage (Program V4, additive): the parent session and the turn a
+    /// `/fork` branched at. Absent on sessions that were not forked and on
+    /// servers that predate it. Clients show it in the session row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ForkOriginWire>,
     /// Task state as the server sees it (list-time snapshot): "running"
     /// or "ready" (has commits ahead of base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1230,6 +1261,68 @@ mod tests {
     use super::*;
     use modron_types::Message;
 
+    #[test]
+    fn fork_frame_carries_an_optional_turn() {
+        let id = Uuid::from_u128(9);
+        let at = Frame::request(
+            1,
+            Payload::Fork {
+                session_id: id,
+                turn: Some(2),
+            },
+        );
+        let json = serde_json::to_value(&at).unwrap();
+        assert!(json.to_string().contains("\"turn\":2"), "{json}");
+        match roundtrip(&at).payload {
+            Payload::Fork { session_id, turn } => {
+                assert_eq!(session_id, id);
+                assert_eq!(turn, Some(2));
+            }
+            other => panic!("fork did not round trip: {other:?}"),
+        }
+        // A tip fork omits the key, and a pre-V4 client's frame (no key)
+        // reads as the tip.
+        let tip = Frame::request(
+            2,
+            Payload::Fork {
+                session_id: id,
+                turn: None,
+            },
+        );
+        assert!(!serde_json::to_string(&tip).unwrap().contains("turn"));
+        let old = serde_json::to_string(&tip).unwrap();
+        let parsed: Frame = serde_json::from_str(&old).unwrap_or_else(|e| panic!("{e}: {old}"));
+        assert!(matches!(parsed.payload, Payload::Fork { turn: None, .. }));
+    }
+
+    #[test]
+    fn session_row_lineage_is_optional_on_the_wire() {
+        let parent = Uuid::from_u128(0xabc);
+        let mut row = SessionMetaWire {
+            id: Uuid::from_u128(1),
+            title: "fork".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            message_count: 4,
+            task_branch: None,
+            task_state: None,
+            working_dir: None,
+            forked_from: Some(ForkOriginWire {
+                session_id: parent,
+                turn: 2,
+            }),
+        };
+        let back: SessionMetaWire =
+            serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(back, row);
+        // An older server's row has no key: it reads as not forked.
+        row.forked_from = None;
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(!json.contains("forked_from"), "{json}");
+        let old: SessionMetaWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.forked_from, None);
+    }
+
     fn roundtrip(frame: &Frame) -> Frame {
         let json = serde_json::to_string(frame).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
@@ -1473,6 +1566,7 @@ mod tests {
             Payload::Welcome {
                 server_version: "0.1.2".into(),
                 protocol: PROTOCOL_VERSION,
+                commands: Vec::new(),
             },
         );
         assert_roundtrip(&welcome);
@@ -1527,6 +1621,7 @@ mod tests {
                 8,
                 Payload::Fork {
                     session_id: session,
+                    turn: None,
                 },
             ),
             Frame::request(9, Payload::NewSession { title: None }),

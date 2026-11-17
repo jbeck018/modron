@@ -250,6 +250,7 @@ impl SessionStore for InMemoryStore {
             created_at: now,
             updated_at: now,
             message_count: 0,
+            forked_from: None,
         };
         sessions.insert(
             meta.id,
@@ -259,6 +260,33 @@ impl SessionStore for InMemoryStore {
             },
         );
         Ok(meta)
+    }
+
+    async fn fork_at(&self, from: SessionId, turn: Option<u32>) -> Result<SessionId> {
+        let (events, title) = {
+            let sessions = lock(&self.sessions);
+            let record = sessions
+                .get(&from)
+                .ok_or_else(|| Error::Session(format!("unknown session {from}")))?;
+            (record.events.clone(), record.meta.title.clone())
+        };
+        let (cut, kept) = crate::rewind::fork_cut(&events, turn)?;
+        let meta = self.create_session(&format!("fork of {title}")).await?;
+        let mut sessions = lock(&self.sessions);
+        let record = sessions
+            .get_mut(&meta.id)
+            .ok_or_else(|| Error::Session(format!("unknown session {}", meta.id)))?;
+        record.meta.forked_from = Some(crate::ForkOrigin {
+            parent: from,
+            turn: kept,
+        });
+        for event in &events[..cut] {
+            if matches!(event, SessionEvent::Message { .. }) {
+                record.meta.message_count += 1;
+            }
+            record.events.push(event.clone());
+        }
+        Ok(meta.id)
     }
 
     async fn append(&self, id: SessionId, event: &SessionEvent) -> Result<()> {

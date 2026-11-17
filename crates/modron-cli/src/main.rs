@@ -3591,7 +3591,14 @@ async fn run_sessions_list(sessions_dir: &Path) -> anyhow::Result<()> {
             meta.message_count,
             usage.total(),
             format!("${cost:.4}"),
-            meta.title
+            match meta.forked_from {
+                Some(origin) => format!(
+                    "{} ({})",
+                    meta.title,
+                    modron_mobile_core::view::fork_origin_text(origin.parent, origin.turn)
+                ),
+                None => meta.title.clone(),
+            }
         );
     }
     if sessions.len() > SHOW {

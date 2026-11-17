@@ -254,6 +254,10 @@ pub const SESSION_DETAIL_LABEL: &str = "session";
 /// The running/idle words, for a session row and the status surface.
 pub const RUNNING_LABEL: &str = "running";
 pub const IDLE_LABEL: &str = "idle";
+/// Lineage words on a forked session's row (Program V4): "forked from
+/// <short id> at turn <n>". Shared by the app targets and `modron sessions`.
+pub const FORKED_FROM_LABEL: &str = "forked from";
+pub const FORK_AT_TURN_LABEL: &str = "at turn";
 /// Settings row labels, in screen order.
 pub const SETTING_MODEL_LABEL: &str = "model";
 pub const SETTING_PROVIDER_LABEL: &str = "provider";
@@ -325,6 +329,9 @@ pub fn tools_without(list: &[String], tool: &str) -> Vec<String> {
 
 /// Shown for a slash command the table does not know.
 pub const SLASH_UNKNOWN_LABEL: &str = "unknown command - try /help";
+/// The popup's about line for a project command (`.claude/commands/<name>.md`,
+/// listed by the server's welcome).
+pub const PROJECT_COMMAND_ABOUT: &str = "project command";
 /// Shown for `/remote-control` with no bridge URL; the usage follows.
 pub const SLASH_NEEDS_ARG_PREFIX: &str = "use ";
 /// The title of the help screen and its two section headings.
@@ -836,10 +843,23 @@ pub fn session_row(meta: &SessionMetaWire, running: bool) -> String {
         meta.title.clone()
     };
     let state = if running { RUNNING_LABEL } else { IDLE_LABEL };
-    format!(
+    let mut row = format!(
         "{title} \u{b7} {state} \u{b7} {} messages",
         meta.message_count
-    )
+    );
+    if let Some(origin) = &meta.forked_from {
+        row.push_str(" \u{b7} ");
+        row.push_str(&fork_origin_text(origin.session_id, origin.turn));
+    }
+    row
+}
+
+/// "forked from <short id> at turn <n>": the lineage line for a forked
+/// session. The short id is the first 8 characters, as an untitled row shows.
+/// Takes the parent id and the turn so the CLI can call it from core types.
+pub fn fork_origin_text(parent: Uuid, turn: u32) -> String {
+    let short: String = parent.to_string().chars().take(8).collect();
+    format!("{FORKED_FROM_LABEL} {short} {FORK_AT_TURN_LABEL} {turn}")
 }
 
 /// The next approval mode in the settings cycle: ask, yolo, deny, ask.
@@ -1141,6 +1161,11 @@ pub struct SessionViewModel {
     /// The configured personas (answers to `personas_req`), in server order.
     #[serde(default)]
     pub personas: Vec<PersonaWire>,
+    /// Project command names from the welcome (`.claude/commands`), sorted.
+    /// Empty from servers that predate them: every unknown `/word` is then a
+    /// local notice (see `modron_protocol::Payload::Welcome`).
+    #[serde(default)]
+    pub project_commands: Vec<String>,
     /// The session's current persona (`LiveState.persona`, `ConfigPatch`).
     #[serde(default)]
     pub persona: Option<String>,
@@ -1247,6 +1272,11 @@ pub struct ViewModelSnapshot {
     pub connection_label: String,
     pub session_id: Option<Uuid>,
     pub server_version: String,
+    /// The project command names the server listed in its welcome. The
+    /// slash popup lists them after the built-ins, and a `/name` line is
+    /// sent only for a listed name (the app's slash module).
+    #[serde(default)]
+    pub project_commands: Vec<String>,
     pub running: bool,
     /// `running` or `idle`.
     pub running_label: String,
@@ -1444,6 +1474,7 @@ impl ViewModelSnapshot {
                 .iter()
                 .map(|model| model_row(model, &vm.model, &vm.provider))
                 .collect(),
+            project_commands: vm.project_commands.clone(),
             personas: vm
                 .personas
                 .iter()
@@ -2531,6 +2562,7 @@ mod copy_tests {
             task_branch: None,
             task_state: state.map(String::from),
             working_dir: None,
+            forked_from: None,
         }
     }
 
@@ -2574,6 +2606,25 @@ mod copy_tests {
         assert_eq!(
             session_row(&m, true),
             "router fix \u{b7} running \u{b7} 3 messages"
+        );
+    }
+
+    #[test]
+    fn a_forked_session_row_names_its_parent_and_turn() {
+        let mut m = meta(ID_A, "retry", 4, None);
+        m.forked_from = Some(modron_protocol::ForkOriginWire {
+            session_id: Uuid::parse_str(ID_B).expect("uuid"),
+            turn: 2,
+        });
+        assert_eq!(
+            session_row(&m, false),
+            "retry \u{b7} idle \u{b7} 4 messages \u{b7} forked from 11111111 at turn 2"
+        );
+        // A session that was not forked keeps the plain row.
+        m.forked_from = None;
+        assert_eq!(
+            session_row(&m, false),
+            "retry \u{b7} idle \u{b7} 4 messages"
         );
     }
 
@@ -2931,6 +2982,7 @@ mod app4_shared_copy_tests {
 
     fn task_meta(title: &str, branch: Option<&str>) -> SessionMetaWire {
         SessionMetaWire {
+            forked_from: None,
             id: Uuid::from_u128(7),
             title: title.into(),
             created_at: String::new(),

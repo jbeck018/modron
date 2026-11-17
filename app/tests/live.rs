@@ -434,6 +434,7 @@ fn start_server(session: Uuid, script: Script) -> (String, mpsc::Receiver<Payloa
                     Payload::Welcome {
                         server_version: "0.1.3".into(),
                         protocol: PROTOCOL_VERSION + u32::from(script.protocol_skew),
+                        commands: Vec::new(),
                     },
                 ),
             )
@@ -972,6 +973,7 @@ fn the_tasks_screen_renders_the_core_summary_under_the_row() {
         ..Default::default()
     };
     snapshot.sessions = vec![SessionMetaWire {
+        forked_from: None,
         id: Uuid::from_u128(1),
         title: "t".into(),
         created_at: String::new(),

@@ -275,7 +275,7 @@ function startWsServer(opts = {}) {
         const frame = JSON.parse(f.payload.toString('utf8'));
         received.push(frame.type);
         if (frame.type === 'hello') {
-          send({ seq: 0, type: 'welcome', server_version: '0.1.3', protocol: 1 });
+          send({ seq: 0, type: 'welcome', server_version: '0.1.3', protocol: 1, commands: opts.commands || [] });
           if (opts.shareLink) {
             send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: {} });
             send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
@@ -309,6 +309,15 @@ function startWsServer(opts = {}) {
         } else if (frame.type === 'personas_req') {
           // The agent picker's rows.
           send({ session: SESSION, seq: 6, type: 'personas', personas: opts.personas || [] });
+        } else if (frame.type === 'auth_start' && opts.oauth) {
+          // The device flow (ChatGPT, Claude): progress with the URL and the
+          // one-time code, then the outcome as a note. No token leaves here.
+          send({ session: SESSION, seq: 7, type: 'o_auth_progress', provider: frame.provider, stage: 'waiting', message: 'enter the code in the browser window', url: 'https://auth.openai.com/codex/device', user_code: 'WXYZ-1234' });
+          // The outcome: a `done` progress (shown on this screen) and a note (the transcript).
+          setTimeout(() => {
+            send({ session: SESSION, seq: 8, type: 'o_auth_progress', provider: frame.provider, stage: 'done', message: 'chatgpt signed in (sk-...ab12)' });
+            send({ session: SESSION, seq: 9, type: 'note', text: 'openai-compat: chatgpt signed in (sk-...ab12)' });
+          }, 300);
         } else if (frame.type === 'list_sessions') {
           // The sessions screen's refresh: answer with the scripted rows.
           send({ session: SESSION, seq: 3, type: 'sessions', sessions: opts.sessions || [] });
@@ -1427,6 +1436,59 @@ async function testBangBangPrivate(browser, base) {
 }
 
 // Packet C3f. Typing "/co" in the composer shows the compact suggestion.
+// V4: a forked session's row names its parent and turn (the core's words),
+// and `/fork 2` sends a fork frame for turn 2 (the tip is `/fork`).
+async function testForkRowAndTurn(browser, base) {
+  const fork = '9c2d7e10-1a2b-4c3d-8e4f-5a6b7c8d9e0f';
+  const ws = await startWsServer({ sessions: [{ id: fork, title: 'retry', created_at: '', updated_at: '', message_count: 4, forked_from: { session_id: SESSION, turn: 2 } }] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await tapLabel(page, 'sessions');
+    await page.waitForFunction(() => document.body.innerText.includes('forked from 5b1e8f4a at turn 2'), null, { timeout: TIMEOUT });
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(200);
+    await page.keyboard.type('/fork 2');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.value === '/fork 2', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    const frame = await waitFrame(ws, 'fork', (f) => f.turn === 2);
+    if (frame.session_id !== SESSION) throw new Error('fork carried ' + frame.session_id);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Program V Part B: the welcome's project commands are listed after the
+// built-ins in the slash popup; `/deploy` is sent, and an unlisted `/word`
+// is the local unknown-command notice with no submit frame.
+async function testProjectCommands(browser, base) {
+  const ws = await startWsServer({ commands: ['deploy'] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/dep');
+    await page.waitForFunction(() => document.body.innerText.includes('/deploy [args]'), null, { timeout: TIMEOUT });
+    await page.keyboard.press('Control+a');
+    await page.keyboard.type('/deploy staging');
+    await page.waitForFunction(() => document.activeElement.value === '/deploy staging', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await waitFrame(ws, 'submit', (f) => f.task === '/deploy staging');
+    await page.keyboard.type('/depoly');
+    await page.waitForFunction(() => document.activeElement.value === '/depoly', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('unknown command'), null, { timeout: TIMEOUT });
+    if (ws.frames.some((f) => f.type === 'submit' && f.task === '/depoly')) throw new Error('an unlisted /word was sent');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 async function testSlashSuggestions(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
@@ -1515,6 +1577,43 @@ async function testCredentialsScreen(browser, base) {
     await page.waitForFunction(() => !document.body.innerText.includes('OpenAI: paste an API key'), null, { timeout: TIMEOUT });
     const html = await page.content();
     if (html.includes('sk-test-123')) throw new Error('the key stayed on the page');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// The ChatGPT row (the server's `openai-compat`, oauth_capable) starts the
+// device flow like Claude's row: Enter sends auth_start, the page shows the
+// URL and the one-time code, and the outcome note lands. No key entry.
+async function testChatGptSignIn(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'not configured', oauth_capable: true },
+    { id: 'openai-compat', label: 'OpenAI / ChatGPT', status: 'not configured', oauth_capable: true },
+  ];
+  const ws = await startWsServer({ providers, oauth: true });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('ChatGPT'), null, { timeout: TIMEOUT }).catch(async (e) => {
+      throw new Error('the credentials screen shows no ChatGPT row: ' + (await page.evaluate(() => document.body.innerText)).slice(0, 400) + ' / ' + e.message);
+    });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Enter');
+    const started = await waitFrame(ws, 'auth_start', (f) => f.provider === 'openai-compat');
+    if (started.provider !== 'openai-compat') throw new Error('auth_start was ' + JSON.stringify(started));
+    await page.waitForFunction(() => document.body.innerText.includes('WXYZ-1234'), null, { timeout: TIMEOUT }).catch(async (e) => {
+      throw new Error('no user code on the page: ' + (await page.evaluate(() => document.body.innerText)).slice(0, 600) + ' / ' + e.message);
+    });
+    if (!(await page.content()).includes('auth.openai.com/codex/device')) throw new Error('the sign-in URL is not shown');
+    await page.waitForFunction(() => document.body.innerText.includes('chatgpt signed in'), null, { timeout: TIMEOUT });
+    if (ws.received.includes('auth_set_key')) throw new Error('ChatGPT sign-in sent a key');
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     await page.close();
   } finally {
@@ -1932,12 +2031,15 @@ if (require.main === module) (async () => {
     ['(i) header controls open the sessions and settings screens', () => testHeaderOpensScreens(browser, base)],
     ['(l) theme picker: light and dark repaint, the dark choice survives a reload', () => testThemePicker(browser, base)],
     ['(j) session row tap sends attach', () => testSessionRowAttaches(browser, base)],
+    ['(j2) V4: a forked session row names its parent and turn; /fork 2 sends turn 2', () => testForkRowAndTurn(browser, base)],
+    ['(j3) Part B: listed project commands are in the popup and sent; an unlisted /word is a local notice', () => testProjectCommands(browser, base)],
     ['(k) effort tap sends set_config', () => testEffortTapSendsConfig(browser, base)],
     ['(l) typing /co shows the compact suggestion', () => testSlashSuggestions(browser, base)],
     ['(m) model picker row sends set_config with the model', () => testModelPickerSendsConfig(browser, base)],
     ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
     ['(t) no page or console error for a few seconds and across a forced reconnect', () => testNoErrorsAcrossReconnect(browser, base)],
     ['(s) credentials: /auth opens it, OAuth sends auth_start, a typed key is sent once and leaves the page', () => testCredentialsScreen(browser, base)],
+    ['(s2) ChatGPT row: Enter starts the device flow; the URL and code show, then the outcome', () => testChatGptSignIn(browser, base)],
     ['(s2) agent picker: /agent lists the server personas, a tap sends set_config with the persona', () => testPersonaPicker(browser, base)],
     ['(s2b) agent picker: the first row clears the persona with an empty set_config', () => testPersonaClear(browser, base)],
     ['(s3) credentials: remove on a signed-in row only, asks y / n, then sends auth_remove', () => testCredentialRemove(browser, base)],

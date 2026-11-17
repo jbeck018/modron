@@ -292,7 +292,11 @@ fn start_server(session: Uuid, frames: usize) -> (String, mpsc::Receiver<Payload
                 &Frame::event(
                     None,
                     0,
-                    Payload::Welcome { server_version: "0.1.3".into(), protocol: PROTOCOL_VERSION },
+                    Payload::Welcome {
+                        server_version: "0.1.3".into(),
+                        protocol: PROTOCOL_VERSION,
+                        commands: Vec::new(),
+                    },
                 ),
             )
             .await;

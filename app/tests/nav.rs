@@ -133,6 +133,7 @@ const IDS: [u128; 3] = [0xa1, 0xb2, 0xc3];
 
 fn meta(n: u128, title: &str, running: bool) -> SessionMetaWire {
     SessionMetaWire {
+        forked_from: None,
         id: Uuid::from_u128(n),
         title: title.into(),
         created_at: String::new(),
@@ -184,6 +185,23 @@ fn opening_sessions_shows_the_core_rows_and_refreshes_the_list() {
     let screen = h.screen();
     assert!(screen.contains("router fix \u{b7} running \u{b7} 4 messages"), "{screen}");
     assert!(screen.contains("Docs pass \u{b7} idle \u{b7} 4 messages"), "{screen}");
+}
+
+#[test]
+fn a_forked_session_row_shows_its_parent_and_turn() {
+    let mut h = Harness::new();
+    let mut snap = fixture();
+    let mut forked = meta(IDS[2], "retry", false);
+    forked.forked_from =
+        Some(modron_protocol::ForkOriginWire { session_id: Uuid::from_u128(IDS[0]), turn: 2 });
+    snap.session_rows[2] = session_row(&forked, false);
+    snap.sessions[2] = forked;
+    h.push(&snap);
+    h.wait_for("chat", |s| s.contains(CHAT_MARK));
+    h.send(ctrl("o"));
+    h.wait_for("sessions rows", |s| s.contains("retry"));
+    // The core's row text, verbatim: the short parent id and the turn.
+    assert!(h.screen().contains("forked from 00000000 at turn 2"), "{}", h.screen());
 }
 
 #[test]

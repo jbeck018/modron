@@ -688,7 +688,7 @@ fn apply(client: &RemoteClient, action: UiAction) {
             client.note_local_error(note);
             Ok(())
         }
-        UiAction::Fork => with_session(client, |s| client.fork_session(s)),
+        UiAction::Fork(turn) => with_session(client, |s| client.fork_session_at(s, turn)),
         UiAction::TaskStatus => with_session(client, |s| client.task_status(s)),
         UiAction::Share => with_session(client, |s| {
             let content = client
@@ -862,6 +862,7 @@ mod tests {
 
     fn row(id: u128, updated: &str, dir: Option<&str>) -> SessionMetaWire {
         SessionMetaWire {
+            forked_from: None,
             id: Uuid::from_u128(id),
             title: format!("s{id}"),
             created_at: updated.into(),

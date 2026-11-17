@@ -289,6 +289,18 @@ pub struct SessionMeta {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub message_count: u32,
+    /// Lineage (Program V4, additive): set on a session created by `/fork`
+    /// and absent on every other session, including all older meta files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ForkOrigin>,
+}
+
+/// Where a forked session came from: the parent session and the number of
+/// user turns (tasks) the fork kept. `turn` 0 is a fork before any turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkOrigin {
+    pub parent: SessionId,
+    pub turn: u32,
 }
 
 /// Append-only session events. `parent_id` (index of the event this one

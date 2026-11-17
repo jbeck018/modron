@@ -66,6 +66,7 @@ async fn greet(ws: &mut Ws) {
             Payload::Welcome {
                 server_version: "0.1.2".into(),
                 protocol: PROTOCOL_VERSION,
+                commands: Vec::new(),
             },
         ),
     )

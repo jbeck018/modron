@@ -1882,6 +1882,7 @@ mod tests {
 
     fn snapshot() -> ViewModelSnapshot {
         let meta = |n: u128, title: &str| SessionMetaWire {
+            forked_from: None,
             id: id(n),
             title: title.into(),
             created_at: String::new(),
@@ -2238,6 +2239,20 @@ mod auth_tests {
     }
 
     #[test]
+    fn the_chatgpt_row_starts_the_device_flow_like_the_claude_row() {
+        // The server lists ChatGPT as `openai-compat` with oauth_capable, the
+        // same shape as Claude's row: Enter starts the sign-in, no key entry.
+        let snap = snapshot(vec![
+            provider("anthropic", "Anthropic", "not configured", true),
+            provider("openai-compat", "OpenAI / ChatGPT", "not configured", true),
+        ]);
+        let mut nav = auth_nav(&snap);
+        nav.apply(NavStep::Move(1));
+        assert_eq!(nav.apply(NavStep::Activate), vec![UiAction::AuthStart("openai-compat".into())]);
+        assert_eq!(nav.view().auth_key, None);
+    }
+
+    #[test]
     fn the_progress_block_carries_the_snapshot_fields() {
         let mut snap = snapshot(vec![provider("openai", "OpenAI", "not configured", true)]);
         snap.oauth = Some(OAuthProgressView {
@@ -2423,6 +2438,7 @@ mod list_screen_tests {
 
     fn meta(n: u128, title: &str, branch: Option<&str>, state: Option<&str>) -> SessionMetaWire {
         SessionMetaWire {
+            forked_from: None,
             id: Uuid::from_u128(n),
             title: title.into(),
             created_at: String::new(),
@@ -2804,6 +2820,7 @@ mod persona_task_auth_tests {
         let mut s = ViewModelSnapshot::default();
         s.sessions = (1..=count)
             .map(|n| SessionMetaWire {
+                forked_from: None,
                 id: Uuid::from_u128(n),
                 title: "t".into(),
                 created_at: String::new(),

@@ -115,8 +115,8 @@ pub enum UiAction {
     /// `/worktree <title>`: a task session in its own worktree (the core's
     /// `create_task`, off the default base).
     CreateTask(String),
-    /// `/fork`, `/tasks`, `/share`, `/remote-control <url>`.
-    Fork,
+    /// `/fork [turn]` (None = the tip), `/tasks`, `/share`, `/remote-control <url>`.
+    Fork(Option<u32>),
     TaskStatus,
     Share,
     RemoteControl(String),
@@ -1507,6 +1507,7 @@ impl Host {
         self.seen_rows = rows;
         self.bookkeeping(snapshot);
         self.raw = Some(snapshot.clone());
+        slash::set_project_commands(&snapshot.project_commands);
         let shown = self.presented(snapshot);
         self.nav.observe(&shown);
         for action in self.nav.first_run(&shown) {
@@ -1586,6 +1587,7 @@ impl Host {
         let Some(raw) = self.raw.clone() else {
             return;
         };
+        slash::set_project_commands(&raw.project_commands);
         let shown = self.presented(&raw);
         self.nav.observe(&shown);
         let _ = self.snapshots.send(shown);

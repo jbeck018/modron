@@ -671,6 +671,7 @@ fn demo_snapshot() -> String {
         ],
         sessions: vec![
             SessionMetaWire {
+                forked_from: None,
                 id: uuid::Uuid::nil(),
                 title: "migrate the router to the new hub".into(),
                 created_at: "2026-11-09T09:00:00Z".into(),
@@ -681,6 +682,7 @@ fn demo_snapshot() -> String {
                 working_dir: None,
             },
             SessionMetaWire {
+                forked_from: None,
                 id: uuid::Uuid::from_u128(1),
                 title: "audit the tools crate".into(),
                 created_at: "2026-11-08T15:00:00Z".into(),

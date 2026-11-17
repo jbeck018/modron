@@ -186,6 +186,7 @@ const AGENT: &str = "agent-review";
 
 fn meta(n: u128, title: &str, running: bool) -> SessionMetaWire {
     SessionMetaWire {
+        forked_from: None,
         id: Uuid::from_u128(n),
         title: title.into(),
         created_at: String::new(),

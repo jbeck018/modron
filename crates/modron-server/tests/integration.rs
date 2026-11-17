@@ -552,7 +552,11 @@ async fn fork_copies_the_log_under_a_fresh_id() {
     a.recv_until(|p| matches!(p, Payload::TurnDone { .. }))
         .await;
 
-    a.send(Payload::Fork { session_id: source }).await;
+    a.send(Payload::Fork {
+        session_id: source,
+        turn: None,
+    })
+    .await;
     let note = a.recv_until(|p| note_text(p).is_some()).await;
     let text = note_text(&note.payload).unwrap();
     let new_id: modron_core::SessionId = text
@@ -581,6 +585,151 @@ async fn fork_copies_the_log_under_a_fresh_id() {
         }
         other => panic!("expected snapshot, got {other:?}"),
     }
+    server.server.shutdown();
+}
+
+/// Fork at a turn: the copy keeps turn 1 only, an out-of-range turn is an
+/// error frame that creates nothing, and the list row names the parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fork_at_turn_keeps_that_turn_and_lists_its_parent() {
+    let server = spawn_server(vec![text_turn("answer one"), text_turn("answer two")], 10).await;
+    let mut a = WsClient::connect(server.addr).await;
+    a.send(Payload::Submit {
+        session_id: None,
+        task: "first".into(),
+        attachments: vec![],
+    })
+    .await;
+    let source = snapshot_id(
+        &a.recv_until(|p| matches!(p, Payload::Snapshot { .. }))
+            .await
+            .payload,
+    )
+    .unwrap();
+    a.recv_until(|p| matches!(p, Payload::TurnDone { .. }))
+        .await;
+    a.send(Payload::Submit {
+        session_id: Some(source),
+        task: "second".into(),
+        attachments: vec![],
+    })
+    .await;
+    a.recv_until(|p| matches!(p, Payload::TurnDone { .. }))
+        .await;
+
+    // Turn 3 does not exist: a clear error, nothing copied.
+    a.send(Payload::Fork {
+        session_id: source,
+        turn: Some(3),
+    })
+    .await;
+    let error = a.recv_until(|p| error_text(p).is_some()).await;
+    let text = error_text(&error.payload).unwrap();
+    assert!(text.contains("turn 3 is out of range"), "{text}");
+
+    a.send(Payload::Fork {
+        session_id: source,
+        turn: Some(1),
+    })
+    .await;
+    let note = a.recv_until(|p| note_text(p).is_some()).await;
+    let new_id: modron_core::SessionId = note_text(&note.payload)
+        .unwrap()
+        .rsplit(" -> ")
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let mut b = WsClient::connect(server.addr).await;
+    b.send(Payload::Attach {
+        session_id: new_id,
+        last_seq: 0,
+    })
+    .await;
+    match b
+        .recv_until(|p| matches!(p, Payload::Snapshot { .. }))
+        .await
+        .payload
+    {
+        Payload::Snapshot { events, .. } => {
+            let tasks: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    modron_core::SessionEvent::Task { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tasks, vec!["first"], "turn 2 must not come along");
+        }
+        other => panic!("expected snapshot, got {other:?}"),
+    }
+
+    a.send(Payload::ListSessions {}).await;
+    match a
+        .recv_until(|p| matches!(p, Payload::Sessions { .. }))
+        .await
+        .payload
+    {
+        Payload::Sessions { sessions } => {
+            let row = sessions
+                .iter()
+                .find(|r| r.id == new_id)
+                .expect("fork listed");
+            let origin = row.forked_from.expect("lineage on the row");
+            assert_eq!(origin.session_id, source);
+            assert_eq!(origin.turn, 1);
+            assert!(sessions
+                .iter()
+                .find(|r| r.id == source)
+                .unwrap()
+                .forked_from
+                .is_none());
+        }
+        other => panic!("expected sessions, got {other:?}"),
+    }
+    server.server.shutdown();
+}
+
+/// The welcome lists the project commands of the served directory, sorted,
+/// and a directory without any lists none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn welcome_lists_the_project_commands() {
+    let server = spawn_server(vec![], 10).await;
+    let commands = server.dir.path().join(".claude").join("commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(commands.join("triage.md"), "triage $ARGUMENTS").unwrap();
+    std::fs::write(commands.join("deploy.md"), "deploy $ARGUMENTS").unwrap();
+    std::fs::write(commands.join("notes.txt"), "not a command").unwrap();
+
+    let welcome = |payload: Payload| match payload {
+        Payload::Welcome { commands, .. } => commands,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    let mut client = WsClient::open_ws(server.addr, None).await.expect("connect");
+    client
+        .send(Payload::Hello {
+            client: "test-client".into(),
+            protocol: modron_protocol::PROTOCOL_VERSION,
+            token: None,
+        })
+        .await;
+    let listed = welcome(client.recv().await.payload);
+    assert_eq!(listed, vec!["deploy".to_string(), "triage".to_string()]);
+    client.close().await;
+
+    let empty = spawn_server(vec![], 10).await;
+    let mut client = WsClient::open_ws(empty.addr, None).await.expect("connect");
+    client
+        .send(Payload::Hello {
+            client: "test-client".into(),
+            protocol: modron_protocol::PROTOCOL_VERSION,
+            token: None,
+        })
+        .await;
+    assert!(welcome(client.recv().await.payload).is_empty());
+    client.close().await;
+    empty.server.shutdown();
     server.server.shutdown();
 }
 
