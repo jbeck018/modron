@@ -2201,9 +2201,10 @@ fn transcript_row(model: Signal<Model>, at: Position) -> impl IntoElement {
         ))
 }
 
-pub(crate) fn header(model: Signal<Model>) -> impl IntoElement {
+pub(crate) fn header(model: Signal<Model>) -> View {
     view()
         .flex_row()
+        .when(WEB_CONTROLS, |v| v.flex_wrap())
         .child(
             text(move || model.with(|m| m.connection.clone()))
                 .text_color(move || token_ink("muted-foreground")),

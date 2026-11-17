@@ -23,6 +23,7 @@ pub mod slash;
 pub mod startup;
 pub mod suggest;
 pub mod theme;
+pub mod ui;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

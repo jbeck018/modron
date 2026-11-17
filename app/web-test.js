@@ -14,6 +14,7 @@
 //       GitHub's status, remove asks first, the repo picker's query and paging,
 //       a run started with {account, repo, branch}, stop / wake / open routes,
 //       one shared line when runs are not configured.
+//   (u1) sign-in card (UX-1): a 44 px sign-in button, no sideways scroll.
 //   (v1) vault (PLAN 10.9 item 3): the credentials rows read the vault, a key
 //       is PUT over HTTPS (never a session frame), removal DELETEs.
 // The page is served by a Node site (startSite) on one origin: the built
@@ -178,9 +179,9 @@ function startSite(port, state) {
         if (p === '/api/invites' && req.method === 'POST') {
           const input = JSON.parse(body || '{}');
           state.invitePosts.push(input);
-          const id = `inv${state.invitePosts.length}`;
+          const id = String(state.invitePosts.length).padStart(32, '0');
           const row = { id, session_id: input.session_id, role: input.role, revoked: false,
-            expires_at: '2026-11-16T10:00:00Z', url: `${base}/i/${id}.sig` };
+            expires_at: '2026-11-16T10:00:00Z', url: `${base}/i/${id}.${'ab'.repeat(32)}` };
           state.invites.push(row);
           return json(res, 201, { id, url: row.url, expires_at: row.expires_at });
         }
@@ -246,12 +247,18 @@ function textFrame(text) {
 // server does (no attach). `frames` keeps every client frame, parsed.
 function startWsServer(opts = {}) {
   let dropped = false;
+  const usedTickets = new Set();
   const received = [];
   const frames = [];
   let onSubmit;
   const submitted = new Promise((resolve) => { onSubmit = resolve; });
   const server = http.createServer((req, res) => { res.writeHead(404); res.end(); });
   server.on('upgrade', (req, socket) => {
+    const ticket = new URL(req.url, 'http://ws.test').searchParams.get('ticket');
+    if (ticket) {
+      if (usedTickets.has(ticket)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
+      usedTickets.add(ticket);
+    }
     const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + GUID).digest('base64');
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
@@ -429,7 +436,12 @@ async function testInviteFromSettings(browser, site) {
     await tapLabel(page, 'settings');
     await page.waitForFunction(() => document.body.innerText.includes('share'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'viewer');
-    await page.waitForFunction(() => document.body.innerText.includes('/i/inv1.sig'), null, { timeout: TIMEOUT });
+    // The whole link must be one run of text (a wrap splits it, and the e2e
+    // harness reads the link from the page text): 64 hex signature digits.
+    await page.waitForFunction(() => /\/i\/0{31}1\.[0-9a-f]{64}/.test(document.body.innerText), null, { timeout: TIMEOUT });
+    const shown = await page.evaluate(() => (document.body.innerText.match(/https?:\/\/\S+\/i\/\S+/) || [''])[0]);
+    const issued = site.state.invites[0] && site.state.invites[0].url;
+    if (!issued || shown !== issued) throw new Error(`the page shows ${shown}, the bridge issued ${issued}`);
     const post = site.state.invitePosts[0];
     if (!post || post.session_id !== SESSION || post.role !== 'viewer' || post.ttl_hours !== 24) {
       throw new Error('invite request was ' + JSON.stringify(post));
@@ -438,8 +450,102 @@ async function testInviteFromSettings(browser, site) {
     await tapLabel(page, 'copy');
     await tapLabel(page, 'revoke');
     await page.waitForFunction(() => document.body.innerText.includes('no invites'), null, { timeout: TIMEOUT });
-    if (site.state.deletes[0] !== 'inv1') throw new Error('revoke deleted ' + site.state.deletes.join(','));
+    if (site.state.deletes[0] !== '0'.repeat(31) + '1') throw new Error('revoke deleted ' + site.state.deletes.join(','));
     await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// The sign-in card (UX-1): the sign-in control is a real button at least 44 px
+// tall, and the page does not scroll sideways.
+async function testSignInLayout(browser, site) {
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/');
+  try {
+    await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT });
+    const box = await page.getByRole('button', { name: 'sign in' }).first().boundingBox();
+    if (!box || box.height < 44) throw new Error('sign-in button is ' + (box ? box.height : 'missing') + ' px tall');
+    const sideways = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+    if (sideways) throw new Error('the sign-in page scrolls sideways');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// One page load opens one socket. A second socket for the same load (a
+// reconnect that reuses a single-use ticket is refused by the bridge) fails
+// this: the count of `websocket` events must be exactly 1 after the page has
+// had time to connect, for a live URL, an invite ticket and an owner page.
+async function testOneSocketPerLoad(browser, site) {
+  const ws = await startWsServer();
+  try {
+  const cases = [
+    ['live', '/app/?url=' + encodeURIComponent(ws.url + '/ws/k1') + '&session=' + SESSION, null],
+    ['invite ticket', '/app/?url=' + encodeURIComponent(ws.url + '/ws/k2?ticket=t2') + '&invite=x.y', null],
+    ['owner', '/app/?url=' + encodeURIComponent(ws.url + '/ws/k3') + '&session=' + SESSION, site.base],
+  ];
+  for (const [label, path, cookie] of cases) {
+    // The listeners are set before the first navigation, so no early socket is missed.
+    const context = await browser.newContext({ viewport: { width: 1000, height: 800 } });
+    if (cookie) await context.addCookies([{ name: 'modron_owner', value: COOKIE, url: cookie }]);
+    try {
+      const page = await context.newPage();
+      const errors = [];
+      watchErrors(page, errors);
+      const sockets = [];
+      let loads = 0;
+      page.on('websocket', (w) => sockets.push(w.url()));
+      page.on('load', () => { loads += 1; });
+      await page.goto(site.base + path, { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+      await page.waitForTimeout(4000);
+      if (loads !== 1) throw new Error(`${label}: the page loaded ${loads} times (a reload opens a second socket)`);
+      if (sockets.length !== 1) throw new Error(`${label}: ${sockets.length} sockets for one page load`);
+      // In-app navigation (chat, settings, back) must not reconnect.
+      await tapLabel(page, 'settings');
+      await page.waitForFunction(() => document.body.innerText.includes('approval mode'), null, { timeout: TIMEOUT });
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+      await page.waitForTimeout(2000);
+      if (sockets.length !== 1) throw new Error(`${label}: ${sockets.length} sockets after chat -> settings -> back`);
+      if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    } finally {
+      await context.close();
+    }
+  }
+  } finally {
+    ws.close();
+  }
+}
+
+// A slow first welcome (over the driver's 3 s connect stall) must not make an
+// invite page open a second socket with the same single-use ticket: the bridge
+// would refuse it. The first socket's welcome is held back 4 s here.
+async function testTicketSlowWelcome(browser, site) {
+  const ws = await startWsServer();
+  const context = await browser.newContext({ viewport: { width: 1000, height: 800 } });
+  try {
+    const page = await context.newPage();
+    const errors = [];
+    watchErrors(page, errors);
+    const sockets = [];
+    page.on('websocket', (w) => sockets.push(w.url()));
+    let held = false;
+    // The route is set before the first navigation: the first welcome is held 4 s.
+    await page.routeWebSocket(/\/ws\//, (route) => {
+      const server = route.connectToServer();
+      route.onMessage((m) => server.send(m));
+      server.onMessage((m) => {
+        if (!held) { held = true; setTimeout(() => route.send(m), 4000); } else route.send(m);
+      });
+    });
+    await page.goto(site.base + '/app/?url=' + encodeURIComponent(ws.url + '/ws/k9?ticket=t9') + '&invite=x.y', { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+    await page.waitForTimeout(6000);
+    if (sockets.length !== 1) throw new Error(`ticket link opened ${sockets.length} sockets for one page load`);
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   } finally {
     await context.close();
@@ -1157,11 +1263,16 @@ async function testSessionRowAttaches(browser, base) {
   const ws = await startWsServer({ sessions: [{ id: other, title: 'other work', created_at: '', updated_at: '', message_count: 2 }] });
   try {
     const { page, errors } = await openLive(browser, base, ws);
+    // One socket per page load: the session list and the attach reuse it (each
+    // socket opens with one hello frame).
+    const hellos = () => ws.received.filter((t) => t === 'hello').length;
+    const before = hellos();
     await tapLabel(page, 'sessions');
     await page.waitForFunction(() => document.body.innerText.includes('other work'), null, { timeout: TIMEOUT });
     await page.getByText('other work', { exact: false }).first().click();
     const frame = await waitFrame(ws, 'attach', (f) => f.session_id === other);
     if (frame.session_id !== other) throw new Error('attach carried ' + frame.session_id);
+    if (hellos() !== before) throw new Error(`opening a session opened ${hellos() - before} more socket(s)`);
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     await page.close();
   } finally {
@@ -1704,7 +1815,7 @@ async function testVaultKeyRows(browser, site) {
   }
 }
 
-(async () => {
+if (require.main === module) (async () => {
   const sitePort = await freePort();
   // The portal is off here (/api/me 503), so no-url pages are the demo.
   const site = await startSite(sitePort, newSiteState('off'));
@@ -1791,6 +1902,12 @@ async function testVaultKeyRows(browser, site) {
       const s = await portalSite('on'); try { await testCloudRunsNotConfigured(browser, s); } finally { s.close(); } }],
     ['(v1) vault: the key row reads the vault, a key is PUT and never a session frame, removal DELETEs', async () => {
       const s = await portalSite('on'); try { await testVaultKeyRows(browser, s); } finally { s.close(); } }],
+    ['(u2) one socket per page load: live, invite ticket and owner pages open exactly one', async () => {
+      const s = await portalSite('on'); try { await testOneSocketPerLoad(browser, s); } finally { s.close(); } }],
+    ['(u3) invite ticket: a slow welcome does not open a second socket with the spent ticket', async () => {
+      const s = await portalSite('on'); try { await testTicketSlowWelcome(browser, s); } finally { s.close(); } }],
+    ['(u1) sign-in: the button is a 44 px target and the page does not scroll sideways', async () => {
+      const s = await portalSite('on'); try { await testSignInLayout(browser, s); } finally { s.close(); } }],
   ];
   more.push(...portal);
   for (const [name, run] of more) {
@@ -1821,3 +1938,7 @@ async function testVaultKeyRows(browser, site) {
   }
   process.exit(failed ? 1 : 0);
 })();
+
+// The helpers the screenshot tool (shots.mjs) reuses: the scripted site, the
+// scripted bridge and the fixtures. Requiring this file runs nothing.
+module.exports = { startSite, startWsServer, newSiteState, PORTAL_ROWS, SESSION, COOKIE, TOKEN, STREAM, freePort, openIsolated, tapLabel, TIMEOUT };

@@ -302,3 +302,24 @@ and page text after Enter.
 - The terminal loop wakes at the animation period while a turn runs
   (`chat::tick_deadline`), so the spinner moves during silent waits; an idle
   app has no deadline.
+
+## Web styling and screenshots (UX-1)
+
+The web target's look is in `src/ui.rs` (components) and `DESIGN.md` (the
+standard). Every style is web-only: on the terminal `ui::screen` returns the
+body unchanged, so the terminal's screens and tests are unaffected.
+
+Screenshots of the web target, in four variants (iPhone 13 light and dark,
+1280 x 800 light and dark), from the scripted site in `web-test.js`:
+
+    nsh package --target web -o dist < /dev/null
+    node shots.mjs /tmp/shots                 # all four variants
+    node shots.mjs /tmp/shots iphone-dark     # one variant
+
+It writes `01-signin`, `02-signin-error`, `03-sessions-empty`,
+`04-sessions-five`, `05-cloud`, `06-chat`, `07-settings`, `08-credentials`,
+`09-help` and `10-sessions` per variant, as `<name>-<variant>.png`. It prints,
+for each shot, whether the page scrolls sideways and which `role=button`
+elements are under 44 px tall. It needs the preinstalled Playwright, like
+`web-test.js` (`require` of `web-test.js` runs nothing: it exports the
+helpers the tool uses).

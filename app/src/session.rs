@@ -428,7 +428,9 @@ impl Driver {
             }
             ConnectionState::Connecting => {
                 let since = *self.connecting_since.get_or_insert_with(Instant::now);
-                if connect_stalled(since, Instant::now()) {
+                // A ticketed link (an invite) never retries: its ticket is
+                // single use, so a second socket is refused (and logged).
+                if connect_stalled(since, Instant::now()) && !self.ticketed() {
                     self.connecting_since = None;
                     self.attempts = self.attempts.saturating_add(1);
                     self.reconnect();
@@ -437,11 +439,12 @@ impl Driver {
             ConnectionState::Disconnected => {
                 self.linked = false;
                 self.startup_sent = false;
-                self.status.reconnecting.store(true, Ordering::SeqCst);
+                let ticketed = self.ticketed();
+                self.status.reconnecting.store(!ticketed, Ordering::SeqCst);
                 let due = *self
                     .retry_at
                     .get_or_insert_with(|| Instant::now() + retry_delay(self.attempts));
-                if Instant::now() >= due {
+                if !ticketed && Instant::now() >= due {
                     self.retry_at = None;
                     self.attempts = self.attempts.saturating_add(1);
                     self.reconnect();
@@ -522,6 +525,11 @@ impl Driver {
             // Startup flags need a session to configure: start one now.
             let _ = self.client.new_session(None);
         }
+    }
+
+    /// Whether the link carries an invite ticket (`?ticket=`, one use only).
+    fn ticketed(&self) -> bool {
+        self.options.url.contains("ticket=")
     }
 
     /// One reconnect try: re-attach to the known session, or connect afresh

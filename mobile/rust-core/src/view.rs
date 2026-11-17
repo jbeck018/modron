@@ -351,6 +351,10 @@ pub const OWN_SERVER_NOTE: &str = "started by modron-app";
 pub const SIGN_IN_LABEL: &str = "sign in";
 pub const SIGN_OUT_LABEL: &str = "sign out";
 pub const SIGN_IN_PLACEHOLDER: &str = "owner token";
+/// The sign-in screen's one explanatory line (web): where the token comes from.
+pub const SIGN_IN_HINT: &str = "the owner token is the OWNER_TOKEN set on the bridge.";
+/// The web header's back control (the same action as Esc).
+pub const BACK_LABEL: &str = "back";
 pub const WRONG_TOKEN_LABEL: &str = "wrong token";
 pub const TOO_MANY_ATTEMPTS_LABEL: &str = "too many attempts";
 pub const SIGN_IN_FAILED_LABEL: &str = "sign-in failed";
@@ -641,18 +645,31 @@ pub fn short_time(iso: &str) -> String {
 /// One portal sessions row: the title (`untitled` when blank), the host
 /// label, the online or offline word, and the last heartbeat time.
 pub fn portal_session_row(title: &str, host_label: &str, online: bool, updated_at: &str) -> String {
+    let (title, subtitle) = portal_session_parts(title, host_label, online, updated_at);
+    format!("{title} \u{b7} {subtitle}")
+}
+
+/// The two parts of a portal row: the title, and the subtitle (host, online
+/// or offline word, last heartbeat time). `portal_session_row` joins them with
+/// the middle dot, so the terminal's line and the web's two lines share words.
+pub fn portal_session_parts(
+    title: &str,
+    host_label: &str,
+    online: bool,
+    updated_at: &str,
+) -> (String, String) {
     let title = if title.trim().is_empty() {
         UNTITLED_LABEL
     } else {
         title
     };
     let state = if online { ONLINE_LABEL } else { OFFLINE_LABEL };
-    let mut row = format!("{title} \u{b7} {host_label} \u{b7} {state}");
+    let mut subtitle = format!("{host_label} \u{b7} {state}");
     if !updated_at.is_empty() {
-        row.push_str(" \u{b7} ");
-        row.push_str(&short_time(updated_at));
+        subtitle.push_str(" \u{b7} ");
+        subtitle.push_str(&short_time(updated_at));
     }
-    row
+    (title.to_string(), subtitle)
 }
 
 /// Cloud runs (web, owner only; PLAN 10.10): the Cloud screen's words.
@@ -2721,6 +2738,25 @@ mod portal_copy_tests {
         assert_eq!(short_time("yesterday"), "yesterday");
         assert_eq!(short_time(""), "");
         assert_eq!(short_time("2026-11-15 10:20"), "2026-11-15 10:20");
+    }
+
+    #[test]
+    fn sign_in_hint_names_the_bridge_token() {
+        assert!(SIGN_IN_HINT.contains("OWNER_TOKEN"));
+        assert!(SIGN_IN_HINT.is_ascii());
+    }
+
+    #[test]
+    fn portal_parts_join_to_the_row_line() {
+        let (title, subtitle) =
+            portal_session_parts("fix router", "laptop", true, "2026-11-15T10:20:30Z");
+        assert_eq!(title, "fix router");
+        assert_eq!(
+            format!("{title} \u{b7} {subtitle}"),
+            portal_session_row("fix router", "laptop", true, "2026-11-15T10:20:30Z")
+        );
+        let (blank, _) = portal_session_parts("  ", "cloud", false, "");
+        assert_eq!(blank, UNTITLED_LABEL);
     }
 
     #[test]
