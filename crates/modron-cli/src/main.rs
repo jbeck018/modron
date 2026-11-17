@@ -105,6 +105,25 @@ impl SandboxChoice {
 
 #[derive(Subcommand, Clone)]
 enum Command {
+    /// Team mode: plan the task into up to N independent items, run each in
+    /// its own git worktree, merge, verify, and run fix rounds. Same as
+    /// `/team [N] <task>` in the app.
+    Team {
+        /// Parallel workers, 1 to 5.
+        #[arg(short = 'n', long, default_value_t = 3)]
+        workers: u32,
+        /// Keep fixing until the verify command passes (default cap 6 fix
+        /// rounds; the token budget and spend cap still stop it).
+        #[arg(long)]
+        until_verified: bool,
+        /// Fix rounds after the first round (default 2, or 6 with
+        /// --until-verified).
+        #[arg(long)]
+        max_rounds: Option<u32>,
+        /// The task.
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
+    },
     /// Interactive multi-turn session: type tasks, stream answers, one
     /// shared session (`/exit` to quit, Ctrl-D also works).
     Chat,
@@ -400,8 +419,9 @@ enum AuthAction {
     /// Add a provider interactively: pick one, paste a token (or run the
     /// Claude OAuth flow in the browser).
     Add,
-    /// Authorize a Claude subscription via browser (PKCE + localhost
-    /// callback) and store tokens.
+    /// Sign in to a subscription: the Claude subscription by default
+    /// (browser, PKCE + localhost callback), or ChatGPT with
+    /// `--provider chatgpt` (device code in the browser). EXPERIMENTAL.
     Login,
     /// Store an API key without the wizard: `auth set <provider> [key]`.
     /// Omit the key (or pass `-`) to read it from stdin — piped secrets
@@ -898,7 +918,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
 
     // `modron auth …` — subscription token management (Phase 5d X3).
     if let Some(Command::Auth { action }) = cli.command {
-        return crate::auth::run_auth(action).await;
+        return crate::auth::run_auth(action, cli.provider.map(|p| p.id())).await;
     }
 
     // `modron mcp add <preset>` — writes a preset server entry to config.toml.
@@ -976,6 +996,27 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     // `modron chat` — interactive multi-turn REPL (Phase-1c I3).
     if let Some(Command::Chat) = cli.command {
         return run_chat(&cli, &cfg).await;
+    }
+    // `modron team`: team mode (V3), one summary, the same engine path as
+    // `/team` in the app.
+    if let Some(Command::Team {
+        workers,
+        until_verified,
+        max_rounds,
+        task,
+    }) = cli.command.clone()
+    {
+        return run_team_cli(
+            &cli,
+            &cfg,
+            modron_core::team::TeamOptions {
+                workers,
+                max_rounds,
+                until_verified,
+            },
+            &task.join(" "),
+        )
+        .await;
     }
     let Some(task) = cli.task.clone() else {
         // Unreachable for `None`/`tui` (handled above); other subcommands
@@ -2998,6 +3039,39 @@ fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
 /// `modron chat` (Phase-1c I3): one session, many turns. Each line is a
 /// task; the transcript (with compaction + memory) carries context across
 /// lines. Errors don't kill the session.
+/// `modron team`: build the agent as a one-shot run does, then run team mode
+/// and print its summary.
+async fn run_team_cli(
+    cli: &Cli,
+    cfg: &config::Config,
+    opts: modron_core::team::TeamOptions,
+    task: &str,
+) -> anyhow::Result<()> {
+    // Refused before any provider or MCP server is set up.
+    opts.check().map_err(anyhow::Error::msg)?;
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let mcp = spawn_mcp_servers(cfg).await?;
+    let agent = build_agent_with(
+        cli,
+        cfg,
+        interactive,
+        AgentSinks::for_mode(if interactive {
+            RunMode::INTERACTIVE
+        } else {
+            RunMode::HEADLESS
+        }),
+        &mcp,
+    )?;
+    let summary = agent.engine.run_team(task, opts).await?;
+    println!("{}", summary.answer);
+    println!();
+    println!(
+        "session: {}  (rounds: {}, worker items: {})",
+        summary.session_id, summary.turns, summary.tool_calls
+    );
+    Ok(())
+}
+
 async fn run_chat(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     use std::io::Write as _;
     let mcp = spawn_mcp_servers(cfg).await?;

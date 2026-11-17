@@ -196,6 +196,10 @@ fn manual_provider_flow(
         writeln!(stdout, "   {} {:<20} {}", opt.number, opt.name, opt.note)?;
     }
     writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "   c  ChatGPT sign-in        sign in with your ChatGPT plan (experimental)"
+    )?;
     writeln!(stdout, "   m  Try mock mode          (no key needed)")?;
     writeln!(stdout, "   q  Quit")?;
     writeln!(stdout)?;
@@ -212,6 +216,16 @@ fn manual_provider_flow(
     if choice.eq_ignore_ascii_case("m") {
         writeln!(stdout, "\n  starting in mock mode — no key needed\n")?;
         return Ok("mock".to_string());
+    }
+    if choice.eq_ignore_ascii_case("c") {
+        // This entry point is synchronous and runs on the multi-thread
+        // runtime `main` starts, so the async device flow blocks in place.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::auth::chatgpt_login())
+        })?;
+        save_default_provider("chatgpt")?;
+        writeln!(stdout, "  ✓ default provider: chatgpt")?;
+        return Ok("chatgpt".to_string());
     }
 
     let num: u8 = choice

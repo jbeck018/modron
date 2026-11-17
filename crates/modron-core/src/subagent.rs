@@ -25,6 +25,9 @@ use std::sync::Arc;
 #[derive(Default)]
 struct ChildMeter {
     state: std::sync::Mutex<MeterState>,
+    /// The parent's price lookup, so the child's spend is priced per model
+    /// (team mode caps spend across its children with it).
+    price: Option<Arc<crate::PriceLookup>>,
 }
 
 #[derive(Default)]
@@ -34,6 +37,8 @@ struct MeterState {
     /// Every usage event the child wrote, summed (its `total()` is the
     /// token meter the heartbeat reports).
     usage: crate::Usage,
+    /// The child's priced spend in USD (0 with no price lookup).
+    spend_usd: f64,
 }
 
 impl ChildMeter {
@@ -45,6 +50,14 @@ impl ChildMeter {
     /// The child's usage so far (a killed child reports what it spent).
     fn usage(&self) -> crate::Usage {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).usage
+    }
+
+    /// The child's priced spend so far.
+    fn spend_usd(&self) -> f64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .spend_usd
     }
 }
 
@@ -65,7 +78,7 @@ impl MeteredStore {
         }
         for event in events {
             match event {
-                SessionEvent::Usage { usage, .. } => {
+                SessionEvent::Usage { model, usage } => {
                     s.usage.input_tokens = s.usage.input_tokens.saturating_add(usage.input_tokens);
                     s.usage.output_tokens =
                         s.usage.output_tokens.saturating_add(usage.output_tokens);
@@ -73,6 +86,12 @@ impl MeteredStore {
                         .usage
                         .cached_input_tokens
                         .saturating_add(usage.cached_input_tokens);
+                    if let Some(lookup) = self.meter.price.as_ref() {
+                        if let Some((in_per_m, out_per_m)) = lookup(model) {
+                            s.spend_usd += usage.input_tokens as f64 / 1_000_000.0 * in_per_m
+                                + usage.output_tokens as f64 / 1_000_000.0 * out_per_m;
+                        }
+                    }
                 }
                 SessionEvent::TurnTrace { turn, .. } => s.turns = s.turns.max(*turn),
                 _ => {}
@@ -266,6 +285,9 @@ pub struct ExploreReport {
     /// and `usage` / `turns` are what it spent before the stop (the parent
     /// still charges them).
     pub killed: bool,
+    /// Priced spend of the child in USD (0 without a price lookup). Team
+    /// mode sums it against the spend cap.
+    pub spend_usd: f64,
 }
 
 /// Run one explore subagent (read-only, cheap tier, no persona).
@@ -631,7 +653,10 @@ async fn run_child(
             label: label.clone(),
         });
     }
-    let meter = Arc::new(ChildMeter::default());
+    let meter = Arc::new(ChildMeter {
+        price: parent.config.price_lookup.clone(),
+        ..ChildMeter::default()
+    });
     let progress_id = subagent_id.clone();
     let progress_label = label.clone();
     let progress_meter = Arc::clone(&meter);
@@ -724,6 +749,7 @@ async fn run_child(
                 usage,
                 turns,
                 killed: true,
+                spend_usd: meter.spend_usd(),
             });
         }
     };
@@ -751,6 +777,7 @@ async fn run_child(
         usage,
         turns,
         killed: false,
+        spend_usd: meter.spend_usd(),
     })
 }
 

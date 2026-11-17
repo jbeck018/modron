@@ -92,6 +92,15 @@ never touch shell history or `ps`), `auth status` (masked), and `auth logout
 [provider]`. Saved keys live in `~/.config/modron/env` (mode 0600), sourced on
 every launch. The `/auth` command opens the same manager mid-session.
 
+EXPERIMENTAL: ChatGPT subscription sign-in. `modron auth login --provider chatgpt`
+(also option `g` in `auth add`, and `c` in the first-run provider list) shows a code and
+opens the OpenAI device page in your browser; enter the code there and Modron
+stores the tokens 0600 in `~/.modron/auth/openai.json`, the same store the Codex
+import uses, and refreshes them itself. `--provider chatgpt` then uses the
+ChatGPT backend. `modron auth logout chatgpt` deletes that sign-in. Like the
+Claude subscription login this is ToS-gray and not verified against a live
+account in this repository; OpenAI API keys remain the supported route.
+
 ## Daemon (persistent sessions)
 
 ```sh
@@ -319,7 +328,22 @@ modron memory list|show|forget|stats|curate
 modron daemon start|status|stop # background engine (see Daemon)
 modron doctor                   # diagnose the setup
 modron upgrade                  # replace the binary with the latest release
+modron team [-n N] [--until-verified] [--max-rounds R] <task>
+                                # team mode: parallel workers in git worktrees (see below)
 ```
+
+## Team mode
+
+`/team [N] <task>` in the app, or `modron team [-n N] <task>`, splits a task
+into up to N independent items (default 3, at most 5). Each item runs as a
+subagent in its own git worktree under `.modron/worktrees/`, in parallel. The
+worktrees are merged into the current branch in item order; a merge conflict
+becomes a fix item. The `[verify]` command and the reviewer then check the
+merged tree, and failures become items for the next round. The run stops when a
+round is clean, at the fix-round cap (`--max-rounds`, default 2), or when the
+token budget or spend cap is spent. `--until-verified` raises the cap to 6.
+Needs a git repository with at least one commit. Merges create commits on the
+current branch, so run it on a branch you can discard.
 
 ## Handoff between hosts
 

@@ -2563,7 +2563,11 @@ pub mod oauth {
         }
 
         pub fn save(auth: &ChatGptAuth) -> anyhow::Result<()> {
-            let path = token_file()?;
+            save_at(&token_file()?, auth)
+        }
+
+        /// Path-parameterized [`save`] (tests write to a temp file).
+        pub fn save_at(path: &std::path::Path, auth: &ChatGptAuth) -> anyhow::Result<()> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -2573,18 +2577,22 @@ pub mod oauth {
                 "account_id": auth.account_id,
                 "saved_at": chrono::Utc::now().to_rfc3339(),
             });
-            super::super::write_private(&path, &body.to_string())?;
+            super::super::write_private(path, &body.to_string())?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
             }
             Ok(())
         }
 
         pub fn load() -> anyhow::Result<Option<ChatGptAuth>> {
-            let path = token_file()?;
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            load_at(&token_file()?)
+        }
+
+        /// Path-parameterized [`load`]: `Ok(None)` when no file exists.
+        pub fn load_at(path: &std::path::Path) -> anyhow::Result<Option<ChatGptAuth>> {
+            let Ok(text) = std::fs::read_to_string(path) else {
                 return Ok(None);
             };
             let value: Value = serde_json::from_str(&text)?;
@@ -2610,6 +2618,21 @@ pub mod oauth {
                     .map(String::from),
                 account_id,
             }))
+        }
+
+        /// Delete the stored ChatGPT sign-in. `Ok(false)` when none was
+        /// stored. Never reads or prints the token values.
+        pub fn clear() -> anyhow::Result<bool> {
+            clear_at(&token_file()?)
+        }
+
+        /// Path-parameterized [`clear`].
+        pub fn clear_at(path: &std::path::Path) -> anyhow::Result<bool> {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(anyhow!("cannot delete ChatGPT sign-in tokens: {e}")),
+            }
         }
     }
 
@@ -2654,6 +2677,52 @@ pub mod oauth {
             assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
             assert_eq!(tokens.expires_in, Some(3600));
             assert!(parse_token_response(&json!({})).is_err());
+        }
+
+        fn scratch_chatgpt_file(tag: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "modron-chatgpt-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.join("openai.json")
+        }
+
+        #[test]
+        fn chatgpt_storage_round_trips_clears_and_is_private() {
+            let path = scratch_chatgpt_file("roundtrip");
+            assert!(chatgpt::load_at(&path).unwrap().is_none());
+            assert!(!chatgpt::clear_at(&path).unwrap(), "nothing stored yet");
+            let auth = chatgpt::ChatGptAuth {
+                access_token: "at-1".into(),
+                refresh_token: Some("rt-1".into()),
+                account_id: "acc-1".into(),
+            };
+            chatgpt::save_at(&path, &auth).unwrap();
+            assert_eq!(chatgpt::load_at(&path).unwrap(), Some(auth));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            assert!(chatgpt::clear_at(&path).unwrap());
+            assert!(chatgpt::load_at(&path).unwrap().is_none());
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+
+        #[test]
+        fn chatgpt_load_refuses_tokens_without_an_account_id() {
+            let path = scratch_chatgpt_file("no-account");
+            std::fs::write(&path, r#"{"access_token":"at-only"}"#).unwrap();
+            let err = chatgpt::load_at(&path).unwrap_err().to_string();
+            assert!(err.contains("account_id"), "{err}");
+            assert!(!err.contains("at-only"), "error must not echo the token");
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
 
         #[test]

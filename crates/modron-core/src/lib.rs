@@ -32,7 +32,9 @@ pub mod sandbox;
 /// engine's run loop is the only client).
 pub(crate) mod speculative;
 pub mod subagent;
+pub mod team;
 pub mod testing;
+pub mod worktree;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

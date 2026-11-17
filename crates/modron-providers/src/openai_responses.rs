@@ -283,55 +283,15 @@ impl OpenAiResponsesProvider {
                 return Ok(true);
             }
         }
-        let response = self
-            .http
-            .post(chatgpt::TOKEN_URL)
-            .timeout(REQUEST_TIMEOUT)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("client_id", chatgpt::CLIENT_ID),
-                ("refresh_token", refresh_token.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
-        if !status.is_success() {
-            return Err(Error::Provider {
-                provider: PROVIDER_ID.into(),
-                message: format!("token refresh failed: HTTP {status}: {text}"),
-            });
-        }
-        let value: Value = serde_json::from_str(&text).map_err(|err| Error::Provider {
-            provider: PROVIDER_ID.into(),
-            message: format!("malformed token refresh response: {err}"),
-        })?;
-        let access_token = value
-            .get("access_token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Provider {
-                provider: PROVIDER_ID.into(),
-                message: "token refresh response missing access_token".into(),
-            })?
-            .to_string();
+        let grant = refresh_grant(&self.http, chatgpt::TOKEN_URL, &refresh_token).await?;
         // OpenAI rotates refresh tokens; keep the old one only when the
         // response omits it.
-        let new_refresh_token = value
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .or(Some(refresh_token));
-        let account_id = value
-            .get("id_token")
-            .and_then(Value::as_str)
-            .and_then(chatgpt::account_id)
+        let new_refresh_token = grant.refresh_token.or(Some(refresh_token));
+        let account_id = grant
+            .account_id
             .unwrap_or_else(|| self.auth.read().expect("auth lock").account_id.clone());
         let new_auth = StoredAuth {
-            access_token,
+            access_token: grant.access_token,
             refresh_token: new_refresh_token,
             account_id: account_id.clone(),
         };
@@ -679,8 +639,178 @@ impl ResponsesAccumulator {
     }
 }
 
+/// What a `refresh_token` grant returned. Nothing is persisted here.
+pub(crate) struct RefreshGrant {
+    pub access_token: String,
+    /// The rotated refresh token, or `None` when the response omits it.
+    pub refresh_token: Option<String>,
+    /// chatgpt-account-id from the response's id_token, when present.
+    pub account_id: Option<String>,
+}
+
+/// POST the `refresh_token` grant to `token_url`. Endpoint-parameterized
+/// so tests can point it at a local mock. Errors never echo token values
+/// beyond the HTTP status and the server's error text.
+pub(crate) async fn refresh_grant(
+    http: &Client,
+    token_url: &str,
+    refresh_token: &str,
+) -> Result<RefreshGrant> {
+    let response = http
+        .post(token_url)
+        .timeout(REQUEST_TIMEOUT)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", chatgpt::CLIENT_ID),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await
+        .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| crate::transport_error(PROVIDER_ID, err))?;
+    if !status.is_success() {
+        return Err(Error::Provider {
+            provider: PROVIDER_ID.into(),
+            message: format!("token refresh failed: HTTP {status}: {text}"),
+        });
+    }
+    let value: Value = serde_json::from_str(&text).map_err(|err| Error::Provider {
+        provider: PROVIDER_ID.into(),
+        message: format!("malformed token refresh response: {err}"),
+    })?;
+    let access_token = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.into(),
+            message: "token refresh response missing access_token".into(),
+        })?
+        .to_string();
+    Ok(RefreshGrant {
+        access_token,
+        refresh_token: value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(String::from),
+        account_id: value
+            .get("id_token")
+            .and_then(Value::as_str)
+            .and_then(chatgpt::account_id),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use modron_core::auth::oauth::base64url_nopad;
+
+    /// Reads one HTTP request off the socket and returns its body.
+    fn read_request_body(sock: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match sock.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+            let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
+            let len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if raw.len() >= pos + 4 + len {
+                break;
+            }
+        }
+        let start = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(raw.len(), |pos| pos + 4);
+        String::from_utf8_lossy(&raw[start..]).into_owned()
+    }
+
+    /// One-shot mock token endpoint: answers the next request with
+    /// `status` and `body`, and sends back the request body it received.
+    fn mock_token_endpoint(
+        status: &'static str,
+        body: impl Into<String>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::Write;
+        let body: String = body.into();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = tx.send(read_request_body(&mut sock));
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}/oauth/token"), rx)
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_posts_the_refresh_grant_and_reads_rotated_tokens() {
+        let jwt = format!(
+            "h.{}.s",
+            base64url_nopad(br#"{"chatgpt_account_id":"acc-9"}"#)
+        );
+        let body =
+            format!(r#"{{"access_token":"at-new","refresh_token":"rt-new","id_token":"{jwt}"}}"#);
+        let (url, request) = mock_token_endpoint("200 OK", body);
+        let grant = refresh_grant(&Client::new(), &url, "rt-old").await.unwrap();
+        assert_eq!(grant.access_token, "at-new");
+        assert_eq!(grant.refresh_token.as_deref(), Some("rt-new"));
+        assert_eq!(grant.account_id.as_deref(), Some("acc-9"));
+        let sent = request.recv().unwrap();
+        assert!(sent.contains("grant_type=refresh_token"), "{sent}");
+        assert!(sent.contains("refresh_token=rt-old"), "{sent}");
+        assert!(
+            sent.contains(&format!("client_id={}", chatgpt::CLIENT_ID)),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_without_rotation_or_id_token_leaves_them_none() {
+        let (url, _request) = mock_token_endpoint("200 OK", r#"{"access_token":"at-only"}"#);
+        let grant = refresh_grant(&Client::new(), &url, "rt-old").await.unwrap();
+        assert_eq!(grant.access_token, "at-only");
+        assert_eq!(grant.refresh_token, None, "caller keeps the previous token");
+        assert_eq!(grant.account_id, None, "caller keeps the stored account");
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_reports_rejection_and_missing_access_token() {
+        let (url, _request) =
+            mock_token_endpoint("401 Unauthorized", r#"{"error":"invalid_grant"}"#);
+        let err = refresh_grant(&Client::new(), &url, "rt-dead")
+            .await
+            .err()
+            .expect("rejected refresh must fail");
+        assert!(err.to_string().contains("HTTP 401"), "{err}");
+
+        let (url, _request) = mock_token_endpoint("200 OK", r#"{"refresh_token":"rt"}"#);
+        let err = refresh_grant(&Client::new(), &url, "rt-old")
+            .await
+            .err()
+            .expect("missing access_token must fail");
+        assert!(err.to_string().contains("missing access_token"), "{err}");
+    }
+
     use super::*;
     use modron_core::{Message, ToolSpec};
 

@@ -394,6 +394,14 @@ written by `modron auth set` (and by `/auth` in the app) are kept in
 | `zai` | `ZAI_API_KEY` | `ZAI_BASE_URL` | `https://api.z.ai/api/paas/v4` |
 | `openai-responses` | `OPENAI_API_KEY` (required) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`, path `/responses`. The OpenAI Responses API with a plain API key: same request and stream code as `chatgpt`, reasoning items replayed; no ChatGPT account header, no token refresh. Its reasoning blocks are scoped to this provider id, separate from `chatgpt` |
 | `chatgpt` | none; uses a stored ChatGPT sign-in | none | ChatGPT backend |
+
+The stored ChatGPT sign-in (EXPERIMENTAL) is created by `modron auth login
+--provider chatgpt` (device code in the browser), by `auth add` option `g`, or by
+reusing `~/.codex/auth.json` at first run. It lives in `~/.modron/auth/openai.json`
+(mode 0600) with the account id the backend requires; the access token is
+refreshed with the stored refresh token. `modron auth status` shows it masked and
+`modron auth logout chatgpt` deletes it. `OPENAI_API_KEY` is not touched by
+either command.
 | `groq` | `GROQ_API_KEY` | `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` |
 | `google` | `GEMINI_API_KEY` | `GOOGLE_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `cerebras` | `CEREBRAS_API_KEY` | `CEREBRAS_BASE_URL` | `https://api.cerebras.ai/v1` |

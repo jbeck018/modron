@@ -213,6 +213,10 @@ pub fn run(line: &str) -> UiAction {
             },
         },
         "build" => UiAction::SetPhase(Phase::Build),
+        // Team mode runs on the server: the line goes out as the task and the
+        // engine reads the `/team [N] <task>` form (a bare `/team` is usage).
+        "team" if args.is_empty() => usage("team"),
+        "team" => UiAction::Send(format!("/team {args}")),
         "fork" => UiAction::Fork,
         "tasks" => UiAction::Nav(NavStep::Open(Screen::Tasks)),
         "cloud" if WEB_CONTROLS => UiAction::Nav(NavStep::Open(Screen::Cloud)),
@@ -228,7 +232,10 @@ pub fn run(line: &str) -> UiAction {
         "share" | "publish" => UiAction::Share,
         "remote-control" | "rc" if args.is_empty() => usage("remote-control"),
         "remote-control" | "rc" => UiAction::RemoteControl(args.to_string()),
-        _ => UiAction::Notice(SLASH_UNKNOWN_LABEL.to_string()),
+        // Not a built-in: the line is a task. The engine expands a project
+        // command (`.claude/commands/<word>.md`) when one exists; otherwise
+        // the model reads the line as text.
+        _ => UiAction::Send(line.trim().to_string()),
     }
 }
 
@@ -238,6 +245,11 @@ mod tests {
 
     fn is_unknown(action: &UiAction) -> bool {
         *action == UiAction::Notice(SLASH_UNKNOWN_LABEL.to_string())
+    }
+
+    /// The line a non-built-in `/word` sends as a task.
+    fn sent(line: &str) -> UiAction {
+        UiAction::Send(line.to_string())
     }
 
     #[test]
@@ -257,8 +269,9 @@ mod tests {
 
     #[test]
     fn cloud_is_a_web_only_command() {
-        // The native tests are the terminal target: no /cloud there.
-        assert!(is_unknown(&run("/cloud")));
+        // The native tests are the terminal target: no /cloud there, so it is
+        // not a built-in and goes out as a task like any unknown word.
+        assert_eq!(run("/cloud"), sent("/cloud"));
         assert!(!local_entries().iter().any(|e| e.name == "cloud"));
     }
 
@@ -294,9 +307,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_words_get_the_shared_notice() {
-        assert!(is_unknown(&run("/nope")));
-        assert!(is_unknown(&run("/remote")));
+    fn unknown_words_are_sent_as_tasks() {
+        // A project command (`.claude/commands/<word>.md`) is expanded by the
+        // engine at submit time; any other word reaches the model as text.
+        assert_eq!(run("/nope"), sent("/nope"));
+        assert_eq!(run("/fix-bug 123 now"), sent("/fix-bug 123 now"));
+        assert_eq!(run("  /remote  "), sent("/remote"));
+        assert!(!is_unknown(&run("/remote")));
+    }
+
+    #[test]
+    fn team_is_a_server_task_and_bare_team_shows_usage() {
+        assert_eq!(run("/team 4 refactor the parser"), sent("/team 4 refactor the parser"));
+        assert_eq!(run("/team fix it"), sent("/team fix it"));
+        assert!(matches!(run("/team"), UiAction::Notice(s) if s.starts_with("use ")));
+        assert!(is_exact("/team"));
     }
 
     #[test]

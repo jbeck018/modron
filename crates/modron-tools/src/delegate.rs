@@ -11,7 +11,6 @@
 use crate::common::{internal_tool_error, tool_err};
 use crate::reduce::reduce_output;
 use crate::validate::validate_args;
-use modron_core::hooks::scrub_tokio_command;
 use modron_core::{Tool, ToolCtx, ToolOutcome, ToolSpec};
 use std::sync::Mutex;
 
@@ -24,11 +23,12 @@ const MAX_BUDGET_TOKENS: u64 = 200_000;
 const MAX_BACKGROUND_DELEGATES: usize = 4;
 
 /// Builds a `git` command rooted at `dir` with provider credentials removed
-/// from its environment. Every git spawn in this module goes through here so
-/// no call site can forget the scrub.
+/// from its environment (the git steps themselves live in
+/// `modron_core::worktree`, which scrubs the same way).
+#[cfg(test)]
 fn git_command(dir: &std::path::Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
-    scrub_tokio_command(&mut cmd);
+    modron_core::hooks::scrub_tokio_command(&mut cmd);
     cmd.current_dir(dir);
     cmd
 }
@@ -214,21 +214,12 @@ impl Tool for DelegateTool {
         }
         if isolate {
             let id = modron_core::subagent::new_worktree_id();
-            let worktree = ctx.working_dir.join(".modron").join("worktrees").join(&id);
-            let output = git_command(&ctx.working_dir)
-                .args(["worktree", "add"])
-                .arg(&worktree)
-                .output()
-                .await;
-            match output {
-                Ok(o) if o.status.success() => {
+            let worktree = modron_core::worktree::path_for(&ctx.working_dir, &id);
+            match modron_core::worktree::create(&ctx.working_dir, &worktree).await {
+                Ok(()) => {
                     child_working_dir = worktree;
                 }
-                other => {
-                    let detail = match other {
-                        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                        Err(e) => e.to_string(),
-                    };
+                Err(detail) => {
                     return Ok(tool_err(
                         NAME,
                         format!(
@@ -972,80 +963,30 @@ impl Tool for MergeWorktreeTool {
 
         // Commit any uncommitted work in the worktree first (the delegate
         // may not have committed), then merge its HEAD.
-        async fn run_in(
-            dir: &std::path::Path,
-            args: &[&str],
-        ) -> std::io::Result<std::process::Output> {
-            git_command(dir).args(args).output().await
-        }
-        let status = run_in(&canonical, &["status", "--porcelain"])
-            .await
-            .map_err(internal_err)?;
-        if !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
-            let add = run_in(&canonical, &["add", "-A"])
-                .await
-                .map_err(internal_err)?;
-            if !add.status.success() {
-                return Ok(tool_err(
-                    MERGE_NAME,
-                    "cannot stage worktree changes",
-                    MAX_BYTES,
-                ));
-            }
-            let commit = run_in(&canonical, &["commit", "-qm", "delegate work"]).await;
-            if let Ok(c) = &commit {
-                if !c.status.success()
-                    && !String::from_utf8_lossy(&c.stdout).contains("nothing to commit")
-                {
-                    return Ok(tool_err(
-                        MERGE_NAME,
-                        "cannot commit worktree changes",
-                        MAX_BYTES,
-                    ));
-                }
-            }
-        }
-        let head = run_in(&canonical, &["rev-parse", "HEAD"])
-            .await
-            .map_err(internal_err)?;
-        if !head.status.success() {
-            return Ok(tool_err(MERGE_NAME, "worktree has no commits", MAX_BYTES));
-        }
-        let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let sha = match modron_core::worktree::commit_all(&canonical).await {
+            Ok(sha) => sha,
+            Err(message) => return Ok(tool_err(MERGE_NAME, message, MAX_BYTES)),
+        };
         let message = args
             .get("message")
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| format!("merge delegated work ({sha:.8})"));
-        let merge = run_in(
-            &ctx.working_dir,
-            &["merge", "--no-ff", "-m", &message, &sha],
-        )
-        .await
-        .map_err(internal_err)?;
-        if !merge.status.success() {
-            // Abort the in-progress conflicted merge, then report.
-            let _ = run_in(&ctx.working_dir, &["merge", "--abort"]).await;
-            return Ok(tool_err(
+        match modron_core::worktree::merge_into(&ctx.working_dir, &sha, &message).await {
+            Ok(modron_core::worktree::MergeOutcome::Merged) => Ok(ToolOutcome::ok(format!(
+                "merged {sha:.8} into the current branch ({})",
+                ctx.working_dir.display()
+            ))),
+            Ok(modron_core::worktree::MergeOutcome::Conflict(report)) => Ok(tool_err(
                 MERGE_NAME,
-                format!(
-                    "merge conflicted and was aborted — resolve manually: {}",
-                    String::from_utf8_lossy(&merge.stdout).trim()
-                ),
+                format!("merge conflicted and was aborted — resolve manually: {report}"),
                 MAX_BYTES,
-            ));
+            )),
+            Err(message) => Err(modron_core::Error::Tool {
+                tool: MERGE_NAME.into(),
+                message,
+            }),
         }
-        Ok(ToolOutcome::ok(format!(
-            "merged {sha:.8} into the current branch ({})",
-            ctx.working_dir.display()
-        )))
-    }
-}
-
-fn internal_err(e: std::io::Error) -> modron_core::Error {
-    modron_core::Error::Tool {
-        tool: MERGE_NAME.into(),
-        message: e.to_string(),
     }
 }
 
