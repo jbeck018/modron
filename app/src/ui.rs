@@ -128,7 +128,10 @@ pub fn button_text(
     let (fill, ink, edge) = match variant {
         Variant::Default => (Some("primary"), "primary-foreground", None),
         Variant::Secondary => (Some("secondary"), "secondary-foreground", None),
-        Variant::Outline => (Some("background"), "foreground", Some("border")),
+        // muted-foreground, not border: the border and input tokens are
+        // #2A2A2A in dark, which vanished on a card. muted-foreground is
+        // #ADADAD dark and #5F5F5F light: visible on both page and card.
+        Variant::Outline => (Some("background"), "foreground", Some("muted-foreground")),
         Variant::Ghost => (None, "foreground", None),
         Variant::Destructive => (Some("destructive"), "destructive-foreground", None),
         Variant::Link => (None, "link", None),
@@ -490,9 +493,23 @@ pub fn value_pair(
         )
 }
 
+/// A row's trailing control, in its slot: the control at the row's end, with
+/// 8 pt to the card's edge while `shown` holds. A hidden control takes no
+/// width, so the row's press fill reaches the card's edge (the slot is the
+/// only place the inset lives; pass `true` for a control that is always
+/// there). Use it as the `trailing` of [`row`] or [`static_row`].
+pub fn trailing(control: impl IntoElement, shown: impl IntoReactive<bool>) -> AnyElement {
+    view()
+        .flex_row()
+        .items_center()
+        .style_when(shown, |s| s.pr(px(8.0)))
+        .child(control)
+        .into_element()
+}
+
 /// The row's bar: the content at the page gutter, 52 pt at least, with a
-/// 1 pt line under it and an optional trailing control (it keeps its own
-/// touch target).
+/// 1 pt line under it and an optional trailing slot (see [`trailing`]; it
+/// keeps its own touch target).
 fn row_bar(main: View, trailing: Option<AnyElement>) -> View {
     let mut bar = view()
         .flex_row()
@@ -502,7 +519,7 @@ fn row_bar(main: View, trailing: Option<AnyElement>) -> View {
         .border_color(tok("border"))
         .child(main);
     if let Some(trailing) = trailing {
-        bar = bar.child(view().flex_row().items_center().pr(px(8.0)).child(trailing));
+        bar = bar.child(trailing);
     }
     bar
 }

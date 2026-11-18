@@ -2363,8 +2363,13 @@ fn note_rows(m: &Model) -> Vec<String> {
 /// The live tool strip: the turn summary line, then the latest tool rows.
 /// Shown while the turn has tool activity; the committed `ToolSummary` row
 /// takes over in the transcript once the turn ends. On the web the summary
-/// line is a button that opens the tool detail panel.
-fn tool_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+/// line is a button that opens the tool detail panel, and while the panel is
+/// open the strip keeps the summary only: the panel shows the same rows.
+fn tool_strip(
+    model: Signal<Model>,
+    nav: Signal<NavView>,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
     let line = text(move || model.with(|m| m.turn_summary.clone().unwrap_or_default()))
         .text_color(move || token_ink(tool_token("")));
     let head = if WEB_CONTROLS {
@@ -2377,13 +2382,15 @@ fn tool_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl 
     } else {
         view().child(line)
     };
-    view().flex_col().child(head).child(row_slots(
-        model,
-        TOOL_SLOTS,
-        tool_rows,
-        tool_row_token,
-        false,
-    ))
+    let strip = view().flex_col().child(head);
+    if WEB_CONTROLS {
+        strip.child(when(
+            move || nav.with(|n| n.tool_panel.is_none()),
+            move || row_slots(model, TOOL_SLOTS, tool_rows, tool_row_token, false),
+        ))
+    } else {
+        strip.child(row_slots(model, TOOL_SLOTS, tool_rows, tool_row_token, false))
+    }
 }
 
 /// The tool detail panel (Ctrl+T): the title, then up to TOOL_PANEL_SLOTS
@@ -2796,7 +2803,7 @@ pub fn screen(
             )))
             .child(live_column(when(move || model.with(|m| m.turn_summary.is_some()), {
                 let actions = actions.clone();
-                move || tool_strip(model, actions.clone())
+                move || tool_strip(model, nav, actions.clone())
             })))
             .child(live_column(swarm_slots(model, nav, actions.clone())))
             .child(live_column(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true)))
@@ -2828,7 +2835,7 @@ pub fn screen(
         .child(when(move || nav.with(|n| n.tool_panel.is_some()), move || tool_panel(model, nav)))
         .child(when(move || model.with(|m| m.turn_summary.is_some()), {
             let actions = actions.clone();
-            move || tool_strip(model, actions.clone())
+            move || tool_strip(model, nav, actions.clone())
         }))
         .child(swarm_slots(model, nav, actions.clone()))
         .child(row_slots(model, ATTACH_SLOTS, attachment_rows, dim_token, true))

@@ -479,7 +479,7 @@ protocol they share is in [docs/PROTOCOL_V2.md](docs/PROTOCOL_V2.md).
 
   In the terminal app, Enter sends (steers while a run is active), Alt+Enter queues, Esc
   interrupts, y/a/n decide approvals, and `/compact` compacts. The web bundle needs the NSH
-  CLI (0.5.1), the wasm32 target and wasm-bindgen CLI 0.2.130:
+  CLI (0.6.0), the wasm32 target and wasm-bindgen CLI 0.2.130:
 
   ```sh
   cd app && nsh package --target web -o dist    # writes dist/Modron/
