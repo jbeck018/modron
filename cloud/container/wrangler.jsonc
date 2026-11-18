@@ -2,6 +2,10 @@
   // modron cloud container: a Worker that wakes one `modron serve`
   // Container per cloud run and lets it sleep when idle. Requires Cloudflare
   // Containers. Deployed by .github/workflows/cloud-deploy.yml (manual).
+  // Its one secret, set by the workflow from the repository secret WAKE_TOKEN
+  // (or by hand: npx wrangler secret put WAKE_TOKEN). Everything else a run
+  // needs (repo, git token, host token, bridge URL) arrives in the wake body
+  // from the bridge. See README.md ("Secrets").
   //
   // UNVERIFIED against a live deploy: the Container class shape follows the
   // Containers docs (a Durable Object with ctx.container), but the image

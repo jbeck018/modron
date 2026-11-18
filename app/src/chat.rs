@@ -30,7 +30,7 @@ use modron_mobile_core::{
     ViewModelSnapshot,
 };
 use modron_view::{TranscriptEntry, COMPOSER_PLACEHOLDER, QUEUE_LABEL, STOP_LABEL};
-use nsh_core::element::{input, AdaptiveColor};
+use nsh_core::element::{input, AdaptiveColor, AnyElement};
 use nsh_core::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 use nsh_platform_tui::{Input, Modifiers};
@@ -43,7 +43,10 @@ use crate::portal::PortalRow;
 use crate::slash;
 use crate::suggest;
 use crate::theme::Choice;
+use crate::ui;
+use crate::ui_chat;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 /// What the user asked the client to do. The host or the view sends these;
 /// the session driver (`crate::session`) turns them into core calls.
@@ -66,6 +69,9 @@ pub enum UiAction {
         note: Option<String>,
     },
     Interrupt,
+    /// The banner's `retry now` (web): try a dropped link again at once,
+    /// instead of at the driver's next backoff step.
+    RetryConnection,
     /// `/compact` in the composer.
     Compact,
     /// Sessions screen: refresh the list (the core's `list_sessions`).
@@ -113,8 +119,8 @@ pub enum UiAction {
     /// `/worktree <title>`: a task session in its own worktree (the core's
     /// `create_task`, off the default base).
     CreateTask(String),
-    /// `/fork`, `/tasks`, `/share`, `/remote-control <url>`.
-    Fork,
+    /// `/fork [turn]` (None = the tip), `/tasks`, `/share`, `/remote-control <url>`.
+    Fork(Option<u32>),
     TaskStatus,
     Share,
     RemoteControl(String),
@@ -146,6 +152,22 @@ pub enum UiAction {
     /// Settings web push (web): subscribe this device when it is off, or
     /// unsubscribe it when it is on. The page decides which from its state.
     TogglePush,
+    /// Cloud (web, owner; PLAN 10.10). The account and run calls go over
+    /// HTTPS to the bridge; the page's timers and replies live in `web.rs`.
+    /// `CloudRefresh` lists the accounts and the runs (the screen's timer
+    /// refreshes the runs only, from `web.rs`).
+    CloudRefresh,
+    /// Link a GitHub account by its access token (the bridge checks it).
+    AddAccount(SecretKey),
+    RemoveAccount(String),
+    /// Start a run for an account, a repo and a branch.
+    StartRun {
+        account: String,
+        repo: String,
+        branch: String,
+    },
+    StopRun(String),
+    WakeRun(String),
     /// `!command` (shared: the output may reach the model) and `!!command`
     /// (private: shown, never sent to the model). The core's `shell` and
     /// `shell_private`; a bare `!` gives the core's usage refusal.
@@ -275,7 +297,21 @@ impl UiAction {
                 | UiAction::RevokeInvite(_)
                 | UiAction::CopyInvite(_)
                 | UiAction::TogglePush
+                | UiAction::CloudRefresh
+                | UiAction::AddAccount(_)
+                | UiAction::RemoveAccount(_)
+                | UiAction::StartRun { .. }
+                | UiAction::StopRun(_)
+                | UiAction::WakeRun(_)
         )
+    }
+
+    /// The actions the web host sends to the owner's vault instead of the
+    /// session socket, while the vault is here (PLAN 10.9 item 3): a key
+    /// entry and a key removal. The terminal never sets the vault, so these
+    /// keep their session route there.
+    pub fn is_vault(&self) -> bool {
+        matches!(self, UiAction::SetKey(_) | UiAction::AuthRemove(_))
     }
 }
 
@@ -358,7 +394,7 @@ const QUEUE_SLOTS: usize = 4;
 const ATTACH_SLOTS: usize = 4;
 const STEER_SLOTS: usize = 3;
 const PLAN_LINE_SLOTS: usize = 12;
-const TOOL_SLOTS: usize = 6;
+pub(crate) const TOOL_SLOTS: usize = 6;
 const SWARM_SLOTS: usize = 4;
 /// Visible slots for the command suggestions (table rows, then local rows).
 const SLASH_SLOTS: usize = 16;
@@ -987,6 +1023,26 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
             };
         }
         Screen::Automations | Screen::Tasks => return route_list_screen_key(key, facts),
+        Screen::Cloud => {
+            // The masked token entry and the branch field have the DOM focus
+            // and take their own keys (the composer passes them through).
+            return match key {
+                Key::Escape => Routed::Nav(NavStep::CloudEsc),
+                _ => composer,
+            };
+        }
+        Screen::CloudRepos => {
+            return match key {
+                Key::Escape if facts.filter_active => Routed::Nav(NavStep::ClearFilter),
+                Key::Escape => Routed::Nav(NavStep::Back),
+                Key::Enter => Routed::Nav(NavStep::PickRepo(facts.selected_index)),
+                Key::Up => Routed::Nav(NavStep::Move(-1)),
+                Key::Down => Routed::Nav(NavStep::Move(1)),
+                Key::Backspace => Routed::Nav(NavStep::FilterBack),
+                Key::Char(c) => Routed::Nav(NavStep::Filter(c)),
+                _ => Routed::Ignored,
+            };
+        }
         Screen::Auth => {
             return match key {
                 Key::Escape if facts.auth_keying => Routed::Nav(NavStep::AuthCancelKey),
@@ -997,6 +1053,7 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
                 Key::Up => Routed::Nav(NavStep::Move(-1)),
                 Key::Down => Routed::Nav(NavStep::Move(1)),
                 Key::Char('d') => Routed::Nav(NavStep::AskAuthRemove(facts.selected_index)),
+                Key::Char('k') => Routed::Nav(NavStep::KeyRow(facts.selected_index)),
                 _ => Routed::Ignored,
             };
         }
@@ -1093,7 +1150,7 @@ pub fn plan_answer(approve: bool) -> UiAction {
     action
 }
 
-fn arm_plan_clear(action: &UiAction) {
+pub(crate) fn arm_plan_clear(action: &UiAction) {
     if let UiAction::DecidePlan { note: Some(_), .. } = action {
         CLEAR_DRAFT.store(true, Ordering::SeqCst);
     }
@@ -1109,6 +1166,9 @@ pub enum Style {
     Tool,
     /// Shell output lines (dim; the command header is `Bold`).
     Dim,
+    /// The web's welcome for a blank session: one row (the model's name),
+    /// drawn as the empty state. The terminal keeps its banner lines.
+    Welcome,
 }
 
 /// One visual line of the transcript.
@@ -1160,6 +1220,8 @@ pub struct Model {
     pub swarm_rows: Vec<String>,
     /// The core's last note and last error, in that order.
     pub notes: Vec<String>,
+    /// The core's last error, alone (web: an alert; `notes` holds it too).
+    pub error: Option<String>,
     /// The live reasoning tail (the last two lines), when reasoning display
     /// is on; empty otherwise.
     pub reasoning: String,
@@ -1196,6 +1258,7 @@ impl Model {
             running: s.running_label.clone(),
             is_running: s.running,
             status_line: s.status_line.clone(),
+            error: s.last_error.clone(),
             lines: if s.history.is_empty() && !s.running {
                 // A blank idle session shows the welcome banner; the first
                 // row (the task echo, a note) replaces it.
@@ -1209,7 +1272,13 @@ impl Model {
                         reason: "welcome".into(),
                     },
                 }];
-                transcript_lines(&welcome)
+                if WEB_CONTROLS {
+                    // The web draws the welcome as one empty state (its model
+                    // name is the row's text); the terminal's banner lines stay.
+                    vec![Line { style: Style::Welcome, text: s.model.clone() }]
+                } else {
+                    transcript_lines(&welcome)
+                }
             } else {
                 transcript_lines(&s.history)
             },
@@ -1359,6 +1428,8 @@ pub struct Host {
     nav: Nav,
     /// The owner portal's actions, taken by the web host (`take_portal`).
     portal: VecDeque<UiAction>,
+    /// The owner's vault answered here (web): key entry and removal go to it.
+    vault_on: bool,
     /// Rows of the tool detail the snapshot held at the last push.
     tool_len: usize,
     /// The latest snapshot as the driver sent it; the shown copy is derived
@@ -1409,6 +1480,7 @@ pub fn link() -> (Host, Client) {
             seen_rows: 0,
             nav: Nav::default(),
             portal: VecDeque::new(),
+            vault_on: false,
             tool_len: 0,
             tool_panel: None,
             raw: None,
@@ -1449,6 +1521,7 @@ impl Host {
         self.seen_rows = rows;
         self.bookkeeping(snapshot);
         self.raw = Some(snapshot.clone());
+        slash::set_project_commands(&snapshot.project_commands);
         let shown = self.presented(snapshot);
         self.nav.observe(&shown);
         for action in self.nav.first_run(&shown) {
@@ -1528,6 +1601,7 @@ impl Host {
         let Some(raw) = self.raw.clone() else {
             return;
         };
+        slash::set_project_commands(&raw.project_commands);
         let shown = self.presented(&raw);
         self.nav.observe(&shown);
         let _ = self.snapshots.send(shown);
@@ -1597,7 +1671,9 @@ impl Host {
                 UiAction::Clear => self.clear_view(),
                 UiAction::Context => self.context_note(),
                 UiAction::Exit => QUIT.store(true, Ordering::SeqCst),
-                action if action.is_portal() => self.portal.push_back(action),
+                action if action.is_portal() || (self.vault_on && action.is_vault()) => {
+                    self.portal.push_back(action)
+                }
                 action => return Some(action),
             }
         }
@@ -1659,6 +1735,66 @@ impl Host {
     pub fn set_share_note(&mut self, note: Option<String>) {
         self.nav.set_share_note(note);
         self.notify();
+    }
+
+    /// The Cloud screen's state (web, owner): the accounts route answered 200
+    /// (`false` hides the Cloud entry and closes its screens).
+    pub fn set_cloud_available(&mut self, available: bool) {
+        self.nav.set_cloud_available(available);
+        self.notify();
+    }
+
+    pub fn set_cloud_accounts(&mut self, rows: Vec<crate::cloud::AccountRow>) {
+        self.nav.set_cloud_accounts(rows);
+        self.notify();
+    }
+
+    pub fn set_cloud_runs(&mut self, rows: Vec<crate::cloud::RunRow>) {
+        self.nav.set_cloud_runs(rows);
+        self.notify();
+    }
+
+    pub fn set_cloud_note(&mut self, note: Option<String>) {
+        self.nav.set_cloud_note(note);
+        self.notify();
+    }
+
+    pub fn set_cloud_repos(
+        &mut self,
+        rows: Vec<crate::cloud::RepoRow>,
+        next_page: Option<u32>,
+        append: bool,
+    ) {
+        self.nav.set_cloud_repos(rows, next_page, append);
+        self.notify();
+    }
+
+    /// The owner's vault (web): its key list, or `None` when there is none.
+    /// While it is set, key entry and removal go to the bridge.
+    pub fn set_vault(&mut self, rows: Option<Vec<(String, bool)>>) {
+        self.vault_on = rows.is_some();
+        self.nav.set_vault(rows);
+        self.notify();
+    }
+
+    pub fn set_vault_note(&mut self, note: Option<String>) {
+        self.nav.set_vault_note(note);
+        self.notify();
+    }
+
+    /// The repo picker's query while it is on top (the server's `q`).
+    pub fn cloud_query(&self) -> Option<String> {
+        self.nav.cloud_query()
+    }
+
+    /// The account the repo picker lists.
+    pub fn cloud_account_id(&self) -> Option<String> {
+        self.nav.cloud_account_id()
+    }
+
+    /// The repo page the picker needs next, when its end is in view.
+    pub fn cloud_next_page_due(&self) -> Option<u32> {
+        self.nav.cloud_next_page_due()
     }
 
     /// The Settings web push row (web host): `None` hides it.
@@ -2027,12 +2163,13 @@ pub(crate) fn style_token(style: Style) -> &'static str {
         Style::Meta => "muted-foreground",
         Style::Tool => "tool",
         Style::Dim => "dim",
+        Style::Welcome => "muted-foreground",
     }
 }
 
 /// The colour token of a tool row, by its shared status mark: `✓` success,
 /// `✗` destructive, anything else (`● name …`) the tool colour.
-fn tool_row_token(line: &str) -> &'static str {
+pub(crate) fn tool_row_token(line: &str) -> &'static str {
     if line.starts_with('\u{2713}') {
         "success"
     } else if line.starts_with('\u{2717}') {
@@ -2056,7 +2193,7 @@ fn styled_line(model: Signal<Model>, at: Position, style: Style) -> impl IntoEle
     match style {
         Style::Bold => line.font_weight(FontWeight::BOLD),
         Style::Meta => line.italic(),
-        Style::Plain | Style::Tool | Style::Dim => line,
+        Style::Plain | Style::Tool | Style::Dim | Style::Welcome => line,
     }
 }
 
@@ -2086,9 +2223,10 @@ fn transcript_row(model: Signal<Model>, at: Position) -> impl IntoElement {
         ))
 }
 
-pub(crate) fn header(model: Signal<Model>) -> impl IntoElement {
+pub(crate) fn header(model: Signal<Model>) -> View {
     view()
         .flex_row()
+        .when(WEB_CONTROLS, |v| v.flex_wrap())
         .child(
             text(move || model.with(|m| m.connection.clone()))
                 .text_color(move || token_ink("muted-foreground")),
@@ -2230,12 +2368,12 @@ fn tool_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl 
     let line = text(move || model.with(|m| m.turn_summary.clone().unwrap_or_default()))
         .text_color(move || token_ink(tool_token("")));
     let head = if WEB_CONTROLS {
-        view()
-            .role(AccessibilityRole::Button)
-            .on_press(move || {
+        ui_chat::summary_row(
+            move || model.with(|m| m.turn_summary.clone().unwrap_or_default()),
+            move || {
                 let _ = actions.send(UiAction::Tools(ToolsStep::Toggle));
-            })
-            .child(line)
+            },
+        )
     } else {
         view().child(line)
     };
@@ -2250,8 +2388,49 @@ fn tool_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl 
 
 /// The tool detail panel (Ctrl+T): the title, then up to TOOL_PANEL_SLOTS
 /// rows of the snapshot's `tool_detail` from the panel's top row, verbatim.
-fn tool_panel(model: Signal<Model>, nav: Signal<NavView>) -> impl IntoElement {
+/// A live region of the web chat (the tool strip, the panel, the reasoning
+/// and streaming text): the page gutter and the list width, as the rows of
+/// the transcript have. The terminal's region is the child, unchanged.
+fn live_column(child: impl IntoElement) -> AnyElement {
+    if WEB_CONTROLS {
+        ui::gutter(view().flex_col().w_full().max_w(px(ui::LIST_WIDTH)).self_center())
+            .child(child)
+            .into_element()
+    } else {
+        child.into_element()
+    }
+}
+
+/// The tool detail panel. On the web it is a card: the title in caption type,
+/// the detail rows in mono and indented (DESIGN.md). The terminal's rows are
+/// unchanged.
+fn tool_panel(model: Signal<Model>, nav: Signal<NavView>) -> AnyElement {
     let top = move || nav.with(|n| n.tool_panel.unwrap_or(0));
+    if WEB_CONTROLS {
+        let mut rows = view().flex_col().gap(px(2.0));
+        for i in 0..TOOL_PANEL_SLOTS {
+            rows = rows.child(when(
+                move || model.with(|m| m.tool_detail.len() > top() + i),
+                move || {
+                    let row = move || {
+                        model.with(|m| m.tool_detail.get(top() + i).cloned().unwrap_or_default())
+                    };
+                    text(row)
+                        .font_family(crate::screens::MONO_STACK)
+                        .text_size(px(13.0))
+                        .line_height(px(18.2))
+                        .text_color(move || token_ink(tool_row_token(&row())))
+                        .pl(px(16.0))
+                },
+            ));
+        }
+        let title = text(move || model.with(|m| m.tool_title.clone()))
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(move || token_ink(tool_token("")));
+        return ui::card_list(view().flex_col().gap(px(4.0)).p(px(12.0)).child(title).child(rows))
+            .into_element();
+    }
     let mut column = view().flex_col().child(
         text(move || model.with(|m| m.tool_title.clone()))
             .text_color(move || token_ink(tool_token(""))),
@@ -2267,7 +2446,7 @@ fn tool_panel(model: Signal<Model>, nav: Signal<NavView>) -> impl IntoElement {
             },
         ));
     }
-    column
+    column.into_element()
 }
 
 /// `y approve   r revise`: the key hint and the core's label per option.
@@ -2379,17 +2558,17 @@ fn approval_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> i
 /// The web-only composer controls: Queue beside the composer (queues the
 /// composer text, as Alt+Enter does), and Stop while a turn runs.
 /// The attach control's label (web).
-const ATTACH_LABEL: &str = "attach";
+pub(crate) const ATTACH_LABEL: &str = "attach";
 
 /// Opens the browser's file chooser (web). The terminal has no chooser: its
 /// image path is Ctrl+V.
 #[cfg(target_arch = "wasm32")]
-fn open_file_picker(actions: UnboundedSender<UiAction>) {
+pub(crate) fn open_file_picker(actions: UnboundedSender<UiAction>) {
     crate::web::open_file_picker(actions);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn open_file_picker(_actions: UnboundedSender<UiAction>) {}
+pub(crate) fn open_file_picker(_actions: UnboundedSender<UiAction>) {}
 
 fn composer_controls(
     model: Signal<Model>,
@@ -2439,28 +2618,48 @@ fn composer_controls(
         .child(when(move || WEB_CONTROLS && model.with(|m| m.is_running), stop))
 }
 
-/// The chat body: the transcript, the live strips, the decision blocks and
+/// The transcript's height: on the web the chrome of the chat (the bar, the
+/// dock and its popovers), on the terminal the fixed reserve.
+fn transcript_height(
+    window: f32,
+    model: Signal<Model>,
+    nav: Signal<NavView>,
+    draft: Signal<String>,
+    details: bool,
+) -> f32 {
+    if WEB_CONTROLS {
+        crate::ui_chat::transcript_px(window, model, nav, draft, details)
+    } else {
+        transcript_px(
+            window,
+            nav.with(|n| n.tool_panel.is_some()),
+            draft.with(|d| d.matches('\n').count() + 1),
+        )
+    }
+}
+
+/// The chat body: the transcript, the live strips and the decision blocks and
 /// the composer. The status surface and navigation are drawn around it by
 /// `screens::frame`. `actions` receives the composer's own actions (Send,
 /// Queue, Compact) and the web controls' actions; decisions, interrupts and
-/// plan answers from the keys come from the host's key routing.
+/// plan answers from the keys come from the host's key routing. On the web
+/// the transcript, the dock and its popovers are `ui_chat`'s; the terminal
+/// keeps its own rows.
 pub fn screen(
     model: Signal<Model>,
     draft: Signal<String>,
     nav: Signal<NavView>,
     window_h: Signal<f32>,
+    details: Signal<bool>,
     actions: UnboundedSender<UiAction>,
-) -> impl IntoElement {
+) -> AnyElement {
     let submit_actions = actions.clone();
     let list_ref = element_ref();
     // The last scroll step the view applied (SCROLL_SEQ).
     let applied_scroll = std::cell::Cell::new(0u64);
+    let height = move || transcript_height(window_h.get(), model, nav, draft, details.get());
     effect(move || {
-        let rows = transcript_px(
-            window_h.get(),
-            nav.with(|n| n.tool_panel.is_some()),
-            draft.with(|d| d.matches('\n').count() + 1),
-        ) / COMPOSER_LINE_H;
+        let rows = height() / COMPOSER_LINE_H;
         VISIBLE_ROWS.store(rows.max(1.0) as usize, Ordering::SeqCst);
     });
     effect(move || {
@@ -2479,21 +2678,11 @@ pub fn screen(
             list_ref.scroll_to_index(index as u32, Percentage(1.0), Points(0.0), false);
         }
     });
-    let composer = input()
-        .auto_focus(true)
-        // Enter sends and keeps focus, so the next line can be typed at once.
-        // Shift+Enter and Ctrl+J add a line (NSH's multiline input), and a
-        // pasted block lands whole in the composer.
-        .multiline(true)
-        .max_h(px(COMPOSER_MAX_LINES as f32 * COMPOSER_LINE_H))
-        .submit_behavior(SubmitBehavior::Submit)
-        .placeholder(COMPOSER_PLACEHOLDER)
-        .value(move || draft.get())
-        .on_change(move |s: &str| {
-            set_draft(s);
-            draft.set(s.to_string());
-        })
-        .on_submit(move |s: &str| {
+    // Enter sends (the same path as the send control, below); the composer
+    // keeps focus, so the next line can be typed at once.
+    let submit: Rc<dyn Fn(&str)> = {
+        let actions = submit_actions.clone();
+        Rc::new(move |s: &str| {
             // The old TUI's line continuation: a line ending in a backslash
             // turns the backslash into a line break and does not submit.
             if let Some(head) = s.strip_suffix('\\') {
@@ -2510,7 +2699,7 @@ pub fn screen(
                 let agent =
                     nav.with(|n| n.agent.as_ref().filter(|a| a.running).map(|a| a.id.clone()));
                 if let (Some(agent), false) = (agent, task.is_empty()) {
-                    let _ = submit_actions.send(UiAction::SteerAgent { agent, text: task });
+                    let _ = actions.send(UiAction::SteerAgent { agent, text: task });
                 }
                 return;
             }
@@ -2519,54 +2708,123 @@ pub fn screen(
             }
             let action = submit_action(&task);
             if !action_is_empty(&action) {
-                let _ = submit_actions.send(action);
+                let _ = actions.send(action);
             }
-        });
+        })
+    };
+    let queue: Rc<dyn Fn()> = {
+        let actions = submit_actions.clone();
+        Rc::new(move || {
+            let task = draft_text().trim().to_string();
+            if task.is_empty() {
+                return;
+            }
+            set_draft("");
+            draft.set(String::new());
+            let _ = actions.send(UiAction::Queue(task));
+        })
+    };
+    let on_submit = submit.clone();
+    let composer = input()
+        .auto_focus(true)
+        // Shift+Enter and Ctrl+J add a line (NSH's multiline input), and a
+        // pasted block lands whole in the composer.
+        .multiline(true)
+        .max_h(px(COMPOSER_MAX_LINES as f32 * if WEB_CONTROLS { 24.0 } else { COMPOSER_LINE_H }))
+        .submit_behavior(SubmitBehavior::Submit)
+        .placeholder(COMPOSER_PLACEHOLDER)
+        .value(move || draft.get())
+        .on_change(move |s: &str| {
+            set_draft(s);
+            draft.set(s.to_string());
+        })
+        .on_submit(move |s: &str| on_submit(s));
+    let list = virtual_list(
+        move || model.with(|m| m.lines.len()),
+        move |at: Position| -> AnyElement {
+            if WEB_CONTROLS {
+                crate::ui_chat::cell(model, at).into_element()
+            } else {
+                transcript_row(model, at).into_element()
+            }
+        },
+    )
+    .element_ref(&list_ref)
+    // Opens at the newest row and stays there while it is at the end;
+    // scrolled up, what is visible stays put as rows arrive.
+    .initial_scroll_at_end()
+    // The web's rows differ in height (cards, code blocks) and the dock
+    // grows by more than a line at once (the approval sheet), so it follows
+    // from further away than the terminal's one-line rows need.
+    .follow_end(px(if WEB_CONTROLS { 320.0 } else { 24.0 }))
+    // An explicit height: a flex-grown virtual list gets zero rows in NSH
+    // 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4). On the web it follows the
+    // window less the chrome, so the composer stays on screen (the page
+    // itself does not scroll).
+    .h(move || px(height()));
+    let scroll_hint = when(
+        move || nav.with(|n| n.scroll_offset > 0),
+        move || {
+            text(move || {
+                let offset = nav.with(|n| n.scroll_offset);
+                let total = model.with(|m| m.lines.len());
+                let visible = VISIBLE_ROWS.load(Ordering::SeqCst);
+                scrolled_up_hint(lines_above(total, offset, visible))
+            })
+            .text_color(move || token_ink("muted-foreground"))
+        },
+    );
+    let new_below = when(
+        move || nav.with(|n| n.new_below && n.scroll_offset > 0),
+        move || text(NEW_OUTPUT_BELOW_LABEL).text_color(move || token_ink("warning")),
+    );
+    let agent_panel = when(move || nav.with(|n| n.screen == Screen::Agent), {
+        let actions = actions.clone();
+        move || crate::screens::agent_panel(nav, actions.clone())
+    });
+    if WEB_CONTROLS {
+        return view()
+            .flex_col()
+            .size_full()
+            .child(agent_panel)
+            .child(list)
+            .child(scroll_hint)
+            .child(new_below)
+            .child(live_column(when(
+                move || nav.with(|n| n.tool_panel.is_some()),
+                move || tool_panel(model, nav),
+            )))
+            .child(live_column(when(move || model.with(|m| m.turn_summary.is_some()), {
+                let actions = actions.clone();
+                move || tool_strip(model, actions.clone())
+            })))
+            .child(live_column(swarm_slots(model, nav, actions.clone())))
+            .child(live_column(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true)))
+            .child(live_column(when(
+                move || model.with(|m| !m.reasoning.is_empty()),
+                move || crate::ui_chat::live_text(model, true),
+            )))
+            .child(live_column(when(
+                move || model.with(|m| !m.streaming.is_empty()),
+                move || crate::ui_chat::live_text(model, false),
+            )))
+            .child(crate::ui_chat::dock(
+                model,
+                draft,
+                nav,
+                actions.clone(),
+                composer,
+                crate::ui_chat::Hooks { submit, queue },
+            ))
+            .into_element();
+    }
     view()
         .flex_col()
         .size_full()
-        .child(when(move || nav.with(|n| n.screen == Screen::Agent), {
-            let actions = actions.clone();
-            move || crate::screens::agent_panel(nav, actions.clone())
-        }))
-        .child(
-            virtual_list(
-                move || model.with(|m| m.lines.len()),
-                move |at: Position| transcript_row(model, at),
-            )
-            .element_ref(&list_ref)
-            // Opens at the newest row and stays there while it is at the end;
-            // scrolled up, what is visible stays put as rows arrive.
-            .initial_scroll_at_end()
-            .follow_end(px(24.0))
-            // An explicit height: a flex-grown virtual list gets zero rows
-            // in NSH 0.5.1 (spikes/nsh-tui/RESULTS.md, section 4). On the
-            // web it follows the window, so the composer and the Stop
-            // control stay on screen (the page itself does not scroll).
-            .h(move || {
-                px(transcript_px(
-                    window_h.get(),
-                    nav.with(|n| n.tool_panel.is_some()),
-                    draft.with(|d| d.matches('\n').count() + 1),
-                ))
-            }),
-        )
-        .child(when(
-            move || nav.with(|n| n.scroll_offset > 0),
-            move || {
-                text(move || {
-                    let offset = nav.with(|n| n.scroll_offset);
-                    let total = model.with(|m| m.lines.len());
-                    let visible = VISIBLE_ROWS.load(Ordering::SeqCst);
-                    scrolled_up_hint(lines_above(total, offset, visible))
-                })
-                .text_color(move || token_ink("muted-foreground"))
-            },
-        ))
-        .child(when(
-            move || nav.with(|n| n.new_below && n.scroll_offset > 0),
-            move || text(NEW_OUTPUT_BELOW_LABEL).text_color(move || token_ink("warning")),
-        ))
+        .child(agent_panel)
+        .child(list)
+        .child(scroll_hint)
+        .child(new_below)
         .child(when(move || nav.with(|n| n.tool_panel.is_some()), move || tool_panel(model, nav)))
         .child(when(move || model.with(|m| m.turn_summary.is_some()), {
             let actions = actions.clone();
@@ -2602,6 +2860,7 @@ pub fn screen(
         .child(queue_chips(model, actions.clone()))
         .child(composer)
         .child(composer_controls(model, draft, actions))
+        .into_element()
 }
 
 /// The live sub-agent rows. On the web each row is a button that opens its
@@ -2637,6 +2896,20 @@ fn swarm_slots(
     column
 }
 
+/// The first row of the suggestions window: `slots` rows around `selected`.
+pub(crate) fn slash_start(len: usize, selected: usize, slots: usize) -> usize {
+    if len <= slots {
+        0
+    } else {
+        selected.saturating_sub(slots - 1).min(len - slots)
+    }
+}
+
+/// A suggestion's text: the selected one carries `> `.
+pub(crate) fn slash_row_label(row: &str, selected: bool) -> String {
+    format!("{}{row}", if selected { "> " } else { "  " })
+}
+
 /// The suggestions above the composer: command suggestions (`usage - about`)
 /// or `@file` paths, the selected one marked with `> `, a window of
 /// SLASH_SLOTS rows around the selection. Esc hides them. On the web a tap
@@ -2647,15 +2920,8 @@ fn slash_list(
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
     let items = move || suggest::for_draft(&draft.get());
-    let start = move || {
-        let len = items().names.len();
-        let selected = nav.with(|n| n.slash_selected);
-        if len <= SLASH_SLOTS {
-            0
-        } else {
-            selected.saturating_sub(SLASH_SLOTS - 1).min(len - SLASH_SLOTS)
-        }
-    };
+    let start =
+        move || slash_start(items().names.len(), nav.with(|n| n.slash_selected), SLASH_SLOTS);
     let mut column = view().flex_col();
     for i in 0..SLASH_SLOTS {
         let actions = actions.clone();
@@ -2665,8 +2931,8 @@ fn slash_list(
                 let press = actions.clone();
                 let label = move || {
                     let at = start() + i;
-                    let marker = if nav.with(|n| n.slash_selected) == at { "> " } else { "  " };
-                    items().rows.get(at).map(|r| format!("{marker}{r}")).unwrap_or_default()
+                    let selected = nav.with(|n| n.slash_selected) == at;
+                    items().rows.get(at).map(|r| slash_row_label(r, selected)).unwrap_or_default()
                 };
                 let row = view()
                     .child(text(label).text_color(move || token_ink(style_token(Style::Plain))));
@@ -3410,6 +3676,17 @@ mod auth_key_tests {
     }
 
     #[test]
+    fn k_opens_the_key_entry_on_any_row_and_the_key_is_typed_once_open() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let on_row = KeyFacts { selected_index: 1, ..auth(false) };
+        assert_eq!(
+            route_key(Key::Char('k'), false, false, on_row, ""),
+            Routed::Nav(NavStep::KeyRow(1))
+        );
+        assert_eq!(route_key(Key::Char('k'), false, false, auth(true), ""), Routed::Composer);
+    }
+
+    #[test]
     fn while_a_key_is_typed_its_keys_go_to_the_masked_input() {
         let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         for key in [Key::Char('s'), Key::Enter, Key::Backspace, Key::Up] {
@@ -3743,5 +4020,29 @@ mod credential_remove_key_tests {
             route_key(Key::Char('d'), false, false, facts, ""),
             Routed::Nav(NavStep::AskAuthRemove(1))
         );
+    }
+}
+
+#[cfg(test)]
+mod vault_route_tests {
+    use super::*;
+
+    /// With the vault set, a key entry goes to the bridge (the portal queue);
+    /// without it the key goes to the session as before (the terminal's way).
+    #[test]
+    fn a_key_entry_goes_to_the_vault_only_while_the_vault_is_set() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let secret = || SecretKey { provider: "openai".into(), key: "sk-test".into() };
+        let (mut host, client) = link();
+        client.actions.send(UiAction::SetKey(secret())).ok();
+        assert!(matches!(host.try_action(), Some(UiAction::SetKey(_))), "session route");
+        assert!(host.take_portal().is_none());
+
+        host.set_vault(Some(vec![("openai".into(), false)]));
+        client.actions.send(UiAction::SetKey(secret())).ok();
+        client.actions.send(UiAction::AuthRemove("openai".into())).ok();
+        assert!(host.try_action().is_none(), "the vault takes both");
+        assert!(matches!(host.take_portal(), Some(UiAction::SetKey(_))));
+        assert!(matches!(host.take_portal(), Some(UiAction::AuthRemove(_))));
     }
 }

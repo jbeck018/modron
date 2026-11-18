@@ -644,3 +644,50 @@ async fn rewound_range_stays_out_but_later_work_survives_every_resume() {
     );
     assert!(!seen.iter().any(|c| c.contains("abandoned")), "{seen:?}");
 }
+
+/// V1: a project's rule files reach the system prompt under a named heading,
+/// and a `/<name>` task naming `.claude/commands/<name>.md` is expanded before
+/// the model sees it.
+#[tokio::test]
+async fn project_rules_and_commands_reach_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".cursor/rules")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude/commands")).unwrap();
+    std::fs::write(
+        dir.path().join(".cursor/rules/style.mdc"),
+        "---\nalwaysApply: true\n---\nPrefer small functions.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".claude/commands/triage.md"),
+        "Triage issue $ARGUMENTS and report the cause.",
+    )
+    .unwrap();
+    let provider = Arc::new(MockProvider::new().then_response(TurnResponse {
+        text: "ok".into(),
+        tool_calls: vec![],
+        usage: Usage::default(),
+        stop_reason: StopReason::EndTurn,
+        provider_blocks: Vec::new(),
+    }));
+    let config = EngineConfig {
+        working_dir: dir.path().to_path_buf(),
+        ..EngineConfig::default()
+    };
+    let engine = engine(provider.clone(), config, registry(false));
+    engine.run_task("/triage 42").await.unwrap();
+
+    let requests = provider.requests();
+    let system = &requests[0].system;
+    assert!(
+        system.contains("# Project rules (other agents' files)"),
+        "{system}"
+    );
+    assert!(system.contains("## .cursor/rules/style.mdc"), "{system}");
+    assert!(system.contains("Prefer small functions."), "{system}");
+    assert!(!system.contains("alwaysApply"), "front matter leaked");
+    assert_eq!(
+        requests[0].messages[0].content,
+        "Triage issue 42 and report the cause."
+    );
+}

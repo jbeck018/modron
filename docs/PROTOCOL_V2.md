@@ -346,3 +346,53 @@ and `!` commands on the session (the refusal is an error reply that names
 imported by `modron handoff import`, clears it. Older clients skip the
 unknown `type` only where they read logs; the live `Event` frame needs a
 client built with this variant, as with every additive event.
+
+## 9. Session tree and project commands (Program V, V4 and Part B)
+
+All additive; no frame is new and `PROTOCOL_VERSION` is unchanged. Every
+new field is `#[serde(default)]`, so an older peer reads the frame as the
+pre-V4 shape.
+
+```
+Fork { session_id, turn?: u32 }        // turn: 1-based user turn; absent = tip
+SessionMetaWire.forked_from?: { session_id, turn }
+Welcome { server_version, protocol, commands?: [name] }
+```
+
+- `fork` with a `turn` copies the log up to the start of turn `turn + 1`
+  (a user turn is one `task` event). `turn` 0 or past the last turn is an
+  `error` frame with the plain message; nothing is copied.
+- `sessions` rows carry `forked_from` for a forked session; clients show it
+  as `forked from <short id> at turn <n>` (`modron_mobile_core::view`).
+  Older servers send no key: the row is a plain row.
+- `welcome.commands` lists the project command names of the served
+  directory (`.claude/commands/<name>.md`), sorted. Clients store them,
+  show them in the slash popup after the built-ins, send a `/name` line only
+  for a listed name, and show the local unknown-command notice for any other
+  `/word`. Absent (an older server) reads as none. The list is read once per
+  connection.
+
+Persisted meta (`SessionMeta.forked_from`, store `{id}.meta.json`): the
+parent id and the kept turn count. Absent on sessions that were not forked,
+so older meta files load unchanged.
+
+## 10. Team stage notes (F1, additive)
+
+Persisted event `progress` (team mode, `SessionEvent::Progress`):
+
+```
+{"type":"progress","text":"<one line, plain ASCII>"}
+```
+
+Written by a team run (`/team`, `modron team`) at each stage boundary: the
+plan (`team plan: N item(s)`), each round's start, merge, verify, review and
+result. The words are the constants in `modron_core::team` (`progress`
+module). It travels as the ordinary live `Event` frame, so no frame is new.
+
+Effect: one transcript note (`TranscriptEntry::Note`), in log order, and no
+other state. It is not model content: no provider request, compaction input,
+or `fork`/`rewind` turn cut sees it, and it is not handoff ownership (only a
+trailing `handed_off` line is). Old logs have none and load unchanged. An
+older binary reads a log that has these lines by skipping each as a corrupt
+line (the store's warn-and-skip); an older client that receives the live
+`Event` frame cannot decode the variant, as with every additive event.

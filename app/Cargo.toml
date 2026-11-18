@@ -20,6 +20,9 @@ path = "src/bin/modron-app-tui.rs"
 
 [dependencies]
 nsh-core = "=0.5.1"
+# The shadcn-style components (src/ui.rs) take their behaviour from nsh_base;
+# default features stay off (editor, highlight, term, plot are not needed here).
+nsh-base = { version = "=0.5.1", default-features = false }
 # No JavaScript engine (spikes/nsh-tui/RESULTS.md, Follow-up S2b).
 modron-mobile-core = { path = "../mobile/rust-core", version = "0.1.3" }
 modron-view = { path = "../crates/modron-view", version = "0.1.3" }

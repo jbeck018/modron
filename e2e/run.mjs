@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import {
   freePort, MODRON, REPO, Local, SCRATCH, api, bodyText, clickContains, clickText, copyApp, inviteUrlIn,
   killEverything, taggedCount, launchBrowser, liveCount, newestMtime, openViewer, ownerCookie, ownerCookieFrom, refused, sleep,
-  shot, snapshotViewer, startBridge, startServe, stopProc, tail, toHttp, typeAndSend, waitBody,
+  shot, snapshotViewer, startBridge, startFakeCloud, startFakeOpenAi, startServe, stopProc, tail, toHttp, typeAndSend, waitBody,
   waitPastPromptGuard, waitUntil, wsFrames,
 } from './lib.mjs';
 
@@ -552,6 +552,90 @@ await scenario('R1', 'serve --remote-control opens the tunnel with no client; br
   await shot(v, 'r1-owner');
 });
 
+// ---- C1: provider key from the owner's vault (PLAN 10.9) -------------------
+// The owner stores an OpenAI-compatible key in the bridge vault. A serve with
+// --portal-credentials and NO key in its environment fetches it at start and
+// sends it to a fake endpoint, which records the Authorization header. Then
+// the key is removed and the serve restarted (a fresh fetch): the next turn
+// must not reach the endpoint with any key. Nothing is written to the serve's
+// home or logs: no value is found in any file under it.
+function filesContaining(dir, needle) {
+  const hits = [];
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) hits.push(...filesContaining(p, needle));
+    else if (statSync(p).isFile() && readFileSync(p).includes(needle)) hits.push(p);
+  }
+  return hits;
+}
+
+await scenario('C1', 'vault key reaches the provider with no local key; a removed key stops the next turn', async (s) => {
+  const VALUE = 'sk-e2e-vault-' + hex();
+  const VAULT_KEY = hex();
+  const fake = await startFakeOpenAi();
+  try {
+    const vault = track(bridges, await startBridge('vault', { OWNER_TOKEN: OWNER, HOST_TOKEN: HOST, VAULT_KEY }));
+    const cookie = await soft(s, ownerCookie(vault.base, OWNER), 'owner sign-in failed');
+    if (!cookie) return;
+    const put = await fetch(vault.base + '/api/credentials/openai-compat', {
+      method: 'PUT', headers: { cookie, origin: vault.base, 'content-type': 'application/json' },
+      body: JSON.stringify({ key: VALUE }),
+    });
+    s.check(put.status === 204, `vault PUT answered ${put.status}`);
+    const list = await api(vault.base, cookie, 'GET', '/api/credentials');
+    s.check(!JSON.stringify(list.json).includes(VALUE), 'the vault list carries the value');
+
+    const extraEnv = { OPENAI_BASE_URL: fake.base + '/v1' };
+    const serveOpts = { remoteControl: vault.ws, hostToken: HOST, provider: 'openai-compat', portalCredentials: true, extraEnv };
+    const sv = track(serves, await startServe('c1', serveOpts));
+    await soft(s, waitUntil(() => tail(sv.log, 400).includes('portal credentials applied'), 60000, 'applied log'),
+      'the serve never applied the vault keys');
+    const environ = readFileSync(`/proc/${sv.pid}/environ`, 'utf8').split('\0');
+    s.check(!environ.some((kv) => kv.startsWith('OPENAI_API_KEY=')), 'the serve process has OPENAI_API_KEY in its environment');
+    s.check(tail(sv.log, 400).includes('OPENAI_API_KEY'), 'the serve log does not name the fetched env var');
+
+    const lx = track(locals, new Local(sv));
+    await soft(s, lx.connect(), 'local client did not connect');
+    const sid = await soft(s, lx.run('vault probe task'), 'the probe task did not start');
+    if (sid) await soft(s, lx.turnDone(sid, 90000), 'the probe turn did not finish');
+    const hits = () => fake.requests.filter((r) => r.path.includes('/chat/completions'));
+    s.check(hits().length >= 1, 'the fake endpoint got no request with the vault key');
+    s.check(hits().some((r) => r.auth === `Bearer ${VALUE}`), 'the request did not carry the vault key as its bearer');
+    s.check(!JSON.stringify(lx.frames).includes(VALUE), 'a client frame carries the value');
+
+    // Remove the key in the vault, then restart the serve: a fresh fetch.
+    const del = await fetch(vault.base + '/api/credentials/openai-compat', { method: 'DELETE', headers: { cookie, origin: vault.base } });
+    s.check(del.status === 204, `vault DELETE answered ${del.status}`);
+    lx.close();
+    await stopProc('serve-c1');
+    const before = hits().length;
+    const sv2 = track(serves, await startServe('c1', serveOpts));
+    await soft(s, waitUntil(() => readFileSync(sv2.log, 'utf8').includes('portal credentials applied'), 60000, 'second applied log'),
+      'the restarted serve never fetched the keys');
+    const lx2 = track(locals, new Local(sv2));
+    await soft(s, lx2.connect(), 'second local client did not connect');
+    const sid2 = await soft(s, lx2.run('vault removed task'), 'the second task did not start');
+    if (sid2) await soft(s, lx2.waitFor((f) => (f.type === 'turn_done' || f.type === 'error') && f.session === sid2, 90000, 'end of the second run'),
+      'the second run never ended');
+    // openai-compat with a base URL and no key is the keyless local-endpoint
+    // path (Ollama, vLLM): the next turn goes out with NO authorization header.
+    // That is the "carries none" outcome; a key must never reach the endpoint.
+    const afterRemoval = hits().slice(before);
+    s.check(afterRemoval.every((r) => r.auth === ''), 'the endpoint saw an authorization header after the key was removed');
+    s.check(afterRemoval.every((r) => !r.auth.includes(VALUE)), 'the removed key reached the endpoint');
+    s.check(!JSON.stringify(lx2.frames).includes(VALUE), 'a second-run frame carries the value');
+    lx2.close();
+
+    // Nothing written to disk: no file under either serve home, nor the bridge log, holds the value.
+    s.check(filesContaining(sv.home, VALUE).length === 0, 'a file under the serve home holds the value');
+    s.check(filesContaining(join(SCRATCH, 'h-c1'), VALUE).length === 0, 'a file under the serve scratch holds the value');
+    s.check(!readFileSync(vault.log, 'utf8').includes(VALUE), 'the bridge log holds the value');
+    s.check(!readFileSync(sv2.log, 'utf8').includes(VALUE), 'the restarted serve log holds the value');
+  } finally {
+    await fake.close();
+  }
+});
+
 // ---- W: workflow steps against a real serve (fresh serve per step) ----------
 // Each W step starts its own serve so the mock script (scripted tool turns
 // are consumed once per process) begins at its first turn. The steps run as
@@ -987,6 +1071,74 @@ if (!want('T2') && !want('T3') && !want('T4')) {
     ptyChecks(s, r);
   });
 }
+
+// P6 -------------------------------------------------------------------------
+// Cloud run (PLAN 10.10). The owner links a GitHub account, starts a run; the
+// fake container records the wake body. This script then plays the container
+// entrypoint with the wake body's values: a real `modron serve --remote-control
+// --run-id <id>` registers with the bridge, the run list shows it running with
+// a session_url, and that URL opens the session in the browser.
+await scenario('P6', 'cloud run: account, run start, a real serve registers the run, its session_url opens', async (s) => {
+  const ghToken = 'tok-e2e-' + hex();
+  const wakeToken = hex();
+  const fake = await startFakeCloud({ ghToken, wakeToken });
+  const cb = track(bridges, await startBridge('cloud', {
+    OWNER_TOKEN: OWNER, HOST_TOKEN: HOST, VAULT_KEY: hex(), WAKE_TOKEN: wakeToken,
+    MODRON_TEST_HOOKS: '1', GITHUB_API_ORIGIN: fake.gh, CONTAINER_URL: fake.ct,
+  }));
+  const cookie = await ownerCookie(cb.base, OWNER);
+  const jar = { name: cookie.split('=')[0], value: cookie.slice(cookie.indexOf('=') + 1), url: cb.base };
+  const post = async (path, body) => {
+    const r = await fetch(cb.base + path, {
+      method: 'POST',
+      headers: { cookie, origin: cb.base, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* not JSON */ }
+    return { status: r.status, json, text };
+  };
+
+  const acct = await post('/api/github/accounts', { token: ghToken });
+  s.check(acct.status === 201 && acct.json && acct.json.login === 'modron-e2e', 'adding the GitHub account failed: ' + acct.status + ' ' + acct.text.slice(0, 120));
+  if (!acct.json) return;
+  const run = await post('/api/runs', { account: acct.json.id, repo: 'modron-e2e/app', branch: 'main' });
+  s.check(run.status === 201 && run.json && run.json.state === 'starting', 'starting the run failed: ' + run.status + ' ' + run.text.slice(0, 120));
+  s.check(!run.text.includes(ghToken), 'the run row carries the git token');
+  const wake = fake.wakes.find((w) => w.path === '/wake');
+  s.check(wake && wake.auth === `Bearer ${wakeToken}`, 'the container did not get /wake with the wake bearer');
+  if (!run.json || !wake) return;
+  s.check(wake.body.run_id === run.json.id && wake.body.git_token === ghToken && wake.body.host_token === HOST,
+    'the wake body does not carry the run id, git token and host token');
+
+  // The container's entrypoint, played here: a real serve for this run.
+  const sv = track(serves, await startServe('cloud', {
+    bridgeWs: cb.ws, hostToken: wake.body.host_token, remoteControl: cb.ws, runId: wake.body.run_id,
+  }));
+  void sv;
+
+  const linked = await waitUntil(async () => {
+    const r = await api(cb.base, cookie, 'GET', '/api/runs');
+    const row = r.json && Array.isArray(r.json.runs) ? r.json.runs.find((x) => x.id === run.json.id) : null;
+    return row && row.state === 'running' && row.session_url ? row : null;
+  }, 60000, 'run running with a session');
+  s.check(linked !== null, 'the run never turned running with a session_url');
+  if (!linked) return;
+  s.check(linked.session_url.startsWith('/app/?url=ws'), 'session_url is not the portal open path: ' + linked.session_url);
+  const listed = await api(cb.base, cookie, 'GET', '/api/sessions');
+  const row = Array.isArray(listed.json) ? listed.json.find((x) => x.open_url === linked.session_url) : null;
+  s.check(row !== null && row.online === true, 'the run session is not listed online in /api/sessions');
+  s.check(!JSON.stringify(await api(cb.base, cookie, 'GET', '/api/runs')).includes(ghToken), 'the run list carries the git token');
+
+  const v = track(viewers, await openViewer(browser, cb.base + linked.session_url, 'cloud-run', jar));
+  await soft(s, waitBody(v, (t) => t.includes('connected'), 40000, 'cloud session connected'), 'the session_url did not open the session');
+  await shot(v, 'p6-cloud');
+
+  const stopped = await post(`/api/runs/${run.json.id}/stop`, {});
+  s.check(stopped.status === 200 && stopped.json && stopped.json.state === 'stopped', 'stop did not answer stopped');
+  s.check(fake.wakes.some((w) => w.path === '/stop' && w.body && w.body.run_id === run.json.id), 'the container did not get /stop');
+});
 
 // H1 -------------------------------------------------------------------------
 // Handoff between two hosts, git carrier (docs/HANDOFF.md). Host A runs a

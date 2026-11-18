@@ -6,3 +6,4 @@ demo-output.txt
 runs/
 __pycache__/
 cloud/bridge/.wrangler/
+cloud/container/.build/

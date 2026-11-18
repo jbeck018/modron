@@ -4,7 +4,7 @@
 //! `web.rs` (wasm32 only). The words come from the client core.
 
 use modron_mobile_core::view::{
-    portal_session_row, SIGN_IN_FAILED_LABEL, TOO_MANY_ATTEMPTS_LABEL, WRONG_TOKEN_LABEL,
+    portal_session_parts, SIGN_IN_FAILED_LABEL, TOO_MANY_ATTEMPTS_LABEL, WRONG_TOKEN_LABEL,
 };
 use serde::Deserialize;
 
@@ -97,6 +97,10 @@ pub fn parse_invites(body: &str) -> Option<Vec<InviteRow>> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortalLine {
     pub text: String,
+    /// The title, and the subtitle (host, online or offline, time): the web
+    /// draws them on two lines. `text` is their join (the terminal's line).
+    pub title: String,
+    pub subtitle: String,
     pub online: bool,
     pub open_url: String,
 }
@@ -104,10 +108,16 @@ pub struct PortalLine {
 /// The list rows, in the server's order (newest first).
 pub fn lines(rows: &[PortalRow]) -> Vec<PortalLine> {
     rows.iter()
-        .map(|row| PortalLine {
-            text: portal_session_row(&row.title, &row.host_label, row.online, &row.updated_at),
-            online: row.online,
-            open_url: row.open_url.clone(),
+        .map(|row| {
+            let (title, subtitle) =
+                portal_session_parts(&row.title, &row.host_label, row.online, &row.updated_at);
+            PortalLine {
+                text: format!("{title} \u{b7} {subtitle}"),
+                title,
+                subtitle,
+                online: row.online,
+                open_url: row.open_url.clone(),
+            }
         })
         .collect()
 }
@@ -180,8 +190,13 @@ mod tests {
 
     #[test]
     fn only_same_origin_paths_open() {
-        let line =
-            |url: &str| PortalLine { text: String::new(), online: true, open_url: url.into() };
+        let line = |url: &str| PortalLine {
+            text: String::new(),
+            title: String::new(),
+            subtitle: String::new(),
+            online: true,
+            open_url: url.into(),
+        };
         assert_eq!(open_target(&line("//evil.example/x")), None);
         assert_eq!(open_target(&line("https://evil.example/")), None);
         assert_eq!(open_target(&line("")), None);

@@ -79,6 +79,7 @@ async fn greet_with_version(ws: &mut Ws, version: &str) {
             Payload::Welcome {
                 server_version: version.into(),
                 protocol: PROTOCOL_VERSION,
+                commands: Vec::new(),
             },
         ),
     )
@@ -811,6 +812,7 @@ async fn protocol_mismatch_fails_the_handshake() {
                 Payload::Welcome {
                     server_version: "future".into(),
                     protocol: PROTOCOL_VERSION + 1,
+                    commands: Vec::new(),
                 },
             ),
         )
@@ -865,6 +867,7 @@ async fn config_changed_updates_labels_and_list_sessions_folds() {
                 list.id.expect("correlated reply carries the id"),
                 Payload::Sessions {
                     sessions: vec![modron_protocol::SessionMetaWire {
+                        forked_from: None,
                         task_branch: None,
                         task_state: None,
                         working_dir: None,
@@ -1327,6 +1330,7 @@ async fn stale_handshake_cannot_replace_the_newer_connection() {
                 Payload::Welcome {
                     server_version: "stale".into(),
                     protocol: PROTOCOL_VERSION,
+                    commands: Vec::new(),
                 },
             ),
         )
@@ -2320,6 +2324,7 @@ async fn token_in_the_url_is_dialed_away_and_sent_in_the_hello() {
                 Payload::Welcome {
                     server_version: "0.1.2".into(),
                     protocol: PROTOCOL_VERSION,
+                    commands: Vec::new(),
                 },
             ),
         )
@@ -2373,6 +2378,7 @@ async fn unix_socket_target_speaks_the_line_framed_protocol() {
             Payload::Welcome {
                 server_version: "0.1.2".into(),
                 protocol: PROTOCOL_VERSION,
+                commands: Vec::new(),
             },
         );
         write

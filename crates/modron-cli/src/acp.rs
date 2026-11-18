@@ -777,7 +777,7 @@ where
 /// `modron acp`: the agent is built from the same CLI config as every other
 /// front end, with the editor as the approver.
 pub(crate) async fn run_acp(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
-    let mcp = spawn_mcp_servers(cfg).await?;
+    let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
     let (hub, events) = AcpHub::new();
     let agent = build_agent_with(
         cli,

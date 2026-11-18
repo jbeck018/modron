@@ -53,6 +53,9 @@ pub struct ServeOptions {
     /// How long the on-exit hook may take before shutdown goes on without it.
     /// `None` = [`DEFAULT_HANDOFF_TIMEOUT`].
     pub handoff_timeout: Option<Duration>,
+    /// The cloud run this process serves (`modron serve --run-id`, PLAN 10.10).
+    /// Stored for the portal registration; `None` = not a cloud run.
+    pub run_id: Option<String>,
 }
 
 /// Time the on-exit hand-off may take before `modron serve` exits without it.
@@ -154,6 +157,15 @@ pub struct BoundServer {
 }
 
 impl BoundServer {
+    /// Start the exit of a foreground serve (ctrl+c or SIGTERM). Portal
+    /// registrations stopped from here on keep their directory entry, so the
+    /// portal lists the session offline (no heartbeat) rather than removing it.
+    pub fn begin_exit(&self) {
+        self.state
+            .portal_exiting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Abort every accept loop and every remote-control tunnel (tunnels
     /// redial on their own, so they must be stopped here too). Integration
     /// tests use this to tear down.
@@ -227,6 +239,7 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
         tasks: task_registry,
         bridge_base: options.bridge_base.clone(),
         rc_keys: std::sync::Mutex::new(HashMap::new()),
+        portal_exiting: Default::default(),
         rc_tunnels: std::sync::Mutex::new(HashMap::new()),
     });
 
@@ -279,6 +292,9 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
     // Remote control at start, once the listeners are up (same tunnel path
     // as the `remote_control` frame). A failure here stops the accept loops
     // before the error goes back to the caller.
+    if let Some(run) = &options.run_id {
+        crate::rc::set_serve_run_id(run)?;
+    }
     let mut serve_session = None;
     if let Some(bridge) = &options.remote_control {
         match crate::rc::start_serve_remote_control(
@@ -337,6 +353,7 @@ pub async fn run_serve(engine: Engine, options: &ServeOptions) -> anyhow::Result
     );
 
     wait_for_stop().await;
+    server.begin_exit();
     if let Some(hook) = &options.handoff_on_exit {
         let timeout = options.handoff_timeout.unwrap_or(DEFAULT_HANDOFF_TIMEOUT);
         handoff_at_exit(&server, hook, timeout);

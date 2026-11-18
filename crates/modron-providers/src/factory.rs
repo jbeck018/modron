@@ -30,6 +30,18 @@ const ZAI_KEY_HINT: &str = "get a pay-as-you-go key at https://z.ai/manage-apike
 /// (`/auth` → Anthropic → sign in with browser) takes precedence over the
 /// API key — the user opted into the subscription explicitly.
 pub fn provider_from_env(provider_id: &str) -> Result<Arc<dyn ModelProvider>> {
+    provider_from_env_with(provider_id, |key| {
+        std::env::var(key).ok().filter(|value| !value.is_empty())
+    })
+}
+
+/// [`provider_from_env`] with the key and base URL read through `env`. The
+/// serve path passes process env first, then the portal overlay (see
+/// `overlay::OverlayProvider`); the subscription sign-in check is the same.
+pub fn provider_from_env_with(
+    provider_id: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Arc<dyn ModelProvider>> {
     if provider_id == "anthropic" {
         match modron_core::auth::oauth::load_tokens() {
             // A corrupt token file must not silently fall through to the
@@ -45,19 +57,15 @@ pub fn provider_from_env(provider_id: &str) -> Result<Arc<dyn ModelProvider>> {
                     tokens.access_token,
                     tokens.refresh_token,
                 )?;
-                if let Ok(base_url) = std::env::var("ANTHROPIC_BASE_URL") {
-                    if !base_url.is_empty() {
-                        provider = provider.with_base_url(base_url);
-                    }
+                if let Some(base_url) = env("ANTHROPIC_BASE_URL") {
+                    provider = provider.with_base_url(base_url);
                 }
                 return Ok(Arc::new(provider));
             }
             Ok(None) => {}
         }
     }
-    provider_from_config(provider_id, |key| {
-        std::env::var(key).ok().filter(|value| !value.is_empty())
-    })
+    provider_from_config(provider_id, env)
 }
 
 /// Build a provider from a config source. `env` is the lookup seam — pass a

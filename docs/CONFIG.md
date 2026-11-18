@@ -260,6 +260,85 @@ headers = { Authorization = "Bearer ${MODRON_MCP_TOKEN}" }
 Not supported over HTTP: the legacy SSE transport, OAuth, and server-initiated
 requests.
 
+### Built-in preset: `playwright`
+
+`modron mcp add playwright` writes this entry to `config.toml` (the path that
+`MODRON_CONFIG` overrides, as elsewhere):
+
+```toml
+[mcp.servers.playwright]
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
+```
+
+The entry is appended as a block, so existing comments and layout stay as they are.
+An entry with the same name is never replaced unless you pass `--force`; that
+replacement rewrites the file and drops its comments. The command needs Node.js.
+`npx` fetches the package on first run. Restart modron to load the server.
+
+## Project files from other agents (rules, commands, MCP)
+
+Modron reads a few files other coding agents keep in a repository, so a
+project set up for them works here too. Everything is read from the working
+directory (`--working_dir`, default `.`; MCP trust uses the current directory).
+Text only, and each file must be a regular file inside the working directory:
+a symlink that points elsewhere is ignored.
+
+**Rules (project memory).** Loaded into the system prompt under
+`# Project rules (other agents' files)`, one `## <path>` heading per file:
+
+| Source | Notes |
+|---|---|
+| `.cursor/rules/*.md`, `*.mdc` | sorted by file name; a leading `---` front-matter block is stripped |
+| `.github/copilot-instructions.md` | |
+| `GEMINI.md` | |
+| `.windsurfrules` | |
+
+`AGENTS.md` and `CLAUDE.md` are loaded as before (first found wins) and are
+not affected. Each rule file is capped at 16 KB and all rule files together
+at 48 KB; a cut is marked `[truncated: ...]` in the prompt.
+
+**Commands.** Each `.claude/commands/<name>.md` is a prompt template. A task
+that starts with `/<name>` is replaced by the file body, with every
+`$ARGUMENTS` replaced by the text after the command word. The expansion runs
+in the engine when a task is submitted, so `modron "/triage 42"` and any client
+that sends the line works. The template is capped at 16 KB. A name that is not
+a file stays a plain task. Built-in commands (`/model`, `/review`, ...) are
+handled by the client before a task is sent, so a project file cannot replace
+them from the app. The app's composer does not list project commands yet and
+rejects an unknown `/word` before sending it.
+
+**MCP servers.** `.mcp.json` and `.cursor/mcp.json` in the workspace declare
+servers in the common shape:
+
+```json
+{
+  "mcpServers": {
+    "docs": { "command": "docs-server", "args": ["--stdio"], "env": {} },
+    "remote": { "url": "https://example.test/mcp", "headers": {} }
+  }
+}
+```
+
+A declared server is **never started until you trust it for this workspace**:
+
+```sh
+modron mcp list               # each server: trusted / untrusted, and its file
+modron mcp trust docs         # trust one server (or: modron mcp trust --all)
+modron mcp untrust            # revoke for this workspace (or: modron mcp untrust <name>)
+```
+
+Trust is stored in `mcp-trust.json` in the Modron config directory (next to
+`config.toml`). Each grant is keyed by the canonical workspace path, the
+server name and a hash of the server's definition. Changing the definition
+(command, args, env, url, headers) needs trust again, and the server does not
+start until you trust it. A name in `[mcp.servers]` always wins over a project
+file with the same name; that config entry runs as before and needs no trust.
+If two project files declare the same name, `.mcp.json` wins.
+
+`modron doctor` lists the rule files, commands and project MCP servers it
+found, with their trust state.
+
 ## [roles]
 
 One optional model id per kind of work. A blank value counts as unset.
@@ -297,6 +376,7 @@ here is not read by `modron`.
 | `MODRON_GOAL_MAX_ITERATIONS` | Iteration cap for `--goal` runs. Default `10`. A non-numeric value is ignored. |
 | `RUST_LOG` | Tracing filter. Replaces the default `info`, or `debug` with `--verbose`. |
 | `MODRON_HANDOFF_ON_EXIT` | `modron serve`: `1` or `true` turns on `--handoff-on-exit`. |
+| `MODRON_RUN_ID` | `modron serve`: the cloud run this serve belongs to (same as `--run-id`; PLAN 10.10). Letters a-z, digits and dashes, 1 to 64. The portal registration then carries it. |
 | `MODRON_FURROW_BIN` | `modron handoff` with `carrier = "furrow"`: path of the furrow binary (default: `furrow` on PATH). |
 | `FURROW_RECOVERY_KEY` | `modron handoff` with `carrier = "furrow"`: the workspace recovery key (required). Furrow's own variables are listed under `[handoff]`. |
 
@@ -314,6 +394,14 @@ written by `modron auth set` (and by `/auth` in the app) are kept in
 | `zai` | `ZAI_API_KEY` | `ZAI_BASE_URL` | `https://api.z.ai/api/paas/v4` |
 | `openai-responses` | `OPENAI_API_KEY` (required) | `OPENAI_BASE_URL` | `https://api.openai.com/v1`, path `/responses`. The OpenAI Responses API with a plain API key: same request and stream code as `chatgpt`, reasoning items replayed; no ChatGPT account header, no token refresh. Its reasoning blocks are scoped to this provider id, separate from `chatgpt` |
 | `chatgpt` | none; uses a stored ChatGPT sign-in | none | ChatGPT backend |
+
+The stored ChatGPT sign-in (EXPERIMENTAL) is created by `modron auth login
+--provider chatgpt` (device code in the browser), by `auth add` option `g`, or by
+reusing `~/.codex/auth.json` at first run. It lives in `~/.modron/auth/openai.json`
+(mode 0600) with the account id the backend requires; the access token is
+refreshed with the stored refresh token. `modron auth status` shows it masked and
+`modron auth logout chatgpt` deletes it. `OPENAI_API_KEY` is not touched by
+either command.
 | `groq` | `GROQ_API_KEY` | `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` |
 | `google` | `GEMINI_API_KEY` | `GOOGLE_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `cerebras` | `CEREBRAS_API_KEY` | `CEREBRAS_BASE_URL` | `https://api.cerebras.ai/v1` |
@@ -329,6 +417,26 @@ app and chat, and through the router, once their key is set.
 Z.ai Coding Plan keys work only on the coding endpoint. Set
 `ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4` for them.
 
+### Web search keys
+
+The `web_search` tool searches through one API. The backend is the first one whose
+key is set, in this order: `BRAVE_API_KEY`, `TAVILY_API_KEY`, `EXA_API_KEY`. With no key
+set the tool refuses and names the three variables. It never scrapes a search page
+without a key.
+
+| Backend | Key | Set with | Endpoint |
+|---|---|---|---|
+| Brave Search | `BRAVE_API_KEY` | `modron auth set brave <key>` | `https://api.search.brave.com/res/v1/web/search` |
+| Tavily | `TAVILY_API_KEY` | `modron auth set tavily <key>` | `https://api.tavily.com/search` |
+| Exa | `EXA_API_KEY` | `modron auth set exa <key>` | `https://api.exa.ai/search` |
+
+Keys are read from the environment first, then from the portal credential overlay,
+the same order the providers use. `modron auth set` saves them to
+`~/.config/modron/env` (mode 0600). They are sent only in request headers and never
+appear in tool output. The tool takes `query`, `max_results` (default 5, at most 10),
+and optional `allowed_domains` and `blocked_domains` lists, which match a domain and
+its subdomains. Results are returned as numbered entries marked as untrusted web content.
+
 ### Remote access and publishing
 
 | Variable | Read by | Effect |
@@ -336,6 +444,7 @@ Z.ai Coding Plan keys work only on the coding endpoint. Set
 | `MODRON_HOST_TOKEN` | `modron serve` | Bearer token sent on the bridge tunnel. Needed when the bridge has `HOST_TOKEN` set. Never shown in error text. |
 | `MODRON_HOST_KIND` | `modron serve` | `cloud` marks the session's host as cloud. Any other value, or unset, means local. |
 | `MODRON_REMOTE_CONTROL` | `modron serve` | Bridge URL (`ws://` or `wss://`) to open remote control against at start, as `--remote-control`. The flag wins when both are set. Empty counts as unset. |
+| `MODRON_PORTAL_CREDENTIALS` | `modron serve` | `1` or `true` turns on `--portal-credentials`: the owner's provider keys are fetched from the bridge vault (needs `--remote-control` and `MODRON_HOST_TOKEN`), held in memory only, and used for future turns. A key set in the environment or the env file wins. Set by the cloud container. |
 | `MODRON_PUBLISH_TOKEN` | `modron serve` (`/share`) | Bearer token for publishing a page to the bridge. Without it, publishing fails before any request is sent. |
 | `MODRON_DEVICE_TOKEN` | `modron --connect ws://...` | Device token for a `modron serve` that requires one. A `token` URL parameter wins over it. |
 
@@ -365,8 +474,8 @@ These are set for hooks and tool-hook children. Do not set them yourself. See
 There is no `sandbox` key. Use `--sandbox off|seatbelt|bubblewrap`. The default
 is `off`, where the approval gate is the only control. `seatbelt` is for macOS.
 `bubblewrap` is for Linux and needs `bwrap` on the `PATH`. A value that the
-platform does not support stops startup. The `webfetch` tool refuses to run
-while any sandbox is active.
+platform does not support stops startup. The `webfetch` and `web_search` tools
+refuse to run while any sandbox is active.
 
 ## Files and directories
 

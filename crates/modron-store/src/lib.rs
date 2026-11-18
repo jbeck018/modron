@@ -17,7 +17,7 @@
 //! never fatal — a partially damaged log must remain loadable.
 
 use async_trait::async_trait;
-use modron_core::{Error, Result, SessionEvent, SessionId, SessionMeta, SessionStore};
+use modron_core::{Error, ForkOrigin, Result, SessionEvent, SessionId, SessionMeta, SessionStore};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -296,6 +296,20 @@ impl Inner {
         Ok(())
     }
 
+    /// Record a fork's parent and kept-turn count in its meta (Program V4).
+    /// Runs before the copy, so the batch append's meta write keeps it.
+    fn set_forked_from_sync(&self, id: SessionId, origin: ForkOrigin) -> Result<()> {
+        let mut meta = self.meta_for(id)?;
+        meta.forked_from = Some(origin);
+        self.write_meta(&meta)?;
+        self.caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .metas
+            .insert(id, meta);
+        Ok(())
+    }
+
     fn create_session_sync(
         &self,
         title: &str,
@@ -309,6 +323,7 @@ impl Inner {
             created_at: now,
             updated_at: now,
             message_count: 0,
+            forked_from: None,
         };
         // Drop any cached handle first: File::create truncates, and a stale
         // cached offset would silently append after the truncation point.
@@ -534,6 +549,7 @@ impl JsonlSessionStore {
             created_at: now,
             updated_at: now,
             message_count: 0,
+            forked_from: None,
         });
         if let Some(title) = title {
             meta.title = title.to_string();
@@ -608,6 +624,25 @@ impl SessionStore for JsonlSessionStore {
     /// `append` maintains — `checkpoint_for` asks per mutating tool call.
     async fn event_count(&self, id: SessionId) -> Result<u64> {
         self.block(move |inner| inner.event_count_sync(id)).await
+    }
+
+    /// Fork at a user turn (Program V4): create the new transcript, record
+    /// its lineage in meta, then copy the kept prefix in one batch. The
+    /// trait default appends without creating, which a file store refuses.
+    async fn fork_at(&self, from: SessionId, turn: Option<u32>) -> Result<SessionId> {
+        let events = self.load(from).await?;
+        let (cut, kept) = modron_core::rewind::fork_cut(&events, turn)
+            .map_err(|e| Error::Session(format!("fork of {from}: {e}")))?;
+        let meta = self.create_session(&format!("fork of {from}")).await?;
+        let id = meta.id;
+        let origin = ForkOrigin {
+            parent: from,
+            turn: kept,
+        };
+        self.block(move |inner| inner.set_forked_from_sync(id, origin))
+            .await?;
+        self.append_batch(id, &events[..cut]).await?;
+        Ok(id)
     }
 
     async fn list(&self) -> Result<Vec<SessionMeta>> {
@@ -1187,5 +1222,148 @@ mod tests {
         assert_eq!(first.load(id).await.unwrap().len(), 400);
         assert_eq!(first.event_count(id).await.unwrap(), 400);
         assert_eq!(second.event_count(id).await.unwrap(), 400);
+    }
+}
+
+#[cfg(test)]
+mod fork_lineage_tests {
+    use super::*;
+    use modron_core::{ForkOrigin, Message};
+
+    fn task(text: &str) -> SessionEvent {
+        SessionEvent::Task { text: text.into() }
+    }
+
+    fn answer(text: &str) -> SessionEvent {
+        SessionEvent::Message {
+            parent_id: None,
+            message: Message::user(text),
+        }
+    }
+
+    async fn seeded(store: &JsonlSessionStore) -> SessionId {
+        let meta = store.create_session("source").await.unwrap();
+        for event in [
+            task("one"),
+            answer("a1"),
+            task("two"),
+            answer("a2"),
+            task("three"),
+            answer("a3"),
+        ] {
+            store.append(meta.id, &event).await.unwrap();
+        }
+        meta.id
+    }
+
+    fn texts(events: &[SessionEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                SessionEvent::Task { text } => format!("task:{text}"),
+                SessionEvent::Message { message, .. } => format!("msg:{}", message.content),
+                _ => "other".to_string(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fork_at_turn_copies_the_prefix_and_records_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let source = seeded(&store).await;
+
+        let fork = store.fork_at(source, Some(2)).await.unwrap();
+        let events = store.load(fork).await.unwrap();
+        assert_eq!(
+            texts(&events),
+            vec!["task:one", "msg:a1", "task:two", "msg:a2"]
+        );
+        // The source is untouched.
+        assert_eq!(store.load(source).await.unwrap().len(), 6);
+
+        let meta = store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == fork)
+            .unwrap();
+        assert_eq!(
+            meta.forked_from,
+            Some(ForkOrigin {
+                parent: source,
+                turn: 2
+            })
+        );
+        // The message counter follows the copied messages, not the source's.
+        assert_eq!(meta.message_count, 2);
+    }
+
+    #[tokio::test]
+    async fn tip_fork_records_every_turn_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = {
+            let store = JsonlSessionStore::new(dir.path());
+            seeded(&store).await
+        };
+        let fork = {
+            let store = JsonlSessionStore::new(dir.path());
+            store.fork(source).await.unwrap()
+        };
+        let reopened = JsonlSessionStore::new(dir.path());
+        assert_eq!(reopened.load(fork).await.unwrap().len(), 6);
+        let meta = reopened
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == fork)
+            .unwrap();
+        assert_eq!(meta.forked_from.map(|o| o.turn), Some(3));
+    }
+
+    #[tokio::test]
+    async fn out_of_range_turn_fails_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let source = seeded(&store).await;
+        let err = store
+            .fork_at(source, Some(9))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"), "{err}");
+        assert_eq!(store.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn meta_without_lineage_loads_as_not_forked() {
+        // A meta file written before Program V4 has no `forked_from` key.
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let meta = store.create_session("old").await.unwrap();
+        let path = dir.path().join(format!("{}.meta.json", meta.id));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("forked_from"), "absent when unset: {text}");
+        let listed = JsonlSessionStore::new(dir.path()).list().await.unwrap();
+        assert_eq!(listed[0].forked_from, None);
+    }
+
+    #[tokio::test]
+    async fn lineage_round_trips_through_the_meta_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path());
+        let source = seeded(&store).await;
+        let fork = store.fork_at(source, Some(1)).await.unwrap();
+        let text = std::fs::read_to_string(dir.path().join(format!("{fork}.meta.json"))).unwrap();
+        let parsed: SessionMeta = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.forked_from,
+            Some(ForkOrigin {
+                parent: source,
+                turn: 1
+            })
+        );
     }
 }

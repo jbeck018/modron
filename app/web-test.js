@@ -9,6 +9,14 @@
 //       permission, a second tap unsubscribes, a viewer invite hides it,
 //       an approver invite subscribes with its invite, iOS tab hint. The push
 //       service is stubbed in the page (no real push service is reached).
+//   (c1..c7) Cloud screen (PLAN 10.10) on a scripted bridge: the entry hidden
+//       on 503, a masked token POSTed and listed, a refused token showing
+//       GitHub's status, remove asks first, the repo picker's query and paging,
+//       a run started with {account, repo, branch}, stop / wake / open routes,
+//       one shared line when runs are not configured.
+//   (u1) sign-in card (UX-1): a 44 px sign-in button, no sideways scroll.
+//   (v1) vault (PLAN 10.9 item 3): the credentials rows read the vault, a key
+//       is PUT over HTTPS (never a session frame), removal DELETEs.
 // The page is served by a Node site (startSite) on one origin: the built
 // bundle under / and /app/, and the portal's routes (/api/*, /auth) answered
 // from a scripted state. Uses only Node built-ins and the preinstalled
@@ -93,6 +101,76 @@ function startSite(port, state) {
           return json(res, 405, { error: 'method not allowed' });
         }
         if (!owner) return json(res, 401, { error: 'unauthorized' });
+        // Cloud (PLAN 10.10): linked GitHub accounts, the repo picker, runs.
+        // The vault (PLAN 10.9): the credentials list, a key PUT and a DELETE.
+        if (p === '/api/github/accounts' && req.method === 'GET') {
+          state.accountGets += 1;
+          if (state.cloud === 'off') return json(res, 503, { error: 'vault not configured' });
+          return json(res, 200, { accounts: state.accounts });
+        }
+        if (p === '/api/github/accounts' && req.method === 'POST') {
+          const input = JSON.parse(body || '{}');
+          state.accountPosts.push(input);
+          if (state.refusedTokens.includes(input.token)) {
+            return json(res, 400, { error: 'GitHub refused the token', github_status: 401 });
+          }
+          const row = { id: `a${state.accounts.length + 1}`, login: 'octocat', kind: 'token' };
+          state.accounts.push(row);
+          return json(res, 201, row);
+        }
+        const account = /^\/api\/github\/accounts\/([^/]+)$/.exec(p);
+        if (account && req.method === 'DELETE') {
+          state.accounts = state.accounts.filter((a) => a.id !== account[1]);
+          state.accountDeletes.push(account[1]);
+          return send(res, 204, '');
+        }
+        if (p === '/api/github/repos' && req.method === 'GET') {
+          const q = url.searchParams.get('q') || '';
+          const page = Number(url.searchParams.get('page') || '1');
+          state.repoQueries.push({ q, page, account: url.searchParams.get('account') });
+          const all = state.repos.filter((r) => r.full_name.includes(q));
+          const repos = all.slice((page - 1) * REPO_PAGE, page * REPO_PAGE);
+          return json(res, 200, { repos, next_page: page * REPO_PAGE < all.length ? page + 1 : null });
+        }
+        if (p === '/api/runs' && req.method === 'GET') {
+          if (state.runsOff) return json(res, 503, { error: 'cloud runs are not configured' });
+          return json(res, 200, { runs: state.runs });
+        }
+        if (p === '/api/runs' && req.method === 'POST') {
+          if (state.runsOff) return json(res, 503, { error: 'cloud runs are not configured' });
+          const input = JSON.parse(body || '{}');
+          state.runPosts.push(input);
+          const row = { id: `r${state.runs.length + 1}`, repo: input.repo, account: input.account,
+            branch: input.branch, state: 'starting', reason: '', created_at: '2026-11-16T09:00:00Z', session_url: '' };
+          state.runs.push(row);
+          return json(res, 201, row);
+        }
+        const run = /^\/api\/runs\/([^/]+)\/(stop|wake)$/.exec(p);
+        if (run && req.method === 'POST') {
+          const row = state.runs.find((r) => r.id === run[1]);
+          state.runActions.push({ id: run[1], action: run[2] });
+          if (row) row.state = run[2] === 'stop' ? 'stopped' : 'running';
+          return send(res, 204, '');
+        }
+        if (p === '/api/credentials' && req.method === 'GET') {
+          if (state.vault === 'off') return json(res, 503, { error: 'vault not configured' });
+          return json(res, 200, { credentials: state.credentials });
+        }
+        const credential = /^\/api\/credentials\/([^/]+)$/.exec(p);
+        if (credential && req.method === 'PUT') {
+          const input = JSON.parse(body || '{}');
+          state.vaultPuts.push({ id: credential[1], body: input });
+          const row = state.credentials.find((c) => c.id === credential[1]);
+          if (row) row.set = true;
+          else state.credentials.push({ id: credential[1], set: true });
+          return send(res, 204, '');
+        }
+        if (credential && req.method === 'DELETE') {
+          state.vaultDeletes.push(credential[1]);
+          const row = state.credentials.find((c) => c.id === credential[1]);
+          if (row) row.set = false;
+          return send(res, 204, '');
+        }
         if (p === '/api/sessions' && req.method === 'GET') return json(res, 200, state.sessions);
         if (p === '/api/invites' && req.method === 'GET') {
           const sid = url.searchParams.get('session_id');
@@ -101,9 +179,9 @@ function startSite(port, state) {
         if (p === '/api/invites' && req.method === 'POST') {
           const input = JSON.parse(body || '{}');
           state.invitePosts.push(input);
-          const id = `inv${state.invitePosts.length}`;
+          const id = String(state.invitePosts.length).padStart(32, '0');
           const row = { id, session_id: input.session_id, role: input.role, revoked: false,
-            expires_at: '2026-11-16T10:00:00Z', url: `${base}/i/${id}.sig` };
+            expires_at: '2026-11-16T10:00:00Z', url: `${base}/i/${id}.${'ab'.repeat(32)}` };
           state.invites.push(row);
           return json(res, 201, { id, url: row.url, expires_at: row.expires_at });
         }
@@ -169,12 +247,24 @@ function textFrame(text) {
 // server does (no attach). `frames` keeps every client frame, parsed.
 function startWsServer(opts = {}) {
   let dropped = false;
+  // refuseAfterDrop: once dropped, reconnects get a 503 until `lift()`.
+  let refusing = true;
+  const usedTickets = new Set();
   const received = [];
   const frames = [];
   let onSubmit;
   const submitted = new Promise((resolve) => { onSubmit = resolve; });
   const server = http.createServer((req, res) => { res.writeHead(404); res.end(); });
   server.on('upgrade', (req, socket) => {
+    const ticket = new URL(req.url, 'http://ws.test').searchParams.get('ticket');
+    if (ticket) {
+      if (usedTickets.has(ticket)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
+      usedTickets.add(ticket);
+    }
+    if (opts.refuseAfterDrop && dropped && refusing) {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+      return;
+    }
     const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + GUID).digest('base64');
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
@@ -191,7 +281,7 @@ function startWsServer(opts = {}) {
         const frame = JSON.parse(f.payload.toString('utf8'));
         received.push(frame.type);
         if (frame.type === 'hello') {
-          send({ seq: 0, type: 'welcome', server_version: '0.1.3', protocol: 1 });
+          send({ seq: 0, type: 'welcome', server_version: '0.1.3', protocol: 1, commands: opts.commands || [] });
           if (opts.shareLink) {
             send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: {} });
             send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
@@ -202,12 +292,18 @@ function startWsServer(opts = {}) {
             dropped = true;
             setTimeout(() => socket.destroy(), 1500);
           }
-          send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: [], live: opts.live || {} });
+          send({ session: SESSION, seq: 0, type: 'snapshot', session_id: SESSION, last_seq: 0, events: opts.events || [], live: opts.live || {} });
           // quiet: no streamed text, so the session stays idle (attachments need an idle session).
           if (!opts.quiet) send({ session: SESSION, seq: 1, type: 'delta', delta: { kind: 'text', text: STREAM } });
           (opts.after || []).forEach((extra, i) => send({ session: SESSION, seq: 2 + i, ...extra }));
         } else if (frame.type === 'submit') {
           onSubmit(frame);
+          // reasoningOnSubmit: the reply streams its reasoning (the page shows it
+          // only after the user opted in with /reasoning).
+          if (opts.reasoningOnSubmit) {
+            send({ session: SESSION, seq: 30, type: 'delta', delta: { kind: 'reasoning', text: 'The router keeps two tables, so the matcher is the piece to split out first.\n' } });
+            send({ session: SESSION, seq: 31, type: 'delta', delta: { kind: 'reasoning', text: 'The handlers then follow the same path into the new crate.' } });
+          }
         } else if (frame.type === 'steer') {
           // The scripted stream leaves the session running, so the composer
           // steers (PROTOCOL_V2 section 2). The cases below only care that
@@ -225,6 +321,15 @@ function startWsServer(opts = {}) {
         } else if (frame.type === 'personas_req') {
           // The agent picker's rows.
           send({ session: SESSION, seq: 6, type: 'personas', personas: opts.personas || [] });
+        } else if (frame.type === 'auth_start' && opts.oauth) {
+          // The device flow (ChatGPT, Claude): progress with the URL and the
+          // one-time code, then the outcome as a note. No token leaves here.
+          send({ session: SESSION, seq: 7, type: 'o_auth_progress', provider: frame.provider, stage: 'waiting', message: 'enter the code in the browser window', url: 'https://auth.openai.com/codex/device', user_code: 'WXYZ-1234' });
+          // The outcome: a `done` progress (shown on this screen) and a note (the transcript).
+          setTimeout(() => {
+            send({ session: SESSION, seq: 8, type: 'o_auth_progress', provider: frame.provider, stage: 'done', message: 'chatgpt signed in (sk-...ab12)' });
+            send({ session: SESSION, seq: 9, type: 'note', text: 'openai-compat: chatgpt signed in (sk-...ab12)' });
+          }, 300);
         } else if (frame.type === 'list_sessions') {
           // The sessions screen's refresh: answer with the scripted rows.
           send({ session: SESSION, seq: 3, type: 'sessions', sessions: opts.sessions || [] });
@@ -234,7 +339,7 @@ function startWsServer(opts = {}) {
     });
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
-    resolve({ url: `ws://127.0.0.1:${server.address().port}/`, submitted, received, frames, close: () => server.close() });
+    resolve({ url: `ws://127.0.0.1:${server.address().port}/`, submitted, received, frames, close: () => server.close(), lift: () => { refusing = false; } });
   }));
 }
 
@@ -243,7 +348,8 @@ function startWsServer(opts = {}) {
 // The browser logs every failed HTTP answer as a console error. The portal's
 // probes answer 401, 429 or 503 on purpose, so those log lines are allowed;
 // any other error, and any page error, still fails a case.
-const EXPECTED_STATUS = /Failed to load resource: the server responded with a status of (401|429|503)\b/;
+// 400 is the bridge's answer to a refused GitHub token (the page shows its note).
+const EXPECTED_STATUS = /Failed to load resource: the server responded with a status of (400|401|429|503)\b/;
 function watchErrors(page, errors) {
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('console', (m) => {
@@ -351,7 +457,12 @@ async function testInviteFromSettings(browser, site) {
     await tapLabel(page, 'settings');
     await page.waitForFunction(() => document.body.innerText.includes('share'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'viewer');
-    await page.waitForFunction(() => document.body.innerText.includes('/i/inv1.sig'), null, { timeout: TIMEOUT });
+    // The whole link must be one run of text (a wrap splits it, and the e2e
+    // harness reads the link from the page text): 64 hex signature digits.
+    await page.waitForFunction(() => /\/i\/0{31}1\.[0-9a-f]{64}/.test(document.body.innerText), null, { timeout: TIMEOUT });
+    const shown = await page.evaluate(() => (document.body.innerText.match(/https?:\/\/\S+\/i\/\S+/) || [''])[0]);
+    const issued = site.state.invites[0] && site.state.invites[0].url;
+    if (!issued || shown !== issued) throw new Error(`the page shows ${shown}, the bridge issued ${issued}`);
     const post = site.state.invitePosts[0];
     if (!post || post.session_id !== SESSION || post.role !== 'viewer' || post.ttl_hours !== 24) {
       throw new Error('invite request was ' + JSON.stringify(post));
@@ -360,8 +471,102 @@ async function testInviteFromSettings(browser, site) {
     await tapLabel(page, 'copy');
     await tapLabel(page, 'revoke');
     await page.waitForFunction(() => document.body.innerText.includes('no invites'), null, { timeout: TIMEOUT });
-    if (site.state.deletes[0] !== 'inv1') throw new Error('revoke deleted ' + site.state.deletes.join(','));
+    if (site.state.deletes[0] !== '0'.repeat(31) + '1') throw new Error('revoke deleted ' + site.state.deletes.join(','));
     await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+// The sign-in card (UX-1): the sign-in control is a real button at least 44 px
+// tall, and the page does not scroll sideways.
+async function testSignInLayout(browser, site) {
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/');
+  try {
+    await page.waitForSelector('input[type="password"]', { timeout: TIMEOUT });
+    const box = await page.getByRole('button', { name: 'sign in' }).first().boundingBox();
+    if (!box || box.height < 44) throw new Error('sign-in button is ' + (box ? box.height : 'missing') + ' px tall');
+    const sideways = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+    if (sideways) throw new Error('the sign-in page scrolls sideways');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// One page load opens one socket. A second socket for the same load (a
+// reconnect that reuses a single-use ticket is refused by the bridge) fails
+// this: the count of `websocket` events must be exactly 1 after the page has
+// had time to connect, for a live URL, an invite ticket and an owner page.
+async function testOneSocketPerLoad(browser, site) {
+  const ws = await startWsServer();
+  try {
+  const cases = [
+    ['live', '/app/?url=' + encodeURIComponent(ws.url + '/ws/k1') + '&session=' + SESSION, null],
+    ['invite ticket', '/app/?url=' + encodeURIComponent(ws.url + '/ws/k2?ticket=t2') + '&invite=x.y', null],
+    ['owner', '/app/?url=' + encodeURIComponent(ws.url + '/ws/k3') + '&session=' + SESSION, site.base],
+  ];
+  for (const [label, path, cookie] of cases) {
+    // The listeners are set before the first navigation, so no early socket is missed.
+    const context = await browser.newContext({ viewport: { width: 1000, height: 800 } });
+    if (cookie) await context.addCookies([{ name: 'modron_owner', value: COOKIE, url: cookie }]);
+    try {
+      const page = await context.newPage();
+      const errors = [];
+      watchErrors(page, errors);
+      const sockets = [];
+      let loads = 0;
+      page.on('websocket', (w) => sockets.push(w.url()));
+      page.on('load', () => { loads += 1; });
+      await page.goto(site.base + path, { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+      await page.waitForTimeout(4000);
+      if (loads !== 1) throw new Error(`${label}: the page loaded ${loads} times (a reload opens a second socket)`);
+      if (sockets.length !== 1) throw new Error(`${label}: ${sockets.length} sockets for one page load`);
+      // In-app navigation (chat, settings, back) must not reconnect.
+      await tapLabel(page, 'settings');
+      await page.waitForFunction(() => document.body.innerText.includes('approval mode'), null, { timeout: TIMEOUT });
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+      await page.waitForTimeout(2000);
+      if (sockets.length !== 1) throw new Error(`${label}: ${sockets.length} sockets after chat -> settings -> back`);
+      if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    } finally {
+      await context.close();
+    }
+  }
+  } finally {
+    ws.close();
+  }
+}
+
+// A slow first welcome (over the driver's 3 s connect stall) must not make an
+// invite page open a second socket with the same single-use ticket: the bridge
+// would refuse it. The first socket's welcome is held back 4 s here.
+async function testTicketSlowWelcome(browser, site) {
+  const ws = await startWsServer();
+  const context = await browser.newContext({ viewport: { width: 1000, height: 800 } });
+  try {
+    const page = await context.newPage();
+    const errors = [];
+    watchErrors(page, errors);
+    const sockets = [];
+    page.on('websocket', (w) => sockets.push(w.url()));
+    let held = false;
+    // The route is set before the first navigation: the first welcome is held 4 s.
+    await page.routeWebSocket(/\/ws\//, (route) => {
+      const server = route.connectToServer();
+      route.onMessage((m) => server.send(m));
+      server.onMessage((m) => {
+        if (!held) { held = true; setTimeout(() => route.send(m), 4000); } else route.send(m);
+      });
+    });
+    await page.goto(site.base + '/app/?url=' + encodeURIComponent(ws.url + '/ws/k9?ticket=t9') + '&invite=x.y', { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+    await page.waitForTimeout(6000);
+    if (sockets.length !== 1) throw new Error(`ticket link opened ${sockets.length} sockets for one page load`);
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   } finally {
     await context.close();
@@ -371,8 +576,21 @@ async function testInviteFromSettings(browser, site) {
 
 function newSiteState(portal) {
   return { portal, rateLimited: false, sessions: PORTAL_ROWS, invites: [], invitePosts: [], deletes: [], loggedOut: 0,
-    push: 'on', pushKeyRequests: [], pushPosts: [], pushDeletes: [] };
+    push: 'on', pushKeyRequests: [], pushPosts: [], pushDeletes: [],
+    cloud: 'on', accountGets: 0, accounts: [], accountPosts: [], accountDeletes: [], refusedTokens: ['ghp_refused'],
+    repos: REPOS, repoQueries: [], runs: [], runsOff: false, runPosts: [], runActions: [],
+    vault: 'on', credentials: [{ id: 'anthropic', set: false }, { id: 'openai', set: false }], vaultPuts: [], vaultDeletes: [] };
 }
+
+// The Cloud fixtures: five repos, two to a page (the bridge pages 50).
+const REPO_PAGE = 2;
+const REPOS = [
+  { full_name: 'acme/app', private: false, default_branch: 'main', pushed_at: '2026-11-14T08:00:00Z' },
+  { full_name: 'acme/api', private: true, default_branch: 'dev', pushed_at: '2026-11-13T08:00:00Z' },
+  { full_name: 'acme/web', private: false, default_branch: 'main', pushed_at: '2026-11-12T08:00:00Z' },
+  { full_name: 'acme/docs', private: false, default_branch: 'main', pushed_at: '2026-11-11T08:00:00Z' },
+  { full_name: 'acme/tools', private: false, default_branch: 'main', pushed_at: '2026-11-10T08:00:00Z' },
+];
 
 // Web push fixtures: the bridge's VAPID public key (65 bytes from 0x04) and the
 // browser's subscription keys, as the stub hands them out.
@@ -487,9 +705,9 @@ async function testPushTapSubscribes(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'default', answer: 'granted' } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: off');
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'off');
+    await tapPushSwitch(page);
+    await waitRow(page, 'notify this device', 'on');
     if (site.state.pushPosts.length !== 1) throw new Error('subscribe posts: ' + site.state.pushPosts.length);
     const post = site.state.pushPosts[0];
     if (!sameBody(post, expectedBody())) throw new Error('subscribe body was ' + JSON.stringify(post));
@@ -512,13 +730,12 @@ async function testPushDeniedStaysOff(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'default', answer: 'denied' } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: off');
+    await waitRow(page, 'notify this device', 'off');
+    await tapPushSwitch(page);
     await page.waitForFunction((s) => document.body.innerText.includes(s), PUSH_BLOCKED, { timeout: TIMEOUT });
     await waitForProbe(site, 0);
     if (site.state.pushPosts.length !== 0) throw new Error('a denied permission posted a subscription');
-    const text = await page.evaluate(() => document.body.innerText);
-    if (!text.includes('notify this device: off')) throw new Error('row left off was not shown');
+    if (!(await rowHas(page, 'notify this device', 'off'))) throw new Error('row left off was not shown');
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   } finally {
     await context.close();
@@ -535,9 +752,9 @@ async function testPushSecondTapUnsubscribes(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { permission: 'granted', subscribed: true } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: on');
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'on');
+    await tapPushSwitch(page);
+    await waitRow(page, 'notify this device', 'off');
     const stub = await page.evaluate(() => window.__push);
     if (stub.unsubscribed !== 1) throw new Error('unsubscribe calls: ' + stub.unsubscribed);
     if (site.state.pushDeletes.length !== 1 || site.state.pushDeletes[0].endpoint !== PUSH_ENDPOINT || Object.keys(site.state.pushDeletes[0]).length !== 1) {
@@ -579,9 +796,9 @@ async function testPushApproverInvite(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { cookie: false, query: '&invite=approver-token', push: { permission: 'granted' } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: off'), null, { timeout: TIMEOUT });
-    await tapLabel(page, 'notify this device: off');
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: on'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'off');
+    await tapPushSwitch(page);
+    await waitRow(page, 'notify this device', 'on');
     const post = site.state.pushPosts[0];
     if (!sameBody(post, expectedBody({ invite: 'approver-token' }))) throw new Error('approver body was ' + JSON.stringify(post));
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -599,7 +816,7 @@ async function testPushIosTabHint(browser, site) {
   const { context, page, errors } = await openPushPage(browser, site, { push: { noPush: true, ios: true } });
   try {
     await openSettings(page);
-    await page.waitForFunction(() => document.body.innerText.includes('notify this device: unavailable'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'notify this device', 'unavailable');
     await page.waitForFunction(() => document.body.innerText.includes('add this page to the Home Screen first'), null, { timeout: TIMEOUT });
     if (site.state.pushPosts.length !== 0) throw new Error('an unavailable row posted');
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -675,6 +892,34 @@ async function openIdle(browser, base, ws) {
 // Clicks the page element whose whole text is `label`.
 async function tapLabel(page, label) {
   await page.getByText(label, { exact: true }).first().click();
+}
+
+// The web draws a settings or credential row's label and value apart (ui.rs
+// value_pair), so the page text has no "label: value" run. A row is checked by
+// its label leaf and a value leaf inside the same small row.
+const rowIncludes = ([label, value]) => {
+  const leaves = [...document.querySelectorAll('body *')].filter((e) => e.childElementCount === 0);
+  const words = (el) => [...el.querySelectorAll('*')].filter((e) => e.childElementCount === 0).map((e) => e.textContent.trim()).filter(Boolean);
+  return leaves.some((leaf) => {
+    if (leaf.textContent.trim() !== label) return false;
+    // The row is the nearest ancestor whose words are exactly the label and the value
+    // (a picker's header and rows share a larger ancestor, which holds more words).
+    for (let el = leaf.parentElement, i = 0; el && i < 5; el = el.parentElement, i++) {
+      const w = words(el);
+      if (w.length === 2 && w.includes(label) && w.includes(value)) return true;
+    }
+    return false;
+  });
+};
+async function waitRow(page, label, value) {
+  await page.waitForFunction(rowIncludes, [label, value], { timeout: TIMEOUT });
+}
+async function rowHas(page, label, value) {
+  return page.evaluate(rowIncludes, [label, value]);
+}
+// The push row's control is its switch (role switch, named by the row's label).
+async function tapPushSwitch(page) {
+  await page.getByRole('switch', { name: 'notify this device', exact: true }).click();
 }
 
 // The approval type-ahead guard (app/src/chat.rs, APPROVAL_KEY_GUARD, 300 ms):
@@ -826,12 +1071,17 @@ async function testApprovalGuard(browser, base) {
 async function testThemeColour(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
-  const colour = await page.evaluate(() => {
-    const leaf = [...document.querySelectorAll('*')].find(
-      (e) => e.childElementCount === 0 && e.textContent.includes('fix the router crate'));
-    return leaf ? getComputedStyle(leaf).color : null;
+  // UX-2: a task is a neutral card, so the primary shows where the design
+  // puts it (the focus ring, the primary buttons, the streaming rule). The
+  // probe is any element whose text, background or border takes the primary.
+  const found = await page.evaluate(() => {
+    const gold = 'rgb(217, 165, 32)';
+    return [...document.querySelectorAll('*')].some((e) => {
+      const s = getComputedStyle(e);
+      return s.color === gold || s.backgroundColor === gold || s.borderTopColor === gold || s.borderLeftColor === gold;
+    });
   });
-  if (colour !== 'rgb(217, 165, 32)') throw new Error('task row colour is ' + colour + ', want the oculus primary');
+  if (!found) throw new Error('no element takes the oculus primary (rgb(217, 165, 32))');
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   await page.close();
 }
@@ -883,6 +1133,60 @@ async function testShiftEnterNewline(browser, base) {
     return frame;
   } finally {
     ws.close();
+  }
+}
+
+// The chat on a phone (UX-2): the send control is a real button at least 44 px
+// tall, the composer sits at the bottom of the window, the page does not
+// scroll sideways; a pending approval shows its three words as buttons.
+async function testChatWeb(browser, base) {
+  {
+    const ws = await startWsServer({ quiet: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      const errors = [];
+      watchErrors(page, errors);
+      await page.goto(base + '/?url=' + encodeURIComponent(ws.url) + '&session=' + SESSION, { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(() => document.body.innerText.includes('connected'), null, { timeout: TIMEOUT });
+      await page.locator('input:not([type=file]), textarea').first().click();
+      await page.keyboard.type('hi');
+      await page.waitForFunction(() => document.activeElement.value === 'hi', null, { timeout: TIMEOUT });
+      const r = await page.evaluate(() => {
+        const send = [...document.querySelectorAll('[role=button]')].find((e) => (e.innerText || '').trim() === 'send');
+        const field = document.querySelector('input:not([type=file]), textarea');
+        const box = send ? send.getBoundingClientRect() : null;
+        return {
+          sendHeight: box ? box.height : 0,
+          fieldBottom: field.getBoundingClientRect().bottom,
+          innerHeight: window.innerHeight,
+          overflowX: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+        };
+      });
+      if (r.sendHeight < 44) throw new Error(`send button is ${r.sendHeight} px tall (want 44)`);
+      if (r.fieldBottom > r.innerHeight || r.innerHeight - r.fieldBottom > 160) {
+        throw new Error(`composer bottom ${Math.round(r.fieldBottom)} is not pinned in ${r.innerHeight}`);
+      }
+      if (r.overflowX) throw new Error('the chat scrolls sideways on a phone');
+      if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+      await page.close();
+    } finally {
+      ws.close();
+    }
+  }
+  {
+    const ws = await startWsServer({ after: [APPROVAL] });
+    try {
+      const { page, errors } = await openLive(browser, base, ws);
+      await page.waitForFunction(() => document.body.innerText.includes('allow once'), null, { timeout: TIMEOUT });
+      const buttons = await page.evaluate(() => [...document.querySelectorAll('[role=button]')].map((e) => (e.innerText || '').trim()));
+      for (const want of ['allow once', 'allow all', 'deny']) {
+        if (!buttons.includes(want)) throw new Error(`approval word "${want}" is not a button (have ${buttons.join(' | ')})`);
+      }
+      if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+      await page.close();
+    } finally {
+      ws.close();
+    }
   }
 }
 
@@ -1007,8 +1311,11 @@ async function testHeaderOpensScreens(browser, base) {
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   await tapLabel(page, 'sessions');
   await page.waitForFunction(() => document.body.innerText.includes('write the release notes'), null, { timeout: TIMEOUT });
+  // The openers live in the chat's bar; a screen has "back", not openers.
+  await tapLabel(page, 'back');
+  await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   await tapLabel(page, 'settings');
-  await page.waitForFunction(() => document.body.innerText.includes('approval mode: ask'), null, { timeout: TIMEOUT });
+  await waitRow(page, 'approval mode', 'ask');
   if (errors.length) throw new Error('page errors: ' + errors.join('; '));
   await page.close();
 }
@@ -1021,11 +1328,11 @@ async function tapText(page, label) {
   await page.getByText(label).first().click();
 }
 // What the page paints: every distinct background, and the text colour of the
-// Settings row "phase: build" (a plain row, not the selected one).
+// Settings row "phase" (a plain row, not the selected one).
 async function paintSummary(page) {
   return page.evaluate(() => {
     const all = [...document.querySelectorAll('*')];
-    const leaf = all.find((e) => e.childElementCount === 0 && e.textContent.includes('phase: build'));
+    const leaf = all.find((e) => e.childElementCount === 0 && e.textContent.trim() === 'phase');
     return {
       backgrounds: [...new Set(all.map((e) => getComputedStyle(e).backgroundColor))],
       text: leaf ? getComputedStyle(leaf).color : null,
@@ -1036,17 +1343,17 @@ async function testThemePicker(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
   await tapText(page, 'settings');
-  await page.waitForFunction(() => document.body.innerText.includes('approval mode: ask'), null, { timeout: TIMEOUT });
-  await tapText(page, 'theme: system');
+  await waitRow(page, 'approval mode', 'ask');
+  await tapLabel(page, 'theme');
   await page.waitForFunction(() => document.body.innerText.includes('oculus light'), null, { timeout: TIMEOUT });
   await tapText(page, 'oculus light');
-  await page.waitForFunction(() => document.body.innerText.includes('theme: oculus light'), null, { timeout: TIMEOUT });
+  await waitRow(page, 'theme', 'oculus light');
   let painted = await paintSummary(page);
   if (!painted.backgrounds.includes('rgb(255, 255, 255)')) throw new Error('light theme paints ' + JSON.stringify(painted));
-  await tapText(page, 'theme: oculus light');
+  await tapLabel(page, 'theme');
   await page.waitForFunction(() => document.body.innerText.includes('oculus dark'), null, { timeout: TIMEOUT });
   await tapText(page, 'oculus dark');
-  await page.waitForFunction(() => document.body.innerText.includes('theme: oculus dark'), null, { timeout: TIMEOUT });
+  await waitRow(page, 'theme', 'oculus dark');
   painted = await paintSummary(page);
   if (!painted.backgrounds.includes('rgb(0, 0, 0)')) throw new Error('dark theme paints ' + JSON.stringify(painted));
   await page.reload({ waitUntil: 'domcontentloaded' });
@@ -1066,27 +1373,32 @@ async function testSessionRowAttaches(browser, base) {
   const ws = await startWsServer({ sessions: [{ id: other, title: 'other work', created_at: '', updated_at: '', message_count: 2 }] });
   try {
     const { page, errors } = await openLive(browser, base, ws);
+    // One socket per page load: the session list and the attach reuse it (each
+    // socket opens with one hello frame).
+    const hellos = () => ws.received.filter((t) => t === 'hello').length;
+    const before = hellos();
     await tapLabel(page, 'sessions');
     await page.waitForFunction(() => document.body.innerText.includes('other work'), null, { timeout: TIMEOUT });
     await page.getByText('other work', { exact: false }).first().click();
     const frame = await waitFrame(ws, 'attach', (f) => f.session_id === other);
     if (frame.session_id !== other) throw new Error('attach carried ' + frame.session_id);
+    if (hellos() !== before) throw new Error(`opening a session opened ${hellos() - before} more socket(s)`);
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     await page.close();
   } finally {
     ws.close();
   }
 }
-// The effort row is pressable: a tap on "effort: unset" sends set_config
+// The effort row is pressable: a tap on the effort row (unset) sends set_config
 // with effort low (unset -> low).
 async function testEffortTapSendsConfig(browser, base) {
   const ws = await startWsServer();
   try {
     const { page, errors } = await openLive(browser, base, ws);
     await tapLabel(page, 'settings');
-    await page.waitForFunction(() => document.body.innerText.includes('effort: unset'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'effort', 'unset');
     // The row opens the effort picker (the old terminal's menus); a tap on a level applies it.
-    await tapLabel(page, 'effort: unset');
+    await tapLabel(page, 'effort');
     await page.waitForFunction(() => document.body.innerText.includes('xhigh'), null, { timeout: TIMEOUT });
     await tapText(page, 'low');
     const frame = await waitFrame(ws, 'set_config', (f) => f.patch && f.patch.effort === 'low');
@@ -1136,6 +1448,59 @@ async function testBangBangPrivate(browser, base) {
 }
 
 // Packet C3f. Typing "/co" in the composer shows the compact suggestion.
+// V4: a forked session's row names its parent and turn (the core's words),
+// and `/fork 2` sends a fork frame for turn 2 (the tip is `/fork`).
+async function testForkRowAndTurn(browser, base) {
+  const fork = '9c2d7e10-1a2b-4c3d-8e4f-5a6b7c8d9e0f';
+  const ws = await startWsServer({ sessions: [{ id: fork, title: 'retry', created_at: '', updated_at: '', message_count: 4, forked_from: { session_id: SESSION, turn: 2 } }] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await tapLabel(page, 'sessions');
+    await page.waitForFunction(() => document.body.innerText.includes('forked from 5b1e8f4a at turn 2'), null, { timeout: TIMEOUT });
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(200);
+    await page.keyboard.type('/fork 2');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.value === '/fork 2', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    const frame = await waitFrame(ws, 'fork', (f) => f.turn === 2);
+    if (frame.session_id !== SESSION) throw new Error('fork carried ' + frame.session_id);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// Program V Part B: the welcome's project commands are listed after the
+// built-ins in the slash popup; `/deploy` is sent, and an unlisted `/word`
+// is the local unknown-command notice with no submit frame.
+async function testProjectCommands(browser, base) {
+  const ws = await startWsServer({ commands: ['deploy'] });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/dep');
+    await page.waitForFunction(() => document.body.innerText.includes('/deploy [args]'), null, { timeout: TIMEOUT });
+    await page.keyboard.press('Control+a');
+    await page.keyboard.type('/deploy staging');
+    await page.waitForFunction(() => document.activeElement.value === '/deploy staging', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await waitFrame(ws, 'submit', (f) => f.task === '/deploy staging');
+    await page.keyboard.type('/depoly');
+    await page.waitForFunction(() => document.activeElement.value === '/depoly', null, { timeout: TIMEOUT });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('unknown command'), null, { timeout: TIMEOUT });
+    if (ws.frames.some((f) => f.type === 'submit' && f.task === '/depoly')) throw new Error('an unlisted /word was sent');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 async function testSlashSuggestions(browser, base) {
   const { page, errors } = await openPage(browser, base + '/');
   await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: TIMEOUT });
@@ -1186,6 +1551,52 @@ async function testNoErrorsAcrossReconnect(browser, base) {
   }
 }
 
+// A dropped link (web): the banner reads `reconnecting` with a `retry now`
+// button (44 px). While the server refuses, the driver keeps retrying; the
+// button reconnects at once and the banner goes.
+async function testReconnectingBannerAndRetryNow(browser, base) {
+  const ws = await startWsServer({ dropOnce: true, refuseAfterDrop: true });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('reconnecting'), null, { timeout: TIMEOUT });
+    const retry = page.getByRole('button', { name: 'retry now', exact: true });
+    await retry.waitFor({ timeout: TIMEOUT });
+    const box = await retry.boundingBox();
+    if (!box || box.height < 44) throw new Error('retry now is under 44 px: ' + JSON.stringify(box));
+    const attaches = () => ws.received.filter((t) => t === 'attach').length;
+    const before = attaches();
+    ws.lift();
+    await retry.click();
+    for (let i = 0; i < 100 && attaches() <= before; i++) await new Promise((r) => setTimeout(r, 100));
+    if (attaches() <= before) throw new Error('retry now did not reconnect');
+    await page.waitForFunction(() => !document.body.innerText.includes('reconnecting'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// A blank session (web): the welcome is one empty state (the app's title, the
+// tagline, the model line). The terminal's key hints are not drawn on the web.
+async function testWebWelcomeEmptyState(browser, base) {
+  const ws = await startWsServer({ quiet: true });
+  try {
+    const { page, errors } = await openIdle(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('a token-efficient Rust coding agent'), null, { timeout: TIMEOUT }).catch(async (e) => {
+      throw new Error('no welcome: ' + JSON.stringify(await page.evaluate(() => document.body.innerText)).slice(0, 700) + ' / ' + e.message);
+    });
+    const text = await page.evaluate(() => document.body.innerText);
+    if (!/modron v\S+/.test(text)) throw new Error('the welcome shows no title: ' + text.slice(0, 300));
+    if (!/\bmodel\b/.test(text)) throw new Error('the welcome shows no model line');
+    if (/shift\+enter|pgup|esc interrupt/i.test(text)) throw new Error('terminal key hints on the web welcome');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // Credentials: the screen opens on the first run (nothing signed in). Enter on
 // the OAuth row sends auth_start; on the key row the masked entry sends
 // auth_set_key with the typed key, and the key leaves the page afterwards.
@@ -1203,7 +1614,7 @@ async function testCredentialsScreen(browser, base) {
     await page.keyboard.type('/auth');
     await page.waitForTimeout(300);
     await page.keyboard.press('Enter');
-    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: not configured'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'not configured');
 
     await page.waitForTimeout(300);
     await page.keyboard.press('Enter');
@@ -1224,6 +1635,80 @@ async function testCredentialsScreen(browser, base) {
     await page.waitForFunction(() => !document.body.innerText.includes('OpenAI: paste an API key'), null, { timeout: TIMEOUT });
     const html = await page.content();
     if (html.includes('sk-test-123')) throw new Error('the key stayed on the page');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// The ChatGPT row (the server's `openai-compat`, oauth_capable) starts the
+// device flow like Claude's row: Enter sends auth_start, the page shows the
+// URL and the one-time code, and the outcome note lands. No key entry.
+async function testChatGptSignIn(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'not configured', oauth_capable: true },
+    { id: 'openai-compat', label: 'OpenAI / ChatGPT', status: 'not configured', oauth_capable: true },
+  ];
+  const ws = await startWsServer({ providers, oauth: true });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('ChatGPT'), null, { timeout: TIMEOUT }).catch(async (e) => {
+      throw new Error('the credentials screen shows no ChatGPT row: ' + (await page.evaluate(() => document.body.innerText)).slice(0, 400) + ' / ' + e.message);
+    });
+    await page.waitForTimeout(300);
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Enter');
+    const started = await waitFrame(ws, 'auth_start', (f) => f.provider === 'openai-compat');
+    if (started.provider !== 'openai-compat') throw new Error('auth_start was ' + JSON.stringify(started));
+    await page.waitForFunction(() => document.body.innerText.includes('WXYZ-1234'), null, { timeout: TIMEOUT }).catch(async (e) => {
+      throw new Error('no user code on the page: ' + (await page.evaluate(() => document.body.innerText)).slice(0, 600) + ' / ' + e.message);
+    });
+    if (!(await page.content()).includes('auth.openai.com/codex/device')) throw new Error('the sign-in URL is not shown');
+    await page.waitForFunction(() => document.body.innerText.includes('chatgpt signed in'), null, { timeout: TIMEOUT });
+    if (ws.received.includes('auth_set_key')) throw new Error('ChatGPT sign-in sent a key');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// An OAuth-capable row has two buttons (web): `api key` opens the masked entry
+// and the key is sent as auth_set_key for that provider; `sign in` starts the
+// device flow. Both work on the ChatGPT row, which Enter alone could not reach.
+async function testChatGptRowHasKeyAndSignInButtons(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'not configured', oauth_capable: true },
+    { id: 'openai-compat', label: 'OpenAI / ChatGPT', status: 'not configured', oauth_capable: true },
+  ];
+  const ws = await startWsServer({ providers, oauth: true });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('ChatGPT'), null, { timeout: TIMEOUT });
+    const keyButton = page.getByRole('button', { name: 'api key', exact: true });
+    await keyButton.nth(1).click();
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI / ChatGPT: paste an API key'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && document.activeElement.type === 'password', null, { timeout: TIMEOUT });
+    await page.keyboard.type('sk-chatgpt-456');
+    await page.waitForFunction(() => document.activeElement.value === 'sk-chatgpt-456', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    const saved = await waitFrame(ws, 'auth_set_key', (f) => f.provider === 'openai-compat');
+    if (saved.key !== 'sk-chatgpt-456') throw new Error('auth_set_key sent the wrong key');
+    await page.waitForFunction(() => !document.body.innerText.includes('OpenAI / ChatGPT: paste an API key'), null, { timeout: TIMEOUT });
+    if (ws.received.includes('auth_start')) throw new Error('the key button started a sign-in');
+    await page.getByRole('button', { name: 'sign in', exact: true }).nth(1).click();
+    const started = await waitFrame(ws, 'auth_start', (f) => f.provider === 'openai-compat');
+    if (started.provider !== 'openai-compat') throw new Error('auth_start was ' + JSON.stringify(started));
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
     await page.close();
   } finally {
@@ -1271,12 +1756,59 @@ async function testCredentialRemove(browser, base) {
     await page.keyboard.type('/auth');
     await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
     await page.keyboard.press('Enter');
-    await page.waitForFunction((s) => document.body.innerText.includes(s), 'OpenAI: not configured', { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'not configured');
     const removes = await page.getByText('remove', { exact: true }).count();
     if (removes !== 1) throw new Error(`expected one remove control, saw ${removes}`);
     await tapLabel(page, 'remove');
-    await page.waitForFunction((s) => document.body.innerText.includes(s), 'remove Anthropic credentials? y / n', { timeout: TIMEOUT });
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'remove Anthropic credentials?', { timeout: TIMEOUT });
     await tapLabel(page, 'y');
+    const removed = await waitFrame(ws, 'auth_remove');
+    if (removed.provider !== 'anthropic') throw new Error('auth_remove was ' + JSON.stringify(removed));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// A confirmation is a modal dialog (web): the question without the terminal's
+// `y / n` hint, the y and n buttons. Tab keeps the focus inside it, Escape
+// closes it without sending anything, and y sends the removal.
+async function testConfirmDialog(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'configured', oauth_capable: true },
+  ];
+  const ws = await startWsServer({ providers });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    await waitRow(page, 'Anthropic', 'configured');
+    await tapLabel(page, 'remove');
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor({ timeout: TIMEOUT });
+    const shown = await dialog.innerText();
+    if (!shown.includes('remove Anthropic credentials?')) throw new Error('the dialog asks: ' + shown);
+    if (shown.includes('y / n')) throw new Error('the dialog shows the terminal key hint: ' + shown);
+    // The dialog slides in (the platform's modal motion) and the page behind
+    // it becomes inert: that is the focus trap (keyboard Tab does not walk the
+    // page on this target at all, with or without a dialog).
+    await page.waitForFunction(() => { const d = document.querySelector('[role="dialog"]'); return d && !d.style.transform; }, null, { timeout: TIMEOUT });
+    const trapped = await page.evaluate(() => {
+      const d = document.querySelector('[role="dialog"]');
+      const behind = [...document.querySelectorAll('[inert]')].filter((e) => !d.contains(e));
+      return { inert: behind.length, dialogHasStops: d.querySelectorAll('[role="button"]').length };
+    });
+    if (trapped.inert === 0) throw new Error('nothing behind the dialog is inert: no focus trap');
+    if (trapped.dialogHasStops < 2) throw new Error('the dialog has no buttons to focus');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('[role="dialog"]'), null, { timeout: TIMEOUT });
+    if (ws.received.includes('auth_remove')) throw new Error('Escape removed the credential');
+    await tapLabel(page, 'remove');
+    await dialog.waitFor({ timeout: TIMEOUT });
+    await dialog.getByRole('button', { name: 'y', exact: true }).click();
     const removed = await waitFrame(ws, 'auth_remove');
     if (removed.provider !== 'anthropic') throw new Error('auth_remove was ' + JSON.stringify(removed));
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -1295,7 +1827,7 @@ async function testDeleteAfterConfirmation(browser, base) {
     await tapLabel(page, 'sessions');
     await page.waitForFunction(() => document.body.innerText.includes('other work'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'delete');
-    await page.waitForFunction(() => document.body.innerText.includes('delete other work? y / n'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('delete other work?'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'y');
     const frame = await waitFrame(ws, 'delete_session', (f) => f.session_id === other);
     if (frame.session_id !== other) throw new Error('delete carried ' + frame.session_id);
@@ -1344,7 +1876,7 @@ async function testAgentSteerAndKill(browser, base) {
     const steer = await waitFrame(ws, 'steer_agent', (f) => f.text === 'focus tests');
     if (steer.agent !== 'agent-review') throw new Error('steer carried ' + steer.agent);
     await tapLabel(page, 'kill');
-    await page.waitForFunction(() => document.body.innerText.includes('kill reviewer? y / n'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('kill reviewer?'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'y');
     const kill = await waitFrame(ws, 'kill_agent', (f) => f.agent === 'agent-review');
     if (kill.agent !== 'agent-review') throw new Error('kill carried ' + kill.agent);
@@ -1393,7 +1925,227 @@ async function testAttachSendsOneImage(browser, base) {
   }
 }
 
-(async () => {
+// A leaf element whose whole text is `text` (the web controls are text).
+async function waitLeaf(page, text) {
+  await page.waitForFunction((t) => [...document.querySelectorAll('*')].some((el) => el.childElementCount === 0 && el.textContent.trim() === t), text, { timeout: TIMEOUT });
+}
+
+// Waits until `pred()` holds (the scripted site records each request).
+async function waitUntil(pred, what) {
+  const end = Date.now() + TIMEOUT;
+  while (!pred()) {
+    if (Date.now() > end) throw new Error('timed out waiting for ' + what);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+// The owner's portal list, with the Cloud screen open (the probe answered 200).
+async function openCloud(page) {
+  await waitLeaf(page, 'cloud');
+  await tapLabel(page, 'cloud');
+  await page.waitForFunction(() => document.body.innerText.includes('github accounts'), null, { timeout: TIMEOUT });
+}
+
+// Waits until the masked field has the focus, then types `text` into it.
+async function typeMasked(page, text) {
+  await page.waitForFunction(() => document.activeElement && document.activeElement.type === 'password', null, { timeout: TIMEOUT });
+  await page.keyboard.type(text);
+  await page.waitForFunction((t) => document.activeElement.value === t, text, { timeout: TIMEOUT });
+}
+
+// The Cloud entry is not drawn where the accounts route answers 503.
+async function testCloudHiddenOn503(browser, site) {
+  site.state.cloud = 'off';
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'fix router', { timeout: TIMEOUT });
+    await waitUntil(() => site.state.accountGets >= 1, 'the accounts probe');
+    await page.waitForTimeout(200);
+    if (await page.getByText('cloud', { exact: true }).count()) throw new Error('the cloud entry showed on a 503');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// A masked token is POSTed and never shown; a refused token shows GitHub's
+// status from the 400, and the next token links the account.
+async function testCloudAddAccount(browser, site) {
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await tapLabel(page, 'add account');
+    await typeMasked(page, 'ghp_refused');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('GitHub refused the token (status 401)'), null, { timeout: TIMEOUT });
+    await waitUntil(() => site.state.accountPosts.length === 1, 'the refused POST');
+    if (!sameBody(site.state.accountPosts[0], { token: 'ghp_refused' })) throw new Error('POST body was ' + JSON.stringify(site.state.accountPosts[0]));
+    if ((await page.content()).includes('ghp_refused')) throw new Error('the refused token stayed on the page');
+    await tapLabel(page, 'add account');
+    await typeMasked(page, 'ghp_good');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('octocat \u00b7 token'), null, { timeout: TIMEOUT });
+    await waitUntil(() => site.state.accountPosts.length === 2, 'the second POST');
+    if (!sameBody(site.state.accountPosts[1], { token: 'ghp_good' })) throw new Error('POST body was ' + JSON.stringify(site.state.accountPosts[1]));
+    if ((await page.content()).includes('ghp_good')) throw new Error('the token stayed on the page');
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// Remove asks y / n first, then DELETEs that account.
+async function testCloudRemoveAccount(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await page.waitForFunction(() => document.body.innerText.includes('octocat \u00b7 token'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'remove');
+    await page.waitForFunction(() => document.body.innerText.includes('remove octocat?'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'y');
+    await waitUntil(() => site.state.accountDeletes.includes('a1'), 'the DELETE');
+    await page.waitForFunction(() => document.body.innerText.includes('no github accounts yet'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// The picker sends its text as `q` once it pauses (one request, not one per
+// key), and asks for the next page when its last row is selected.
+async function testCloudRepoPicker(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await tapLabel(page, 'choose a repo');
+    await page.waitForFunction(() => document.body.innerText.includes('acme/app \u00b7 public'), null, { timeout: TIMEOUT });
+    await waitUntil(() => site.state.repoQueries.some((r) => r.q === '' && r.page === 1 && r.account === 'a1'), 'the first page');
+    await page.keyboard.type('ac');
+    await waitUntil(() => site.state.repoQueries.some((r) => r.q === 'ac' && r.page === 1), 'the filtered page');
+    if (site.state.repoQueries.some((r) => r.q === 'a')) throw new Error('a query went out per key: ' + JSON.stringify(site.state.repoQueries));
+    // Two rows on the first page: the second is the last, so selecting it pages on.
+    await page.waitForFunction(() => document.body.innerText.includes('acme/api \u00b7 private'), null, { timeout: TIMEOUT });
+    await page.keyboard.press('ArrowDown');
+    await waitUntil(() => site.state.repoQueries.some((r) => r.q === 'ac' && r.page === 2), 'the next page');
+    await page.waitForFunction(() => document.body.innerText.includes('acme/docs \u00b7 public'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// A pick fills the run's repo and default branch; the branch can be edited;
+// start posts {account, repo, branch} and the run's row appears.
+async function testCloudStartRun(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await tapLabel(page, 'choose a repo');
+    await page.waitForFunction(() => document.body.innerText.includes('acme/app \u00b7 public'), null, { timeout: TIMEOUT });
+    await page.getByText('acme/app', { exact: false }).first().click();
+    await page.waitForFunction(() => document.body.innerText.includes('repo: acme/app'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.querySelector('input') && document.querySelector('input').value === 'main', null, { timeout: TIMEOUT });
+    await page.locator('input').first().fill('dev');
+    await page.waitForFunction(() => document.querySelector('input').value === 'dev', null, { timeout: TIMEOUT });
+    await tapLabel(page, 'start run');
+    await waitUntil(() => site.state.runPosts.length === 1, 'the start POST');
+    if (!sameBody(site.state.runPosts[0], { account: 'a1', repo: 'acme/app', branch: 'dev' })) {
+      throw new Error('start body was ' + JSON.stringify(site.state.runPosts[0]));
+    }
+    await page.waitForFunction(() => document.body.innerText.includes('acme/app \u00b7 dev \u00b7 starting'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// A running run offers stop and open; a failed one offers wake. Each control
+// hits its route; open goes to the run's session address.
+async function testCloudRunActions(browser, site) {
+  site.state.accounts = [{ id: 'a1', login: 'octocat', kind: 'token' }];
+  site.state.runs = [
+    { id: 'r1', repo: 'acme/app', account: 'a1', branch: 'main', state: 'running', reason: '', created_at: '2026-11-15T10:20:30Z', session_url: '/app/?opened=run1' },
+    { id: 'r2', repo: 'acme/api', account: 'a1', branch: 'dev', state: 'failed', reason: 'exit 2', created_at: '2026-11-14T08:00:00Z', session_url: '' },
+  ];
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await page.waitForFunction(() => document.body.innerText.includes('acme/api \u00b7 dev \u00b7 failed \u00b7 exit 2'), null, { timeout: TIMEOUT });
+    if (await page.getByText('open', { exact: true }).count() !== 1) throw new Error('only the run with a session offers open');
+    await tapLabel(page, 'wake');
+    await waitUntil(() => site.state.runActions.some((a) => a.id === 'r2' && a.action === 'wake'), 'the wake route');
+    await page.getByText('stop', { exact: true }).first().click();
+    await waitUntil(() => site.state.runActions.some((a) => a.id === 'r1' && a.action === 'stop'), 'the stop route');
+    await page.getByText('open', { exact: true }).first().click();
+    await page.waitForURL(/opened=run1/, { timeout: TIMEOUT });
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// The runs route answers 503 (no cloud runner): one shared line says so.
+async function testCloudRunsNotConfigured(browser, site) {
+  site.state.runsOff = true;
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/', site.base);
+  try {
+    await openCloud(page);
+    await page.waitForFunction(() => document.body.innerText.includes('the bridge has no cloud runner yet'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+  }
+}
+
+// The vault (PLAN 10.9 item 3) on a live page: the API-key row reads the vault,
+// a key goes to the bridge (PUT, never a session frame), removal DELETEs.
+async function testVaultKeyRows(browser, site) {
+  const ws = await startWsServer({ providers: [
+    { id: 'anthropic', label: 'Anthropic', status: 'not configured', oauth_capable: true },
+    { id: 'openai', label: 'OpenAI', status: 'not configured', oauth_capable: false },
+  ] });
+  const { context, page, errors } = await openIsolated(browser, site.base + '/app/?url=' + encodeURIComponent(ws.url) + '&session=' + SESSION, site.base);
+  try {
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('the key is stored for your cloud hosts'), null, { timeout: TIMEOUT });
+    await waitRow(page, 'OpenAI', 'not configured');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI: paste an API key'), null, { timeout: TIMEOUT });
+    await typeMasked(page, 'sk-vault-1');
+    await page.keyboard.press('Enter');
+    await waitUntil(() => site.state.vaultPuts.length === 1, 'the vault PUT');
+    if (!sameBody(site.state.vaultPuts[0], { id: 'openai', body: { key: 'sk-vault-1' } })) {
+      throw new Error('PUT was ' + JSON.stringify(site.state.vaultPuts[0]));
+    }
+    if (ws.received.includes('auth_set_key')) throw new Error('the key went over the session socket');
+    await waitRow(page, 'OpenAI', 'saved in the vault');
+    if ((await page.content()).includes('sk-vault-1')) throw new Error('the key stayed on the page');
+    await tapLabel(page, 'remove');
+    await page.waitForFunction(() => document.body.innerText.includes('remove OpenAI credentials?'), null, { timeout: TIMEOUT });
+    await tapLabel(page, 'y');
+    await waitUntil(() => site.state.vaultDeletes.includes('openai'), 'the vault DELETE');
+    if (ws.received.includes('auth_remove')) throw new Error('the removal went over the session socket');
+    await waitRow(page, 'OpenAI', 'not configured');
+    await assertNoSecrets(page);
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+  } finally {
+    await context.close();
+    ws.close();
+  }
+}
+
+if (require.main === module) (async () => {
   const sitePort = await freePort();
   // The portal is off here (/api/me 503), so no-url pages are the demo.
   const site = await startSite(sitePort, newSiteState('off'));
@@ -1421,20 +2173,28 @@ async function testAttachSendsOneImage(browser, base) {
     ['(i) header controls open the sessions and settings screens', () => testHeaderOpensScreens(browser, base)],
     ['(l) theme picker: light and dark repaint, the dark choice survives a reload', () => testThemePicker(browser, base)],
     ['(j) session row tap sends attach', () => testSessionRowAttaches(browser, base)],
+    ['(j2) V4: a forked session row names its parent and turn; /fork 2 sends turn 2', () => testForkRowAndTurn(browser, base)],
+    ['(j3) Part B: listed project commands are in the popup and sent; an unlisted /word is a local notice', () => testProjectCommands(browser, base)],
     ['(k) effort tap sends set_config', () => testEffortTapSendsConfig(browser, base)],
     ['(l) typing /co shows the compact suggestion', () => testSlashSuggestions(browser, base)],
     ['(m) model picker row sends set_config with the model', () => testModelPickerSendsConfig(browser, base)],
     ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
     ['(t) no page or console error for a few seconds and across a forced reconnect', () => testNoErrorsAcrossReconnect(browser, base)],
+    ['(t2) a dropped link reads reconnecting with a 44 px retry now that reconnects at once', () => testReconnectingBannerAndRetryNow(browser, base)],
+    ['(t3) a blank web session: one welcome empty state, no terminal key hints', () => testWebWelcomeEmptyState(browser, base)],
     ['(s) credentials: /auth opens it, OAuth sends auth_start, a typed key is sent once and leaves the page', () => testCredentialsScreen(browser, base)],
+    ['(s2) ChatGPT row: Enter starts the device flow; the URL and code show, then the outcome', () => testChatGptSignIn(browser, base)],
+    ['(s2a) ChatGPT row: the api key button opens the masked entry, the sign-in button starts the device flow', () => testChatGptRowHasKeyAndSignInButtons(browser, base)],
     ['(s2) agent picker: /agent lists the server personas, a tap sends set_config with the persona', () => testPersonaPicker(browser, base)],
     ['(s2b) agent picker: the first row clears the persona with an empty set_config', () => testPersonaClear(browser, base)],
     ['(s3) credentials: remove on a signed-in row only, asks y / n, then sends auth_remove', () => testCredentialRemove(browser, base)],
+    ['(s4) a confirmation is a modal dialog: no key hint, Tab stays inside, Escape cancels, y sends', () => testConfirmDialog(browser, base)],
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
     ['(q) shift+enter adds a line and does not submit', () => testShiftEnterNewline(browser, base)],
     ['(r) esc on a pending approval sends deny', () => testEscDeniesApproval(browser, base)],
     ['(w) mouse wheel over the transcript reaches the oldest row', () => testWheelScrollsTranscript(browser, base)],
     ['(l2) at 1280x720 and 390x844 every control and the composer are inside the window (approval, run, two queued)', () => testLayoutInViewport(browser, base)],
+    ['(x) chat on a phone: send is 44 px, the composer is pinned at the bottom, no sideways scroll, approval words are buttons', () => testChatWeb(browser, base)],
   ];
   // The portal cases: each on its own site (its own state) and context.
   const portal = [
@@ -1464,6 +2224,28 @@ async function testAttachSendsOneImage(browser, base) {
       const s = await portalSite('on'); try { await testPushApproverInvite(browser, s); } finally { s.close(); } }],
     ['(w7) push: an iPhone tab without push shows unavailable with the Home Screen hint', async () => {
       const s = await portalSite('on'); try { await testPushIosTabHint(browser, s); } finally { s.close(); } }],
+    ['(c1) cloud: the entry is not drawn where the accounts route answers 503', async () => {
+      const s = await portalSite('on'); try { await testCloudHiddenOn503(browser, s); } finally { s.close(); } }],
+    ['(c2) cloud: a masked token is POSTed and not shown; a refused token shows GitHub status', async () => {
+      const s = await portalSite('on'); try { await testCloudAddAccount(browser, s); } finally { s.close(); } }],
+    ['(c3) cloud: remove asks y / n, then DELETEs the account', async () => {
+      const s = await portalSite('on'); try { await testCloudRemoveAccount(browser, s); } finally { s.close(); } }],
+    ['(c4) cloud: the repo picker sends its text as q once, and pages at the last row', async () => {
+      const s = await portalSite('on'); try { await testCloudRepoPicker(browser, s); } finally { s.close(); } }],
+    ['(c5) cloud: a pick fills the run; start posts {account, repo, branch} and the run shows', async () => {
+      const s = await portalSite('on'); try { await testCloudStartRun(browser, s); } finally { s.close(); } }],
+    ['(c6) cloud: stop, wake and open hit their routes; open goes to the session address', async () => {
+      const s = await portalSite('on'); try { await testCloudRunActions(browser, s); } finally { s.close(); } }],
+    ['(c7) cloud: runs answered 503 shows the shared not-configured line', async () => {
+      const s = await portalSite('on'); try { await testCloudRunsNotConfigured(browser, s); } finally { s.close(); } }],
+    ['(v1) vault: the key row reads the vault, a key is PUT and never a session frame, removal DELETEs', async () => {
+      const s = await portalSite('on'); try { await testVaultKeyRows(browser, s); } finally { s.close(); } }],
+    ['(u2) one socket per page load: live, invite ticket and owner pages open exactly one', async () => {
+      const s = await portalSite('on'); try { await testOneSocketPerLoad(browser, s); } finally { s.close(); } }],
+    ['(u3) invite ticket: a slow welcome does not open a second socket with the spent ticket', async () => {
+      const s = await portalSite('on'); try { await testTicketSlowWelcome(browser, s); } finally { s.close(); } }],
+    ['(u1) sign-in: the button is a 44 px target and the page does not scroll sideways', async () => {
+      const s = await portalSite('on'); try { await testSignInLayout(browser, s); } finally { s.close(); } }],
   ];
   more.push(...portal);
   for (const [name, run] of more) {
@@ -1494,3 +2276,7 @@ async function testAttachSendsOneImage(browser, base) {
   }
   process.exit(failed ? 1 : 0);
 })();
+
+// The helpers the screenshot tool (shots.mjs) reuses: the scripted site, the
+// scripted bridge and the fixtures. Requiring this file runs nothing.
+module.exports = { startSite, startWsServer, newSiteState, PORTAL_ROWS, SESSION, COOKIE, TOKEN, STREAM, freePort, openIsolated, tapLabel, TIMEOUT };

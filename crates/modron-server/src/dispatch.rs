@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use modron_core::{Phase, SessionId};
 use modron_protocol::{
-    ConfigPatch, Frame, ModelWire, Payload, PlanDecision, SessionMetaWire, PROTOCOL_VERSION,
+    ConfigPatch, ForkOriginWire, Frame, ModelWire, Payload, PlanDecision, SessionMetaWire,
+    PROTOCOL_VERSION,
 };
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
@@ -45,6 +46,11 @@ pub struct ServerState {
     /// Session -> share key (minted by /remote-control; used to auth
     /// page publishes).
     pub rc_keys: std::sync::Mutex<HashMap<SessionId, String>>,
+    /// Set when `modron serve` starts its exit (see `BoundServer::begin_exit`).
+    /// A registration stopped after this keeps its portal entry, so the
+    /// portal lists the session offline instead of racing a DELETE against
+    /// the process exit.
+    pub portal_exiting: std::sync::atomic::AtomicBool,
     /// Session -> the live tunnel's abort handle: re-registration aborts
     /// the previous tunnel instead of stacking duplicate pumpers
     /// (2026-11-12 cycle-2 audit L7).
@@ -323,7 +329,7 @@ pub(crate) fn relay_tier(scope: SessionId, payload: &Payload) -> Result<RelayTie
         | Payload::Wake { session_id, .. }
         | Payload::CancelWake { session_id }
         | Payload::ExplainRule { session_id, .. }
-        | Payload::Fork { session_id }
+        | Payload::Fork { session_id, .. }
         | Payload::GetTaskStatus { session_id } => {
             if own(session_id) {
                 Ok(Owner)
@@ -565,6 +571,9 @@ async fn dispatch_frame(
                     Payload::Welcome {
                         server_version: state.version.clone(),
                         protocol: PROTOCOL_VERSION,
+                        // The project commands of the served directory (the
+                        // engine expands the same files on a run).
+                        commands: modron_core::context::project_command_names(&state.working_dir),
                     },
                 ),
             );
@@ -623,6 +632,10 @@ async fn dispatch_frame(
                             task_branch: task.as_ref().map(|r| r.branch.clone()),
                             task_state,
                             working_dir,
+                            forked_from: meta.forked_from.map(|origin| ForkOriginWire {
+                                session_id: origin.parent,
+                                turn: origin.turn,
+                            }),
                         }
                     })
                     .collect();
@@ -1124,8 +1137,8 @@ async fn dispatch_frame(
                 ),
             ),
         },
-        Payload::Fork { session_id } => {
-            handle_fork(state, ctx, request_id, session_id).await;
+        Payload::Fork { session_id, turn } => {
+            handle_fork(state, ctx, request_id, session_id, turn).await;
         }
         Payload::Attach { session_id, .. } => {
             attach(state, ctx, request_id, session_id).await;
@@ -1330,6 +1343,7 @@ async fn handle_fork(
     ctx: &mut ConnCtx,
     request_id: Option<u64>,
     session_id: SessionId,
+    turn: Option<u32>,
 ) {
     // Validate the source first: an unknown id must be an error,
     // not a silently empty fork.
@@ -1343,22 +1357,34 @@ async fn handle_fork(
                 ),
             );
         }
-        Ok(_) => match state.store.fork(session_id).await {
-            Ok(new_id) => {
-                state.hub.ensure_session(new_id, None);
-                let note = Payload::Note {
-                    text: format!("forked {session_id} -> {new_id}"),
+        Ok(events) => {
+            // An out-of-range turn is refused before any copy, with the
+            // plain core message (the turn list is the caller's own input).
+            if let Err(e) = modron_core::rewind::fork_cut(&events, turn) {
+                let message = match e {
+                    modron_core::Error::Session(text) => text,
+                    other => other.to_string(),
                 };
-                // Both channels: the source session's clients see
-                // the fork happen, and the requester gets the new
-                // id even when not attached.
-                if let Some(handle) = state.hub.handle(&session_id) {
-                    handle.publish(note.clone());
-                }
-                send(ctx, reply(request_id, Some(session_id), note));
+                send(ctx, error(request_id, message));
+                return;
             }
-            Err(e) => send(ctx, error(request_id, e.to_string())),
-        },
+            match state.store.fork_at(session_id, turn).await {
+                Ok(new_id) => {
+                    state.hub.ensure_session(new_id, None);
+                    let note = Payload::Note {
+                        text: format!("forked {session_id} -> {new_id}"),
+                    };
+                    // Both channels: the source session's clients see
+                    // the fork happen, and the requester gets the new
+                    // id even when not attached.
+                    if let Some(handle) = state.hub.handle(&session_id) {
+                        handle.publish(note.clone());
+                    }
+                    send(ctx, reply(request_id, Some(session_id), note));
+                }
+                Err(e) => send(ctx, error(request_id, e.to_string())),
+            }
+        }
         Err(e) => send(ctx, error(request_id, e.to_string())),
     }
 }
@@ -2367,6 +2393,7 @@ mod tests {
             tasks: crate::tasks::TaskRegistry::new(),
             bridge_base: None,
             rc_keys: std::sync::Mutex::new(HashMap::new()),
+            portal_exiting: Default::default(),
             rc_tunnels: std::sync::Mutex::new(HashMap::new()),
         });
         (state, dir)
@@ -2869,12 +2896,18 @@ mod tests {
             ),
             (
                 "fork own",
-                Payload::Fork { session_id: own },
+                Payload::Fork {
+                    session_id: own,
+                    turn: None,
+                },
                 [false, true, false, false],
             ),
             (
                 "fork other",
-                Payload::Fork { session_id: other },
+                Payload::Fork {
+                    session_id: other,
+                    turn: None,
+                },
                 [false, false, false, false],
             ),
             (

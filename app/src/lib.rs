@@ -8,6 +8,7 @@ pub mod chat;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod clipboard;
 pub mod clock;
+pub mod cloud;
 pub mod demo;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod files;
@@ -22,6 +23,9 @@ pub mod slash;
 pub mod startup;
 pub mod suggest;
 pub mod theme;
+pub mod ui;
+pub mod ui_chat;
+pub mod ui_screens;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

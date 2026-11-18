@@ -87,7 +87,11 @@ impl Tool for BashTool {
         };
         let mut plain;
         let cmd: &mut Command = match prepared.as_mut() {
-            Some(prepared) => &mut prepared.command,
+            Some(prepared) => {
+                // D9 holds for the sandboxed shell too (see the plain branch).
+                scrub_tokio_command(&mut prepared.command);
+                &mut prepared.command
+            }
             None => {
                 plain = Command::new(shell());
                 // D9: provider secrets never reach the child environment.

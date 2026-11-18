@@ -137,6 +137,7 @@ Both are Wrangler secrets, never in `wrangler.jsonc` or the repository:
 ```sh
 npx wrangler secret put OWNER_TOKEN   # owner sign-in; also keys invite signatures
 npx wrangler secret put HOST_TOKEN    # host registration and the agent tunnel
+npx wrangler secret put VAULT_KEY     # provider-key vault (see "Provider keys")
 ```
 
 - `OWNER_TOKEN` unset: every `/auth`, `/api/*` and `/i/*` route answers
@@ -153,6 +154,55 @@ npx wrangler secret put HOST_TOKEN    # host registration and the agent tunnel
 
 Tokens are compared in constant time and never logged. Owner cookies are
 stored in the Directory as SHA-256 hashes.
+
+### Cloud run secrets (PLAN 10.10)
+
+Set with `npx wrangler secret put <NAME>` from this directory. Each is
+optional for the rest of the portal; without them the run routes answer 503
+"cloud runs are not configured" and the GitHub account routes need only
+`VAULT_KEY`.
+
+- `CONTAINER_URL`: the container worker's public https URL (for example
+  `https://modron-container-preview.<you>.workers.dev`). Plain http is accepted
+  only for a loopback address under `MODRON_TEST_HOOKS`.
+- `WAKE_TOKEN`: bearer the bridge sends to the container worker's `/wake` and
+  `/stop`. Set the same value on the container worker (the deploy workflow
+  reads the repository secret `WAKE_TOKEN`).
+- `VAULT_KEY` and `HOST_TOKEN`: as above. Both are required for runs.
+
+`GITHUB_API_ORIGIN` is a test-only variable (honoured under
+`MODRON_TEST_HOOKS` for a loopback address); deployments leave it unset.
+
+### Provider keys (vault)
+
+Provider API keys belong to the owner, not to a container deploy (PLAN 10.9).
+The owner stores a key here; a host running `modron serve --remote-control
+--portal-credentials` fetches the set and uses it for future turns.
+
+- `VAULT_KEY` (Wrangler secret) unset: `GET/PUT/DELETE /api/credentials*` and
+  `GET /api/host/credentials` answer `503`; nothing else changes.
+- `GET /api/credentials` (owner cookie): one row per allowed provider with
+  `set` and `unreadable`. Never a value.
+- `PUT /api/credentials/<id>` with `{ "key": "..." }` (owner cookie and an
+  `Origin` header equal to the bridge's origin): stores the key, `204`.
+  `DELETE` removes it, `204` or `404`.
+- Allowed ids are the auth catalog's (`anthropic`, `openai-compat`, `zai`,
+  `google`, `groq`, `openrouter`, `mistral`, `cerebras`, `nvidia`,
+  `github-models`); each maps to one env var (`src/vault.ts`). Other ids are
+  `400`. A key is 1-512 UTF-8 bytes with no control characters.
+- `GET /api/host/credentials` (bearer `HOST_TOKEN`): `{ "credentials":
+  { "ANTHROPIC_API_KEY": "...", ... } }`. The only route that returns a value,
+  and only to the host.
+- Encryption: AES-256-GCM. The key is HKDF-SHA256 of `VAULT_KEY` (salt
+  `modron-vault-v1`, info `modron-vault-aes-gcm-v1`). Each write draws a fresh
+  96-bit nonce; the provider id is the additional authenticated data. The
+  Directory table `credentials` stores nonce and ciphertext only. A row that
+  fails to open is reported `unreadable`, and the host fetch leaves it out.
+- Invites never manage keys: a request presenting `?invite=` gets `403`; a
+  request with no owner cookie gets `401`.
+- Values are never logged and never returned to a browser. Responses are
+  `cache-control: no-store`. Rotating `VAULT_KEY` makes existing rows
+  unreadable; re-enter the keys (key rotation is not built).
 
 ### Routes
 
@@ -198,7 +248,10 @@ never be silently ignored).
    ```
 
    rc.rs PUTs on open, on every running-state change, and every 60 seconds
-   (the heartbeat). Remove it with `DELETE` when the session ends.
+   (the heartbeat). Remove it with `DELETE` when the session is ended while
+   the serve runs. A serve that exits (ctrl+c or SIGTERM) sends no DELETE: its
+   entry goes stale and is listed offline, like any host that stopped
+   heartbeating.
 
 ### Staleness
 
@@ -305,6 +358,57 @@ Expiry: invites are normally at least one hour (`ttl_hours`). With
 `MODRON_TEST_HOOKS=1` (set only by the test, never in a deployment)
 `POST /api/invites` also accepts `ttl_seconds` (1 to 3600), and the test waits
 about 2.2 seconds for a one-second invite to lapse.
+
+## GitHub accounts and cloud runs (PLAN 10.10)
+
+Owner only (cookie; invites get 403; no cookie 401), `VAULT_KEY` required (503
+without it), same-origin `Origin` on writes. `cache-control: no-store`.
+
+- `GET /api/github/accounts` -> `{ accounts: [{ id, login, kind }] }`.
+- `POST /api/github/accounts` `{ token }`: GitHub `GET /user` with the token;
+  stores the login and the sealed token, answers 201 `{ id, login, kind: "token" }`.
+  A token GitHub refuses (401 or 403) is 400 `{ error, github_status }`; other
+  GitHub failures are 502. At most 10 accounts (409 past that).
+- `DELETE /api/github/accounts/<id>`: 204, or 404.
+- `GET /api/github/repos?account=<id>&q=<text>&page=<n>` ->
+  `{ repos: [{ full_name, private, default_branch, pushed_at }], next_page }`.
+  Without `q`: one GitHub page of 50, sorted by pushed. With `q`: GitHub pages
+  1 to 3 at 100 each are read and filtered here (case-insensitive, `owner/name`),
+  then cut into pages of 50; a filter sees at most 300 repositories.
+- `GET /api/runs` -> `{ runs: [{ id, repo, account, branch, state, reason,
+  created_at, session_url }] }`, newest first, at most 100. Each list polls the
+  container worker's `POST /status` (bearer `WAKE_TOKEN`, body `{ run_id }`)
+  for the runs marked `running`, at most 4 seconds each. A container that is
+  not running turns its run `sleeping`; an unanswered poll keeps the stored
+  state.
+- `POST /api/runs` `{ account, repo, branch?, handoff_ref? }` -> 201 with the
+  row. `repo` must be `owner/name`; refs are checked. The run is stored as
+  `starting`, then the container worker's `POST /wake` is called with bearer
+  `WAKE_TOKEN` and the body `{ run_id, bridge_url, host_token, repo, branch,
+  git_token, handoff_ref }` (`bridge_url` is this bridge's `wss://` origin). A
+  refused wake sets `failed` with reason `wake failed: container answered status N`.
+- `POST /api/runs/<id>/stop` -> the row, `stopped` (or `failed`, reason
+  `stop failed: ...`). The container worker's `/stop` gets `{ run_id }`.
+- `POST /api/runs/<id>/wake` -> the row, `starting` (or `failed`). Sends the
+  same body as the start, so the git token and handoff ref are sent again.
+
+Run states: `starting`, `running`, `sleeping`, `stopped`, `failed`. A host
+registration (`PUT /api/host/sessions/<id>`) may carry `run_id` (`[a-z0-9-]`,
+at most 64); with a known run that has not stopped or failed, the run becomes
+`running` and links the session. `sleeping` is set by the list poll above
+(the platform stopped the container, e.g. after its idle timeout, and the run
+still exists). A wake from sleeping goes to `starting` as usual; a stopped or
+failed run is never polled.
+
+The git token appears only in the wake body the bridge sends to the container
+worker over https. No browser-facing response carries a token; a GitHub error
+is answered with its status, never its body. Outbound calls: GitHub only at
+`https://api.github.com` (test override above), the container worker only at
+`CONTAINER_URL`, each with a 10 second timeout.
+
+Tests: `node test/cloud.mjs` (wrangler local, with a fake GitHub and a fake
+container worker on loopback). The e2e scenario P6 runs a real
+`modron serve --run-id` against this bridge.
 
 ## Web push (approvals, plans, finished runs)
 

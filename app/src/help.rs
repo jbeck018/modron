@@ -557,6 +557,29 @@ impl HelpTab {
     }
 }
 
+/// The tabs the web shows. Shortcuts lists keyboard bindings, which the web's
+/// controls replace; the terminal keeps all three.
+pub fn shown_tabs() -> &'static [HelpTab] {
+    if crate::chat::WEB_CONTROLS {
+        &[HelpTab::General, HelpTab::Commands]
+    } else {
+        &HELP_TABS
+    }
+}
+
+/// The rows a tab shows. On the web General keeps its tagline only: its other
+/// rows name terminal keys. The terminal shows [`tab_lines`] as they are.
+pub fn rows_for(tab: HelpTab) -> Vec<String> {
+    if !crate::chat::WEB_CONTROLS {
+        return tab_lines(tab);
+    }
+    match tab {
+        HelpTab::General => vec![WELCOME_TAGLINE.to_string()],
+        HelpTab::Commands => tab_lines(tab),
+        HelpTab::Shortcuts => Vec::new(),
+    }
+}
+
 /// The rows of one tab. Commands come from the shared slash table and the
 /// app's own rows; Shortcuts from the one key table, so help cannot drift
 /// from behaviour.
@@ -576,7 +599,7 @@ pub fn tab_lines(tab: HelpTab) -> Vec<String> {
             lines.extend(
                 slash::all()
                     .iter()
-                    .filter(|e| slash_lookup(e.name).is_none())
+                    .filter(|e| slash_lookup(&e.name).is_none())
                     .map(|e| format!("{} - {}", e.usage, e.about)),
             );
             lines
@@ -616,7 +639,7 @@ mod tests {
         }
         let commands = tab_lines(HelpTab::Commands);
         for e in slash::all() {
-            assert!(commands.iter().any(|l| l.starts_with(e.usage)), "{}", e.usage);
+            assert!(commands.iter().any(|l| l.starts_with(e.usage.as_ref())), "{}", e.usage);
         }
     }
 

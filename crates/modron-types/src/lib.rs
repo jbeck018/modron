@@ -289,6 +289,18 @@ pub struct SessionMeta {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub message_count: u32,
+    /// Lineage (Program V4, additive): set on a session created by `/fork`
+    /// and absent on every other session, including all older meta files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ForkOrigin>,
+}
+
+/// Where a forked session came from: the parent session and the number of
+/// user turns (tasks) the fork kept. `turn` 0 is a fork before any turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkOrigin {
+    pub parent: SessionId,
+    pub turn: u32,
 }
 
 /// Append-only session events. `parent_id` (index of the event this one
@@ -426,6 +438,17 @@ pub enum SessionEvent {
         to: Option<String>,
         at: chrono::DateTime<chrono::Utc>,
         carrier_ref: String,
+    },
+    /// Team-mode stage note (additive): one short line at each stage boundary
+    /// of a team run (plan done, round started, merging, verifying,
+    /// reviewing, round result). It exists for the transcript only. It is not
+    /// model content, compaction input, handoff ownership, or a turn boundary
+    /// (`fork_cut` counts `Task` events), and a provider request never sees
+    /// it. Clients fold it as one transcript note. Logs without it load
+    /// unchanged; a binary that predates the variant skips such a line as a
+    /// corrupt one (the store's usual warn-and-skip).
+    Progress {
+        text: String,
     },
 }
 
@@ -667,6 +690,28 @@ pub struct RunSummary {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn progress_line_round_trips_and_older_lines_still_parse() {
+        // The new line shape is pinned: `{"type":"progress","text":...}`.
+        let line = serde_json::to_string(&SessionEvent::Progress {
+            text: "team plan: 2 item(s)".into(),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"type":"progress","text":"team plan: 2 item(s)"}"#);
+        let back: SessionEvent = serde_json::from_str(&line).unwrap();
+        assert!(matches!(back, SessionEvent::Progress { text } if text == "team plan: 2 item(s)"));
+        // Lines written before the variant existed load unchanged.
+        let old = [
+            r#"{"type":"task","text":"make it"}"#,
+            r#"{"type":"message","parent_id":null,"message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"handed_off","at":"2026-11-01T00:00:00Z","carrier_ref":"refs/x"}"#,
+        ];
+        for text in old {
+            serde_json::from_str::<SessionEvent>(text)
+                .unwrap_or_else(|e| panic!("old line {text}: {e}"));
+        }
+    }
 
     fn thinking_block(provider: &str, api: &str, index: u32) -> ProviderBlock {
         ProviderBlock {

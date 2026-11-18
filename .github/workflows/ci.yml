@@ -71,7 +71,7 @@ jobs:
       # fails the job if it installs anything other than 0.5.1.
       - name: Install NSH CLI (nsh.dev installer)
         run: |
-          curl -fsSL https://nsh.dev/install.sh | sh
+          curl -fsSL https://nsh.dev/install.sh | NSH_VERSION=v0.5.1 sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Check NSH CLI version (0.5.1)
         run: nsh --version | grep -q '0\.5\.1'
@@ -133,7 +133,7 @@ jobs:
         run: wasm-bindgen --version | grep -q '0.2.130'
       - name: Install NSH CLI (nsh.dev installer)
         run: |
-          curl -fsSL https://nsh.dev/install.sh | sh
+          curl -fsSL https://nsh.dev/install.sh | NSH_VERSION=v0.5.1 sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Check NSH CLI version (0.5.1)
         run: nsh --version | grep -q '0\.5\.1'

@@ -8,6 +8,7 @@
 use crate::client::{handshake_timeout, hello_frame, In};
 use crate::error::ClientError;
 use futures_util::{SinkExt, StreamExt};
+use modron_protocol::client::WelcomeInfo;
 use modron_protocol::{Frame, Payload, PROTOCOL_VERSION};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -101,20 +102,25 @@ impl Conn {
 pub(crate) async fn handshake(
     url: &str,
     token: Option<&str>,
-) -> Result<(Conn, String), ClientError> {
+) -> Result<(Conn, WelcomeInfo), ClientError> {
     match crate::client::unix_socket_path(url)? {
         Some(path) => unix_handshake(&path, token).await,
         None => ws_handshake(url, token).await,
     }
 }
 
-/// Map the server's first frame to its version, or the mismatch/refusal.
-fn welcome_version(frame: Frame) -> Result<String, ClientError> {
+/// Map the server's first frame to its welcome (version and project
+/// commands), or the mismatch/refusal.
+fn welcome_info(frame: Frame) -> Result<WelcomeInfo, ClientError> {
     match frame.payload {
         Payload::Welcome {
             server_version,
             protocol,
-        } if protocol == PROTOCOL_VERSION => Ok(server_version),
+            commands,
+        } if protocol == PROTOCOL_VERSION => Ok(WelcomeInfo {
+            server_version,
+            commands,
+        }),
         Payload::Welcome { protocol, .. } => Err(ClientError::ProtocolMismatch {
             server: protocol,
             client: PROTOCOL_VERSION,
@@ -129,7 +135,7 @@ fn welcome_version(frame: Frame) -> Result<String, ClientError> {
 async fn unix_handshake(
     path: &std::path::Path,
     token: Option<&str>,
-) -> Result<(Conn, String), ClientError> {
+) -> Result<(Conn, WelcomeInfo), ClientError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
         ClientError::Connect(format!(
@@ -151,8 +157,8 @@ async fn unix_handshake(
             Ok(Some(line)) if line.trim().is_empty() => continue,
             Ok(Some(line)) => match serde_json::from_str::<Frame>(&line) {
                 Ok(frame) => {
-                    let server_version = welcome_version(frame)?;
-                    return Ok((Conn::Unix { write, lines }, server_version));
+                    let info = welcome_info(frame)?;
+                    return Ok((Conn::Unix { write, lines }, info));
                 }
                 Err(_) => continue,
             },
@@ -168,13 +174,13 @@ async fn unix_handshake(
 async fn unix_handshake(
     _path: &std::path::Path,
     _token: Option<&str>,
-) -> Result<(Conn, String), ClientError> {
+) -> Result<(Conn, WelcomeInfo), ClientError> {
     Err(ClientError::Connect(
         "unix sockets are not available on this platform".into(),
     ))
 }
 
-async fn ws_handshake(url: &str, token: Option<&str>) -> Result<(Conn, String), ClientError> {
+async fn ws_handshake(url: &str, token: Option<&str>) -> Result<(Conn, WelcomeInfo), ClientError> {
     // Limits are set explicitly (the tungstenite defaults are 64 MiB per
     // message); `connect` itself is bounded by the caller's connect deadline.
     let mut config = WebSocketConfig::default();
@@ -200,6 +206,6 @@ async fn ws_handshake(url: &str, token: Option<&str>) -> Result<(Conn, String), 
         Some(Err(e)) => return Err(ClientError::Handshake(e.to_string())),
         None => return Err(ClientError::Handshake("closed during handshake".into())),
     };
-    let server_version = welcome_version(frame)?;
-    Ok((Conn::Ws { sink, stream }, server_version))
+    let info = welcome_info(frame)?;
+    Ok((Conn::Ws { sink, stream }, info))
 }

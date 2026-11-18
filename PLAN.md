@@ -500,3 +500,106 @@ and ownership. Two carriers, chosen by `[handoff] carrier = "git" |
 5. Out of scope for v1: live handoff during a run, merging diverged
    trees, moving provider credentials.
 
+### 10.9 Decision and design: provider credentials belong to the owner (C6d)
+
+Owner, 2026-11-16: model auth must come from the harness sign-in, not
+from how a container was deployed. Compared with Claude Code (model
+access follows the signed-in user; environment secrets are for the
+user's code): same rule here. This replaces the "Secrets" row of 10.2
+for provider credentials; infrastructure tokens stay Worker secrets.
+
+1. Vault in the bridge. Owner-only routes (owner cookie; invites and
+   viewers refused): `GET /api/credentials` lists provider ids and
+   whether each is set (never a value), `PUT /api/credentials/<id>`
+   stores an API key, `DELETE` removes it. Values are stored in the
+   Directory DO encrypted with AES-GCM under a key derived (HKDF) from
+   a dedicated Worker secret `VAULT_KEY`; unset = 503 and nothing else
+   changes. Values are never logged and never returned to a browser.
+2. Host fetch. `GET /api/host/credentials` with the HOST_TOKEN bearer
+   returns the decrypted set to a host. `modron serve
+   --portal-credentials` (env MODRON_PORTAL_CREDENTIALS=1; the cloud
+   container sets it) fetches them at start and after each tunnel
+   reconnect, keeps them in process memory only (never written to the
+   env file or the session log), and applies them to future turns. A
+   locally configured key wins over a vault key.
+3. App. On the web target, when the app is served by a bridge and the
+   viewer is the owner, the credentials screen writes API keys to the
+   vault (HTTPS to the bridge, not through the session socket). The
+   existing rule stays: key entry and removal over a relayed session
+   socket are refused.
+4. The cloud deploy workflow and the container worker drop
+   ANTHROPIC_API_KEY and OPENAI_API_KEY.
+5. Not in this pass: subscription sign-ins (browser OAuth and token
+   files), per-invite credentials, key rotation of VAULT_KEY.
+
+### 10.10 Design: linked GitHub accounts and cloud runs from the portal (C6e, C6f)
+
+Owner, 2026-11-16: no per-deploy repo or tokens; build the gaps. The
+container worker is deployed once with no runtime secrets of its own.
+Everything a run needs comes from the bridge at wake time.
+
+Bridge API (owner cookie unless noted; JSON; `cache-control: no-store`;
+same-origin `Origin` required on writes; 503 when `VAULT_KEY` is unset):
+
+- `GET /api/github/accounts` -> `{ accounts: [{ id, login, kind }] }`
+  (`kind` is "token" for a pasted access token; "oauth" later).
+- `POST /api/github/accounts` body `{ token }`: the bridge calls
+  GitHub `GET /user` with it, stores the token in the vault under a
+  new account id with the returned login, and answers the account row.
+  A token GitHub refuses is a 400 with GitHub's status, never the token.
+- `DELETE /api/github/accounts/<id>`.
+- `GET /api/github/repos?account=<id>&q=<text>&page=<n>` ->
+  `{ repos: [{ full_name, private, default_branch, pushed_at }],
+  next_page }` (GitHub `GET /user/repos`, sorted by pushed, filtered
+  by `q` on the bridge side; 50 per page).
+- `GET /api/runs` -> `{ runs: [{ id, repo, account, branch, state,
+  created_at, session_url }] }`; states: starting, running, sleeping,
+  stopped, failed (with a short `reason`).
+- `POST /api/runs` body `{ account, repo, branch?, handoff_ref? }` ->
+  the run row. The bridge creates a run id, and calls the container
+  worker (`CONTAINER_URL` + `WAKE_TOKEN`, both bridge secrets; unset =
+  503 "cloud runs are not configured") with the per-run environment:
+  bridge URL (its own origin), host token, repo, branch, the account's
+  git token, handoff ref, and the run id. The container starts
+  `modron serve --remote-control --portal-credentials
+  --handoff-on-exit` for that repo; the session it registers carries
+  the run id so the portal can link run and session.
+- `POST /api/runs/<id>/stop`, `POST /api/runs/<id>/wake`.
+- Viewers and invited approvers get 403 on all of these.
+
+Container worker: one route `POST /wake` (bearer WAKE_TOKEN) taking the
+per-run environment in the body, one container instance per run id,
+sleep after idle; `POST /stop`. It holds no provider keys, no repo and
+no git token of its own. The git token is passed to git through
+environment-based config and kept for the push that handoff-on-exit
+needs (it is not exported to the agent's tools: `modron serve` scrubs
+it from child process environments).
+
+App (web target, owner only, served by a bridge): a "Cloud" screen
+reachable from the portal's session list: GitHub accounts (add by
+token, remove), a repo picker (type to filter), "start run", and the
+runs list with state, open, stop, wake. Provider credentials on the
+credentials screen write to the vault (10.9 item 3). The terminal
+target shows none of this (divergence row).
+
+Later: GitHub OAuth (needs an OAuth app's client id), per-run cost
+limits, more than one container size.
+
+
+### 10.11 Program V - parity gaps against oh-my-pi and oh-my-claudecode (2026-11-17)
+
+Owner request 2026-11-17: build all five gaps from the comparison. Decisions
+made under 10.2a (compare with Claude Code and oh-my-pi, decide, record).
+
+Already present (found while planning, so out of scope): AGENTS.md / CLAUDE.md
+memory, `.claude/skills`, session fork (`/fork`, protocol and store), rewind.
+
+| Id | Gap | Decision |
+|---|---|---|
+| V1 | Read other agents' config | Rules: also load `.cursor/rules/*.md*`, `.github/copilot-instructions.md`, `GEMINI.md`, `.windsurfrules` as project memory (text only, size capped, source named in the prompt). Commands: `.claude/commands/*.md` become slash commands. MCP: discover `.mcp.json` and `.cursor/mcp.json`, but a discovered server runs only after the user trusts it for that workspace (Claude Code asks the same; oh-my-pi does not). `modron doctor` lists what was found. |
+| V2 | Web search and browser | `web_search` is an on-demand tool with backends Brave, Tavily and Exa, chosen by which key is configured; no keyless scraping. Browser: no native CDP driver; `modron mcp add playwright` installs a preset MCP server entry (Claude Code's route; oh-my-pi ships its own Puppeteer). |
+| V3 | Team mode | `/team [N] <task>` and `modron team`: plan, N workers as `delegate` children in worktrees, merge, verify with the `[verify]` command and the reviewer, fix rounds up to a cap. `--until-verified` keeps going until verify passes or the cap or budget is hit. Reuses delegate, merge_worktree, the finish gate and the swarm rows; lands in both app targets. |
+| V4 | Session tree | Fork exists. Add: fork from an earlier turn (not only the tip), lineage stored on the session, and the sessions screen shows the parent. |
+| V5 | Subscription logins | Add a native ChatGPT (Codex) login so reuse of `~/.codex/auth.json` is not the only route. GitHub Copilot chat login is NOT built: it needs another product's client id; GitHub Models tokens stay the supported route. Owner can overrule. |
+
+Order: V1 and V2 in parallel (different crates), then V3, then V4 and V5.

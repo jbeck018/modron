@@ -157,22 +157,12 @@ impl SessionStore for BroadcastingStore {
         self.inner.event_count(id).await
     }
 
-    /// Fork = create the new transcript, then copy events into it. The
-    /// trait's default (append without create) cannot work against
-    /// file-backed stores, which require `create_session` first. Copied
-    /// events go through `inner` directly — attached clients of the fork
-    /// get the full log via their attach Snapshot instead of a replay.
-    async fn fork(&self, from: SessionId) -> modron_core::Result<SessionId> {
-        let events = self.inner.load(from).await?;
-        let meta = self
-            .inner
-            .create_session(&format!("fork of {from}"))
-            .await?;
-        // One batched write: per-event appends meant one meta rewrite +
-        // several syscalls PER EVENT (a 5k-event fork churned the disk for
-        // seconds; cycle-2 audit H5).
-        self.inner.append_batch(meta.id, &events).await?;
-        Ok(meta.id)
+    /// Fork at a user turn (V4). The inner store creates the new transcript
+    /// and copies the kept prefix; this wrapper only forwards it. The copy
+    /// bypasses `append`, so attached clients of the fork get the full log
+    /// via their attach Snapshot instead of a replay.
+    async fn fork_at(&self, from: SessionId, turn: Option<u32>) -> modron_core::Result<SessionId> {
+        self.inner.fork_at(from, turn).await
     }
 }
 
@@ -247,6 +237,10 @@ impl SessionStore for PinnedCreateStore {
 
     async fn event_count(&self, id: SessionId) -> modron_core::Result<u64> {
         self.inner.event_count(id).await
+    }
+
+    async fn fork_at(&self, from: SessionId, turn: Option<u32>) -> modron_core::Result<SessionId> {
+        self.inner.fork_at(from, turn).await
     }
 }
 

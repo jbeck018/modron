@@ -81,6 +81,10 @@ interface Env {
   // Host registration and the agent tunnel. Unset leaves /agent open to
   // anyone holding the agent key, as before.
   HOST_TOKEN?: string;
+  // Provider-key vault (src/vault.ts, README "Provider keys"). Wrangler
+  // secret, separate from every other secret. Unset: /api/credentials and
+  // /api/host/credentials answer 503 and nothing else changes.
+  VAULT_KEY?: string;
   DIRECTORY: DurableObjectNamespace<Directory>;
   // Test-only (set by test/portal.mjs, never in a deployment): accepts a
   // ttl_seconds field on POST /api/invites so expiry can be tested quickly.
@@ -92,6 +96,13 @@ interface Env {
   VAPID_PRIVATE_KEY?: string;
   VAPID_SUBJECT?: string;
   PUSH_TEST_ORIGIN?: string;
+  // GitHub accounts and cloud runs (PLAN 10.10; README "GitHub accounts and
+  // cloud runs"). CONTAINER_URL (https, the container worker) and WAKE_TOKEN
+  // (its bearer) are wrangler secrets; unset means /api/runs answers 503.
+  // GITHUB_API_ORIGIN is honoured only with MODRON_TEST_HOOKS (a loopback fake).
+  CONTAINER_URL?: string;
+  WAKE_TOKEN?: string;
+  GITHUB_API_ORIGIN?: string;
 }
 
 // constantTimeEquals (publish token, owner token, invite signatures) lives in
@@ -132,7 +143,35 @@ interface RegistryEntry {
 }
 
 import { DurableObject } from "cloudflare:workers";
-import { Directory } from "./directory";
+import { Directory, type CredentialRow, type GithubAccountRow, type RunRow, type RunView } from "./directory";
+import {
+  checkCredentialValue,
+  openCredential,
+  openValue,
+  providerEnvVar,
+  sealCredential,
+  sealValue,
+  VAULT_PROVIDERS,
+  type Sealed,
+} from "./vault";
+import {
+  ACCOUNT_ID_RE,
+  ACCOUNT_LIMIT,
+  checkGithubToken,
+  githubGet,
+  loginOf,
+  repoPage,
+} from "./github";
+import {
+  RUN_ID_RE,
+  containerBase,
+  containerPost,
+  runEnvironment,
+  validRef,
+  validRepo,
+  type RunsEnv,
+  containerRunning,
+} from "./runs";
 import {
   PUSH_WORKER,
   importVapid,
@@ -773,11 +812,18 @@ async function handleHostSession(request: Request, env: Env, id: string): Promis
     return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
   }
   if (request.method !== "PUT") return plainResponse(405, "method not allowed");
-  const parsed = await readJsonObject(request, ["title", "host_label", "host_kind", "viewer_key", "state"]);
+  const parsed = await readJsonObject(request, ["title", "host_label", "host_kind", "viewer_key", "state", "run_id"]);
   if (!parsed.ok) return parsed.response;
   const input = parseHostSession(parsed.body);
   if (!input.ok) return plainResponse(400, input.message);
+  // Optional (PLAN 10.10): a cloud run's session carries its run id, which
+  // moves the run to running and links it to this session.
+  const runId = parsed.body.run_id;
+  if (runId !== undefined && runId !== null && (typeof runId !== "string" || !RUN_ID_RE.test(runId))) {
+    return plainResponse(400, "run_id must match [a-z0-9-]{1,64}");
+  }
   await directory(env).upsertSession({ id: sid, ...input.value, updated_at: now }, now);
+  if (typeof runId === "string") await directory(env).linkRunSession(runId, sid);
   return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 }
 
@@ -1005,6 +1051,320 @@ async function handlePushSubscribe(request: Request, env: Env): Promise<Response
   return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
 }
 
+// --- provider-key vault: /api/credentials (owner), /api/host/credentials (host) ---
+// Owner routes need the owner cookie (401 without it). A request that presents
+// an invite (any role, `?invite=`) is refused 403: invites never manage keys.
+// PUT and DELETE also need an Origin header equal to this bridge's origin, on
+// top of the SameSite=Strict cookie. Every response is no-store and no route
+// returns a value to a browser; only the host route returns values, and only
+// with the HOST_TOKEN bearer.
+
+function sameOriginWrite(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  return origin !== null && origin === new URL(request.url).origin;
+}
+
+function sealedOf(row: CredentialRow): Sealed {
+  return { nonce: new Uint8Array(row.nonce), ciphertext: new Uint8Array(row.ciphertext) };
+}
+
+// Copies a fresh byte array into its own ArrayBuffer for DO storage.
+const bufferOf = (bytes: Uint8Array): ArrayBuffer => bytes.slice().buffer;
+
+// GET /api/credentials: { credentials: [{ provider, env_var, set, unreadable,
+// updated_at }] } for every allowed provider. Never a value.
+// PUT /api/credentials/<id> { key }: store (204). DELETE: remove (204 or 404).
+async function handleCredentials(request: Request, env: Env, path: string): Promise<Response> {
+  if (!env.VAULT_KEY) return plainResponse(503, "provider keys are disabled: this bridge has no VAULT_KEY secret");
+  if (!(await ownerCookieLive(request, env))) {
+    if (new URL(request.url).searchParams.has("invite")) return plainResponse(403, "invites cannot manage provider keys");
+    return plainResponse(401, "unauthorized");
+  }
+  const dir = directory(env);
+  if (path === "/api/credentials") {
+    if (request.method !== "GET") return plainResponse(405, "method not allowed");
+    const rows = new Map((await dir.listCredentials()).map((row) => [row.provider_id, row] as const));
+    const list = [];
+    for (const [id, envVar] of Object.entries(VAULT_PROVIDERS)) {
+      const row = rows.get(id);
+      let unreadable = false;
+      if (row) {
+        try { await openCredential(env.VAULT_KEY, id, sealedOf(row)); } catch { unreadable = true; }
+      }
+      list.push({
+        provider: id,
+        env_var: envVar,
+        set: row !== undefined,
+        unreadable,
+        updated_at: row ? iso(row.updated_at) : null,
+      });
+    }
+    return jsonResponse(200, { credentials: list });
+  }
+  const m = path.match(/^\/api\/credentials\/([^/]+)$/);
+  if (!m) return plainResponse(404, "not found");
+  const id = m[1];
+  if (request.method !== "PUT" && request.method !== "DELETE") return plainResponse(405, "method not allowed");
+  if (!sameOriginWrite(request)) return plainResponse(403, "cross-origin change refused");
+  if (providerEnvVar(id) === null) return plainResponse(400, "unknown provider id");
+  if (request.method === "DELETE") {
+    const existed = await dir.deleteCredential(id);
+    return existed
+      ? new Response(null, { status: 204, headers: { "cache-control": "no-store" } })
+      : plainResponse(404, "not set");
+  }
+  const parsed = await readJsonObject(request, ["key"]);
+  if (!parsed.ok) return parsed.response;
+  const value = checkCredentialValue(parsed.body.key);
+  if (!value.ok) return plainResponse(400, value.message);
+  const sealed = await sealCredential(env.VAULT_KEY, id, value.value);
+  await dir.putCredential({
+    provider_id: id,
+    nonce: bufferOf(sealed.nonce),
+    ciphertext: bufferOf(sealed.ciphertext),
+    updated_at: requestNow(request, env),
+  });
+  return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+}
+
+// GET /api/host/credentials, bearer HOST_TOKEN: { credentials: { <ENV>: value } }
+// for every readable stored key. An unreadable row is left out, never sent.
+async function handleHostCredentials(request: Request, env: Env): Promise<Response> {
+  if (!env.HOST_TOKEN || !env.VAULT_KEY) {
+    return plainResponse(503, "host credentials are disabled: this bridge has no HOST_TOKEN or VAULT_KEY secret");
+  }
+  if (request.method !== "GET") return plainResponse(405, "method not allowed");
+  if (!bearerMatches(request, env.HOST_TOKEN)) return plainResponse(401, "unauthorized");
+  const out: Record<string, string> = {};
+  for (const row of await directory(env).listCredentials()) {
+    const envVar = providerEnvVar(row.provider_id);
+    if (envVar === null) continue;
+    try {
+      out[envVar] = await openCredential(env.VAULT_KEY, row.provider_id, sealedOf(row));
+    } catch {
+      // Unreadable: omitted. The value is never part of an error.
+    }
+  }
+  return jsonResponse(200, { credentials: out });
+}
+
+
+// --- GitHub accounts and cloud runs (PLAN 10.10) ---
+// Owner only: a live owner cookie, else 401 (an invite on the request is 403).
+// VAULT_KEY is required (GitHub tokens are sealed under it, associated data =
+// the account id). Writes need the same-origin Origin header. No response
+// carries a token; the git token reaches the container worker only inside the
+// wake and stop bodies, over https.
+
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+// The run routes' config, or null: CONTAINER_URL (https), WAKE_TOKEN, HOST_TOKEN.
+function runsConfig(env: Env): RunsEnv & { base: string; hostToken: string } | null {
+  const base = containerBase(env);
+  if (base === null || !env.HOST_TOKEN) return null;
+  return { base, hostToken: env.HOST_TOKEN };
+}
+
+// The GitHub token of an account, or null when the row cannot be opened.
+async function unsealGithubToken(vaultKey: string, row: GithubAccountRow): Promise<string | null> {
+  try {
+    return await openValue(vaultKey, row.id, { nonce: new Uint8Array(row.nonce), ciphertext: new Uint8Array(row.ciphertext) });
+  } catch {
+    return null;
+  }
+}
+
+// The row the browser sees (PLAN 10.10). session_url is the portal's open
+// path for the linked session, the same path GET /api/sessions gives.
+function runView(row: RunView, origin: string) {
+  return {
+    id: row.id,
+    repo: row.repo,
+    account: row.account_id,
+    branch: row.branch === "" ? null : row.branch,
+    state: row.state,
+    reason: row.reason,
+    created_at: iso(row.created_at),
+    session_url: row.viewer_key === null ? null : sessionOpenUrl(origin, row.viewer_key),
+  };
+}
+
+const RUNS_UNCONFIGURED = "cloud runs are not configured";
+
+// PLAN 10.10 "sleeping": the platform stops a run's container after its idle
+// timeout, and nothing else reports that. So each list asks the container
+// worker about the runs still marked running; a container that is no longer
+// running moves its run to sleeping (stored, and the row is updated in place).
+// An unanswered poll keeps the stored state. Only running runs are asked:
+// starting ones are not yet linked, and stopped, failed and sleeping ones
+// have nothing to report.
+async function markSleepingRuns(
+  env: Env,
+  config: RunsEnv & { base: string },
+  dir: ReturnType<typeof directory>,
+  rows: RunView[],
+): Promise<void> {
+  const live = rows.filter((r) => r.state === "running");
+  const running = await Promise.all(live.map((r) => containerRunning(env, config.base, r.id)));
+  for (let i = 0; i < live.length; i++) {
+    if (running[i] === false && (await dir.sleepRun(live[i].id))) live[i].state = "sleeping";
+  }
+}
+
+async function handleCloud(request: Request, env: Env, path: string): Promise<Response> {
+  const method = request.method;
+  const write = method !== "GET";
+  if (!env.VAULT_KEY) {
+    return plainResponse(503, "GitHub accounts and cloud runs are disabled: this bridge has no VAULT_KEY secret");
+  }
+  const vaultKey: string = env.VAULT_KEY;
+  if (!(await ownerCookieLive(request, env))) {
+    if (new URL(request.url).searchParams.has("invite")) {
+      return plainResponse(403, "invites cannot use GitHub accounts or cloud runs");
+    }
+    return plainResponse(401, "unauthorized");
+  }
+  if (write && !sameOriginWrite(request)) return plainResponse(403, "cross-origin change refused");
+
+  const url = new URL(request.url);
+  const dir = directory(env);
+  const now = requestNow(request, env);
+  const origin = wsOriginOf(url);
+
+  // GET /api/github/accounts, POST /api/github/accounts { token }
+  if (path === "/api/github/accounts") {
+    if (method === "GET") {
+      const accounts = (await dir.listGithubAccounts()).map((a) => ({ id: a.id, login: a.login, kind: a.kind }));
+      return jsonResponse(200, { accounts });
+    }
+    if (method !== "POST") return plainResponse(405, "method not allowed");
+    const parsed = await readJsonObject(request, ["token"]);
+    if (!parsed.ok) return parsed.response;
+    const token = checkGithubToken(parsed.body.token);
+    if (!token.ok) return plainResponse(400, token.message);
+    if ((await dir.countGithubAccounts()) >= ACCOUNT_LIMIT) {
+      return plainResponse(409, `at most ${ACCOUNT_LIMIT} GitHub accounts: remove one first`);
+    }
+    const answer = await githubGet(env, token.value, "/user");
+    if (answer === null) return plainResponse(502, "GitHub did not answer");
+    const login = answer.status === 200 ? loginOf(answer.body) : null;
+    if (login === null) {
+      if (answer.status === 401 || answer.status === 403) {
+        return jsonResponse(400, { error: "GitHub refused the token", github_status: answer.status });
+      }
+      return jsonResponse(502, { error: "GitHub gave no usable login", github_status: answer.status });
+    }
+    const id = randomHex(16);
+    const sealed = await sealValue(vaultKey, id, token.value);
+    await dir.putGithubAccount({
+      id,
+      login,
+      kind: "token",
+      nonce: bufferOf(sealed.nonce),
+      ciphertext: bufferOf(sealed.ciphertext),
+      created_at: now,
+    });
+    return jsonResponse(201, { id, login, kind: "token" });
+  }
+
+  // DELETE /api/github/accounts/<id>
+  const account = path.match(/^\/api\/github\/accounts\/([^/]+)$/);
+  if (account) {
+    if (method !== "DELETE") return plainResponse(405, "method not allowed");
+    if (!ACCOUNT_ID_RE.test(account[1])) return plainResponse(400, "invalid account id");
+    const existed = await dir.deleteGithubAccount(account[1]);
+    return existed
+      ? new Response(null, { status: 204, headers: { "cache-control": "no-store" } })
+      : plainResponse(404, "not found");
+  }
+
+  // GET /api/github/repos?account=<id>&q=<text>&page=<n>
+  if (path === "/api/github/repos") {
+    if (method !== "GET") return plainResponse(405, "method not allowed");
+    const accountId = url.searchParams.get("account") ?? "";
+    if (!ACCOUNT_ID_RE.test(accountId)) return plainResponse(400, "account must be an account id");
+    const q = url.searchParams.get("q") ?? "";
+    if (q.length > 100 || CONTROL_CHARS.test(q)) return plainResponse(400, "q must be at most 100 plain characters");
+    const pageText = url.searchParams.get("page") ?? "1";
+    if (!/^[1-9][0-9]{0,3}$/.test(pageText)) return plainResponse(400, "page must be a positive integer");
+    const row = await dir.getGithubAccount(accountId);
+    if (row === null) return plainResponse(404, "account not found");
+    const token = await unsealGithubToken(vaultKey, row);
+    if (token === null) return plainResponse(409, "the account's token cannot be read");
+    const page = await repoPage(env, token, q, Number(pageText));
+    if (page === "unavailable") return jsonResponse(502, { error: "GitHub did not return the repositories" });
+    return jsonResponse(200, page);
+  }
+
+  // GET /api/runs, POST /api/runs { account, repo, branch?, handoff_ref? }
+  if (path === "/api/runs") {
+    if (method === "GET") {
+      const config = runsConfig(env);
+      const rows = await dir.listRuns();
+      if (config !== null) await markSleepingRuns(env, config, dir, rows);
+      return jsonResponse(200, { runs: rows.map((r) => runView(r, origin)) });
+    }
+    if (method !== "POST") return plainResponse(405, "method not allowed");
+    const config = runsConfig(env);
+    if (config === null) return plainResponse(503, RUNS_UNCONFIGURED);
+    const parsed = await readJsonObject(request, ["account", "repo", "branch", "handoff_ref"]);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.body;
+    if (typeof body.account !== "string" || !ACCOUNT_ID_RE.test(body.account)) {
+      return plainResponse(400, "account must be an account id");
+    }
+    if (!validRepo(body.repo)) return plainResponse(400, "repo must look like owner/name");
+    if (body.branch !== undefined && !validRef(body.branch)) return plainResponse(400, "branch is not a valid git ref");
+    if (body.handoff_ref !== undefined && !validRef(body.handoff_ref)) return plainResponse(400, "handoff_ref is not a valid ref");
+    const owned = await dir.getGithubAccount(body.account);
+    if (owned === null) return plainResponse(404, "account not found");
+    const token = await unsealGithubToken(vaultKey, owned);
+    if (token === null) return plainResponse(409, "the account's token cannot be read");
+    const run: RunRow = {
+      id: crypto.randomUUID(),
+      repo: body.repo,
+      account_id: owned.id,
+      branch: typeof body.branch === "string" ? body.branch : "",
+      state: "starting",
+      reason: null,
+      created_at: now,
+      session_id: null,
+      handoff_ref: typeof body.handoff_ref === "string" ? body.handoff_ref : "",
+    };
+    await dir.putRun(run);
+    const wake = await containerPost(env, config.base, "/wake",
+      runEnvironment(run.id, origin, config.hostToken, run, token, run.handoff_ref));
+    if (!wake.ok) await dir.setRunState(run.id, "failed", "wake failed: " + wake.reason);
+    const saved = (await dir.getRun(run.id)) ?? { ...run, viewer_key: null };
+    return jsonResponse(201, runView(saved, origin));
+  }
+
+  // POST /api/runs/<id>/stop and /api/runs/<id>/wake
+  const action = path.match(/^\/api\/runs\/([^/]+)\/(stop|wake)$/);
+  if (action) {
+    if (method !== "POST") return plainResponse(405, "method not allowed");
+    const config = runsConfig(env);
+    if (config === null) return plainResponse(503, RUNS_UNCONFIGURED);
+    const run = RUN_ID_RE.test(action[1]) ? await dir.getRun(action[1]) : null;
+    if (run === null) return plainResponse(404, "run not found");
+    if (action[2] === "stop") {
+      const stop = await containerPost(env, config.base, "/stop", { run_id: run.id });
+      await dir.setRunState(run.id, stop.ok ? "stopped" : "failed", stop.ok ? null : "stop failed: " + stop.reason);
+    } else {
+      const owned = await dir.getGithubAccount(run.account_id);
+      if (owned === null) return plainResponse(409, "the run's GitHub account was removed");
+      const token = await unsealGithubToken(vaultKey, owned);
+      if (token === null) return plainResponse(409, "the account's token cannot be read");
+      const wake = await containerPost(env, config.base, "/wake",
+        runEnvironment(run.id, origin, config.hostToken, run, token, run.handoff_ref));
+      await dir.setRunState(run.id, wake.ok ? "starting" : "failed", wake.ok ? null : "wake failed: " + wake.reason);
+    }
+    const saved = (await dir.getRun(run.id)) ?? run;
+    return jsonResponse(200, runView(saved, origin));
+  }
+  return plainResponse(404, "not found");
+}
+
 const router: ExportedHandler<Env> = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -1068,6 +1428,10 @@ const router: ExportedHandler<Env> = {
     if ((m = path.match(/^\/api\/host\/sessions\/([^/]+)$/))) {
       return handleHostSession(request, env, m[1]);
     }
+    if (path === "/api/host/credentials") return handleHostCredentials(request, env);
+    if (path === "/api/credentials" || path.startsWith("/api/credentials/")) {
+      return handleCredentials(request, env, path);
+    }
     if (path === "/api/invites" || path.startsWith("/api/invites/")) {
       const denied = await requireOwner(request, env);
       if (denied) return denied;
@@ -1078,6 +1442,9 @@ const router: ExportedHandler<Env> = {
     }
     if (path === "/api/push/key") return handlePushKey(request, env);
     if (path === "/api/push/subscribe") return handlePushSubscribe(request, env);
+    if (path === "/api/github/accounts" || path.startsWith("/api/github/") || path === "/api/runs" || path.startsWith("/api/runs/")) {
+      return handleCloud(request, env, path);
+    }
     if (path.startsWith("/api/")) return plainResponse(404, "not found");
     // The agent tunnel: /agent/<agent key>, routed to the DO named by the
     // derived viewer key (see viewerKeyOf). With HOST_TOKEN set, the bearer

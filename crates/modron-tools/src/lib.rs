@@ -39,6 +39,7 @@ mod skill;
 mod tool_search;
 pub mod validate;
 mod verify;
+mod web_search;
 mod webfetch;
 mod write;
 
@@ -57,6 +58,7 @@ pub use remember::RememberTool;
 pub use skill::SkillTool;
 pub use validate::validate_args;
 pub use verify::VerifyTool;
+pub use web_search::WebSearchTool;
 pub use webfetch::WebFetchTool;
 pub use write::WriteTool;
 
@@ -91,6 +93,7 @@ pub fn default_registry_with_memory(memory_root: &Path) -> ToolRegistry {
     )));
     registry.register(Arc::new(crate::minify::ReadMinifiedTool));
     registry.register(Arc::new(crate::webfetch::WebFetchTool));
+    registry.register(Arc::new(crate::web_search::WebSearchTool::default()));
     registry.register(Arc::new(crate::tool_search::ToolSearchTool));
     registry.register(Arc::new(crate::diagnostics::DiagnosticsTool));
     registry.register(Arc::new(crate::interact::InteractTool::new()));
@@ -237,7 +240,13 @@ mod tests {
                 spec.name
             );
         }
-        for hidden in ["remember", "read_minified", "edit_lines", "webfetch"] {
+        for hidden in [
+            "remember",
+            "read_minified",
+            "edit_lines",
+            "webfetch",
+            "web_search",
+        ] {
             assert!(
                 registry.specs().iter().any(|s| s.name == hidden),
                 "{hidden} stays registered"
@@ -266,6 +275,7 @@ mod tests {
                 "read_minified",
                 "remember",
                 "tool_search",
+                "web_search",
                 "webfetch",
                 "write"
             ],

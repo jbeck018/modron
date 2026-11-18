@@ -102,6 +102,41 @@ pub async fn rewind_last_checkpoint(
     })
 }
 
+/// Where a fork at user turn `turn` cuts a session log (Program V4). A user
+/// turn is one `Task` event, the row the transcript shows as the task echo.
+/// `turn` is 1-based; `None` is the tip (every event). Returns the cut (the
+/// number of leading events the fork copies) and the number of user turns
+/// those events hold. Cutting at turn `n` keeps everything up to the start
+/// of turn `n + 1`, so the turn's answer and its tool activity come along.
+/// Pure: the caller decides where the copy goes.
+pub fn fork_cut(events: &[SessionEvent], turn: Option<u32>) -> crate::Result<(usize, u32)> {
+    let starts: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, SessionEvent::Task { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let total = starts.len() as u32;
+    let Some(n) = turn else {
+        return Ok((events.len(), total));
+    };
+    if n == 0 {
+        return Err(crate::Error::Session(
+            "turns are numbered from 1; /fork 0 is not a turn".into(),
+        ));
+    }
+    if n > total {
+        return Err(crate::Error::Session(if total == 0 {
+            "the session has no user turns to fork at".into()
+        } else {
+            format!("turn {n} is out of range; the session has {total} user turns (1 to {total})")
+        }));
+    }
+    // Turn n+1 starts at starts[n]; for the last turn the cut is the tip.
+    let cut = starts.get(n as usize).copied().unwrap_or(events.len());
+    Ok((cut, n))
+}
+
 /// Resolve a checkpoint-relative path under the working dir; absolute paths
 /// pass through (they were recorded as given to the tool).
 fn resolve_under(working_dir: &Path, path: &str) -> crate::Result<std::path::PathBuf> {
@@ -294,5 +329,107 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no checkpoints"));
+    }
+}
+
+#[cfg(test)]
+mod fork_cut_tests {
+    use super::*;
+    use crate::Message;
+
+    fn task(text: &str) -> SessionEvent {
+        SessionEvent::Task { text: text.into() }
+    }
+
+    fn reply(text: &str) -> SessionEvent {
+        SessionEvent::Message {
+            parent_id: None,
+            message: Message::user(text),
+        }
+    }
+
+    /// Three user turns; each has an answer, and turn 2 has a checkpoint.
+    fn three_turns() -> Vec<SessionEvent> {
+        vec![
+            task("one"),
+            reply("answer one"),
+            task("two"),
+            reply("answer two"),
+            SessionEvent::Checkpoint {
+                path: "a.txt".into(),
+                prior_content_b64: None,
+                event_index: 4,
+                uncaptured: false,
+            },
+            task("three"),
+            reply("answer three"),
+        ]
+    }
+
+    #[test]
+    fn team_stage_notes_do_not_move_turns_or_the_cut() {
+        // A Progress note after every event (a team run's stage notes) leaves
+        // the turn count and the kept conversation unchanged.
+        let plain = three_turns();
+        let note = |n: usize| SessionEvent::Progress {
+            text: format!("note {n}"),
+        };
+        let mut noted = Vec::new();
+        for (n, event) in plain.iter().enumerate() {
+            noted.push(event.clone());
+            noted.push(note(n));
+        }
+        let kept_text = |events: &[SessionEvent], cut: usize| -> Vec<String> {
+            events[..cut]
+                .iter()
+                .filter(|e| !matches!(e, SessionEvent::Progress { .. }))
+                .map(|e| format!("{e:?}"))
+                .collect()
+        };
+        for turn in [None, Some(1), Some(2), Some(3)] {
+            let (cut, turns) = fork_cut(&plain, turn).unwrap();
+            let (noted_cut, noted_turns) = fork_cut(&noted, turn).unwrap();
+            assert_eq!(noted_turns, turns, "turn count for {turn:?}");
+            assert_eq!(
+                kept_text(&noted, noted_cut),
+                kept_text(&plain, cut),
+                "kept conversation for {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tip_keeps_everything_and_counts_all_turns() {
+        let events = three_turns();
+        assert_eq!(fork_cut(&events, None).unwrap(), (events.len(), 3));
+    }
+
+    #[test]
+    fn fork_at_turn_keeps_that_turns_answer_and_stops_before_the_next_task() {
+        let events = three_turns();
+        // After turn 1: the first task and its answer, nothing from turn 2.
+        assert_eq!(fork_cut(&events, Some(1)).unwrap(), (2, 1));
+        // After turn 2: the checkpoint belongs to turn 2 and comes along.
+        assert_eq!(fork_cut(&events, Some(2)).unwrap(), (5, 2));
+        // After the last turn: the whole log.
+        assert_eq!(fork_cut(&events, Some(3)).unwrap(), (events.len(), 3));
+    }
+
+    #[test]
+    fn turn_zero_and_past_the_end_are_refused_with_plain_messages() {
+        let events = three_turns();
+        let zero = fork_cut(&events, Some(0)).unwrap_err().to_string();
+        assert!(zero.contains("numbered from 1"), "{zero}");
+        let past = fork_cut(&events, Some(4)).unwrap_err().to_string();
+        assert!(past.contains("turn 4 is out of range"), "{past}");
+        assert!(past.contains("3 user turns"), "{past}");
+    }
+
+    #[test]
+    fn a_session_without_turns_has_no_turn_to_fork_at() {
+        let events = vec![reply("orphan")];
+        assert_eq!(fork_cut(&events, None).unwrap(), (1, 0));
+        let err = fork_cut(&events, Some(1)).unwrap_err().to_string();
+        assert!(err.contains("no user turns"), "{err}");
     }
 }

@@ -44,6 +44,7 @@ fn test_state() -> Arc<ServerState> {
         tasks: TaskRegistry::new(),
         bridge_base: None,
         rc_keys: Default::default(),
+        portal_exiting: Default::default(),
         rc_tunnels: Default::default(),
     })
 }
@@ -1123,6 +1124,62 @@ async fn a_forgotten_session_key_ends_the_tunnel_without_a_redial() {
     outcome.expect("a stopped tunnel is not an error");
     tokio::time::sleep(fast_reconnect().cap * 5).await;
     assert_eq!(bridge.ws_auth().len(), 1, "no redial for a deleted session");
+}
+
+/// `modron serve` exit: the tunnel is aborted after `begin_exit`, the path
+/// `run_serve` takes. The entry must stay (the portal lists the session
+/// offline); a DELETE raced the exit and removed the row in some runs.
+#[tokio::test]
+async fn an_exiting_serve_keeps_its_portal_entry_when_its_tunnel_is_aborted() {
+    let bridge = FakeBridge::start().await;
+    let timing = RegistrationTiming {
+        debounce: Duration::from_millis(10),
+        heartbeat: Duration::from_millis(50),
+        poll: Duration::from_millis(5),
+    };
+    let (state, _session, _key, task) = open_tunnel(
+        &bridge,
+        env_with(&[(HOST_TOKEN_ENV, "tok")]),
+        timing,
+        "exit",
+    )
+    .await;
+    eventually("the first PUT", || bridge.puts().len() == 1).await;
+    state
+        .portal_exiting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    stop(task).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        bridge.deletes().is_empty(),
+        "an exiting serve must not DELETE its entry"
+    );
+}
+
+/// The control for the test above: the same abort without an exit still
+/// removes the entry (a session forgotten while the serve runs).
+#[tokio::test]
+async fn an_aborted_tunnel_outside_an_exit_still_deletes_its_entry() {
+    let bridge = FakeBridge::start().await;
+    let timing = RegistrationTiming {
+        debounce: Duration::from_millis(10),
+        heartbeat: Duration::from_millis(50),
+        poll: Duration::from_millis(5),
+    };
+    let (_state, session, _key, task) = open_tunnel(
+        &bridge,
+        env_with(&[(HOST_TOKEN_ENV, "tok")]),
+        timing,
+        "forget",
+    )
+    .await;
+    eventually("the first PUT", || bridge.puts().len() == 1).await;
+    stop(task).await;
+    eventually("the DELETE", || bridge.deletes().len() == 1).await;
+    assert_eq!(
+        bridge.deletes()[0].path,
+        format!("/api/host/sessions/{session}")
+    );
 }
 
 #[tokio::test]

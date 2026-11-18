@@ -20,9 +20,12 @@ use anyhow::anyhow;
 // ── Commands ──────────────────────────────────────────────────────────────
 
 /// `modron auth` family: token/OAuth management for every provider.
-pub(super) async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
+pub(super) async fn run_auth(action: AuthAction, provider: Option<&str>) -> anyhow::Result<()> {
     match action {
-        AuthAction::Login => login().await,
+        AuthAction::Login => match login_route(provider)? {
+            LoginRoute::Claude => login().await,
+            LoginRoute::ChatGpt => chatgpt_login().await,
+        },
         AuthAction::Add => add_provider_wizard().await,
         AuthAction::Set { provider_id, key } => {
             let key = read_key_arg(key)?;
@@ -33,6 +36,39 @@ pub(super) async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             Ok(())
         }
         AuthAction::Logout { provider_id } => logout(provider_id.as_deref()),
+    }
+}
+
+/// The sign-in `modron auth login` runs. The global `--provider` flag picks
+/// it; omitted keeps the Claude subscription login it has always run.
+#[derive(Debug, PartialEq, Eq)]
+enum LoginRoute {
+    Claude,
+    ChatGpt,
+}
+
+fn login_route(provider: Option<&str>) -> anyhow::Result<LoginRoute> {
+    match provider {
+        None | Some("anthropic") => Ok(LoginRoute::Claude),
+        Some("chatgpt") => Ok(LoginRoute::ChatGpt),
+        Some(other) => Err(anyhow!(
+            "`auth login` signs in to anthropic or chatgpt, not `{other}` \
+             (API keys: `modron auth set {other}`)"
+        )),
+    }
+}
+
+/// The `auth status` cell for the ChatGPT sign-in: masked token only.
+fn chatgpt_status(
+    stored: anyhow::Result<Option<modron_core::auth::oauth::chatgpt::ChatGptAuth>>,
+) -> String {
+    match stored {
+        Ok(Some(auth)) => format!(
+            "{} (OAuth)",
+            modron_core::auth::mask_key(&auth.access_token)
+        ),
+        Ok(None) => "— (run `modron auth login --provider chatgpt`)".to_string(),
+        Err(e) => format!("unreadable ({e}) — run `modron auth login --provider chatgpt`"),
     }
 }
 
@@ -113,10 +149,32 @@ async fn add_provider_wizard() -> anyhow::Result<()> {
     set_key(opt.provider_id, key)
 }
 
+/// Web search keys for the `web_search` tool, accepted by `auth set` next to
+/// the providers. They are not providers: no chat model, no wizard entry.
+/// Returns (display name, env var) for a search id.
+fn search_key_env(id: &str) -> Option<(&'static str, &'static str)> {
+    match id {
+        "brave" => Some(("Brave Search", "BRAVE_API_KEY")),
+        "tavily" => Some(("Tavily", "TAVILY_API_KEY")),
+        "exa" => Some(("Exa", "EXA_API_KEY")),
+        _ => None,
+    }
+}
+
 /// Non-interactive: `modron auth set <provider> <key>`.
 fn set_key(provider: &str, key: &str) -> anyhow::Result<()> {
     if key.trim().is_empty() {
         anyhow::bail!("empty key");
+    }
+    if let Some((name, env_var)) = search_key_env(provider) {
+        let path = crate::onboarding::env_file()?;
+        modron_core::auth::set_key_in_env_file(&path, env_var, key)?;
+        std::env::set_var(env_var, key);
+        println!(
+            "✓ {name} key saved to {} (0600); web_search uses it when no earlier key is set",
+            path.display()
+        );
+        return Ok(());
     }
     let opt = crate::onboarding::option_for_provider(provider).ok_or_else(|| {
         anyhow!("unknown provider `{provider}` — run `modron auth add` to pick one")
@@ -157,6 +215,11 @@ fn print_status() -> anyhow::Result<()> {
         ),
         None => println!("{:<17} — (run `modron auth login`)", "Claude subscription "),
     }
+    println!(
+        "{:<17} {}",
+        "ChatGPT sign-in ",
+        chatgpt_status(modron_core::auth::oauth::chatgpt::load())
+    );
     Ok(())
 }
 
@@ -177,6 +240,17 @@ fn logout(provider: Option<&str>) -> anyhow::Result<()> {
             },
             Err(e) => Err(e),
         },
+        // The ChatGPT sign-in is OAuth tokens, not a saved key: clear the
+        // token file and leave OPENAI_API_KEY alone.
+        Some("chatgpt") => {
+            use modron_core::auth::oauth::chatgpt;
+            if chatgpt::clear()? {
+                println!("✓ ChatGPT sign-in removed");
+            } else {
+                println!("no ChatGPT sign-in stored");
+            }
+            Ok(())
+        }
         Some(provider) => {
             let opt = crate::onboarding::option_for_provider(provider).ok_or_else(|| {
                 anyhow!("unknown provider `{provider}` — run `modron auth add` to pick one")
@@ -222,8 +296,15 @@ async fn zai_login() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn chatgpt_login() -> anyhow::Result<()> {
+/// ChatGPT subscription sign-in (Codex device flow). Used by
+/// `auth login --provider chatgpt`, the `auth add` wizard and onboarding.
+/// Tokens land in `~/.modron/auth/openai.json`, the same store the Codex
+/// import writes and the provider refreshes.
+pub(crate) async fn chatgpt_login() -> anyhow::Result<()> {
     use modron_core::auth::oauth::chatgpt;
+    println!(
+        "EXPERIMENTAL: ChatGPT subscription sign-in (ToS-gray; OpenAI API keys remain first-class)."
+    );
     let device = chatgpt::start().await?;
     modron_core::auth::open_browser(&device.verification_uri);
     println!(
@@ -267,4 +348,68 @@ async fn login() -> anyhow::Result<()> {
          (a saved API key stays the fallback; /auth → Anthropic → remove to go back)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chatgpt_status, login_route, search_key_env, LoginRoute};
+    use modron_core::auth::oauth::chatgpt::ChatGptAuth;
+
+    #[test]
+    fn login_routes_by_provider_and_defaults_to_claude() {
+        assert_eq!(login_route(None).unwrap(), LoginRoute::Claude);
+        assert_eq!(login_route(Some("anthropic")).unwrap(), LoginRoute::Claude);
+        assert_eq!(login_route(Some("chatgpt")).unwrap(), LoginRoute::ChatGpt);
+        let err = login_route(Some("zai")).unwrap_err().to_string();
+        assert!(err.contains("not `zai`"), "{err}");
+        assert!(err.contains("modron auth set zai"), "{err}");
+    }
+
+    #[test]
+    fn chatgpt_status_shows_a_masked_token_and_never_the_raw_one() {
+        let token = "eyJhbGciOiJSUzI1NiJ9.payload-secret-value.sig";
+        let signed_in = chatgpt_status(Ok(Some(ChatGptAuth {
+            access_token: token.into(),
+            refresh_token: Some("rt-secret".into()),
+            account_id: "acc-1".into(),
+        })));
+        assert!(signed_in.ends_with("(OAuth)"), "{signed_in}");
+        assert!(!signed_in.contains(token), "{signed_in}");
+        assert!(!signed_in.contains("rt-secret"), "{signed_in}");
+
+        let absent = chatgpt_status(Ok(None));
+        assert!(
+            absent.contains("modron auth login --provider chatgpt"),
+            "{absent}"
+        );
+
+        let broken = chatgpt_status(Err(anyhow::anyhow!(
+            "stored openai tokens missing account_id"
+        )));
+        assert!(broken.contains("unreadable"), "{broken}");
+    }
+
+    #[test]
+    fn chatgpt_is_not_a_key_provider_id() {
+        // `logout chatgpt` must not fall through to the key path, which
+        // rejects unknown ids (the ChatGPT registry id is openai-compat).
+        assert!(crate::onboarding::option_for_provider("chatgpt").is_none());
+    }
+
+    #[test]
+    fn search_ids_map_to_the_web_search_env_vars() {
+        assert_eq!(
+            search_key_env("brave").map(|(_, v)| v),
+            Some("BRAVE_API_KEY")
+        );
+        assert_eq!(
+            search_key_env("tavily").map(|(_, v)| v),
+            Some("TAVILY_API_KEY")
+        );
+        assert_eq!(search_key_env("exa").map(|(_, v)| v), Some("EXA_API_KEY"));
+        assert!(
+            search_key_env("zai").is_none(),
+            "providers keep their own path"
+        );
+    }
 }

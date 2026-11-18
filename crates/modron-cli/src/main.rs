@@ -23,6 +23,8 @@ pub mod auth;
 mod checksums;
 pub mod config;
 pub mod evals;
+mod mcp_preset;
+mod mcp_trust;
 pub mod upgrade;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -103,6 +105,25 @@ impl SandboxChoice {
 
 #[derive(Subcommand, Clone)]
 enum Command {
+    /// Team mode: plan the task into up to N independent items, run each in
+    /// its own git worktree, merge, verify, and run fix rounds. Same as
+    /// `/team [N] <task>` in the app.
+    Team {
+        /// Parallel workers, 1 to 5.
+        #[arg(short = 'n', long, default_value_t = 3)]
+        workers: u32,
+        /// Keep fixing until the verify command passes (default cap 6 fix
+        /// rounds; the token budget and spend cap still stop it).
+        #[arg(long)]
+        until_verified: bool,
+        /// Fix rounds after the first round (default 2, or 6 with
+        /// --until-verified).
+        #[arg(long)]
+        max_rounds: Option<u32>,
+        /// The task.
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
+    },
     /// Interactive multi-turn session: type tasks, stream answers, one
     /// shared session (`/exit` to quit, Ctrl-D also works).
     Chat,
@@ -197,6 +218,18 @@ enum Command {
         /// upgrade that carries an Origin header is refused.
         #[arg(long = "allow-origin")]
         allow_origin: Vec<String>,
+        /// Fetch the owner's provider keys from the bridge vault at start and
+        /// after each tunnel reconnect (needs --remote-control and
+        /// MODRON_HOST_TOKEN). The keys stay in memory only; a key set in the
+        /// environment or env file wins. Also set by env
+        /// MODRON_PORTAL_CREDENTIALS=1 (the cloud container sets it).
+        #[arg(long = "portal-credentials")]
+        portal_credentials: bool,
+        /// The cloud run this serve belongs to (PLAN 10.10). Its portal
+        /// session carries the id, so the owner's run list links the run to
+        /// the session. Also set by env MODRON_RUN_ID; [a-z0-9-], 1 to 64.
+        #[arg(long = "run-id", value_name = "ID")]
+        run_id: Option<String>,
     },
     /// Manage paired remote devices (Phase 3): mint, list, revoke the
     /// bearer tokens remote clients send in their hello frame.
@@ -344,6 +377,14 @@ enum SessionsAction {
 
 #[derive(Subcommand, Clone)]
 enum McpAction {
+    /// Add a built-in server preset to the user config, e.g. `mcp add playwright`.
+    Add {
+        /// Preset name (see `modron mcp add --help` for the list).
+        preset: String,
+        /// Replace an existing entry with the same name.
+        #[arg(long)]
+        force: bool,
+    },
     /// Inspect one configured server by name.
     Info { name: String },
     /// Read one resource from a configured server (the `read_resource`
@@ -354,6 +395,23 @@ enum McpAction {
         /// The resource URI to read.
         uri: String,
     },
+    /// Trust a project MCP server (`.mcp.json` or `.cursor/mcp.json`) for the
+    /// current workspace, or every one with `--all`. Undeclared servers never
+    /// start; a changed definition needs trust again.
+    Trust {
+        /// Server name, as `modron mcp list` shows it.
+        name: Option<String>,
+        /// Trust every project server in this workspace.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Revoke trust for the current workspace: one server, or all of them.
+    Untrust {
+        /// Server name (omit for all).
+        name: Option<String>,
+    },
+    /// List project MCP servers with their trust state and source file.
+    List,
 }
 
 #[derive(Subcommand, Clone)]
@@ -361,8 +419,9 @@ enum AuthAction {
     /// Add a provider interactively: pick one, paste a token (or run the
     /// Claude OAuth flow in the browser).
     Add,
-    /// Authorize a Claude subscription via browser (PKCE + localhost
-    /// callback) and store tokens.
+    /// Sign in to a subscription: the Claude subscription by default
+    /// (browser, PKCE + localhost callback), or ChatGPT with
+    /// `--provider chatgpt` (device code in the browser). EXPERIMENTAL.
     Login,
     /// Store an API key without the wizard: `auth set <provider> [key]`.
     /// Omit the key (or pass `-`) to read it from stdin — piped secrets
@@ -739,7 +798,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
 
     // `modron doctor` — setup diagnostics (Phase 8).
     if let Some(Command::Doctor) = cli.command {
-        return run_doctor(&cfg);
+        return run_doctor(&cfg, &working_dir);
     }
 
     // `modron daemon …` — background engine management (Phase 9).
@@ -757,6 +816,8 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         remote_control,
         share_url_file,
         handoff_on_exit,
+        portal_credentials,
+        run_id,
     }) = &cli.command
     {
         // The flag wins over MODRON_REMOTE_CONTROL (see rc::resolve_remote_control).
@@ -803,7 +864,30 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         } else {
             None
         };
-        let mcp = spawn_mcp_servers(&cfg).await?;
+        // Portal credentials (PLAN 10.9): the owner's vault keys are fetched
+        // before any provider is built, so a provider with no local key still
+        // starts. The tunnel refetches them on each reconnect (rc::dial_once).
+        let portal = *portal_credentials
+            || modron_server::rc::portal_credentials_on(&|name| std::env::var(name).ok());
+        let host_token = std::env::var(modron_server::rc::HOST_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty());
+        modron_server::rc::check_portal_credentials(
+            portal,
+            remote.as_deref(),
+            host_token.as_deref(),
+        )?;
+        if let (true, Some(bridge), Some(token)) =
+            (portal, remote.as_deref(), host_token.as_deref())
+        {
+            modron_server::rc::check_tunnel_bridge(bridge)?;
+            // Set for the tunnel's reconnects; the flag alone is not enough
+            // for them, which read the environment.
+            std::env::set_var(modron_server::rc::PORTAL_CREDENTIALS_ENV, "1");
+            modron_core::credential_overlay::enable();
+            modron_server::rc::refresh_portal_credentials_logged(bridge, token).await;
+        }
+        let mcp = spawn_mcp_servers(&cfg, &working_dir).await?;
         let agent = build_agent_with(
             &cli,
             &cfg,
@@ -821,6 +905,11 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
                 remote_control: remote,
                 share_url_file: share_url_file.clone(),
                 handoff_on_exit: on_exit,
+                run_id: run_id.clone().or_else(|| {
+                    std::env::var("MODRON_RUN_ID")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                }),
                 ..modron_server::ServeOptions::default()
             },
         )
@@ -829,7 +918,18 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
 
     // `modron auth …` — subscription token management (Phase 5d X3).
     if let Some(Command::Auth { action }) = cli.command {
-        return crate::auth::run_auth(action).await;
+        return crate::auth::run_auth(action, cli.provider.map(|p| p.id())).await;
+    }
+
+    // `modron mcp add <preset>` — writes a preset server entry to config.toml.
+    if let Some(Command::Mcp {
+        action: McpAction::Add { preset, force },
+    }) = &cli.command
+    {
+        let path = crate::config::config_path()
+            .ok_or_else(|| anyhow::anyhow!("no home directory: cannot find config.toml"))?;
+        println!("{}", crate::mcp_preset::add_preset(&path, preset, *force)?);
+        return Ok(());
     }
 
     // `modron mcp info …` — server inspection (Phase 5e).
@@ -837,13 +937,31 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         action: McpAction::Read { name, uri },
     }) = &cli.command
     {
-        return run_mcp_read(&cfg, name.clone(), uri.clone()).await;
+        return run_mcp_read(&cfg, &working_dir, name.clone(), uri.clone()).await;
     }
     if let Some(Command::Mcp {
         action: McpAction::Info { name },
     }) = cli.command
     {
-        return run_mcp_info(&cfg, name).await;
+        return run_mcp_info(&cfg, &working_dir, name).await;
+    }
+    if let Some(Command::Mcp {
+        action: McpAction::Trust { name, all },
+    }) = cli.command.clone()
+    {
+        return mcp_trust::run_trust(&cfg, &working_dir, name.as_deref(), all);
+    }
+    if let Some(Command::Mcp {
+        action: McpAction::Untrust { name },
+    }) = cli.command.clone()
+    {
+        return mcp_trust::run_untrust(&working_dir, name.as_deref());
+    }
+    if let Some(Command::Mcp {
+        action: McpAction::List,
+    }) = cli.command
+    {
+        return mcp_trust::run_list(&cfg, &working_dir);
     }
 
     // `modron bench` — multi-model measurement (Phase 5f).
@@ -879,6 +997,27 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     if let Some(Command::Chat) = cli.command {
         return run_chat(&cli, &cfg).await;
     }
+    // `modron team`: team mode (V3), one summary, the same engine path as
+    // `/team` in the app.
+    if let Some(Command::Team {
+        workers,
+        until_verified,
+        max_rounds,
+        task,
+    }) = cli.command.clone()
+    {
+        return run_team_cli(
+            &cli,
+            &cfg,
+            modron_core::team::TeamOptions {
+                workers,
+                max_rounds,
+                until_verified,
+            },
+            &task.join(" "),
+        )
+        .await;
+    }
     let Some(task) = cli.task.clone() else {
         // Unreachable for `None`/`tui` (handled above); other subcommands
         // without a task print help.
@@ -887,7 +1026,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     };
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let mcp = spawn_mcp_servers(&cfg).await?;
+    let mcp = spawn_mcp_servers(&cfg, &working_dir).await?;
     let agent = build_agent_with(
         &cli,
         &cfg,
@@ -1618,6 +1757,18 @@ fn stdout_delta_sink() -> Arc<modron_core::DeltaSink> {
 /// Construct one provider by id (mock/demo or env-backed), shared by the
 /// agent builder and the multi-provider bench.
 pub(crate) fn build_provider_shim(pid: &str) -> anyhow::Result<Arc<dyn ModelProvider>> {
+    // With --portal-credentials the key is resolved per turn: the process
+    // environment, then the vault overlay (see modron_providers::overlay).
+    if pid != "mock" && modron_core::credential_overlay::enabled() {
+        let env: modron_providers::overlay::EnvFn = Arc::new(|name: &str| std::env::var(name).ok());
+        if let Some(provider) = modron_providers::overlay::OverlayProvider::new(
+            pid,
+            modron_core::credential_overlay::shared(),
+            env,
+        ) {
+            return Ok(Arc::new(RetryingProvider::new(Arc::new(provider))));
+        }
+    }
     Ok(match pid {
         "mock" => Arc::new(modron_core::testing::rich_demo_provider()),
         other => Arc::new(RetryingProvider::new(provider_from_env(other).map_err(
@@ -1727,7 +1878,7 @@ pub(crate) fn load_attachment(path: &Path) -> anyhow::Result<modron_core::Attach
 /// `modron doctor` (Phase 8): diagnose the setup — API keys, config,
 /// git, PDF support, and the terminal. Every check prints ✓/✗ with an
 /// actionable fix; the exit code reflects overall health.
-fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
+fn run_doctor(cfg: &config::Config, working_dir: &Path) -> anyhow::Result<()> {
     let mut healthy = true;
 
     println!("modron {} — environment check", env!("CARGO_PKG_VERSION"));
@@ -1842,6 +1993,12 @@ fn run_doctor(_cfg: &config::Config) -> anyhow::Result<()> {
         }
     );
 
+    // Project files (V1): rules, commands and project MCP servers with trust.
+    println!("\nproject files:");
+    for line in mcp_trust::doctor_lines(cfg, working_dir) {
+        println!("{line}");
+    }
+
     println!();
     if healthy {
         println!("all critical checks passed — run: modron \"your task\"");
@@ -1937,7 +2094,7 @@ async fn run_daemon(action: DaemonAction, cli: &Cli, cfg: &config::Config) -> an
                 return Ok(());
             }
             // Build the engine with the current config.
-            let mcp = spawn_mcp_servers(cfg).await?;
+            let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
             let agent = build_agent_with(
                 cli,
                 cfg,
@@ -1963,12 +2120,28 @@ pub struct McpRegistration {
 /// Spawn every configured MCP server and collect its tools (Phase 5a).
 /// Per-server schema cost is enforced here — a server whose tools would
 /// fatten the prompt past its budget is refused with an actionable error.
-async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegistration>> {
-    let Some(mcp) = &cfg.mcp else {
-        return Ok(Vec::new());
-    };
+async fn spawn_mcp_servers(
+    cfg: &config::Config,
+    working_dir: &Path,
+) -> anyhow::Result<Vec<McpRegistration>> {
+    // Modron's own [mcp.servers] first, then project servers the user trusted
+    // for this workspace (V1). A name clash keeps the config entry. The
+    // workspace is the effective working dir (`--working-dir`), never the
+    // process cwd.
+    let mut servers: Vec<(String, config::McpServerConfig)> = cfg
+        .mcp
+        .as_ref()
+        .map(|mcp| {
+            mcp.servers
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let configured = mcp_trust::configured_names(cfg);
+    servers.extend(mcp_trust::trusted_servers(working_dir, &configured));
     let mut out = Vec::new();
-    for (name, server) in &mcp.servers {
+    for (name, server) in &servers {
         let (handle, tools) = connect_mcp_server(name, server).await?;
         let total: u64 = tools.iter().map(|t| t.schema_tokens).sum();
         let cap = server.max_schema_tokens.unwrap_or(20_000);
@@ -2212,7 +2385,13 @@ async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Res
 
 /// `modron mcp info <name>` (Phase 5e): spawn one configured server and
 /// print its tools (with schema costs), resources, and prompts.
-async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> {
+async fn run_mcp_info(
+    cfg: &config::Config,
+    working_dir: &Path,
+    name: String,
+) -> anyhow::Result<()> {
+    let cfg = mcp_trust::with_project_server(cfg, working_dir, &name)?;
+    let cfg = &cfg;
     let Some(mcp) = &cfg.mcp else {
         anyhow::bail!("no [mcp.servers] configured");
     };
@@ -2265,7 +2444,14 @@ async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> 
 /// `modron mcp read <server> <uri>`: read one resource's contents
 /// (2026-11-12 audit: `read_resource` existed and was tested, but no
 /// surface could reach it).
-async fn run_mcp_read(cfg: &config::Config, name: String, uri: String) -> anyhow::Result<()> {
+async fn run_mcp_read(
+    cfg: &config::Config,
+    working_dir: &Path,
+    name: String,
+    uri: String,
+) -> anyhow::Result<()> {
+    let cfg = mcp_trust::with_project_server(cfg, working_dir, &name)?;
+    let cfg = &cfg;
     let handle = mcp_handle(cfg, &name).await?;
     let mut handle = handle.lock().await;
     let text = handle.read_resource(&uri).await?;
@@ -2523,7 +2709,7 @@ async fn run_bench(
         anyhow::bail!("--models parsed to an empty list");
     }
     let suite = bench_suite();
-    let mcp = spawn_mcp_servers(cfg).await?;
+    let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
 
     // Multi-provider support: each model's provider comes from the catalog;
     // the union of providers is built once. Free tiers all speak
@@ -2865,9 +3051,42 @@ fn run_router_eval(cfg: &config::Config) -> anyhow::Result<()> {
 /// `modron chat` (Phase-1c I3): one session, many turns. Each line is a
 /// task; the transcript (with compaction + memory) carries context across
 /// lines. Errors don't kill the session.
+/// `modron team`: build the agent as a one-shot run does, then run team mode
+/// and print its summary.
+async fn run_team_cli(
+    cli: &Cli,
+    cfg: &config::Config,
+    opts: modron_core::team::TeamOptions,
+    task: &str,
+) -> anyhow::Result<()> {
+    // Refused before any provider or MCP server is set up.
+    opts.check().map_err(anyhow::Error::msg)?;
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
+    let agent = build_agent_with(
+        cli,
+        cfg,
+        interactive,
+        AgentSinks::for_mode(if interactive {
+            RunMode::INTERACTIVE
+        } else {
+            RunMode::HEADLESS
+        }),
+        &mcp,
+    )?;
+    let summary = agent.engine.run_team(task, opts).await?;
+    println!("{}", summary.answer);
+    println!();
+    println!(
+        "session: {}  (rounds: {}, worker items: {})",
+        summary.session_id, summary.turns, summary.tool_calls
+    );
+    Ok(())
+}
+
 async fn run_chat(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     use std::io::Write as _;
-    let mcp = spawn_mcp_servers(cfg).await?;
+    let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
     let agent = build_agent_with(
         cli,
         cfg,
@@ -3384,7 +3603,14 @@ async fn run_sessions_list(sessions_dir: &Path) -> anyhow::Result<()> {
             meta.message_count,
             usage.total(),
             format!("${cost:.4}"),
-            meta.title
+            match meta.forked_from {
+                Some(origin) => format!(
+                    "{} ({})",
+                    meta.title,
+                    modron_mobile_core::view::fork_origin_text(origin.parent, origin.turn)
+                ),
+                None => meta.title.clone(),
+            }
         );
     }
     if sessions.len() > SHOW {

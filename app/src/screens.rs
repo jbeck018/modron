@@ -5,53 +5,71 @@
 //! or the shared table.
 
 use modron_mobile_core::view::{
-    AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL, AUTH_CODE_LABEL,
-    AUTH_KEY_HINT, AUTH_KEY_PLACEHOLDER, AUTH_KEY_SAVE_HINT, AUTH_NO_PROVIDERS_LABEL,
-    AUTH_VISIT_LABEL, AUTH_WAITING_LABEL, CONFIRM_NO_LABEL, CONFIRM_YES_LABEL, COPIED_LABEL,
-    COPY_LABEL, DELETE_LABEL, HELP_TITLE, MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL,
-    REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL, SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
+    auth_row_hint, AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL,
+    AUTH_CODE_LABEL, AUTH_KEY_HINT, AUTH_KEY_PLACEHOLDER, AUTH_KEY_SAVE_HINT,
+    AUTH_NO_PROVIDERS_LABEL, AUTH_TITLE_LABEL, AUTH_VISIT_LABEL, AUTH_WAITING_LABEL,
+    CONFIRM_NO_LABEL, CONFIRM_YES_LABEL, COPIED_LABEL, COPY_LABEL, DELETE_LABEL, HELP_TITLE,
+    MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL, REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL,
+    SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
 };
 use modron_mobile_core::{
     FILTER_LABEL, NEW_SESSION_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL, SESSIONS_NO_MATCH_LABEL,
     SETTINGS_LABEL,
 };
-use nsh_core::element::{input, AdaptiveColor};
+use nsh_core::element::{input, AdaptiveColor, AnyElement};
 use nsh_core::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::{self, style_token, token_ink, Model, SecretKey, Style, UiAction, WEB_CONTROLS};
+use crate::ui::{self, tok, Bar, Tone};
+use crate::ui_chat;
+use crate::ui_screens;
 use modron_mobile_core::view::{
     AUTOMATIONS_EMPTY_LABEL, AUTOMATIONS_NO_MATCH_LABEL, AUTOMATIONS_TITLE_LABEL,
     AUTOMATION_ADD_LABEL, AUTOMATION_FORM_HINT, SAVE_DEFAULT_HINT, SAVE_DEFAULT_LABEL,
-    TASKS_EMPTY_LABEL, TASKS_NO_MATCH_LABEL, TASKS_TITLE_LABEL, TASK_FORM_HINT, TASK_MERGE_LABEL,
-    TASK_NEW_LABEL,
+    SIGN_IN_HINT, TASKS_EMPTY_LABEL, TASKS_NO_MATCH_LABEL, TASKS_TITLE_LABEL, TASK_FORM_HINT,
+    TASK_MERGE_LABEL, TASK_NEW_LABEL,
 };
 
 use crate::help::{HELP_TABS, HELP_VISIBLE};
 use crate::nav::{FormKind, NavStep, NavView, PickerRow, Screen};
 use modron_mobile_core::view::REMOVE_LABEL;
+use modron_mobile_core::view::{
+    CLOUD_ACCOUNTS_EMPTY_LABEL, CLOUD_ACCOUNTS_LABEL, CLOUD_ACCOUNT_ADD_LABEL,
+    CLOUD_ACCOUNT_PICK_LABEL, CLOUD_BRANCH_LABEL, CLOUD_LABEL, CLOUD_NO_ACCOUNT_LABEL,
+    CLOUD_OPEN_LABEL, CLOUD_REPOS_EMPTY_LABEL, CLOUD_REPO_PICK_LABEL, CLOUD_RUNS_EMPTY_LABEL,
+    CLOUD_RUNS_LABEL, CLOUD_RUN_LABEL, CLOUD_START_LABEL, CLOUD_STOP_LABEL, CLOUD_TOKEN_HINT,
+    CLOUD_TOKEN_PLACEHOLDER, CLOUD_WAKE_LABEL, VAULT_NOTE_LABEL,
+};
 
 /// Picker rows the list shows at once (a longer list is filtered, not scrolled).
-const PICKER_SLOTS: usize = 16;
+pub(crate) const PICKER_SLOTS: usize = 16;
 /// The mark on the current picker value (a dot, as the old terminal drew it).
-const PICKER_CURRENT: &str = "\u{25cf} ";
+pub(crate) const PICKER_CURRENT: &str = "\u{25cf} ";
 
 /// Visible slots: fixed counts keep NSH's cell layout static (see the chat
 /// body's notes). Rows past the slot count are not shown.
-const SESSION_SLOTS: usize = 12;
-const SETTING_SLOTS: usize = 24;
-const AUTH_SLOTS: usize = 12;
-const MODEL_SLOTS: usize = 16;
-const PORTAL_SLOTS: usize = 24;
-const INVITE_SLOTS: usize = 8;
-const AUTOMATION_SLOTS: usize = 12;
-const TASK_SLOTS: usize = 12;
-const FORM_SLOTS: usize = 3;
+pub(crate) const SESSION_SLOTS: usize = 12;
+pub(crate) const SETTING_SLOTS: usize = 24;
+pub(crate) const AUTH_SLOTS: usize = 12;
+pub(crate) const MODEL_SLOTS: usize = 16;
+pub(crate) const PORTAL_SLOTS: usize = 24;
+pub(crate) const INVITE_SLOTS: usize = 8;
+pub(crate) const AUTOMATION_SLOTS: usize = 12;
+pub(crate) const TASK_SLOTS: usize = 12;
+pub(crate) const FORM_SLOTS: usize = 3;
+/// Cloud slots: accounts, runs, and one page of repos (the picker's page).
+pub(crate) const CLOUD_ACCOUNT_SLOTS: usize = 8;
+pub(crate) const CLOUD_RUN_SLOTS: usize = 12;
+pub(crate) const CLOUD_REPO_SLOTS: usize = 50;
 
 /// Web controls for the list screens and their forms. App copy: the
 /// terminal does not draw these (its keys are the hints above each list).
-const FORM_SAVE_LABEL: &str = "save";
-const FORM_CANCEL_LABEL: &str = "cancel";
+pub(crate) const FORM_SAVE_LABEL: &str = "save";
+pub(crate) const FORM_CANCEL_LABEL: &str = "cancel";
+/// The model picker's header word (web). The screen had none; its header now
+/// names it.
+const MODELS_TITLE: &str = "models";
 
 /// Terminal hints for the openers. Key names are presentation (the
 /// divergence table); the web shows buttons instead.
@@ -95,47 +113,170 @@ fn chat_frame(
     window_h: Signal<f32>,
     actions: UnboundedSender<UiAction>,
 ) -> impl IntoElement {
-    view()
+    // The web's chat draws its own bar (sessions, title and status, settings,
+    // help); the other screens show one status caption above their own
+    // scaffold. The terminal keeps its header and openers.
+    let details = signal(false);
+    let frame = view()
         .flex_col()
         .size_full()
-        .child(chat::header(model))
-        .child(text(move || model.with(|m| m.status_line.clone())).text_color(muted()))
-        .child(nav_bar(actions.clone()))
+        .when(WEB_CONTROLS, |v| v.pt_safe_area().pl_safe_area().pr_safe_area().pb_safe_area());
+    let frame = if WEB_CONTROLS {
+        frame
+            .child(when(move || nav.with(|n| matches!(n.screen, Screen::Chat | Screen::Agent)), {
+                let actions = actions.clone();
+                move || ui_chat::bar(model, actions.clone(), details)
+            }))
+            .child(when(move || nav.with(|n| !matches!(n.screen, Screen::Chat | Screen::Agent)), {
+                let actions = actions.clone();
+                // One status caption; the screen's own bar has "back", so
+                // the openers are not repeated here.
+                let _ = &actions;
+                move || ui_chat::screen_status(model)
+            }))
+    } else {
+        frame
+            .child(web_gutter(chat::header(model)))
+            .child(web_gutter(
+                text(move || model.with(|m| m.status_line.clone())).text_color(muted()),
+            ))
+            .child(nav_bar(actions.clone()))
+    };
+    frame
         .child(when(move || nav.with(|n| matches!(n.screen, Screen::Chat | Screen::Agent)), {
             let actions = actions.clone();
-            move || chat::screen(model, draft, nav, window_h, actions.clone())
+            move || chat::screen(model, draft, nav, window_h, details, actions.clone())
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Sessions), {
             let actions = actions.clone();
-            move || sessions_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), SESSIONS_LABEL),
+                    if WEB_CONTROLS {
+                        ui_screens::sessions(nav, actions.clone()).into_element()
+                    } else {
+                        sessions_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Settings), {
             let actions = actions.clone();
-            move || settings_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), SETTINGS_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::settings(nav, actions.clone()).into_element()
+                    } else {
+                        settings_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Models), {
             let actions = actions.clone();
-            move || models_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), MODELS_TITLE).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::models(nav, actions.clone()).into_element()
+                    } else {
+                        models_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Auth), {
             let actions = actions.clone();
-            move || auth_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), AUTH_TITLE_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::credentials(nav, actions.clone()).into_element()
+                    } else {
+                        auth_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Automations), {
             let actions = actions.clone();
-            move || automations_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), AUTOMATIONS_TITLE_LABEL),
+                    if WEB_CONTROLS {
+                        ui_screens::automations(nav, actions.clone()).into_element()
+                    } else {
+                        automations_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Tasks), {
             let actions = actions.clone();
-            move || tasks_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), TASKS_TITLE_LABEL),
+                    if WEB_CONTROLS {
+                        ui_screens::tasks(nav, actions.clone()).into_element()
+                    } else {
+                        tasks_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Cloud), {
+            let actions = actions.clone();
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), CLOUD_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::CloudRepos), {
+            let actions = actions.clone();
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), CLOUD_REPO_PICK_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud_repos(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_repos_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Help), {
             let actions = actions.clone();
-            move || help_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), HELP_TITLE).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::help(nav, actions.clone()).into_element()
+                    } else {
+                        help_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
         .child(when(move || nav.with(|n| n.screen == Screen::Picker), {
             let actions = actions.clone();
-            move || picker_body(nav, actions.clone())
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), move || nav.with(|n| n.picker_title.clone()))
+                        .form(),
+                    if WEB_CONTROLS {
+                        ui_screens::picker(nav, actions.clone()).into_element()
+                    } else {
+                        picker_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
         }))
 }
 
@@ -396,6 +537,17 @@ fn auth_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl I
     }
     column = column
         .child(when(move || nav.with(|n| n.auth_progress.is_some()), move || auth_progress(nav)));
+    // The vault's note (the keys above are stored for the cloud hosts).
+    column = column.child(when(
+        move || nav.with(|n| n.vault),
+        move || text(VAULT_NOTE_LABEL).text_color(muted()),
+    ));
+    column = column.child(when(
+        move || nav.with(|n| n.vault_note.is_some()),
+        move || {
+            text(move || nav.with(|n| n.vault_note.clone().unwrap_or_default())).text_color(muted())
+        },
+    ));
     let confirm_actions = actions.clone();
     column
         .child(when(
@@ -423,9 +575,22 @@ fn auth_row(
             }
         })
     };
-    let row = view().flex_col().child(text(line).text_color(move || {
+    let mut row = view().flex_col().child(text(line).text_color(move || {
         token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
     }));
+    if !WEB_CONTROLS {
+        // The keys for the selected row (the web draws them as buttons).
+        let hint = move || {
+            nav.with(|n| {
+                n.auth.get(i).filter(|_| n.selected == i).map(|r| auth_row_hint(r.oauth_capable))
+            })
+            .unwrap_or_default()
+        };
+        row = row.child(when(
+            move || nav.with(|n| n.selected == i && n.auth.get(i).is_some()),
+            move || text(hint).text_color(muted()),
+        ));
+    }
     if WEB_CONTROLS {
         // A signed-in row also carries the remove control (it asks y / n first).
         let remove_actions = actions.clone();
@@ -443,9 +608,301 @@ fn auth_row(
     }
 }
 
+/// A tap-able text control: a bold line that sends `press` (web only).
+fn cloud_button(
+    label: impl Fn() -> String + 'static,
+    press: impl Fn() + 'static,
+) -> impl IntoElement {
+    view()
+        .role(AccessibilityRole::Button)
+        .px(px(8.0))
+        .on_press(press)
+        .child(text(label).text_color(move || token_ink(style_token(Style::Bold))))
+}
+
+/// The Cloud screen (web, owner; PLAN 10.10): the linked GitHub accounts
+/// (add by token, remove with a y / n), the new-run form (account, repo,
+/// branch, start) and the runs list (open, stop, wake). Every control is a
+/// tap; the note line carries the shared words for a refusal or a failure.
+fn cloud_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.note.is_some()),
+        move || {
+            text(move || nav.with(|n| n.cloud.note.clone().unwrap_or_default())).text_color(muted())
+        },
+    ));
+    column = column.child(text(CLOUD_ACCOUNTS_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.accounts.is_empty()),
+        move || text(CLOUD_ACCOUNTS_EMPTY_LABEL).text_color(muted()),
+    ));
+    for i in 0..CLOUD_ACCOUNT_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.cloud.accounts.len() > i),
+            move || cloud_account_row(nav, i, actions.clone()),
+        ));
+    }
+    column = column.child(when(move || nav.with(|n| !n.cloud.adding), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                || CLOUD_ACCOUNT_ADD_LABEL.to_string(),
+                move || {
+                    let _ = actions.send(UiAction::Nav(NavStep::CloudAddOpen));
+                },
+            )
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| n.cloud.adding), {
+        let actions = actions.clone();
+        move || cloud_token_entry(actions.clone())
+    }));
+    column = column.child(text(CLOUD_RUN_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.accounts.is_empty()),
+        move || text(CLOUD_NO_ACCOUNT_LABEL).text_color(muted()),
+    ));
+    column = column.child(when(move || nav.with(|n| n.cloud.accounts.len() > 1), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                move || {
+                    nav.with(|n| {
+                        let login =
+                            n.cloud.chosen_account().map(|a| a.login.clone()).unwrap_or_default();
+                        format!("{CLOUD_ACCOUNT_PICK_LABEL}: {login}")
+                    })
+                },
+                move || {
+                    let _ = actions.send(UiAction::Nav(NavStep::CloudPickAccount));
+                },
+            )
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| !n.cloud.accounts.is_empty()), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                move || {
+                    nav.with(|n| match &n.cloud.repo {
+                        Some(repo) => format!("{CLOUD_REPO_PICK_LABEL}: {}", repo.full_name),
+                        None => CLOUD_REPO_PICK_LABEL.to_string(),
+                    })
+                },
+                move || {
+                    let _ = actions.send(UiAction::Nav(NavStep::Open(Screen::CloudRepos)));
+                },
+            )
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| n.cloud.repo.is_some()), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            input()
+                .placeholder(CLOUD_BRANCH_LABEL)
+                .value(move || nav.with(|n| n.cloud.branch.clone()))
+                .on_change(move |s: &str| {
+                    let _ = actions.send(UiAction::Nav(NavStep::SetBranch(s.to_string())));
+                })
+        }
+    }));
+    column = column.child(when(move || nav.with(|n| n.cloud_start_action().is_some()), {
+        let actions = actions.clone();
+        move || {
+            let actions = actions.clone();
+            cloud_button(
+                || CLOUD_START_LABEL.to_string(),
+                move || {
+                    if let Some(action) = nav.with(|n| n.cloud_start_action()) {
+                        let _ = actions.send(action);
+                    }
+                },
+            )
+        }
+    }));
+    column = column.child(text(CLOUD_RUNS_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.runs.is_empty()),
+        move || text(CLOUD_RUNS_EMPTY_LABEL).text_color(muted()),
+    ));
+    for i in 0..CLOUD_RUN_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.cloud.runs.len() > i),
+            move || cloud_run_row(nav, i, actions.clone()),
+        ));
+    }
+    column.child(confirm_line(nav, actions))
+}
+
+/// One linked account: its line, and a remove control (it asks y / n).
+fn cloud_account_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let line =
+        move || nav.with(|n| n.cloud.accounts.get(i).map(|a| a.text.clone()).unwrap_or_default());
+    view()
+        .flex_row()
+        .child(text(line).text_color(move || token_ink(style_token(Style::Plain))))
+        .child(tap(REMOVE_LABEL, actions, UiAction::Nav(NavStep::AskAccountRemove(i))))
+}
+
+/// One run: its line, then open (when it has a session), stop and wake as
+/// its state offers them.
+fn cloud_run_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let line =
+        move || nav.with(|n| n.cloud.runs.get(i).map(|r| r.text.clone()).unwrap_or_default());
+    let open_actions = actions.clone();
+    let stop_actions = actions.clone();
+    let wake_actions = actions;
+    view()
+        .flex_col()
+        .child(text(line).text_color(move || token_ink(style_token(Style::Plain))))
+        .child(
+            view()
+                .flex_row()
+                .child(when(
+                    move || {
+                        nav.with(|n| n.cloud.runs.get(i).is_some_and(|r| !r.session_url.is_empty()))
+                    },
+                    move || {
+                        let actions = open_actions.clone();
+                        cloud_button(
+                            || CLOUD_OPEN_LABEL.to_string(),
+                            move || {
+                                let _ = actions.send(UiAction::Nav(NavStep::CloudOpenRun(i)));
+                            },
+                        )
+                    },
+                ))
+                .child(when(
+                    move || nav.with(|n| n.cloud.runs.get(i).is_some_and(|r| r.stop)),
+                    move || {
+                        let actions = stop_actions.clone();
+                        cloud_button(
+                            || CLOUD_STOP_LABEL.to_string(),
+                            move || {
+                                if let Some(id) =
+                                    nav.with(|n| n.cloud.runs.get(i).map(|r| r.id.clone()))
+                                {
+                                    let _ = actions.send(UiAction::StopRun(id));
+                                }
+                            },
+                        )
+                    },
+                ))
+                .child(when(
+                    move || nav.with(|n| n.cloud.runs.get(i).is_some_and(|r| r.wake)),
+                    move || {
+                        let actions = wake_actions.clone();
+                        cloud_button(
+                            || CLOUD_WAKE_LABEL.to_string(),
+                            move || {
+                                if let Some(id) =
+                                    nav.with(|n| n.cloud.runs.get(i).map(|r| r.id.clone()))
+                                {
+                                    let _ = actions.send(UiAction::WakeRun(id));
+                                }
+                            },
+                        )
+                    },
+                )),
+        )
+}
+
+/// The masked token entry for "add account" (the same widget as the key
+/// entry). The field is cleared on every submit; Enter and the save control
+/// send the same action.
+fn cloud_token_entry(actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let token = signal(String::new());
+    let submit = actions.clone();
+    let press = actions;
+    let field = input()
+        .masked(true)
+        .auto_focus(true)
+        .submit_behavior(SubmitBehavior::Submit)
+        .placeholder(CLOUD_TOKEN_PLACEHOLDER)
+        .value(move || token.get())
+        .on_change(move |s: &str| token.set(s.to_string()))
+        .on_submit(move |s: &str| {
+            send_token(&submit, s);
+            token.set(String::new());
+        });
+    view().flex_col().child(text(CLOUD_TOKEN_HINT).text_color(muted())).child(field).child(
+        cloud_button(
+            || AUTH_KEY_SAVE_HINT.to_string(),
+            move || {
+                let value = token.get();
+                token.set(String::new());
+                send_token(&press, &value);
+            },
+        ),
+    )
+}
+
+/// Sends the token for a new linked account and closes the entry. An empty
+/// token sends nothing and keeps the entry open.
+pub(crate) fn send_token(actions: &UnboundedSender<UiAction>, value: &str) {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return;
+    }
+    let _ = actions
+        .send(UiAction::AddAccount(SecretKey { provider: "github".to_string(), key: value }));
+    let _ = actions.send(UiAction::Nav(NavStep::CloudAddDone));
+}
+
+/// The repo picker (web, owner): the filter line (sent to the server as
+/// `q`), one row per repo, and the list's end. A tap on a row uses that repo.
+fn cloud_repos_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let mut column = view().flex_col();
+    column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
+    column = column.child(text(CLOUD_REPO_PICK_LABEL).text_color(muted()));
+    column = column.child(when(
+        move || nav.with(|n| n.cloud.repos.is_empty() && n.cloud.next_page.is_none()),
+        move || text(CLOUD_REPOS_EMPTY_LABEL).text_color(muted()),
+    ));
+    for i in 0..CLOUD_REPO_SLOTS {
+        let actions = actions.clone();
+        column = column.child(when(
+            move || nav.with(|n| n.cloud.repos.len() > i),
+            move || cloud_repo_row(nav, i, actions.clone()),
+        ));
+    }
+    column
+}
+
+/// One repo row: a press uses that repo (the picker closes).
+fn cloud_repo_row(
+    nav: Signal<NavView>,
+    i: usize,
+    actions: UnboundedSender<UiAction>,
+) -> impl IntoElement {
+    let line =
+        move || nav.with(|n| n.cloud.repos.get(i).map(|r| r.text.clone()).unwrap_or_default());
+    view()
+        .role(AccessibilityRole::Button)
+        .on_press(move || {
+            let _ = actions.send(UiAction::Nav(NavStep::PickRepo(i)));
+        })
+        .child(text(line).text_color(move || token_ink(style_token(Style::Plain))))
+}
+
 /// The browser sign-in progress: the stage, the message, the URL to open
 /// and the device code, from the snapshot's `oauth` (the core's words).
-fn auth_progress(nav: Signal<NavView>) -> impl IntoElement {
+pub(crate) fn auth_progress(nav: Signal<NavView>) -> impl IntoElement {
     let head = move || {
         nav.with(|n| {
             n.auth_progress
@@ -485,7 +942,7 @@ fn auth_progress(nav: Signal<NavView>) -> impl IntoElement {
                 })
             },
         ))
-        .child(text(AUTH_WAITING_LABEL).text_color(muted()))
+        .when(!WEB_CONTROLS, |v| v.child(text(AUTH_WAITING_LABEL).text_color(muted())))
 }
 
 /// The masked key entry for the open provider (`input().masked(true)`, the
@@ -535,7 +992,7 @@ fn auth_key_entry(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> i
 
 /// Sends the key for the open provider and closes the entry. An empty key
 /// sends nothing and keeps the entry open.
-fn send_key(actions: &UnboundedSender<UiAction>, nav: Signal<NavView>, value: &str) {
+pub(crate) fn send_key(actions: &UnboundedSender<UiAction>, nav: Signal<NavView>, value: &str) {
     let value = value.trim().to_string();
     if value.is_empty() {
         return;
@@ -552,20 +1009,53 @@ fn nav_bar(actions: UnboundedSender<UiAction>) -> impl IntoElement {
         return view().child(text(TERMINAL_NAV_HINT).text_color(muted()));
     }
     let opener = |label: &'static str, screen: Screen| {
-        let actions = actions.clone();
-        view()
-            .role(AccessibilityRole::Button)
-            .px(px(8.0))
-            .on_press(move || {
-                let _ = actions.send(UiAction::Nav(NavStep::Open(screen)));
-            })
-            .child(text(label).text_color(move || token_ink(style_token(Style::Plain))))
+        ui::action(label, actions.clone(), UiAction::Nav(NavStep::Open(screen)))
     };
-    view()
-        .flex_row()
+    ui::gutter(view().flex_row().items_center().gap(px(4.0)).min_h(px(ui::TOUCH_H)))
         .child(opener(SESSIONS_LABEL, Screen::Sessions))
         .child(opener(SETTINGS_LABEL, Screen::Settings))
         .child(opener(HELP_TITLE, Screen::Help))
+}
+
+/// The scaffold for a screen reached from the chat frame: its title and the
+/// back control (what Esc does).
+fn scaffold(
+    nav: Signal<NavView>,
+    actions: UnboundedSender<UiAction>,
+    title: impl IntoReactive<SharedString>,
+) -> Bar {
+    Bar::new(title).back(nav, actions)
+}
+
+/// The portal's header: refresh, cloud (when the account route answers) and
+/// sign out. No back control: the list is the root.
+fn portal_bar(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> Bar {
+    let cloud = {
+        let actions = actions.clone();
+        when(
+            move || nav.with(|n| n.cloud.available),
+            move || {
+                ui::action(
+                    CLOUD_LABEL,
+                    actions.clone(),
+                    UiAction::Nav(NavStep::Open(Screen::Cloud)),
+                )
+            },
+        )
+    };
+    Bar::new(SESSIONS_LABEL)
+        .action(ui::action(REFRESH_LABEL, actions.clone(), UiAction::RefreshPortal))
+        .action(cloud)
+        .action(ui::action(SIGN_OUT_LABEL, actions, UiAction::SignOut))
+}
+
+/// The web's gutter around a chat-frame row (the terminal keeps its layout).
+fn web_gutter<V: Styled>(v: V) -> V {
+    if WEB_CONTROLS {
+        ui::gutter(v)
+    } else {
+        v
+    }
 }
 
 /// A pressable word (web): one button that sends `action`.
@@ -860,7 +1350,6 @@ fn model_row(
 /// the web. On the web a tap on a tab label opens it.
 fn help_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
     let mut column = view().flex_col();
-    column = column.child(text(HELP_TITLE).font_weight(FontWeight::BOLD));
     let mut strip = view().flex_row();
     for tab in HELP_TABS {
         let tab_actions = actions.clone();
@@ -907,8 +1396,6 @@ fn help_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl I
 /// or a tap (web) applies the row and closes the picker.
 fn picker_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
     let mut column = view().flex_col();
-    column = column
-        .child(text(move || nav.with(|n| n.picker_title.clone())).font_weight(FontWeight::BOLD));
     column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
     column = column.child(when(
         move || nav.with(|n| !n.picker_note.is_empty()),
@@ -959,10 +1446,10 @@ fn picker_row(
 /// screen is open: the row's text, its state, the kill control (web), and
 /// the inline confirmation. The composer below it steers (Enter sends a
 /// `steer_agent`). After the agent ends the row stays and kill is disabled.
-pub(crate) fn agent_panel(
-    nav: Signal<NavView>,
-    actions: UnboundedSender<UiAction>,
-) -> impl IntoElement {
+pub(crate) fn agent_panel(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> AnyElement {
+    if WEB_CONTROLS {
+        return ui_screens::agent_panel(nav, actions).into_element();
+    }
     let title = move || {
         nav.with(|n| {
             n.agent.as_ref().map(|a| a.text.clone()).unwrap_or_else(|| AGENT_NONE_LABEL.to_string())
@@ -986,6 +1473,7 @@ pub(crate) fn agent_panel(
         .child(text(state).text_color(muted()))
         .child(kill)
         .child(confirm_line(nav, actions))
+        .into_element()
 }
 
 /// The portal root: the sign-in screen or the session list.
@@ -995,17 +1483,44 @@ fn portal_frame(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> imp
         .size_full()
         .child(when(move || nav.with(|n| n.screen == Screen::SignIn), {
             let actions = actions.clone();
-            move || sign_in_body(nav, actions.clone())
+            move || ui::screen(Bar::blank().form(), sign_in_body(nav, actions.clone()))
         }))
-        .child(when(
-            move || nav.with(|n| n.screen == Screen::Portal),
-            move || portal_body(nav, actions.clone()),
-        ))
+        .child(when(move || nav.with(|n| n.screen == Screen::Portal), {
+            let actions = actions.clone();
+            move || ui::screen(portal_bar(nav, actions.clone()), portal_body(nav, actions.clone()))
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::Cloud), {
+            let actions = actions.clone();
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), CLOUD_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
+        }))
+        .child(when(move || nav.with(|n| n.screen == Screen::CloudRepos), {
+            let actions = actions.clone();
+            move || {
+                ui::screen(
+                    scaffold(nav, actions.clone(), CLOUD_REPO_PICK_LABEL).form(),
+                    if WEB_CONTROLS {
+                        ui_screens::cloud_repos(nav, actions.clone()).into_element()
+                    } else {
+                        cloud_repos_body(nav, actions.clone()).into_element()
+                    },
+                )
+            }
+        }))
 }
 
-/// The owner sign-in: a masked token input (the page never shows or keeps
-/// the token: the input is cleared on every submit), a sign-in control and
-/// the last attempt's message. Enter and the control send the same action.
+/// The owner sign-in (web): the wordmark, a card with the title, the one
+/// explanatory line, the masked token field, the sign-in button and the last
+/// attempt's message. Enter and the button send the same action. The page
+/// never shows or keeps the token: the field is cleared on every submit.
 fn sign_in_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
     let token = signal(String::new());
     let submit = actions.clone();
@@ -1024,62 +1539,94 @@ fn sign_in_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> imp
                 let _ = submit.send(UiAction::SignIn(value));
             }
         });
-    let button = view()
-        .role(AccessibilityRole::Button)
-        .px(px(8.0))
-        .on_press(move || {
-            let value = token.get().trim().to_string();
-            token.set(String::new());
-            if !value.is_empty() {
-                let _ = press.send(UiAction::SignIn(value));
-            }
-        })
-        .child(text(SIGN_IN_LABEL).text_color(move || token_ink(style_token(Style::Bold))));
-    view()
+    let button = ui::button(SIGN_IN_LABEL, ui::Variant::Default, ui::Size::Lg, move || {
+        let value = token.get().trim().to_string();
+        token.set(String::new());
+        if !value.is_empty() {
+            let _ = press.send(UiAction::SignIn(value));
+        }
+    })
+    .w_full();
+    let form = view()
         .flex_col()
-        .child(text(SIGN_IN_LABEL).font_weight(FontWeight::BOLD))
-        .child(field)
+        .gap(px(16.0))
+        .child(
+            text(SIGN_IN_LABEL)
+                .text_size(px(24.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(tok("foreground")),
+        )
+        .child(text(SIGN_IN_HINT).text_size(px(15.0)).text_color(tok("muted-foreground")))
+        .child(ui::text_field("", "", field))
         .child(button)
         .child(when(
             move || nav.with(|n| n.signin_error.is_some()),
             move || {
-                text(move || nav.with(|n| n.signin_error.clone().unwrap_or_default()))
-                    .text_color(move || token_ink("destructive"))
+                ui::alert(Tone::Destructive, move || {
+                    nav.with(|n| n.signin_error.clone().unwrap_or_default())
+                })
+                .w_full()
             },
-        ))
-}
-
-/// The portal's session list: the header (refresh, sign out), the filter
-/// line, the empty states and one line per row. Offline rows are dim; a
-/// press opens an online row (the navigation decides).
-fn portal_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
-    let header = view()
-        .flex_row()
-        .child(text(SESSIONS_LABEL).font_weight(FontWeight::BOLD))
-        .child(tap(REFRESH_LABEL, actions.clone(), UiAction::RefreshPortal))
-        .child(tap(SIGN_OUT_LABEL, actions.clone(), UiAction::SignOut));
-    let mut column = view().flex_col().child(header);
-    column = column.child(text(move || nav.with(|n| filter_line(&n.filter))).text_color(muted()));
-    column = column.child(when(
-        move || nav.with(|n| n.portal_total == 0),
-        move || text(SESSIONS_EMPTY_LABEL).text_color(muted()),
-    ));
-    column = column.child(when(
-        move || nav.with(|n| n.portal_total > 0 && n.portal.is_empty()),
-        move || text(SESSIONS_NO_MATCH_LABEL).text_color(muted()),
-    ));
-    for i in 0..PORTAL_SLOTS {
-        let actions = actions.clone();
-        column = column.child(when(
-            move || nav.with(|n| n.portal.len() > i),
-            move || portal_row(nav, i, actions.clone()),
         ));
-    }
-    column
+    view()
+        .flex_col()
+        .gap(px(24.0))
+        .child(wordmark())
+        .child(ui::card(ui::card_content(form)).w_full())
 }
 
-/// One portal row: its line, marked when selected, and a press that asks
-/// the navigation to open it.
+/// The Modron wordmark for the sign-in card: a gold dot and the name.
+fn wordmark() -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(8.0))
+        .child(view().w(px(10.0)).h(px(10.0)).rounded_full().bg(tok("primary")))
+        .child(
+            text("Modron")
+                .text_size(px(20.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(tok("foreground")),
+        )
+}
+
+/// The portal's session list (web): the filter field, the card of rows (a
+/// title, the host, the online or offline word and the time, a status dot),
+/// and the empty states. Offline rows are dimmed and do not press.
+fn portal_body(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
+    let column = view()
+        .flex_col()
+        .gap(px(16.0))
+        .w_full()
+        .child(ui::search_field(move || nav.with(|n| n.filter.clone()), FILTER_LABEL))
+        .child(when(
+            move || nav.with(|n| n.portal_total == 0),
+            move || ui::empty_state(SESSIONS_EMPTY_LABEL, "", None),
+        ))
+        .child(when(
+            move || nav.with(|n| n.portal_total > 0 && n.portal.is_empty()),
+            move || ui::empty_state(SESSIONS_NO_MATCH_LABEL, "", None),
+        ));
+    column.child(when(
+        move || nav.with(|n| !n.portal.is_empty()),
+        move || {
+            let mut rows = view().flex_col();
+            for i in 0..PORTAL_SLOTS {
+                let actions = actions.clone();
+                rows = rows.child(when(
+                    move || nav.with(|n| n.portal.len() > i),
+                    move || portal_row(nav, i, actions.clone()),
+                ));
+            }
+            ui::card_list(rows)
+        },
+    ))
+}
+
+/// One portal row: its title and subtitle, a status dot, the selected row
+/// tinted. A press asks the navigation to open it; an offline row is dimmed,
+/// and the navigation ignores its press.
 fn portal_row(
     nav: Signal<NavView>,
     i: usize,
@@ -1087,28 +1634,17 @@ fn portal_row(
 ) -> impl IntoElement {
     let selected = move || nav.with(|n| n.selected == i);
     let online = move || nav.with(|n| n.portal.get(i).is_some_and(|r| r.online));
-    let line = move || {
-        nav.with(|n| {
-            let text = n.portal.get(i).map(|r| r.text.clone()).unwrap_or_default();
-            if n.selected == i {
-                format!("> {text}")
-            } else {
-                text
-            }
-        })
-    };
-    view()
-        .role(AccessibilityRole::Button)
-        .on_press(move || {
-            let _ = actions.send(UiAction::Nav(NavStep::OpenPortal(i)));
-        })
-        .child(text(line).text_color(move || {
-            if online() {
-                token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
-            } else {
-                token_ink(style_token(Style::Meta))
-            }
-        }))
+    let title = move || nav.with(|n| n.portal.get(i).map(|r| r.title.clone()).unwrap_or_default());
+    let subtitle =
+        move || nav.with(|n| n.portal.get(i).map(|r| r.subtitle.clone()).unwrap_or_default());
+    let dot = ui::status_dot(move || if online() { Tone::Success } else { Tone::Muted });
+    ui::list_row(title, subtitle, Some(dot.into_element()), move || {
+        let _ = actions.send(UiAction::Nav(NavStep::OpenPortal(i)));
+    })
+    // An offline row is dimmed; its press still reaches the navigation,
+    // which ignores it (as before), so the row is not `disabled`.
+    .style_when(move || !online(), |s| s.opacity(0.5))
+    .style_when(selected, |s| s.bg(tok("accent")))
 }
 
 /// The Settings share section (owner, a connected session): create a viewer
@@ -1154,19 +1690,32 @@ fn created_invite(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> i
             }
         })
         .child(text(COPY_LABEL).text_color(move || token_ink(style_token(Style::Plain))));
-    view()
-        .flex_col()
-        .child(
-            text(move || {
-                nav.with(|n| n.share.as_ref().and_then(|s| s.created.clone()).unwrap_or_default())
-            })
-            .text_color(move || token_ink("foreground")),
-        )
-        .child(view().flex_row().child(copy).child(when(
-            move || nav.with(|n| n.share.as_ref().is_some_and(|s| s.note.is_some())),
-            move || text(COPIED_LABEL).text_color(muted()),
-        )))
+    view().flex_col().child(created_url_line(nav)).child(view().flex_row().child(copy).child(when(
+        move || nav.with(|n| n.share.as_ref().is_some_and(|s| s.note.is_some())),
+        move || text(COPIED_LABEL).text_color(muted()),
+    )))
 }
+
+/// The new invite's URL, whole and never ellipsized. On the web it is a
+/// selectable monospace line in a horizontal scroll: a wrap would split the
+/// link into several lines (a copied or read link would then be cut at the
+/// first line break; a read by a person or the e2e harness is broken), so the
+/// link stays one run of text, and the copy control takes it whole. The
+/// terminal keeps its text.
+fn created_url_line(nav: Signal<NavView>) -> impl IntoElement {
+    let line = text(move || {
+        nav.with(|n| n.share.as_ref().and_then(|s| s.created.clone()).unwrap_or_default())
+    })
+    .text_color(move || token_ink("foreground"));
+    if WEB_CONTROLS {
+        scroll().horizontal().child(line.font_family(MONO_STACK).text_size(px(14.0))).into_element()
+    } else {
+        line.into_element()
+    }
+}
+
+/// The monospace stack for a link or a code line (the theme names no font).
+pub(crate) const MONO_STACK: &str = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
 /// One invite: its line and the revoke control (the id is read at press
 /// time, so the row always revokes the invite it shows).

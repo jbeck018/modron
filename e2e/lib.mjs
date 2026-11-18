@@ -2,6 +2,7 @@
 // ports, a minimal local protocol client (Node's built-in WebSocket), and
 // Playwright viewer helpers. No npm installs; Playwright is preinstalled.
 import { spawn, spawnSync } from 'node:child_process';
+import { createServer as createHttpServer } from 'node:http';
 import { createConnection, createServer } from 'node:net';
 import { cpSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -167,7 +168,11 @@ export function copyApp() {
 
 // remoteControl: a bridge ws(s) URL; the serve opens its tunnel at start
 // (--remote-control) and writes the share URL to shareUrlFile (returned).
-export async function startServe(name, { bridgeWs, hostToken, config, remoteControl } = {}) {
+// provider (default mock) and portalCredentials (--portal-credentials) are for
+// the vault scenario (C1). For a real provider the serve's environment drops
+// OPENAI_API_KEY, so only the vault can supply it. extraEnv is merged last.
+// runId: --run-id (a cloud run's serve, PLAN 10.10): its portal session carries the id.
+export async function startServe(name, { bridgeWs, hostToken, config, remoteControl, provider = 'mock', portalCredentials = false, runId, extraEnv = {} } = {}) {
   const home = join(SCRATCH, 'h-' + name);
   const work = join(home, 'w');
   mkdirSync(join(work, '.modron'), { recursive: true }); // remote-control needs a project marker
@@ -180,14 +185,94 @@ export async function startServe(name, { bridgeWs, hostToken, config, remoteCont
   const env = { ...process.env, HOME: home };
   delete env.MODRON_HOST_TOKEN;
   if (hostToken) env.MODRON_HOST_TOKEN = hostToken;
+  if (provider !== 'mock') delete env.OPENAI_API_KEY;
+  Object.assign(env, extraEnv);
   const log = join(SCRATCH, `serve-${name}.log`);
-  const args = ['serve', '--listen', `127.0.0.1:${port}`, '--provider', 'mock', '--working-dir', work];
+  const args = ['serve', '--listen', `127.0.0.1:${port}`, '--provider', provider, '--working-dir', work];
   if (bridgeWs) args.push('--bridge', bridgeWs);
   const shareUrlFile = remoteControl ? join(home, 'share-url') : null;
   if (remoteControl) args.push('--remote-control', remoteControl, '--share-url-file', shareUrlFile);
-  spawnLogged('serve-' + name, MODRON, args, { cwd: work, env, log });
+  if (portalCredentials) args.push('--portal-credentials');
+  if (runId) args.push('--run-id', runId);
+  const child = spawnLogged('serve-' + name, MODRON, args, { cwd: work, env, log });
   await waitUntil(() => portOpen(port), 60000, `serve ${name} listening (log ${log})`);
-  return { name, port, ws: `ws://127.0.0.1:${port}`, log, shareUrlFile };
+  return { name, port, ws: `ws://127.0.0.1:${port}`, log, shareUrlFile, home, pid: child.pid };
+}
+
+// The cloud scenario's two fakes on 127.0.0.1 (PLAN 10.10): GitHub (GET /user,
+// GET /user/repos, one repo) and the container worker (POST /wake, /stop).
+// Every call is recorded; the wake body carries the git token, by design.
+export async function startFakeCloud({ ghToken, wakeToken, login = 'modron-e2e' }) {
+  const wakes = [];
+  const json = (res, status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+  const gh = createHttpServer((req, res) => {
+    if ((req.headers.authorization || '') !== `Bearer ${ghToken}`) return json(res, 401, { message: 'Bad credentials' });
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (url.pathname === '/user') return json(res, 200, { login });
+    if (url.pathname === '/user/repos') {
+      const page = Number(url.searchParams.get('page') || '1');
+      const repo = { full_name: `${login}/app`, private: false, default_branch: 'main', pushed_at: new Date().toISOString() };
+      return json(res, 200, page === 1 ? [repo] : []);
+    }
+    return json(res, 404, { message: 'Not Found' });
+  });
+  const ct = createHttpServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const parsed = body ? JSON.parse(body) : null;
+      wakes.push({ path: req.url, auth: req.headers.authorization || '', body: parsed });
+      if ((req.headers.authorization || '') !== `Bearer ${wakeToken}`) return json(res, 401, { error: 'unauthorized' });
+      if (req.url === '/wake') return json(res, 202, { running: true });
+      if (req.url === '/stop') return json(res, 200, { running: false });
+      return json(res, 404, { error: 'not found' });
+    });
+  });
+  for (const srv of [gh, ct]) await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return {
+    gh: `http://127.0.0.1:${gh.address().port}`,
+    ct: `http://127.0.0.1:${ct.address().port}`,
+    wakes,
+    close: () => { gh.close(); ct.close(); },
+  };
+}
+
+// A fake OpenAI-compatible endpoint on 127.0.0.1. Every request's path and
+// Authorization header is recorded; it answers a minimal chat completion
+// (plain JSON, or SSE when the request asks to stream).
+export async function startFakeOpenAi() {
+  const requests = [];
+  const server = createHttpServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      requests.push({ path: req.url, auth: req.headers.authorization || '' });
+      let stream = false;
+      try { stream = JSON.parse(body).stream === true; } catch { /* not JSON */ }
+      const usage = { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 };
+      if (stream) {
+        const text = { id: 'e2e-fake', object: 'chat.completion.chunk', created: 0, model: 'e2e-fake',
+          choices: [{ index: 0, delta: { role: 'assistant', content: 'vault ok' }, finish_reason: null }] };
+        const last = { ...text, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage };
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(`data: ${JSON.stringify(text)}\n\ndata: ${JSON.stringify(last)}\n\ndata: [DONE]\n\n`);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'e2e-fake', object: 'chat.completion', created: 0, model: 'e2e-fake',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'vault ok' }, finish_reason: 'stop' }], usage }));
+    });
+  });
+  const port = await freePort();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+  return {
+    base: `http://127.0.0.1:${port}`,
+    requests,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
 }
 
 // ---- local protocol client (the test drives serve like a TUI would) -------
@@ -314,7 +399,11 @@ export async function launchBrowser() {
 // `cookie` ({ name, value, url }) is set in the new context before the page
 // loads: an owner browser for the owner-only steps (config, shell, steer).
 export async function openViewer(browser, url, label, cookie = null) {
-  const ctx = await browser.newContext();
+  // A tall page: the transcript is a virtual list, so rows scrolled out of
+  // view are not in the DOM. The scenarios assert on what a session shows,
+  // not on how much fits a laptop screen, so the page is tall enough to hold
+  // a scenario's whole transcript.
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 2400 } });
   if (cookie) await ctx.addCookies([{ name: cookie.name, value: cookie.value, url: cookie.url }]);
   const page = await ctx.newPage();
   const v = { label, ctx, page, sockets: [], errors: [], finalUrl: '', requested: url };

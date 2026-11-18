@@ -34,8 +34,9 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 ///
 /// Every new tool needs an explicit gated/ungated decision here: a tool that
 /// is not added to this list runs without approval.
-const MUTATING_TOOLS: [&str; 9] = [
+const MUTATING_TOOLS: [&str; 10] = [
     "webfetch",
+    "web_search",
     "bash",
     "write",
     "edit",
@@ -660,6 +661,17 @@ impl Engine {
             ));
         }
 
+        // `/team [N] <task>` runs team mode (V3) instead of one turn.
+        if let Some(team) = crate::team::parse_command(task) {
+            let (opts, goal) = team.map_err(|message| {
+                Error::Config(message, "usage: /team [N] <task>, N from 1 to 5".into())
+            })?;
+            return self.run_team_in(None, &goal, opts).await;
+        }
+        // A `/<name>` task naming `.claude/commands/<name>.md` is expanded
+        // here, so every client that submits the line gets the template (V1).
+        let expanded = context::expand_project_command(&self.config.working_dir, task);
+        let task = expanded.as_deref().unwrap_or(task);
         let meta = self.store.create_session(&session_title(task)).await?;
         self.store
             .append(
@@ -708,6 +720,14 @@ impl Engine {
             ));
         }
 
+        if let Some(team) = crate::team::parse_command(task) {
+            let (opts, goal) = team.map_err(|message| {
+                Error::Config(message, "usage: /team [N] <task>, N from 1 to 5".into())
+            })?;
+            return self.run_team_in(Some(session_id), &goal, opts).await;
+        }
+        let expanded = context::expand_project_command(&self.config.working_dir, task);
+        let task = expanded.as_deref().unwrap_or(task);
         let events = self.store.load(session_id).await?;
         if events.is_empty() {
             return Err(Error::Session(format!(
@@ -1604,7 +1624,7 @@ impl Engine {
     /// [`PriceLookup`](crate::PriceLookup). No lookup or unknown model → $0
     /// (warned once per run from the caller's perspective is the CLI's job;
     /// here it is silent to avoid log spam).
-    fn turn_cost_usd(&self, model: &str, usage: &Usage) -> f64 {
+    pub(crate) fn turn_cost_usd(&self, model: &str, usage: &Usage) -> f64 {
         let Some(lookup) = self.config.price_lookup.as_ref() else {
             return 0.0;
         };
@@ -1638,6 +1658,12 @@ impl Engine {
         } else {
             format!("{base}{memory_block}")
         };
+        // Other agents' rule files (.cursor/rules, copilot, GEMINI.md,
+        // .windsurfrules): text only, capped, empty when none exist (V1).
+        let system = format!(
+            "{system}{}",
+            context::project_rules_section(&self.config.working_dir)
+        );
         // Skills index (Phase 4): names + descriptions only; the model loads
         // a body via the `skill` tool when it wants the workflow.
         let system = match context::load_skills_index(&self.config.working_dir) {
@@ -1861,7 +1887,7 @@ impl Engine {
     /// The `critic` role as a reviewer (H7c): one review round on the role's
     /// model when no explicit `reviewer` is configured. Unresolvable = `None`
     /// (today's behaviour: no reviewer).
-    fn critic_reviewer(&self, task: &str) -> Option<crate::ReviewerConfig> {
+    pub(crate) fn critic_reviewer(&self, task: &str) -> Option<crate::ReviewerConfig> {
         let model = self.config.roles.critic.clone()?;
         let base = self.selector.select(&SelectRequest {
             task: task.to_string(),
@@ -2176,7 +2202,7 @@ impl Engine {
     /// Whether the finish gate may run `verify` right now (A5). Uses the
     /// same admission rules as a model-issued call: an Ask decision goes to
     /// the approver, and a refusal or a missing approver skips verification.
-    fn finish_gate_may_verify(&self) -> bool {
+    pub(crate) fn finish_gate_may_verify(&self) -> bool {
         match self.admission("verify") {
             Admission::Run => true,
             Admission::Ask => {
@@ -2603,6 +2629,49 @@ impl Engine {
             return Vec::new();
         }
         review::claim_findings(&state.answer, &state.run_facts)
+    }
+
+    /// One tool-less model turn for team mode (V3): the plan call and the
+    /// reviewer pass on the merged diff. `role_model` (a configured model id)
+    /// resolves through [`Self::role_choice`]; `None` routes by `action`. The
+    /// result is the text, its usage and its model, or `None` when the model
+    /// does not resolve or the provider fails (the caller records a skip).
+    pub(crate) async fn team_turn(
+        &self,
+        task: &str,
+        action: ActionKind,
+        role: &str,
+        role_model: Option<&str>,
+        system: &str,
+        prompt: String,
+    ) -> Option<(String, Usage, String)> {
+        let base = self.selector.select(&SelectRequest {
+            task: task.to_string(),
+            action,
+            context_tokens: estimate_tokens(system) + estimate_tokens(&prompt),
+            budget_remaining_usd: None,
+        });
+        let choice = match role_model {
+            Some(model) => self.role_choice(base, model, role)?,
+            None => base,
+        };
+        let (provider, model) = self.resolve_provider(&choice).ok()?;
+        let request = Arc::new(TurnRequest {
+            model: model.clone(),
+            system: system.to_string(),
+            messages: vec![Message::user(prompt)],
+            tools: Vec::new(),
+            max_tokens: MAX_OUTPUT_TOKENS,
+            effort: None,
+            reasoning_summary: false,
+        });
+        match provider.turn(request).await {
+            Ok(response) => Some((response.text, response.usage, model)),
+            Err(err) => {
+                tracing::warn!(error = %err, role, "team turn failed; stage skipped");
+                None
+            }
+        }
     }
 
     /// The reviewer call (H4a). `None` when no review applies (wrong phase,
@@ -3418,6 +3487,8 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
             // the current plan as a transient tail on every turn (H2a), so
             // raw plan writes stay out of the transcript.
             SessionEvent::Plan { .. } => {}
+            // A team stage note is for the transcript only (never a message).
+            SessionEvent::Progress { .. } => {}
         }
     }
     messages

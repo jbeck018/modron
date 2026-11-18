@@ -1027,6 +1027,7 @@ dependencies = [
  "libc",
  "modron-core",
  "modron-mcp",
+ "modron-mobile-core",
  "modron-providers",
  "modron-router",
  "modron-server",

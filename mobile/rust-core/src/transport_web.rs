@@ -9,6 +9,7 @@
 
 use crate::client::{handshake_timeout, hello_frame, In};
 use crate::error::ClientError;
+use modron_protocol::client::WelcomeInfo;
 use modron_protocol::{Frame, Payload, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use wasm_bindgen::closure::Closure;
@@ -75,7 +76,7 @@ fn js_string(v: &JsValue) -> String {
 pub(crate) async fn handshake(
     url: &str,
     token: Option<&str>,
-) -> Result<(Conn, String), ClientError> {
+) -> Result<(Conn, WelcomeInfo), ClientError> {
     let ws = web_sys::WebSocket::new(url).map_err(|e| ClientError::Connect(js_string(&e)))?;
     ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
@@ -163,7 +164,14 @@ pub(crate) async fn handshake(
         Payload::Welcome {
             server_version,
             protocol,
-        } if protocol == PROTOCOL_VERSION => Ok((conn, server_version)),
+            commands,
+        } if protocol == PROTOCOL_VERSION => Ok((
+            conn,
+            WelcomeInfo {
+                server_version,
+                commands,
+            },
+        )),
         Payload::Welcome { protocol, .. } => Err(ClientError::ProtocolMismatch {
             server: protocol,
             client: PROTOCOL_VERSION,

@@ -113,6 +113,10 @@ const SECRET_EXACT: &[&str] = &[
     "MODRON_GITHUB_TOKEN",
     "MODRON_DEVICE_TOKEN",
     "MODRON_PUBLISH_TOKEN",
+    // The cloud container's git token (handed to `modron serve` for the
+    // handoff push only) and the portal host token (PLAN 10.10).
+    "MODRON_GIT_TOKEN",
+    "MODRON_HOST_TOKEN",
 ];
 
 /// Name prefixes that mark a provider credential or config (matched
@@ -136,10 +140,90 @@ pub fn is_secret_env(name: &str) -> bool {
 /// [`is_secret_env`] matches. Names that are not UTF-8 are judged lossily and
 /// returned as the original `OsString`, so they can still be removed.
 fn secret_env_names() -> Vec<std::ffi::OsString> {
-    std::env::vars_os()
-        .filter(|(name, _)| is_secret_env(&name.to_string_lossy()))
+    secret_env_names_in(std::env::vars_os())
+}
+
+/// [`secret_env_names`] over any list of (name, value) pairs.
+fn secret_env_names_in(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<std::ffi::OsString> {
+    vars.into_iter()
+        .filter(|(name, value)| {
+            let name = name.to_string_lossy();
+            is_secret_env(&name) || is_auth_git_config(&name, &value.to_string_lossy())
+        })
         .map(|(name, _)| name)
         .collect()
+}
+
+/// True for a `GIT_CONFIG_*` variable whose value sets an HTTP
+/// `Authorization` header: how a git token is handed to one git call (the
+/// container entrypoint and the handoff push both do this). Removed whatever
+/// its name, so such a token never reaches a tool child.
+pub fn is_auth_git_config(name: &str, value: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("GIT_CONFIG_")
+        && value.to_ascii_lowercase().contains("authorization")
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::{is_auth_git_config, is_secret_env, secret_env_names_in};
+    use std::ffi::OsString;
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        list.iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect()
+    }
+
+    #[test]
+    fn cloud_run_token_names_are_secret_by_name() {
+        assert!(is_secret_env("MODRON_GIT_TOKEN"));
+        assert!(is_secret_env("modron_host_token"));
+        assert!(is_secret_env("MODRON_PUBLISH_TOKEN"));
+        assert!(!is_secret_env("MODRON_RUN_ID"));
+        assert!(!is_secret_env("PATH"));
+    }
+
+    #[test]
+    fn git_config_carrying_an_authorization_header_is_scrubbed_whatever_its_name() {
+        assert!(is_auth_git_config(
+            "GIT_CONFIG_VALUE_0",
+            "Authorization: Basic eC1hY2Nlc3M="
+        ));
+        assert!(is_auth_git_config("GIT_CONFIG_0", "x AUTHORIZATION y"));
+        assert!(!is_auth_git_config("GIT_CONFIG_KEY_0", "http.extraHeader"));
+        assert!(!is_auth_git_config("GIT_CONFIG_VALUE_1", "false"));
+        assert!(!is_auth_git_config("HOME", "Authorization: x"));
+    }
+
+    #[test]
+    fn scrub_selects_the_token_names_and_keeps_the_rest() {
+        let env = pairs(&[
+            ("MODRON_GIT_TOKEN", "t1"),
+            ("MODRON_HOST_TOKEN", "h1"),
+            ("MODRON_PUBLISH_TOKEN", "p1"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+            ("GIT_CONFIG_VALUE_0", "Authorization: Basic eC1hY2Nlc3M="),
+            ("PATH", "/usr/bin"),
+            ("MODRON_RUN_ID", "run-1"),
+        ]);
+        let mut names: Vec<String> = secret_env_names_in(env)
+            .into_iter()
+            .map(|n| n.into_string().expect("ascii name"))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "GIT_CONFIG_VALUE_0",
+                "MODRON_GIT_TOKEN",
+                "MODRON_HOST_TOKEN",
+                "MODRON_PUBLISH_TOKEN",
+            ]
+        );
+    }
 }
 
 /// Removes every secret variable (see [`is_secret_env`]) from the child

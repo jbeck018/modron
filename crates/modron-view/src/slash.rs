@@ -78,8 +78,8 @@ pub const SLASH_COMMANDS: &[SlashSpec] = &[
     },
     SlashSpec {
         name: "fork",
-        usage: "/fork",
-        about: "branch the session log; the original is untouched",
+        usage: "/fork [turn]",
+        about: "branch the session log after a turn (default: the tip); the original is untouched",
         aliases: &[],
         scope: Scope::Session,
     },
@@ -136,6 +136,13 @@ pub const SLASH_COMMANDS: &[SlashSpec] = &[
         name: "build",
         usage: "/build",
         about: "switch to the build phase (edits allowed) for future runs",
+        aliases: &[],
+        scope: Scope::Session,
+    },
+    SlashSpec {
+        name: "team",
+        usage: "/team [N] <task>",
+        about: "split the task across N parallel workers (default 3, max 5), merge, verify, fix",
         aliases: &[],
         scope: Scope::Session,
     },
@@ -514,6 +521,7 @@ mod tests {
             ),
             ("plan", "/plan [task]", Scope::Session),
             ("build", "/build", Scope::Session),
+            ("team", "/team [N] <task>", Scope::Session),
         ];
         for (name, usage, scope) in cases {
             let spec = slash_lookup(name).unwrap_or_else(|| panic!("/{name} missing"));
@@ -535,6 +543,7 @@ mod tests {
         assert_eq!(suggestions("/eff"), vec!["effort"]);
         assert_eq!(suggestions("/pl"), vec!["plan"]);
         assert_eq!(suggestions("/bu"), vec!["build"]);
+        assert_eq!(suggestions("/te"), vec!["team"]);
         // Shared prefixes keep canonical table order.
         assert_eq!(
             suggestions("/s"),

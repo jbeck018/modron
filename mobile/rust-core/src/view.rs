@@ -134,12 +134,23 @@ pub const WELCOME_KEYS: &str =
 pub fn welcome_lines(model: &str, version: &str) -> Vec<String> {
     vec![
         String::new(),
-        format!("\u{2726} modron v{version}"),
+        welcome_title(version),
         format!("  {WELCOME_TAGLINE}"),
         String::new(),
-        format!("  model {model}  \u{b7}  {WELCOME_KEYS}"),
+        format!("  {}  \u{b7}  {WELCOME_KEYS}", welcome_model_line(model)),
         String::new(),
     ]
+}
+
+/// The welcome's title (the app name and version), shared by the terminal's
+/// banner and the web's welcome state.
+pub fn welcome_title(version: &str) -> String {
+    format!("\u{2726} modron v{version}")
+}
+
+/// The welcome's model line (the model's name, the shared word `model`).
+pub fn welcome_model_line(model: &str) -> String {
+    format!("model {model}")
 }
 
 /// The theme names the app offers (`/theme`, the Settings theme row and the
@@ -235,6 +246,25 @@ pub fn connection_label(state: &ConnectionState) -> &'static str {
     }
 }
 
+/// The word while the app's driver is retrying a dropped link. The core does
+/// not reconnect on its own (a drop leaves `Disconnected`); the driver does,
+/// on a backoff, and says so through `reconnecting`. Both targets show this
+/// word from the snapshot's `connection_label`.
+pub const RECONNECTING_LABEL: &str = "reconnecting";
+/// The banner's button while the driver retries: try the link now, not at
+/// the next backoff step.
+pub const RETRY_NOW_LABEL: &str = "retry now";
+
+/// The connection word for a snapshot: `reconnecting` while the driver is
+/// retrying and the link is not up, else the core's word.
+pub fn retrying_label(state: &ConnectionState, reconnecting: bool) -> &'static str {
+    if reconnecting && *state != ConnectionState::Connected {
+        RECONNECTING_LABEL
+    } else {
+        connection_label(state)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sessions and settings copy (the NSH app's screens and any later shell)
 // ---------------------------------------------------------------------------
@@ -246,9 +276,18 @@ pub const NEW_SESSION_LABEL: &str = "new session";
 pub const SESSIONS_EMPTY_LABEL: &str = "no sessions yet";
 pub const SESSIONS_NO_MATCH_LABEL: &str = "no sessions match";
 pub const FILTER_LABEL: &str = "filter";
+/// The chat bar's title (the app's name), the send control's word and the
+/// session id's word in the bar's details row (web, UX-2).
+pub const CHAT_TITLE_LABEL: &str = "modron";
+pub const SEND_LABEL: &str = "send";
+pub const SESSION_DETAIL_LABEL: &str = "session";
 /// The running/idle words, for a session row and the status surface.
 pub const RUNNING_LABEL: &str = "running";
 pub const IDLE_LABEL: &str = "idle";
+/// Lineage words on a forked session's row (Program V4): "forked from
+/// <short id> at turn <n>". Shared by the app targets and `modron sessions`.
+pub const FORKED_FROM_LABEL: &str = "forked from";
+pub const FORK_AT_TURN_LABEL: &str = "at turn";
 /// Settings row labels, in screen order.
 pub const SETTING_MODEL_LABEL: &str = "model";
 pub const SETTING_PROVIDER_LABEL: &str = "provider";
@@ -320,6 +359,9 @@ pub fn tools_without(list: &[String], tool: &str) -> Vec<String> {
 
 /// Shown for a slash command the table does not know.
 pub const SLASH_UNKNOWN_LABEL: &str = "unknown command - try /help";
+/// The popup's about line for a project command (`.claude/commands/<name>.md`,
+/// listed by the server's welcome).
+pub const PROJECT_COMMAND_ABOUT: &str = "project command";
 /// Shown for `/remote-control` with no bridge URL; the usage follows.
 pub const SLASH_NEEDS_ARG_PREFIX: &str = "use ";
 /// The title of the help screen and its two section headings.
@@ -351,6 +393,10 @@ pub const OWN_SERVER_NOTE: &str = "started by modron-app";
 pub const SIGN_IN_LABEL: &str = "sign in";
 pub const SIGN_OUT_LABEL: &str = "sign out";
 pub const SIGN_IN_PLACEHOLDER: &str = "owner token";
+/// The sign-in screen's one explanatory line (web): where the token comes from.
+pub const SIGN_IN_HINT: &str = "the owner token is the OWNER_TOKEN set on the bridge.";
+/// The web header's back control (the same action as Esc).
+pub const BACK_LABEL: &str = "back";
 pub const WRONG_TOKEN_LABEL: &str = "wrong token";
 pub const TOO_MANY_ATTEMPTS_LABEL: &str = "too many attempts";
 pub const SIGN_IN_FAILED_LABEL: &str = "sign-in failed";
@@ -398,6 +444,23 @@ pub const AUTH_KEY_PLACEHOLDER: &str = "paste an API key";
 pub const AUTH_WAITING_LABEL: &str = "waiting for the sign-in... esc backs out";
 pub const AUTH_CODE_LABEL: &str = "code";
 pub const AUTH_VISIT_LABEL: &str = "open";
+/// The terminal's key for the key entry on a credentials row (`k`, any row).
+pub const AUTH_KEY_KEY: &str = "k";
+/// The web's two actions on an OAuth-capable row (buttons): sign in through
+/// the browser, or paste an API key. A key-only row has the key action alone.
+pub const AUTH_ROW_SIGN_IN_LABEL: &str = "sign in";
+pub const AUTH_ROW_KEY_LABEL: &str = "api key";
+
+/// The terminal's hint on the selected credentials row: Enter does the
+/// row's default (sign in for an OAuth provider, else the key entry), and `k`
+/// always opens the key entry.
+pub fn auth_row_hint(oauth_capable: bool) -> String {
+    if oauth_capable {
+        format!("enter {AUTH_SIGN_IN_HINT} - {AUTH_KEY_KEY} {AUTH_KEY_HINT}")
+    } else {
+        format!("enter {AUTH_KEY_HINT}")
+    }
+}
 
 /// Usage lines for the task commands (copy, not prompt text).
 pub const BTW_USAGE: &str = "use /btw <quick question>";
@@ -641,16 +704,130 @@ pub fn short_time(iso: &str) -> String {
 /// One portal sessions row: the title (`untitled` when blank), the host
 /// label, the online or offline word, and the last heartbeat time.
 pub fn portal_session_row(title: &str, host_label: &str, online: bool, updated_at: &str) -> String {
+    let (title, subtitle) = portal_session_parts(title, host_label, online, updated_at);
+    format!("{title} \u{b7} {subtitle}")
+}
+
+/// The two parts of a portal row: the title, and the subtitle (host, online
+/// or offline word, last heartbeat time). `portal_session_row` joins them with
+/// the middle dot, so the terminal's line and the web's two lines share words.
+pub fn portal_session_parts(
+    title: &str,
+    host_label: &str,
+    online: bool,
+    updated_at: &str,
+) -> (String, String) {
     let title = if title.trim().is_empty() {
         UNTITLED_LABEL
     } else {
         title
     };
     let state = if online { ONLINE_LABEL } else { OFFLINE_LABEL };
-    let mut row = format!("{title} \u{b7} {host_label} \u{b7} {state}");
+    let mut subtitle = format!("{host_label} \u{b7} {state}");
     if !updated_at.is_empty() {
+        subtitle.push_str(" \u{b7} ");
+        subtitle.push_str(&short_time(updated_at));
+    }
+    (title.to_string(), subtitle)
+}
+
+/// Cloud runs (web, owner only; PLAN 10.10): the Cloud screen's words.
+pub const CLOUD_LABEL: &str = "cloud";
+pub const CLOUD_ACCOUNTS_LABEL: &str = "github accounts";
+pub const CLOUD_ACCOUNTS_EMPTY_LABEL: &str = "no github accounts yet";
+pub const CLOUD_ACCOUNT_ADD_LABEL: &str = "add account";
+pub const CLOUD_TOKEN_PLACEHOLDER: &str = "paste a GitHub access token";
+pub const CLOUD_TOKEN_HINT: &str = "github token";
+pub const CLOUD_RUN_LABEL: &str = "new run";
+pub const CLOUD_ACCOUNT_PICK_LABEL: &str = "account";
+pub const CLOUD_NO_ACCOUNT_LABEL: &str = "add a GitHub account first";
+pub const CLOUD_REPO_PICK_LABEL: &str = "choose a repo";
+pub const CLOUD_BRANCH_LABEL: &str = "branch";
+pub const CLOUD_START_LABEL: &str = "start run";
+pub const CLOUD_RUNS_LABEL: &str = "runs";
+pub const CLOUD_RUNS_EMPTY_LABEL: &str = "no runs yet";
+pub const CLOUD_STOP_LABEL: &str = "stop";
+pub const CLOUD_WAKE_LABEL: &str = "wake";
+pub const CLOUD_OPEN_LABEL: &str = "open";
+pub const CLOUD_NOT_CONFIGURED_LABEL: &str = "the bridge has no cloud runner yet";
+pub const CLOUD_FAILED_LABEL: &str = "cloud request failed";
+pub const CLOUD_REPOS_EMPTY_LABEL: &str = "no repos match";
+pub const CLOUD_PRIVATE_LABEL: &str = "private";
+pub const CLOUD_PUBLIC_LABEL: &str = "public";
+pub const RUN_STARTING_LABEL: &str = "starting";
+pub const RUN_RUNNING_LABEL: &str = "running";
+pub const RUN_SLEEPING_LABEL: &str = "sleeping";
+pub const RUN_STOPPED_LABEL: &str = "stopped";
+pub const RUN_FAILED_LABEL: &str = "failed";
+/// The credentials rows whose key is in the owner's vault (web, owner).
+pub const VAULT_SAVED_LABEL: &str = "saved in the vault";
+pub const VAULT_NOTE_LABEL: &str = "the key is stored for your cloud hosts";
+pub const VAULT_SAVE_FAILED_LABEL: &str = "could not save the key";
+
+/// The inline confirmation for removing a linked GitHub account.
+pub fn cloud_account_remove_text(login: &str) -> String {
+    format!("remove {login}? {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}")
+}
+
+/// The words for a run's state from the bridge's state word. An unknown
+/// state shows as the bridge sent it.
+pub fn run_state_label(state: &str) -> String {
+    match state {
+        "starting" => RUN_STARTING_LABEL,
+        "running" => RUN_RUNNING_LABEL,
+        "sleeping" => RUN_SLEEPING_LABEL,
+        "stopped" => RUN_STOPPED_LABEL,
+        "failed" => RUN_FAILED_LABEL,
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// A refused GitHub token: GitHub's status when the bridge sent one. The
+/// token itself is never shown.
+pub fn token_refused_line(github_status: Option<u16>) -> String {
+    match github_status {
+        Some(status) => format!("GitHub refused the token (status {status})"),
+        None => "GitHub refused the token".to_string(),
+    }
+}
+
+/// One linked account row: the login and its kind (`token`, `oauth`).
+pub fn account_line(login: &str, kind: &str) -> String {
+    if kind.is_empty() {
+        login.to_string()
+    } else {
+        format!("{login} \u{b7} {kind}")
+    }
+}
+
+/// One repo picker row: the full name, private or public, and the last push.
+pub fn repo_line(full_name: &str, private: bool, pushed_at: &str) -> String {
+    let visibility = if private {
+        CLOUD_PRIVATE_LABEL
+    } else {
+        CLOUD_PUBLIC_LABEL
+    };
+    if pushed_at.is_empty() {
+        format!("{full_name} \u{b7} {visibility}")
+    } else {
+        format!(
+            "{full_name} \u{b7} {visibility} \u{b7} {}",
+            short_time(pushed_at)
+        )
+    }
+}
+
+/// One run row: `repo · branch · state (· reason) · started`.
+pub fn run_line(repo: &str, branch: &str, state: &str, reason: &str, created_at: &str) -> String {
+    let mut row = format!("{repo} \u{b7} {branch} \u{b7} {}", run_state_label(state));
+    if !reason.trim().is_empty() {
         row.push_str(" \u{b7} ");
-        row.push_str(&short_time(updated_at));
+        row.push_str(reason.trim());
+    }
+    if !created_at.is_empty() {
+        row.push_str(" \u{b7} ");
+        row.push_str(&short_time(created_at));
     }
     row
 }
@@ -713,10 +890,23 @@ pub fn session_row(meta: &SessionMetaWire, running: bool) -> String {
         meta.title.clone()
     };
     let state = if running { RUNNING_LABEL } else { IDLE_LABEL };
-    format!(
+    let mut row = format!(
         "{title} \u{b7} {state} \u{b7} {} messages",
         meta.message_count
-    )
+    );
+    if let Some(origin) = &meta.forked_from {
+        row.push_str(" \u{b7} ");
+        row.push_str(&fork_origin_text(origin.session_id, origin.turn));
+    }
+    row
+}
+
+/// "forked from <short id> at turn <n>": the lineage line for a forked
+/// session. The short id is the first 8 characters, as an untitled row shows.
+/// Takes the parent id and the turn so the CLI can call it from core types.
+pub fn fork_origin_text(parent: Uuid, turn: u32) -> String {
+    let short: String = parent.to_string().chars().take(8).collect();
+    format!("{FORKED_FROM_LABEL} {short} {FORK_AT_TURN_LABEL} {turn}")
 }
 
 /// The next approval mode in the settings cycle: ask, yolo, deny, ask.
@@ -1018,6 +1208,11 @@ pub struct SessionViewModel {
     /// The configured personas (answers to `personas_req`), in server order.
     #[serde(default)]
     pub personas: Vec<PersonaWire>,
+    /// Project command names from the welcome (`.claude/commands`), sorted.
+    /// Empty from servers that predate them: every unknown `/word` is then a
+    /// local notice (see `modron_protocol::Payload::Welcome`).
+    #[serde(default)]
+    pub project_commands: Vec<String>,
     /// The session's current persona (`LiveState.persona`, `ConfigPatch`).
     #[serde(default)]
     pub persona: Option<String>,
@@ -1124,6 +1319,11 @@ pub struct ViewModelSnapshot {
     pub connection_label: String,
     pub session_id: Option<Uuid>,
     pub server_version: String,
+    /// The project command names the server listed in its welcome. The
+    /// slash popup lists them after the built-ins, and a `/name` line is
+    /// sent only for a listed name (the app's slash module).
+    #[serde(default)]
+    pub project_commands: Vec<String>,
     pub running: bool,
     /// `running` or `idle`.
     pub running_label: String,
@@ -1321,6 +1521,7 @@ impl ViewModelSnapshot {
                 .iter()
                 .map(|model| model_row(model, &vm.model, &vm.provider))
                 .collect(),
+            project_commands: vm.project_commands.clone(),
             personas: vm
                 .personas
                 .iter()
@@ -2408,6 +2609,7 @@ mod copy_tests {
             task_branch: None,
             task_state: state.map(String::from),
             working_dir: None,
+            forked_from: None,
         }
     }
 
@@ -2451,6 +2653,25 @@ mod copy_tests {
         assert_eq!(
             session_row(&m, true),
             "router fix \u{b7} running \u{b7} 3 messages"
+        );
+    }
+
+    #[test]
+    fn a_forked_session_row_names_its_parent_and_turn() {
+        let mut m = meta(ID_A, "retry", 4, None);
+        m.forked_from = Some(modron_protocol::ForkOriginWire {
+            session_id: Uuid::parse_str(ID_B).expect("uuid"),
+            turn: 2,
+        });
+        assert_eq!(
+            session_row(&m, false),
+            "retry \u{b7} idle \u{b7} 4 messages \u{b7} forked from 11111111 at turn 2"
+        );
+        // A session that was not forked keeps the plain row.
+        m.forked_from = None;
+        assert_eq!(
+            session_row(&m, false),
+            "retry \u{b7} idle \u{b7} 4 messages"
         );
     }
 
@@ -2623,6 +2844,25 @@ mod portal_copy_tests {
     }
 
     #[test]
+    fn sign_in_hint_names_the_bridge_token() {
+        assert!(SIGN_IN_HINT.contains("OWNER_TOKEN"));
+        assert!(SIGN_IN_HINT.is_ascii());
+    }
+
+    #[test]
+    fn portal_parts_join_to_the_row_line() {
+        let (title, subtitle) =
+            portal_session_parts("fix router", "laptop", true, "2026-11-15T10:20:30Z");
+        assert_eq!(title, "fix router");
+        assert_eq!(
+            format!("{title} \u{b7} {subtitle}"),
+            portal_session_row("fix router", "laptop", true, "2026-11-15T10:20:30Z")
+        );
+        let (blank, _) = portal_session_parts("  ", "cloud", false, "");
+        assert_eq!(blank, UNTITLED_LABEL);
+    }
+
+    #[test]
     fn portal_row_shows_title_host_state_and_time() {
         assert_eq!(
             portal_session_row("fix router", "laptop", true, "2026-11-15T10:20:30Z"),
@@ -2717,6 +2957,38 @@ mod auth_copy_tests {
     use super::*;
 
     #[test]
+    fn the_welcome_title_and_model_line_are_the_banner_words() {
+        let lines = welcome_lines("gpt", "1.2.3");
+        assert_eq!(lines[1], welcome_title("1.2.3"));
+        assert_eq!(
+            lines[4],
+            format!("  {}  \u{b7}  {WELCOME_KEYS}", welcome_model_line("gpt"))
+        );
+        assert_eq!(welcome_model_line("gpt"), "model gpt");
+    }
+
+    #[test]
+    fn a_dropped_link_reads_as_reconnecting_only_while_the_driver_retries() {
+        use ConnectionState::*;
+        assert_eq!(retrying_label(&Disconnected, true), "reconnecting");
+        assert_eq!(retrying_label(&Connecting, true), "reconnecting");
+        assert_eq!(retrying_label(&Connected, true), "connected");
+        assert_eq!(retrying_label(&Disconnected, false), "disconnected");
+        assert_eq!(retrying_label(&Connecting, false), "connecting");
+        assert_eq!(RETRY_NOW_LABEL, "retry now");
+    }
+
+    #[test]
+    fn the_row_hint_names_both_actions_for_an_oauth_provider() {
+        assert_eq!(
+            auth_row_hint(true),
+            "enter sign in (browser) - k paste an API key"
+        );
+        assert_eq!(auth_row_hint(false), "enter paste an API key");
+        assert_eq!(AUTH_KEY_KEY, "k");
+    }
+
+    #[test]
     fn auth_rows_join_the_core_label_and_status_with_a_colon() {
         assert_eq!(
             auth_row_line("Anthropic", "subscription (oauth)"),
@@ -2789,6 +3061,7 @@ mod app4_shared_copy_tests {
 
     fn task_meta(title: &str, branch: Option<&str>) -> SessionMetaWire {
         SessionMetaWire {
+            forked_from: None,
             id: Uuid::from_u128(7),
             title: title.into(),
             created_at: String::new(),
@@ -2959,5 +3232,67 @@ mod removal_tests {
         );
         assert_eq!(PICKER_NONE_LABEL, RULES_NONE_LABEL);
         assert_eq!(REMOVE_LABEL, "remove");
+    }
+}
+
+#[cfg(test)]
+mod cloud_view_tests {
+    use super::*;
+
+    #[test]
+    fn run_states_map_to_the_shared_words_and_unknown_passes_through() {
+        assert_eq!(run_state_label("starting"), "starting");
+        assert_eq!(run_state_label("running"), "running");
+        assert_eq!(run_state_label("sleeping"), "sleeping");
+        assert_eq!(run_state_label("stopped"), "stopped");
+        assert_eq!(run_state_label("failed"), "failed");
+        assert_eq!(run_state_label("paused"), "paused");
+    }
+
+    #[test]
+    fn run_rows_show_repo_branch_state_reason_and_time() {
+        assert_eq!(
+            run_line(
+                "acme/app",
+                "main",
+                "failed",
+                "out of memory",
+                "2026-11-15T10:20:30Z"
+            ),
+            "acme/app \u{b7} main \u{b7} failed \u{b7} out of memory \u{b7} 2026-11-15 10:20"
+        );
+        assert_eq!(
+            run_line("a/b", "dev", "running", "  ", ""),
+            "a/b \u{b7} dev \u{b7} running"
+        );
+    }
+
+    #[test]
+    fn repo_and_account_rows_format_their_fields() {
+        assert_eq!(
+            repo_line("acme/app", true, "2026-11-14T08:00:00Z"),
+            "acme/app \u{b7} private \u{b7} 2026-11-14 08:00"
+        );
+        assert_eq!(repo_line("acme/site", false, ""), "acme/site \u{b7} public");
+        assert_eq!(account_line("octocat", "token"), "octocat \u{b7} token");
+        assert_eq!(account_line("octocat", ""), "octocat");
+    }
+
+    #[test]
+    fn a_refused_token_names_githubs_status_only() {
+        assert_eq!(
+            token_refused_line(Some(401)),
+            "GitHub refused the token (status 401)"
+        );
+        assert_eq!(token_refused_line(None), "GitHub refused the token");
+        assert!(!token_refused_line(Some(401)).contains("ghp_"));
+    }
+
+    #[test]
+    fn the_account_removal_confirmation_uses_the_shared_yes_and_no() {
+        assert_eq!(
+            cloud_account_remove_text("octocat"),
+            "remove octocat? y / n"
+        );
     }
 }

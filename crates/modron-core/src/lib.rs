@@ -17,6 +17,7 @@ pub mod budget;
 pub mod builtin_skills;
 pub mod compact;
 pub mod context;
+pub mod credential_overlay;
 pub mod engine;
 pub mod goal;
 pub mod handoff;
@@ -31,7 +32,9 @@ pub mod sandbox;
 /// engine's run loop is the only client).
 pub(crate) mod speculative;
 pub mod subagent;
+pub mod team;
 pub mod testing;
+pub mod worktree;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -63,7 +66,7 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 
 pub use modron_types::{
-    replayable_blocks, AgentState, Attachment, Effort, Message, ModelRoles, PlanItem,
+    replayable_blocks, AgentState, Attachment, Effort, ForkOrigin, Message, ModelRoles, PlanItem,
     ProviderBlock, Role, RunSummary, SandboxPolicy, SessionEvent, SessionId, SessionMeta,
     StopReason, StreamDelta, ToolActivity, ToolCall, ToolOutcome, ToolSpec, Usage,
 };
@@ -333,9 +336,18 @@ pub trait SessionStore: Send + Sync {
     /// both branches then evolve independently. Default: event-by-event
     /// copy through `load` + `append`, which every store already supports.
     async fn fork(&self, from: SessionId) -> Result<SessionId> {
+        self.fork_at(from, None).await
+    }
+    /// Fork a session at user turn `turn` (1-based; `None` = the tip): the
+    /// copy keeps the log up to the start of turn `turn + 1` (see
+    /// [`rewind::fork_cut`]). Stores that keep lineage (`ForkOrigin`) must
+    /// override this; the default copies events only and records no parent.
+    async fn fork_at(&self, from: SessionId, turn: Option<u32>) -> Result<SessionId> {
         let events = self.load(from).await?;
+        let (cut, _) = rewind::fork_cut(&events, turn)
+            .map_err(|e| Error::Session(format!("fork of {from}: {e}")))?;
         let new = SessionId::new_v4();
-        for event in &events {
+        for event in &events[..cut] {
             self.append(new, event).await?;
         }
         Ok(new)

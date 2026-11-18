@@ -27,8 +27,8 @@ use std::{
 };
 
 use modron_mobile_core::{
-    approval_mode_next, connection_label, sandbox_next, ClientError, ConfigPatch, ConnectOptions,
-    ConnectionState, Phase, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
+    approval_mode_next, connection_label, retrying_label, sandbox_next, ClientError, ConfigPatch,
+    ConnectOptions, ConnectionState, Phase, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
 };
 use modron_protocol::SessionMetaWire;
 use tokio::sync::mpsc::{
@@ -392,6 +392,7 @@ impl Driver {
     pub fn step(&mut self) -> bool {
         loop {
             match self.actions.try_recv() {
+                Ok(UiAction::RetryConnection) => self.retry_now(),
                 Ok(action) => apply(&self.client, action),
                 Err(TryRecvError::Empty) => break,
                 // The view is gone: nothing left to drive.
@@ -428,7 +429,9 @@ impl Driver {
             }
             ConnectionState::Connecting => {
                 let since = *self.connecting_since.get_or_insert_with(Instant::now);
-                if connect_stalled(since, Instant::now()) {
+                // A ticketed link (an invite) never retries: its ticket is
+                // single use, so a second socket is refused (and logged).
+                if connect_stalled(since, Instant::now()) && !self.ticketed() {
                     self.connecting_since = None;
                     self.attempts = self.attempts.saturating_add(1);
                     self.reconnect();
@@ -437,11 +440,12 @@ impl Driver {
             ConnectionState::Disconnected => {
                 self.linked = false;
                 self.startup_sent = false;
-                self.status.reconnecting.store(true, Ordering::SeqCst);
+                let ticketed = self.ticketed();
+                self.status.reconnecting.store(!ticketed, Ordering::SeqCst);
                 let due = *self
                     .retry_at
                     .get_or_insert_with(|| Instant::now() + retry_delay(self.attempts));
-                if Instant::now() >= due {
+                if !ticketed && Instant::now() >= due {
                     self.retry_at = None;
                     self.attempts = self.attempts.saturating_add(1);
                     self.reconnect();
@@ -480,7 +484,8 @@ impl Driver {
             }
         }
         let mut snapshot = self.client.state();
-        snapshot.connection_label = self.label(&snapshot.connection_label);
+        let word = retrying_label(&snapshot.connection, self.status.reconnecting());
+        snapshot.connection_label = self.label(word);
         // Snapshots carry no PartialEq; the JSON form is the change test.
         let json = serde_json::to_string(&snapshot).unwrap_or_default();
         // A submit that clears the staged image chips changes nothing in the
@@ -521,6 +526,21 @@ impl Driver {
         } else if !self.options.startup.is_empty() {
             // Startup flags need a session to configure: start one now.
             let _ = self.client.new_session(None);
+        }
+    }
+
+    /// Whether the link carries an invite ticket (`?ticket=`, one use only).
+    fn ticketed(&self) -> bool {
+        self.options.url.contains("ticket=")
+    }
+
+    /// `retry now` (web): a reconnect at once, when the driver is retrying a
+    /// dropped link. A ticketed link never retries (its ticket is spent), so
+    /// the action does nothing there.
+    fn retry_now(&mut self) {
+        if self.status.reconnecting() && !self.ticketed() {
+            self.retry_at = None;
+            self.reconnect();
         }
     }
 
@@ -583,6 +603,8 @@ fn apply(client: &RemoteClient, action: UiAction) {
             }
             result
         }
+        // The driver handles it in `step` (its reconnect state is there).
+        UiAction::RetryConnection => Ok(()),
         UiAction::Detach => {
             if crate::chat::unstage_last() {
                 client.note_local_error(ATTACH_REMOVED_NOTE);
@@ -680,7 +702,7 @@ fn apply(client: &RemoteClient, action: UiAction) {
             client.note_local_error(note);
             Ok(())
         }
-        UiAction::Fork => with_session(client, |s| client.fork_session(s)),
+        UiAction::Fork(turn) => with_session(client, |s| client.fork_session_at(s, turn)),
         UiAction::TaskStatus => with_session(client, |s| client.task_status(s)),
         UiAction::Share => with_session(client, |s| {
             let content = client
@@ -773,6 +795,12 @@ fn apply(client: &RemoteClient, action: UiAction) {
         | UiAction::RevokeInvite(_)
         | UiAction::CopyInvite(_)
         | UiAction::TogglePush
+        | UiAction::CloudRefresh
+        | UiAction::AddAccount(_)
+        | UiAction::RemoveAccount(_)
+        | UiAction::StartRun { .. }
+        | UiAction::StopRun(_)
+        | UiAction::WakeRun(_)
         | UiAction::Clear
         | UiAction::Context => Ok(()),
     };
@@ -848,6 +876,7 @@ mod tests {
 
     fn row(id: u128, updated: &str, dir: Option<&str>) -> SessionMetaWire {
         SessionMetaWire {
+            forked_from: None,
             id: Uuid::from_u128(id),
             title: format!("s{id}"),
             created_at: updated.into(),

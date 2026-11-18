@@ -23,11 +23,24 @@ pub fn hello_frame(client: &str, token: Option<String>) -> Frame {
 /// The handshake outcome: `Ok(server_version)` on a matching welcome.
 pub type HandshakeResult = Result<String, String>;
 
+/// What a matching welcome carries: the server's version and the project
+/// command names of its working directory (empty from older servers).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WelcomeInfo {
+    pub server_version: String,
+    pub commands: Vec<String>,
+}
+
 /// Validate the first server frame. A matching `welcome` yields the
 /// server's version string; a version mismatch, a refusal, a non-frame,
 /// or silence yields the actionable message (the three clients shipped
 /// three subtly different wordings for these - same rules, one copy now).
 pub fn check_welcome(frame: Option<Frame>, target: &str) -> HandshakeResult {
+    check_welcome_info(frame, target).map(|info| info.server_version)
+}
+
+/// [`check_welcome`] that also returns the welcome's project commands.
+pub fn check_welcome_info(frame: Option<Frame>, target: &str) -> Result<WelcomeInfo, String> {
     let Some(frame) = frame else {
         return Err(format!("server did not answer the handshake ({target})"));
     };
@@ -35,9 +48,13 @@ pub fn check_welcome(frame: Option<Frame>, target: &str) -> HandshakeResult {
         Payload::Welcome {
             server_version,
             protocol,
+            commands,
         } => {
             if protocol == PROTOCOL_VERSION {
-                Ok(server_version)
+                Ok(WelcomeInfo {
+                    server_version,
+                    commands,
+                })
             } else {
                 Err(format!(
                     "protocol mismatch: server speaks {protocol}, this build speaks \
@@ -102,6 +119,40 @@ mod tests {
     }
 
     #[test]
+    fn welcome_carries_the_project_commands_and_an_old_one_has_none() {
+        let with = Frame::event(
+            None,
+            0,
+            Payload::Welcome {
+                server_version: "1".into(),
+                protocol: PROTOCOL_VERSION,
+                commands: vec!["deploy".into(), "review-pr".into()],
+            },
+        );
+        let info = check_welcome_info(Some(with), "t").unwrap();
+        assert_eq!(info.commands, vec!["deploy", "review-pr"]);
+        assert_eq!(info.server_version, "1");
+        // An older server's welcome has no `commands` key at all: an empty
+        // list is omitted on the wire, so that frame is what it sends.
+        let old = Frame::event(
+            None,
+            0,
+            Payload::Welcome {
+                server_version: "0.1.2".into(),
+                protocol: PROTOCOL_VERSION,
+                commands: Vec::new(),
+            },
+        );
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("commands"), "{json}");
+        let frame: Frame = serde_json::from_str(&json).unwrap();
+        assert!(check_welcome_info(Some(frame), "t")
+            .unwrap()
+            .commands
+            .is_empty());
+    }
+
+    #[test]
     fn welcome_checks_agree_with_the_old_per_client_wording() {
         let welcome = Frame::event(
             None,
@@ -109,6 +160,7 @@ mod tests {
             Payload::Welcome {
                 server_version: "9.9".into(),
                 protocol: PROTOCOL_VERSION,
+                commands: Vec::new(),
             },
         );
         assert_eq!(check_welcome(Some(welcome), "t").unwrap(), "9.9");
@@ -119,6 +171,7 @@ mod tests {
             Payload::Welcome {
                 server_version: "9.9".into(),
                 protocol: PROTOCOL_VERSION + 1,
+                commands: Vec::new(),
             },
         );
         let err = check_welcome(Some(mismatch), "t").unwrap_err();

@@ -223,6 +223,7 @@ fn start_flaky_server(session: Uuid) -> (String, mpsc::Receiver<Payload>) {
                         Payload::Welcome {
                             server_version: "0.1.3".into(),
                             protocol: PROTOCOL_VERSION,
+                            commands: Vec::new(),
                         },
                     ),
                 )

@@ -1026,3 +1026,138 @@ async fn explain_rule_lists_each_rule_and_ends_with_the_result() {
     let none = handle.explain_rule("read", &serde_json::json!({"path": "a"}));
     assert!(none.lines().last() == Some("result: no rule"), "{none}");
 }
+
+/// A provider for team runs: the plan call gets two items, every worker
+/// answers `done` without touching the tree.
+struct TeamMock;
+
+#[async_trait::async_trait]
+impl modron_core::ModelProvider for TeamMock {
+    fn id(&self) -> &str {
+        "mock"
+    }
+    async fn turn(
+        &self,
+        req: Arc<modron_core::TurnRequest>,
+    ) -> modron_core::Result<modron_core::TurnResponse> {
+        let text = if req.system.starts_with("You split a coding task") {
+            r#"{"items":[{"task":"reply one"},{"task":"reply two"}]}"#
+        } else {
+            "done"
+        };
+        Ok(modron_core::TurnResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+            },
+            stop_reason: modron_core::StopReason::EndTurn,
+            provider_blocks: Vec::new(),
+        })
+    }
+}
+
+/// Team stage notes are published to live subscribers as they are written:
+/// the frames a subscriber saw, the persisted log and the transcript replay
+/// all carry the same notes in the same order.
+#[tokio::test]
+async fn team_stage_notes_reach_live_subscribers_in_order() {
+    let repo = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "hub@test.invalid"]);
+    git(&["config", "user.name", "hub test"]);
+    std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    let hub = SessionHub::empty();
+    let inner: Arc<dyn SessionStore> = Arc::new(modron_core::testing::InMemoryStore::new());
+    let store: Arc<dyn SessionStore> =
+        Arc::new(BroadcastingStore::new(Arc::clone(&inner), hub.clone()));
+    let mut providers: std::collections::HashMap<String, Arc<dyn modron_core::ModelProvider>> =
+        Default::default();
+    providers.insert("mock".into(), Arc::new(TeamMock));
+    let engine = Engine {
+        selector: Arc::new(modron_core::testing::StaticSelector::new(
+            "mock-model",
+            "mock",
+        )),
+        providers,
+        tools: Arc::new(modron_core::ToolRegistry::new()),
+        store: Arc::clone(&store),
+        config: EngineConfig {
+            default_model: "mock-model".into(),
+            default_provider: "mock".into(),
+            working_dir: repo.path().to_path_buf(),
+            ..EngineConfig::default()
+        },
+    };
+    hub.set_engine(engine.clone());
+    let meta = store.create_session("team").await.unwrap();
+    let handle = hub.ensure_session(meta.id, None);
+    // Subscribe before the run: the live frames are what a client sees.
+    let mut rx = handle.subscribe();
+
+    engine
+        .run_task_resuming(meta.id, "/team 2 write two replies")
+        .await
+        .unwrap();
+
+    let mut live = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        let frame: Frame = serde_json::from_str(&frame.json).unwrap();
+        if let Payload::Event {
+            event: SessionEvent::Progress { text },
+        } = frame.payload
+        {
+            live.push(text);
+        }
+    }
+    let events = store.load(meta.id).await.unwrap();
+    let persisted: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Progress { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let replayed: Vec<String> = modron_view::replay(&events)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            modron_view::TranscriptEntry::Note { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+
+    let expected = vec![
+        "team plan: 2 item(s)",
+        "round 1 started: 2 item(s)",
+        "round 1 merging 2 worker item(s)",
+        "round 1 result: 2 merged, 0 conflict(s), 0 failed; verify not configured; review not configured",
+    ];
+    assert_eq!(live, expected, "live frames");
+    assert_eq!(persisted, expected, "persisted log");
+    assert_eq!(
+        replayed
+            .iter()
+            .filter(|t| expected.contains(&t.as_str()))
+            .count(),
+        expected.len(),
+        "replay carries every note"
+    );
+    let positions: Vec<usize> = expected
+        .iter()
+        .map(|note| replayed.iter().position(|t| t.as_str() == *note).unwrap())
+        .collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]), "replay order");
+}

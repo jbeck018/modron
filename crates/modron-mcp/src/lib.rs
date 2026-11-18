@@ -261,6 +261,9 @@ impl McpServerHandle {
         env: &[(String, String)],
     ) -> anyhow::Result<(Arc<Mutex<McpServerHandle>>, Vec<McpToolInfo>)> {
         let mut cmd = tokio::process::Command::new(command);
+        // D9: no secret variable of modron's own environment reaches the
+        // server; the explicit `env` below still applies.
+        modron_core::hooks::scrub_tokio_command(&mut cmd);
         cmd.args(args)
             .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
