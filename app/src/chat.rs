@@ -43,6 +43,7 @@ use crate::portal::PortalRow;
 use crate::slash;
 use crate::suggest;
 use crate::theme::Choice;
+use crate::ui;
 use crate::ui_chat;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -68,6 +69,9 @@ pub enum UiAction {
         note: Option<String>,
     },
     Interrupt,
+    /// The banner's `retry now` (web): try a dropped link again at once,
+    /// instead of at the driver's next backoff step.
+    RetryConnection,
     /// `/compact` in the composer.
     Compact,
     /// Sessions screen: refresh the list (the core's `list_sessions`).
@@ -1049,6 +1053,7 @@ fn route_screen_key(key: Key, chord: bool, facts: &KeyFacts, draft: &str) -> Rou
                 Key::Up => Routed::Nav(NavStep::Move(-1)),
                 Key::Down => Routed::Nav(NavStep::Move(1)),
                 Key::Char('d') => Routed::Nav(NavStep::AskAuthRemove(facts.selected_index)),
+                Key::Char('k') => Routed::Nav(NavStep::KeyRow(facts.selected_index)),
                 _ => Routed::Ignored,
             };
         }
@@ -1161,6 +1166,9 @@ pub enum Style {
     Tool,
     /// Shell output lines (dim; the command header is `Bold`).
     Dim,
+    /// The web's welcome for a blank session: one row (the model's name),
+    /// drawn as the empty state. The terminal keeps its banner lines.
+    Welcome,
 }
 
 /// One visual line of the transcript.
@@ -1264,7 +1272,13 @@ impl Model {
                         reason: "welcome".into(),
                     },
                 }];
-                transcript_lines(&welcome)
+                if WEB_CONTROLS {
+                    // The web draws the welcome as one empty state (its model
+                    // name is the row's text); the terminal's banner lines stay.
+                    vec![Line { style: Style::Welcome, text: s.model.clone() }]
+                } else {
+                    transcript_lines(&welcome)
+                }
             } else {
                 transcript_lines(&s.history)
             },
@@ -2149,6 +2163,7 @@ pub(crate) fn style_token(style: Style) -> &'static str {
         Style::Meta => "muted-foreground",
         Style::Tool => "tool",
         Style::Dim => "dim",
+        Style::Welcome => "muted-foreground",
     }
 }
 
@@ -2178,7 +2193,7 @@ fn styled_line(model: Signal<Model>, at: Position, style: Style) -> impl IntoEle
     match style {
         Style::Bold => line.font_weight(FontWeight::BOLD),
         Style::Meta => line.italic(),
-        Style::Plain | Style::Tool | Style::Dim => line,
+        Style::Plain | Style::Tool | Style::Dim | Style::Welcome => line,
     }
 }
 
@@ -2373,8 +2388,49 @@ fn tool_strip(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl 
 
 /// The tool detail panel (Ctrl+T): the title, then up to TOOL_PANEL_SLOTS
 /// rows of the snapshot's `tool_detail` from the panel's top row, verbatim.
-fn tool_panel(model: Signal<Model>, nav: Signal<NavView>) -> impl IntoElement {
+/// A live region of the web chat (the tool strip, the panel, the reasoning
+/// and streaming text): the page gutter and the list width, as the rows of
+/// the transcript have. The terminal's region is the child, unchanged.
+fn live_column(child: impl IntoElement) -> AnyElement {
+    if WEB_CONTROLS {
+        ui::gutter(view().flex_col().w_full().max_w(px(ui::LIST_WIDTH)).self_center())
+            .child(child)
+            .into_element()
+    } else {
+        child.into_element()
+    }
+}
+
+/// The tool detail panel. On the web it is a card: the title in caption type,
+/// the detail rows in mono and indented (DESIGN.md). The terminal's rows are
+/// unchanged.
+fn tool_panel(model: Signal<Model>, nav: Signal<NavView>) -> AnyElement {
     let top = move || nav.with(|n| n.tool_panel.unwrap_or(0));
+    if WEB_CONTROLS {
+        let mut rows = view().flex_col().gap(px(2.0));
+        for i in 0..TOOL_PANEL_SLOTS {
+            rows = rows.child(when(
+                move || model.with(|m| m.tool_detail.len() > top() + i),
+                move || {
+                    let row = move || {
+                        model.with(|m| m.tool_detail.get(top() + i).cloned().unwrap_or_default())
+                    };
+                    text(row)
+                        .font_family(crate::screens::MONO_STACK)
+                        .text_size(px(13.0))
+                        .line_height(px(18.2))
+                        .text_color(move || token_ink(tool_row_token(&row())))
+                        .pl(px(16.0))
+                },
+            ));
+        }
+        let title = text(move || model.with(|m| m.tool_title.clone()))
+            .text_size(px(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(move || token_ink(tool_token("")));
+        return ui::card_list(view().flex_col().gap(px(4.0)).p(px(12.0)).child(title).child(rows))
+            .into_element();
+    }
     let mut column = view().flex_col().child(
         text(move || model.with(|m| m.tool_title.clone()))
             .text_color(move || token_ink(tool_token(""))),
@@ -2390,7 +2446,7 @@ fn tool_panel(model: Signal<Model>, nav: Signal<NavView>) -> impl IntoElement {
             },
         ));
     }
-    column
+    column.into_element()
 }
 
 /// `y approve   r revise`: the key hint and the core's label per option.
@@ -2734,24 +2790,24 @@ pub fn screen(
             .child(list)
             .child(scroll_hint)
             .child(new_below)
-            .child(when(
+            .child(live_column(when(
                 move || nav.with(|n| n.tool_panel.is_some()),
                 move || tool_panel(model, nav),
-            ))
-            .child(when(move || model.with(|m| m.turn_summary.is_some()), {
+            )))
+            .child(live_column(when(move || model.with(|m| m.turn_summary.is_some()), {
                 let actions = actions.clone();
                 move || tool_strip(model, actions.clone())
-            }))
-            .child(swarm_slots(model, nav, actions.clone()))
-            .child(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true))
-            .child(when(
+            })))
+            .child(live_column(swarm_slots(model, nav, actions.clone())))
+            .child(live_column(row_slots(model, STEER_SLOTS, steer_rows, dim_token, true)))
+            .child(live_column(when(
                 move || model.with(|m| !m.reasoning.is_empty()),
                 move || crate::ui_chat::live_text(model, true),
-            ))
-            .child(when(
+            )))
+            .child(live_column(when(
                 move || model.with(|m| !m.streaming.is_empty()),
                 move || crate::ui_chat::live_text(model, false),
-            ))
+            )))
             .child(crate::ui_chat::dock(
                 model,
                 draft,
@@ -3617,6 +3673,17 @@ mod auth_key_tests {
             route_key(Key::Escape, false, false, auth(true), ""),
             Routed::Nav(NavStep::AuthCancelKey)
         );
+    }
+
+    #[test]
+    fn k_opens_the_key_entry_on_any_row_and_the_key_is_typed_once_open() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let on_row = KeyFacts { selected_index: 1, ..auth(false) };
+        assert_eq!(
+            route_key(Key::Char('k'), false, false, on_row, ""),
+            Routed::Nav(NavStep::KeyRow(1))
+        );
+        assert_eq!(route_key(Key::Char('k'), false, false, auth(true), ""), Routed::Composer);
     }
 
     #[test]

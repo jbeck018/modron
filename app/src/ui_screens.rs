@@ -11,16 +11,16 @@
 
 use modron_mobile_core::view::{
     AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL, AUTH_KEY_HINT,
-    AUTH_KEY_PLACEHOLDER, AUTH_NO_PROVIDERS_LABEL, AUTOMATIONS_EMPTY_LABEL,
-    AUTOMATIONS_NO_MATCH_LABEL, AUTOMATION_ADD_LABEL, CLOUD_ACCOUNTS_EMPTY_LABEL,
-    CLOUD_ACCOUNTS_LABEL, CLOUD_ACCOUNT_ADD_LABEL, CLOUD_ACCOUNT_PICK_LABEL, CLOUD_BRANCH_LABEL,
-    CLOUD_NO_ACCOUNT_LABEL, CLOUD_OPEN_LABEL, CLOUD_REPOS_EMPTY_LABEL, CLOUD_REPO_PICK_LABEL,
-    CLOUD_RUNS_EMPTY_LABEL, CLOUD_RUNS_LABEL, CLOUD_RUN_LABEL, CLOUD_START_LABEL, CLOUD_STOP_LABEL,
-    CLOUD_TOKEN_HINT, CLOUD_TOKEN_PLACEHOLDER, CLOUD_WAKE_LABEL, CONFIRM_NO_LABEL,
-    CONFIRM_YES_LABEL, COPIED_LABEL, COPY_LABEL, DELETE_LABEL, MODELS_EMPTY_LABEL,
-    NO_INVITES_LABEL, PUSH_LABEL, REMOVE_LABEL, REVOKE_LABEL, SAVE_DEFAULT_LABEL, SHARE_LABEL,
-    TASKS_EMPTY_LABEL, TASKS_NO_MATCH_LABEL, TASK_MERGE_LABEL, TASK_NEW_LABEL, VAULT_NOTE_LABEL,
-    VIEWER_LABEL,
+    AUTH_KEY_PLACEHOLDER, AUTH_NO_PROVIDERS_LABEL, AUTH_ROW_KEY_LABEL, AUTH_ROW_SIGN_IN_LABEL,
+    AUTOMATIONS_EMPTY_LABEL, AUTOMATIONS_NO_MATCH_LABEL, AUTOMATION_ADD_LABEL,
+    CLOUD_ACCOUNTS_EMPTY_LABEL, CLOUD_ACCOUNTS_LABEL, CLOUD_ACCOUNT_ADD_LABEL,
+    CLOUD_ACCOUNT_PICK_LABEL, CLOUD_BRANCH_LABEL, CLOUD_NO_ACCOUNT_LABEL, CLOUD_OPEN_LABEL,
+    CLOUD_REPOS_EMPTY_LABEL, CLOUD_REPO_PICK_LABEL, CLOUD_RUNS_EMPTY_LABEL, CLOUD_RUNS_LABEL,
+    CLOUD_RUN_LABEL, CLOUD_START_LABEL, CLOUD_STOP_LABEL, CLOUD_TOKEN_HINT,
+    CLOUD_TOKEN_PLACEHOLDER, CLOUD_WAKE_LABEL, CONFIRM_NO_LABEL, CONFIRM_YES_LABEL, COPIED_LABEL,
+    COPY_LABEL, DELETE_LABEL, MODELS_EMPTY_LABEL, NO_INVITES_LABEL, PUSH_LABEL, REMOVE_LABEL,
+    REVOKE_LABEL, SAVE_DEFAULT_LABEL, SHARE_LABEL, TASKS_EMPTY_LABEL, TASKS_NO_MATCH_LABEL,
+    TASK_MERGE_LABEL, TASK_NEW_LABEL, VAULT_NOTE_LABEL, VIEWER_LABEL,
 };
 use modron_mobile_core::{
     FILTER_LABEL, NEW_SESSION_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_NO_MATCH_LABEL,
@@ -30,7 +30,7 @@ use nsh_core::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::UiAction;
-use crate::help::{HELP_TABS, HELP_VISIBLE};
+use crate::help::{shown_tabs, HELP_VISIBLE};
 use crate::nav::{NavStep, NavView, Screen};
 use crate::screens::{
     auth_progress, send_key, send_token, AUTH_SLOTS, AUTOMATION_SLOTS, CLOUD_ACCOUNT_SLOTS,
@@ -125,12 +125,12 @@ fn push_row(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl In
         .child(ui::static_row(ui::value_pair(label, value), Some(switch.into_element())))
         .child(when(
             move || nav.with(|n| n.push.as_ref().is_some_and(|p| p.hint.is_some())),
-            move || view().px(px(ui::GUTTER)).pb(px(8.0)).child(ui::caption(hint)),
+            move || view().px(px(ui::GUTTER)).py(px(8.0)).child(ui::caption(hint)),
         ))
         .child(when(
             move || nav.with(|n| n.push.as_ref().is_some_and(|p| p.note.is_some())),
             move || {
-                view().px(px(ui::GUTTER)).pb(px(8.0)).child(ui::alert(Tone::Warning, note).w_full())
+                view().px(px(ui::GUTTER)).py(px(8.0)).child(ui::alert(Tone::Warning, note).w_full())
             },
         ))
 }
@@ -299,6 +299,8 @@ fn credential_row(
     let label = move || nav.with(|n| n.auth.get(i).map(|r| r.label.clone()).unwrap_or_default());
     let status = move || nav.with(|n| n.auth.get(i).map(|r| r.status.clone()).unwrap_or_default());
     let press = actions.clone();
+    let sign_in = actions.clone();
+    let key = actions.clone();
     let remove = when(
         move || nav.with(|n| n.auth.get(i).is_some_and(|r| r.signed_in())),
         move || {
@@ -308,9 +310,28 @@ fn credential_row(
             })
         },
     );
-    ui::row(ui::value_pair(label, status), Some(remove.into_element()), move || {
+    let row = ui::row(ui::value_pair(label, status), Some(remove.into_element()), move || {
         let _ = press.send(UiAction::Nav(NavStep::ActivateRow(i)));
-    })
+    });
+    // An OAuth-capable row has both actions as buttons: the browser sign-in
+    // and the key entry. A key-only row has its press (the key entry) alone.
+    let oauth = move || nav.with(|n| n.auth.get(i).is_some_and(|r| r.oauth_capable));
+    let buttons = when(oauth, move || {
+        let sign_in = sign_in.clone();
+        let key = key.clone();
+        view()
+            .flex_row()
+            .gap(px(8.0))
+            .px(px(ui::GUTTER))
+            .py(px(8.0))
+            .child(ui::button(AUTH_ROW_SIGN_IN_LABEL, Variant::Outline, Size::Sm, move || {
+                let _ = sign_in.send(UiAction::Nav(NavStep::SignInRow(i)));
+            }))
+            .child(ui::button(AUTH_ROW_KEY_LABEL, Variant::Outline, Size::Sm, move || {
+                let _ = key.send(UiAction::Nav(NavStep::KeyRow(i)));
+            }))
+    });
+    view().flex_col().child(row).child(buttons)
 }
 
 /// The masked key entry for the open provider. The field is a view signal that
@@ -462,8 +483,8 @@ fn model_row(
 /// The help screen: the three tabs over a window of the rows, and a footer
 /// that says which rows show.
 pub(crate) fn help(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
-    let mut tabs = view().flex_row();
-    for kind in HELP_TABS {
+    let mut tabs = view().flex_row().w_full();
+    for &kind in shown_tabs() {
         let actions = actions.clone();
         tabs = tabs.child(ui::tab(
             kind.label(),
@@ -1097,38 +1118,28 @@ pub(crate) fn confirm(
         move || {
             let yes = actions.clone();
             let no = actions.clone();
-            view()
-                .flex_col()
-                .gap(px(8.0))
-                .child(
-                    ui::alert(Tone::Warning, move || {
-                        nav.with(|n| n.confirm.clone().unwrap_or_default())
-                    })
-                    .w_full(),
-                )
-                .child(
-                    view()
-                        .flex_row()
-                        .gap(px(8.0))
-                        .child(ui::button(
-                            CONFIRM_YES_LABEL,
-                            Variant::Destructive,
-                            Size::Sm,
-                            move || {
-                                let _ = yes.send(UiAction::Nav(NavStep::Confirm));
-                            },
-                        ))
-                        .child(ui::button(
-                            CONFIRM_NO_LABEL,
-                            Variant::Outline,
-                            Size::Sm,
-                            move || {
-                                let _ = no.send(UiAction::Nav(NavStep::Cancel));
-                            },
-                        )),
-                )
+            ui::confirm_dialog(
+                move || nav.with(|n| confirm_question(&n.confirm.clone().unwrap_or_default())),
+                "",
+                CONFIRM_YES_LABEL,
+                CONFIRM_NO_LABEL,
+                move || {
+                    let _ = yes.send(UiAction::Nav(NavStep::Confirm));
+                },
+                move || {
+                    let _ = no.send(UiAction::Nav(NavStep::Cancel));
+                },
+            )
         },
     )
+}
+
+/// The question a confirmation asks, as the web's dialog title: the shared
+/// sentence without its terminal key hint (` y / n`), which the dialog's two
+/// buttons replace.
+fn confirm_question(text: &str) -> String {
+    let hint = format!(" {CONFIRM_YES_LABEL} / {CONFIRM_NO_LABEL}");
+    text.strip_suffix(&hint).unwrap_or(text).to_string()
 }
 
 /// The sub-agent panel (web), above the transcript while the agent screen is

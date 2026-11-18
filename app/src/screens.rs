@@ -5,12 +5,12 @@
 //! or the shared table.
 
 use modron_mobile_core::view::{
-    AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL, AUTH_CODE_LABEL,
-    AUTH_KEY_HINT, AUTH_KEY_PLACEHOLDER, AUTH_KEY_SAVE_HINT, AUTH_NO_PROVIDERS_LABEL,
-    AUTH_TITLE_LABEL, AUTH_VISIT_LABEL, AUTH_WAITING_LABEL, CONFIRM_NO_LABEL, CONFIRM_YES_LABEL,
-    COPIED_LABEL, COPY_LABEL, DELETE_LABEL, HELP_TITLE, MODELS_EMPTY_LABEL, NO_INVITES_LABEL,
-    REFRESH_LABEL, REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL, SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL,
-    VIEWER_LABEL,
+    auth_row_hint, AGENT_ENDED_LABEL, AGENT_KILL_LABEL, AGENT_NONE_LABEL, APPROVER_LABEL,
+    AUTH_CODE_LABEL, AUTH_KEY_HINT, AUTH_KEY_PLACEHOLDER, AUTH_KEY_SAVE_HINT,
+    AUTH_NO_PROVIDERS_LABEL, AUTH_TITLE_LABEL, AUTH_VISIT_LABEL, AUTH_WAITING_LABEL,
+    CONFIRM_NO_LABEL, CONFIRM_YES_LABEL, COPIED_LABEL, COPY_LABEL, DELETE_LABEL, HELP_TITLE,
+    MODELS_EMPTY_LABEL, NO_INVITES_LABEL, REFRESH_LABEL, REVOKE_LABEL, SHARE_LABEL, SIGN_IN_LABEL,
+    SIGN_IN_PLACEHOLDER, SIGN_OUT_LABEL, VIEWER_LABEL,
 };
 use modron_mobile_core::{
     FILTER_LABEL, NEW_SESSION_LABEL, SESSIONS_EMPTY_LABEL, SESSIONS_LABEL, SESSIONS_NO_MATCH_LABEL,
@@ -575,9 +575,22 @@ fn auth_row(
             }
         })
     };
-    let row = view().flex_col().child(text(line).text_color(move || {
+    let mut row = view().flex_col().child(text(line).text_color(move || {
         token_ink(style_token(if selected() { Style::Bold } else { Style::Plain }))
     }));
+    if !WEB_CONTROLS {
+        // The keys for the selected row (the web draws them as buttons).
+        let hint = move || {
+            nav.with(|n| {
+                n.auth.get(i).filter(|_| n.selected == i).map(|r| auth_row_hint(r.oauth_capable))
+            })
+            .unwrap_or_default()
+        };
+        row = row.child(when(
+            move || nav.with(|n| n.selected == i && n.auth.get(i).is_some()),
+            move || text(hint).text_color(muted()),
+        ));
+    }
     if WEB_CONTROLS {
         // A signed-in row also carries the remove control (it asks y / n first).
         let remove_actions = actions.clone();

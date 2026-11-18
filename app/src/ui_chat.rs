@@ -12,8 +12,9 @@
 use std::rc::Rc;
 
 use modron_mobile_core::view::{
-    connection_label, queue_chip, ConnectionState, CHAT_TITLE_LABEL, HELP_TITLE, REMOVE_LABEL,
-    SEND_LABEL, SESSIONS_LABEL, SESSION_DETAIL_LABEL, SETTINGS_LABEL,
+    connection_label, queue_chip, welcome_model_line, welcome_title, ConnectionState,
+    CHAT_TITLE_LABEL, HELP_TITLE, RECONNECTING_LABEL, REMOVE_LABEL, RETRY_NOW_LABEL, SEND_LABEL,
+    SESSIONS_LABEL, SESSION_DETAIL_LABEL, SETTINGS_LABEL, WELCOME_TAGLINE,
 };
 use modron_view::{QUEUE_LABEL, STOP_LABEL};
 use nsh_core::prelude::*;
@@ -47,7 +48,12 @@ const BAR_H: f32 = ui::HEADER_H;
 const STRIP_H: f32 = 40.0;
 const DOCK_BASE_H: f32 = 8.0 + 8.0 + 44.0 + 8.0 + 44.0 + 8.0 + 8.0;
 const DETAILS_H: f32 = 40.0;
-const BANNER_H: f32 = 40.0;
+/// The banner's height per connection word: a warning line with a skeleton
+/// (connecting), the same with a retry button (reconnecting), a destructive
+/// line (disconnected). The dock's estimate uses these.
+const BANNER_CONNECTING_H: f32 = 72.0;
+const BANNER_RETRY_H: f32 = 124.0;
+const BANNER_DISCONNECTED_H: f32 = 56.0;
 const TOOL_PANEL_H: f32 = 240.0;
 const POPOVER_ROW_H: f32 = 60.0;
 const APPROVAL_H: f32 = 180.0;
@@ -147,16 +153,7 @@ pub fn bar(
     details: Signal<bool>,
 ) -> impl IntoElement {
     let state = move || model.with(|m| first_fact(&m.connection).to_string());
-    let tone = move || {
-        let state = state();
-        if state == connection_label(&ConnectionState::Connected) {
-            Tone::Success
-        } else if state == connection_label(&ConnectionState::Connecting) {
-            Tone::Warning
-        } else {
-            Tone::Destructive
-        }
-    };
+    let tone = move || connection_tone(&state());
     // The title block is the status's press target (the details row): at
     // least 44 pt tall, the name and the status line inside it.
     let title = view()
@@ -221,7 +218,34 @@ pub fn bar(
                 .child(row)
                 .child(details_row),
         )
-        .child(banner(model))
+        .child(banner(model, actions))
+}
+
+/// The tone of a connection word (the bar's dot, the banner's alert): the
+/// connected word is success; the words of a link that is coming up
+/// (connecting, and reconnecting after a drop) are warning; any other word is
+/// destructive.
+pub fn connection_tone(word: &str) -> Tone {
+    if word == connection_label(&ConnectionState::Connected) {
+        Tone::Success
+    } else if word == connection_label(&ConnectionState::Connecting) || word == RECONNECTING_LABEL {
+        Tone::Warning
+    } else {
+        Tone::Destructive
+    }
+}
+
+/// The banner's height for a connection word (0 when connected).
+pub fn banner_px(word: &str) -> f32 {
+    if word == RECONNECTING_LABEL {
+        BANNER_RETRY_H
+    } else if word == connection_label(&ConnectionState::Connecting) {
+        BANNER_CONNECTING_H
+    } else if word == connection_label(&ConnectionState::Connected) {
+        0.0
+    } else {
+        BANNER_DISCONNECTED_H
+    }
 }
 
 /// A bar control: a compact ghost button that opens `screen`.
@@ -235,22 +259,34 @@ fn bar_action(
     })
 }
 
-/// The connection banner: `connecting` (warning, with a skeleton line) or
-/// `disconnected` (destructive). Nothing while connected.
-fn banner(model: Signal<Model>) -> impl IntoElement {
+/// The connection banner: `connecting` (warning, with a skeleton line),
+/// `reconnecting` (the same, with `retry now`) or `disconnected` (destructive).
+/// Nothing while connected.
+fn banner(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> impl IntoElement {
     let state = move || model.with(|m| first_fact(&m.connection).to_string());
-    let is = move |which: ConnectionState| move || state() == connection_label(&which);
-    let connecting = is(ConnectionState::Connecting);
-    let disconnected = is(ConnectionState::Disconnected);
+    let connecting = move || state() == connection_label(&ConnectionState::Connecting);
+    let reconnecting = move || state() == RECONNECTING_LABEL;
+    let disconnected = move || state() == connection_label(&ConnectionState::Disconnected);
     view()
         .flex_col()
-        .child(when(connecting, move || {
-            ui::gutter(view().flex_col().gap(px(8.0)).py(px(8.0)).w_full())
-                .max_w(px(ui::LIST_WIDTH))
-                .self_center()
-                .child(ui::alert(Tone::Warning, state))
-                .child(ui::skeleton(8.0))
-        }))
+        .child(when(
+            move || connecting() || reconnecting(),
+            move || {
+                let retry = actions.clone();
+                ui::gutter(view().flex_col().gap(px(8.0)).py(px(8.0)).w_full())
+                    .max_w(px(ui::LIST_WIDTH))
+                    .self_center()
+                    .child(ui::alert(Tone::Warning, state))
+                    .child(ui::skeleton(8.0))
+                    .child(when(reconnecting, move || {
+                        let retry = retry.clone();
+                        ui::button(RETRY_NOW_LABEL, Variant::Outline, Size::Sm, move || {
+                            let _ = retry.send(UiAction::RetryConnection);
+                        })
+                        .w_full()
+                    }))
+            },
+        ))
         .child(when(disconnected, move || {
             ui::gutter(view().flex_col().py(px(8.0)).w_full())
                 .max_w(px(ui::LIST_WIDTH))
@@ -272,6 +308,18 @@ pub fn cell(model: Signal<Model>, at: nsh_core::element::Position) -> impl IntoE
         .child(when(move || is_style(model, at, Style::Meta), move || meta(model, at)))
         .child(when(move || is_style(model, at, Style::Tool), move || tool(model, at)))
         .child(when(move || is_style(model, at, Style::Dim), move || dim(model, at)))
+        .child(when(move || is_style(model, at, Style::Welcome), move || welcome(model, at)))
+}
+
+/// The web's welcome for a blank session: the app's title and version, the
+/// tagline, and the model line (the row's text is the model's name). The
+/// words are the shared welcome words.
+fn welcome(model: Signal<Model>, at: nsh_core::element::Position) -> impl IntoElement {
+    let model_name =
+        move || model.with(|m| m.lines.get(at.index()).map(|l| l.text.clone()).unwrap_or_default());
+    ui::welcome_state(welcome_title(env!("CARGO_PKG_VERSION")), WELCOME_TAGLINE, move || {
+        welcome_model_line(&model_name())
+    })
 }
 
 /// A task: a card row. The first and last rows of a run of task rows carry the
@@ -620,7 +668,7 @@ fn queue_popover(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> im
                     move || model.with(|m| m.queued.len() > i),
                     move || {
                         let actions = actions.clone();
-                        ui::list_row(
+                        ui::pick_row(
                             move || {
                                 model.with(|m| {
                                     m.queued
@@ -629,8 +677,6 @@ fn queue_popover(model: Signal<Model>, actions: UnboundedSender<UiAction>) -> im
                                         .unwrap_or_default()
                                 })
                             },
-                            "",
-                            None,
                             move || {
                                 let _ = actions.send(UiAction::Dequeue(i));
                             },
@@ -664,7 +710,7 @@ fn suggestions(
                 move || visible() && items().names.len().min(POPOVER_ROWS) > i,
                 move || {
                     let actions = actions.clone();
-                    ui::list_row(
+                    ui::pick_row(
                         move || {
                             let at = start() + i;
                             let selected = nav.with(|n| n.slash_selected) == at;
@@ -682,8 +728,6 @@ fn suggestions(
                                 })
                                 .unwrap_or_default()
                         },
-                        "",
-                        None,
                         move || {
                             if let Some(name) = items().names.get(start() + i).cloned() {
                                 let _ = actions.send(UiAction::Nav(NavStep::Complete(name)));
@@ -826,6 +870,17 @@ fn composer_actions(
         ))
 }
 
+/// The height of a live text block of `text` at `line_px` per line, wrapped at
+/// about `cols` characters, with its padding (0 when empty).
+fn live_text_px(text: &str, line_px: f32, cols: usize) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let lines: usize =
+        text.split('\n').map(|line| line.chars().count().div_ceil(cols).max(1)).sum();
+    lines.min(12) as f32 * line_px + ROW_GAP + 2.0
+}
+
 /// The transcript's height on the web: the window less the bar, the banner,
 /// the live strips and the dock, which grows with its popovers and the
 /// composer's lines. A floor keeps a sliver of transcript when everything
@@ -860,12 +915,14 @@ pub fn transcript_px(
     if details {
         reserve += DETAILS_H;
     }
-    if state != connection_label(&ConnectionState::Connected) {
-        reserve += BANNER_H;
-    }
+    reserve += banner_px(&state);
     if tool_panel {
         reserve += TOOL_PANEL_H;
     }
+    // The live text sits between the transcript and the dock: its lines (the
+    // streaming answer, the opted-in reasoning) come off the transcript too.
+    let (streamed, reasoned) = model.with(|m| (m.streaming.clone(), m.reasoning.clone()));
+    reserve += live_text_px(&streamed, 24.0, 44) + live_text_px(&reasoned, 20.0, 56);
     if scrolled {
         reserve += 20.0;
     }
@@ -948,5 +1005,21 @@ mod tests {
             join_facts(&["anthropic", "", "claude \u{b7} 0 tok", ""]),
             "anthropic \u{b7} claude \u{b7} 0 tok"
         );
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[test]
+    fn a_dropped_link_is_a_warning_with_a_retry_and_a_closed_one_is_destructive() {
+        assert_eq!(connection_tone("connected"), Tone::Success);
+        assert_eq!(connection_tone("connecting"), Tone::Warning);
+        assert_eq!(connection_tone(RECONNECTING_LABEL), Tone::Warning);
+        assert_eq!(connection_tone("disconnected"), Tone::Destructive);
+        assert_eq!(banner_px("connected"), 0.0);
+        assert!(banner_px(RECONNECTING_LABEL) > banner_px("connecting"));
+        assert!(banner_px("disconnected") > 0.0);
     }
 }

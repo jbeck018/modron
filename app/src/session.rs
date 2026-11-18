@@ -27,8 +27,8 @@ use std::{
 };
 
 use modron_mobile_core::{
-    approval_mode_next, connection_label, sandbox_next, ClientError, ConfigPatch, ConnectOptions,
-    ConnectionState, Phase, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
+    approval_mode_next, connection_label, retrying_label, sandbox_next, ClientError, ConfigPatch,
+    ConnectOptions, ConnectionState, Phase, RemoteClient, ViewModelSnapshot, PLAN_DECISION_LABELS,
 };
 use modron_protocol::SessionMetaWire;
 use tokio::sync::mpsc::{
@@ -392,6 +392,7 @@ impl Driver {
     pub fn step(&mut self) -> bool {
         loop {
             match self.actions.try_recv() {
+                Ok(UiAction::RetryConnection) => self.retry_now(),
                 Ok(action) => apply(&self.client, action),
                 Err(TryRecvError::Empty) => break,
                 // The view is gone: nothing left to drive.
@@ -483,7 +484,8 @@ impl Driver {
             }
         }
         let mut snapshot = self.client.state();
-        snapshot.connection_label = self.label(&snapshot.connection_label);
+        let word = retrying_label(&snapshot.connection, self.status.reconnecting());
+        snapshot.connection_label = self.label(word);
         // Snapshots carry no PartialEq; the JSON form is the change test.
         let json = serde_json::to_string(&snapshot).unwrap_or_default();
         // A submit that clears the staged image chips changes nothing in the
@@ -530,6 +532,16 @@ impl Driver {
     /// Whether the link carries an invite ticket (`?ticket=`, one use only).
     fn ticketed(&self) -> bool {
         self.options.url.contains("ticket=")
+    }
+
+    /// `retry now` (web): a reconnect at once, when the driver is retrying a
+    /// dropped link. A ticketed link never retries (its ticket is spent), so
+    /// the action does nothing there.
+    fn retry_now(&mut self) {
+        if self.status.reconnecting() && !self.ticketed() {
+            self.retry_at = None;
+            self.reconnect();
+        }
     }
 
     /// One reconnect try: re-attach to the known session, or connect afresh
@@ -591,6 +603,8 @@ fn apply(client: &RemoteClient, action: UiAction) {
             }
             result
         }
+        // The driver handles it in `step` (its reconnect state is there).
+        UiAction::RetryConnection => Ok(()),
         UiAction::Detach => {
             if crate::chat::unstage_last() {
                 client.note_local_error(ATTACH_REMOVED_NOTE);

@@ -44,7 +44,33 @@ const CHAT_STATES = [
   { name: '16-chat-queued', server: { quiet: true, after: [{ type: 'queue_changed', queued: ['run the migration after the tests', 'draft the release note'] }] }, wait: '[2] draft' },
   { name: '17-chat-suggestions', server: { quiet: true }, wait: 'a token-efficient Rust coding agent', keys: '/co', wait2: '/compact - compact this session' },
   { name: '18-chat-error', server: { quiet: true, after: [{ type: 'error', message: 'the provider refused the request (429)' }] }, wait: 'refused the request' },
-  { name: '19-chat-disconnected', server: { quiet: true }, url: 'ws://127.0.0.1:39998/', wait: 'disconnected' },
+  // A dropped link: the driver keeps retrying, so the banner reads reconnecting with retry now.
+  { name: '19-chat-reconnecting', server: { quiet: true }, url: 'ws://127.0.0.1:39998/', wait: 'retry now' },
+  // The reasoning view: opted in with /reasoning, then a task whose reply streams reasoning.
+  { name: '33-chat-reasoning', server: { quiet: true, reasoningOnSubmit: true }, wait: 'a token-efficient Rust coding agent',
+    run: async (page) => {
+      await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: T.TIMEOUT });
+      await page.keyboard.type('/reasoning');
+      await page.waitForTimeout(300);
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(300);
+      await page.keyboard.type('explain the router split');
+      await page.waitForTimeout(200);
+      await page.keyboard.press('Enter');
+      await page.waitForFunction(() => document.body.innerText.includes('two tables'), null, { timeout: T.TIMEOUT });
+    } },
+  // A finished turn with tools: the summary row, tapped open to its detail panel.
+  { name: '34-chat-tool-panel', server: { quiet: true, after: [
+    { type: 'tool', activity: { kind: 'start', name: 'read', call_id: 't1' } },
+    { type: 'tool', activity: { kind: 'done', name: 'read', is_error: false, bytes: 2048, call_id: 't1' } },
+    { type: 'tool', activity: { kind: 'start', name: 'edit', call_id: 't2' } },
+    { type: 'tool', activity: { kind: 'done', name: 'edit', is_error: true, bytes: 96, call_id: 't2' } },
+  ] }, wait: 'a token-efficient Rust coding agent',
+    run: async (page) => {
+      await page.waitForFunction(() => document.body.innerText.includes('2 tools'), null, { timeout: T.TIMEOUT });
+      await page.getByText(/2 tools/).first().click();
+      await page.waitForTimeout(300);
+    } },
 ];
 
 // Five sessions, two offline (the list's states).
@@ -197,11 +223,15 @@ async function main() {
             await shoot(page, '08-credentials');
           });
           await step('help', async () => {
+            // The credentials screen is open: back to the chat, where the bar has help.
+            await T.tapLabel(page, 'back');
+            await page.waitForFunction(() => document.body.innerText.includes('sessions'), null, { timeout: T.TIMEOUT });
             await T.tapLabel(page, 'help');
             await page.waitForTimeout(500);
             await shoot(page, '09-help');
           });
           await step('sessions', async () => {
+            await T.tapLabel(page, 'back');
             await T.tapLabel(page, 'sessions');
             await page.waitForFunction(() => document.body.innerText.includes('fix the router crate'), null, { timeout: T.TIMEOUT });
             await shoot(page, '10-sessions');
@@ -242,7 +272,7 @@ async function main() {
             ['23-settings-theme-picker', async () => { await settings(); await T.tapLabel(page, 'theme'); await waitFor('oculus light'); }],
             ['24-models', async () => { await settings(); await T.tapLabel(page, 'model'); await waitFor('filter'); }],
             ['25-agent-picker', async () => { await command('/agent'); await waitFor('no persona'); }],
-            ['26-help-shortcuts', async () => { await T.tapLabel(page, 'help'); await T.tapLabel(page, 'Shortcuts'); await waitFor('shortcuts: 1-'); }],
+            ['26-help-commands', async () => { await T.tapLabel(page, 'help'); await T.tapLabel(page, 'Commands'); await waitFor('commands: 1-'); }],
             ['27-tasks', async () => { await command('/tasks'); await waitFor('new task'); }],
             ['28-task-form', async () => { await command('/tasks'); await waitFor('new task'); await T.tapLabel(page, 'new task'); await waitFor('cancel'); }],
             ['29-automations', async () => { await command('/automations'); await waitFor('add'); }],
@@ -300,6 +330,7 @@ async function main() {
               await page.keyboard.type(state.keys);
               await page.waitForFunction((s) => document.body.innerText.includes(s), state.wait2, { timeout: T.TIMEOUT });
             }
+            if (state.run) await state.run(page);
             await shoot(page, state.name);
           });
           await ctx.close();

@@ -91,6 +91,15 @@ wrap it the same way in `ui.rs`.
 - `list_row(title, subtitle, trailing, press)`: `.disabled(flag)` stops the
   press; `.style_when(.., |s| s.opacity(0.5))` dims a row whose press the
   navigation decides on (the portal's offline rows).
+- `pick_row(title, press)`: the one-line form (no empty subtitle line): the
+  queue chips and the suggestion popover.
+- `welcome_state(title, tagline, model)`: a blank chat's welcome in the empty
+  state's layout (the shared title, tagline and model line; no key hints).
+- `confirm_dialog(title, description, confirm_label, cancel_label, on_confirm,
+  on_cancel)`: a modal on nsh_base's `dialog()` (the platform's modal layer:
+  it keeps the focus inside and returns it on close). Escape and the back
+  control send `on_cancel`; the confirm button is destructive, the cancel
+  outline; the scrim is the background token at three quarters.
 - Settings and list rows (UX-3): `row(content, trailing, press)` is a 52 pt
   pressable row whose press covers the content only, so its trailing control
   (a destructive small button, a switch) takes its own presses;
@@ -129,14 +138,22 @@ order are the shared ones. Layout, phone first:
   44 pt press target: a tap opens a details row under the bar with the
   connection address and `session <id>`.
 - Banner under the bar, only while not connected: `connecting` (warning alert
-  with a skeleton line) or `disconnected` (destructive alert).
+  with a skeleton line), `reconnecting` (the same, with a `retry now` button,
+  44 pt) or `disconnected` (destructive alert). The driver retries a dropped
+  link on a backoff and says so (`reconnecting`); `retry now` reconnects at
+  once. A ticketed link never retries, so it reads `disconnected`.
+- Blank session: one welcome row (`ui::welcome_state`: the title, the tagline
+  and the model line; the terminal's key hints are not drawn here).
 - Transcript, the virtual list at the page gutter, 720 pt column on wide
-  windows. Tasks are secondary-token cards (the first and last rows of a run
+  windows. The live regions (the tool strip and panel, the reasoning and the
+  streaming text, the sub-agent and steer rows) sit in the same column
+  (`chat::live_column`), and the transcript's height estimate reserves their
+  lines. Tasks are secondary-token cards (the first and last rows of a run
   carry the card's padding). Assistant text is body 16 pt, 1.5 leading,
   paragraphs by the core's blank lines; a fenced code block is a bordered mono
   panel that scrolls sideways (the fence lines are markup and are not shown).
   The turn's tool summary is a compact bordered row, pressed to toggle the
-  detail panel; its detail rows are mono and indented. Model and usage notes
+  detail panel; the panel is a card whose detail rows are mono and indented. Model and usage notes
   are centred captions. Shell output is mono. The in-flight text carries an
   accent rule and commits with the turn; opted-in reasoning is muted italic
   under a neutral rule. Both are web rows appended in `Model::from_snapshot`
@@ -200,7 +217,9 @@ sessions, tasks, automations).
   monospace panel that scrolls sideways with a copy control, the invites in a
   card with a destructive revoke each.
 - Credentials: the provider rows in a card (label left, status right; a
-  signed-in row has a remove control); the browser sign-in progress in a card;
+  signed-in row has a remove control). An OAuth-capable row (the browser
+  sign-in) has two outline buttons under it, `sign in` and `api key`; a
+  key-only row's press opens the key entry. The browser sign-in progress in a card;
   the masked key entry in a card. The sign-in's Esc hint is not drawn (the
   back control does the same).
 - Pickers (`picker`, `models`): the filter as a search field, the rows in a
@@ -210,8 +229,11 @@ sessions, tasks, automations).
   card with their own control (delete, merge), the create control full width,
   the inline form as a card of fields with save (default) and cancel (outline).
   The form's keyboard hint is not drawn.
-- Help: the three tabs as a segmented control (`tab_list`), the rows in a card,
-  a footer caption for the rows shown.
+- Help: the tabs as a segmented control (`tab_list`), the rows in a card, a
+  footer caption for the rows shown. The web shows General (its tagline only:
+  the other General rows name terminal keys) and Commands. The Shortcuts tab
+  lists keyboard bindings, which the web's controls replace, so the web does
+  not show it (`help::shown_tabs`, `help::rows_for`).
 - Cloud: the accounts card (remove asks first), the token entry card (masked),
   the new-run card (account and repo pickers as outline buttons, the branch
   field, start as a default button), the runs card (open outline, stop
@@ -219,12 +241,26 @@ sessions, tasks, automations).
 - Agent panel (web): the row and its kill control in a card, above the
   transcript.
 
+Confirmations (remove, kill, delete, merge, revoke) are `confirm_dialog`s: the
+question is the shared sentence without its terminal ` y / n` hint, and the
+buttons are the shared `y` and `n` words.
+
 Words stay the shared ones. Keyboard-only hints are not drawn on the web where
 a visible control does the same: the form hints, the key hint on the save
 controls (the web uses the `save` word), the sign-in wait line's Esc hint.
 Their constants stay in the shared table.
 
 ## Known gaps
+
+- Keyboard Tab does not move focus on the web target, with or without a
+  dialog: the runtime takes Tab and finds no stop. A dialog's focus trap is the
+  platform's (the page behind it is inert), not Tab's.
+- While the tool panel is open its activity shows twice: the panel card, and
+  the live strip's rows (plain text under the strip's summary).
+- The outline buttons on a dark card have a faint border (the border token on
+  near-black).
+- A row's trailing control keeps 8 pt at the right even when it is hidden, so a
+  key-only credentials row's press fill stops short of the card's edge.
 
 - The soft keyboard cannot be driven from Playwright: the sign-in card is
   centred and scrolls, but its behaviour with a real keyboard is unverified.

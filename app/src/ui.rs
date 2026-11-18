@@ -27,6 +27,7 @@
 //! - [`list_row`], [`status_dot`], [`empty_state`].
 
 use modron_mobile_core::view::BACK_LABEL;
+use nsh_base::dialog;
 use nsh_core::element::AnyElement;
 use nsh_core::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
@@ -409,6 +410,28 @@ pub fn list_row(
     row.on_press(press)
 }
 
+/// A one-line row (a queued message, a suggestion): the title in the row's
+/// 52 pt press target, with no subtitle line. [`list_row`] keeps its subtitle
+/// line even when it is empty, which left these rows top-heavy.
+pub fn pick_row(title: impl IntoReactive<SharedString>, press: impl Fn() + 'static) -> View {
+    view()
+        .role(AccessibilityRole::Button)
+        .flex_row()
+        .items_center()
+        .min_h(px(52.0))
+        .px(px(GUTTER))
+        .py(px(8.0))
+        .border_b_1()
+        .border_color(tok("border"))
+        .cursor_pointer()
+        .hover(|s| s.bg(tok("accent")))
+        .active(|s| s.bg(tok("muted")))
+        .disabled_style(|s| s.opacity(0.5))
+        .focus_visible(|s| s.ring(px(2.0)).ring_color(tok("ring")))
+        .child(body_size(text(title)).text_color(tok("foreground")).flex_1().truncate())
+        .on_press(press)
+}
+
 /// Centred words for an empty list: a title, an optional line (pass "" to
 /// leave it out) and an optional action.
 pub fn empty_state(title: &'static str, line: &'static str, action: Option<AnyElement>) -> View {
@@ -421,6 +444,24 @@ pub fn empty_state(title: &'static str, line: &'static str, action: Option<AnyEl
         column = column.child(action);
     }
     column
+}
+
+/// The web's welcome for a blank chat: the title over the tagline and the
+/// model line, centred, in the empty state's layout. It carries no key hints
+/// (the terminal's keys are not the web's controls).
+pub fn welcome_state(
+    title: impl IntoReactive<SharedString>,
+    tagline: &'static str,
+    model: impl IntoReactive<SharedString>,
+) -> View {
+    view()
+        .flex_col()
+        .items_center()
+        .gap(px(8.0))
+        .py(px(32.0))
+        .child(title_text(title).text_center())
+        .child(caption(tagline).text_center())
+        .child(caption(model).text_center())
 }
 
 /// A section title over a card (shadcn's Label): 13 pt, medium, muted.
@@ -593,15 +634,19 @@ pub fn tab(
         .cursor_pointer()
         .selected_style(|s| s.bg(token_ink("background")))
         .focus_visible(|s| s.ring(px(2.0)).ring_color(tok("ring")))
-        .child(text(label).text_size(px(15.0)).font_weight(FontWeight::MEDIUM).text_color(
-            move || {
-                if ink() {
-                    token_ink("foreground")
-                } else {
-                    token_ink("muted-foreground")
-                }
-            },
-        ))
+        .child(
+            text(label)
+                .text_size(px(15.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || {
+                    if ink() {
+                        token_ink("foreground")
+                    } else {
+                        token_ink("muted-foreground")
+                    }
+                })
+                .truncate(),
+        )
 }
 
 /// A labelled display field for an inline form: the label over a bordered
@@ -624,6 +669,53 @@ pub fn field(
             .style_when(active, |s| s.ring(px(2.0)).ring_color(tok("ring")))
             .child(body(value)),
     )
+}
+
+/// A destructive confirmation as a modal dialog (nsh_base's `dialog`, the
+/// platform's modal layer): the question as its title, `description` below it
+/// (`""` leaves it out), then the cancel button (outline) and the confirm
+/// button (destructive). Escape and the back control send `on_cancel`; the
+/// platform keeps the focus inside the dialog and returns it when it closes.
+/// Present it by putting it in the view; leave it out to close it.
+pub fn confirm_dialog(
+    title: impl IntoReactive<SharedString>,
+    description: &'static str,
+    confirm_label: &'static str,
+    cancel_label: &'static str,
+    on_confirm: impl Fn() + 'static,
+    on_cancel: impl Fn() + Clone + 'static,
+) -> impl IntoElement {
+    let cancel = on_cancel.clone();
+    let mut header = view().flex_col().gap(px(4.0)).p(px(GUTTER)).child(card_title(title));
+    if !description.is_empty() {
+        header = header.child(card_description(description));
+    }
+    let footer = card_footer(
+        button(cancel_label, Variant::Outline, Size::Default, cancel).flex_1().into_element(),
+    )
+    .child(
+        button(confirm_label, Variant::Destructive, Size::Default, on_confirm)
+            .flex_1()
+            .into_element(),
+    );
+    let card = card_list(view().flex_col().child(header).child(footer));
+    dialog().on_cancel(on_cancel).child(
+        view()
+            .flex_col()
+            .size_full()
+            .justify_center()
+            .items_center()
+            .p(px(GUTTER))
+            .bg(scrim)
+            .child(view().flex_col().w_full().max_w(px(FORM_WIDTH)).child(card)),
+    )
+}
+
+/// The dimming behind a dialog: the background token at three quarters, so
+/// it darkens in dark appearance and washes out in light.
+fn scrim() -> AdaptiveColor {
+    let c = token_ink("background");
+    AdaptiveColor { light: c.light.alpha(0.75), dark: c.dark.alpha(0.75) }
 }
 
 /// The scaffold's header and its content, in one value. `Bar::new(title)`

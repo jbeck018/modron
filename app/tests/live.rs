@@ -845,8 +845,9 @@ fn a_server_one_protocol_ahead_is_refused_and_never_streams() {
     .expect("spawn driver");
     let mut h = Harness::new();
     // A Welcome with another protocol never sets the connection up: the
-    // header reads disconnected and the server's stream is not folded.
-    h.wait_for("refused handshake", Some(&mut live), |s| s.contains("disconnected"));
+    // driver keeps retrying, so the header reads reconnecting (never
+    // connected), and the server's stream is not folded.
+    h.wait_for("refused handshake", Some(&mut live), |s| s.contains("reconnecting"));
     assert!(!h.screen().contains("Migrating the router now"), "{}", h.screen());
 }
 

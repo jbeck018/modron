@@ -133,6 +133,12 @@ pub enum NavStep {
     Activate,
     /// A tap on a credentials row (web): select it, then as [`NavStep::Activate`].
     ActivateRow(usize),
+    /// `k` on a credentials row (terminal), or the key button on a row (web):
+    /// select it and open the masked key entry, whatever its kind.
+    KeyRow(usize),
+    /// The sign-in button on an OAuth-capable row (web): select it and start
+    /// the browser sign-in. A key-only row ignores it.
+    SignInRow(usize),
     /// Esc during the key entry: close it, the typed text is dropped.
     AuthCancelKey,
     /// The key entry was submitted: close it (the view has sent the key).
@@ -1524,6 +1530,18 @@ impl Nav {
                 self.selected = index.min(self.auth.len().saturating_sub(1));
                 return self.apply(NavStep::Activate);
             }
+            NavStep::KeyRow(index) if self.top() == Screen::Auth && self.auth_key.is_none() => {
+                self.selected = index.min(self.auth.len().saturating_sub(1));
+                if let Some(row) = self.auth.get(self.selected) {
+                    self.auth_key = Some(row.id.clone());
+                }
+            }
+            NavStep::SignInRow(index) if self.top() == Screen::Auth && self.auth_key.is_none() => {
+                self.selected = index.min(self.auth.len().saturating_sub(1));
+                if let Some(row) = self.auth.get(self.selected).filter(|r| r.oauth_capable) {
+                    return vec![UiAction::AuthStart(row.id.clone())];
+                }
+            }
             NavStep::AuthCancelKey | NavStep::AuthKeyDone => self.auth_key = None,
             NavStep::OpenPicker(kind) => {
                 self.push(Screen::Picker);
@@ -1632,7 +1650,7 @@ impl Nav {
 
     /// The last help scroll position that still shows the tab's last row.
     fn help_max_scroll(&self) -> usize {
-        help::tab_lines(self.help_tab).len().saturating_sub(HELP_VISIBLE)
+        help::rows_for(self.help_tab).len().saturating_sub(HELP_VISIBLE)
     }
 
     /// Records a theme change: the view applies it once (see [`ThemeChange`]),
@@ -1710,7 +1728,7 @@ impl Nav {
             theme: self.theme,
             theme_change: self.theme_change,
             help_tab: self.help_tab,
-            help_rows: help::tab_lines(self.help_tab),
+            help_rows: help::rows_for(self.help_tab),
             help_scroll: self.help_scroll.min(self.help_max_scroll()),
             cloud: self.cloud.clone(),
             vault: self.vault.is_some(),
@@ -2250,6 +2268,51 @@ mod auth_tests {
         nav.apply(NavStep::Move(1));
         assert_eq!(nav.apply(NavStep::Activate), vec![UiAction::AuthStart("openai-compat".into())]);
         assert_eq!(nav.view().auth_key, None);
+    }
+
+    #[test]
+    fn an_oauth_row_has_both_actions_the_sign_in_and_the_key_entry() {
+        let snap = snapshot(vec![
+            provider("anthropic", "Anthropic", "not configured", true),
+            provider("openai-compat", "OpenAI / ChatGPT", "not configured", true),
+        ]);
+        let mut nav = auth_nav(&snap);
+        // The web's key button opens the entry, not the browser sign-in.
+        assert!(nav.apply(NavStep::KeyRow(1)).is_empty());
+        assert_eq!(nav.view().auth_key.as_deref(), Some("openai-compat"));
+        assert_eq!(nav.selected(), 1);
+        nav.apply(NavStep::AuthCancelKey);
+        // The sign-in button starts the browser flow on that row.
+        assert_eq!(
+            nav.apply(NavStep::SignInRow(1)),
+            vec![UiAction::AuthStart("openai-compat".into())]
+        );
+        assert_eq!(nav.view().auth_key, None);
+        // Enter on the row still signs in, as for the Claude row.
+        assert_eq!(nav.apply(NavStep::Activate), vec![UiAction::AuthStart("openai-compat".into())]);
+    }
+
+    #[test]
+    fn a_key_only_row_takes_the_key_entry_and_ignores_the_sign_in() {
+        let snap = snapshot(vec![provider("openai", "OpenAI", "not configured", false)]);
+        let mut nav = auth_nav(&snap);
+        assert!(nav.apply(NavStep::SignInRow(0)).is_empty());
+        assert_eq!(nav.view().auth_key, None);
+        assert!(nav.apply(NavStep::KeyRow(0)).is_empty());
+        assert_eq!(nav.view().auth_key.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn the_key_action_does_not_switch_rows_while_a_key_is_typed() {
+        let snap = snapshot(vec![
+            provider("openai", "OpenAI", "not configured", false),
+            provider("openai-compat", "OpenAI / ChatGPT", "not configured", true),
+        ]);
+        let mut nav = auth_nav(&snap);
+        nav.apply(NavStep::KeyRow(0));
+        nav.apply(NavStep::KeyRow(1));
+        assert_eq!(nav.view().auth_key.as_deref(), Some("openai"));
+        assert!(nav.apply(NavStep::SignInRow(1)).is_empty());
     }
 
     #[test]

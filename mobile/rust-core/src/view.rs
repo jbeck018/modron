@@ -134,12 +134,23 @@ pub const WELCOME_KEYS: &str =
 pub fn welcome_lines(model: &str, version: &str) -> Vec<String> {
     vec![
         String::new(),
-        format!("\u{2726} modron v{version}"),
+        welcome_title(version),
         format!("  {WELCOME_TAGLINE}"),
         String::new(),
-        format!("  model {model}  \u{b7}  {WELCOME_KEYS}"),
+        format!("  {}  \u{b7}  {WELCOME_KEYS}", welcome_model_line(model)),
         String::new(),
     ]
+}
+
+/// The welcome's title (the app name and version), shared by the terminal's
+/// banner and the web's welcome state.
+pub fn welcome_title(version: &str) -> String {
+    format!("\u{2726} modron v{version}")
+}
+
+/// The welcome's model line (the model's name, the shared word `model`).
+pub fn welcome_model_line(model: &str) -> String {
+    format!("model {model}")
 }
 
 /// The theme names the app offers (`/theme`, the Settings theme row and the
@@ -232,6 +243,25 @@ pub fn connection_label(state: &ConnectionState) -> &'static str {
         ConnectionState::Connected => "connected",
         ConnectionState::Connecting => "connecting",
         ConnectionState::Disconnected => "disconnected",
+    }
+}
+
+/// The word while the app's driver is retrying a dropped link. The core does
+/// not reconnect on its own (a drop leaves `Disconnected`); the driver does,
+/// on a backoff, and says so through `reconnecting`. Both targets show this
+/// word from the snapshot's `connection_label`.
+pub const RECONNECTING_LABEL: &str = "reconnecting";
+/// The banner's button while the driver retries: try the link now, not at
+/// the next backoff step.
+pub const RETRY_NOW_LABEL: &str = "retry now";
+
+/// The connection word for a snapshot: `reconnecting` while the driver is
+/// retrying and the link is not up, else the core's word.
+pub fn retrying_label(state: &ConnectionState, reconnecting: bool) -> &'static str {
+    if reconnecting && *state != ConnectionState::Connected {
+        RECONNECTING_LABEL
+    } else {
+        connection_label(state)
     }
 }
 
@@ -414,6 +444,23 @@ pub const AUTH_KEY_PLACEHOLDER: &str = "paste an API key";
 pub const AUTH_WAITING_LABEL: &str = "waiting for the sign-in... esc backs out";
 pub const AUTH_CODE_LABEL: &str = "code";
 pub const AUTH_VISIT_LABEL: &str = "open";
+/// The terminal's key for the key entry on a credentials row (`k`, any row).
+pub const AUTH_KEY_KEY: &str = "k";
+/// The web's two actions on an OAuth-capable row (buttons): sign in through
+/// the browser, or paste an API key. A key-only row has the key action alone.
+pub const AUTH_ROW_SIGN_IN_LABEL: &str = "sign in";
+pub const AUTH_ROW_KEY_LABEL: &str = "api key";
+
+/// The terminal's hint on the selected credentials row: Enter does the
+/// row's default (sign in for an OAuth provider, else the key entry), and `k`
+/// always opens the key entry.
+pub fn auth_row_hint(oauth_capable: bool) -> String {
+    if oauth_capable {
+        format!("enter {AUTH_SIGN_IN_HINT} - {AUTH_KEY_KEY} {AUTH_KEY_HINT}")
+    } else {
+        format!("enter {AUTH_KEY_HINT}")
+    }
+}
 
 /// Usage lines for the task commands (copy, not prompt text).
 pub const BTW_USAGE: &str = "use /btw <quick question>";
@@ -2908,6 +2955,38 @@ mod task_copy_tests {
 #[cfg(test)]
 mod auth_copy_tests {
     use super::*;
+
+    #[test]
+    fn the_welcome_title_and_model_line_are_the_banner_words() {
+        let lines = welcome_lines("gpt", "1.2.3");
+        assert_eq!(lines[1], welcome_title("1.2.3"));
+        assert_eq!(
+            lines[4],
+            format!("  {}  \u{b7}  {WELCOME_KEYS}", welcome_model_line("gpt"))
+        );
+        assert_eq!(welcome_model_line("gpt"), "model gpt");
+    }
+
+    #[test]
+    fn a_dropped_link_reads_as_reconnecting_only_while_the_driver_retries() {
+        use ConnectionState::*;
+        assert_eq!(retrying_label(&Disconnected, true), "reconnecting");
+        assert_eq!(retrying_label(&Connecting, true), "reconnecting");
+        assert_eq!(retrying_label(&Connected, true), "connected");
+        assert_eq!(retrying_label(&Disconnected, false), "disconnected");
+        assert_eq!(retrying_label(&Connecting, false), "connecting");
+        assert_eq!(RETRY_NOW_LABEL, "retry now");
+    }
+
+    #[test]
+    fn the_row_hint_names_both_actions_for_an_oauth_provider() {
+        assert_eq!(
+            auth_row_hint(true),
+            "enter sign in (browser) - k paste an API key"
+        );
+        assert_eq!(auth_row_hint(false), "enter paste an API key");
+        assert_eq!(AUTH_KEY_KEY, "k");
+    }
 
     #[test]
     fn auth_rows_join_the_core_label_and_status_with_a_colon() {

@@ -247,6 +247,8 @@ function textFrame(text) {
 // server does (no attach). `frames` keeps every client frame, parsed.
 function startWsServer(opts = {}) {
   let dropped = false;
+  // refuseAfterDrop: once dropped, reconnects get a 503 until `lift()`.
+  let refusing = true;
   const usedTickets = new Set();
   const received = [];
   const frames = [];
@@ -258,6 +260,10 @@ function startWsServer(opts = {}) {
     if (ticket) {
       if (usedTickets.has(ticket)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
       usedTickets.add(ticket);
+    }
+    if (opts.refuseAfterDrop && dropped && refusing) {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+      return;
     }
     const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + GUID).digest('base64');
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
@@ -292,6 +298,12 @@ function startWsServer(opts = {}) {
           (opts.after || []).forEach((extra, i) => send({ session: SESSION, seq: 2 + i, ...extra }));
         } else if (frame.type === 'submit') {
           onSubmit(frame);
+          // reasoningOnSubmit: the reply streams its reasoning (the page shows it
+          // only after the user opted in with /reasoning).
+          if (opts.reasoningOnSubmit) {
+            send({ session: SESSION, seq: 30, type: 'delta', delta: { kind: 'reasoning', text: 'The router keeps two tables, so the matcher is the piece to split out first.\n' } });
+            send({ session: SESSION, seq: 31, type: 'delta', delta: { kind: 'reasoning', text: 'The handlers then follow the same path into the new crate.' } });
+          }
         } else if (frame.type === 'steer') {
           // The scripted stream leaves the session running, so the composer
           // steers (PROTOCOL_V2 section 2). The cases below only care that
@@ -327,7 +339,7 @@ function startWsServer(opts = {}) {
     });
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
-    resolve({ url: `ws://127.0.0.1:${server.address().port}/`, submitted, received, frames, close: () => server.close() });
+    resolve({ url: `ws://127.0.0.1:${server.address().port}/`, submitted, received, frames, close: () => server.close(), lift: () => { refusing = false; } });
   }));
 }
 
@@ -1539,6 +1551,52 @@ async function testNoErrorsAcrossReconnect(browser, base) {
   }
 }
 
+// A dropped link (web): the banner reads `reconnecting` with a `retry now`
+// button (44 px). While the server refuses, the driver keeps retrying; the
+// button reconnects at once and the banner goes.
+async function testReconnectingBannerAndRetryNow(browser, base) {
+  const ws = await startWsServer({ dropOnce: true, refuseAfterDrop: true });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('reconnecting'), null, { timeout: TIMEOUT });
+    const retry = page.getByRole('button', { name: 'retry now', exact: true });
+    await retry.waitFor({ timeout: TIMEOUT });
+    const box = await retry.boundingBox();
+    if (!box || box.height < 44) throw new Error('retry now is under 44 px: ' + JSON.stringify(box));
+    const attaches = () => ws.received.filter((t) => t === 'attach').length;
+    const before = attaches();
+    ws.lift();
+    await retry.click();
+    for (let i = 0; i < 100 && attaches() <= before; i++) await new Promise((r) => setTimeout(r, 100));
+    if (attaches() <= before) throw new Error('retry now did not reconnect');
+    await page.waitForFunction(() => !document.body.innerText.includes('reconnecting'), null, { timeout: TIMEOUT });
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// A blank session (web): the welcome is one empty state (the app's title, the
+// tagline, the model line). The terminal's key hints are not drawn on the web.
+async function testWebWelcomeEmptyState(browser, base) {
+  const ws = await startWsServer({ quiet: true });
+  try {
+    const { page, errors } = await openIdle(browser, base, ws);
+    await page.waitForFunction(() => document.body.innerText.includes('a token-efficient Rust coding agent'), null, { timeout: TIMEOUT }).catch(async (e) => {
+      throw new Error('no welcome: ' + JSON.stringify(await page.evaluate(() => document.body.innerText)).slice(0, 700) + ' / ' + e.message);
+    });
+    const text = await page.evaluate(() => document.body.innerText);
+    if (!/modron v\S+/.test(text)) throw new Error('the welcome shows no title: ' + text.slice(0, 300));
+    if (!/\bmodel\b/.test(text)) throw new Error('the welcome shows no model line');
+    if (/shift\+enter|pgup|esc interrupt/i.test(text)) throw new Error('terminal key hints on the web welcome');
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // Credentials: the screen opens on the first run (nothing signed in). Enter on
 // the OAuth row sends auth_start; on the key row the masked entry sends
 // auth_set_key with the typed key, and the key leaves the page afterwards.
@@ -1621,6 +1679,43 @@ async function testChatGptSignIn(browser, base) {
   }
 }
 
+// An OAuth-capable row has two buttons (web): `api key` opens the masked entry
+// and the key is sent as auth_set_key for that provider; `sign in` starts the
+// device flow. Both work on the ChatGPT row, which Enter alone could not reach.
+async function testChatGptRowHasKeyAndSignInButtons(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'not configured', oauth_capable: true },
+    { id: 'openai-compat', label: 'OpenAI / ChatGPT', status: 'not configured', oauth_capable: true },
+  ];
+  const ws = await startWsServer({ providers, oauth: true });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.body.innerText.includes('ChatGPT'), null, { timeout: TIMEOUT });
+    const keyButton = page.getByRole('button', { name: 'api key', exact: true });
+    await keyButton.nth(1).click();
+    await page.waitForFunction(() => document.body.innerText.includes('OpenAI / ChatGPT: paste an API key'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.activeElement && document.activeElement.type === 'password', null, { timeout: TIMEOUT });
+    await page.keyboard.type('sk-chatgpt-456');
+    await page.waitForFunction(() => document.activeElement.value === 'sk-chatgpt-456', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    const saved = await waitFrame(ws, 'auth_set_key', (f) => f.provider === 'openai-compat');
+    if (saved.key !== 'sk-chatgpt-456') throw new Error('auth_set_key sent the wrong key');
+    await page.waitForFunction(() => !document.body.innerText.includes('OpenAI / ChatGPT: paste an API key'), null, { timeout: TIMEOUT });
+    if (ws.received.includes('auth_start')) throw new Error('the key button started a sign-in');
+    await page.getByRole('button', { name: 'sign in', exact: true }).nth(1).click();
+    const started = await waitFrame(ws, 'auth_start', (f) => f.provider === 'openai-compat');
+    if (started.provider !== 'openai-compat') throw new Error('auth_start was ' + JSON.stringify(started));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
 // /agent opens the persona picker: the server's personas are its rows, and a
 // tap on a row sends set_config with that persona.
 async function testPersonaPicker(browser, base) {
@@ -1665,8 +1760,55 @@ async function testCredentialRemove(browser, base) {
     const removes = await page.getByText('remove', { exact: true }).count();
     if (removes !== 1) throw new Error(`expected one remove control, saw ${removes}`);
     await tapLabel(page, 'remove');
-    await page.waitForFunction((s) => document.body.innerText.includes(s), 'remove Anthropic credentials? y / n', { timeout: TIMEOUT });
+    await page.waitForFunction((s) => document.body.innerText.includes(s), 'remove Anthropic credentials?', { timeout: TIMEOUT });
     await tapLabel(page, 'y');
+    const removed = await waitFrame(ws, 'auth_remove');
+    if (removed.provider !== 'anthropic') throw new Error('auth_remove was ' + JSON.stringify(removed));
+    if (errors.length) throw new Error('page errors: ' + errors.join('; '));
+    await page.close();
+  } finally {
+    ws.close();
+  }
+}
+
+// A confirmation is a modal dialog (web): the question without the terminal's
+// `y / n` hint, the y and n buttons. Tab keeps the focus inside it, Escape
+// closes it without sending anything, and y sends the removal.
+async function testConfirmDialog(browser, base) {
+  const providers = [
+    { id: 'anthropic', label: 'Anthropic', status: 'configured', oauth_capable: true },
+  ];
+  const ws = await startWsServer({ providers });
+  try {
+    const { page, errors } = await openLive(browser, base, ws);
+    await page.waitForFunction(() => document.activeElement && ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName), null, { timeout: TIMEOUT });
+    await page.keyboard.type('/auth');
+    await page.waitForFunction(() => document.activeElement.value === '/auth', null, { timeout: TIMEOUT });
+    await page.keyboard.press('Enter');
+    await waitRow(page, 'Anthropic', 'configured');
+    await tapLabel(page, 'remove');
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor({ timeout: TIMEOUT });
+    const shown = await dialog.innerText();
+    if (!shown.includes('remove Anthropic credentials?')) throw new Error('the dialog asks: ' + shown);
+    if (shown.includes('y / n')) throw new Error('the dialog shows the terminal key hint: ' + shown);
+    // The dialog slides in (the platform's modal motion) and the page behind
+    // it becomes inert: that is the focus trap (keyboard Tab does not walk the
+    // page on this target at all, with or without a dialog).
+    await page.waitForFunction(() => { const d = document.querySelector('[role="dialog"]'); return d && !d.style.transform; }, null, { timeout: TIMEOUT });
+    const trapped = await page.evaluate(() => {
+      const d = document.querySelector('[role="dialog"]');
+      const behind = [...document.querySelectorAll('[inert]')].filter((e) => !d.contains(e));
+      return { inert: behind.length, dialogHasStops: d.querySelectorAll('[role="button"]').length };
+    });
+    if (trapped.inert === 0) throw new Error('nothing behind the dialog is inert: no focus trap');
+    if (trapped.dialogHasStops < 2) throw new Error('the dialog has no buttons to focus');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('[role="dialog"]'), null, { timeout: TIMEOUT });
+    if (ws.received.includes('auth_remove')) throw new Error('Escape removed the credential');
+    await tapLabel(page, 'remove');
+    await dialog.waitFor({ timeout: TIMEOUT });
+    await dialog.getByRole('button', { name: 'y', exact: true }).click();
     const removed = await waitFrame(ws, 'auth_remove');
     if (removed.provider !== 'anthropic') throw new Error('auth_remove was ' + JSON.stringify(removed));
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
@@ -1685,7 +1827,7 @@ async function testDeleteAfterConfirmation(browser, base) {
     await tapLabel(page, 'sessions');
     await page.waitForFunction(() => document.body.innerText.includes('other work'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'delete');
-    await page.waitForFunction(() => document.body.innerText.includes('delete other work? y / n'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('delete other work?'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'y');
     const frame = await waitFrame(ws, 'delete_session', (f) => f.session_id === other);
     if (frame.session_id !== other) throw new Error('delete carried ' + frame.session_id);
@@ -1734,7 +1876,7 @@ async function testAgentSteerAndKill(browser, base) {
     const steer = await waitFrame(ws, 'steer_agent', (f) => f.text === 'focus tests');
     if (steer.agent !== 'agent-review') throw new Error('steer carried ' + steer.agent);
     await tapLabel(page, 'kill');
-    await page.waitForFunction(() => document.body.innerText.includes('kill reviewer? y / n'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('kill reviewer?'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'y');
     const kill = await waitFrame(ws, 'kill_agent', (f) => f.agent === 'agent-review');
     if (kill.agent !== 'agent-review') throw new Error('kill carried ' + kill.agent);
@@ -1861,7 +2003,7 @@ async function testCloudRemoveAccount(browser, site) {
     await openCloud(page);
     await page.waitForFunction(() => document.body.innerText.includes('octocat \u00b7 token'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'remove');
-    await page.waitForFunction(() => document.body.innerText.includes('remove octocat? y / n'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('remove octocat?'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'y');
     await waitUntil(() => site.state.accountDeletes.includes('a1'), 'the DELETE');
     await page.waitForFunction(() => document.body.innerText.includes('no github accounts yet'), null, { timeout: TIMEOUT });
@@ -1990,7 +2132,7 @@ async function testVaultKeyRows(browser, site) {
     await waitRow(page, 'OpenAI', 'saved in the vault');
     if ((await page.content()).includes('sk-vault-1')) throw new Error('the key stayed on the page');
     await tapLabel(page, 'remove');
-    await page.waitForFunction(() => document.body.innerText.includes('remove OpenAI credentials? y / n'), null, { timeout: TIMEOUT });
+    await page.waitForFunction(() => document.body.innerText.includes('remove OpenAI credentials?'), null, { timeout: TIMEOUT });
     await tapLabel(page, 'y');
     await waitUntil(() => site.state.vaultDeletes.includes('openai'), 'the vault DELETE');
     if (ws.received.includes('auth_remove')) throw new Error('the removal went over the session socket');
@@ -2038,11 +2180,15 @@ if (require.main === module) (async () => {
     ['(m) model picker row sends set_config with the model', () => testModelPickerSendsConfig(browser, base)],
     ['(n) delete asks inline, then the yes control sends delete_session', () => testDeleteAfterConfirmation(browser, base)],
     ['(t) no page or console error for a few seconds and across a forced reconnect', () => testNoErrorsAcrossReconnect(browser, base)],
+    ['(t2) a dropped link reads reconnecting with a 44 px retry now that reconnects at once', () => testReconnectingBannerAndRetryNow(browser, base)],
+    ['(t3) a blank web session: one welcome empty state, no terminal key hints', () => testWebWelcomeEmptyState(browser, base)],
     ['(s) credentials: /auth opens it, OAuth sends auth_start, a typed key is sent once and leaves the page', () => testCredentialsScreen(browser, base)],
     ['(s2) ChatGPT row: Enter starts the device flow; the URL and code show, then the outcome', () => testChatGptSignIn(browser, base)],
+    ['(s2a) ChatGPT row: the api key button opens the masked entry, the sign-in button starts the device flow', () => testChatGptRowHasKeyAndSignInButtons(browser, base)],
     ['(s2) agent picker: /agent lists the server personas, a tap sends set_config with the persona', () => testPersonaPicker(browser, base)],
     ['(s2b) agent picker: the first row clears the persona with an empty set_config', () => testPersonaClear(browser, base)],
     ['(s3) credentials: remove on a signed-in row only, asks y / n, then sends auth_remove', () => testCredentialRemove(browser, base)],
+    ['(s4) a confirmation is a modal dialog: no key hint, Tab stays inside, Escape cancels, y sends', () => testConfirmDialog(browser, base)],
     ['(o) agent screen: steer sends steer_agent, kill confirms then sends kill_agent', () => testAgentSteerAndKill(browser, base)],
     ['(q) shift+enter adds a line and does not submit', () => testShiftEnterNewline(browser, base)],
     ['(r) esc on a pending approval sends deny', () => testEscDeniesApproval(browser, base)],
