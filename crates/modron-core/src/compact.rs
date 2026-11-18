@@ -394,7 +394,7 @@ mod tests {
         let mut with_fact = base.clone();
         with_fact.push(SessionEvent::HandedOff {
             to: None,
-            at: chrono::Utc::now(),
+            at: modron_types::Timestamp::now(),
             carrier_ref: "refs/heads/modron/handoff/x".into(),
         });
         assert!(!is_transcript_item(with_fact.last().unwrap()));

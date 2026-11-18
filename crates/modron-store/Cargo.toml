@@ -13,7 +13,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-chrono.workspace = true
+modron-types = { path = "../modron-types", version = "0.1.0" }
 # spawn_blocking: fs work stays off the async workers (2026-11-12 audit).
 tokio = { workspace = true, default-features = false, features = ["rt"] }
 

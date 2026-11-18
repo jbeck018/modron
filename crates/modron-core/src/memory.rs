@@ -138,7 +138,7 @@ impl MemoryStore {
         fs::create_dir_all(&entries_dir)
             .map_err(|err| io_err(&err, format!("cannot create {}", entries_dir.display())))?;
 
-        let now = chrono::Utc::now();
+        let now = modron_types::Timestamp::now();
         let date = now.format("%Y-%m-%d").to_string();
         let stamp = now.format("%Y%m%dT%H%M%S%3f").to_string();
         let title_slug = slugify(title, MAX_TITLE_SLUG);
@@ -329,7 +329,7 @@ impl MemoryStore {
         }
         fs::create_dir_all(&self.root)
             .map_err(|err| io_err(&err, format!("cannot create {}", self.root.display())))?;
-        let now = chrono::Utc::now();
+        let now = modron_types::Timestamp::now();
         let stamp = now.format("%Y%m%dT%H%M%S%3f").to_string();
         let crumb = Breadcrumb {
             id: format!("bc-{stamp}-{}", short_hash(text)),
@@ -460,7 +460,7 @@ impl MemoryStore {
         let mut stats = self.load_stats();
         let stat = stats.entry(id.to_string()).or_default();
         stat.uses += 1;
-        stat.last_used = chrono::Utc::now().to_rfc3339();
+        stat.last_used = modron_types::Timestamp::now().to_rfc3339();
         let _ = self.write_stats(&stats);
     }
 
@@ -541,7 +541,7 @@ impl MemoryStore {
     /// usefulness score has gone non-positive, reinstate ones that recovered,
     /// and drop stale breadcrumbs. Idempotent.
     pub fn curate(&self, policy: CuratePolicy) -> Result<CurateReport> {
-        let now = chrono::Utc::now();
+        let now = modron_types::Timestamp::now();
         let mut report = CurateReport::default();
         let _lock = self.lock();
         let facts = self.facts_oldest_first();
@@ -552,9 +552,9 @@ impl MemoryStore {
                 let stat = stats.entry(id.clone()).or_default();
                 let created = entry_created_older(label); // YYYY-MM-DD from the label
                 let last_used = parse_rfc3339(&stat.last_used).or(created).unwrap_or(now); // unknown → no idle decay yet
-                let idle_days = (now - last_used).num_days().max(0) as f64;
+                let idle_days = modron_types::whole_days(now - last_used).max(0) as f64;
                 let age_days = created
-                    .map(|c| (now - c).num_days().max(0) as f64)
+                    .map(|c| modron_types::whole_days(now - c).max(0) as f64)
                     .unwrap_or(0.0);
                 let score = usefulness_score(stat, idle_days);
                 let was = stat.relegated;
@@ -575,7 +575,9 @@ impl MemoryStore {
                 .into_iter()
                 .filter(|c| {
                     parse_rfc3339(&c.created)
-                        .map(|t| (now - t).num_days() as f64 <= policy.breadcrumb_ttl_days)
+                        .map(|t| {
+                            modron_types::whole_days(now - t) as f64 <= policy.breadcrumb_ttl_days
+                        })
                         .unwrap_or(true)
                 })
                 .collect();
@@ -614,19 +616,15 @@ fn usefulness_score(stat: &FactStat, idle_days: f64) -> f64 {
 }
 
 /// `YYYY-MM-DD` label prefix → a UTC midnight timestamp.
-fn entry_created_older(label: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+fn entry_created_older(label: &str) -> Option<modron_types::Timestamp> {
     let date = label.get(0..10)?;
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .ok()?
-        .and_hms_opt(0, 0, 0)?
-        .and_utc()
-        .into()
+    let day = jiff::civil::Date::strptime("%Y-%m-%d", date).ok()?;
+    let midnight = day.at(0, 0, 0, 0).to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+    Some(modron_types::Timestamp::from_jiff(midnight.timestamp()))
 }
 
-fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&chrono::Utc))
+fn parse_rfc3339(s: &str) -> Option<modron_types::Timestamp> {
+    modron_types::Timestamp::parse_rfc3339(s)
 }
 
 /// Lowercased query tokens, punctuation split, empties dropped.
@@ -896,7 +894,9 @@ mod tests {
         assert!(entry.path.is_file(), "{:?} should exist", entry.path);
         assert_eq!(
             entry.date,
-            chrono::Utc::now().format("%Y-%m-%d").to_string()
+            modron_types::Timestamp::now()
+                .format("%Y-%m-%d")
+                .to_string()
         );
 
         let index = store.read_index();
@@ -1181,7 +1181,9 @@ body second
             let mut stats = store.stats();
             let stat = stats.entry(workhorse.clone()).or_default();
             stat.uses = 50;
-            stat.last_used = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            stat.last_used = (modron_types::Timestamp::now()
+                - jiff::SignedDuration::from_hours(24 * 30))
+            .to_rfc3339();
             std::fs::write(
                 store.root().join("stats.json"),
                 serde_json::to_string(&stats).unwrap(),
@@ -1208,7 +1210,8 @@ body second
             id: "bc-stale".into(),
             text: "old crumb".into(),
             tags: vec![],
-            created: (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339(),
+            created: (modron_types::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 365))
+                .to_rfc3339(),
         };
         std::fs::write(
             store.root().join("breadcrumbs.jsonl"),

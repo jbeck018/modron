@@ -928,7 +928,11 @@ pub fn transcript_px(
     }
     let (turn, tools, swarm) = live;
     if turn {
-        reserve += STRIP_H + tools.min(chat::TOOL_SLOTS) as f32 * 18.0;
+        // With the detail panel open the strip shows its summary only.
+        reserve += STRIP_H;
+        if !tool_panel {
+            reserve += tools.min(chat::TOOL_SLOTS) as f32 * 18.0;
+        }
     }
     reserve += swarm.min(4) as f32 * 20.0;
     reserve += (lines - 1) as f32 * COMPOSER_LINE_PX;

@@ -243,7 +243,7 @@ impl InMemoryStore {
 impl SessionStore for InMemoryStore {
     async fn create_session(&self, title: &str) -> Result<SessionMeta> {
         let mut sessions = lock(&self.sessions);
-        let now = chrono::Utc::now();
+        let now = modron_types::Timestamp::now();
         let meta = SessionMeta {
             id: Uuid::new_v4(),
             title: title.to_string(),
@@ -297,7 +297,7 @@ impl SessionStore for InMemoryStore {
         if matches!(event, SessionEvent::Message { .. }) {
             record.meta.message_count += 1;
         }
-        record.meta.updated_at = chrono::Utc::now();
+        record.meta.updated_at = modron_types::Timestamp::now();
         record.events.push(event.clone());
         Ok(())
     }

@@ -301,7 +301,7 @@ async fn fire(state: &Arc<ServerState>, automation: &Automation) -> Result<Sessi
     // Update the registry: last_run stamp + next due.
     let mut all = load(state);
     if let Some(entry) = all.iter_mut().find(|a| a.name == automation.name) {
-        entry.last_run = chrono::Utc::now().to_rfc3339();
+        entry.last_run = modron_types::Timestamp::now().to_rfc3339();
         entry.next_due_epoch =
             Some(now_epoch().saturating_add((automation.interval_minutes as u64) * 60));
         let _ = save(state, &all);

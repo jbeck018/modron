@@ -382,7 +382,9 @@ pub(crate) async fn run_evals(
     }
 
     let mcp = crate::spawn_mcp_servers(cfg, &cli.working_dir).await?;
-    let stamp = chrono::Utc::now().to_rfc3339().replace([':', '+'], "-");
+    let stamp = modron_types::Timestamp::now()
+        .to_rfc3339()
+        .replace([':', '+'], "-");
     let workspaces_root = std::env::temp_dir().join(format!("modron-evals-{stamp}"));
     std::fs::create_dir_all(&workspaces_root)?;
     let mut all: Vec<EvalResult> = Vec::new();

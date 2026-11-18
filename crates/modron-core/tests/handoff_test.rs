@@ -2,9 +2,9 @@
 //! host that handed it off; a longer log that continues past the HandedOff
 //! line brings it back.
 
-use chrono::Utc;
 use modron_core::testing::{InMemoryStore, MockProvider, StaticSelector};
 use modron_core::{Engine, EngineConfig, ModelProvider, SessionEvent, SessionStore, ToolRegistry};
+use modron_types::Timestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ fn engine(provider: Arc<dyn ModelProvider>, store: Arc<InMemoryStore>) -> Engine
 fn handed_off() -> SessionEvent {
     SessionEvent::HandedOff {
         to: Some("laptop".into()),
-        at: Utc::now(),
+        at: Timestamp::now(),
         carrier_ref: "refs/heads/modron/handoff/x".into(),
     }
 }

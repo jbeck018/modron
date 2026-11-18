@@ -2001,7 +2001,7 @@ pub mod oauth {
             "access_token": tokens.access_token,
             "refresh_token": tokens.refresh_token,
             "expires_in": tokens.expires_in,
-            "saved_at": chrono::Utc::now().to_rfc3339(),
+            "saved_at": modron_types::Timestamp::now().to_rfc3339(),
         });
         super::write_private(&path, &body.to_string())?;
         #[cfg(unix)]
@@ -2575,7 +2575,7 @@ pub mod oauth {
                 "access_token": auth.access_token,
                 "refresh_token": auth.refresh_token,
                 "account_id": auth.account_id,
-                "saved_at": chrono::Utc::now().to_rfc3339(),
+                "saved_at": modron_types::Timestamp::now().to_rfc3339(),
             });
             super::super::write_private(path, &body.to_string())?;
             #[cfg(unix)]

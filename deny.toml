@@ -4,14 +4,7 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  # chrono declared unmaintained on 2026-11 (all versions, no safe upgrade).
-  # It is not a vulnerability. chrono's DateTime is in the persisted session
-  # format (modron-types), so leaving it is a migration to jiff or time, not
-  # a version bump. Tracked in LEDGER.md (row DEP-1); remove this entry when
-  # that lands.
-  { id = "RUSTSEC-2026-0543", reason = "unmaintained, no fix available; migration tracked as DEP-1" },
-]
+ignore = []
 
 [licenses]
 version = 2

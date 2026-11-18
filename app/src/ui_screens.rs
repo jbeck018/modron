@@ -81,16 +81,14 @@ fn setting_row(
     let value =
         move || nav.with(|n| n.settings.get(i).map(|r| r.value.clone()).unwrap_or_default());
     let press = actions.clone();
-    let remove = when(
-        move || nav.with(|n| n.settings.get(i).is_some_and(|r| r.remove.is_some())),
-        move || {
-            let remove = actions.clone();
-            ui::button(REMOVE_LABEL, Variant::Destructive, Size::Sm, move || {
-                let _ = remove.send(UiAction::Nav(NavStep::AskSettingRemove(i)));
-            })
-        },
-    );
-    ui::row(ui::value_pair(label, value), Some(remove.into_element()), move || {
+    let shown = move || nav.with(|n| n.settings.get(i).is_some_and(|r| r.remove.is_some()));
+    let remove = when(shown, move || {
+        let remove = actions.clone();
+        ui::button(REMOVE_LABEL, Variant::Destructive, Size::Sm, move || {
+            let _ = remove.send(UiAction::Nav(NavStep::AskSettingRemove(i)));
+        })
+    });
+    ui::row(ui::value_pair(label, value), Some(ui::trailing(remove, shown)), move || {
         if let Some(action) = nav.with(|n| n.settings.get(i).and_then(|r| r.action.clone())) {
             let _ = press.send(action);
         }
@@ -122,7 +120,7 @@ fn push_row(nav: Signal<NavView>, actions: UnboundedSender<UiAction>) -> impl In
         move || nav.with(|n| n.push.as_ref().and_then(|p| p.note.clone()).unwrap_or_default());
     view()
         .flex_col()
-        .child(ui::static_row(ui::value_pair(label, value), Some(switch.into_element())))
+        .child(ui::static_row(ui::value_pair(label, value), Some(ui::trailing(switch, true))))
         .child(when(
             move || nav.with(|n| n.push.as_ref().is_some_and(|p| p.hint.is_some())),
             move || view().px(px(ui::GUTTER)).py(px(8.0)).child(ui::caption(hint)),
@@ -241,7 +239,7 @@ fn invite_row(
             let _ = actions.send(UiAction::RevokeInvite(id));
         }
     });
-    ui::static_row(view().flex_1().child(ui::caption(line)), Some(revoke.into_element()))
+    ui::static_row(view().flex_1().child(ui::caption(line)), Some(ui::trailing(revoke, true)))
 }
 
 /// The credentials screen: the provider rows as one card, the browser sign-in
@@ -301,18 +299,17 @@ fn credential_row(
     let press = actions.clone();
     let sign_in = actions.clone();
     let key = actions.clone();
-    let remove = when(
-        move || nav.with(|n| n.auth.get(i).is_some_and(|r| r.signed_in())),
-        move || {
-            let remove = actions.clone();
-            ui::button(REMOVE_LABEL, Variant::Destructive, Size::Sm, move || {
-                let _ = remove.send(UiAction::Nav(NavStep::AskAuthRemove(i)));
-            })
-        },
-    );
-    let row = ui::row(ui::value_pair(label, status), Some(remove.into_element()), move || {
-        let _ = press.send(UiAction::Nav(NavStep::ActivateRow(i)));
+    let shown = move || nav.with(|n| n.auth.get(i).is_some_and(|r| r.signed_in()));
+    let remove = when(shown, move || {
+        let remove = actions.clone();
+        ui::button(REMOVE_LABEL, Variant::Destructive, Size::Sm, move || {
+            let _ = remove.send(UiAction::Nav(NavStep::AskAuthRemove(i)));
+        })
     });
+    let row =
+        ui::row(ui::value_pair(label, status), Some(ui::trailing(remove, shown)), move || {
+            let _ = press.send(UiAction::Nav(NavStep::ActivateRow(i)));
+        });
     // An OAuth-capable row has both actions as buttons: the browser sign-in
     // and the key entry. A key-only row has its press (the key entry) alone.
     let oauth = move || nav.with(|n| n.auth.get(i).is_some_and(|r| r.oauth_capable));
@@ -582,7 +579,7 @@ fn session_row(
             let _ = actions.send(UiAction::Nav(NavStep::AskDelete(i)));
         }
     });
-    ui::row(view().flex_1().child(ui::body(line)), Some(delete.into_element()), move || {
+    ui::row(view().flex_1().child(ui::body(line)), Some(ui::trailing(delete, true)), move || {
         if let Some(id) = nav.with(|n| n.sessions.get(i).map(|r| r.id)) {
             let _ = actions.send(UiAction::Nav(NavStep::Attach(id)));
         }
@@ -655,7 +652,7 @@ fn task_row(
         move || nav.with(|n| n.tasks.get(i).is_some_and(|r| !r.summary.is_empty())),
         move || ui::caption(summary),
     ));
-    ui::row(content, Some(merge.into_element()), move || {
+    ui::row(content, Some(ui::trailing(merge, true)), move || {
         if let Some(id) = nav.with(|n| n.tasks.get(i).map(|r| r.id)) {
             let _ = actions.send(UiAction::Nav(NavStep::Attach(id)));
         }
@@ -719,7 +716,7 @@ fn automation_row(
     let delete = ui::button(DELETE_LABEL, Variant::Destructive, Size::Sm, move || {
         let _ = actions.send(UiAction::Nav(NavStep::AskRemove(i)));
     });
-    ui::static_row(view().flex_1().child(ui::body(line)), Some(delete.into_element()))
+    ui::static_row(view().flex_1().child(ui::body(line)), Some(ui::trailing(delete, true)))
 }
 
 /// The open inline form (automations and tasks): one field per line, the
@@ -887,7 +884,7 @@ fn cloud_account_row(
     let remove = ui::button(REMOVE_LABEL, Variant::Destructive, Size::Sm, move || {
         let _ = actions.send(UiAction::Nav(NavStep::AskAccountRemove(i)));
     });
-    ui::static_row(view().flex_1().child(ui::body(line)), Some(remove.into_element()))
+    ui::static_row(view().flex_1().child(ui::body(line)), Some(ui::trailing(remove, true)))
 }
 
 /// The new-run controls: the account picker (with more than one account), the

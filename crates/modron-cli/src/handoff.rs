@@ -10,10 +10,10 @@
 
 use crate::handoff_furrow::{settings_from_config, FurrowSettings};
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
 use modron_core::handoff::handed_off_ref;
 use modron_core::{SessionEvent, SessionId, SessionStore};
 use modron_store::JsonlSessionStore;
+use modron_types::Timestamp;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -202,7 +202,7 @@ pub async fn export(
                 id,
                 &SessionEvent::HandedOff {
                     to: None,
-                    at: Utc::now(),
+                    at: Timestamp::now(),
                     carrier_ref: carrier_ref.clone(),
                 },
             )
@@ -333,7 +333,7 @@ pub async fn export(
             id,
             &SessionEvent::HandedOff {
                 to: None,
-                at: Utc::now(),
+                at: Timestamp::now(),
                 carrier_ref: tree_ref.clone(),
             },
         )
@@ -733,7 +733,7 @@ mod tests {
     fn handed_off_line() -> String {
         event_line(&SessionEvent::HandedOff {
             to: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             carrier_ref: "refs/heads/modron/handoff/x".into(),
         })
     }

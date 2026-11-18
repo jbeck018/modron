@@ -2311,7 +2311,8 @@ async fn run_sessions_vacuum(
     older_than_days: u64,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(clamp_vacuum_days(older_than_days));
+    let cutoff = modron_types::Timestamp::now()
+        - jiff::SignedDuration::from_hours(24 * clamp_vacuum_days(older_than_days));
     let store = JsonlSessionStore::new(sessions_dir);
     let sessions = store
         .list()
@@ -2573,10 +2574,10 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Upper bound for session-age inputs (`--older-than-days`, `ttl_days`).
 /// 100 years is far beyond any retention window and keeps
-/// `chrono::Duration::days` well inside its range (it panics when too large).
+/// `jiff::SignedDuration::from_hours` well inside its range (it panics when too large).
 const MAX_VACUUM_DAYS: u64 = 36_500;
 
-/// Clamp a user-supplied session age so `chrono::Duration::days` cannot panic.
+/// Clamp a user-supplied session age so the cutoff arithmetic cannot panic.
 fn clamp_vacuum_days(days: u64) -> i64 {
     days.min(MAX_VACUUM_DAYS) as i64
 }
@@ -2950,7 +2951,9 @@ async fn run_bench(
     if let Some(home) = dirs::home_dir() {
         let dir = home.join(".modron").join("bench");
         let _ = std::fs::create_dir_all(&dir);
-        let stamp = chrono::Utc::now().to_rfc3339().replace([':', '+'], "-");
+        let stamp = modron_types::Timestamp::now()
+            .to_rfc3339()
+            .replace([':', '+'], "-");
         let path = dir.join(format!("{stamp}.jsonl"));
         if let Ok(file) = std::fs::File::create(&path) {
             use std::io::Write as _;
@@ -4073,8 +4076,9 @@ mod tests {
     fn vacuum_days_are_clamped_so_duration_cannot_panic() {
         assert_eq!(clamp_vacuum_days(7), 7);
         assert_eq!(clamp_vacuum_days(u64::MAX), 36_500);
-        // Would panic inside chrono before the clamp (value past i64 range).
-        let _ = chrono::Utc::now() - chrono::Duration::days(clamp_vacuum_days(u64::MAX));
+        // Would overflow before the clamp (value past i64 range).
+        let _ = modron_types::Timestamp::now()
+            - jiff::SignedDuration::from_hours(24 * clamp_vacuum_days(u64::MAX));
     }
 
     #[test]

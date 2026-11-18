@@ -48,6 +48,8 @@ composed from NSH primitives in the same style, and is listed below.
   Header bar 52 pt. List rows at least 52 pt; the whole row presses.
 - Cards: card token, 1 pt border in the border token, the radius, no shadow.
   Rows separate with a 1 pt bottom border.
+- Outline's edge is the `muted-foreground` token: the `border` and `input`
+  tokens are #2A2A2A in dark, invisible on a card.
 - Hover (pointer): accent fill for ghost, outline, link and rows; opacity 0.9
   or 0.92 for the filled variants. Pressed: opacity 0.75 (rows: muted fill).
   Focus: 2 pt ring in the ring token, on keyboard focus only (`focus_visible`;
@@ -88,6 +90,9 @@ wrap it the same way in `ui.rs`.
 - `search_field(value, placeholder)`.
 - `badge(label, Tone)`, `alert(Tone, text)`, `skeleton(height)`,
   `separator()`, `status_dot(tone)`, `empty_state(title, line, action)`.
+- `trailing(control, shown)`: a row's trailing slot. It keeps 8 pt at the
+  row's end only while `shown` holds, so a hidden control leaves the press
+  fill at the card's edge. Pass `true` for an always-shown control.
 - `list_row(title, subtitle, trailing, press)`: `.disabled(flag)` stops the
   press; `.style_when(.., |s| s.opacity(0.5))` dims a row whose press the
   navigation decides on (the portal's offline rows).
@@ -190,7 +195,7 @@ Chat components: `ui::button_text` (a reactive label, for the core's option
 words; `ui::button` wraps it), and in `ui_chat`: `bar`, `banner`, `cell`,
 `dock`, `summary_row`, `transcript_px`, `blocks` (the fence parser, tested).
 
-Layout limits of NSH 0.5.1 (see the code comments):
+Layout limits found on NSH 0.5.1 (see the code comments; not re-measured on 0.6.0):
 
 - `LineHeight` is not publicly re-exported, so leading is a point value
   computed from the font size.
@@ -255,13 +260,6 @@ Their constants stay in the shared table.
 - Keyboard Tab does not move focus on the web target, with or without a
   dialog: the runtime takes Tab and finds no stop. A dialog's focus trap is the
   platform's (the page behind it is inert), not Tab's.
-- While the tool panel is open its activity shows twice: the panel card, and
-  the live strip's rows (plain text under the strip's summary).
-- The outline buttons on a dark card have a faint border (the border token on
-  near-black).
-- A row's trailing control keeps 8 pt at the right even when it is hidden, so a
-  key-only credentials row's press fill stops short of the card's edge.
-
 - The soft keyboard cannot be driven from Playwright: the sign-in card is
   centred and scrolls, but its behaviour with a real keyboard is unverified.
 - The terminal bodies that the web no longer draws (the old text rows in

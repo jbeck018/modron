@@ -219,7 +219,7 @@ terminal app.
 
 ## Web bundle
 
-Needs the NSH CLI (0.5.1), the wasm32 target, and the wasm-bindgen CLI at
+Needs the NSH CLI (0.6.0), the wasm32 target, and the wasm-bindgen CLI at
 the version the runtime links (0.2.130; the build prints the name it wants).
 
     rustup target add wasm32-unknown-unknown

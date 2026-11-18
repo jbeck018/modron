@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod timestamp;
+pub use timestamp::{whole_days, Timestamp};
+
 /// Session identifier (uuid v4 at creation time).
 pub type SessionId = uuid::Uuid;
 
@@ -286,8 +289,8 @@ pub enum StreamDelta {
 pub struct SessionMeta {
     pub id: SessionId,
     pub title: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     pub message_count: u32,
     /// Lineage (Program V4, additive): set on a session created by `/fork`
     /// and absent on every other session, including all older meta files.
@@ -436,7 +439,7 @@ pub enum SessionEvent {
     HandedOff {
         #[serde(default)]
         to: Option<String>,
-        at: chrono::DateTime<chrono::Utc>,
+        at: Timestamp,
         carrier_ref: String,
     },
     /// Team-mode stage note (additive): one short line at each stage boundary
