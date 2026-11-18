@@ -160,4 +160,6 @@ jobs:
           name: SHA256SUMS
           path: assets/SHA256SUMS
       - name: Attach SHA256SUMS to the release
-        run: gh release upload "$RELEASE_TAG" assets/SHA256SUMS --clobber
+        # --repo: this job has no checkout, and gh otherwise asks git for the
+        # repository.
+        run: gh release upload "$RELEASE_TAG" assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
