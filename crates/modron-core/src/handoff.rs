@@ -34,7 +34,7 @@ pub fn run_refusal(session_id: SessionId, events: &[SessionEvent]) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use modron_types::Timestamp;
 
     fn task(text: &str) -> SessionEvent {
         SessionEvent::Task { text: text.into() }
@@ -43,7 +43,7 @@ mod tests {
     fn handed_off() -> SessionEvent {
         SessionEvent::HandedOff {
             to: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
             carrier_ref: "refs/heads/modron/handoff/x".into(),
         }
     }

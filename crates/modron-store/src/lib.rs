@@ -224,7 +224,7 @@ impl Inner {
         if let Ok(disk) = self.read_meta(id) {
             meta.message_count = meta.message_count.max(disk.message_count);
         }
-        meta.updated_at = chrono::Utc::now();
+        meta.updated_at = modron_types::Timestamp::now();
         if meta_bump {
             meta.message_count = meta.message_count.saturating_add(1);
         }
@@ -314,7 +314,7 @@ impl Inner {
         &self,
         title: &str,
         id: SessionId,
-        now: chrono::DateTime<chrono::Utc>,
+        now: modron_types::Timestamp,
     ) -> Result<SessionMeta> {
         self.ensure_root()?;
         let meta = SessionMeta {
@@ -444,7 +444,7 @@ impl Inner {
         if let Ok(disk) = self.read_meta(id) {
             meta.message_count = meta.message_count.max(disk.message_count);
         }
-        meta.updated_at = chrono::Utc::now();
+        meta.updated_at = modron_types::Timestamp::now();
         meta.message_count = meta.message_count.saturating_add(meta_bumps as u32);
         self.write_meta(&meta)?;
         self.caches
@@ -542,7 +542,7 @@ impl JsonlSessionStore {
                 )
             })
             .count() as u32;
-        let now = chrono::Utc::now();
+        let now = modron_types::Timestamp::now();
         let mut meta = inner.read_meta(id).unwrap_or(SessionMeta {
             id,
             title: title.unwrap_or("handed-off session").to_string(),
@@ -597,7 +597,7 @@ impl JsonlSessionStore {
 impl SessionStore for JsonlSessionStore {
     async fn create_session(&self, title: &str) -> Result<SessionMeta> {
         let id = Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = modron_types::Timestamp::now();
         let title = title.to_string();
         self.block(move |inner| inner.create_session_sync(&title, id, now))
             .await

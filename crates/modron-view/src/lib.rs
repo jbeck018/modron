@@ -1390,7 +1390,7 @@ mod shell_tests {
             SessionEvent::Task { text: "t".into() },
             SessionEvent::HandedOff {
                 to: None,
-                at: chrono::Utc::now(),
+                at: modron_types::Timestamp::now(),
                 carrier_ref: "refs/heads/modron/handoff/x".into(),
             },
         ];

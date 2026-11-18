@@ -208,9 +208,10 @@ pub fn cached_update() -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     let checked_at = value.get("checked_at")?.as_str()?;
-    let checked = chrono::DateTime::parse_from_rfc3339(checked_at).ok()?;
-    let age = chrono::Utc::now().signed_duration_since(checked);
-    if age.num_hours() >= CHECK_TTL_HOURS {
+    let checked = modron_types::Timestamp::parse_rfc3339(checked_at)?;
+    let age = modron_types::Timestamp::now() - checked;
+    // Truncated whole hours, as chrono's num_hours().
+    if age.as_secs() / 3_600 >= CHECK_TTL_HOURS {
         return None;
     }
     let tag = value.get("newer_version")?.as_str()?;
@@ -230,7 +231,7 @@ pub fn cache_check(newer_version: Option<&str>) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let body = json!({
-        "checked_at": chrono::Utc::now().to_rfc3339(),
+        "checked_at": modron_types::Timestamp::now().to_rfc3339(),
         "newer_version": newer_version.unwrap_or(""),
     });
     std::fs::write(&path, body.to_string())?;
