@@ -798,7 +798,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
 
     // `modron doctor` — setup diagnostics (Phase 8).
     if let Some(Command::Doctor) = cli.command {
-        return run_doctor(&cfg);
+        return run_doctor(&cfg, &working_dir);
     }
 
     // `modron daemon …` — background engine management (Phase 9).
@@ -887,7 +887,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
             modron_core::credential_overlay::enable();
             modron_server::rc::refresh_portal_credentials_logged(bridge, token).await;
         }
-        let mcp = spawn_mcp_servers(&cfg).await?;
+        let mcp = spawn_mcp_servers(&cfg, &working_dir).await?;
         let agent = build_agent_with(
             &cli,
             &cfg,
@@ -937,31 +937,31 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
         action: McpAction::Read { name, uri },
     }) = &cli.command
     {
-        return run_mcp_read(&cfg, name.clone(), uri.clone()).await;
+        return run_mcp_read(&cfg, &working_dir, name.clone(), uri.clone()).await;
     }
     if let Some(Command::Mcp {
         action: McpAction::Info { name },
     }) = cli.command
     {
-        return run_mcp_info(&cfg, name).await;
+        return run_mcp_info(&cfg, &working_dir, name).await;
     }
     if let Some(Command::Mcp {
         action: McpAction::Trust { name, all },
     }) = cli.command.clone()
     {
-        return mcp_trust::run_trust(&cfg, name.as_deref(), all);
+        return mcp_trust::run_trust(&cfg, &working_dir, name.as_deref(), all);
     }
     if let Some(Command::Mcp {
         action: McpAction::Untrust { name },
     }) = cli.command.clone()
     {
-        return mcp_trust::run_untrust(name.as_deref());
+        return mcp_trust::run_untrust(&working_dir, name.as_deref());
     }
     if let Some(Command::Mcp {
         action: McpAction::List,
     }) = cli.command
     {
-        return mcp_trust::run_list(&cfg);
+        return mcp_trust::run_list(&cfg, &working_dir);
     }
 
     // `modron bench` — multi-model measurement (Phase 5f).
@@ -1026,7 +1026,7 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     };
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let mcp = spawn_mcp_servers(&cfg).await?;
+    let mcp = spawn_mcp_servers(&cfg, &working_dir).await?;
     let agent = build_agent_with(
         &cli,
         &cfg,
@@ -1878,7 +1878,7 @@ pub(crate) fn load_attachment(path: &Path) -> anyhow::Result<modron_core::Attach
 /// `modron doctor` (Phase 8): diagnose the setup — API keys, config,
 /// git, PDF support, and the terminal. Every check prints ✓/✗ with an
 /// actionable fix; the exit code reflects overall health.
-fn run_doctor(cfg: &config::Config) -> anyhow::Result<()> {
+fn run_doctor(cfg: &config::Config, working_dir: &Path) -> anyhow::Result<()> {
     let mut healthy = true;
 
     println!("modron {} — environment check", env!("CARGO_PKG_VERSION"));
@@ -1995,7 +1995,7 @@ fn run_doctor(cfg: &config::Config) -> anyhow::Result<()> {
 
     // Project files (V1): rules, commands and project MCP servers with trust.
     println!("\nproject files:");
-    for line in mcp_trust::doctor_lines(cfg) {
+    for line in mcp_trust::doctor_lines(cfg, working_dir) {
         println!("{line}");
     }
 
@@ -2094,7 +2094,7 @@ async fn run_daemon(action: DaemonAction, cli: &Cli, cfg: &config::Config) -> an
                 return Ok(());
             }
             // Build the engine with the current config.
-            let mcp = spawn_mcp_servers(cfg).await?;
+            let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
             let agent = build_agent_with(
                 cli,
                 cfg,
@@ -2120,9 +2120,14 @@ pub struct McpRegistration {
 /// Spawn every configured MCP server and collect its tools (Phase 5a).
 /// Per-server schema cost is enforced here — a server whose tools would
 /// fatten the prompt past its budget is refused with an actionable error.
-async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegistration>> {
+async fn spawn_mcp_servers(
+    cfg: &config::Config,
+    working_dir: &Path,
+) -> anyhow::Result<Vec<McpRegistration>> {
     // Modron's own [mcp.servers] first, then project servers the user trusted
-    // for this workspace (V1). A name clash keeps the config entry.
+    // for this workspace (V1). A name clash keeps the config entry. The
+    // workspace is the effective working dir (`--working-dir`), never the
+    // process cwd.
     let mut servers: Vec<(String, config::McpServerConfig)> = cfg
         .mcp
         .as_ref()
@@ -2133,10 +2138,8 @@ async fn spawn_mcp_servers(cfg: &config::Config) -> anyhow::Result<Vec<McpRegist
                 .collect()
         })
         .unwrap_or_default();
-    if let Ok(workspace) = std::env::current_dir() {
-        let configured = mcp_trust::configured_names(cfg);
-        servers.extend(mcp_trust::trusted_servers(&workspace, &configured));
-    }
+    let configured = mcp_trust::configured_names(cfg);
+    servers.extend(mcp_trust::trusted_servers(working_dir, &configured));
     let mut out = Vec::new();
     for (name, server) in &servers {
         let (handle, tools) = connect_mcp_server(name, server).await?;
@@ -2382,8 +2385,12 @@ async fn run_sessions_restart(sessions_dir: &Path, id: SessionId) -> anyhow::Res
 
 /// `modron mcp info <name>` (Phase 5e): spawn one configured server and
 /// print its tools (with schema costs), resources, and prompts.
-async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> {
-    let cfg = mcp_trust::with_project_server(cfg, &name)?;
+async fn run_mcp_info(
+    cfg: &config::Config,
+    working_dir: &Path,
+    name: String,
+) -> anyhow::Result<()> {
+    let cfg = mcp_trust::with_project_server(cfg, working_dir, &name)?;
     let cfg = &cfg;
     let Some(mcp) = &cfg.mcp else {
         anyhow::bail!("no [mcp.servers] configured");
@@ -2437,8 +2444,13 @@ async fn run_mcp_info(cfg: &config::Config, name: String) -> anyhow::Result<()> 
 /// `modron mcp read <server> <uri>`: read one resource's contents
 /// (2026-11-12 audit: `read_resource` existed and was tested, but no
 /// surface could reach it).
-async fn run_mcp_read(cfg: &config::Config, name: String, uri: String) -> anyhow::Result<()> {
-    let cfg = mcp_trust::with_project_server(cfg, &name)?;
+async fn run_mcp_read(
+    cfg: &config::Config,
+    working_dir: &Path,
+    name: String,
+    uri: String,
+) -> anyhow::Result<()> {
+    let cfg = mcp_trust::with_project_server(cfg, working_dir, &name)?;
     let cfg = &cfg;
     let handle = mcp_handle(cfg, &name).await?;
     let mut handle = handle.lock().await;
@@ -2697,7 +2709,7 @@ async fn run_bench(
         anyhow::bail!("--models parsed to an empty list");
     }
     let suite = bench_suite();
-    let mcp = spawn_mcp_servers(cfg).await?;
+    let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
 
     // Multi-provider support: each model's provider comes from the catalog;
     // the union of providers is built once. Free tiers all speak
@@ -3050,7 +3062,7 @@ async fn run_team_cli(
     // Refused before any provider or MCP server is set up.
     opts.check().map_err(anyhow::Error::msg)?;
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let mcp = spawn_mcp_servers(cfg).await?;
+    let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
     let agent = build_agent_with(
         cli,
         cfg,
@@ -3074,7 +3086,7 @@ async fn run_team_cli(
 
 async fn run_chat(cli: &Cli, cfg: &config::Config) -> anyhow::Result<()> {
     use std::io::Write as _;
-    let mcp = spawn_mcp_servers(cfg).await?;
+    let mcp = spawn_mcp_servers(cfg, &cli.working_dir).await?;
     let agent = build_agent_with(
         cli,
         cfg,

@@ -2,11 +2,20 @@
 //! splits the task into up to N independent work items with file scopes. Each
 //! item runs as a `delegate` child ([`crate::subagent::delegate_owned`], the
 //! same path as every other subagent) in its own git worktree under
-//! `.modron/worktrees/`, in parallel. The finished worktrees are committed and
-//! merged into the main checkout in item order, with `--no-ff` merge commits.
-//! A merge that does not apply becomes a fix item. The `[verify]` command and
-//! the reviewer pass then check the merged tree, and every failure becomes an
-//! item for the next round.
+//! `.modron/worktrees/`, in parallel. The team works on its own branch
+//! `team/<id>` (created from HEAD) in an integration worktree; the finished
+//! item worktrees are committed and merged into it in item order, with
+//! `--no-ff` merge commits. A merge that does not apply becomes a fix item.
+//! The `[verify]` command and the reviewer pass then check the integration
+//! tree, and every failure becomes an item for the next round.
+//!
+//! Landing: a clean run (see [`is_clean`]) fast-forwards the user's branch to
+//! `team/<id>` and deletes the team branch. Any other run leaves the user's
+//! branch untouched and keeps `team/<id>`, and the summary gives the
+//! `git merge` command. The team's worktrees and branch are removed when the
+//! run is dropped mid-flight ([`worktree::TeamGuard`]); a later run sweeps the
+//! leftovers of a team whose process is gone ([`worktree::sweep_stale`]). A
+//! dirty tracked tree at the start refuses the run.
 //!
 //! Limits: a round is clean when no item failed or conflicted and verify
 //! passed (or no verify command is configured) and the reviewer did not ask
@@ -45,6 +54,49 @@ pub const WORKER_BUDGET_TOKENS: u64 = 100_000;
 const DIFF_CAP_BYTES: usize = 60 * 1024;
 /// Verify output kept in a fix item and in the summary.
 const OUTPUT_CHARS: usize = 2_000;
+
+/// Stage-note wording of team mode: every line a team run writes to the
+/// transcript as a `Progress` event comes from here. Plain ASCII.
+mod progress {
+    use super::RoundLog;
+
+    /// After planning: how many items the round will run.
+    pub fn plan(items: usize) -> String {
+        format!("team plan: {items} item(s)")
+    }
+
+    /// A round starts with `items` work items.
+    pub fn round_started(round: u32, items: usize) -> String {
+        format!("round {round} started: {items} item(s)")
+    }
+
+    /// Workers have finished; their results are merged in item order.
+    pub fn merging(round: u32, items: usize) -> String {
+        format!("round {round} merging {items} worker item(s)")
+    }
+
+    /// The `[verify]` command runs on the team branch.
+    pub fn verifying(round: u32) -> String {
+        format!("round {round} verifying")
+    }
+
+    /// The reviewer reads the team's change.
+    pub fn reviewing(round: u32) -> String {
+        format!("round {round} reviewing")
+    }
+
+    /// The round's outcome, in the words the summary uses.
+    pub fn round_result(round: u32, log: &RoundLog) -> String {
+        format!(
+            "round {round} result: {} merged, {} conflict(s), {} failed; verify {}; review {}",
+            log.merged,
+            log.conflicts,
+            log.failed,
+            log.verify.label(),
+            log.review.label()
+        )
+    }
+}
 
 /// Options of one team run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,15 +421,35 @@ struct RoundResult {
     fixes: Vec<WorkItem>,
 }
 
+/// How a finished team run left the user's branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Landing {
+    /// The run was clean: the user's branch fast-forwarded to the team's work
+    /// and the team branch was deleted.
+    FastForwarded,
+    /// The user's branch is untouched; the team branch is kept, with why.
+    Kept { branch: String, reason: String },
+}
+
 /// A team run in progress: the engine it runs on and its fixed context.
 struct Team<'a> {
     engine: &'a Engine,
     session: SessionId,
     goal: &'a str,
-    /// The main checkout (the engine's working dir): where merges land.
+    /// The user's checkout (the engine's working dir). It is never edited
+    /// during the run; a clean run fast-forwards its branch at the end.
     main: PathBuf,
     /// The checkout's HEAD when the team started.
     base: String,
+    /// The team id (8 hex digits): names the team's worktrees and branch.
+    id: String,
+    /// The team branch `team/<id>`, created from `base`.
+    branch: String,
+    /// The integration worktree on `branch`: items merge here, verify and
+    /// review run here.
+    work: PathBuf,
+    /// Notes known before the first round (for example a stale sweep).
+    pre_notes: Vec<String>,
 }
 
 impl Engine {
@@ -409,6 +481,52 @@ impl Engine {
                 "run `git init` and commit first, or run the task without /team".into(),
             ));
         };
+        // The clean run fast-forwards the user's branch at the end, which git
+        // refuses over tracked edits; refuse up front with the same reason.
+        match worktree::is_dirty(&main).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(Error::Config(
+                    "team mode needs a clean working tree: uncommitted changes to tracked files \
+                     would block the fast-forward that lands the team's work"
+                        .into(),
+                    "commit or stash your changes, then run the team again".into(),
+                ));
+            }
+            Err(reason) => {
+                return Err(Error::Config(
+                    format!("cannot read git status: {reason}"),
+                    "team mode needs a git repository".into(),
+                ));
+            }
+        }
+        // Leftovers of earlier runs that died (their marker's pid is gone).
+        let swept = worktree::sweep_stale(&main);
+        let pre_notes = if swept.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "removed {} team workspace(s) left by an earlier run that did not finish",
+                swept.len()
+            )]
+        };
+        let id = subagent::new_worktree_id();
+        let branch = worktree::team_branch(&id);
+        let work = worktree::team_dir(&main, &id);
+        // The marker comes first, so a crash after this point is swept later.
+        worktree::write_marker(&main, &id).map_err(|reason| {
+            Error::Config(
+                format!("team mode could not write its marker: {reason}"),
+                "check that .modron/worktrees is writable".into(),
+            )
+        })?;
+        let mut guard = worktree::TeamGuard::new(&main, &id);
+        if let Err(reason) = worktree::create_on_branch(&main, &work, &branch).await {
+            return Err(Error::Config(
+                format!("team mode could not create its branch: {reason}"),
+                "check the repository state (git worktree list), then run the team again".into(),
+            ));
+        }
         let session_id = match session {
             Some(id) => id,
             None => {
@@ -436,9 +554,14 @@ impl Engine {
             goal,
             main,
             base,
+            id,
+            branch,
+            work,
+            pre_notes,
         };
         let (report, stop) = team.run(&opts).await;
-        let answer = render(&opts, &report, stop);
+        let landing = team.land(stop, &report, &mut guard).await;
+        let answer = render(&opts, &report, stop, &landing);
         self.store
             .append(
                 session_id,
@@ -463,10 +586,15 @@ impl Team<'_> {
     /// Plan, then rounds until a stop. Returns the report and the stop.
     async fn run(&self, opts: &TeamOptions) -> (TeamReport, Stop) {
         let cap = opts.fix_round_cap();
-        let mut report = TeamReport::default();
+        let mut report = TeamReport {
+            notes: self.pre_notes.clone(),
+            ..TeamReport::default()
+        };
         let mut items = self.plan(opts, &mut report).await;
+        self.note(progress::plan(items.len())).await;
         let stop = loop {
             let round = report.rounds.len() as u32 + 1;
+            self.note(progress::round_started(round, items.len())).await;
             let result = self.round(items, round, &mut report).await;
             let verify = result.log.verify.clone();
             report.open_items = result.fixes.len();
@@ -494,6 +622,46 @@ impl Team<'_> {
             report.open_items = 0;
         }
         (report, stop)
+    }
+
+    /// Appends one stage note to the team session, so live clients see it as
+    /// it is written. A failed append loses the note, not the run.
+    async fn note(&self, text: String) {
+        let _ = self
+            .engine
+            .store
+            .append(self.session, &SessionEvent::Progress { text })
+            .await;
+    }
+
+    /// Lands the run. A clean run fast-forwards the user's branch to the team
+    /// branch and removes the team's state. Any other run leaves the user's
+    /// branch where it was, removes the integration worktree, and keeps the
+    /// team branch (and the worktrees kept on purpose) for the user to merge.
+    async fn land(
+        &self,
+        stop: Stop,
+        report: &TeamReport,
+        guard: &mut worktree::TeamGuard,
+    ) -> Landing {
+        let reason = if !is_clean(stop, report) {
+            "the run did not end clean".to_string()
+        } else {
+            match worktree::fast_forward(&self.main, &self.branch).await {
+                Ok(()) => {
+                    worktree::remove_team(&self.main, &self.id);
+                    guard.disarm();
+                    return Landing::FastForwarded;
+                }
+                Err(reason) => format!("fast-forward refused: {}", first_line(&reason)),
+            }
+        };
+        worktree::remove_work(&self.main, &self.id);
+        guard.disarm();
+        Landing::Kept {
+            branch: self.branch.clone(),
+            reason,
+        }
     }
 
     /// Stage 1: one planning call. A call that fails or returns no usable
@@ -542,7 +710,7 @@ impl Team<'_> {
         round: u32,
         report: &mut TeamReport,
     ) -> RoundResult {
-        let round_base = worktree::head_sha(&self.main)
+        let round_base = worktree::head_sha(&self.work)
             .await
             .unwrap_or_else(|| self.base.clone());
         let mut log = RoundLog {
@@ -557,6 +725,7 @@ impl Team<'_> {
         )
         .await;
 
+        self.note(progress::merging(round, runs.len())).await;
         let mut fixes = Vec::new();
         for run in runs {
             report.add_spend(run.usage, run.spend_usd);
@@ -580,11 +749,11 @@ impl Team<'_> {
                     continue;
                 }
             };
-            let diff = worktree::diff(&self.main, &round_base, &sha, DIFF_CAP_BYTES)
+            let diff = worktree::diff(&self.work, &round_base, &sha, DIFF_CAP_BYTES)
                 .await
                 .unwrap_or_default();
             let message = format!("team worker {}: {}", run.label, first_line(&run.item.task));
-            let merged = worktree::merge_into(&self.main, &sha, &message).await;
+            let merged = worktree::merge_into(&self.work, &sha, &message).await;
             match merged {
                 Ok(MergeOutcome::Merged) => {
                     log.merged += 1;
@@ -603,7 +772,7 @@ impl Team<'_> {
             }
         }
 
-        log.verify = self.verify().await;
+        log.verify = self.verify(round).await;
         match &log.verify {
             VerifyState::Failed(output) => {
                 let output = clip(output);
@@ -620,17 +789,17 @@ impl Team<'_> {
             VerifyState::Passed => report.last_verify_output = None,
             _ => {}
         }
-        let (review, fix) = self.review(report).await;
+        let (review, fix) = self.review(round, report).await;
         log.review = review;
         fixes.extend(fix);
+        self.note(progress::round_result(round, &log)).await;
         RoundResult { log, fixes }
     }
 
     /// One worker: a `delegate` child in a fresh worktree of the current HEAD.
     async fn worker(&self, label: String, item: WorkItem) -> WorkerRun {
-        let id = subagent::new_worktree_id();
-        let path = worktree::path_for(&self.main, &id);
-        if let Err(reason) = worktree::create(&self.main, &path).await {
+        let path = worktree::item_dir(&self.main, &self.id, &label);
+        if let Err(reason) = worktree::create(&self.work, &path).await {
             return WorkerRun {
                 label,
                 ok: false,
@@ -678,16 +847,17 @@ impl Team<'_> {
     /// Stage 4: the `verify` tool on the merged main checkout, when the
     /// engine has one. Runs the way the finish gate runs it: the approval
     /// policy decides whether it may run at all.
-    async fn verify(&self) -> VerifyState {
+    async fn verify(&self, round: u32) -> VerifyState {
         let Some(tool) = self.engine.tools.get("verify") else {
             return VerifyState::NotConfigured;
         };
         if !self.engine.finish_gate_may_verify() {
             return VerifyState::NotPermitted;
         }
+        self.note(progress::verifying(round)).await;
         let ctx = ToolCtx {
             sandbox: self.engine.config.sandbox,
-            working_dir: self.main.clone(),
+            working_dir: self.work.clone(),
             engine: Some(Arc::new(self.engine.clone())),
             session_id: None,
         };
@@ -704,7 +874,7 @@ impl Team<'_> {
 
     /// Stage 4, reviewer half: one tool-less review of the whole team change
     /// (base to HEAD) on the reviewer model the engine would use.
-    async fn review(&self, report: &mut TeamReport) -> (ReviewState, Option<WorkItem>) {
+    async fn review(&self, round: u32, report: &mut TeamReport) -> (ReviewState, Option<WorkItem>) {
         let Some(reviewer) = self
             .engine
             .config
@@ -714,12 +884,13 @@ impl Team<'_> {
         else {
             return (ReviewState::NotConfigured, None);
         };
-        let diff = worktree::diff(&self.main, &self.base, "HEAD", DIFF_CAP_BYTES)
+        let diff = worktree::diff(&self.work, &self.base, "HEAD", DIFF_CAP_BYTES)
             .await
             .filter(|diff| !diff.trim().is_empty());
         let Some(diff) = diff else {
             return (ReviewState::NoChange, None);
         };
+        self.note(progress::reviewing(round)).await;
         let turn = self
             .engine
             .team_turn(
@@ -780,8 +951,27 @@ impl Team<'_> {
     }
 }
 
-/// The final summary: what ran, what merged, what failed, how it stopped.
-fn render(opts: &TeamOptions, report: &TeamReport, stop: Stop) -> String {
+/// A run is clean when it stopped on a clean round or a verified one, no item
+/// failed in any round, and the last round's verify and review are not
+/// outstanding (passed, not configured, or nothing to review). Only a clean
+/// run lands on the user's branch.
+fn is_clean(stop: Stop, report: &TeamReport) -> bool {
+    matches!(stop, Stop::Verified | Stop::Clean)
+        && report.rounds.iter().all(|round| round.failed == 0)
+        && report.rounds.last().is_some_and(|round| {
+            matches!(
+                round.verify,
+                VerifyState::Passed | VerifyState::NotConfigured
+            ) && matches!(
+                round.review,
+                ReviewState::Passed | ReviewState::NoChange | ReviewState::NotConfigured
+            )
+        })
+}
+
+/// The final summary: what ran, what merged, what failed, how it stopped,
+/// and where the work landed.
+fn render(opts: &TeamOptions, report: &TeamReport, stop: Stop, landing: &Landing) -> String {
     let items: usize = report.rounds.iter().map(|r| r.items).sum();
     let mut lines = vec![format!(
         "team: {items} worker item(s) in {} round(s), up to {} per round",
@@ -816,6 +1006,20 @@ fn render(opts: &TeamOptions, report: &TeamReport, stop: Stop) -> String {
         lines.push(format!("last verify output:\n{output}"));
     }
     lines.push(format!("stopped: {}", stop.label(opts.fix_round_cap())));
+    match landing {
+        Landing::FastForwarded => lines.push(
+            "landed: your branch was fast-forwarded to the team's work; the team branch was \
+             removed"
+                .to_string(),
+        ),
+        Landing::Kept { branch, reason } => {
+            lines.push(format!(
+                "not landed ({reason}): your branch is unchanged and the team branch `{branch}` \
+                 is kept"
+            ));
+            lines.push(format!("to merge it: git merge {branch}"));
+        }
+    }
     lines.push(format!(
         "tokens: {}, spend: ${:.4}",
         report.usage.total(),
@@ -980,9 +1184,10 @@ mod tests {
         }
     }
 
-    /// Verify: the main checkout fails its first `fail_main` calls, then
-    /// passes. Worker worktrees (under `.modron`) always pass and do not
-    /// count, so the finish gate inside a worker cannot skew the count.
+    /// Verify: the integration worktree (the merged tree) fails its first
+    /// `fail_main` calls, then passes. Item and delegate worktrees always pass
+    /// and do not count, so the finish gate inside a worker cannot skew the
+    /// count.
     struct VerifyTool {
         fail_main: usize,
         main_calls: AtomicUsize,
@@ -999,11 +1204,15 @@ mod tests {
         }
 
         async fn execute(&self, _args: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-            if ctx
+            // The integration worktree is `team-<id>` (one dash); item and
+            // delegate worktrees carry a second dash or an 8-hex name.
+            let name = ctx
                 .working_dir
-                .components()
-                .any(|c| c.as_os_str() == ".modron")
-            {
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let integration = name.starts_with("team-") && name.matches('-').count() == 1;
+            if !integration {
                 return Ok(ToolOutcome::ok("worker check ok"));
             }
             let n = self.main_calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1461,5 +1670,158 @@ mod tests {
             crate::run_scope().token(id).is_none(),
             "the team run is no longer live"
         );
+        assert_no_team_state(dir.path());
+    }
+
+    /// `git <args>` in `dir`, its stdout trimmed.
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// No team worktree directory, marker or `team/` branch is left in `dir`.
+    fn assert_no_team_state(dir: &Path) {
+        let root = dir.join(".modron").join("worktrees");
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("team-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "team leftovers: {leftovers:?}");
+        let branches = git_out(dir, &["branch", "--list", "team/*"]);
+        assert!(branches.is_empty(), "team branch left: {branches}");
+    }
+
+    #[tokio::test]
+    async fn clean_run_fast_forwards_the_user_branch_and_deletes_the_team_branch() {
+        let dir = repo();
+        let base = git_out(dir.path(), &["rev-parse", "HEAD"]);
+        let h = harness(dir.path(), plan_and_workers(TWO_FILES), None, |_| {});
+        let summary = h.engine.run_team("make the files", opts(2)).await.unwrap();
+        assert!(
+            summary
+                .answer
+                .contains("landed: your branch was fast-forwarded"),
+            "{}",
+            summary.answer
+        );
+        assert!(dir.path().join("a.txt").exists() && dir.path().join("b.txt").exists());
+        let head = git_out(dir.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(head, base, "the user's branch moved");
+        git(dir.path(), &["merge-base", "--is-ancestor", &base, &head]);
+        assert_no_team_state(dir.path());
+    }
+
+    #[tokio::test]
+    async fn unclean_run_leaves_the_user_branch_and_keeps_the_team_branch() {
+        let dir = repo();
+        let base = git_out(dir.path(), &["rev-parse", "HEAD"]);
+        let verify = VerifyTool {
+            fail_main: usize::MAX,
+            main_calls: AtomicUsize::new(0),
+        };
+        let h = harness(
+            dir.path(),
+            plan_and_workers(r#"{"items":[{"task":"WRITE x.txt=1"}]}"#),
+            Some(verify),
+            |_| {},
+        );
+        let team = TeamOptions {
+            max_rounds: Some(0),
+            ..opts(1)
+        };
+        let summary = h.engine.run_team("keep it", team).await.unwrap();
+        assert!(
+            summary.answer.contains("your branch is unchanged"),
+            "{}",
+            summary.answer
+        );
+        assert_eq!(git_out(dir.path(), &["rev-parse", "HEAD"]), base);
+        assert!(!dir.path().join("x.txt").exists(), "nothing landed");
+        let branches = git_out(dir.path(), &["branch", "--list", "team/*"]);
+        let branch = branches.trim().trim_start_matches("* ").trim().to_string();
+        assert!(branch.starts_with("team/"), "team branch kept: {branches}");
+        let id = branch.trim_start_matches("team/");
+        assert!(
+            summary.answer.contains(&format!("git merge team/{id}")),
+            "the merge command is named: {}",
+            summary.answer
+        );
+        // The integration worktree is gone; the branch is what remains.
+        assert!(!dir
+            .path()
+            .join(".modron/worktrees")
+            .join(format!("team-{id}"))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn stage_notes_arrive_in_order_and_stay_out_of_the_model_request() {
+        let dir = repo();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&sent);
+        let plan = plan_and_workers(TWO_FILES);
+        let verify = VerifyTool {
+            fail_main: 0,
+            main_calls: AtomicUsize::new(0),
+        };
+        let h = harness(
+            dir.path(),
+            move |req: &TurnRequest| {
+                let mut log = seen.lock().unwrap();
+                log.push(req.system.clone());
+                log.extend(req.messages.iter().map(|m| m.content.clone()));
+                drop(log);
+                plan(req)
+            },
+            Some(verify),
+            |_| {},
+        );
+        let summary = h.engine.run_team("make the files", opts(2)).await.unwrap();
+        let events = h.store.load(summary.session_id).await.unwrap();
+        let notes: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Progress { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            vec![
+                "team plan: 2 item(s)".to_string(),
+                "round 1 started: 2 item(s)".to_string(),
+                "round 1 merging 2 worker item(s)".to_string(),
+                "round 1 verifying".to_string(),
+                "round 1 result: 2 merged, 0 conflict(s), 0 failed; verify passed; review not configured"
+                    .to_string(),
+            ],
+            "the stage notes, in the order the run wrote them"
+        );
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter()
+                .all(|text| !text.contains("team plan:") && !text.contains("round 1 ")),
+            "no stage note reaches a provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_tracked_tree_refuses_the_team_before_any_work() {
+        let dir = repo();
+        std::fs::write(dir.path().join("README.md"), "edited\n").unwrap();
+        let h = harness(dir.path(), plan_and_workers(TWO_FILES), None, |_| {});
+        let err = h.engine.run_team("nope", opts(2)).await.unwrap_err();
+        assert!(err.to_string().contains("clean working tree"), "{err}");
+        assert_no_team_state(dir.path());
+        assert!(!dir.path().join("a.txt").exists());
     }
 }

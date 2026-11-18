@@ -407,6 +407,7 @@ mod tests {
             tasks: crate::tasks::TaskRegistry::new(),
             bridge_base: None,
             rc_keys: std::sync::Mutex::new(Default::default()),
+            portal_exiting: Default::default(),
             rc_tunnels: std::sync::Mutex::new(Default::default()),
         })
     }

@@ -1,7 +1,10 @@
 // modron cloud container worker (PLAN 10.10). The bridge calls
 //   POST /wake  with `Authorization: Bearer <WAKE_TOKEN>` and the per-run
 //               environment as the JSON body (fields below), and
-//   POST /stop  with the same bearer and body { "run_id": "<id>" }.
+//   POST /stop  with the same bearer and body { "run_id": "<id>" }, and
+//   POST /status with the same bearer and body { "run_id": "<id>" }, which
+//               answers { "running": boolean } (PLAN 10.10 "sleeping": the
+//               platform stopped the container after its idle timeout).
 // One ModronAgent Durable Object (and so one Container) per run id. Wake
 // starts the container with the run's environment, or wakes it; it sleeps
 // after SLEEP_AFTER_MS without requests. Stop destroys the container.
@@ -142,7 +145,8 @@ export class ModronAgent extends DurableObject<Env> {
     if (request.method === "POST" && url.pathname === "/stop") {
       return this.stop();
     }
-    if (request.method === "GET" && url.pathname === "/status") {
+    if (request.method === "POST" && url.pathname === "/status") {
+      // No container object (containers not enabled) reads as not running.
       return json({ running: this.ctx.container?.running ?? false });
     }
     return new Response("not found", { status: 404 });
@@ -175,7 +179,7 @@ export class ModronAgent extends DurableObject<Env> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method !== "POST" || (url.pathname !== "/wake" && url.pathname !== "/stop")) {
+    if (request.method !== "POST" || !["/wake", "/stop", "/status"].includes(url.pathname)) {
       return new Response("modron cloud container runtime", { status: 404 });
     }
     if (!env.WAKE_TOKEN) {
@@ -194,6 +198,7 @@ export default {
       containerEnv = parsed.value;
       runId = parsed.value.MODRON_RUN_ID;
     } else {
+      // /stop and /status: the run id names the Durable Object.
       const id = read.value !== null && typeof read.value === "object" ? (read.value as { run_id?: unknown }).run_id : undefined;
       if (typeof id !== "string" || !RUN_ID.test(id)) return json({ error: "run_id must match [a-z0-9-]{1,64}" }, 400);
       runId = id;

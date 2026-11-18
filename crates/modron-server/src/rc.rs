@@ -547,7 +547,15 @@ async fn registration_loop(host: PortalHost, mut stop: oneshot::Receiver<()>) {
             _ = ticker.tick() => {}
         }
     }
-    if !off {
+    // A serve that is exiting keeps the entry: nothing awaits this DELETE
+    // (the process is about to end, see BoundServer::begin_exit), so it
+    // raced the exit and sometimes removed the row. Left in place, the entry
+    // goes stale and the portal lists the session offline.
+    let exiting = host
+        .state
+        .portal_exiting
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if !off && !exiting {
         let outcome = client
             .delete(&url)
             .header(AUTHORIZATION, format!("Bearer {}", host.token))

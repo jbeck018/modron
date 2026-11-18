@@ -375,3 +375,24 @@ Welcome { server_version, protocol, commands?: [name] }
 Persisted meta (`SessionMeta.forked_from`, store `{id}.meta.json`): the
 parent id and the kept turn count. Absent on sessions that were not forked,
 so older meta files load unchanged.
+
+## 10. Team stage notes (F1, additive)
+
+Persisted event `progress` (team mode, `SessionEvent::Progress`):
+
+```
+{"type":"progress","text":"<one line, plain ASCII>"}
+```
+
+Written by a team run (`/team`, `modron team`) at each stage boundary: the
+plan (`team plan: N item(s)`), each round's start, merge, verify, review and
+result. The words are the constants in `modron_core::team` (`progress`
+module). It travels as the ordinary live `Event` frame, so no frame is new.
+
+Effect: one transcript note (`TranscriptEntry::Note`), in log order, and no
+other state. It is not model content: no provider request, compaction input,
+or `fork`/`rewind` turn cut sees it, and it is not handoff ownership (only a
+trailing `handed_off` line is). Old logs have none and load unchanged. An
+older binary reads a log that has these lines by skipping each as a corrupt
+line (the store's warn-and-skip); an older client that receives the live
+`Event` frame cannot decode the variant, as with every additive event.

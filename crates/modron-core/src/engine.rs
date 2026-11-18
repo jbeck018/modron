@@ -3487,6 +3487,8 @@ fn events_to_messages<'a>(events: impl IntoIterator<Item = &'a SessionEvent>) ->
             // the current plan as a transient tail on every turn (H2a), so
             // raw plan writes stay out of the transcript.
             SessionEvent::Plan { .. } => {}
+            // A team stage note is for the transcript only (never a message).
+            SessionEvent::Progress { .. } => {}
         }
     }
     messages

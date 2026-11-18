@@ -729,6 +729,12 @@ impl ReplayFolder {
                     text: handoff_note(to.as_deref(), carrier_ref),
                 });
             }
+            // A team stage note: one transcript note, shown as written.
+            SessionEvent::Progress { text } => {
+                self.flush_tools();
+                self.entries
+                    .push(TranscriptEntry::Note { text: text.clone() });
+            }
             SessionEvent::TurnTrace { .. } | SessionEvent::Checkpoint { .. } => {}
         }
     }
@@ -1394,6 +1400,28 @@ mod shell_tests {
             Some(&TranscriptEntry::Note {
                 text: "session handed off to another host (refs/heads/modron/handoff/x)".into(),
             })
+        );
+        // Team stage notes replay as transcript notes, in log order, and
+        // flush no tool rows of their own.
+        let events = vec![
+            SessionEvent::Task { text: "t".into() },
+            SessionEvent::Progress {
+                text: "team plan: 2 item(s)".into(),
+            },
+            SessionEvent::Progress {
+                text: "round 1 started: 2 item(s)".into(),
+            },
+        ];
+        assert_eq!(
+            replay(&events)[1..],
+            [
+                TranscriptEntry::Note {
+                    text: "team plan: 2 item(s)".into(),
+                },
+                TranscriptEntry::Note {
+                    text: "round 1 started: 2 item(s)".into(),
+                },
+            ]
         );
         assert_eq!(
             handoff_note(Some("laptop"), "r"),

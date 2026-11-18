@@ -384,7 +384,10 @@ pub enum Payload {
     /// one transcript note ([`modron_view::handoff_note`]) and change no
     /// other state. The host that exported the session refuses runs on it
     /// until an import brings a longer log; that refusal arrives as an error
-    /// reply, not as this event.
+    /// reply, not as this event. `Progress` (team stage note, additive) is
+    /// one transcript note in log order and changes no other state; it is
+    /// never model content, compaction input, or a turn boundary (see
+    /// docs/PROTOCOL_V2.md section 10).
     Event { event: SessionEvent },
     /// A streaming delta (text or reasoning; never tool-call items).
     Delta { delta: WireDelta },

@@ -337,13 +337,27 @@ modron team [-n N] [--until-verified] [--max-rounds R] <task>
 `/team [N] <task>` in the app, or `modron team [-n N] <task>`, splits a task
 into up to N independent items (default 3, at most 5). Each item runs as a
 subagent in its own git worktree under `.modron/worktrees/`, in parallel. The
-worktrees are merged into the current branch in item order; a merge conflict
-becomes a fix item. The `[verify]` command and the reviewer then check the
-merged tree, and failures become items for the next round. The run stops when a
-round is clean, at the fix-round cap (`--max-rounds`, default 2), or when the
-token budget or spend cap is spent. `--until-verified` raises the cap to 6.
-Needs a git repository with at least one commit. Merges create commits on the
-current branch, so run it on a branch you can discard.
+team works on its own branch `team/<id>`, created from HEAD: items are merged
+into it in item order, and a merge conflict becomes a fix item. The `[verify]`
+command and the reviewer then check the team branch, and failures become items
+for the next round. The run stops when a round is clean, at the fix-round cap
+(`--max-rounds`, default 2), or when the token budget or spend cap is spent.
+`--until-verified` raises the cap to 6. Each stage boundary (plan, round start,
+merge, verify, review, round result) adds one note to the transcript.
+
+Your branch is changed only at the end. A clean run (verify passed or not
+configured, the reviewer satisfied, no failed item) fast-forwards your branch to
+`team/<id>` and deletes the team branch. Any other run leaves your branch
+untouched, keeps `team/<id>`, and prints the command to merge it
+(`git merge team/<id>`). Items that failed keep their worktrees for inspection.
+The run refuses to start when tracked files have uncommitted changes, and needs a
+git repository with at least one commit.
+
+If a run is interrupted, its worktrees and team branch are removed. A run that
+was killed outright leaves its worktrees behind; the next team run removes them
+for any team whose process has exited (identified by a marker file, never a
+delegate or user worktree). Its `team/<id>` branch is kept, since it holds work
+nobody landed; delete it with `git branch -D team/<id>` once you no longer want it.
 
 ## Handoff between hosts
 

@@ -190,6 +190,8 @@ fn render_events<'a>(
             | SessionEvent::ModelSelected { .. }
             | SessionEvent::Review { .. }
             | SessionEvent::HandedOff { .. }
+            // A team stage note is display-only, never summarizer input.
+            | SessionEvent::Progress { .. }
             | SessionEvent::Usage { .. } => {}
         }
     }
@@ -428,6 +430,39 @@ mod tests {
             tokens < 512,
             "summarizer prompt too expensive: {tokens} tokens"
         );
+    }
+
+    #[test]
+    fn progress_notes_are_not_compaction_input() {
+        // A team stage note between every event changes neither the summarizer
+        // text nor where the older/tail split falls.
+        let plain = sample_events();
+        let mut noted = Vec::new();
+        for event in &plain {
+            noted.push(event.clone());
+            noted.push(SessionEvent::Progress {
+                text: "round 1 started: 2 item(s)".into(),
+            });
+        }
+        for skip in [0, 1, 3] {
+            assert_eq!(
+                older_transcript_text(&noted, skip),
+                older_transcript_text(&plain, skip),
+                "skip {skip}"
+            );
+            // The split keeps notes on whichever side they fall; what matters
+            // is that the conversation events land on the same sides.
+            let conversation = |events: &[&SessionEvent]| -> usize {
+                events
+                    .iter()
+                    .filter(|e| !matches!(e, SessionEvent::Progress { .. }))
+                    .count()
+            };
+            let (older_noted, tail_noted) = split_older_tail(&noted, skip);
+            let (older_plain, tail_plain) = split_older_tail(&plain, skip);
+            assert_eq!(conversation(&older_noted), conversation(&older_plain));
+            assert_eq!(conversation(&tail_noted), conversation(&tail_plain));
+        }
     }
 
     #[test]

@@ -367,6 +367,38 @@ mod fork_cut_tests {
     }
 
     #[test]
+    fn team_stage_notes_do_not_move_turns_or_the_cut() {
+        // A Progress note after every event (a team run's stage notes) leaves
+        // the turn count and the kept conversation unchanged.
+        let plain = three_turns();
+        let note = |n: usize| SessionEvent::Progress {
+            text: format!("note {n}"),
+        };
+        let mut noted = Vec::new();
+        for (n, event) in plain.iter().enumerate() {
+            noted.push(event.clone());
+            noted.push(note(n));
+        }
+        let kept_text = |events: &[SessionEvent], cut: usize| -> Vec<String> {
+            events[..cut]
+                .iter()
+                .filter(|e| !matches!(e, SessionEvent::Progress { .. }))
+                .map(|e| format!("{e:?}"))
+                .collect()
+        };
+        for turn in [None, Some(1), Some(2), Some(3)] {
+            let (cut, turns) = fork_cut(&plain, turn).unwrap();
+            let (noted_cut, noted_turns) = fork_cut(&noted, turn).unwrap();
+            assert_eq!(noted_turns, turns, "turn count for {turn:?}");
+            assert_eq!(
+                kept_text(&noted, noted_cut),
+                kept_text(&plain, cut),
+                "kept conversation for {turn:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tip_keeps_everything_and_counts_all_turns() {
         let events = three_turns();
         assert_eq!(fork_cut(&events, None).unwrap(), (events.len(), 3));

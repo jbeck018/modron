@@ -5,7 +5,9 @@ The owner starts a run from the portal: the bridge (`cloud/bridge`) calls this
 Worker's `POST /wake` with the run's environment, and the container clones the
 repo, starts `modron serve --remote-control --run-id <id>`, and registers its
 session with the bridge. The container sleeps after 10 minutes without
-requests. `POST /stop` destroys it.
+requests. `POST /stop` destroys it. `POST /status` (`{ run_id }`, same bearer)
+answers `{ running }`: the bridge polls it on each run list, so a container the
+platform stopped after its idle timeout shows as `sleeping` (PLAN 10.10).
 
 Status: the wake path, the entrypoint and the bridge side are tested locally
 (`cloud/bridge/test/cloud.mjs`, the e2e scenario P6). The image is built in CI
@@ -34,7 +36,7 @@ run id values are refused with 400 before any container starts.
 
 | Where | Secret | Set by | Purpose |
 |---|---|---|---|
-| Container Worker | `WAKE_TOKEN` | the workflow, from the repository secret `WAKE_TOKEN` | Bearer for `/wake` and `/stop`. Unset: both answer 503. |
+| Container Worker | `WAKE_TOKEN` | the workflow, from the repository secret `WAKE_TOKEN` | Bearer for `/wake`, `/stop` and `/status`. Unset: all three answer 503. |
 | Bridge Worker | `WAKE_TOKEN` | `wrangler secret put` in `cloud/bridge` | The same value; the bridge sends it. |
 | Bridge Worker | `CONTAINER_URL` | `wrangler secret put` in `cloud/bridge` | This Worker's public https URL. |
 | Bridge Worker | `HOST_TOKEN`, `VAULT_KEY`, `OWNER_TOKEN` | `wrangler secret put` in `cloud/bridge` | See `cloud/bridge/README.md`. |

@@ -46,6 +46,11 @@ pub struct ServerState {
     /// Session -> share key (minted by /remote-control; used to auth
     /// page publishes).
     pub rc_keys: std::sync::Mutex<HashMap<SessionId, String>>,
+    /// Set when `modron serve` starts its exit (see `BoundServer::begin_exit`).
+    /// A registration stopped after this keeps its portal entry, so the
+    /// portal lists the session offline instead of racing a DELETE against
+    /// the process exit.
+    pub portal_exiting: std::sync::atomic::AtomicBool,
     /// Session -> the live tunnel's abort handle: re-registration aborts
     /// the previous tunnel instead of stacking duplicate pumpers
     /// (2026-11-12 cycle-2 audit L7).
@@ -2388,6 +2393,7 @@ mod tests {
             tasks: crate::tasks::TaskRegistry::new(),
             bridge_base: None,
             rc_keys: std::sync::Mutex::new(HashMap::new()),
+            portal_exiting: Default::default(),
             rc_tunnels: std::sync::Mutex::new(HashMap::new()),
         });
         (state, dir)

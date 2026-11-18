@@ -170,6 +170,7 @@ import {
   validRef,
   validRepo,
   type RunsEnv,
+  containerRunning,
 } from "./runs";
 import {
   PUSH_WORKER,
@@ -1190,6 +1191,26 @@ function runView(row: RunView, origin: string) {
 
 const RUNS_UNCONFIGURED = "cloud runs are not configured";
 
+// PLAN 10.10 "sleeping": the platform stops a run's container after its idle
+// timeout, and nothing else reports that. So each list asks the container
+// worker about the runs still marked running; a container that is no longer
+// running moves its run to sleeping (stored, and the row is updated in place).
+// An unanswered poll keeps the stored state. Only running runs are asked:
+// starting ones are not yet linked, and stopped, failed and sleeping ones
+// have nothing to report.
+async function markSleepingRuns(
+  env: Env,
+  config: RunsEnv & { base: string },
+  dir: ReturnType<typeof directory>,
+  rows: RunView[],
+): Promise<void> {
+  const live = rows.filter((r) => r.state === "running");
+  const running = await Promise.all(live.map((r) => containerRunning(env, config.base, r.id)));
+  for (let i = 0; i < live.length; i++) {
+    if (running[i] === false && (await dir.sleepRun(live[i].id))) live[i].state = "sleeping";
+  }
+}
+
 async function handleCloud(request: Request, env: Env, path: string): Promise<Response> {
   const method = request.method;
   const write = method !== "GET";
@@ -1278,7 +1299,10 @@ async function handleCloud(request: Request, env: Env, path: string): Promise<Re
   // GET /api/runs, POST /api/runs { account, repo, branch?, handoff_ref? }
   if (path === "/api/runs") {
     if (method === "GET") {
-      return jsonResponse(200, { runs: (await dir.listRuns()).map((r) => runView(r, origin)) });
+      const config = runsConfig(env);
+      const rows = await dir.listRuns();
+      if (config !== null) await markSleepingRuns(env, config, dir, rows);
+      return jsonResponse(200, { runs: rows.map((r) => runView(r, origin)) });
     }
     if (method !== "POST") return plainResponse(405, "method not allowed");
     const config = runsConfig(env);

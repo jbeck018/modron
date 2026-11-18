@@ -110,6 +110,9 @@ const GH_ORIGIN = `http://127.0.0.1:${gh.address().port}`;
 
 // --- fake container worker (loopback) ---
 const ctRequests = [];
+// Run ids the fake reports as not running: the platform's idle timeout put
+// their container to sleep (PLAN 10.10). The test adds and removes them.
+const ctAsleep = new Set();
 const ct = createHttp((req, res) => {
   let raw = "";
   req.on("data", (c) => { raw += c; });
@@ -123,6 +126,7 @@ const ct = createHttp((req, res) => {
       return send(202, { running: true });
     }
     if (req.url === "/stop") return send(200, { running: false });
+    if (req.url === "/status") return send(200, { running: !(body && ctAsleep.has(body.run_id)) });
     return send(404, { error: "not found" });
   });
 });
@@ -310,11 +314,35 @@ try {
   });
   check("a malformed run_id on registration is 400", badRunId.status === 400, String(badRunId.status));
 
+  // Sleeping: a running container is polled on each list and stays running.
+  const polled = () => ctRequests.filter((r) => r.path === "/status" && r.body?.run_id === run.id);
+  const beforePoll = polled().length;
+  const stillRunning = (await call(A.base, "/api/runs", { cookie })).json().runs.find((r) => r.id === run.id);
+  check("a list polls the running container's /status with the bearer and run id",
+    polled().length === beforePoll + 1 && polled().at(-1).auth === `Bearer ${WAKE}`, String(polled().length));
+  check("a running container keeps the run running", stillRunning?.state === "running");
+
+  // The platform stops the container (idle timeout): the next list says sleeping.
+  ctAsleep.add(run.id);
+  const asleep = (await call(A.base, "/api/runs", { cookie })).json().runs.find((r) => r.id === run.id);
+  check("a container the platform stopped turns the run sleeping, session still linked",
+    asleep?.state === "sleeping" && asleep.session_url === openUrl, JSON.stringify(asleep));
+  const asleepAgain = (await call(A.base, "/api/runs", { cookie })).json().runs.find((r) => r.id === run.id);
+  check("a sleeping run is not polled again and stays sleeping", asleepAgain?.state === "sleeping" && polled().length === beforePoll + 2,
+    `${asleepAgain?.state} polls ${polled().length - beforePoll}`);
+  ctAsleep.delete(run.id);
+
   const stop = await call(A.base, `/api/runs/${run.id}/stop`, { method: "POST", cookie });
   check("stop answers 200 stopped", stop.status === 200 && stop.json().state === "stopped", stop.text.slice(0, 160));
   const stopCall = ctRequests.at(-1);
   check("stop reaches the container /stop with the run id and the bearer",
     stopCall && stopCall.path === "/stop" && stopCall.auth === `Bearer ${WAKE}` && stopCall.body.run_id === run.id);
+  const afterStop = polled().length;
+  ctAsleep.add(run.id);
+  const stopped = (await call(A.base, "/api/runs", { cookie })).json().runs.find((r) => r.id === run.id);
+  check("a stopped run stays stopped (not polled, not turned sleeping)",
+    stopped?.state === "stopped" && polled().length === afterStop, JSON.stringify(stopped?.state));
+  ctAsleep.delete(run.id);
 
   const wake = await call(A.base, `/api/runs/${run.id}/wake`, { method: "POST", cookie });
   check("wake answers 200 starting again", wake.status === 200 && wake.json().state === "starting", wake.text.slice(0, 160));
@@ -345,8 +373,8 @@ try {
 
   check("no browser-facing response carries a git token",
     !browserSeen.some((t) => t.includes(TOKEN_ALICE) || t.includes(TOKEN_BOB)));
-  check("the fake container saw only /wake and /stop calls",
-    ctRequests.every((r) => r.path === "/wake" || r.path === "/stop"));
+  check("the fake container saw only /wake, /stop and /status calls",
+    ctRequests.every((r) => r.path === "/wake" || r.path === "/stop" || r.path === "/status"));
 
   // ---- B: VAULT_KEY set, container URL not https ----
   const bCookie = await ownerCookie(B.base);

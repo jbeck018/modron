@@ -157,6 +157,15 @@ pub struct BoundServer {
 }
 
 impl BoundServer {
+    /// Start the exit of a foreground serve (ctrl+c or SIGTERM). Portal
+    /// registrations stopped from here on keep their directory entry, so the
+    /// portal lists the session offline (no heartbeat) rather than removing it.
+    pub fn begin_exit(&self) {
+        self.state
+            .portal_exiting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Abort every accept loop and every remote-control tunnel (tunnels
     /// redial on their own, so they must be stopped here too). Integration
     /// tests use this to tear down.
@@ -230,6 +239,7 @@ pub async fn bind_server(engine: Engine, options: &ServeOptions) -> anyhow::Resu
         tasks: task_registry,
         bridge_base: options.bridge_base.clone(),
         rc_keys: std::sync::Mutex::new(HashMap::new()),
+        portal_exiting: Default::default(),
         rc_tunnels: std::sync::Mutex::new(HashMap::new()),
     });
 
@@ -343,6 +353,7 @@ pub async fn run_serve(engine: Engine, options: &ServeOptions) -> anyhow::Result
     );
 
     wait_for_stop().await;
+    server.begin_exit();
     if let Some(hook) = &options.handoff_on_exit {
         let timeout = options.handoff_timeout.unwrap_or(DEFAULT_HANDOFF_TIMEOUT);
         handoff_at_exit(&server, hook, timeout);

@@ -170,7 +170,16 @@ pub fn trusted_servers(workspace: &Path, configured: &[String]) -> Vec<(String, 
             return Vec::new();
         }
     };
-    let (rows, errors) = statuses(workspace, configured, &store);
+    trusted_with(&store, workspace, configured)
+}
+
+/// [`trusted_servers`] against an open store (the discovery itself).
+pub fn trusted_with(
+    store: &TrustStore,
+    workspace: &Path,
+    configured: &[String],
+) -> Vec<(String, McpServerConfig)> {
+    let (rows, errors) = statuses(workspace, configured, store);
     for error in errors {
         tracing::warn!(error = %error, "project MCP file ignored");
     }
@@ -195,7 +204,11 @@ pub fn configured_names(cfg: &config::Config) -> Vec<String> {
 /// config, but only if it is trusted. An untrusted or invalid project server
 /// is an error here, so it is never started. Unknown names pass through and
 /// get the caller's usual "unknown server" error.
-pub fn with_project_server(cfg: &config::Config, name: &str) -> anyhow::Result<config::Config> {
+pub fn with_project_server(
+    cfg: &config::Config,
+    workspace: &Path,
+    name: &str,
+) -> anyhow::Result<config::Config> {
     if cfg
         .mcp
         .as_ref()
@@ -203,10 +216,9 @@ pub fn with_project_server(cfg: &config::Config, name: &str) -> anyhow::Result<c
     {
         return Ok(cfg.clone());
     }
-    let workspace = current_workspace()?;
     let store = TrustStore::open(trust_store_path())
         .map_err(|err| anyhow!("MCP trust store unreadable: {err}"))?;
-    let (rows, _) = statuses(&workspace, &configured_names(cfg), &store);
+    let (rows, _) = statuses(workspace, &configured_names(cfg), &store);
     let Some(row) = rows.into_iter().find(|row| row.name == name) else {
         return Ok(cfg.clone());
     };
@@ -249,10 +261,6 @@ pub fn workspace_key(workspace: &Path) -> String {
         .unwrap_or_else(|_| workspace.to_path_buf())
         .to_string_lossy()
         .to_string()
-}
-
-fn current_workspace() -> anyhow::Result<PathBuf> {
-    std::env::current_dir().context("cannot read the current directory")
 }
 
 /// One trust grant: this server definition may run in this workspace.
@@ -353,14 +361,18 @@ fn open_store() -> anyhow::Result<TrustStore> {
 
 /// `modron mcp trust [name | --all]`: trust one declared server, or every
 /// valid undeclared-by-config server, for the current workspace.
-pub fn run_trust(cfg: &config::Config, name: Option<&str>, all: bool) -> anyhow::Result<()> {
+pub fn run_trust(
+    cfg: &config::Config,
+    workspace: &Path,
+    name: Option<&str>,
+    all: bool,
+) -> anyhow::Result<()> {
     if name.is_some() == all {
         bail!("name one server (`modron mcp trust <name>`) or trust all of them (`--all`)");
     }
-    let workspace = current_workspace()?;
-    let key = workspace_key(&workspace);
+    let key = workspace_key(workspace);
     let mut store = open_store()?;
-    let (rows, errors) = statuses(&workspace, &configured_names(cfg), &store);
+    let (rows, errors) = statuses(workspace, &configured_names(cfg), &store);
     for error in &errors {
         eprintln!("warning: {error}");
     }
@@ -403,8 +415,8 @@ pub fn run_trust(cfg: &config::Config, name: Option<&str>, all: bool) -> anyhow:
 }
 
 /// `modron mcp untrust [name]`: revoke trust for the current workspace.
-pub fn run_untrust(name: Option<&str>) -> anyhow::Result<()> {
-    let key = workspace_key(&current_workspace()?);
+pub fn run_untrust(workspace: &Path, name: Option<&str>) -> anyhow::Result<()> {
+    let key = workspace_key(workspace);
     let mut store = open_store()?;
     let removed = store.untrust(&key, name);
     store.save()?;
@@ -414,10 +426,9 @@ pub fn run_untrust(name: Option<&str>) -> anyhow::Result<()> {
 
 /// `modron mcp list`: every project MCP server with its trust state and the
 /// file that declares it.
-pub fn run_list(cfg: &config::Config) -> anyhow::Result<()> {
-    let workspace = current_workspace()?;
+pub fn run_list(cfg: &config::Config, workspace: &Path) -> anyhow::Result<()> {
     let store = open_store()?;
-    let (rows, errors) = statuses(&workspace, &configured_names(cfg), &store);
+    let (rows, errors) = statuses(workspace, &configured_names(cfg), &store);
     for error in &errors {
         println!("warning: {error}");
     }
@@ -453,19 +464,16 @@ fn state_label(state: &State) -> String {
 
 /// Lines for `modron doctor`: rule files, project commands and project MCP
 /// servers found in the current workspace, with trust state.
-pub fn doctor_lines(cfg: &config::Config) -> Vec<String> {
+pub fn doctor_lines(cfg: &config::Config, workspace: &Path) -> Vec<String> {
     let mut lines = Vec::new();
-    let Ok(workspace) = current_workspace() else {
-        return vec!["  · no current directory; project files not checked".to_string()];
-    };
     lines.push(format!("  workspace: {}", workspace.display()));
-    let rules = modron_core::context::project_rule_sources(&workspace);
+    let rules = modron_core::context::project_rule_sources(workspace);
     if rules.is_empty() {
         lines.push("  · rules: none (.cursor/rules, .github/copilot-instructions.md, GEMINI.md, .windsurfrules)".to_string());
     } else {
         lines.push(format!("  ✓ rules: {}", rules.join(", ")));
     }
-    let commands = modron_core::context::project_command_names(&workspace);
+    let commands = modron_core::context::project_command_names(workspace);
     if commands.is_empty() {
         lines.push("  · commands: none (.claude/commands/*.md)".to_string());
     } else {
@@ -482,7 +490,7 @@ pub fn doctor_lines(cfg: &config::Config) -> Vec<String> {
             }
         }
     };
-    let (rows, errors) = statuses(&workspace, &configured_names(cfg), &store);
+    let (rows, errors) = statuses(workspace, &configured_names(cfg), &store);
     for error in errors {
         lines.push(format!("  ✗ mcp file: {error}"));
     }
@@ -624,6 +632,36 @@ mod tests {
             rows[0].state,
             State::Untrusted,
             "changed definition must need trust again"
+        );
+    }
+
+    #[test]
+    fn discovery_follows_the_workspace_not_the_process_cwd() {
+        // The test process runs in the crate directory, which has no
+        // `.mcp.json`. Discovery must read the workspace it is given.
+        let ws = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        write(
+            ws.path(),
+            ".mcp.json",
+            &json!({"mcpServers": {"demo": {"command": "srv"}}}),
+        );
+        let mut store = store_in(store_dir.path());
+        let (rows, _) = statuses(ws.path(), &[], &store);
+        store.trust(&workspace_key(ws.path()), "demo", &rows[0].hash);
+        store.save().unwrap();
+        let reopened = store_in(store_dir.path());
+
+        let started = trusted_with(&reopened, ws.path(), &[]);
+        assert_eq!(
+            started.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["demo"],
+            "the trusted server of the given workspace starts"
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(
+            trusted_with(&reopened, elsewhere.path(), &[]).is_empty(),
+            "a workspace without the file starts nothing"
         );
     }
 

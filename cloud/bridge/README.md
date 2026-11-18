@@ -248,7 +248,10 @@ never be silently ignored).
    ```
 
    rc.rs PUTs on open, on every running-state change, and every 60 seconds
-   (the heartbeat). Remove it with `DELETE` when the session ends.
+   (the heartbeat). Remove it with `DELETE` when the session is ended while
+   the serve runs. A serve that exits (ctrl+c or SIGTERM) sends no DELETE: its
+   entry goes stale and is listed offline, like any host that stopped
+   heartbeating.
 
 ### Staleness
 
@@ -373,7 +376,11 @@ without it), same-origin `Origin` on writes. `cache-control: no-store`.
   1 to 3 at 100 each are read and filtered here (case-insensitive, `owner/name`),
   then cut into pages of 50; a filter sees at most 300 repositories.
 - `GET /api/runs` -> `{ runs: [{ id, repo, account, branch, state, reason,
-  created_at, session_url }] }`, newest first, at most 100.
+  created_at, session_url }] }`, newest first, at most 100. Each list polls the
+  container worker's `POST /status` (bearer `WAKE_TOKEN`, body `{ run_id }`)
+  for the runs marked `running`, at most 4 seconds each. A container that is
+  not running turns its run `sleeping`; an unanswered poll keeps the stored
+  state.
 - `POST /api/runs` `{ account, repo, branch?, handoff_ref? }` -> 201 with the
   row. `repo` must be `owner/name`; refs are checked. The run is stored as
   `starting`, then the container worker's `POST /wake` is called with bearer
@@ -388,8 +395,10 @@ without it), same-origin `Origin` on writes. `cache-control: no-store`.
 Run states: `starting`, `running`, `sleeping`, `stopped`, `failed`. A host
 registration (`PUT /api/host/sessions/<id>`) may carry `run_id` (`[a-z0-9-]`,
 at most 64); with a known run that has not stopped or failed, the run becomes
-`running` and links the session. `sleeping` is in the vocabulary but nothing
-sets it yet (the container does not report back).
+`running` and links the session. `sleeping` is set by the list poll above
+(the platform stopped the container, e.g. after its idle timeout, and the run
+still exists). A wake from sleeping goes to `starting` as usual; a stopped or
+failed run is never polled.
 
 The git token appears only in the wake body the bridge sends to the container
 worker over https. No browser-facing response carries a token; a GitHub error

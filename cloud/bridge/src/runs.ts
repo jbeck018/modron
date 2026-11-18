@@ -12,6 +12,8 @@ export const RUN_STATES = ["starting", "running", "sleeping", "stopped", "failed
 // no "..", at most 200 characters. The empty string means "not given".
 const REF_RE = /^[A-Za-z0-9._/-]{1,200}$/;
 const CONTAINER_CALL_MS = 10 * 1000;
+// A status poll rides on the run list, so it gives up sooner than a wake.
+const STATUS_CALL_MS = 4 * 1000;
 
 export interface RunsEnv {
   MODRON_TEST_HOOKS?: string;
@@ -102,4 +104,33 @@ export async function containerPost(
   }
   if (res.status >= 200 && res.status < 300) return { ok: true };
   return { ok: false, reason: `container answered status ${res.status}` };
+}
+
+// POST {container}/status with the bearer and { run_id }: the container's
+// running flag. null when the container worker did not give a usable answer,
+// so the caller keeps the stored state rather than guessing.
+export async function containerRunning(env: RunsEnv, base: string, runId: string): Promise<boolean | null> {
+  let res: Response;
+  try {
+    res = await fetch(base + "/status", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer " + (env.WAKE_TOKEN ?? ""),
+        "content-type": "application/json",
+        "user-agent": "modron-bridge",
+      },
+      body: JSON.stringify({ run_id: runId }),
+      redirect: "manual",
+      signal: AbortSignal.timeout(STATUS_CALL_MS),
+    });
+  } catch {
+    return null;
+  }
+  if (res.status !== 200) return null;
+  try {
+    const body = (await res.json()) as { running?: unknown };
+    return typeof body.running === "boolean" ? body.running : null;
+  } catch {
+    return null;
+  }
 }

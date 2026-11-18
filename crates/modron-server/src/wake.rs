@@ -377,6 +377,7 @@ mod tests {
             tasks: crate::tasks::TaskRegistry::new(),
             bridge_base: None,
             rc_keys: StdMutex::new(Default::default()),
+            portal_exiting: Default::default(),
             rc_tunnels: StdMutex::new(Default::default()),
         })
     }

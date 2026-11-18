@@ -431,6 +431,16 @@ export class Directory extends DurableObject<object> {
     return existed;
   }
 
+  // The container stopped while the run was running (the platform's idle
+  // timeout): sleeping. Conditional, so a stop or failure that landed first
+  // keeps its state. Returns true when the run moved.
+  async sleepRun(id: string): Promise<boolean> {
+    const updated = this.sql.exec(
+      "UPDATE runs SET state = 'sleeping' WHERE id = ? AND state = 'running'", id,
+    );
+    return updated.rowsWritten > 0;
+  }
+
   // A host registered a session carrying this run id: the run is running and
   // linked to the session. Only a run that has not stopped or failed moves.
   async linkRunSession(id: string, sessionId: string): Promise<boolean> {
