@@ -27,7 +27,8 @@ pub const PROVIDER_ID: &str = "openai-compat";
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 use crate::http::{
-    build_client, check_status, drain_sse, post_json, within_idle, STREAM_IDLE_TIMEOUT,
+    build_client, check_status, drain_sse, json_instead_of_stream, post_json, within_idle,
+    STREAM_IDLE_TIMEOUT,
 };
 
 /// Any OpenAI-compatible chat-completions endpoint.
@@ -185,6 +186,18 @@ impl OpenAiCompatProvider {
             .send_chat(body, |body| self.post_stream(&url, body))
             .await?;
 
+        let response = match json_instead_of_stream(PROVIDER_ID, response).await? {
+            Ok(body) => {
+                let parsed = parse_response(body)?;
+                if !parsed.text.is_empty() {
+                    let _ = tx.send(StreamDelta::Text(parsed.text.clone()));
+                }
+                let _ = tx.send(StreamDelta::Done);
+                return Ok(parsed);
+            }
+            Err(response) => response,
+        };
+
         let mut acc = OaiStreamAccumulator::default();
         drain_sse(
             PROVIDER_ID,
@@ -325,15 +338,25 @@ impl OaiStreamAccumulator {
 
         let mut tools = self.tools;
         tools.sort_by_key(|(index, ..)| *index);
+        // A response cut off by the output cap ends mid-call: its last
+        // arguments are not valid JSON. That is the cap, not a protocol
+        // error, so the cut call is dropped and the turn reports MaxTokens.
+        let cut = self.finish_reason.as_deref() == Some("length");
         let mut tool_calls = Vec::new();
         for (_, id, name, arguments) in &tools {
             let arguments = if arguments.is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(arguments).map_err(|err| Error::Provider {
-                    provider: PROVIDER_ID.into(),
-                    message: format!("malformed tool arguments from model: {err}"),
-                })?
+                match serde_json::from_str(arguments) {
+                    Ok(value) => value,
+                    Err(_) if cut => continue,
+                    Err(err) => {
+                        return Err(Error::Provider {
+                            provider: PROVIDER_ID.into(),
+                            message: format!("malformed tool arguments from model: {err}"),
+                        })
+                    }
+                }
             };
             tool_calls.push(ToolCall {
                 id: id.clone(),
@@ -362,11 +385,12 @@ impl OaiStreamAccumulator {
             }
         };
 
+        let stop_reason = stop_reason_for(self.finish_reason.as_deref(), !tool_calls.is_empty());
         Ok(TurnResponse {
             text: self.text,
             tool_calls,
             usage,
-            stop_reason: map_stop_reason(self.finish_reason.as_deref()),
+            stop_reason,
             provider_blocks: Vec::new(),
         })
     }
@@ -550,15 +574,22 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
             message: "response contained no choices".into(),
         })?;
 
+    let cut = choice.finish_reason.as_deref() == Some("length");
     let mut tool_calls = Vec::new();
     for call in choice.message.tool_calls.unwrap_or_default() {
         let arguments = if call.function.arguments.is_empty() {
             json!({})
         } else {
-            serde_json::from_str(&call.function.arguments).map_err(|err| Error::Provider {
-                provider: PROVIDER_ID.into(),
-                message: format!("malformed tool arguments from model: {err}"),
-            })?
+            match serde_json::from_str(&call.function.arguments) {
+                Ok(value) => value,
+                Err(_) if cut => continue,
+                Err(err) => {
+                    return Err(Error::Provider {
+                        provider: PROVIDER_ID.into(),
+                        message: format!("malformed tool arguments from model: {err}"),
+                    })
+                }
+            }
         };
         tool_calls.push(ToolCall {
             id: call.id,
@@ -585,13 +616,27 @@ pub fn parse_response(body: Value) -> Result<TurnResponse> {
         }
     };
 
+    let stop_reason = stop_reason_for(choice.finish_reason.as_deref(), !tool_calls.is_empty());
     Ok(TurnResponse {
         text: choice.message.content.unwrap_or_default(),
         tool_calls,
         usage,
-        stop_reason: map_stop_reason(choice.finish_reason.as_deref()),
+        stop_reason,
         provider_blocks: Vec::new(),
     })
+}
+
+/// The stop reason of a turn. Tool calls outrank the endpoint's
+/// `finish_reason`: some OpenAI-compatible servers send `stop` (or nothing)
+/// next to a non-empty `tool_calls`, and the engine only dispatches tools on
+/// `ToolUse`. `length` is kept, because a call cut off by the output cap is
+/// not safe to run.
+fn stop_reason_for(reason: Option<&str>, has_tool_calls: bool) -> StopReason {
+    match map_stop_reason(reason) {
+        StopReason::MaxTokens => StopReason::MaxTokens,
+        _ if has_tool_calls => StopReason::ToolUse,
+        other => other,
+    }
 }
 
 fn map_stop_reason(reason: Option<&str>) -> StopReason {
@@ -937,6 +982,53 @@ mod tests {
         }"#;
         let parsed = parse_response(serde_json::from_str::<Value>(fixture).unwrap()).unwrap();
         assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+    }
+
+    /// Some compatible servers send `stop` (or nothing) next to tool calls;
+    /// the calls still make it a tool-use turn.
+    #[test]
+    fn tool_calls_with_a_stop_finish_reason_are_a_tool_use_turn() {
+        for reason in [r#""stop""#, "null"] {
+            let fixture = format!(
+                r#"{{
+                "choices": [{{
+                    "message": {{
+                        "role": "assistant", "content": null,
+                        "tool_calls": [{{"id": "c1", "function": {{"name": "read", "arguments": "{{}}"}}}}]
+                    }},
+                    "finish_reason": {reason}
+                }}],
+                "usage": {{"prompt_tokens": 1, "completion_tokens": 1}}
+            }}"#
+            );
+            let parsed = parse_response(serde_json::from_str::<Value>(&fixture).unwrap()).unwrap();
+            assert_eq!(
+                parsed.stop_reason,
+                StopReason::ToolUse,
+                "finish_reason {reason}"
+            );
+            assert_eq!(parsed.tool_calls.len(), 1);
+        }
+    }
+
+    /// A tool call cut off by the output cap is the cap, not a protocol
+    /// error: the cut call is dropped and the turn reports MaxTokens.
+    #[test]
+    fn a_tool_call_cut_by_the_output_cap_is_dropped_not_an_error() {
+        let fixture = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{"id": "c1", "function": {"name": "write", "arguments": "{\"path\": \"a.py\", \"content\": \"import"}}]
+                },
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 8192}
+        }"#;
+        let parsed = parse_response(serde_json::from_str::<Value>(fixture).unwrap()).unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.usage.output_tokens, 8192);
     }
 
     #[test]

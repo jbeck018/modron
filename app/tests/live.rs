@@ -300,21 +300,21 @@ fn y_approves_and_r_revises_a_pending_plan() {
 }
 
 #[test]
-fn r_revises_with_the_composer_text_as_the_note() {
+fn enter_revises_with_the_composer_text_as_the_note() {
     let mut h = Harness::new();
-    h.push(&fixture());
-    h.wait_for("transcript", None, |s| s.contains("fix the router crate"));
-    // Typed before the plan arrives: the plan keys are taken by then.
-    h.type_text("fix it");
-    h.wait_for("typed note", None, |s| s.contains("fix it"));
     let mut snapshot = fixture();
     plan(&mut snapshot);
     h.push(&snapshot);
     h.wait_for("plan", None, |s| s.contains("r revise"));
-    h.send(key("r"));
+    // Typed while the plan waits: the note holds both plan keys' letters,
+    // and neither decides the plan once the composer has text.
+    h.type_text("try postgres");
+    h.wait_for("typed note", None, |s| s.contains("try postgres"));
+    assert_eq!(h.action(), None);
+    h.send(key("Enter"));
     assert_eq!(
         h.action(),
-        Some(UiAction::DecidePlan { approve: false, note: Some("fix it".into()) })
+        Some(UiAction::DecidePlan { approve: false, note: Some("try postgres".into()) })
     );
 }
 

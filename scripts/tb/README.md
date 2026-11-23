@@ -63,3 +63,52 @@ Notes:
   WITH the API key) - gitignored on purpose, never commit it.
 - `tb run` results land in `runs/<timestamp>/results.json` per trial
   (`is_resolved`, `failure_mode`, token totals).
+
+## Agent comparison (modron vs omp)
+
+`compare.sh` runs the same tasks with modron and with omp
+(`@oh-my-pi/pi-coding-agent`) on one pinned model and prints a table:
+
+```sh
+bun install -g @oh-my-pi/pi-coding-agent          # omp, once
+cargo build --release -p modron-cli --target x86_64-unknown-linux-musl
+RELAY_API_KEY=$ZAI_API_KEY scripts/tb/compare.sh /tmp/tb-tasks/tasks /tmp/bench
+python3 scripts/tb/compare.py /tmp/bench          # again, any time, also mid-run
+```
+
+Pieces:
+
+- `relay.mjs` - a small HTTP relay the task containers call instead of the
+  provider (`/t/<tag>/<provider path>`). It holds the key, so no container
+  and no `commands.txt` ever contains it, and it counts requests and tokens
+  per trial from the provider's own usage fields. Both agents are measured
+  by the same counter; neither agent's self-report is used. It also records
+  which models each trial called, which is how a run proves that only the
+  pinned model was used.
+- `bench_agents.py` - `ModronAgent` and `OmpAgent`. Same flow for both: one
+  headless run in the task's own shell, approvals off, pinned model, no
+  retry, no second model, the harness's task timeout. modron speaks the
+  OpenAI wire format to Z.AI and omp the Anthropic one; that is each
+  agent's own choice for this model and is left alone.
+- `compare.py` - joins the harness verdict with the relay row per trial and
+  writes `compare.md` and `compare.json`. Trials whose agent never started
+  (image build failure) are left out. Totals cover only tasks both agents
+  attempted.
+- `compare-tasks.txt` - the default task set (24 tasks that need no GPU,
+  QEMU or large downloads).
+
+Env: `MODEL`, `ATTEMPTS` (2), `CONCURRENT` (2 per agent), `AGENTS`,
+`RELAY_PORT`, `RELAY_UPSTREAM`, `BENCH_CA_BUNDLE` (a PEM bundle to trust
+inside task containers, for hosts whose outbound HTTPS is re-signed by an
+inspecting proxy; applied to both agents).
+
+Things that bit the first run (2026-11-23):
+
+- Run ids become docker compose project names and must be lowercase.
+- Docker Hub rate-limits shared egress; start dockerd with
+  `--registry-mirror https://mirror.gcr.io`.
+- The Z.AI coding plan answers 429 (code 1302) above roughly four
+  concurrent streams. Two trials per agent is the ceiling for a
+  two-agent run; do not run anything else against the key meanwhile.
+- Wall time includes the provider's speed that day. Compare requests and
+  tokens first, seconds second.

@@ -34,7 +34,11 @@ thiserror = "2"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Both root sets: the bundled Mozilla roots keep a static binary working
+# in an image with no CA store, and the native roots (system store,
+# SSL_CERT_FILE, SSL_CERT_DIR) make private CAs and TLS-inspecting
+# proxies work.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -46,7 +50,7 @@ toml = "0.8"
 dirs = "5"
 futures = "0.3"
 tempfile = "3"
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 libc = "0.2"
 sha2 = "0.10"
 

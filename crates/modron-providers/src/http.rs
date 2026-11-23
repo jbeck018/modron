@@ -224,6 +224,45 @@ pub(crate) async fn check_status(
     Ok(response)
 }
 
+/// The JSON document of a response that answered a streaming request
+/// without streaming, or the response back when it is an event stream.
+///
+/// Some OpenAI- and Anthropic-compatible servers ignore `"stream": true`
+/// and reply with the ordinary one-document body (`Content-Type:
+/// application/json`). That is a complete answer; reading it as SSE would
+/// find no event and fail the turn as a dropped connection.
+pub(crate) async fn json_instead_of_stream(
+    provider_id: &str,
+    response: reqwest::Response,
+) -> Result<std::result::Result<serde_json::Value, reqwest::Response>> {
+    let is_json = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+        });
+    if !is_json {
+        return Ok(Err(response));
+    }
+    let text = within_idle(provider_id, STREAM_IDLE_TIMEOUT, async {
+        response
+            .text()
+            .await
+            .map_err(|err| crate::transport_error(provider_id, err))
+    })
+    .await?;
+    serde_json::from_str(&text)
+        .map(Ok)
+        .map_err(|err| Error::Provider {
+            provider: provider_id.to_string(),
+            message: format!("malformed response: {err}"),
+        })
+}
+
 /// Text + status-check + parse tail for a response already in hand (the
 /// anthropic path wraps its POST in the 401 retry first, so it cannot go
 /// through [`post_json`] wholesale).

@@ -232,7 +232,14 @@ pub fn set_key_in_env_file(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Only a missing file is empty. Any other read failure (not UTF-8,
+    // no permission) must stop the write: rewriting from "empty" would
+    // drop every other saved key.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
     let mut lines: Vec<String> = existing
         .lines()
         .filter(|l| !l.starts_with(&format!("export {env_var}=")))

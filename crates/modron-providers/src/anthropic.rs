@@ -28,8 +28,8 @@ const REPLAY_API: &str = "messages";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 use crate::http::{
-    build_client, check_status, drain_sse, finish_json, with_401_retry, within_idle,
-    REQUEST_TIMEOUT, STREAM_IDLE_TIMEOUT,
+    build_client, check_status, drain_sse, finish_json, json_instead_of_stream, with_401_retry,
+    within_idle, REQUEST_TIMEOUT, STREAM_IDLE_TIMEOUT,
 };
 
 /// Anthropic Messages API client.
@@ -305,6 +305,17 @@ impl AnthropicProvider {
         // Streaming failures arrive as a plain (non-SSE) error body; the
         // shared status check maps them to the canonical error text.
         let response = check_status(PROVIDER_ID, response).await?;
+        let response = match json_instead_of_stream(PROVIDER_ID, response).await? {
+            Ok(body) => {
+                let parsed = parse_response(body)?;
+                if !parsed.text.is_empty() {
+                    let _ = tx.send(StreamDelta::Text(parsed.text.clone()));
+                }
+                let _ = tx.send(StreamDelta::Done);
+                return Ok(parsed);
+            }
+            Err(response) => response,
+        };
 
         let mut acc = StreamAccumulator::default();
         drain_sse(
@@ -586,15 +597,25 @@ impl StreamAccumulator {
         }
 
         self.tool_blocks.sort_by_key(|(index, ..)| *index);
+        // A response cut off by the output cap ends mid-call: its last
+        // arguments are not valid JSON. That is the cap, not a protocol
+        // error, so the cut call is dropped and the turn reports MaxTokens.
+        let cut = self.stop_reason.as_deref() == Some("max_tokens");
         let mut tool_calls = Vec::new();
         for (_, id, name, partial_json) in &self.tool_blocks {
             let arguments = if partial_json.is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(partial_json).map_err(|err| Error::Provider {
-                    provider: PROVIDER_ID.into(),
-                    message: format!("malformed tool arguments from model: {err}"),
-                })?
+                match serde_json::from_str(partial_json) {
+                    Ok(value) => value,
+                    Err(_) if cut => continue,
+                    Err(err) => {
+                        return Err(Error::Provider {
+                            provider: PROVIDER_ID.into(),
+                            message: format!("malformed tool arguments from model: {err}"),
+                        })
+                    }
+                }
             };
             tool_calls.push(ToolCall {
                 id: id.clone(),

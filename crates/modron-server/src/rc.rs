@@ -1018,9 +1018,15 @@ async fn dial_once(
         // on what the relay happened to buffer. A snapshot resets a client's
         // view, so viewers already attached are unaffected.
         let joined = matches!(frame.payload, modron_protocol::Payload::Hello { .. });
-        if handle_relayed_frame(state, &mut ctx, frame).await == Flow::Close {
-            break;
+        // Every remote client shares this one connection context, so a
+        // frame that acts on "this connection" acts on all of them. A
+        // remote detach is therefore dropped (it would unsubscribe every
+        // viewer), and a remote frame never closes the tunnel (a hello with
+        // the wrong protocol version gets its error and nothing else).
+        if matches!(frame.payload, modron_protocol::Payload::Detach {}) {
+            continue;
         }
+        let _ = handle_relayed_frame(state, &mut ctx, frame).await;
         if joined {
             let resync = modron_protocol::Frame::request(
                 0,

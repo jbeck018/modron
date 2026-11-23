@@ -3732,7 +3732,7 @@ fn print_compaction_lines(events: &[SessionEvent], baseline: usize, tail_message
 /// Print the per-model usage table for THIS run: persisted `Usage` events
 /// (provider-reported ground truth) appended after `baseline`, with estimated
 /// cost from the router catalog and the provider-reported cache-hit rate
-/// (K3): cached/(input+cached), `0%` when nothing was cached. Unknown models
+/// (K3): cached/input (input includes cached), `0%` when nothing was cached. Unknown models
 /// get `n/a` instead of a made-up price.
 fn print_usage_table(events: &[SessionEvent]) -> anyhow::Result<()> {
     let mut order: Vec<String> = Vec::new();
@@ -3755,7 +3755,7 @@ fn print_usage_table(events: &[SessionEvent]) -> anyhow::Result<()> {
     println!();
     println!(
         "usage per model (provider-reported; cost is ESTIMATED from the catalog; \
-         cache hit = cached/(input+cached)):"
+         cache hit = cached/input, input includes cached):"
     );
     println!(
         "{:<24} {:>10} {:>10} {:>10} {:>10} {:>14}",
@@ -3779,18 +3779,12 @@ fn print_usage_table(events: &[SessionEvent]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Provider-reported cache-hit rate as a rounded percentage: cached input
-/// over all input (cached tokens ride outside `input_tokens` on some
-/// providers). `0%` when nothing was cached — never a blank or a guess.
+/// Provider-reported cache-hit rate as a rounded percentage, the same
+/// figure the app's status surface shows (`modron_view::cache_hit_pct`:
+/// cached input over all input, and `input_tokens` already includes the
+/// cached part). `0%` when nothing was cached, never a blank or a guess.
 fn cache_hit_column(usage: &Usage) -> String {
-    let all_input = usage.input_tokens + usage.cached_input_tokens;
-    if all_input == 0 {
-        return "0%".to_string();
-    }
-    format!(
-        "{:.0}%",
-        (usage.cached_input_tokens as f64 / all_input as f64) * 100.0
-    )
+    format!("{:.0}%", modron_view::cache_hit_pct(usage).unwrap_or(0.0))
 }
 
 fn print_usage_row(model: &str, usage: &Usage, cost: f64) {
@@ -4021,11 +4015,19 @@ mod tests {
     #[test]
     fn cache_hit_column_is_provider_reported_share() {
         let usage = Usage {
-            input_tokens: 750,
+            input_tokens: 1000,
             output_tokens: 10,
             cached_input_tokens: 250,
         };
         assert_eq!(cache_hit_column(&usage), "25%");
+        // A fully cached prompt is 100%, not 50%: the cached tokens are
+        // part of `input_tokens`, not on top of it.
+        let all_cached = Usage {
+            input_tokens: 1000,
+            output_tokens: 10,
+            cached_input_tokens: 1000,
+        };
+        assert_eq!(cache_hit_column(&all_cached), "100%");
         // Nothing cached → honest 0%, not blank.
         assert_eq!(cache_hit_column(&Usage::default()), "0%");
         let no_cache = Usage {

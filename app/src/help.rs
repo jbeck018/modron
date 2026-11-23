@@ -297,6 +297,16 @@ pub fn bindings() -> Vec<Binding> {
             chord: false,
             alt: false,
             facts: || with(|f| f.plan_pending = true),
+            draft: "",
+            expect: || Routed::Action(UiAction::DecidePlan { approve: false, note: None }),
+        },
+        Binding {
+            label: "Enter",
+            what: "with a plan proposed and a note typed: revise the plan with the note",
+            key: Key::Enter,
+            chord: false,
+            alt: false,
+            facts: || with(|f| f.plan_pending = true),
             draft: "split it",
             expect: || {
                 Routed::Action(UiAction::DecidePlan {

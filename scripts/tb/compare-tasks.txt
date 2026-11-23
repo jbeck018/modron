@@ -1,0 +1,26 @@
+# Default task set for scripts/tb/compare.sh: terminal-bench-core v0.2.x
+# tasks that build quickly and need no GPU, QEMU or large downloads.
+blind-maze-explorer-5x5
+broken-python
+crack-7z-hash
+csv-to-parquet
+extract-safely
+fibonacci-server
+fix-git
+fix-pandas-version
+fix-permissions
+git-multibranch
+git-workflow-hack
+grid-pattern-transform
+heterogeneous-dates
+modernize-fortran-build
+new-encrypt-command
+nginx-request-logging
+openssl-selfsigned-cert
+organization-json-generator
+password-recovery
+polyglot-c-py
+processing-pipeline
+sanitize-git-repo
+simple-web-scraper
+sqlite-db-truncate

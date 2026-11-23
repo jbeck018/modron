@@ -27,6 +27,26 @@ use std::sync::Arc;
 /// output cap; this is a sane non-streaming default).
 const MAX_OUTPUT_TOKENS: u32 = 8192;
 
+/// One provider turn with nobody watching the deltas (a headless run, the
+/// reviewer, an escalation, a compaction summary).
+///
+/// It still goes over the provider's streaming transport. The blocking
+/// transport has one total deadline per request (two minutes), and a
+/// reasoning model can need longer than that for a single response: the
+/// request then times out, is sent again from the start and billed again,
+/// and can fail the run. A stream has no total deadline, only an idle
+/// timeout between chunks, so a slow but live response completes.
+async fn turn_unobserved(
+    provider: &Arc<dyn ModelProvider>,
+    request: Arc<TurnRequest>,
+) -> Result<TurnResponse> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = provider.turn_streaming(request, tx).await;
+    let _ = drain.await;
+    result
+}
+
 /// The approval-gated tool class (A1, decision D1): these change system state
 /// or run model-supplied commands, so they need an explicit approval outside
 /// `ApproveAll`. Every tool whose name starts with `mcp__` is gated too (see
@@ -34,7 +54,9 @@ const MAX_OUTPUT_TOKENS: u32 = 8192;
 ///
 /// Every new tool needs an explicit gated/ungated decision here: a tool that
 /// is not added to this list runs without approval.
-const MUTATING_TOOLS: [&str; 10] = [
+const MUTATING_TOOLS: [&str; 11] = [
+    // Commits a worktree and merges it into the user's branch.
+    "merge_worktree",
     "webfetch",
     "web_search",
     "bash",
@@ -490,6 +512,20 @@ async fn git_diff_text(dir: &std::path::Path) -> Option<String> {
 /// retries; 2 keeps the worst case tight).
 const MAX_VERIFY_ROUNDS: u32 = 2;
 
+/// How many times per run a response cut off by the output cap is answered
+/// with [`OUTPUT_CAP_NUDGE`] instead of ending the run.
+const MAX_OUTPUT_CAP_ROUNDS: u32 = 3;
+
+/// Stands in for the text of a response that the output cap cut off before
+/// any text was produced.
+const OUTPUT_CAP_EMPTY: &str = "[no output: the response was cut off by the output token limit]";
+
+/// Sent as a user message after a response that hit the output token cap.
+const OUTPUT_CAP_NUDGE: &str = "Your last response was cut off by the output token limit before \
+     it finished, so none of its tool calls ran. Continue from where you stopped. Think briefly, \
+     and keep each tool call small: write a large file in several steps (create it, then append \
+     or edit) instead of one call.";
+
 /// System-prompt addendum for the escalation turn (verify-failure
 /// escalation): one appended block, not a rebuilt prompt, so the escalated
 /// model sees the same identity/tool contract the run used and only the
@@ -567,6 +603,8 @@ struct RunLoopState {
     /// run, and how many verification rounds have been spent.
     mutated_this_run: bool,
     verify_rounds: u32,
+    /// Responses cut off by the output cap that were answered with a nudge.
+    output_cap_rounds: u32,
     /// Whether the finish gate already injected its self-check turn. The
     /// self-check runs at most once per run.
     self_check_sent: bool,
@@ -615,6 +653,7 @@ impl RunLoopState {
             spend_usd: 0.0,
             mutated_this_run: false,
             verify_rounds: 0,
+            output_cap_rounds: 0,
             self_check_sent: false,
             self_check_turn_pending: false,
             run_tier_override: None,
@@ -720,6 +759,12 @@ impl Engine {
             ));
         }
 
+        let events = self.store.load(session_id).await?;
+        // A session handed off to another host takes no more runs here,
+        // team runs included.
+        if let Some(refusal) = crate::handoff::run_refusal(session_id, &events) {
+            return Err(Error::Session(refusal));
+        }
         if let Some(team) = crate::team::parse_command(task) {
             let (opts, goal) = team.map_err(|message| {
                 Error::Config(message, "usage: /team [N] <task>, N from 1 to 5".into())
@@ -728,15 +773,11 @@ impl Engine {
         }
         let expanded = context::expand_project_command(&self.config.working_dir, task);
         let task = expanded.as_deref().unwrap_or(task);
-        let events = self.store.load(session_id).await?;
         if events.is_empty() {
             return Err(Error::Session(format!(
                 "session {session_id} has no events — nothing to resume; \
                  check the id against `modron --resume <id>` of a completed run"
             )));
-        }
-        if let Some(refusal) = crate::handoff::run_refusal(session_id, &events) {
-            return Err(Error::Session(refusal));
         }
         // Rewind support (C2): when `resume_from_event` is set, events after
         // that index stay in the append-only log but never re-enter context.
@@ -826,13 +867,25 @@ impl Engine {
 
             // Loop-external turn state: `None` = self-check short-circuit
             // (the outer run loop ends with the preserved answer).
-            let Some(turn) = self
+            let Some(mut turn) = self
                 .execute_provider_turn(session_id, &system, &tool_specs, &route, &mut state)
                 .await?
             else {
                 break;
             };
             state.turns += 1;
+            // A response cut off by the output cap never runs its tool
+            // calls: the last one is incomplete, and a call recorded but
+            // not answered would make the next request invalid.
+            let output_capped = turn.response.stop_reason == StopReason::MaxTokens;
+            if output_capped {
+                turn.response.tool_calls.clear();
+                if turn.response.text.trim().is_empty() {
+                    // Never an empty assistant message: providers refuse
+                    // one, and an empty final answer would hide the cause.
+                    turn.response.text = OUTPUT_CAP_EMPTY.to_string();
+                }
+            }
 
             // Usage: provider-reported ground truth, never estimates.
             state.governor.feed_turn(turn.response.usage);
@@ -922,6 +975,34 @@ impl Engine {
                     .await;
                     break;
                 }
+            }
+
+            // Output cap: the model ran out of output tokens mid-response
+            // (often all of them spent reasoning, or one very large write).
+            // Ending the run here would report a truncated or empty answer
+            // as the result, so the model is told what happened and the
+            // loop goes on, a bounded number of times per run.
+            if output_capped
+                && state.output_cap_rounds < MAX_OUTPUT_CAP_ROUNDS
+                && state.turns < self.config.max_turns
+            {
+                state.output_cap_rounds += 1;
+                tracing::warn!(
+                    round = state.output_cap_rounds,
+                    "response hit the output token cap; asking the model to continue"
+                );
+                let nudge = Message::user(OUTPUT_CAP_NUDGE);
+                self.store
+                    .append(
+                        session_id,
+                        &SessionEvent::Message {
+                            parent_id: None,
+                            message: nudge.clone(),
+                        },
+                    )
+                    .await?;
+                state.transcript.push(nudge);
+                continue;
             }
 
             if turn.response.stop_reason != StopReason::ToolUse
@@ -1309,7 +1390,7 @@ impl Engine {
                         result
                     }
                 }
-                None => provider.turn(request).await,
+                None => turn_unobserved(&provider, request).await,
             };
             match response {
                 Ok(r) => {
@@ -2665,7 +2746,7 @@ impl Engine {
             effort: None,
             reasoning_summary: false,
         });
-        match provider.turn(request).await {
+        match turn_unobserved(&provider, request).await {
             Ok(response) => Some((response.text, response.usage, model)),
             Err(err) => {
                 tracing::warn!(error = %err, role, "team turn failed; stage skipped");
@@ -2757,7 +2838,7 @@ impl Engine {
         });
         tracing::info!(provider = provider.id(), model = %model, "review turn: independent reviewer");
         let turn_started = std::time::Instant::now();
-        let response = match provider.turn(request).await {
+        let response = match turn_unobserved(&provider, request).await {
             Ok(response) => response,
             Err(err) => {
                 tracing::warn!(error = %err, "review turn failed; review skipped");
@@ -2966,7 +3047,7 @@ impl Engine {
         // Best-effort by contract: a provider failure keeps the
         // pre-escalation answer (which already carries the gate's give-up
         // note) and ends the run — never a failed run for a bonus turn.
-        let response = match provider.turn(request).await {
+        let response = match turn_unobserved(&provider, request).await {
             Ok(response) => response,
             Err(err) => {
                 tracing::warn!(
@@ -3182,7 +3263,7 @@ impl Engine {
             summarized_events,
             "compaction turn: summarizing older transcript"
         );
-        let response = provider.turn(request).await?;
+        let response = turn_unobserved(&provider, request).await?;
 
         // Cap the summary before it is persisted (char boundary + marker).
         let summary =

@@ -85,6 +85,20 @@ fn private_file_options() -> OpenOptions {
     OpenOptions::new()
 }
 
+/// Whether the file is empty or its last byte is a newline. An unreadable
+/// file counts as fine: the append that follows reports the real error.
+fn ends_with_newline(path: &Path) -> bool {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return true;
+    };
+    if file.seek(SeekFrom::End(-1)).is_err() {
+        return true; // empty file
+    }
+    let mut last = [0u8; 1];
+    matches!(file.read_exact(&mut last), Ok(()) if last[0] == b'\n')
+}
+
 /// Reduces an existing file or directory to `mode` when it grants any bit
 /// outside it (group/other access left by an older build or a manual copy).
 /// Never widens and never touches a path that is already private enough.
@@ -252,6 +266,7 @@ impl Inner {
         // Reuse the cached handle; opening fresh only on the first append
         // (or after a delete). NotFound maps to the documented
         // unknown-session error.
+        let mut repaired = false;
         if let std::collections::hash_map::Entry::Vacant(entry) = caches.handles.entry(id) {
             let path = self.jsonl_path(id);
             let file = OpenOptions::new().append(true).open(&path).map_err(|e| {
@@ -268,19 +283,38 @@ impl Inner {
             tighten(&path, 0o600).map_err(|e| {
                 Error::Session(format!("could not tighten {}: {e}", path.display()))
             })?;
+            // A write cut short earlier (disk full, a kill mid-append)
+            // leaves a torn last line. Appending straight after it would
+            // glue the next event onto the torn text, and a load would skip
+            // both as one corrupt line. End the torn line before the first
+            // append through this handle.
+            let mut file = file;
+            if !ends_with_newline(&path) {
+                file.write_all(b"\n").map_err(|e| {
+                    Error::Session(format!("could not append to {}: {e}", path.display()))
+                })?;
+                repaired = true;
+            }
             entry.insert(file);
+        }
+        if repaired {
+            caches.counts.remove(&id);
         }
         let file = caches.handles.get_mut(&id).expect("handle inserted above");
         // Length before our write. Another process may append between this
         // read and our write, but then the recorded length below falls
         // behind the file and the next `event_count` recounts.
         let len_before = file.metadata().ok().map(|m| m.len());
-        file.write_all(buffer.as_bytes()).map_err(|e| {
-            Error::Session(format!(
+        if let Err(e) = file.write_all(buffer.as_bytes()) {
+            // The write may have landed in part. Drop the handle and the
+            // count so the next append reopens and repairs a torn line.
+            caches.handles.remove(&id);
+            caches.counts.remove(&id);
+            return Err(Error::Session(format!(
                 "could not append to {}: {e}",
                 self.jsonl_path(id).display()
-            ))
-        })?;
+            )));
+        }
         let written = buffer.len() as u64;
         match (caches.counts.get_mut(&id), len_before) {
             (Some(entry), Some(before)) if entry.len == before => {
@@ -957,6 +991,37 @@ mod tests {
             matches!(loaded.last(), Some(SessionEvent::Message { message, ..
                 }) if message.content == "again")
         );
+    }
+
+    /// A torn last line (a write cut short, then a restart) must not
+    /// swallow the next event: the append ends the torn line first.
+    #[tokio::test]
+    async fn append_after_a_torn_line_keeps_the_new_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let meta = {
+            let store = JsonlSessionStore::new(root.clone());
+            let meta = store.create_session("torn").await.unwrap();
+            store.append(meta.id, &sample_events()[0]).await.unwrap();
+            meta
+        };
+        let jsonl_path = root.join(format!("{}.jsonl", meta.id));
+        let mut file = OpenOptions::new().append(true).open(&jsonl_path).unwrap();
+        file.write_all(b"{\"type\":\"mess").unwrap();
+        drop(file);
+
+        // A fresh store, as after a restart: no cached handle.
+        let store = JsonlSessionStore::new(root);
+        let events = sample_events();
+        store.append(meta.id, &events[1]).await.unwrap();
+        let loaded = store.load(meta.id).await.unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "the torn line is skipped, the new event kept"
+        );
+        assert_eq!(event_json(&loaded[1]), event_json(&events[1]));
+        assert_eq!(store.event_count(meta.id).await.unwrap(), 2);
     }
 
     #[tokio::test]

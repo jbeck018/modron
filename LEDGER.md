@@ -1769,3 +1769,17 @@ clear it). A packet is DONE only with evidence (commit + gate result).
 - 2026-11-18: F1, F3: team mode on its own branch with cleanup and stage notes; offline marking race fixed; sleeping runs; see rows.
 - 2026-11-18: F2: app fixes (credentials actions, reconnecting, dialogs, empty state, screenshot review); see row.
 - 2026-11-18: DEP-1 done (chrono replaced by jiff); A1: app cosmetics and NSH 0.6.0; see rows.
+- 2026-11-23: review and bench round; see docs/REVIEW_2026-11-23.md
+  (56 rows, 18 marked fixed, the rest open with ids). Fixed: unobserved
+  turns go over the streaming transport (the blocking one's 120 s
+  deadline resent and re-billed slow responses); a response cut off by
+  the output cap continues instead of failing or ending empty; native
+  TLS roots; a JSON answer to a streaming request; tool calls with a
+  `stop` finish reason; approver plan notes; viewer hello and detach on
+  the tunnel; `merge_worktree` gated; torn transcript line; env file
+  rewrite on a failed read; `/team` handoff refusal; CLI cache-hit
+  figure; plan keys while a note is typed; wheel on non-chat screens;
+  `url` 2.5.9 (RUSTSEC-2026-0592). New: scripts/tb agent comparison
+  (relay.mjs, bench_agents.py, compare.sh, compare.py). Gates: root fmt,
+  clippy, cargo-deny clean, 1523 tests; app fmt, clippy, wasm32 check
+  clean, tests pass. Not run: web-test.js, e2e.

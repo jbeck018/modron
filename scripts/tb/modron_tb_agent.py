@@ -102,6 +102,8 @@ class ModronTbAgent(BaseAgent):
             [binary], container_dir="/usr/local/bin", container_filename="modron"
         )
 
+        home = "/tmp/modron-home"
+
         # 1b. Claude escalation support: ship modron's auth store so a
         #     follow-up run with --provider anthropic can authenticate
         #     (tokens imported from the host Claude Code sign-in).
@@ -133,7 +135,6 @@ class ModronTbAgent(BaseAgent):
         #    ONE literal send ending in a newline: non-blocking sends go
         #    through verbatim (the blocking path strips and injects its
         #    own Enter machinery — two separate sends raced and merged).
-        home = "/tmp/modron-home"
         cmd = (
             f"chmod +x {BINARY_IN_CONTAINER}; "
             # NO HOME override: task images legitimately ship dotfiles in

@@ -15,6 +15,7 @@ modron-tools = { path = "../modron-tools", version = "0.1.0" }
 modron-store = { path = "../modron-store", version = "0.1.0" }
 modron-router = { path = "../modron-router", version = "0.1.0" }
 modron-mcp = { path = "../modron-mcp", version = "0.1.0" }
+modron-view = { path = "../modron-view", version = "0.1.0" }
 modron-server = { path = "../modron-server", version = "0.1.0" }
 # The lineage words of a forked session's row, shared with the app targets.
 modron-mobile-core = { path = "../../mobile/rust-core", version = "0.1.3" }

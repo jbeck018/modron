@@ -707,8 +707,9 @@ pub enum Routed {
 /// opens Help. Enter otherwise reaches the composer (Alt marks a queue);
 /// Backspace on an empty composer with messages queued removes the last one;
 /// a chord passes; Esc interrupts; with an approval pending, y / a / n decide
-/// its options and every other key is the composer's; with a plan pending, y
-/// approves and r revises with the trimmed composer text as the note.
+/// its options and every other key is the composer's; with a plan pending and
+/// an empty composer, y approves and r revises; with a note typed, Enter
+/// revises with the trimmed composer text as the note.
 ///
 /// Esc precedence: on Sessions and Models, Esc clears a non-empty filter
 /// first and closes the screen second; on Settings, Help and Agent it closes
@@ -767,6 +768,15 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
             return Routed::Nav(NavStep::CompleteSelected)
         }
         Key::Enter if alt => return queue_route(draft),
+        // With a plan pending, Enter on a typed note revises the plan with
+        // it (the plan keys only act on an empty composer, see below).
+        Key::Enter
+            if facts.plan_pending
+                && facts.approval_options.is_none()
+                && !draft.trim().is_empty() =>
+        {
+            return Routed::Action(plan_answer_for(false, draft))
+        }
         Key::Enter => return composer,
         Key::Tab if suggesting && facts.file_mode => return Routed::CompleteFile,
         Key::Tab if suggesting => return Routed::Nav(NavStep::CompleteSelected),
@@ -820,7 +830,10 @@ pub fn route_key(key: Key, alt: bool, chord: bool, facts: KeyFacts, draft: &str)
             _ => composer,
         };
     }
-    if facts.plan_pending {
+    // The plan keys decide only on an empty composer. Once a note is being
+    // typed they are ordinary letters ("use postgres" holds an r, "try" a
+    // y), and Enter sends the note as a revision.
+    if facts.plan_pending && draft.trim().is_empty() {
         if name == PLAN_KEYS[0] {
             return Routed::Action(UiAction::DecidePlan { approve: true, note: None });
         }
@@ -1967,11 +1980,13 @@ impl Host {
         if rows == 0 {
             return;
         }
-        // The wheel moves the help rows on the help screen (up is toward the top).
-        if self.nav.top() == Screen::Help {
-            self.nav_step(NavStep::HelpScroll(-rows));
-        } else {
-            self.scroll(ScrollStep::Lines(rows));
+        // The wheel moves the help rows on the help screen (up is toward the
+        // top) and the transcript on the two screens that show one. On any
+        // other screen it must not scroll the chat hidden underneath.
+        match self.nav.top() {
+            Screen::Help => self.nav_step(NavStep::HelpScroll(-rows)),
+            Screen::Chat | Screen::Agent => self.scroll(ScrollStep::Lines(rows)),
+            _ => {}
         }
     }
 
@@ -3339,16 +3354,27 @@ mod tests {
     fn plan_keys_approve_and_revise_with_the_draft_as_note() {
         let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            route_key(Key::Char('y'), false, false, plan(), "ignored"),
+            route_key(Key::Char('y'), false, false, plan(), ""),
             Routed::Action(UiAction::DecidePlan { approve: true, note: None })
         );
         assert_eq!(
-            route_key(Key::Char('r'), false, false, plan(), "  split the crate  "),
+            route_key(Key::Enter, false, false, plan(), "  split the crate  "),
             Routed::Action(UiAction::DecidePlan {
                 approve: false,
                 note: Some("split the crate".into())
             })
         );
+    }
+
+    /// A note can hold the plan keys' letters: with text in the composer
+    /// `y` and `r` are typed, not decisions.
+    #[test]
+    fn plan_keys_are_letters_while_a_note_is_typed() {
+        let _serial = super::tests::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(route_key(Key::Char('r'), false, false, plan(), "use postg"), composer());
+        assert_eq!(route_key(Key::Char('y'), false, false, plan(), "tr"), composer());
+        // Without a plan, Enter still goes to the composer.
+        assert_eq!(route_key(Key::Enter, false, false, NONE, "use postgres"), composer());
     }
 
     #[test]

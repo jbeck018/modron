@@ -195,6 +195,59 @@ async fn full_tool_loop_end_to_end() {
     assert_eq!(listed[0].title, "list the rust files");
 }
 
+/// A response cut off by the output cap does not end the run and does not
+/// run (or leave dangling) its tool calls: the model is told and continues.
+#[tokio::test]
+async fn output_capped_turn_is_nudged_and_its_tool_calls_never_run() {
+    let mut capped = tool_call_response("call_cut", "echo_tool", Usage::default());
+    capped.stop_reason = StopReason::MaxTokens;
+    capped.text = String::new();
+    let provider = Arc::new(
+        MockProvider::new()
+            .then_response(capped)
+            .then_text("Finished in smaller steps."),
+    );
+    let engine = engine(provider.clone(), base_config(), registry(false));
+    let summary = engine.run_task("write the big file").await.unwrap();
+
+    assert_eq!(summary.answer, "Finished in smaller steps.");
+    assert_eq!(summary.turns, 2);
+    assert_eq!(summary.tool_calls, 0, "a cut-off call must not run");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second = &requests[1].messages;
+    assert_tool_pairs_balanced(second);
+    assert_eq!(second[1].role, Role::Assistant);
+    assert!(second[1].tool_calls.is_empty());
+    assert!(
+        !second[1].content.is_empty(),
+        "never an empty assistant message"
+    );
+    assert_eq!(second[2].role, Role::User);
+    assert!(second[2].content.contains("output token limit"));
+}
+
+/// The nudge is bounded: a model that keeps hitting the cap ends the run
+/// with the stand-in text instead of looping to max_turns.
+#[tokio::test]
+async fn output_cap_nudges_are_bounded() {
+    let capped = TurnResponse {
+        text: String::new(),
+        tool_calls: vec![],
+        usage: Usage::default(),
+        stop_reason: StopReason::MaxTokens,
+        provider_blocks: Vec::new(),
+    };
+    let provider = Arc::new(MockProvider::new().then_response(capped).then_repeat_last());
+    let engine = engine(provider.clone(), base_config(), registry(false));
+    let summary = engine.run_task("think forever").await.unwrap();
+    assert_eq!(
+        summary.turns, 4,
+        "one capped turn plus three nudged retries"
+    );
+    assert!(summary.answer.contains("cut off by the output token limit"));
+}
+
 #[tokio::test]
 async fn stops_at_max_turns() {
     let provider = Arc::new(
