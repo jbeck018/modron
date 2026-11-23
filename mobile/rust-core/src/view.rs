@@ -1594,6 +1594,11 @@ pub(crate) struct FoldState {
     /// Event/ToolResult path); guards the live-strip commit at turn end
     /// against servers that send both.
     pub committed_tools: bool,
+    /// The text of the newest assistant `Message` that arrived live and
+    /// was committed through the Event path (None after a snapshot, a
+    /// turn end, or a tool-only message). At `TurnDone` it tells whether
+    /// the run's answer is already on screen.
+    answer_seen: Option<String>,
 }
 
 impl FoldState {
@@ -1647,6 +1652,8 @@ impl FoldState {
             if message.role == Role::Assistant {
                 vm.streaming_text.clear();
                 vm.streaming_reasoning.clear();
+                self.answer_seen =
+                    (!message.content.trim().is_empty()).then(|| message.content.clone());
             }
         }
         // The single incremental push: the folder returns exactly the
@@ -1705,6 +1712,7 @@ impl FoldState {
         self.prefix.clear();
         self.open_group.clear();
         self.committed_tools = false;
+        self.answer_seen = None;
     }
 
     /// Fold one live `Tool` frame through the canonical tracker.
@@ -1906,18 +1914,45 @@ pub(crate) fn fold_turn_done(
     }
     fold.committed_tools = false;
     let mut text = std::mem::take(&mut vm.streaming_text);
+    let seen = fold.answer_seen.take();
     if text.is_empty() {
         text = summary.answer.clone();
     }
-    // Servers that persist the assistant message AND send TurnDone would
-    // double-commit; the identical last assistant row suppresses that.
-    let last_assistant = vm.history.iter().rev().find_map(|row| match &row.entry {
-        TranscriptEntry::Assistant { text } => Some(text.as_str()),
-        _ => None,
-    });
-    let already_committed = last_assistant == Some(text.as_str());
-    if !text.is_empty() && !already_committed {
-        commit(vm, TranscriptEntry::Assistant { text });
+    // The answer usually reached the transcript already, as the persisted
+    // assistant message. Its rows need not equal `summary.answer`: the
+    // engine may append a note to the answer (verification skipped, spend
+    // cap), and replay splits a `modron-ui` block into its own rows and
+    // trims a leading newline. So the test is against the message's own
+    // text, not against the last row; only what the engine added after
+    // the message is new, and it lands as a note.
+    let appended = seen
+        .as_deref()
+        .and_then(|seen| text.trim_start().strip_prefix(seen.trim_start()));
+    match appended {
+        Some(rest) => {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                commit(
+                    vm,
+                    TranscriptEntry::Note {
+                        text: rest.to_string(),
+                    },
+                );
+            }
+        }
+        None => {
+            // Servers that persist the assistant message AND send TurnDone
+            // would double-commit; the identical last assistant row
+            // suppresses that (an attach between the two frames).
+            let last_assistant = vm.history.iter().rev().find_map(|row| match &row.entry {
+                TranscriptEntry::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            });
+            let already_committed = last_assistant == Some(text.as_str());
+            if !text.is_empty() && !already_committed {
+                commit(vm, TranscriptEntry::Assistant { text });
+            }
+        }
     }
     vm.streaming_reasoning.clear();
     let lines = fold.tracker.take_swarm_summary();
@@ -1957,6 +1992,7 @@ pub(crate) fn fold_turn_unfinished(
         );
     }
     fold.committed_tools = false;
+    fold.answer_seen = None;
     vm.streaming_text.clear();
     vm.streaming_reasoning.clear();
     // The tracker is the source `fold_tool` re-syncs from: clear it with
@@ -2395,6 +2431,61 @@ mod tests {
         };
         fold_turn_done(&mut vm, &mut fold, &summary);
         assert!(vm.pending_steers.is_empty(), "turn done clears steers");
+    }
+
+    /// The answer is on screen once, whatever the engine appended to the
+    /// summary and however replay split the message into rows.
+    #[test]
+    fn turn_done_never_repeats_an_answer_the_event_path_committed() {
+        let summary = |answer: &str| WireRunSummary {
+            session_id: Uuid::nil(),
+            answer: answer.into(),
+            turns: 1,
+            tool_calls: 0,
+            usage: Usage::default(),
+            models_used: Vec::new(),
+        };
+        let assistant_rows = |vm: &SessionViewModel| {
+            vm.history
+                .iter()
+                .filter(|row| matches!(row.entry, TranscriptEntry::Assistant { .. }))
+                .count()
+        };
+        let message = |text: &str| SessionEvent::Message {
+            parent_id: None,
+            message: Message::assistant(text),
+        };
+
+        // The engine appended a note after the persisted message.
+        let mut fold = FoldState::default();
+        let mut vm = SessionViewModel::default();
+        fold.fold_event(&mut vm, message("All done."));
+        let rows = vm.history.len();
+        fold_turn_done(
+            &mut vm,
+            &mut fold,
+            &summary("All done.\n\n[verification skipped: no command configured]"),
+        );
+        assert_eq!(assistant_rows(&vm), 1, "the answer is not repeated");
+        assert_eq!(vm.history.len(), rows + 1, "only the appended note is new");
+        assert!(matches!(
+            &vm.history.last().unwrap().entry,
+            TranscriptEntry::Note { text } if text.starts_with("[verification skipped")
+        ));
+
+        // A leading newline (replay trims it from the row).
+        let mut fold = FoldState::default();
+        let mut vm = SessionViewModel::default();
+        fold.fold_event(&mut vm, message("\nAll done."));
+        let rows = vm.history.len();
+        fold_turn_done(&mut vm, &mut fold, &summary("\nAll done."));
+        assert_eq!(vm.history.len(), rows, "nothing new at turn end");
+
+        // No persisted message this turn: the summary answer commits.
+        let mut fold = FoldState::default();
+        let mut vm = SessionViewModel::default();
+        fold_turn_done(&mut vm, &mut fold, &summary("Only in the summary."));
+        assert_eq!(assistant_rows(&vm), 1);
     }
 
     #[test]

@@ -3653,6 +3653,11 @@ fn derive_action(messages: &[Message]) -> ActionKind {
     ActionKind::Chat
 }
 
+/// Upper bound of the pre-flight estimate for one image attachment. Above
+/// what current providers charge for their largest accepted image, so the
+/// estimate stays on the safe side.
+const IMAGE_TOKEN_CEILING: u64 = 6_000;
+
 fn estimate_context_tokens(system: &str, tools: &[ToolSpec], messages: &[Message]) -> u64 {
     let mut tokens = estimate_tokens(system);
     if let Ok(json) = serde_json::to_string(tools) {
@@ -3666,7 +3671,12 @@ fn estimate_context_tokens(system: &str, tools: &[ToolSpec], messages: &[Message
         for attachment in &message.attachments {
             match attachment {
                 crate::Attachment::Image { data, .. } => {
-                    tokens += (data.len() as u64).div_ceil(4);
+                    // Providers bill an image by its pixels, a few thousand
+                    // tokens at most, not by its base64 length. Counting
+                    // bytes / 4 put a 600 KB screenshot at 150k tokens: the
+                    // run failed pre-flight, and a compaction bitmap made
+                    // the context look full again right after compacting.
+                    tokens += (data.len() as u64).div_ceil(4).min(IMAGE_TOKEN_CEILING);
                 }
                 crate::Attachment::Document { text, .. } => {
                     tokens += estimate_tokens(text);
@@ -5683,6 +5693,35 @@ mod tests {
         assert!(messages
             .iter()
             .all(|m| !m.content.contains("standing plan")));
+    }
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+
+    /// One large image is a few thousand tokens to a provider. The
+    /// estimate must not turn it into a budget failure.
+    #[test]
+    fn an_image_is_estimated_by_a_ceiling_not_by_its_bytes() {
+        let big = crate::Attachment::Image {
+            media_type: "image/png".into(),
+            data: "A".repeat(800_000),
+        };
+        let small = crate::Attachment::Image {
+            media_type: "image/png".into(),
+            data: "A".repeat(400),
+        };
+        let estimate = |attachment: crate::Attachment| {
+            estimate_context_tokens(
+                "",
+                &[],
+                &[Message::user_with_attachments("", vec![attachment])],
+            )
+        };
+        let base = estimate_context_tokens("", &[], &[Message::user("")]);
+        assert_eq!(estimate(big) - base, IMAGE_TOKEN_CEILING);
+        assert_eq!(estimate(small) - base, 100);
     }
 }
 

@@ -177,7 +177,10 @@ impl RuleSet {
 
 /// Ok when the rule matches the call; Err carries the reason it does not.
 fn matches(rule: &Rule, tool: &str, args: &Value) -> Result<(), String> {
-    if rule.tool != tool {
+    // `edit_lines` is the line-addressed form of `edit`: a rule written
+    // for `edit` covers both, like the `--allow` / `--deny` name lists.
+    let same_tool = rule.tool == tool || (rule.tool == "edit" && tool == "edit_lines");
+    if !same_tool {
         return Err("different tool".to_string());
     }
     let Some(pattern) = rule.pattern.as_deref() else {
@@ -188,15 +191,25 @@ fn matches(rule: &Rule, tool: &str, args: &Value) -> Result<(), String> {
         return Err("no subject argument".to_string());
     };
 
-    let (pattern, candidates): (&str, Vec<&str>) = if is_bash {
+    let (pattern, candidates): (&str, Vec<String>) = if is_bash {
         if rule.effect == RuleEffect::Allow {
             if has_compound(raw) {
                 return Err("compound command never matches an allow pattern".to_string());
             }
-            (pattern, vec![raw.trim()])
+            (pattern, vec![raw.trim().to_string()])
         } else {
-            let mut c = vec![raw.trim()];
-            c.extend(split_segments(raw));
+            // Deny and ask look at every command in the line, with the
+            // wrappers a shell allows in front of one removed, so
+            // `(rm -rf x)`, `FOO=1 rm -rf x` and `sudo rm -rf x` all meet a
+            // `rm -rf*` rule.
+            let mut c = vec![raw.trim().to_string()];
+            for segment in split_segments(raw) {
+                let bare = strip_command_prefixes(segment);
+                if bare != segment {
+                    c.push(bare.to_string());
+                }
+                c.push(segment.to_string());
+            }
             (pattern, c)
         }
     } else {
@@ -205,10 +218,18 @@ fn matches(rule: &Rule, tool: &str, args: &Value) -> Result<(), String> {
         if rule.effect == RuleEffect::Allow && raw.split(['/', '\\']).any(|part| part == "..") {
             return Err("path with `..` never matches an allow pattern".to_string());
         }
-        (
-            pattern.strip_prefix("./").unwrap_or(pattern),
-            vec![raw.strip_prefix("./").unwrap_or(raw)],
-        )
+        let plain = raw.strip_prefix("./").unwrap_or(raw).to_string();
+        let candidates = if rule.effect == RuleEffect::Allow {
+            vec![plain]
+        } else {
+            // Deny and ask must hold however the path is spelled: the
+            // tools resolve `sub/../.env`, `.//.env` and an absolute path
+            // to the same file a `.env` rule names.
+            let mut c = path_spellings(raw);
+            c.push(plain);
+            c
+        };
+        (pattern.strip_prefix("./").unwrap_or(pattern), candidates)
     };
 
     if candidates.iter().any(|c| glob_match(pattern, c, !is_bash)) {
@@ -228,6 +249,59 @@ fn subject<'a>(tool: &str, args: &'a Value) -> Option<&'a str> {
     }
 }
 
+/// The spellings of a path argument a deny or ask rule is matched against:
+/// the path with `.`, empty and `..` components folded away, and, for an
+/// absolute path, every trailing run of its components (the working
+/// directory is not known here, so `/work/repo/.env` is offered as
+/// `work/repo/.env`, `repo/.env` and `.env`). Matching more is the safe
+/// direction for these two effects.
+fn path_spellings(raw: &str) -> Vec<String> {
+    let absolute = raw.starts_with('/') || raw.starts_with('\\');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = vec![parts.join("/")];
+    if absolute {
+        for start in 1..parts.len() {
+            out.push(parts[start..].join("/"));
+        }
+    }
+    out
+}
+
+/// A command with the things a shell allows in front of it removed:
+/// grouping (`(`, `{`), control words (`then`, `do`, `else`), wrappers
+/// (`sudo`, `env`, `exec`, `command`, `nohup`, `time`) and `NAME=value`
+/// assignments.
+fn strip_command_prefixes(segment: &str) -> &str {
+    const WORDS: [&str; 10] = [
+        "then", "do", "else", "elif", "sudo", "env", "exec", "command", "nohup", "time",
+    ];
+    let mut rest = segment.trim_start();
+    loop {
+        let before = rest;
+        rest = rest.trim_start_matches(['(', '{', '!']).trim_start();
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        let is_assignment = word.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if word_end < rest.len() && (WORDS.contains(&word) || is_assignment) {
+            rest = rest[word_end..].trim_start();
+        }
+        if rest == before {
+            return rest;
+        }
+    }
+}
+
 fn has_compound(cmd: &str) -> bool {
     // A lone `&` (background) chains commands too, so any `&` counts.
     [";", "&", "|", "`", "$(", ">", "<", "\n"]
@@ -235,7 +309,8 @@ fn has_compound(cmd: &str) -> bool {
         .any(|t| cmd.contains(t))
 }
 
-/// Splits on `;`, `&&`, `||` and `|`; segments are trimmed, empties dropped.
+/// Splits on `;`, `&&`, `||`, `|`, newlines, parentheses (subshells and
+/// `$(...)`) and backticks; segments are trimmed, empties dropped.
 fn split_segments(cmd: &str) -> Vec<&str> {
     let bytes = cmd.as_bytes();
     let mut out = Vec::new();
@@ -243,7 +318,8 @@ fn split_segments(cmd: &str) -> Vec<&str> {
     let mut i = 0;
     while i < bytes.len() {
         let sep = match bytes[i] {
-            b';' | b'|' | b'&' | b'\n' => 1,
+            // Grouping and substitution open or close a command too.
+            b';' | b'|' | b'&' | b'\n' | b'(' | b')' | b'`' => 1,
             _ => 0,
         };
         if sep > 0 {
@@ -543,6 +619,73 @@ mod tests {
             rules.evaluate("edit", &inside).unwrap().effect,
             RuleEffect::Allow
         );
+    }
+
+    /// A deny or ask rule holds however the path is spelled, and an `edit`
+    /// rule covers `edit_lines`.
+    #[test]
+    fn deny_rules_hold_for_every_spelling_of_a_path() {
+        let rules = RuleSet::new(vec![
+            Rule::parse(RuleEffect::Deny, "read(.env)").unwrap(),
+            Rule::parse(RuleEffect::Deny, "edit(secrets/**)").unwrap(),
+        ]);
+        for path in [
+            ".env",
+            "./.env",
+            ".//.env",
+            "sub/../.env",
+            "/work/repo/.env",
+        ] {
+            let args = serde_json::json!({ "path": path });
+            assert_eq!(
+                rules.evaluate("read", &args).map(|v| v.effect),
+                Some(RuleEffect::Deny),
+                "read {path}"
+            );
+        }
+        let other = serde_json::json!({"path": "src/env.rs"});
+        assert!(rules.evaluate("read", &other).is_none());
+        for (tool, path) in [
+            ("edit", "secrets/key.pem"),
+            ("edit_lines", "secrets/key.pem"),
+            ("edit_lines", "/work/repo/secrets/a/b"),
+        ] {
+            let args = serde_json::json!({ "path": path });
+            assert_eq!(
+                rules.evaluate(tool, &args).map(|v| v.effect),
+                Some(RuleEffect::Deny),
+                "{tool} {path}"
+            );
+        }
+    }
+
+    /// A bash deny rule meets the command inside grouping, substitution and
+    /// the usual wrappers, not only at the start of a segment.
+    #[test]
+    fn bash_deny_rules_see_wrapped_commands() {
+        let rules = RuleSet::new(vec![Rule::parse(RuleEffect::Deny, "bash(rm -rf*)").unwrap()]);
+        for command in [
+            "rm -rf x",
+            "(rm -rf x)",
+            "{ rm -rf x; }",
+            "if true; then rm -rf x; fi",
+            "FOO=1 rm -rf x",
+            "sudo rm -rf x",
+            "echo $(rm -rf x)",
+            "echo `rm -rf x`",
+            "sudo env A=b rm -rf x",
+        ] {
+            let args = serde_json::json!({ "command": command });
+            assert_eq!(
+                rules.evaluate("bash", &args).map(|v| v.effect),
+                Some(RuleEffect::Deny),
+                "{command}"
+            );
+        }
+        for command in ["ls -la", "echo rm", "git rm -r x"] {
+            let args = serde_json::json!({ "command": command });
+            assert!(rules.evaluate("bash", &args).is_none(), "{command}");
+        }
     }
 
     #[test]

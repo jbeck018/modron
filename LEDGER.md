@@ -1783,3 +1783,9 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   (relay.mjs, bench_agents.py, compare.sh, compare.py). Gates: root fmt,
   clippy, cargo-deny clean, 1523 tests; app fmt, clippy, wasm32 check
   clean, tests pass. Not run: web-test.js, e2e.
+- 2026-11-23: second batch from docs/REVIEW_2026-11-23.md (22 rows
+  marked fixed): deny and ask rules hold for every path spelling and
+  for wrapped shell commands, and `edit` rules cover `edit_lines`; one
+  image is estimated at 6000 tokens at most; TurnDone no longer repeats
+  an answer the event path committed. Gates: root fmt, clippy clean,
+  1527 tests; app 363 tests; client core tests pass.
