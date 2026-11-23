@@ -1789,3 +1789,7 @@ clear it). A packet is DONE only with evidence (commit + gate result).
   image is estimated at 6000 tokens at most; TurnDone no longer repeats
   an answer the event path committed. Gates: root fmt, clippy clean,
   1527 tests; app 363 tests; client core tests pass.
+- 2026-11-23: third batch, from the bench's session traces: `interact`
+  presses Enter instead of typing the word; `write` counts as the read
+  the read-before-edit gate asks for; `plan` infers a missing `op`.
+  Gates: root fmt, clippy clean, 1529 tests.

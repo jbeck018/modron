@@ -262,6 +262,41 @@ async fn pre_tool_hook_vetoes_the_tool() {
     );
 }
 
+/// A file the session itself wrote can be edited straight away: the write
+/// counts as the read the read-before-edit gate asks for.
+#[tokio::test]
+async fn a_file_the_session_wrote_is_editable_without_a_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn SessionStore> =
+        Arc::new(JsonlSessionStore::new(dir.path().join("sessions")));
+    let provider = MockProvider::new()
+        .then_response(tool_call_response(
+            "c1",
+            "write",
+            json!({"path": "new.txt", "content": "alpha beta"}),
+        ))
+        .then_response(tool_call_response(
+            "c2",
+            "edit",
+            json!({"path": "new.txt", "old_string": "beta", "new_string": "gamma"}),
+        ))
+        .then_response(text_response("done"));
+    let engine = engine_with(provider, Arc::clone(&store), dir.path(), |cfg| {
+        cfg.approvals = ApprovalPolicy {
+            mode: ApprovalMode::ApproveAll,
+            non_interactive: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            ..Default::default()
+        };
+    });
+    engine.run_task("write then edit").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+        "alpha gamma"
+    );
+}
+
 /// C1+C2: a checkpoint precedes the write; rewind restores the prior file
 /// and the resume honors the truncation point.
 #[tokio::test]

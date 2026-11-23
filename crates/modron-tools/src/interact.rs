@@ -137,13 +137,20 @@ impl Tool for InteractTool {
                     return Ok(tool_err(NAME, "send requires `keys`", MAX_BYTES));
                 };
                 let enter = args.get("enter").and_then(|v| v.as_bool()).unwrap_or(false);
-                let mut cmd = vec!["send-keys", "-t", session, "-l", keys];
-                if enter {
-                    cmd.push("Enter");
-                }
-                let out = run(cmd)
+                // Two sends. `-l` makes EVERY following argument literal
+                // text, so an `Enter` on the same command line is typed as
+                // the five letters instead of pressing the key. `--` keeps
+                // keys that start with a dash from being read as options.
+                let mut out = run(vec!["send-keys", "-t", session, "-l", "--", keys])
                     .await
                     .map_err(|e| internal_tool_error(NAME, format!("tmux spawn failed: {e}")))?;
+                if enter && out.status.success() {
+                    out = run(vec!["send-keys", "-t", session, "Enter"])
+                        .await
+                        .map_err(|e| {
+                            internal_tool_error(NAME, format!("tmux spawn failed: {e}"))
+                        })?;
+                }
                 if !out.status.success() {
                     return Ok(ToolOutcome::err(format!(
                         "tmux send failed (session `{session}` alive?): {}",
@@ -177,5 +184,65 @@ impl Tool for InteractTool {
             }
         };
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `enter: true` presses Enter; it must not type the word. Runs only
+    /// where tmux is installed.
+    #[tokio::test]
+    async fn send_with_enter_presses_the_key() {
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            engine: None,
+            sandbox: modron_core::SandboxPolicy::Off,
+            working_dir: dir.path().to_path_buf(),
+            session_id: None,
+        };
+        let session = format!("modron-interact-test-{}", std::process::id());
+        let tool = InteractTool::new();
+        let started = tool
+            .execute(
+                json!({"action": "start", "command": "cat", "session": session}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!started.is_error, "{}", started.content);
+        // A leading dash must reach the program as text, not as an option.
+        let sent = tool
+            .execute(
+                json!({"action": "send", "keys": "-l hello", "enter": true, "session": session}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &session])
+            .output();
+        assert!(!sent.is_error, "{}", sent.content);
+        assert!(
+            !sent.content.contains("Enter"),
+            "Enter was typed as text: {}",
+            sent.content
+        );
+        // `cat` echoes the line back once Enter is pressed: typed + echoed.
+        assert_eq!(
+            sent.content.matches("-l hello").count(),
+            2,
+            "{}",
+            sent.content
+        );
     }
 }

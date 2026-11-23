@@ -143,6 +143,12 @@ impl Tool for WriteTool {
                 MAX_BYTES,
             ));
         }
+        // The session wrote every byte of this file, so it has "read" it:
+        // without this mark the first edit of a file the model just
+        // created is refused, and a turn is spent reading it back.
+        if let Some(engine) = &ctx.engine {
+            engine.tools.read_gate.mark_in(ctx.session_id, &path);
+        }
         // Live LSP (Phase 14): full overwrites re-lint like edits — without
         // this push, diagnostics go stale after a `write`.
         // D6: language servers run repo code outside the sandbox, so they

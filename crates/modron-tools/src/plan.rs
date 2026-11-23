@@ -72,6 +72,22 @@ impl Tool for PlanTool {
         args: serde_json::Value,
         ctx: &ToolCtx,
     ) -> modron_core::Result<ToolOutcome> {
+        // A call without `op` is unambiguous when it carries `items` (a
+        // set) or `index` (an update). Models leave `op` out often enough
+        // that refusing the call just costs a turn.
+        let mut args = args;
+        if args.get("op").is_none() {
+            let inferred = if args.get("items").is_some() {
+                Some("set")
+            } else if args.get("index").is_some() {
+                Some("update")
+            } else {
+                None
+            };
+            if let (Some(op), Some(object)) = (inferred, args.as_object_mut()) {
+                object.insert("op".into(), serde_json::json!(op));
+            }
+        }
         let spec = self.spec();
         if let Err(message) = validate_args(&spec, &args) {
             return Ok(tool_err(
@@ -237,9 +253,10 @@ mod tests {
         let tool = PlanTool;
         let ctx = ctx_with(&engine, session);
 
+        // `op` left out: `items` makes it a set.
         let outcome = tool
             .execute(
-                serde_json::json!({"op": "set", "items": [
+                serde_json::json!({"items": [
                     {"text": "add the plan tool", "done_criteria": "tool registered"},
                     {"text": "wire the tests", "done_criteria": "tests green"}
                 ]}),
